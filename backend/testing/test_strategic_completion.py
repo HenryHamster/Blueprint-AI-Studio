@@ -33,6 +33,7 @@ from app.strategic_completion import (
     _extract_cycle_reasoning,
     _extract_rationale_from_notes,
     _compute_churn_metrics,
+    _compute_lifetime_burn_metrics,
     _CREATED_NOTE_PREFIX,
     _RETIRED_NOTE_PREFIX,
 )
@@ -381,6 +382,126 @@ class TestCheckDirectionHealth:
         # non_merge_finished=20, merged=0, window_cycles=5
         assert "0 merged" in result
         assert "5 cycles" in result
+
+    # --- Rule 6: Lifetime cumulative burn backstop ---
+
+    def test_rule6_fires_when_aggregate_pushes_lifetime_over_threshold(self):
+        # Window: 10 non-merging tasks (< Rule-5 threshold of 15) — Rule 5 stays silent.
+        # Aggregate adds 150 more → lifetime_non_merge=160 ≥ 150 at 0% rate → Rule 6 fires.
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=3, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+            history_aggregate={
+                "total_tasks_completed": 150,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+                "total_prs_merged": 0,
+                "total_cycles": 30,
+            },
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Lifetime burn backstop" in result
+
+    def test_rule6_not_triggered_at_healthy_lifetime_merge_rate(self):
+        # Window: 5 merged in 5 cycles keeps Rule-5 quiet.
+        # Aggregate: 25 merged across 200 completed → lifetime merge rate ≈14% > 10% → Rule 6 off.
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=3, tasks_completed=2, tasks_failed=0, prs_merged=1
+            ),
+            history_aggregate={
+                "total_tasks_completed": 200,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+                "total_prs_merged": 25,
+                "total_cycles": 40,
+            },
+        )
+        result = _check_direction_health(d)
+        assert result is None or "Lifetime burn backstop" not in result
+
+    def test_rule6_independent_of_rolling_window_rule5(self):
+        # Window non_merge=10 < Rule-5 threshold (15) → Rule 5 does NOT fire.
+        # Lifetime aggregate pushes total to 160 non-merging at 0% → Rule 6 fires.
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=3, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+            history_aggregate={
+                "total_tasks_completed": 150,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+                "total_prs_merged": 0,
+                "total_cycles": 30,
+            },
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Lifetime burn backstop" in result
+        assert "Churn guardrail" not in result
+
+    def test_rule6_config_threshold_honored(self, mocker):
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"direction_lifetime_non_merge_threshold": 50},
+            clear=False,
+        )
+        # Window: 10 non-merge (< Rule-5 default 15). Aggregate: 50 completed → lifetime=60 ≥ 50.
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=3, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+            history_aggregate={
+                "total_tasks_completed": 50,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+                "total_prs_merged": 0,
+                "total_cycles": 10,
+            },
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Lifetime burn backstop" in result
+
+    def test_rule6_message_includes_machine_readable_counts(self):
+        # lifetime_non_merge_finished=160, lifetime_merged=0, rate=0%
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=3, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+            history_aggregate={
+                "total_tasks_completed": 150,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+                "total_prs_merged": 0,
+                "total_cycles": 30,
+            },
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "160" in result
+        assert "0 merged" in result
+        assert "0%" in result
+
+    def test_rule6_not_classified_as_code_failure(self):
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=3, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+            history_aggregate={
+                "total_tasks_completed": 150,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+                "total_prs_merged": 0,
+                "total_cycles": 30,
+            },
+        )
+        reason = _check_direction_health(d)
+        assert reason is not None
+        assert "Lifetime burn backstop" in reason
+        assert _is_code_failure_pause_reason(reason) is False
 
 
 # ── _compute_churn_metrics ────────────────────────────────────────────────────
@@ -4258,3 +4379,213 @@ async def test_set_problem_model_with_qualify_request_does_not_400(client, db_se
     # problem_model write succeeded: revision bumped off the empty baseline.
     assert body["revision"] == 1
     assert body["qualify_request_received"] is True
+
+
+# ── _compute_lifetime_burn_metrics ───────────────────────────────────────────
+
+
+class TestComputeLifetimeBurnMetrics:
+    def test_returns_none_when_no_history_and_no_aggregate(self):
+        d = _direction(research_history=[], history_aggregate={})
+        assert _compute_lifetime_burn_metrics(d) is None
+
+    def test_window_only_no_aggregate(self):
+        # 5 cycles: 5 completed, 0 merged each → lifetime_non_merge_finished=25
+        d = _direction(
+            research_history=_history(
+                5, tasks_completed=5, tasks_failed=0, prs_merged=0
+            )
+        )
+        m = _compute_lifetime_burn_metrics(d)
+        assert m is not None
+        assert m["lifetime_non_merge_finished"] == 25
+        assert m["lifetime_merged"] == 0
+        assert m["lifetime_merge_rate"] == 0.0
+
+    def test_aggregate_and_window_combined(self):
+        # aggregate has 100 completed/0 merged (evicted cycles)
+        # window has 5 cycles: 10 completed, 0 merged
+        agg = {
+            "total_prs_merged": 0,
+            "total_tasks_completed": 100,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        }
+        d = _direction(
+            research_history=_history(
+                5, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+            history_aggregate=agg,
+        )
+        m = _compute_lifetime_burn_metrics(d)
+        assert m is not None
+        assert m["lifetime_non_merge_finished"] == 110  # 100 + 10
+        assert m["lifetime_merged"] == 0
+
+    def test_healthy_direction_high_merge_rate(self):
+        # 5 cycles × (5 completed, 4 merged) → 25 completed, 20 merged
+        # non_merge=max(0,25-20)=5, total_finished=25 → merge_rate=20/25=80%
+        d = _direction(
+            research_history=_history(
+                5, tasks_completed=5, tasks_failed=0, prs_merged=4
+            ),
+        )
+        m = _compute_lifetime_burn_metrics(d)
+        assert m is not None
+        assert m["lifetime_merge_rate"] == 0.8
+
+    def test_infra_failures_excluded_from_non_merge(self):
+        # 5 cycles: tasks_failed=2 (all infra), tasks_completed=3, prs_merged=0
+        # code_failed = max(0, 2-2) = 0 → non_merge = max(0, 3+0-0) = 3 per cycle
+        d = _direction(
+            research_history=_history(
+                5, tasks_completed=3, tasks_failed=2, tasks_failed_infra=2, prs_merged=0
+            )
+        )
+        m = _compute_lifetime_burn_metrics(d)
+        assert m is not None
+        assert m["lifetime_non_merge_finished"] == 15  # 5 * 3
+
+    def test_aggregate_infra_failures_excluded(self):
+        agg = {
+            "total_prs_merged": 0,
+            "total_tasks_completed": 10,
+            "total_tasks_failed": 20,
+            "total_tasks_failed_infra": 20,  # all infra → code_failed=0
+        }
+        d = _direction(research_history=[], history_aggregate=agg)
+        m = _compute_lifetime_burn_metrics(d)
+        assert m is not None
+        assert m["lifetime_non_merge_finished"] == 10  # only tasks_completed counts
+
+
+# ── Rule 6: Lifetime burn backstop ───────────────────────────────────────────
+
+
+class TestRule6LifetimeBurnBackstop:
+    def test_fires_when_aggregate_plus_window_exceed_threshold(self, mocker):
+        # Window: 5 cycles × 2 completed, 0 merged = 10 non-merge (below Rule 5 threshold 15)
+        # Aggregate: 145 completed, 0 merged
+        # Lifetime total: 155 > 150 → Rule 6 fires, merge_rate = 0%
+        # tasks_created=5 > tasks_completed=2 prevents Rule 2 in-flight guard from firing
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {
+                "direction_lifetime_non_merge_threshold": 150,
+                "direction_lifetime_min_merge_rate": 0.10,
+            },
+            clear=False,
+        )
+        agg = {
+            "total_prs_merged": 0,
+            "total_tasks_completed": 145,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        }
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=5, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+            history_aggregate=agg,
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Lifetime burn backstop" in result
+        assert "155" in result
+
+    def test_not_fired_when_healthy_lifetime_merge_rate(self, mocker):
+        # 200 non-merge finished but 200 merged → merge_rate=50%, above 10% floor
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {
+                "direction_lifetime_non_merge_threshold": 150,
+                "direction_lifetime_min_merge_rate": 0.10,
+            },
+            clear=False,
+        )
+        agg = {
+            "total_prs_merged": 200,
+            "total_tasks_completed": 400,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        }
+        d = _direction(research_history=[], history_aggregate=agg)
+        result = _check_direction_health(d)
+        assert result is None
+
+    def test_independent_of_windowed_rule5(self, mocker):
+        # Window is clean (below Rule 5 threshold) but aggregate pushes lifetime over Rule 6 threshold
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {
+                "direction_churn_non_merge_threshold": 15,
+                "direction_churn_min_merge_rate": 0.10,
+                "direction_lifetime_non_merge_threshold": 150,
+                "direction_lifetime_min_merge_rate": 0.10,
+            },
+            clear=False,
+        )
+        # Window: 5 cycles × 2 completed, 0 merged = 10 non_merge (below Rule 5 threshold 15)
+        # Aggregate: 145 completed, 0 merged
+        # Lifetime total: 10 + 145 = 155 > 150 → Rule 6 fires
+        # tasks_created=5 > finished=2 keeps tasks in-flight so Rule 2's
+        # zero-merge guard does not fire before Rule 6.
+        agg = {
+            "total_prs_merged": 0,
+            "total_tasks_completed": 145,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        }
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=5, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+            history_aggregate=agg,
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Lifetime burn backstop" in result
+
+    def test_not_fired_below_lifetime_threshold(self, mocker):
+        # Only 100 lifetime non-merge finished, threshold is 150 → no pause
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {
+                "direction_lifetime_non_merge_threshold": 150,
+                "direction_lifetime_min_merge_rate": 0.10,
+            },
+            clear=False,
+        )
+        agg = {
+            "total_prs_merged": 0,
+            "total_tasks_completed": 100,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        }
+        d = _direction(research_history=[], history_aggregate=agg)
+        result = _check_direction_health(d)
+        # Should not fire Rule 6 (only 100 < 150), though Rule 2 (zero merges) may fire
+        # We only assert Rule 6 is NOT the trigger
+        assert result is None or "Lifetime burn backstop" not in result
+
+    def test_lifetime_backstop_not_classified_as_code_failure(self, mocker):
+        # Rule 6 is a volume/burn signal, not a code error — must not trigger investigation
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {
+                "direction_lifetime_non_merge_threshold": 150,
+                "direction_lifetime_min_merge_rate": 0.10,
+            },
+            clear=False,
+        )
+        agg = {
+            "total_prs_merged": 0,
+            "total_tasks_completed": 160,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        }
+        d = _direction(research_history=[], history_aggregate=agg)
+        reason = _check_direction_health(d)
+        assert reason is not None
+        assert "Lifetime burn backstop" in reason
+        assert _is_code_failure_pause_reason(reason) is False

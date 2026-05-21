@@ -83,7 +83,10 @@ async def get_directions(
     from app.shared_state import get_direction_hold_info as _get_direction_hold_info  # noqa: PLC0415
     from app.shared_state import runtime_config as _runtime_config  # noqa: PLC0415
     from app.direction_metrics import _compute_direction_quality_score  # noqa: PLC0415
-    from app.strategic_completion import _compute_churn_metrics  # noqa: PLC0415
+    from app.strategic_completion import (
+        _compute_churn_metrics,
+        _compute_lifetime_burn_metrics,
+    )  # noqa: PLC0415
 
     project = await _get_user_project(project_id, current_user["user_id"], session)
     directions = project.directions or []
@@ -92,6 +95,12 @@ async def get_directions(
     )
     churn_min_rate = float(
         _runtime_config.get("direction_churn_min_merge_rate", 0.10) or 0.10
+    )
+    lifetime_threshold = int(
+        _runtime_config.get("direction_lifetime_non_merge_threshold", 150) or 150
+    )
+    lifetime_min_rate = float(
+        _runtime_config.get("direction_lifetime_min_merge_rate", 0.10) or 0.10
     )
     enriched = []
     for d in directions:
@@ -108,6 +117,16 @@ async def get_directions(
             if raw_churn is not None
             else None
         )
+        raw_lifetime = _compute_lifetime_burn_metrics(d)
+        lifetime_burn_metrics = (
+            {
+                **raw_lifetime,
+                "threshold": lifetime_threshold,
+                "min_merge_rate": lifetime_min_rate,
+            }
+            if raw_lifetime is not None
+            else None
+        )
         enriched.append(
             {
                 **d,
@@ -122,6 +141,7 @@ async def get_directions(
                 if isinstance(held_until, datetime)
                 else None,
                 "churn_metrics": churn_metrics,
+                "lifetime_burn_metrics": lifetime_burn_metrics,
             }
         )
     return {

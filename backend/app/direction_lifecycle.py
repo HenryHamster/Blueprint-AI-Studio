@@ -477,6 +477,7 @@ async def _process_direction_lifecycle(
         _check_direction_health,
         _check_direction_completion,
         _compute_churn_metrics,
+        _compute_lifetime_burn_metrics,
     )
 
     directions_modified = False
@@ -930,6 +931,21 @@ async def _process_direction_lifecycle(
                 churn_ev = _compute_churn_metrics(d)
                 if churn_ev:
                     d["churn_pause_evidence"] = churn_ev
+            # Lifetime burn backstop: store evidence and flag for manual intervention.
+            # The lifetime metric won't drop on its own after auto-recovery, so the
+            # direction would thrash through repeated pause/extend cycles — surface it
+            # for operator decision (retire vs. reset history_aggregate) instead.
+            if pause_reason.startswith("Lifetime burn backstop:"):
+                lb_ev = _compute_lifetime_burn_metrics(d)
+                if lb_ev:
+                    d["lifetime_burn_pause_evidence"] = lb_ev
+                if not d.get("needs_manual_intervention"):
+                    d["needs_manual_intervention"] = True
+                    d["needs_manual_intervention_at"] = _utcnow().isoformat()
+                    logger.warning(
+                        f"[AUTONOMOUS] Direction {did} flagged needs_manual_intervention "
+                        f"(lifetime burn backstop): operator must retire or reset."
+                    )
             # Only code-failure pauses (Rules 3/4) count toward auto-retirement.
             # Infrastructure-driven pauses (saturation, unproductive) shouldn't
             # permanently retire an otherwise healthy direction.

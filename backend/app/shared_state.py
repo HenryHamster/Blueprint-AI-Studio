@@ -269,6 +269,12 @@ runtime_config: Dict = {
     "direction_churn_window_cycles": 5,
     "direction_churn_non_merge_threshold": 15,
     "direction_churn_min_merge_rate": 0.10,
+    # Lifetime/cumulative burn backstop — catches slow-burn directions that stay
+    # just under the rolling-window threshold every window but accumulate hundreds
+    # of non-merging tasks over their lifetime. Thresholds are intentionally high
+    # (order-of-hundreds) so healthy high-throughput directions are never paused.
+    "direction_lifetime_non_merge_threshold": 150,
+    "direction_lifetime_min_merge_rate": 0.10,
     "strategic_research_frequency": 6,  # Every Nth research cycle is a strategic vision review
     "architecture_review_frequency": 3,  # Every Nth strategic cycle includes architecture (design doc) review
     "max_active_directions": 10,
@@ -650,14 +656,16 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "next_role_poll_timeout_secs",
                     "direction_churn_window_cycles",
                     "direction_churn_non_merge_threshold",
+                    "direction_lifetime_non_merge_threshold",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))
-                if "direction_churn_min_merge_rate" in config_json:
-                    _set(
-                        "direction_churn_min_merge_rate",
-                        float(config_json["direction_churn_min_merge_rate"]),
-                    )
+                for float_key in (
+                    "direction_churn_min_merge_rate",
+                    "direction_lifetime_min_merge_rate",
+                ):
+                    if float_key in config_json:
+                        _set(float_key, float(config_json[float_key]))
                 if "reserved_slots_for_types" in config_json:
                     _set(
                         "reserved_slots_for_types",

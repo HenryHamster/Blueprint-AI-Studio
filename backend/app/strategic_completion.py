@@ -677,6 +677,45 @@ def _compute_churn_metrics(direction: dict) -> dict | None:
     }
 
 
+def _compute_lifetime_burn_metrics(direction: dict) -> dict | None:
+    """Return lifetime/cumulative non-merge burn metrics combining research_history and history_aggregate.
+
+    Uses the same non-merge definition as _compute_churn_metrics (tasks_completed +
+    code_failed - prs_merged) but across the direction's entire lifetime. Returns
+    None when there is no meaningful lifetime data.
+    """
+    history = direction.get("research_history") or []
+    agg = direction.get("history_aggregate") or {}
+
+    window_merged = sum(e.get("prs_merged", 0) for e in history)
+    window_completed = sum(e.get("tasks_completed", 0) for e in history)
+    window_code_failed = sum(
+        max(0, e.get("tasks_failed", 0) - e.get("tasks_failed_infra", 0))
+        for e in history
+    )
+    agg_merged = agg.get("total_prs_merged", 0)
+    agg_completed = agg.get("total_tasks_completed", 0)
+    agg_code_failed = max(
+        0, agg.get("total_tasks_failed", 0) - agg.get("total_tasks_failed_infra", 0)
+    )
+
+    lifetime_merged = window_merged + agg_merged
+    lifetime_non_merge_finished = max(
+        0,
+        (window_completed + window_code_failed + agg_completed + agg_code_failed)
+        - lifetime_merged,
+    )
+    total_finished = lifetime_merged + lifetime_non_merge_finished
+    if total_finished == 0:
+        return None
+    lifetime_merge_rate = lifetime_merged / total_finished
+    return {
+        "lifetime_merged": lifetime_merged,
+        "lifetime_non_merge_finished": lifetime_non_merge_finished,
+        "lifetime_merge_rate": round(lifetime_merge_rate, 3),
+    }
+
+
 def _check_direction_health(direction: dict) -> str | None:
     """Return a pause reason if this direction should be auto-paused, else None."""
     history = direction.get("research_history") or []
@@ -751,6 +790,27 @@ def _check_direction_health(direction: dict) -> str | None:
                     f"without merging, {metrics['merged']} merged in last "
                     f"{metrics['window_cycles']} cycles "
                     f"(merge rate {metrics['merge_rate']:.0%})"
+                )
+
+    # Rule 6: Lifetime cumulative burn backstop — catches slow-burn directions that stay
+    # just under the rolling-window threshold every window but accumulate hundreds of
+    # non-merging tasks over their lifetime. High threshold prevents pausing productive
+    # high-throughput directions. This pause requires manual operator intervention (retire
+    # vs. reset) because the lifetime metric will not drop on its own after auto-recovery.
+    lifetime_threshold = int(
+        _runtime_config.get("direction_lifetime_non_merge_threshold", 150) or 150
+    )
+    lifetime_min_merge_rate = float(
+        _runtime_config.get("direction_lifetime_min_merge_rate", 0.10) or 0.10
+    )
+    if lifetime_threshold > 0:
+        lm = _compute_lifetime_burn_metrics(direction)
+        if lm and lm["lifetime_non_merge_finished"] >= lifetime_threshold:
+            if lm["lifetime_merge_rate"] < lifetime_min_merge_rate:
+                return (
+                    f"Lifetime burn backstop: {lm['lifetime_non_merge_finished']} tasks "
+                    f"finished without merging lifetime, {lm['lifetime_merged']} merged "
+                    f"(lifetime merge rate {lm['lifetime_merge_rate']:.0%})"
                 )
 
     return None
