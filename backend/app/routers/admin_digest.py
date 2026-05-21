@@ -54,6 +54,7 @@ from app.direction_metrics import _compute_direction_quality_score
 from app.direction_outcomes import synthesize_prompt_quality_patterns
 from app.retry_budget import failure_class_history_classes
 from app import strategic_cycle as _strategic_cycle
+from app import release_version as _release_version
 from app.strategic_analysis import _compute_prediction_calibration
 from app.playbook_learning import (
     _MIN_DIRECTION_SR_SAMPLE,
@@ -9667,4 +9668,57 @@ async def get_version_lifecycle(
         ],
         "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
         "promotion_readiness": promotion_readiness,
+    }
+
+
+class _SetVersionPhaseBody(BaseModel):
+    phase: str = _Field(..., pattern=r"^(build|stabilize)$")
+    reasoning: str = _Field(default="", max_length=500)
+
+
+@router.post("/projects/{project_id}/version-phase")
+async def set_version_phase(
+    project_id: uuid.UUID,
+    payload: _SetVersionPhaseBody,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Set the phase of the open release version for a project.
+
+    Member+ role required.  Returns 404 when there is no open version.
+    Combined with POST /qualify this gives the operator a direct lever to
+    advance a version to stabilize and trigger the release gate end-to-end,
+    producing a dry-run QualificationVerdict without waiting for the strategic
+    agent's conservative stall threshold (~14 days).
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    open_ver = await _release_version.current_open_version(session, project_id)
+    if open_ver is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No open release version found for this project.",
+        )
+
+    operator_id = current_user.get("email") or current_user["user_id"]
+    full_reasoning = (
+        f"[operator:{operator_id}] {payload.reasoning}".strip()
+        if payload.reasoning
+        else f"[operator:{operator_id}]"
+    )
+    _release_version.set_version_phase(
+        open_ver, payload.phase, reasoning=full_reasoning
+    )
+    session.add(open_ver)
+    await session.commit()
+    await session.refresh(open_ver)
+    return {
+        "version_number": open_ver.version_number,
+        "phase": open_ver.phase,
+        "phase_changed_at": open_ver.phase_changed_at.isoformat()
+        if open_ver.phase_changed_at
+        else None,
+        "phase_reasoning": open_ver.phase_reasoning,
     }

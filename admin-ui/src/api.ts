@@ -788,3 +788,52 @@ export async function fetchVersionLifecycle(projectId: string): Promise<VersionL
   if (!res.ok) throw new Error(`Failed to fetch version lifecycle: ${res.status}`);
   return res.json();
 }
+
+export interface SetVersionPhaseResponse {
+  version_number: number;
+  phase: string;
+  phase_changed_at: string | null;
+  phase_reasoning: string | null;
+}
+
+export async function setVersionPhase(
+  projectId: string,
+  phase: 'build' | 'stabilize',
+  reasoning?: string,
+): Promise<SetVersionPhaseResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-phase`, {
+    method: 'POST',
+    body: JSON.stringify({ phase, reasoning: reasoning ?? '' }),
+  });
+  if (!res.ok) throw new Error(`Failed to set version phase: ${res.status}`);
+  return res.json();
+}
+
+export type QualifyTriggerStatus =
+  | 'wrong_phase'
+  | 'already_pending'
+  | 'project_not_found'
+  | 'no_credentials'
+  | 'sha_error'
+  | 'version_not_found'
+  | 'already_dry_run'
+  | 'spawn_failed'
+  | 'not_promoted'
+  | 'dry_run'
+  | 'promoted'
+  | 'promotion_failed'
+  | 'error';
+
+export interface QualifyTriggerResponse {
+  status: QualifyTriggerStatus;
+  error?: string | null;
+  conflict?: boolean | null;
+}
+
+export async function triggerQualify(projectId: string): Promise<QualifyTriggerResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/qualify`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error(`Failed to trigger qualify: ${res.status}`);
+  return res.json();
+}

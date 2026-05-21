@@ -532,3 +532,93 @@ async def test_recent_closed_versions_scoped_to_project(db_session):
 
     assert await rv.recent_closed_versions(db_session, project_a.id) != []
     assert await rv.recent_closed_versions(db_session, project_b.id) == []
+
+
+# ===========================================================================
+# ensure_initial_release_version
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_ensure_initial_release_version_creates_stabilize_version(db_session):
+    """When no version rows exist and branch != 'main', version 1 is opened in
+    the 'stabilize' phase (ready to qualify immediately, not waiting on build)."""
+    project = await _make_project(db_session)
+    version = await rv.ensure_initial_release_version(
+        db_session,
+        project.id,
+        integration_branch="automain",
+        base_sha="deadbeef",
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version is not None
+    assert version.version_number == 1
+    assert version.phase == "stabilize"
+    assert version.status == "open"
+    assert version.base_sha == "deadbeef"
+
+
+@pytest.mark.asyncio
+async def test_ensure_initial_release_version_noop_when_main_branch(db_session):
+    """integration_branch='main' is degenerate (main…HEAD diff is empty) — no row
+    is created and None is returned."""
+    project = await _make_project(db_session)
+    result = await rv.ensure_initial_release_version(
+        db_session,
+        project.id,
+        integration_branch="main",
+        base_sha="abc123",
+    )
+    await db_session.commit()
+
+    assert result is None
+    assert await rv.current_open_version(db_session, project.id) is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_initial_release_version_idempotent_open_exists(db_session):
+    """If an open version already exists the function is a no-op and returns None."""
+    project = await _make_project(db_session)
+    await rv.open_version(db_session, project.id, version_number=1, base_sha="sha1")
+    await db_session.commit()
+
+    result = await rv.ensure_initial_release_version(
+        db_session,
+        project.id,
+        integration_branch="automain",
+        base_sha="sha2",
+    )
+    assert result is None
+
+    open_ver = await rv.current_open_version(db_session, project.id)
+    assert open_ver is not None
+    assert open_ver.version_number == 1
+    assert open_ver.base_sha == "sha1"
+
+
+@pytest.mark.asyncio
+async def test_ensure_initial_release_version_noop_when_history_exists(db_session):
+    """If any version row exists (even promoted, not open), return None — the
+    lifecycle has already started and bootstrapping would skip gaps."""
+    project = await _make_project(db_session)
+
+    promoted = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="build",
+        status="promoted",
+        opened_at=_utcnow() - timedelta(hours=1),
+    )
+    db_session.add(promoted)
+    await db_session.commit()
+
+    result = await rv.ensure_initial_release_version(
+        db_session,
+        project.id,
+        integration_branch="automain",
+        base_sha="newsha",
+    )
+    assert result is None
+    assert await rv.current_open_version(db_session, project.id) is None

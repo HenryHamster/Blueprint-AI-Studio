@@ -11,7 +11,7 @@ import {
   Search,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { apiFetch, fetchSrUnhandledEdgesRetrospectives, type PromptFingerprintAnalyticsResponse, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
+import { apiFetch, fetchSrUnhandledEdgesRetrospectives, setVersionPhase, triggerQualify, type PromptFingerprintAnalyticsResponse, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
@@ -464,12 +464,46 @@ function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadines
   );
 }
 
-function VersionLifecyclePanel({ data, loading }: { data: VersionLifecycleResponse | null; loading: boolean }) {
+function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: VersionLifecycleResponse | null; loading: boolean; projectId: string | null; onRefresh: () => void }) {
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [actionMsg, setActionMsg] = useState<string | null>(null);
+
   if (loading || !data || (!data.current_version && data.recent_versions.length === 0)) return null;
   const cv = data.current_version;
   const recent = data.recent_versions;
   const promotionEnabled = data.promotion_enabled ?? false;
   const readiness = data.promotion_readiness;
+
+  const handleSetPhase = async (phase: 'build' | 'stabilize') => {
+    if (!projectId) return;
+    setActionLoading('phase');
+    setActionMsg(null);
+    try {
+      await setVersionPhase(projectId, phase, 'operator advance');
+      setActionMsg(`Phase → ${phase}`);
+      onRefresh();
+    } catch {
+      setActionMsg('Request failed');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleQualify = async () => {
+    if (!projectId) return;
+    setActionLoading('qualify');
+    setActionMsg(null);
+    try {
+      const result = await triggerQualify(projectId);
+      setActionMsg(`qualify: ${result.status ?? 'done'}`);
+      onRefresh();
+    } catch {
+      setActionMsg('Request failed');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
   return (
     <section data-testid="version-lifecycle-panel">
       <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Version Lifecycle</h2>
@@ -505,6 +539,42 @@ function VersionLifecyclePanel({ data, loading }: { data: VersionLifecycleRespon
                 )}
                 {cv.last_qualification.blocker && (
                   <p className="text-[10px] text-red-400 truncate">{cv.last_qualification.blocker}</p>
+                )}
+              </div>
+            )}
+            {projectId && (
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                {cv.phase === 'build' ? (
+                  // eslint-disable-next-line viewport/min-touch-target
+                  <button
+                    onClick={() => handleSetPhase('stabilize')}
+                    disabled={actionLoading !== null}
+                    className="text-[10px] px-2 py-0.5 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {actionLoading === 'phase' ? '…' : '→ stabilize'}
+                  </button>
+                ) : (
+                  // eslint-disable-next-line viewport/min-touch-target
+                  <button
+                    onClick={() => handleSetPhase('build')}
+                    disabled={actionLoading !== null}
+                    className="text-[10px] px-2 py-0.5 rounded border border-blue-500/40 text-blue-400 hover:bg-blue-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {actionLoading === 'phase' ? '…' : '→ build'}
+                  </button>
+                )}
+                {cv.phase === 'stabilize' && (
+                  // eslint-disable-next-line viewport/min-touch-target
+                  <button
+                    onClick={handleQualify}
+                    disabled={actionLoading !== null}
+                    className="text-[10px] px-2 py-0.5 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {actionLoading === 'qualify' ? '…' : 'Run Qualify'}
+                  </button>
+                )}
+                {actionMsg && (
+                  <span className="text-[10px] text-neutral-400 italic">{actionMsg}</span>
                 )}
               </div>
             )}
@@ -1064,6 +1134,14 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     setLastFetchError(allFailed);
   }, [selectedProjectId, windowHours]);
 
+  const refreshVersionLifecycle = useCallback(async () => {
+    if (!selectedProjectId) return;
+    try {
+      const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/version-lifecycle`);
+      if (res.ok) setVersionLifecycle(await res.json());
+    } catch { /* silent */ }
+  }, [selectedProjectId]);
+
   const fetchSrTrendDrilldown = useCallback(async (categories: string[]) => {
     if (!selectedProjectId || categories.length === 0) return;
     setSrTrendDrilldownLoading(true);
@@ -1169,7 +1247,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       {selectedProjectId && <ViewportDebtPanel projectId={selectedProjectId} />}
 
       {/* Version Lifecycle */}
-      {selectedProjectId && <VersionLifecyclePanel data={versionLifecycle} loading={loading} />}
+      {selectedProjectId && <VersionLifecyclePanel data={versionLifecycle} loading={loading} projectId={selectedProjectId} onRefresh={refreshVersionLifecycle} />}
 
       {/* Pipeline Efficiency */}
       <PipelineEfficiencyPanel projectId={selectedProjectId} />

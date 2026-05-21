@@ -17,6 +17,7 @@ from app.models import (
     AllowedUser,
     Project,
     ProjectMember,
+    ReleaseVersion,
     Task,
     TaskStatus,
     Alert,
@@ -3071,6 +3072,117 @@ class TestIntegrationBranchValidation:
         assert resp.status_code == 400, (
             f"Expected 400 for branch {bad_branch!r}, got {resp.status_code}"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin.py — Set Version Phase
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def _make_open_version(session, project_id, phase="build"):
+    """Create an open ReleaseVersion for the given project."""
+    version = ReleaseVersion(
+        project_id=project_id, version_number=1, phase=phase, status="open"
+    )
+    session.add(version)
+    await session.commit()
+    await session.refresh(version)
+    return version
+
+
+class TestSetVersionPhase:
+    @pytest.mark.asyncio
+    async def test_set_phase_to_stabilize(self, client: AsyncClient, db_session):
+        """Member can advance phase from build to stabilize."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="build")
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "stabilize", "reasoning": "ready for gate"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["phase"] == "stabilize"
+        assert "ready for gate" in data["phase_reasoning"]
+        assert data["phase_changed_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_set_phase_back_to_build(self, client: AsyncClient, db_session):
+        """Member can revert phase from stabilize back to build."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="stabilize")
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "build"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["phase"] == "build"
+
+    @pytest.mark.asyncio
+    async def test_set_phase_no_open_version_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns 404 when no open release version exists for the project."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "stabilize"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_set_phase_invalid_phase_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """Payload with an unrecognised phase value is rejected by Pydantic."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "qualify"},
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_set_phase_non_member_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """User without project membership cannot set the version phase."""
+        other = Project(name="Other", user_id="other-owner")
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id="other-owner", role="owner")
+        )
+        await _make_open_version(db_session, other.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{other.id}/version-phase",
+            json={"phase": "stabilize"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_set_phase_records_operator_reasoning(
+        self, client: AsyncClient, db_session
+    ):
+        """Operator email is prepended to phase_reasoning in the response."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "stabilize", "reasoning": "dry-run calibration"},
+        )
+        assert resp.status_code == 200
+        reasoning = resp.json()["phase_reasoning"]
+        assert "[operator:" in reasoning
+        assert "dry-run calibration" in reasoning
 
 
 class TestResetIterationCap:

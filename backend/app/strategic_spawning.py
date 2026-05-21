@@ -1569,11 +1569,39 @@ async def _spawn_strategic_review(
             from app.release_version import (
                 count_merged_since,
                 current_open_version,
+                ensure_initial_release_version,
                 recent_closed_versions,
                 to_phase_block,
             )
 
             _open_version = await current_open_version(session, project.id)
+            if _open_version is None:
+                # No open version: attempt bootstrap if the integration branch
+                # is a real trunk distinct from "main" (i.e. the LTS split is
+                # active). Try to resolve the integration-branch HEAD SHA so the
+                # qualifier's diff is meaningful; fall back to None on any error.
+                _integration_branch = _runtime_config.get("integration_branch", "main")
+                _bootstrap_sha: str | None = None
+                try:
+                    from app import github as _github
+                    from app.release_qualifier import _resolve_github_with_session
+
+                    _resolved = await _resolve_github_with_session(session, project)
+                    if _resolved is not None:
+                        _gh_token, _gh_owner, _gh_repo = _resolved
+                        _bootstrap_sha = await _github.get_branch_sha(
+                            _gh_token, _gh_owner, _gh_repo, _integration_branch
+                        )
+                except Exception:
+                    logger.exception(
+                        "[STRATEGIC] could not resolve integration branch SHA for bootstrap"
+                    )
+                _open_version = await ensure_initial_release_version(
+                    session,
+                    project.id,
+                    integration_branch=_integration_branch,
+                    base_sha=_bootstrap_sha,
+                )
             if _open_version is not None:
                 _tasks_merged = await count_merged_since(
                     session, project.id, _open_version.opened_at

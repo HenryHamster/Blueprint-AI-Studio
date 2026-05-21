@@ -180,6 +180,13 @@ vi.mock('../api', () => ({
     by_class: {},
   })),
   onboardProject: vi.fn(async () => ({})),
+  setVersionPhase: vi.fn(async () => ({
+    version_number: 42,
+    phase: 'stabilize',
+    phase_changed_at: '2026-05-20T12:00:00Z',
+    phase_reasoning: '[operator:test] operator advance',
+  })),
+  triggerQualify: vi.fn(async () => ({ status: 'dry_run' })),
   CANONICAL_LAYER_NAMES: ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS', 'VIEWPORT'] as const,
   fetchCanonicalRegressionLayers: vi.fn(async () => ({ layers: [] })),
 }));
