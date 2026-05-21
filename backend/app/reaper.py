@@ -2303,19 +2303,23 @@ async def reaper_service():
                 # because the ``Task.latest_status_message``/``Task.status`` event
                 # listeners (models.py ~360) read status_log on every set; under
                 # async sessions a deferred-column fetch raises MissingGreenlet.
-                _children_by_parent: Dict[uuid.UUID, list] = {}
                 # Plain-tuple snapshot of (id, status, context) per child, captured
-                # at SELECT time. Step 4 iterates this rather than touching live
-                # ORM children: ``_check_and_trigger_rollup`` in Step 3 may commit
+                # at SELECT time. Steps 3 AND 4 iterate this rather than touching
+                # live ORM rows: ``_check_and_trigger_rollup`` in Step 3 may commit
                 # or trigger a session rollback (via inner DB error), which under
                 # SQLAlchemy expires every loaded instance — a subsequent
-                # ``c.status`` read fires a sync lazy-load that can't acquire a
-                # connection if the underlying asyncpg socket is dead, crashing
-                # the entire reaper cycle. Snapshotting decouples Step 4 from
-                # session state. (Production 2026-05-08: 26x crashes at
-                # reaper.py:2407 over a 45 min Cloud SQL instability window.)
+                # ``parent.id`` / ``child.status`` read fires a sync lazy-load that
+                # can't acquire a connection if the underlying asyncpg socket is
+                # dead, crashing the entire reaper cycle. Snapshotting + re-fetching
+                # via ``session.get`` decouples both steps from session state.
+                # (Production 2026-05-08: 26x crashes at reaper.py:2407; recurred
+                # 2026-05-21 at reaper.py:2385/2420 — Step 3/4 still read parent.id
+                # and child.status off the now-stale batch.)
                 _children_snapshot_by_parent: Dict[uuid.UUID, list[tuple]] = {}
                 evaluating_parents = []
+                # Plain UUID list — Steps 3 & 4 iterate this, never the live
+                # ``evaluating_parents`` ORM objects (see snapshot note above).
+                _parent_ids: list = []
                 try:
                     stale_cutoff = now - timedelta(minutes=15)
                     evaluating_parents = (
@@ -2370,28 +2374,34 @@ async def reaper_service():
                             .all()
                         )
                         for _c in _all_children:
-                            _children_by_parent.setdefault(
-                                _c.parent_task_id, []
-                            ).append(_c)
                             _children_snapshot_by_parent.setdefault(
                                 _c.parent_task_id, []
                             ).append((_c.id, _c.status, _c.context or {}))
-                    for parent in evaluating_parents:
-                        # Find a completed child to use as the trigger for _check_and_trigger_rollup
-                        child = next(
+                    for parent_id in _parent_ids:
+                        # Find a COMPLETED child id from the plain-tuple snapshot,
+                        # then re-fetch it fresh. An earlier iteration's
+                        # _check_and_trigger_rollup may have committed or rolled
+                        # back — reading parent.id / child.status off the now-stale
+                        # ORM batch fires a sync lazy-load that crashes the cycle
+                        # on an unhealthy connection.
+                        completed_child_id = next(
                             (
-                                c
-                                for c in _children_by_parent.get(parent.id, [])
-                                if c.status == TaskStatus.COMPLETED
+                                cid
+                                for cid, c_status, _ in _children_snapshot_by_parent.get(
+                                    parent_id, []
+                                )
+                                if c_status == TaskStatus.COMPLETED
                             ),
                             None,
                         )
-                        if child:
+                        if completed_child_id is not None:
                             try:
-                                await _check_and_trigger_rollup(child, session)
+                                child = await session.get(Task, completed_child_id)
+                                if child is not None:
+                                    await _check_and_trigger_rollup(child, session)
                             except Exception as e:  # noqa: BLE001
                                 logger.warning(
-                                    f"[REAPER] Evaluating sweep rollup failed for parent {parent.id}: {e}",
+                                    f"[REAPER] Evaluating sweep rollup failed for parent {parent_id}: {e}",
                                     exc_info=True,
                                 )
                     if evaluating_parents:
@@ -2416,8 +2426,8 @@ async def reaper_service():
                         TaskStatus.CANCELLED,
                     }
                     rescued = 0
-                    for parent in evaluating_parents:
-                        children_snap = _children_snapshot_by_parent.get(parent.id, [])
+                    for parent_id in _parent_ids:
+                        children_snap = _children_snapshot_by_parent.get(parent_id, [])
                         if not children_snap:
                             continue
                         if any(
@@ -2435,6 +2445,11 @@ async def reaper_service():
                         # via _requeue_parent_task which clones failed children with retry
                         # guidance (up to MAX_PARENT_REQUEUES attempts).  If attempts are
                         # exhausted it marks the parent FAILED and fires a failure alert.
+                        # Re-fetch the parent fresh — Step 3 may have committed or
+                        # rolled back, expiring the live ``evaluating_parents`` batch.
+                        parent = await session.get(Task, parent_id)
+                        if parent is None:
+                            continue
                         failed_children = [
                             (cid, ctx)
                             for cid, status, ctx in children_snap

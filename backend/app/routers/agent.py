@@ -2897,9 +2897,18 @@ async def claim_task(
                 .where(
                     Task.project_id == project_for_playbook.id,
                     Task.status == TaskStatus.COMPLETED,
-                    Task.completed_at > _utcnow() - timedelta(days=14),
+                    # Task has no `completed_at` column — that name is a property
+                    # on the strategic-cycle model, not Task. For a COMPLETED
+                    # task, created_at bounds the recent-window scan (mirrors
+                    # sr_blind_spots._scan_fp_stats, the sibling 14-day SR scan).
+                    Task.created_at > _utcnow() - timedelta(days=14),
                 )
-                .order_by(Task.completed_at.desc())
+                .options(
+                    load_only(
+                        Task.id, Task.context, Task.payloads, Task.created_at
+                    )
+                )
+                .order_by(Task.created_at.desc())
                 .limit(2000)
             )
             pairs = aggregate_sr_co_failure_pairs(high_iter_tasks)
@@ -2921,7 +2930,7 @@ async def claim_task(
         try:
             from app.pipeline_regression_dispatcher import (
                 get_sr_persistent_blind_spot_hint,
-            )  # noqa: PLC0415
+            )
 
             _pbs = await get_sr_persistent_blind_spot_hint(
                 session, project_for_playbook.id

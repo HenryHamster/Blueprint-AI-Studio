@@ -1508,6 +1508,90 @@ async def test_step4_diagnostic_summarizes_failure_categories(
 
 
 @pytest.mark.asyncio
+async def test_step4_rescues_parent_after_step3_rollup_expires_session(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Step 4 rescues an all-children-failed parent even when Step 3's rollup
+    helper expired every loaded ORM instance mid-sweep.
+
+    Regression: Step 3/4 once iterated the live ``evaluating_parents`` batch and
+    read ``parent.id`` / ``child.status`` off it. ``_check_and_trigger_rollup``
+    can commit or roll back (inner DB error), expiring every instance — the next
+    read fired a sync lazy-load that crashed the reaper cycle on a dead socket
+    (prod 2026-05-21, reaper.py:2385/2420). The fix snapshots ids/statuses and
+    re-fetches via ``session.get``. (The crash itself needs an unhealthy
+    connection — not reproducible on in-memory SQLite — so this locks the
+    snapshot+re-fetch contract and exercises the post-expiry code paths.)
+    """
+
+    def _expire_session(_child, session):
+        # Mirror the documented "_check_and_trigger_rollup may commit or roll
+        # back" behaviour — both expire every loaded ORM instance.
+        session.expire_all()
+
+    rollup_mock = mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup",
+        new_callable=AsyncMock,
+        side_effect=_expire_session,
+    )
+    requeue_mock = mocker.patch(
+        "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
+    )
+
+    project = await _make_project(reaper_db)
+
+    # Parent A: has a COMPLETED child → Step 3 invokes the rollup helper, which
+    # expires the reaper's session.
+    parent_a = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(parent_a)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent_a)
+    reaper_db.add(
+        Task(
+            project_id=project.id,
+            parent_task_id=parent_a.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+        )
+    )
+
+    # Parent B: all children FAILED → Step 4 must still rescue it after the
+    # session was expired by parent A's Step 3 rollup.
+    parent_b = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(parent_b)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent_b)
+    for _ in range(2):
+        reaper_db.add(
+            Task(
+                project_id=project.id,
+                parent_task_id=parent_b.id,
+                payloads=[{"type": "create"}],
+                status=TaskStatus.FAILED,
+                context={"failure_category": "CODE_ERROR"},
+            )
+        )
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    assert rollup_mock.await_count >= 1
+    requeued_ids = {call.args[0].id for call in requeue_mock.await_args_list}
+    assert parent_b.id in requeued_ids
+    assert parent_a.id not in requeued_ids
+
+
+@pytest.mark.asyncio
 async def test_retry_after_sweep_preserves_valid(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):
