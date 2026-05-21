@@ -3,7 +3,7 @@ import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNo
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders } from '../api';
 import { parseTimestamp } from '../utils/time';
-import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, formatSinceTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP, type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes, ROUTINE_EVENT_LABELS } from './MessagesPanel.utils';
+import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, formatSinceTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP, type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes, ROUTINE_EVENT_LABELS, countHighSignalMessages, fetchServerNoisePrefs, saveServerNoisePrefs } from './MessagesPanel.utils';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -367,7 +367,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     seenMessageIdsRef.current = new Set();
     seenPromotedGroupKeysRef.current = new Set();
     hasInitiallyLoadedRef.current = false;
-    setEventPrefs(loadEventPrefs(auth.currentUser?.email, selectedProjectId));
+    const localPrefs = loadEventPrefs(auth.currentUser?.email, selectedProjectId);
+    setEventPrefs(localPrefs);
     setTempMutes(loadTemporaryMutes(auth.currentUser?.email, selectedProjectId));
     setWebhookStats(null);
     setMuteWindow(loadMuteWindow(auth.currentUser?.email, selectedProjectId));
@@ -375,13 +376,20 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     setDividerTime(lastSeen);
     dividerTimeRef.current = lastSeen;
     dividerDismissedRef.current = false;
-    // Prefer backend last-seen over localStorage — if backend has a more recent
-    // timestamp (e.g. dismissed on another device), update the divider position.
     if (selectedProjectId) {
+      // Prefer backend last-seen over localStorage — if backend has a more recent
+      // timestamp (e.g. dismissed on another device), update the divider position.
       fetchBackendLastSeen(selectedProjectId).then(backendTs => {
         if (backendTs !== null && backendTs > (dividerTimeRef.current ?? 0)) {
           setDividerTime(backendTs);
           dividerTimeRef.current = backendTs;
+        }
+      });
+      // Prefer server noise prefs over localStorage — picks up prefs set on another device.
+      fetchServerNoisePrefs(selectedProjectId).then(serverPrefs => {
+        if (serverPrefs !== null) {
+          setEventPrefs(serverPrefs);
+          saveEventPrefs(auth.currentUser?.email, selectedProjectId, serverPrefs);
         }
       });
     }
@@ -449,7 +457,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     return parseTimestamp(m.created_at).getTime() > dividerTime;
   };
 
-  // Count new high-signal messages (created after divider time)
+  // Count new high-signal messages (created after divider time) — for visual divider only
   const newHighSignalCount = dividerTime
     ? openMessages.filter(m =>
         m.created_at &&
@@ -457,6 +465,12 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
         parseTimestamp(m.created_at).getTime() > dividerTime
       ).length
     : 0;
+
+  // Badge/tab-title count. Uses countHighSignalMessages (prefs-independent) so the value
+  // matches the closed-panel App.tsx badge and the fetch callback at line 806 — the count
+  // must not jump when the operator opens the panel. Operator mute/surface prefs only
+  // affect in-panel grouping (highSignalOpen/routineOpen), not the global badge.
+  const highSignalCount = countHighSignalMessages(messages);
 
   // Count new messages by type for the summary card (respecting mute prefs and criticalOnly)
   const newMessageCounts = dividerTime
@@ -560,6 +574,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
         ? Object.fromEntries(Object.entries(prev).filter(([k]) => k !== et)) as Record<string, EventPref>
         : { ...prev, [et]: pref };
       saveEventPrefs(auth.currentUser?.email, selectedProjectId, next);
+      if (selectedProjectId) void saveServerNoisePrefs(selectedProjectId, next);
       return next;
     });
   }
@@ -613,6 +628,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
       setSearchQuery('');
       setEventPrefs({});
       saveEventPrefs(auth.currentUser?.email, selectedProjectId, {});
+      if (selectedProjectId) void saveServerNoisePrefs(selectedProjectId, {});
       setSortMode('importance');
       setShowResolved(false);
       setRoutineExpanded(false);
@@ -625,6 +641,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     setSearchQuery(view.query);
     setEventPrefs(view.prefs);
     saveEventPrefs(auth.currentUser?.email, selectedProjectId, view.prefs);
+    if (selectedProjectId) void saveServerNoisePrefs(selectedProjectId, view.prefs);
     setSortMode(view.sort);
     setShowResolved(view.showResolved);
     setRoutineExpanded(view.routineExpanded);
@@ -787,8 +804,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
         if (prev.length === msgs.length && prev.every((m, i) => m.id === msgs[i].id && m.status === msgs[i].status)) return prev;
         return msgs;
       });
-      const openCount = msgs.filter(m => m.status === 'open' && (m.from_type || '').toLowerCase() !== 'user').length;
-      onMessageCountChange?.(openCount);
+      onMessageCountChange?.(countHighSignalMessages(msgs));
       // Fetch webhook delivery stats (non-critical — errors are silently ignored)
       try {
         const statsRes = await apiFetch(`${API_BASE_URL}/api/admin/notification-dispatch/stats?project_id=${selectedProjectId}`);
@@ -828,10 +844,12 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     prevMessageCountRef.current = currentCount;
   }, [highSignalOpen, routineOpen, visibleResolved]);
 
-  // Update parent with new high-signal message count (for tab title badge)
+  // Update parent with the high-signal count for the tab-title badge. highSignalCount is
+  // countHighSignalMessages(messages), identical to the fetch callback and the closed-panel
+  // App.tsx path, so the badge stays stable across open/closed transitions.
   useEffect(() => {
-    onMessageCountChange?.(newHighSignalCount);
-  }, [newHighSignalCount, onMessageCountChange]);
+    onMessageCountChange?.(highSignalCount);
+  }, [highSignalCount, onMessageCountChange]);
 
   // Track scroll position for "scroll to bottom" button
   useEffect(() => {
@@ -1419,7 +1437,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-medium text-neutral-300">Event visibility</span>
                     {Object.keys(eventPrefs).length > 0 && (
-                      <button onClick={() => { setEventPrefs({}); saveEventPrefs(auth.currentUser?.email, selectedProjectId, {}); }} className="text-[10px] text-neutral-500 hover:text-red-400 transition-colors">Reset all</button>
+                      <button onClick={() => { setEventPrefs({}); saveEventPrefs(auth.currentUser?.email, selectedProjectId, {}); if (selectedProjectId) void saveServerNoisePrefs(selectedProjectId, {}); }} className="text-[10px] text-neutral-500 hover:text-red-400 transition-colors">Reset all</button>
                     )}
                   </div>
                   {sortedEventTypes.length === 0 ? (

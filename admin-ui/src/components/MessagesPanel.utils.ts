@@ -1,3 +1,5 @@
+import { apiFetch, API_BASE_URL } from '../api';
+
 // Canonical set of escalation event types emitted by backend/app/notification_dispatch.py.
 // One source of truth: high-signal classification, error toast severity, and ContextBadges
 // all read from this set, so a new escalation type added here automatically gets surfaced
@@ -565,6 +567,15 @@ export function isEventTypeTemporarilyMuted(eventType: string | undefined, tempM
   return expiresAt !== undefined && expiresAt > Date.now();
 }
 
+// Count high-signal open messages (genuine operator attention items, excluding routine ops chatter).
+// High-signal includes: user messages, FEEDBACK/BLOCKER/BUG_REPORT types, and critical escalation NOTEs.
+// This computation is used consistently whether the messages panel is open or closed.
+export function countHighSignalMessages(messages: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown> }>): number {
+  return messages.filter(m =>
+    m.status === 'open' && classifySignalLevel(m) === 'high'
+  ).length;
+}
+
 // Collapses stale routine rows (older than STALE_ROUTINE_COLLAPSE_AGE_MS) into per-day digest
 // entries. Failing groups and high-signal events are never collapsed.
 export function collapseStaleRoutineRows<T extends { id: string; context: Record<string, unknown>; created_at?: string | null }>(
@@ -622,4 +633,50 @@ export function formatDailyDigestSummary(breakdown: Record<string, number>): str
     .slice(0, 3)
     .map(([et, cnt]) => `${cnt} ${ROUTINE_EVENT_LABELS[et] ?? et.replace(/_/g, ' ')}`)
     .join(', ');
+}
+
+// ── Server-side noise prefs (per-operator, per-project) ──────────────────────
+// Mirrors the existing per-operator last-seen persistence pattern. localStorage
+// remains the offline fallback; on successful fetch the server value wins.
+
+function sanitizeServerEventPrefs(raw: Record<string, unknown>): Record<string, EventPref> {
+  const out: Record<string, EventPref> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (v === 'mute' || v === 'routine' || v === 'surfaced') out[k] = v;
+  }
+  return out;
+}
+
+export async function fetchServerNoisePrefs(
+  projectId: string,
+): Promise<Record<string, EventPref> | null> {
+  try {
+    const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/noise-prefs?project_id=${encodeURIComponent(projectId)}`);
+    if (!res.ok) return null;
+    const data = await res.json() as { prefs?: Record<string, unknown> };
+    return sanitizeServerEventPrefs(data.prefs ?? {});
+  } catch {
+    return null;
+  }
+}
+
+export async function saveServerNoisePrefs(
+  projectId: string,
+  prefs: Record<string, EventPref>,
+): Promise<void> {
+  try {
+    await apiFetch(`${API_BASE_URL}/api/admin/messages/noise-prefs`, {
+      method: 'PUT',
+      body: JSON.stringify({ project_id: projectId, prefs }),
+    });
+  } catch { /* ignore — localStorage copy remains authoritative offline */ }
+}
+
+// Merges local and server noise prefs, preferring server when available.
+// Pass null serverPrefs to fall back to local (offline or fetch failed).
+export function resolveNoisePrefs(
+  localPrefs: Record<string, EventPref>,
+  serverPrefs: Record<string, EventPref> | null,
+): Record<string, EventPref> {
+  return serverPrefs ?? localPrefs;
 }

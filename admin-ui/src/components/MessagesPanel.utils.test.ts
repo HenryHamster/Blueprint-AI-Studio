@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, test } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, test, vi } from 'vitest';
 import {
   loadEventPrefs,
   saveEventPrefs,
@@ -28,7 +28,17 @@ import {
   loadLastSeen,
   saveLastSeen,
   resolveLastSeen,
+  resolveNoisePrefs,
+  fetchServerNoisePrefs,
+  saveServerNoisePrefs,
 } from './MessagesPanel.utils';
+
+vi.mock('../api', () => ({
+  apiFetch: vi.fn(),
+  API_BASE_URL: '',
+}));
+
+import { apiFetch } from '../api';
 
 describe('MessagesPanel.utils - Event Preferences', () => {
   beforeEach(() => {
@@ -749,5 +759,69 @@ describe('resolveLastSeen (backend + localStorage merge)', () => {
 
   test('returns null when both sources are null', () => {
     expect(resolveLastSeen(null, null)).toBeNull();
+  });
+});
+
+// ── Server-side noise prefs ───────────────────────────────────────────────────
+
+describe('resolveNoisePrefs', () => {
+  test('returns server prefs when server result is present', () => {
+    const local: Record<string, EventPref> = { pr_merged: 'mute' };
+    const server: Record<string, EventPref> = { pr_merged: 'surfaced', cycle_summary: 'routine' };
+    expect(resolveNoisePrefs(local, server)).toEqual(server);
+  });
+
+  test('falls back to local when server is null (offline)', () => {
+    const local: Record<string, EventPref> = { pr_merged: 'mute' };
+    expect(resolveNoisePrefs(local, null)).toEqual(local);
+  });
+
+  test('returns empty server object when server returns empty prefs', () => {
+    const local: Record<string, EventPref> = { pr_merged: 'mute' };
+    expect(resolveNoisePrefs(local, {})).toEqual({});
+  });
+});
+
+describe('fetchServerNoisePrefs', () => {
+
+  beforeEach(() => { vi.resetAllMocks(); });
+
+  test('returns sanitized prefs on successful response', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ prefs: { pr_merged: 'mute', cycle_summary: 'invalid', failure_alert: 'surfaced' } }),
+    } as Response);
+    const result = await fetchServerNoisePrefs('project-uuid');
+    expect(result).toEqual({ pr_merged: 'mute', failure_alert: 'surfaced' }); // 'invalid' dropped
+  });
+
+  test('returns null on non-ok response', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({ ok: false } as Response);
+    expect(await fetchServerNoisePrefs('project-uuid')).toBeNull();
+  });
+
+  test('returns null on network error', async () => {
+    vi.mocked(apiFetch).mockRejectedValue(new Error('network'));
+    expect(await fetchServerNoisePrefs('project-uuid')).toBeNull();
+  });
+});
+
+describe('saveServerNoisePrefs', () => {
+
+  beforeEach(() => { vi.resetAllMocks(); });
+
+  test('calls PUT with the correct project_id and prefs', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({ ok: true } as Response);
+    const prefs: Record<string, EventPref> = { pr_merged: 'mute' };
+    await saveServerNoisePrefs('proj-123', prefs);
+    expect(vi.mocked(apiFetch)).toHaveBeenCalledWith(
+      expect.stringContaining('/api/admin/messages/noise-prefs'),
+      expect.objectContaining({ method: 'PUT', body: JSON.stringify({ project_id: 'proj-123', prefs }) }),
+    );
+  });
+
+  test('silently swallows network errors', async () => {
+    vi.mocked(apiFetch).mockRejectedValue(new Error('network'));
+    await expect(saveServerNoisePrefs('proj-123', {})).resolves.toBeUndefined();
   });
 });

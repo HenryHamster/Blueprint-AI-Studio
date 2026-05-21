@@ -616,6 +616,24 @@ async def _run_regression_scan_and_notify(session) -> int:
     return len(fired)
 
 
+async def _purge_stale_routine_messages(session, retention_days: int = 7) -> int:
+    """Delete open system-authored routine messages older than retention_days. Returns count."""
+    from app.models import ProjectMessage
+    from app.routers.admin_notifications import ROUTINE_EVENT_TYPES
+    from sqlalchemy import delete
+
+    cutoff = _utcnow() - timedelta(days=retention_days)
+    res = await session.execute(
+        delete(ProjectMessage).where(
+            ProjectMessage.created_at < cutoff,
+            ProjectMessage.from_type == "system",
+            ProjectMessage.status == "open",
+            ProjectMessage.context["event_type"].astext.in_(list(ROUTINE_EVENT_TYPES)),
+        )
+    )
+    return res.rowcount
+
+
 async def reaper_service():
     """
     Background worker that scans for orphaned VMs.
@@ -3150,6 +3168,16 @@ async def reaper_service():
                         f"[REAPER] Stuck qualification sweep error: {e}",
                         exc_info=True,
                     )
+                # Step 10: Routine message retention — purge stale routine ops messages.
+                try:
+                    _purged = await _purge_stale_routine_messages(session)
+                    if _purged:
+                        await session.commit()
+                        logger.info(
+                            f"[REAPER] Purged {_purged} stale routine message(s)"
+                        )
+                except Exception as e:
+                    logger.error(f"[REAPER] Routine message purge: {e}", exc_info=True)
             consecutive_errors = 0
             # Liveness telemetry: only bump on the success path. If the
             # cycle body raised above, neither this counter nor the

@@ -12,6 +12,7 @@ import { PipelineView } from './components/PipelineView';
 import { ProjectDashboard } from './components/ProjectDashboard';
 import { auth, signInWithGoogle, signOut } from './firebase';
 import { fetchTask, apiFetch, API_BASE_URL, fetchSrMissedRetrospectives } from './api';
+import { countHighSignalMessages } from './components/MessagesPanel.utils';
 import { SrMissedRetrospective, type SrMissedTask, type SrInvestigationSignal } from './components/SrTrendBreakdown';
 import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
@@ -104,8 +105,8 @@ export default function App() {
         const res = await apiFetch(`${API_BASE_URL}/api/admin/messages?${params}`);
         if (!res.ok || cancelled) return;
         const data = await res.json();
-        const msgs: { from_type?: string }[] = data.messages ?? [];
-        if (!cancelled) setOpenMessageCount(msgs.filter(m => (m.from_type || '').toLowerCase() !== 'user').length);
+        const msgs: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown> }> = data.messages ?? [];
+        if (!cancelled) setOpenMessageCount(countHighSignalMessages(msgs));
       } catch { /* ignore */ }
     }
     fetchCount();

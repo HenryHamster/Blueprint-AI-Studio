@@ -10,7 +10,7 @@ from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import func, update
+from sqlalchemy import func, update, or_
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
@@ -22,6 +22,7 @@ from app.models import (
     ProjectMessage,
     MessageType,
     MessagesLastSeen,
+    MessagesNoisePrefs,
     _utcnow,
 )
 from app.auth import get_current_user
@@ -56,6 +57,11 @@ class MessageResolve(BaseModel):
 class LastSeenUpdate(BaseModel):
     project_id: str
     timestamp: int  # Unix ms epoch
+
+
+class NoisePrefUpdate(BaseModel):
+    project_id: str
+    prefs: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AdminPlaybookSet(BaseModel):
@@ -329,6 +335,22 @@ async def list_messages(
         )
     ).scalar() or 0
 
+    # Guarantee open high-signal messages (user-authored or BLOCKER/FEEDBACK/BUG_REPORT)
+    # are always returned, regardless of how much routine volume fills the paged window.
+    guaranteed_msgs: list = []
+    if status != "resolved":
+        pid_uuid = uuid.UUID(project_id) if project_id else None
+        hs_q = select(ProjectMessage).where(
+            ProjectMessage.project_id.in_(user_pids),
+            ProjectMessage.status == "open",
+            or_(
+                ProjectMessage.from_type == "user",
+                ProjectMessage.message_type.in_(["FEEDBACK", "BLOCKER", "BUG_REPORT"]),
+            ),
+            *([ProjectMessage.project_id == pid_uuid] if pid_uuid else []),
+        )
+        guaranteed_msgs = list((await session.execute(hs_q)).scalars().all())
+
     result = await session.execute(
         select(ProjectMessage)
         .where(*filters)
@@ -336,7 +358,9 @@ async def list_messages(
         .offset(offset)
         .limit(limit)
     )
-    messages = result.scalars().all()
+    paged = list(result.scalars().all())
+    guaranteed_ids = {m.id for m in guaranteed_msgs}
+    messages = guaranteed_msgs + [m for m in paged if m.id not in guaranteed_ids]
 
     return {
         "messages": [
@@ -513,6 +537,74 @@ async def put_messages_last_seen(
     session.add(row)
     await session.commit()
     return {"status": "ok", "last_seen_at": int(new_ts.timestamp() * 1000)}
+
+
+# ── Messages Noise-Prefs Endpoints ───────────────────────────────────────────
+
+
+@router.get("/messages/noise-prefs")
+async def get_messages_noise_prefs(
+    project_id: str = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the operator's messages-panel noise-control preferences."""
+    try:
+        pid = uuid.UUID(project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    row = (
+        await session.execute(
+            select(MessagesNoisePrefs).where(
+                MessagesNoisePrefs.user_id == current_user["user_id"],
+                MessagesNoisePrefs.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+
+    return {"prefs": row.prefs if row is not None else {}}
+
+
+@router.put("/messages/noise-prefs")
+async def put_messages_noise_prefs(
+    payload: NoisePrefUpdate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Upsert the operator's messages-panel noise-control preferences."""
+    try:
+        pid = uuid.UUID(payload.project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    if len(json.dumps(payload.prefs)) > 50_000:
+        raise HTTPException(status_code=400, detail="Prefs too large (max 50KB)")
+
+    row = (
+        await session.execute(
+            select(MessagesNoisePrefs).where(
+                MessagesNoisePrefs.user_id == current_user["user_id"],
+                MessagesNoisePrefs.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+
+    if row is None:
+        row = MessagesNoisePrefs(
+            user_id=current_user["user_id"],
+            project_id=pid,
+            prefs=payload.prefs,
+        )
+    else:
+        row.prefs = payload.prefs
+        flag_modified(row, "prefs")
+
+    session.add(row)
+    await session.commit()
+    return {"status": "ok"}
 
 
 # ── Admin Playbook Endpoints ──────────────────────────────────────────────────

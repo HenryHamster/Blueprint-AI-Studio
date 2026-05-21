@@ -1009,6 +1009,49 @@ class TestMessages:
         )
         assert resp.status_code == 400
 
+    @pytest.mark.asyncio
+    async def test_list_messages_guarantees_high_signal_with_routine_flood(
+        self, client: AsyncClient, db_session
+    ):
+        """BLOCKER messages are always returned even when routine messages fill the paged limit."""
+        from datetime import datetime, timedelta, timezone
+
+        project = await _make_project(db_session)
+        now = datetime.now(timezone.utc)
+
+        # BLOCKER is the OLDEST message: with order_by(created_at.desc()) and limit=3 the
+        # five newer routine rows would evict it entirely unless the guaranteed-query logic
+        # in list_messages explicitly pulls it back in. This ordering is what makes the test
+        # actually exercise the guarantee — a newest BLOCKER would survive on recency alone.
+        blocker = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BLOCKER,
+            from_type="system",
+            content="critical blocker",
+            context={},
+        )
+        blocker.created_at = now - timedelta(hours=10)
+        db_session.add(blocker)
+        for i in range(5):
+            routine = ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.NOTE,
+                from_type="system",
+                content=f"routine {i}",
+                context={"event_type": "pr_merged"},
+            )
+            routine.created_at = now - timedelta(minutes=5 * (5 - i))
+            db_session.add(routine)
+        await db_session.commit()
+
+        # limit=3 would normally cut off the BLOCKER if 5 newer routine messages exist
+        resp = await client.get(
+            f"/api/admin/messages?project_id={project.id}&status=open&limit=3"
+        )
+        assert resp.status_code == 200
+        returned_ids = {m["id"] for m in resp.json()["messages"]}
+        assert str(blocker.id) in returned_ids
+
 
 class TestMessagesLastSeen:
     @pytest.mark.asyncio
@@ -1367,9 +1410,7 @@ class TestNotificationConfigSettings:
         assert body["promotion_enabled"] is True
         assert body["smoketest_enabled"] is False
         # Restore the default so promotion_enabled does not leak to other tests.
-        await client.patch(
-            "/api/admin/settings", json={"promotion_enabled": False}
-        )
+        await client.patch("/api/admin/settings", json={"promotion_enabled": False})
 
     @pytest.mark.asyncio
     async def test_patch_next_role_poll_timeout_secs(self, client: AsyncClient):

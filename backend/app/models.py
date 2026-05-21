@@ -362,6 +362,40 @@ class MessagesLastSeen(SQLModel, table=True):
     )
 
 
+class MessagesNoisePrefs(SQLModel, table=True):
+    """Per-operator, per-project messages-panel noise-control preferences.
+
+    Persists the operator's per-event-type visibility choices and saved filter
+    views server-side so they follow the operator across devices. localStorage
+    remains the offline fallback; this table is the authoritative source when
+    the backend is reachable.
+
+    prefs shape (stored as JSONB, validated by the admin_notifications router):
+      {
+        "event_type_visibility": {<event_type>: "show"|"mute"|"routine"},
+        "saved_filter_views": [{"name": str, "filters": {...}}, ...]
+      }
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    user_id: str = Field(index=True, max_length=128)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    prefs: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "project_id", name="uq_messagesnoiseprefs_user_project"
+        ),
+    )
+
+
 class Task(SQLModel, table=True):
     """
     Extensible Task model. The 'payloads' JSONB column holds a flexible list
