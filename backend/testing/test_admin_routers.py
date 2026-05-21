@@ -1349,6 +1349,29 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_release_flags_round_trip_on_get(self, client: AsyncClient):
+        """The automain/LTS release-control flags — integration_branch,
+        promotion_enabled, smoketest_enabled — are settable via PATCH and
+        visible on GET (regression: GET previously omitted them)."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "integration_branch": "automain",
+                "promotion_enabled": True,
+                "smoketest_enabled": False,
+            },
+        )
+        assert resp.status_code == 200
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["integration_branch"] == "automain"
+        assert body["promotion_enabled"] is True
+        assert body["smoketest_enabled"] is False
+        # Restore the default so promotion_enabled does not leak to other tests.
+        await client.patch(
+            "/api/admin/settings", json={"promotion_enabled": False}
+        )
+
+    @pytest.mark.asyncio
     async def test_patch_next_role_poll_timeout_secs(self, client: AsyncClient):
         """next_role_poll_timeout_secs accepts ints in [30,600] and rejects out-of-range / non-numeric."""
         resp = await client.patch(

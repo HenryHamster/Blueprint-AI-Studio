@@ -183,6 +183,15 @@ async def get_settings(
         "ci_backstop_timeout_minutes": _runtime_config.get(
             "ci_backstop_timeout_minutes", 60
         ),
+        # automain/LTS release-qualifier control flags — kept in sync with the
+        # _apply_settings write path and the runtime_config_json persistence.
+        "integration_branch": _runtime_config.get("integration_branch", "main"),
+        "promotion_enabled": bool(
+            _runtime_config.get("promotion_enabled", False)
+        ),
+        "smoketest_enabled": bool(
+            _runtime_config.get("smoketest_enabled", False)
+        ),
         "warm_continuity_enabled": bool(
             _runtime_config.get("warm_continuity_enabled", False)
         ),
