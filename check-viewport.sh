@@ -18,7 +18,12 @@ OUT=$(env "${VPORT_ARGS[@]}" npm run test:viewport 2>&1)
 STATUS=$?
 echo "$OUT"
 if [ "$STATUS" -eq 0 ]; then
-  exit 0
+  # Confirm tests actually ran and passed
+  if echo "$OUT" | grep -qE "Tests +[0-9]+ passed"; then
+    exit 0
+  fi
+  echo "[check] admin-ui viewport: test suite exited 0 but no test assertions found"
+  exit 1
 fi
 
 # Native failed — check if it's a Chromium bootstrap failure
@@ -50,8 +55,13 @@ DOCKER_STATUS=$?
 echo "$DOCKER_OUT"
 
 if [ "$DOCKER_STATUS" -eq 0 ]; then
-  echo "[check] admin-ui viewport passed in Docker."
-  exit 0
+  # Confirm tests actually ran and passed
+  if echo "$DOCKER_OUT" | grep -qE "Tests +[0-9]+ passed"; then
+    echo "[check] admin-ui viewport passed in Docker."
+    exit 0
+  fi
+  echo "[check] admin-ui viewport: Docker run exited 0 but no test assertions found"
+  exit 1
 fi
 
 # Docker also failed — check whether any test ASSERTIONS failed (vs file-import errors only)
@@ -66,5 +76,6 @@ if echo "$DOCKER_OUT" | grep -qiE "$BOOTSTRAP_PATTERNS"; then
   exit 75
 fi
 
-echo "[check] WARNING: admin-ui viewport has file-import errors in Docker (pre-existing env issue); no test assertions failed. CI will enforce full coverage."
-exit 0
+# Docker run failed without detected test assertions or bootstrap errors
+echo "[check] admin-ui viewport Docker run failed (exit $DOCKER_STATUS) without recognized test assertions or bootstrap errors — blocking."
+exit 1
