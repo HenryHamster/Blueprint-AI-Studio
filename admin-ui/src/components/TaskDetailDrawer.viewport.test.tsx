@@ -148,4 +148,56 @@ describe('TaskDetailDrawer — viewport regression', () => {
       });
     });
   });
+
+  test('renders without horizontal overflow at 768px (tablet width)', async () => {
+    await expectNoOverflowAt(768, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <TaskDetailDrawer
+            task={makeTask()}
+            logLines={[]}
+            onClose={() => {}}
+            onApprove={() => {}}
+            onRequestChanges={() => {}}
+            onCancel={() => {}}
+            onRetry={() => {}}
+            onEditPrompt={() => {}}
+            onDismiss={() => {}}
+          />,
+        );
+      });
+    });
+  });
+
+  test('long task title and description are not silently clipped at 768px', async () => {
+    await expectNoTextTruncationAt(768, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <TaskDetailDrawer
+            task={makeTask({
+              title: 'feat(regression): classify viewport-test failures as a distinct regression class with per-layer escalation_reason metadata attached to each pipeline case',
+              description: 'fix(backend): handle the edge case where pipeline_regression_dispatcher emits duplicate escalation_reason labels on retry loops — add dedup guard in dispatch_single_signal and update test_pipeline_regression_dispatcher.py to cover the retry path',
+              latest_status_message: 'backend/testing/test_pipeline_regression_dispatcher.py — 47 tests passing; admin-ui/src/components/PipelineRegressionsPanel.viewport.test.tsx — building at 768px tablet viewport',
+            })}
+            logLines={[]}
+            onClose={() => {}}
+            onApprove={() => {}}
+            onRequestChanges={() => {}}
+            onCancel={() => {}}
+            onRetry={() => {}}
+            onEditPrompt={() => {}}
+            onDismiss={() => {}}
+          />,
+        );
+      });
+    });
+  });
 });

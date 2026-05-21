@@ -3,6 +3,48 @@ import fs from 'fs';
 import path from 'path';
 
 describe('viewport test coverage invariant', () => {
+  it('fails CI when a required component is missing viewport assertions for a required width', () => {
+    const requiredPath = path.join(__dirname, 'viewport-required.json');
+    const { requiredWidths, components } = JSON.parse(fs.readFileSync(requiredPath, 'utf-8')) as {
+      requiredWidths: number[];
+      components: string[];
+    };
+
+    const componentsDir = path.join(__dirname, '../components');
+    const missing: string[] = [];
+
+    for (const component of components) {
+      const testFile = path.join(componentsDir, `${component}.viewport.test.tsx`);
+      if (!fs.existsSync(testFile)) {
+        for (const width of requiredWidths) {
+          missing.push(`${component} — no viewport test file (needs ${width}px coverage)`);
+        }
+        continue;
+      }
+      const content = fs.readFileSync(testFile, 'utf-8');
+      for (const width of requiredWidths) {
+        // Detect any call to an expect*At helper at the required width
+        if (!new RegExp(`At\\s*\\(\\s*${width}[^\\d]`).test(content)) {
+          missing.push(`${component} — missing ${width}px assertion in ${component}.viewport.test.tsx`);
+        }
+      }
+    }
+
+    const errorMessage =
+      missing.length > 0
+        ? `
+The following required components are missing viewport assertions at required widths.
+Add an expect*At(width, ...) call for each missing entry:
+
+${missing.map(m => `  ${m}`).join('\n')}
+
+Required widths come from admin-ui/src/test/viewport-required.json.
+        `.trim()
+        : '';
+
+    expect(missing, errorMessage).toEqual([]);
+  });
+
   it('fails CI when a new operator component lacks a *.viewport.test.tsx file', () => {
     const componentsDir = path.join(__dirname, '../components');
     const files = fs.readdirSync(componentsDir);
@@ -31,8 +73,6 @@ describe('viewport test coverage invariant', () => {
       // Utility component: renders chip columns in KanbanBoard's table; layout
       // controlled entirely by parent, not rendering standalone in operator pages.
       'ColumnsPicker',
-      // Sub-component of KanbanBoard; not rendered standalone, layout delegated.
-      'KanbanColumn',
       // Toast notifications: positioned fixed/absolutely, exempt from viewport
       // flow overflow checks; positioned via Tailwind fixed positioning.
       'Toasts',

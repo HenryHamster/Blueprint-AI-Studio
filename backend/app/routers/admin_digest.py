@@ -9036,6 +9036,10 @@ async def get_viewport_debt(
     untested_rows = [dict(r) for r in top_untested]
 
     if rows or untested_rows:
+        from app.regression_layer_classifier import (  # noqa: PLC0415
+            parse_viewport_regression_class,
+        )
+
         cutoff = datetime.utcnow() - timedelta(days=30)
         stmt = select(RegressionRemediationCase).where(
             RegressionRemediationCase.project_id == project_id,
@@ -9049,11 +9053,13 @@ async def get_viewport_debt(
         # Map component stem → case count
         case_counts: Dict[str, int] = {}
         for c in vp_cases:
-            cls = c.regression_class  # e.g. "viewport_regression:MessagesPanel.tsx@375"
-            # Extract component name between ":" and "@"
-            inner = cls[len("viewport_regression:") :]
-            comp = inner.split("@")[0]  # e.g. "MessagesPanel.tsx"
-            case_counts[comp] = case_counts.get(comp, 0) + 1
+            parsed = parse_viewport_regression_class(c.regression_class)
+            comp = parsed.get("component")
+            if comp:
+                # Normalize component name to .tsx extension for consistent lookup
+                if not comp.endswith(".tsx"):
+                    comp = f"{comp}.tsx"
+                case_counts[comp] = case_counts.get(comp, 0) + 1
 
         project = await session.get(Project, project_id)
         gh_owner = project.github_owner if project else None

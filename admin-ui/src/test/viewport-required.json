@@ -1,4 +1,5 @@
 {
+  "requiredWidths": [375],
   "components": [
     "DashboardHome",
     "ProjectDashboard",

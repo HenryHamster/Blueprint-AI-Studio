@@ -20,6 +20,11 @@ export default defineConfig({
     include: ['src/**/*.viewport.test.{ts,tsx}'],
     css: true,
     setupFiles: ['./src/test/viewport-setup.ts'],
+    // JSON reporter writes a structured failure manifest so the regression
+    // dispatcher can correlate failed test names → screenshot paths in
+    // test-results/ and upload them to the backend for operator review.
+    reporters: ['default', 'json'],
+    outputFile: { json: './test-results/viewport-failures.json' },
     browser: {
       enabled: true,
       headless: true,

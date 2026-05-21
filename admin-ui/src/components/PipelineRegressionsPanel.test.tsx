@@ -236,6 +236,37 @@ describe('AutoRecoveredPanel — layer badges', () => {
 const escalationResponse = (byReason: Record<string, unknown>): Response =>
   ({ ok: true, status: 200, json: async () => ({ by_reason: byReason, lookback_days: 30 }) }) as Response;
 
+describe('ManualInterventionPanel — viewport failure screenshot disclosure', () => {
+  const viewportCase = {
+    ...baseCase,
+    regression_class: 'viewport_regression:MessagesPanel@375',
+  };
+
+  it('shows failure image alongside baseline when failure_screenshot_url is set', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([{
+      ...viewportCase,
+      failure_screenshot_url: '/uploads/viewport-failures/MessagesPanel-375px-abc.png',
+    }]));
+    render(<ManualInterventionPanel projectId="proj-1" />);
+    await screen.findByText('viewport regression');
+    const toggle = screen.getByRole('button', { name: /images/ });
+    fireEvent.click(toggle);
+    expect(screen.getByAltText('MessagesPanel baseline at 375px')).toBeInTheDocument();
+    expect(screen.getByAltText('MessagesPanel failure at 375px')).toBeInTheDocument();
+    expect(screen.getByText('Latest failure')).toBeInTheDocument();
+  });
+
+  it('shows only baseline when failure_screenshot_url is null', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([{ ...viewportCase, failure_screenshot_url: null }]));
+    render(<ManualInterventionPanel projectId="proj-1" />);
+    await screen.findByText('viewport regression');
+    const toggle = screen.getByRole('button', { name: /images/ });
+    fireEvent.click(toggle);
+    expect(screen.getByAltText('MessagesPanel baseline at 375px')).toBeInTheDocument();
+    expect(screen.queryByText('Latest failure')).toBeNull();
+  });
+});
+
 describe('EscalationOutcomePanel — compliance_followup bucket', () => {
   it('renders both cross-layer baseline and compliance_followup rows as separate entries', async () => {
     apiFetchMock.mockResolvedValueOnce(escalationResponse({
@@ -261,5 +292,46 @@ describe('EscalationOutcomePanel — compliance_followup bucket', () => {
     // baseline durable_resolution_rate = 50%; followup = 100%
     expect(screen.getByText('50%')).toBeInTheDocument();
     expect(screen.getByText('100%')).toBeInTheDocument();
+  });
+});
+
+describe('ManualInterventionPanel — viewport baseline disclosure', () => {
+  it('renders correct baseline image URL for new-format viewport regression (Component:assertion_type@Width)', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([
+      {
+        ...baseCase,
+        id: 'vp-1',
+        regression_class: 'viewport_regression:MessagesPanel:overflow@375',
+        signal_name: 'viewport overflow',
+      },
+    ]));
+    render(<ManualInterventionPanel projectId="proj-1" />);
+    await waitFor(() => expect(screen.getByText('viewport overflow')).toBeInTheDocument());
+    // Click images disclosure button
+    const button = screen.getAllByRole('button', { name: /images/ })[0];
+    fireEvent.click(button);
+    // Verify that the image URL does NOT include the assertion_type in the filename
+    const img = screen.getByAltText(/MessagesPanel baseline at 375px/) as HTMLImageElement;
+    expect(img.src).toContain('/viewport-baselines/MessagesPanel-375px.png');
+    expect(img.src).not.toContain('overflow');
+  });
+
+  it('renders correct baseline image URL for legacy-format viewport regression (Component@Width)', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([
+      {
+        ...baseCase,
+        id: 'vp-2',
+        regression_class: 'viewport_regression:TaskCard@768',
+        signal_name: 'viewport legacy',
+      },
+    ]));
+    render(<ManualInterventionPanel projectId="proj-1" />);
+    await waitFor(() => expect(screen.getByText('viewport legacy')).toBeInTheDocument());
+    // Click images disclosure button
+    const button = screen.getAllByRole('button', { name: /images/ })[0];
+    fireEvent.click(button);
+    // Verify that the image URL is correct for legacy format
+    const img = screen.getByAltText(/TaskCard baseline at 768px/) as HTMLImageElement;
+    expect(img.src).toContain('/viewport-baselines/TaskCard-768px.png');
   });
 });

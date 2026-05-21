@@ -14850,6 +14850,97 @@ async def test_viewport_debt_coverage_summary_counts_full_set(
     assert len(cs["untested_components"]) == 50
 
 
+@pytest.mark.asyncio
+async def test_viewport_debt_counts_assertion_type_regressions(
+    client: AsyncClient, db_session
+):
+    """GET /viewport-debt counts regressions with new assertion_type format."""
+    from unittest.mock import patch
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    membership = make_membership(project.id, user_id="test-user-123", role="owner")
+    db_session.add(membership)
+    await db_session.commit()
+
+    fake_rows = [
+        {
+            "component": "admin-ui/src/components/TaskCard.tsx",
+            "eslint_disable_count": 1,
+            "data_viewport_allow_small_target": 0,
+            "data_viewport_allow_overflow": 0,
+            "data_viewport_allow_truncation": 0,
+            "total_opt_outs": 5,
+            "has_viewport_test": True,
+            "regression_case_count": 0,
+            "source_url": None,
+        },
+        {
+            "component": "admin-ui/src/components/MessagesPanel.tsx",
+            "eslint_disable_count": 1,
+            "data_viewport_allow_small_target": 0,
+            "data_viewport_allow_overflow": 0,
+            "data_viewport_allow_truncation": 0,
+            "total_opt_outs": 3,
+            "has_viewport_test": True,
+            "regression_case_count": 0,
+            "source_url": None,
+        },
+    ]
+
+    with patch(
+        "app.routers.admin_digest._scan_viewport_debt_rows",
+        return_value=(
+            fake_rows,
+            [],
+            {"total_components": 2, "untested_count": 0, "untested_components": []},
+        ),
+    ):
+        # Create regression cases in both old and new format
+        case1 = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:TaskCard.tsx@375",  # old format
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=_utcnow(),
+        )
+        case2 = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:TaskCard:text_truncation@375",  # new format
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=_utcnow(),
+        )
+        case3 = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:MessagesPanel:overflow@768",  # new format, different width
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=_utcnow(),
+        )
+        db_session.add(case1)
+        db_session.add(case2)
+        db_session.add(case3)
+        await db_session.commit()
+
+        response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+    assert response.status_code == 200
+    body = response.json()
+    rows = body["rows"]
+
+    # Find TaskCard and MessagesPanel rows
+    task_card_row = next((r for r in rows if "TaskCard" in r["component"]), None)
+    messages_panel_row = next(
+        (r for r in rows if "MessagesPanel" in r["component"]), None
+    )
+
+    assert task_card_row is not None, "TaskCard row not found"
+    assert task_card_row["regression_case_count"] == 2  # old format + new format
+
+    assert messages_panel_row is not None, "MessagesPanel row not found"
+    assert messages_panel_row["regression_case_count"] == 1  # new format
+
+
 # ---------------------------------------------------------------------------
 # Acknowledge endpoint
 # ---------------------------------------------------------------------------
