@@ -4138,6 +4138,82 @@ async def test_compute_sr_catch_rate_trends_returns_none_below_sample_size(
 
 
 @pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_stamps_heartbeat_on_low_sample(
+    db_session: AsyncSession,
+):
+    """Even when returning None (below _MIN_SR_FINDINGS), stamps signal_last_computed_at."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for i in range(4):  # 4 findings per window — below _MIN_SR_FINDINGS=5
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(4):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is None
+    stored = (project.design_doc or {}).get("sr_catch_rate_trends", {})
+    assert "signal_last_computed_at" in stored, (
+        "heartbeat must be stamped even when returning None (idle/low-data state)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_stamps_heartbeat_on_success(
+    db_session: AsyncSession,
+):
+    """Stamps signal_last_computed_at in design_doc when computation produces a result."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(5):  # 5 findings per window — meets _MIN_SR_FINDINGS=5
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    stored = (project.design_doc or {}).get("sr_catch_rate_trends", {})
+    assert "signal_last_computed_at" in stored, (
+        "heartbeat must be stamped on every successful invocation"
+    )
+
+
+@pytest.mark.asyncio
 async def test_compute_sr_catch_rate_trends_exposes_finding_counts(
     db_session: AsyncSession,
 ):
@@ -4729,6 +4805,135 @@ async def test_compute_sr_catch_rate_trends_rate_history_grows(
     # 4 existing + 1 new = 5 (capped at 5)
     assert len(history) == 5
     assert history[-1] == round(3 / 5, 3)
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_calendar_to_cycle_resets_history(
+    db_session: AsyncSession,
+):
+    """Transitioning from calendar mode to cycle mode resets rate_history.
+
+    When prior data was produced in calendar mode and this run uses cycle mode,
+    the stored history is incomparable — the function must not concatenate them.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _make_project(db_session)
+    # Pre-seed calendar-mode history with two prior entries.
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": (_utcnow() - timedelta(days=15)).isoformat(),
+            "bucket_mode": "calendar",
+            "categories": {
+                "test-coverage": {"rate_history": [0.9, 0.85]},
+            },
+        }
+    }
+    flag_modified(project, "design_doc")
+    await db_session.flush()
+
+    # Create two completed cycles so cycle mode is selected.
+    c_cycle = _make_cycle(project.id, age_days=2)
+    p_cycle = _make_cycle(project.id, age_days=20)
+    db_session.add(c_cycle)
+    db_session.add(p_cycle)
+    await db_session.flush()
+
+    tasks = []
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=1,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        t.strategic_cycle_id = c_cycle.id
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=19,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        t.strategic_cycle_id = p_cycle.id
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result["bucket_mode"] == "cycle"
+    history = result["categories"]["test-coverage"]["rate_history"]
+    # Old calendar entries must be discarded — only the fresh cycle measurement.
+    assert len(history) == 1, f"expected 1 entry after mode transition, got {history}"
+    assert 0.9 not in history
+    assert 0.85 not in history
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_cycle_to_calendar_resets_history(
+    db_session: AsyncSession,
+):
+    """Transitioning from cycle mode to calendar mode resets rate_history.
+
+    When prior data was produced in cycle mode and this run falls back to
+    calendar windows (no completed cycles with enough tasks), history must
+    not carry over incomparable cycle-span rates.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _make_project(db_session)
+    fake_cycle_id = "old-cycle-abc123"
+    # Pre-seed cycle-mode history.
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": (_utcnow() - timedelta(days=15)).isoformat(),
+            "bucket_mode": "cycle",
+            "current_cycle_id": fake_cycle_id,
+            "categories": {
+                "test-coverage": {"rate_history": [0.7, 0.65]},
+            },
+        }
+    }
+    flag_modified(project, "design_doc")
+    await db_session.flush()
+
+    # No completed cycles — forces calendar fallback.
+    tasks = []
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result["bucket_mode"] == "calendar"
+    history = result["categories"]["test-coverage"]["rate_history"]
+    # Old cycle entries must be discarded — only the fresh calendar measurement.
+    assert len(history) == 1, f"expected 1 entry after mode transition, got {history}"
+    assert 0.7 not in history
+    assert 0.65 not in history
 
 
 @pytest.mark.asyncio

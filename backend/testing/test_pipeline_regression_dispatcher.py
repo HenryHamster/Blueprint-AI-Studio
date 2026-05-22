@@ -7922,6 +7922,112 @@ async def test_telemetry_stale_recovery_closes_when_signal_refreshed(db_session)
     assert case.status == RegressionCaseStatus.CLOSED
 
 
+@pytest.mark.asyncio
+async def test_telemetry_stale_no_spawn_when_heartbeat_fresh_but_no_categories(
+    db_session,
+):
+    """Fresh signal_last_computed_at with no categories (low-sample/idle state) does not spawn.
+
+    This is the key idle-vs-broken distinction: the heartbeat ran recently but review
+    volume was below the minimum sample threshold so no result was produced.  The
+    watchdog must treat this as a healthy idle state, not a broken signal.
+    """
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    fresh_ts = (now - timedelta(hours=12)).isoformat()
+    project = make_project(
+        design_doc={
+            # Heartbeat is fresh; no categories key — simulates low-sample early return.
+            "sr_catch_rate_trends": {"signal_last_computed_at": fresh_ts},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await run_once(db_session, project.id)
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    stale_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class") == "telemetry_stale:sr_catch_rate"
+    ]
+    assert len(stale_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_telemetry_stale_no_spawn_when_heartbeat_key_absent(db_session):
+    """No signal_last_computed_at key at all → no staleness investigation spawned.
+
+    If the heartbeat has never been written (e.g. the project is brand-new or
+    the metric was just added), the watchdog should not treat the absence as a
+    stale signal and must not spawn an investigate task.
+    """
+    project = make_project(
+        design_doc={
+            # design_doc has sr_catch_rate_trends but no signal_last_computed_at.
+            "sr_catch_rate_trends": {"categories": {}},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await run_once(db_session, project.id)
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    stale_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class") == "telemetry_stale:sr_catch_rate"
+    ]
+    assert len(stale_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_telemetry_stale_computed_at_alone_does_not_trigger(db_session):
+    """Stale computed_at with no signal_last_computed_at does not spawn an investigation.
+
+    The old dispatcher used computed_at as a fallback for sr_catch_rate staleness.
+    After the heartbeat fix, signal_last_computed_at is the sole staleness key;
+    a stale computed_at without a heartbeat must not trigger the watchdog.
+    """
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    stale_ts = (now - timedelta(hours=60)).isoformat()
+    project = make_project(
+        design_doc={
+            # Only computed_at present (the old result-stamp key), no heartbeat key.
+            "sr_catch_rate_trends": {"computed_at": stale_ts},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await run_once(db_session, project.id)
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    stale_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class") == "telemetry_stale:sr_catch_rate"
+    ]
+    assert len(stale_tasks) == 0
+
+
 # ---------------------------------------------------------------------------
 # Layer-defense ledger tests
 # ---------------------------------------------------------------------------

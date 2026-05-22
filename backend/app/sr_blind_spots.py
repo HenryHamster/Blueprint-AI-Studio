@@ -122,6 +122,23 @@ def stamp_sr_blind_spot_computed_at(
     doc["sr_blind_spot_signal_last_computed_at"] = ts
 
 
+def stamp_sr_catch_rate_computed_at(
+    doc: dict,
+    now: datetime | None = None,
+) -> None:
+    """Write the current UTC timestamp into *doc* under the sr_catch_rate_trends
+    heartbeat key consumed by the pipeline staleness watchdog.
+
+    Mirrors stamp_sr_blind_spot_computed_at — call on every invocation of
+    compute_sr_catch_rate_trends, success or no-result alike, so the watchdog
+    can distinguish idle/low-data from genuinely broken.  Pass *now* in tests
+    to fix the clock.
+    """
+    trends = dict(doc.get("sr_catch_rate_trends") or {})
+    trends["signal_last_computed_at"] = (now or datetime.utcnow()).isoformat()
+    doc["sr_catch_rate_trends"] = trends
+
+
 def is_skipped_sr_outcome(sro: Dict[str, Any] | None) -> bool:
     """A self-review outcome is a 'skip' when the agent emitted the
     bash ./done fallback envelope: verdict=='unknown' with empty

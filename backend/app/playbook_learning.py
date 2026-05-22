@@ -3893,6 +3893,18 @@ async def compute_sr_catch_rate_trends(
         current_finding_count < _MIN_SR_FINDINGS
         or previous_finding_count < _MIN_SR_FINDINGS
     ):
+        # Stamp a heartbeat so the staleness watchdog knows the job ran but had
+        # insufficient reviewer-rejection findings (low-data / idle state), not
+        # that the computation broke.  Mirrors sr_blind_spots heartbeat pattern.
+        _project = await session.get(Project, project_id)
+        if _project is not None:
+            _doc = dict(_project.design_doc or {})
+            _trends = dict(_doc.get("sr_catch_rate_trends") or {})
+            _trends["signal_last_computed_at"] = now.isoformat()
+            _doc["sr_catch_rate_trends"] = _trends
+            _project.design_doc = _doc
+            flag_modified(_project, "design_doc")
+            session.add(_project)
         return None
 
     all_cats = (
@@ -4109,10 +4121,22 @@ async def compute_sr_catch_rate_trends(
         except (ValueError, TypeError):
             pass
 
+    # Detect bucket-mode transition (cycle ↔ calendar). Rate history entries
+    # computed in one mode are not comparable to those from the other (cycle
+    # buckets span multi-week strategic cycles; calendar buckets are fixed
+    # 14-day windows), so history is reset on transition to avoid mixing them.
+    current_bucket_mode = "cycle" if use_cycle_mode else "calendar"
+    mode_changed = (
+        existing.get("bucket_mode") is not None
+        and existing.get("bucket_mode") != current_bucket_mode
+    )
+
     existing_cats: dict = dict(existing.get("categories") or {})
     for cat, data in categories.items():
         prev_cat: dict = dict(existing_cats.get(cat) or {})
         rate_history: list = list(prev_cat.get("rate_history") or [])
+        if mode_changed:
+            rate_history = []
         if (is_new_window or not rate_history) and data["current_hit_rate"] is not None:
             rate_history.append(data["current_hit_rate"])
             rate_history = rate_history[-5:]
@@ -4344,6 +4368,8 @@ async def compute_sr_catch_rate_trends(
                 (existing_by_scope.get(scope) or {}).get(cat) or {}
             )
             scope_rate_history: list = list(prev_scope_entry.get("rate_history") or [])
+            if mode_changed:
+                scope_rate_history = []
             if is_new_window or not scope_rate_history:
                 scope_rate_history.append(hit_rate)
                 scope_rate_history = scope_rate_history[-5:]
@@ -4491,7 +4517,9 @@ async def compute_sr_catch_rate_trends(
     }
     by_direction = compute_sr_catch_rate_by_direction(
         all_tasks,
-        existing_by_direction=existing.get("by_direction") or {},
+        existing_by_direction={}
+        if mode_changed
+        else (existing.get("by_direction") or {}),
         is_new_window=is_new_window,
         direction_text_map=_dir_text_map or None,
     )

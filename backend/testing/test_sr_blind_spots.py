@@ -14,6 +14,7 @@ from app.sr_blind_spots import (
     count_reviewer_disagreements_in_tasks,
     filter_disallowed_blind_spots,
     is_disallowed_blind_spot,
+    stamp_sr_catch_rate_computed_at,
     triage_sr_blind_spot_theme,
 )
 from testing.factories import make_task
@@ -926,3 +927,35 @@ def test_origin_sub_counters_sum_to_aggregate_miss():
         + bucket["miss_coverage_gap"]
     )
     assert total_sub == bucket["miss"]
+
+
+# ---------------------------------------------------------------------------
+# Unit: stamp_sr_catch_rate_computed_at
+# ---------------------------------------------------------------------------
+
+
+def test_stamp_sr_catch_rate_computed_at_writes_heartbeat():
+    """Heartbeat is written into sr_catch_rate_trends.signal_last_computed_at."""
+    fixed = datetime(2026, 1, 15, 12, 0, 0)
+    doc: dict = {}
+    stamp_sr_catch_rate_computed_at(doc, now=fixed)
+    assert doc["sr_catch_rate_trends"]["signal_last_computed_at"] == fixed.isoformat()
+
+
+def test_stamp_sr_catch_rate_computed_at_preserves_existing_keys():
+    """Existing keys in sr_catch_rate_trends are not clobbered."""
+    fixed = datetime(2026, 1, 15, 12, 0, 0)
+    doc: dict = {"sr_catch_rate_trends": {"computed_at": "old", "some_key": 42}}
+    stamp_sr_catch_rate_computed_at(doc, now=fixed)
+    assert doc["sr_catch_rate_trends"]["some_key"] == 42
+    assert doc["sr_catch_rate_trends"]["signal_last_computed_at"] == fixed.isoformat()
+
+
+def test_stamp_sr_catch_rate_computed_at_initialises_missing_trends():
+    """Works when sr_catch_rate_trends key is absent from doc."""
+    fixed = datetime(2026, 3, 1, 8, 30, 0)
+    doc: dict = {"other_key": "value"}
+    stamp_sr_catch_rate_computed_at(doc, now=fixed)
+    assert "sr_catch_rate_trends" in doc
+    assert doc["sr_catch_rate_trends"]["signal_last_computed_at"] == fixed.isoformat()
+    assert doc["other_key"] == "value"

@@ -333,8 +333,7 @@ async def _run_signal_staleness_watchdog(
     specs: list[tuple[str, Any, timedelta]] = [
         (
             "sr_catch_rate",
-            (doc.get("sr_catch_rate_trends") or {}).get("signal_last_computed_at")
-            or (doc.get("sr_catch_rate_trends") or {}).get("computed_at"),
+            (doc.get("sr_catch_rate_trends") or {}).get("signal_last_computed_at"),
             _SIGNAL_STALENESS_WINDOWS["sr_catch_rate"],
         ),
         (
@@ -6702,9 +6701,7 @@ def _get_staleness_raw_ts(
 ) -> tuple[Any, timedelta]:
     """Return (raw_timestamp_str, freshness_threshold) for a staleness-monitored signal."""
     if signal_name == "sr_catch_rate":
-        raw = (doc.get("sr_catch_rate_trends") or {}).get(
-            "signal_last_computed_at"
-        ) or (doc.get("sr_catch_rate_trends") or {}).get("computed_at")
+        raw = (doc.get("sr_catch_rate_trends") or {}).get("signal_last_computed_at")
     elif signal_name == "fix_loop_divergence":
         raw = doc.get("fix_loop_divergence_signal_last_computed_at") or doc.get(
             "fix_loop_divergence_detected_at"

@@ -2006,3 +2006,53 @@ describe('SrTrendBreakdown finding-count gating (catch-rate true denominator)', 
     expect(screen.getByText(/3 — too small/)).toBeInTheDocument();
   });
 });
+
+describe('SrTrendBreakdown is_stale badge', () => {
+  it('renders stale badge in card variant when is_stale is true', () => {
+    const trends: SrTrendData = {
+      is_stale: true,
+      computed_at: '2026-04-01T00:00:00',
+      categories: {
+        correctness: { miss_rate: 0.3, trend: 'stable' },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.getByTestId('sr-trend-stale-badge')).toBeInTheDocument();
+    expect(screen.getByTestId('sr-trend-stale-badge').textContent).toMatch(/stale/);
+  });
+
+  it('does not render stale badge in card variant when is_stale is false', () => {
+    const trends: SrTrendData = {
+      is_stale: false,
+      computed_at: '2026-05-21T00:00:00',
+      categories: {
+        correctness: { miss_rate: 0.3, trend: 'stable' },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByTestId('sr-trend-stale-badge')).toBeNull();
+  });
+
+  it('does not render stale badge in card variant when is_stale is absent', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: { miss_rate: 0.3, trend: 'stable' },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByTestId('sr-trend-stale-badge')).toBeNull();
+  });
+
+  it('renders stale badge in inline variant when is_stale is true', () => {
+    const trends: SrTrendData = {
+      is_stale: true,
+      computed_at: '2026-04-01T00:00:00',
+      categories: {
+        correctness: { miss_rate: 0.3, trend: 'stable' },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="inline" />);
+    expect(screen.getByTestId('sr-trend-stale-badge')).toBeInTheDocument();
+    expect(screen.getByTestId('sr-trend-stale-badge').textContent).toContain('[stale]');
+  });
+});

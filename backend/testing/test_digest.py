@@ -10488,6 +10488,68 @@ async def test_digest_sr_trends_empty_optional_fields_present(
     assert trends["execution_evidence_miss_rates"] == {}
 
 
+@pytest.mark.asyncio
+async def test_serialize_sr_catch_rate_trends_is_stale(client: AsyncClient, db_session):
+    """is_stale=True when computed_at is >7 days old; False when fresh; True when absent."""
+    # Case 1: stale (8 days old)
+    project = make_project()
+    stale_ts = (datetime.utcnow() - timedelta(days=8)).isoformat()
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": stale_ts,
+            "categories": {"correctness": {"miss_rate": 0.3, "trend": "stable"}},
+            "by_task_type": {},
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    trends = response.json().get("self_review_prediction_accuracy_trends")
+    assert trends is not None
+    assert trends["is_stale"] is True
+
+    # Case 2: fresh (1 day old)
+    project2 = make_project()
+    fresh_ts = (datetime.utcnow() - timedelta(days=1)).isoformat()
+    project2.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": fresh_ts,
+            "categories": {"correctness": {"miss_rate": 0.2, "trend": "stable"}},
+            "by_task_type": {},
+        }
+    }
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project2)
+
+    response2 = await client.get(f"/api/admin/digest?project_id={project2.id}")
+    assert response2.status_code == 200
+    trends2 = response2.json().get("self_review_prediction_accuracy_trends")
+    assert trends2 is not None
+    assert trends2["is_stale"] is False
+
+    # Case 3: computed_at absent → stale
+    project3 = make_project()
+    project3.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {"correctness": {"miss_rate": 0.1, "trend": "stable"}},
+            "by_task_type": {},
+        }
+    }
+    db_session.add(project3)
+    await db_session.commit()
+    await db_session.refresh(project3)
+
+    response3 = await client.get(f"/api/admin/digest?project_id={project3.id}")
+    assert response3.status_code == 200
+    trends3 = response3.json().get("self_review_prediction_accuracy_trends")
+    assert trends3 is not None
+    assert trends3["is_stale"] is True
+
+
 # ---------------------------------------------------------------------------
 # Per-direction SR breakdown endpoint
 # ---------------------------------------------------------------------------

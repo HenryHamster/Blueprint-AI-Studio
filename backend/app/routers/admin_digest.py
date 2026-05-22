@@ -298,14 +298,30 @@ def _author_sr_failed_categories(check_results: Dict[str, Any]) -> set[str]:
     }
 
 
+_SR_TREND_STALENESS_DAYS = 7
+
+
 def _serialize_sr_catch_rate_trends(sr_trends: Dict[str, Any]) -> Dict[str, Any]:
+    computed_at_str = sr_trends.get("computed_at")
+    if computed_at_str:
+        try:
+            computed_at_dt = datetime.fromisoformat(computed_at_str)
+            is_stale = computed_at_dt < datetime.utcnow() - timedelta(
+                days=_SR_TREND_STALENESS_DAYS
+            )
+        except (ValueError, TypeError):
+            is_stale = True
+    else:
+        is_stale = True
+
     serialized = {
-        "computed_at": sr_trends.get("computed_at"),
+        "computed_at": computed_at_str,
         "signal_last_computed_at": sr_trends.get("signal_last_computed_at")
-        or sr_trends.get("computed_at"),
+        or computed_at_str,
         "categories": sr_trends.get("categories") or {},
         "by_task_type": sr_trends.get("by_task_type") or {},
         "by_fix_iteration": sr_trends.get("by_fix_iteration") or {},
+        "is_stale": is_stale,
     }
     for key, value in sr_trends.items():
         serialized.setdefault(key, value)

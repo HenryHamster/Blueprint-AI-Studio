@@ -176,6 +176,8 @@ export interface ReviewerHallucinationRate {
 
 export interface SrTrendData {
   computed_at?: string | null;
+  /** True when the stored trend is older than the freshness window (7 days) or was never computed. */
+  is_stale?: boolean | null;
   bucket_mode?: 'cycle' | 'calendar' | null;
   current_cycle_id?: string | null;
   previous_cycle_id?: string | null;
@@ -1558,6 +1560,15 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRate
               version changed
             </span>
           )}
+          {trends?.is_stale && (
+            <span
+              data-testid="sr-trend-stale-badge"
+              className="text-[9px] text-amber-400 font-mono ml-auto"
+              title={`Trend data is stale — last computed ${trends.computed_at ? new Date(trends.computed_at).toLocaleDateString() : 'unknown'}. Numbers may not reflect current production.`}
+            >
+              stale · as of {trends.computed_at ? new Date(trends.computed_at).toLocaleDateString() : '?'}
+            </span>
+          )}
         </div>
         {!srCatchRateTargets || Object.keys(srCatchRateTargets).length === 0 ? (
           <p className="text-[11px] text-neutral-400 hover:text-neutral-200 mb-1">
@@ -1626,6 +1637,15 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRate
 
   return (
     <div data-testid="sr-trend-breakdown" className="flex flex-col gap-0.5 ml-1">
+      {trends?.is_stale && (
+        <span
+          data-testid="sr-trend-stale-badge"
+          className="text-[9px] text-amber-400 font-mono"
+          title={`Trend data is stale — last computed ${trends.computed_at ? new Date(trends.computed_at).toLocaleDateString() : 'unknown'}`}
+        >
+          [stale]
+        </span>
+      )}
       {trends?.by_severity && Object.keys(trends.by_severity).length > 0 && (
         <SeveritySection bySeverity={trends.by_severity} inline />
       )}
