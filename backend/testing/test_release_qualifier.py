@@ -216,6 +216,78 @@ class TestComputeCompositeHardBlockers:
         }
 
 
+class TestComputeCompositeCiState:
+    """ci_state parameter distinguishes confirmed red build from unresolved CI."""
+
+    def test_ci_unresolved_when_state_pending(self):
+        """not ci_green + ci_state='pending' → ci_unresolved (not ci_not_green)."""
+        result = rq.compute_composite(
+            ci_green=False,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            ci_state="pending",
+        )
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+        assert result["blocker"] == "ci_unresolved"
+
+    def test_ci_unresolved_when_state_no_checks(self):
+        """not ci_green + ci_state='no_checks' → ci_unresolved."""
+        result = rq.compute_composite(
+            ci_green=False,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            ci_state="no_checks",
+        )
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+        assert result["blocker"] == "ci_unresolved"
+
+    def test_ci_not_green_only_when_state_red(self):
+        """not ci_green + ci_state='red' (default) → ci_not_green (real red build)."""
+        result = rq.compute_composite(
+            ci_green=False,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            ci_state="red",
+        )
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+        assert result["blocker"] == "ci_not_green"
+
+    def test_ci_state_default_preserves_existing_ci_not_green_behavior(self):
+        """ci_state defaults to 'red' so existing call sites are unaffected."""
+        result = rq.compute_composite(
+            ci_green=False,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+        )
+        assert result["blocker"] == "ci_not_green"
+
+    def test_ci_green_true_ignores_ci_state(self):
+        """When ci_green is True, ci_state is irrelevant — no blocker fires."""
+        for state in ("green", "red", "pending", "no_checks"):
+            result = rq.compute_composite(
+                ci_green=True,
+                audit_score=1.0,
+                test_erosion=1.0,
+                smoketest_score=1.0,
+                policy=_POLICY,
+                ci_state=state,
+            )
+            assert result["blocker"] is None, (
+                f"unexpected blocker for ci_state={state!r}"
+            )
+
+
 class TestComputeCompositeWeightedSum:
     """When no blocker fires, confidence is the policy-weighted sum."""
 
@@ -2533,10 +2605,11 @@ async def test_finalize_project_not_found_breaks_pending_loop(db_session, mocker
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    # _resolve_ci_at_finalize degrades to not-green when the project is gone,
-    # so the composite hard-blocks on ci_not_green — not promotion_failed.
+    # _resolve_ci_at_finalize degrades to not-green + state=_CI_PENDING when the
+    # project is gone, so the composite hard-blocks on ci_unresolved (not
+    # ci_not_green — the build was never evaluated, CI merely could not be read).
     assert result["status"] == "not_promoted"
-    assert result["blocker"] == "ci_not_green"
+    assert result["blocker"] == "ci_unresolved"
 
     await db_session.refresh(version)
     # The pending loop is broken — status is terminal.
@@ -6566,6 +6639,74 @@ async def test_sweep_triggers_calcification_check(db_session):
     )
     assert len(alerts) == 1
     assert "calcifying" in alerts[0].title
+
+
+# ===========================================================================
+# ci_unresolved blocker — calcification + readiness guards
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_calcification_skips_ci_unresolved_blocker(db_session):
+    """ci_unresolved must NOT trigger the quality calcification alert — it is an
+    infrastructure / resolution concern, not a quality regression."""
+    from app.models import Alert as _Alert
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.qualification_attempts = rq._MIN_CALCIFICATION_ATTEMPTS
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_unresolved",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    fired = await rq._check_version_calcification(db_session, version)
+    await db_session.commit()
+
+    assert fired is False
+    alerts = (
+        (
+            await db_session.execute(
+                select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_readiness_excludes_ci_unresolved_from_recurring_blockers(db_session):
+    """A window full of ci_unresolved verdicts must NOT produce a recurring-blocker
+    block in the promotion-readiness summary."""
+    project, _version = await _make_project_and_version(db_session)
+
+    # Seed enough ci_unresolved verdicts to exceed the recurring-blocker threshold
+    # if they were counted.
+    for _ in range(rq._READINESS_RECURRING_BLOCKER_MIN + 1):
+        db_session.add(
+            QualificationVerdict(
+                project_id=project.id,
+                release_version_id=_version.id,
+                candidate_sha="abc1234",
+                confidence=0.0,
+                sub_scores={},
+                blocker="ci_unresolved",
+                would_promote=False,
+                promotion_enabled=False,
+                terminal_status="not_promoted",
+                threshold=0.9,
+            )
+        )
+    await db_session.commit()
+
+    result = await rq.compute_promotion_readiness(db_session, project.id)
+
+    # ci_unresolved must not appear in blocker_counts or recurring_blockers.
+    assert "ci_unresolved" not in result["blocker_counts"]
+    assert "ci_unresolved" not in result["recurring_blockers"]
 
 
 # ===========================================================================
