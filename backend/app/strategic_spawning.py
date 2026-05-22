@@ -793,6 +793,7 @@ async def _build_recent_interventions(
         t.parent_task_id for t in merged_tasks if t.parent_task_id is not None
     }
     _parent_pr_merged: dict[uuid.UUID, bool] = {}
+    _parent_rollup_pr: dict[uuid.UUID, int | str | None] = {}
     if _all_parent_ids:
         _parents_result = await session.execute(
             select(Task)
@@ -800,9 +801,111 @@ async def _build_recent_interventions(
             .options(load_only(Task.id, Task.context, Task.status_log))
         )
         for _p in _parents_result.scalars().all():
-            _parent_pr_merged[_p.id] = bool((_p.context or {}).get("pr_merged", False))
+            _p_ctx = _p.context or {}
+            _parent_pr_merged[_p.id] = bool(_p_ctx.get("pr_merged", False))
+            _parent_rollup_pr[_p.id] = _p_ctx.get("rollup_pr_number") or _p_ctx.get(
+                "pr_number"
+            )
+
+    # GitHub-ancestry verification for the on_automain signal.
+    # The pr_merged flag is set when a PR is observed merged, but does NOT
+    # confirm the commit is reachable from the integration branch (e.g. the
+    # PR may have landed on a rollup staging branch that itself never merged).
+    # We attempt a best-effort ancestry check using the existing github
+    # primitives; if credentials are unavailable or an API call fails, we
+    # fall back to the flag heuristic so a GitHub outage cannot break the feed.
+    _gh_token_ss: str | None = None
+    _gh_owner_ss: str | None = None
+    _gh_repo_ss: str | None = None
+    _integration_branch_ss = _runtime_config.get("integration_branch", "main")
+    _automain_verified: dict[uuid.UUID, bool] = {}
+
+    try:
+        from app import github as _github_ss
+        from app.release_qualifier import _resolve_github_with_session as _resolve_gh
+
+        _gh_creds = await _resolve_gh(session, project)
+        if _gh_creds:
+            _gh_token_ss, _gh_owner_ss, _gh_repo_ss = _gh_creds
+    except Exception as _exc_ss:  # noqa: BLE001 — credential failure → flag fallback
+        logger.debug("[STRATEGIC] GitHub credential resolution skipped: %s", _exc_ss)
+
+    if _gh_token_ss and _gh_owner_ss and _gh_repo_ss:
+        # Collect the bounded set of tasks that will actually appear in the feed:
+        # top-limit merges_out entries + tasks merged since the last strategic
+        # cycle (the per_direction_delta recent window).
+        _recent_cutoff_verify = _strategic_cutoff or _24h_ago
+        _to_verify_ids: set[uuid.UUID] = {t.id for t in merged_tasks[:limit]}
+        for _t_v in merged_tasks:
+            _ts_v = _t_v.updated_at or _t_v.created_at
+            if _ts_v and _ts_v >= _recent_cutoff_verify:
+                _to_verify_ids.add(_t_v.id)
+        _to_verify = [t for t in merged_tasks if t.id in _to_verify_ids]
+
+        _pr_data_cache: dict[int, dict] = {}
+
+        for _t in _to_verify:
+            _ctx_t = _t.context or {}
+            # Resolve which PR's merge commit to verify for ancestry.
+            # A rollup child task merges into the rollup staging branch, so the
+            # child PR's own merge commit lives on that branch — once the rollup
+            # PR squash-merges, the child commit is NOT an ancestor of the
+            # integration branch. The child is on automain iff the *parent's*
+            # rollup PR landed, so verify that PR instead of the child's own.
+            if _t.parent_task_id is not None:
+                _pr_num_raw = _parent_rollup_pr.get(_t.parent_task_id)
+            else:
+                _pr_num_raw = _ctx_t.get("rollup_pr_number") or _ctx_t.get("pr_number")
+            if not _pr_num_raw:
+                # No PR number available — cannot verify, use flag fallback later
+                continue
+            try:
+                _pr_num = int(_pr_num_raw)
+                if _pr_num not in _pr_data_cache:
+                    _pr_data_cache[_pr_num] = await _github_ss.get_pull_request(
+                        _gh_token_ss,
+                        _gh_owner_ss,
+                        _gh_repo_ss,
+                        _pr_num,
+                        project_id=str(project.id),
+                    )
+                _pr_data = _pr_data_cache[_pr_num]
+                _merge_sha = _pr_data.get("merge_commit_sha")
+                if not _merge_sha:
+                    # PR has no merge SHA (not yet merged or API gap) → not landed
+                    _automain_verified[_t.id] = False
+                    continue
+
+                _is_anc = await _github_ss.is_ancestor_of(
+                    _gh_token_ss,
+                    _gh_owner_ss,
+                    _gh_repo_ss,
+                    _merge_sha,
+                    _integration_branch_ss,
+                    project_id=str(project.id),
+                )
+
+                # is_ancestor_of returns True (merge commit reachable from the
+                # integration branch), False (genuinely not reachable), or None
+                # (compare API indeterminate). Only True confirms the change
+                # landed; False and None are both degrade-safe NOT-landed.
+                _automain_verified[_t.id] = _is_anc is True
+            except Exception as _exc_t:  # noqa: BLE001 — API failure → flag fallback
+                logger.debug(
+                    "[STRATEGIC] ancestry check failed for task %s (pr=%s): %s",
+                    _t.id,
+                    _pr_num_raw,
+                    _exc_t,
+                )
+                # Leave _t.id absent from _automain_verified; flag fallback used below
 
     def _on_automain(task: Task) -> bool:
+        # Prefer the GitHub-verified result when available.
+        if task.id in _automain_verified:
+            return _automain_verified[task.id]
+        # Fallback: flag heuristic (when credentials unavailable or PR has no number).
+        # Root tasks merged directly are assumed on automain; child tasks depend on
+        # whether their rollup parent's PR was merged.
         if task.parent_task_id is None:
             return True
         return _parent_pr_merged.get(task.parent_task_id, False)
