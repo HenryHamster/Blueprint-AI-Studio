@@ -1054,6 +1054,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         .scalars()
         .all()
     )
+    # Build set of finding hashes already memoed to prevent duplicate memo spawns
+    # across research cycles for the same underlying finding.
+    _existing_memo_finding_hashes: set[str] = {
+        h
+        for t in recent_tasks_for_dedup
+        if (h := (t.context or {}).get("memo_source_finding_hash"))
+    }
     # Collect parent IDs for COMPLETED+pr_merged tasks to detect ghost merges
     # (code merged to staging branch but parent rollup PR to main failed)
     potential_ghost_parent_ids = {
@@ -2153,6 +2160,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     ] + [(f, "degradation_gate") for f in _degradation_gate_deferred]
     _research_direction_id = (task.context or {}).get("direction_id")
     for _mf, _drop_reason in _memo_candidates[:MEMO_SPAWN_CAP_PER_CYCLE]:
+        _mf_hash = _mf.get("finding_hash") or _finding_hash(
+            _mf.get("title", ""), _mf.get("description", "") or _mf.get("prompt", "")
+        )
+        if _mf_hash in _existing_memo_finding_hashes:
+            logger.debug(
+                "[RESEARCH] Skipping duplicate memo for finding hash %s (task %s)",
+                _mf_hash,
+                task.id,
+            )
+            continue
         _memo_topic = str(
             _mf.get("title")
             or (_mf.get("description") or "")[:80]
@@ -2180,6 +2197,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "memo_source_task_id": str(task.id),
                 "memo_reasoning_kind": "deferred_finding",
                 "memo_drop_reason": _drop_reason,
+                "memo_source_finding_hash": _mf_hash,
                 **({"direction_id": _memo_dir_id} if _memo_dir_id else {}),
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",

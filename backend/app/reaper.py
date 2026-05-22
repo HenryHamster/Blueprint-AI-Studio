@@ -218,6 +218,8 @@ _PROGRESS_STALE_DEFAULTS = {
 # was reaped after 484s while in the middle of pass-1 thinking — actual
 # attempt completed cleanly in 19 min once given a budget). These types
 # get a flat longer cutoff regardless of nominal scope.
+# Memo (pure-reasoning documentation tasks with no repo) may run 5-10+ min
+# producing a reasoning artifact without any tool calls — not a sign of staleness.
 _THINKING_HEAVY_TASK_TYPES = frozenset(
     {
         "strategic_review",
@@ -225,6 +227,7 @@ _THINKING_HEAVY_TASK_TYPES = frozenset(
         "research",
         "investigate",
         "plan",
+        "memo",
     }
 )
 _THINKING_HEAVY_PROGRESS_STALE_SECONDS = 1500  # 25 min

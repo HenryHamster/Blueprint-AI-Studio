@@ -5860,6 +5860,7 @@ async def _compute_digest(
     self_review_prediction_accuracy_trends: Optional[Dict[str, Any]] = None
     sr_regression_risk_test_signal_trends: Optional[Dict[str, Any]] = None
     memo_pathway_exits: int = 0
+    recent_cycle_memo_stats: list[dict[str, Any]] = []
     if project_id:
         _proj = await session.get(Project, project_id)
         memo_pathway_exits = await _strategic_cycle.count_memo_exits(
@@ -5911,6 +5912,18 @@ async def _compute_digest(
                 limit=20,
             )
             prediction_calibration = _compute_prediction_calibration(_proj, _sc_history)
+            recent_cycle_memo_stats = [
+                {
+                    "cycle_id": c.get("cycle_id"),
+                    "started_at": c.get("started_at"),
+                    CYCLE_META_MEMOS_AVAILABLE: int(
+                        c.get(CYCLE_META_MEMOS_AVAILABLE) or 0
+                    ),
+                    CYCLE_META_MEMOS_CITED: int(c.get(CYCLE_META_MEMOS_CITED) or 0),
+                }
+                for c in _sc_history
+                if c.get("outcome") not in (None, "in_progress")
+            ]
             # Fresh-reviewer cycle-over-cycle trend persisted by compute_fresh_reviewer_trend.
             _fr_trends = (_proj.design_doc or {}).get("fresh_reviewer_trend") or {}
             if _fr_trends:
@@ -6873,6 +6886,7 @@ async def _compute_digest(
         "trend_history": trend_history,
         "latest_cycle": latest_cycle,
         "memo_pathway_exits": memo_pathway_exits,
+        "recent_cycle_memo_stats": recent_cycle_memo_stats,
         "scope_conversion_rates": scope_conversion_rates or None,
         "prev_scope_conversion_rates": prev_scope_conversion_rates or None,
         "pipeline_acceptance_rate": pipeline_acceptance_rate,

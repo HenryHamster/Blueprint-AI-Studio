@@ -291,7 +291,11 @@ interface DigestData {
     directions_retired?: number | null;
     vision_updated?: boolean | null;
     summary_text?: string | null;
+    memos_available?: number | null;
+    memos_cited?: number | null;
   } | null;
+  memo_pathway_exits?: number | null;
+  recent_cycle_memo_stats?: Array<{ cycle_id: string | null; started_at: string | null; memos_available: number; memos_cited: number }> | null;
   remediation_funnel?: {
     investigations_spawned: number;
     investigations_completed: number;
@@ -804,6 +808,11 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                     {digest.latest_cycle.vision_updated && (
                       <span className="text-[10px] text-cyan-400">vision updated</span>
                     )}
+                    {(digest.latest_cycle.memos_available != null || digest.latest_cycle.memos_cited != null) && (
+                      <span className="text-[10px] text-violet-400" title="memos available / cited in this cycle">
+                        {digest.latest_cycle.memos_available ?? 0}m avail, {digest.latest_cycle.memos_cited ?? 0} cited
+                      </span>
+                    )}
                   </div>
                   {digest.latest_cycle.summary_text && (
                     <div className="text-[11px] text-neutral-400 leading-relaxed">
@@ -819,6 +828,28 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                           {cycleSummaryExpanded ? 'less' : 'more'}
                         </button>
                       )}
+                    </div>
+                  )}
+                </div>
+              )}
+              {/* Memo pathway metrics */}
+              {(digest.memo_pathway_exits ?? 0) > 0 && (
+                <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                  <span className="text-[10px] text-neutral-500 uppercase tracking-wide">Memo pathway</span>
+                  <span className="text-[10px] font-semibold text-violet-400 px-1.5 py-0.5 rounded border border-violet-500/30 bg-violet-500/10">
+                    {digest.memo_pathway_exits} exit{digest.memo_pathway_exits !== 1 ? 's' : ''}
+                  </span>
+                  {(digest.recent_cycle_memo_stats ?? []).length > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {(digest.recent_cycle_memo_stats ?? []).slice(0, 5).map((s, i) => (
+                        <span
+                          key={s.cycle_id ?? i}
+                          className="text-[10px] text-neutral-400 px-1.5 py-0.5 rounded border border-neutral-700/50 bg-neutral-800/50"
+                          title={s.started_at ? `cycle ${timeAgo(s.started_at)}` : undefined}
+                        >
+                          {s.memos_cited}/{s.memos_available}
+                        </span>
+                      ))}
                     </div>
                   )}
                 </div>

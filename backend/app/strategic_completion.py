@@ -1556,9 +1556,22 @@ async def _handle_strategic_completion(
                 )
             _cycle_reasoning = _extract_cycle_reasoning(task)
             _memos_available = len(_memo_citations)
-            _memos_cited = strategic_cycle.count_cited_memos(
-                _memo_citations, _cycle_reasoning
-            )
+            # Prefer the structured cited-ID set written by the agent via the
+            # cite_memos API (task.context["_strategic_cited_memo_ids"]).  This is
+            # reliable because the thinker analysis text is scanned at emit-time,
+            # right after the thinker phase, before the status message is set.
+            # Fall back to text-scanning _cycle_reasoning for tasks that predate
+            # the cite_memos API (no key in context).
+            _ctx_cited_ids = (task.context or {}).get("_strategic_cited_memo_ids")
+            if _ctx_cited_ids is not None:
+                _available_ids = {
+                    m.get("task_id") for m in _memo_citations if m.get("task_id")
+                }
+                _memos_cited = len(set(_ctx_cited_ids) & _available_ids)
+            else:
+                _memos_cited = strategic_cycle.count_cited_memos(
+                    _memo_citations, _cycle_reasoning
+                )
             await strategic_cycle.mark_phase2_completed(
                 session,
                 cycle_id,

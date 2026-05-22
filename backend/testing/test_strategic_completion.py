@@ -3733,6 +3733,40 @@ async def test_set_evidence_progress_invalid_status_returns_400(client, db_sessi
 
 
 @pytest.mark.asyncio
+async def test_cite_memos_does_not_set_api_called(client, db_session):
+    """cite_memos persists cited IDs but must NOT flip _strategic_api_called.
+
+    cite_memos is auto-invoked by the thinker pass before the executor runs,
+    so flagging api-usage would mask a no-op/broken executor cycle as a success
+    and suppress the failure circuit-breaker.
+    """
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(db_session, name="CM-HTTP", vm="vm-cm")
+    token = create_agent_token(str(task.id), "vm-cm", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "cite_memos",
+            "data": {"cited_memo_ids": ["memo-1", "memo-2"]},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["op"] == "cite_memos"
+    assert body["count"] == 2
+
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_strategic_cited_memo_ids") == [
+        "memo-1",
+        "memo-2",
+    ]
+    assert (task.context or {}).get("_strategic_api_called") is not True
+
+
+@pytest.mark.asyncio
 async def test_set_evidence_progress_non_list_returns_400(client, db_session):
     """HTTP API: a non-list payload (dict) is rejected with 400."""
     from app.auth import create_agent_token
@@ -5508,7 +5542,8 @@ async def test_memo_available_and_cited_counts_persisted(db_session, mocker):
     """memos_available and memos_cited are computed and stored in cycle_metadata.
 
     memos_available == number of memo tasks returned by query_recent_memo_citations.
-    memos_cited == how many of those task_ids appear in the cycle reasoning text.
+    memos_cited == count of IDs in task.context["_strategic_cited_memo_ids"] that
+    intersect the available memo list (API path — reliable structured output).
     """
     from unittest.mock import AsyncMock
     from app.models import TaskStatus
@@ -5550,9 +5585,11 @@ async def test_memo_available_and_cited_counts_persisted(db_session, mocker):
         context={
             "_strategic_vision_set": True,
             "strategic_cycle_id": cycle.id,
+            # Agent emits cited IDs via the cite_memos API endpoint; the completion
+            # handler reads this key instead of scanning the status message text.
+            "_strategic_cited_memo_ids": [memo_id],
         },
         strategic_cycle_id=cycle.id,
-        plan_output={"reasoning": f"Referenced memo {memo_id} for cache strategy."},
     )
     db_session.add(sr_task)
     await db_session.commit()
@@ -5566,5 +5603,140 @@ async def test_memo_available_and_cited_counts_persisted(db_session, mocker):
         f"memos_available should be 1 (one memo task), got {meta.get('memos_available')}"
     )
     assert meta.get("memos_cited") == 1, (
-        f"memos_cited should be 1 (memo_id appears in reasoning), got {meta.get('memos_cited')}"
+        f"memos_cited should be 1 (memo_id in _strategic_cited_memo_ids), got {meta.get('memos_cited')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_memos_cited_zero_when_no_context_key(db_session, mocker):
+    """memos_cited is 0 when _strategic_cited_memo_ids is absent from context.
+
+    The fallback text-scan path runs but _extract_cycle_reasoning returns the
+    mechanical status message which never contains a memo task id.
+    """
+    from unittest.mock import AsyncMock
+    from app.models import TaskStatus
+    from app.strategic_completion import _handle_strategic_completion
+    from app import strategic_cycle
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="MemoCitedZero",
+        user_id="u-memo-z",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    memo_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "memo", "topic": "Cache analysis"}],
+        status=TaskStatus.COMPLETED,
+        plan_output={"memo": {"summary": "Some reasoning.", "citations": []}},
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(memo_task)
+    await db_session.commit()
+    await db_session.refresh(memo_task)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    sr_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={
+            "_strategic_vision_set": True,
+            "strategic_cycle_id": cycle.id,
+            # No _strategic_cited_memo_ids key — fallback path fires.
+            # latest_status_message is unset so _extract_cycle_reasoning returns "".
+        },
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(sr_task)
+    await db_session.commit()
+    await db_session.refresh(sr_task)
+
+    await _handle_strategic_completion(sr_task, "", db_session)
+
+    await db_session.refresh(cycle)
+    meta = cycle.cycle_metadata or {}
+    assert meta.get("memos_available") == 1, (
+        f"memos_available should be 1, got {meta.get('memos_available')}"
+    )
+    assert meta.get("memos_cited") == 0, (
+        f"memos_cited should be 0 (no _strategic_cited_memo_ids key), got {meta.get('memos_cited')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_memos_cited_filters_to_available_only(db_session, mocker):
+    """memos_cited counts only IDs that appear in both cited and available sets.
+
+    An ID in _strategic_cited_memo_ids that is NOT in memo_citations is excluded.
+    """
+    from unittest.mock import AsyncMock
+    from app.models import TaskStatus
+    from app.strategic_completion import _handle_strategic_completion
+    from app import strategic_cycle
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="MemoFilter",
+        user_id="u-memo-f",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    memo_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "memo", "topic": "Cache analysis"}],
+        status=TaskStatus.COMPLETED,
+        plan_output={"memo": {"summary": "Reasoning.", "citations": []}},
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(memo_task)
+    await db_session.commit()
+    await db_session.refresh(memo_task)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    memo_id = str(memo_task.id)
+    phantom_id = "00000000-0000-0000-0000-000000000001"
+    sr_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={
+            "_strategic_vision_set": True,
+            "strategic_cycle_id": cycle.id,
+            # memo_id is in the available set; phantom_id is not.
+            "_strategic_cited_memo_ids": [memo_id, phantom_id],
+        },
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(sr_task)
+    await db_session.commit()
+    await db_session.refresh(sr_task)
+
+    await _handle_strategic_completion(sr_task, "", db_session)
+
+    await db_session.refresh(cycle)
+    meta = cycle.cycle_metadata or {}
+    assert meta.get("memos_available") == 1, (
+        f"memos_available should be 1, got {meta.get('memos_available')}"
+    )
+    assert meta.get("memos_cited") == 1, (
+        f"memos_cited should be 1 (only memo_id intersects available set), got {meta.get('memos_cited')}"
     )

@@ -194,6 +194,24 @@ def test_progress_stale_cutoff_research_design_doc_investigate_plan_thinking_hea
         )
 
 
+def test_progress_stale_cutoff_memo_uses_thinking_heavy_budget():
+    """Memo (pure-reasoning documentation) tasks use the 1500s thinking-heavy budget.
+
+    Regression: memo tasks are read-only (no repo, no tools) and may spend 5-10+ min
+    producing a reasoning artifact without any tool calls. The short 480s cutoff
+    (small scope) would incorrectly classify a heartbeating memo in mid-reasoning as
+    stalled, causing premature reap. Memo must use thinking-heavy budget.
+    """
+
+    class _T:
+        context = {"scope": "small"}  # noqa: RUF012
+        first_payload = {"type": "memo"}  # noqa: RUF012
+        payloads = [{"type": "memo"}]  # noqa: RUF012
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    assert _progress_stale_cutoff(_T(), now) == now - timedelta(seconds=1500)
+
+
 def test_progress_stale_cutoff_fix_review_create_use_scope_default():
     """Tool-cadence task types (fix, review, create) keep scope-based budgets."""
     now = datetime(2026, 1, 1, 12, 0, 0)
@@ -669,6 +687,49 @@ async def test_in_progress_no_tool_use_codex_provider_not_reaped(
     await reaper_db.refresh(t)
 
     assert t.status == TaskStatus.IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_in_progress_memo_zero_tool_use_heartbeating_not_reaped(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Memo task heartbeating with zero tool calls for 10min must NOT be reaped.
+
+    Memo tasks are pure-reasoning read-only tasks (no repo, no tools). They
+    legitimately spend 5-10+ minutes producing reasoning artifacts without
+    any tool calls. The progress-stale watchdog would incorrectly classify this
+    as stalled if memo used the small-scope 480s cutoff (8 min). Memo uses the
+    thinking-heavy 1500s (25 min) cutoff instead.
+
+    Regression: pre-fix, memo tasks were reaped mid-think because they were not
+    in the thinking-heavy task types, causing premature termination of legitimate
+    reasoning work.
+    """
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "memo", "topic": "analyze architecture"}],
+        vm_instance_id="vm-memo-reasoning",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        # Started 10 minutes ago — would be stale under 480s cutoff but not 1500s
+        started_at=datetime.utcnow() - timedelta(minutes=10),
+        # Heartbeat fresh — agent is alive and thinking
+        last_heartbeat=datetime.utcnow() - timedelta(seconds=30),
+        # No tool calls — memo is pure reasoning, no tools needed
+        last_tool_use_at=None,
+        context={"scope": "small", "llm_provider": "anthropic"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.IN_PROGRESS, (
+        "Memo task heartbeating for 10min with zero tools must not be reaped "
+        "(uses 1500s thinking-heavy cutoff, not 480s small-scope cutoff)"
+    )
 
 
 @pytest.mark.asyncio

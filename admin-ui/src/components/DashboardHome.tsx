@@ -110,6 +110,8 @@ interface LatestCycle {
   directions_retired: number;
   vision_updated: boolean;
   summary_text?: string | null;
+  memos_available?: number | null;
+  memos_cited?: number | null;
 }
 
 interface DigestData {
@@ -304,6 +306,8 @@ interface DigestData {
     top_notes: { snippet: string; count: number }[];
   } | null;
   tasks_truncated?: boolean;
+  memo_pathway_exits?: number | null;
+  recent_cycle_memo_stats?: Array<{ cycle_id: string | null; started_at: string | null; memos_available: number; memos_cited: number }> | null;
 }
 
 interface SrFixIterationBucket { hit_rate?: number | null; miss_rate?: number | null; sample_count?: number | null; }
@@ -2462,6 +2466,8 @@ function AnomalyThrottleBanner({ digest }: { digest: DigestData | null }) {
 
 function SystemStatusCard({ digest, loading }: { digest: DigestData | null; loading: boolean }) {
   const cycle = digest?.latest_cycle ?? null;
+  const memoExits = digest?.memo_pathway_exits ?? 0;
+  const recentCycleMemoStats = digest?.recent_cycle_memo_stats ?? [];
   const hasContent = digest?.narrative_summary || cycle;
 
   return (
@@ -2489,11 +2495,39 @@ function SystemStatusCard({ digest, loading }: { digest: DigestData | null; load
                     Last cycle: {timeAgo(cycle.completed_at ?? cycle.started_at)} &mdash;{' '}
                     {cycle.directions_created} created, {cycle.directions_retired} retired
                   </span>
+                  {(cycle.memos_available != null || cycle.memos_cited != null) && (
+                    <span className="text-violet-400" title="memos available / cited in last cycle">
+                      {cycle.memos_available ?? 0} memo{(cycle.memos_available ?? 0) !== 1 ? 's' : ''} avail, {cycle.memos_cited ?? 0} cited
+                    </span>
+                  )}
                 </div>
                 {cycle.summary_text && (
                   <p className="text-[10px] text-neutral-500 mt-1">{cycle.summary_text}</p>
                 )}
               </>
+            )}
+            {memoExits > 0 && (
+              <div className="mt-2 pt-2 border-t border-neutral-800/50">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[10px] text-neutral-500 uppercase tracking-wide">Memo pathway</span>
+                  <span className="text-[10px] font-semibold text-violet-400 px-1.5 py-0.5 rounded border border-violet-500/30 bg-violet-500/10">
+                    {memoExits} exit{memoExits !== 1 ? 's' : ''}
+                  </span>
+                  {recentCycleMemoStats.length > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {recentCycleMemoStats.slice(0, 5).map((s, i) => (
+                        <span
+                          key={s.cycle_id ?? i}
+                          className="text-[10px] text-neutral-400 px-1.5 py-0.5 rounded border border-neutral-700/50 bg-neutral-800/50"
+                          title={s.started_at ? `cycle ${timeAgo(s.started_at)}` : undefined}
+                        >
+                          {s.memos_cited}/{s.memos_available}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
             )}
           </>
         )}

@@ -5835,6 +5835,122 @@ async def test_memo_spawn_capped_per_cycle(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_memo_dedup_same_finding_deferred_twice_spawns_one_memo(
+    db_session, mocker
+):
+    """A finding deferred across two consecutive cycles produces exactly one memo task.
+    The second cycle skips spawning because a memo with the same finding hash already exists."""
+    direction_id = "d-memodedup1"
+    direction = _active_direction(direction_id, "Memo dedup same finding")
+    project = Project(
+        name="Memo Dedup Same",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Cycle 1: finding is deferred (low_actionability) → one memo spawned.
+    task1 = await _make_research_task(project, direction, db_session)
+    _patch_research_externals(mocker)
+    finding = _make_finding("Duplicate finding", direction_id)
+    finding["actionability_grade"] = "LOW"
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, ""),
+    )
+    await _handle_research_completion(task1, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task1.id)
+    )
+    memos_after_cycle1 = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "memo"
+    ]
+    assert len(memos_after_cycle1) == 1, "Cycle 1 must spawn exactly one memo"
+    memo_hash = (memos_after_cycle1[0].context or {}).get("memo_source_finding_hash")
+    assert memo_hash is not None, (
+        "Memo task must record memo_source_finding_hash in context"
+    )
+
+    # Cycle 2: same finding re-deferred → dedup must block a second memo.
+    task2 = await _make_research_task(project, direction, db_session)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding],
+    )
+    await _handle_research_completion(task2, "", db_session)
+
+    result2 = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.type == "memo")
+        if hasattr(Task, "type")
+        else select(Task).where(Task.project_id == project.id)
+    )
+    all_tasks = result2.scalars().all()
+    all_memos = [t for t in all_tasks if t.first_payload.get("type") == "memo"]
+    assert len(all_memos) == 1, (
+        f"Expected exactly 1 memo across both cycles (dedup), got {len(all_memos)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_memo_dedup_two_distinct_findings_spawn_two_memos(db_session, mocker):
+    """Two genuinely different findings deferred in consecutive cycles each spawn their
+    own memo — dedup only blocks re-spawning of the same finding."""
+    direction_id = "d-memodedup2"
+    direction = _active_direction(direction_id, "Memo dedup distinct findings")
+    project = Project(
+        name="Memo Dedup Distinct",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Cycle 1: finding A is deferred → one memo for A.
+    task1 = await _make_research_task(project, direction, db_session)
+    _patch_research_externals(mocker)
+    finding_a = _make_finding("Distinct finding A", direction_id)
+    finding_a["actionability_grade"] = "LOW"
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding_a],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, ""),
+    )
+    await _handle_research_completion(task1, "", db_session)
+
+    # Cycle 2: finding B (different title/description) is deferred → one memo for B.
+    task2 = await _make_research_task(project, direction, db_session)
+    finding_b = _make_finding("Distinct finding B", direction_id)
+    finding_b["actionability_grade"] = "LOW"
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[finding_b],
+    )
+    await _handle_research_completion(task2, "", db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    all_tasks = result.scalars().all()
+    all_memos = [t for t in all_tasks if t.first_payload.get("type") == "memo"]
+    assert len(all_memos) == 2, (
+        f"Expected 2 memos (one per distinct finding), got {len(all_memos)}"
+    )
+    hashes = {(t.context or {}).get("memo_source_finding_hash") for t in all_memos}
+    assert len(hashes) == 2, "Both memos must have distinct finding hashes"
+
+
+@pytest.mark.asyncio
 async def test_health_gate_metadata_findings_bypass_cap(db_session, mocker):
     """Metadata finding types (design_doc_observation, direction_update) bypass the health gate."""
     from app.research_completion import _DEGRADED_SPAWN_CAP

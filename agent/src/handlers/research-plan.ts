@@ -5,7 +5,7 @@ import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, readHandlerOutput,
   persistAndPostStatus, runClaudeCode,
-  getProviderRunner,
+  getProviderRunner, apiPost,
 } from '../index.js';
 import * as indexMod from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
@@ -2419,6 +2419,30 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
     );
     if (!thinkerGateResult.ok) return;
     const analysisText = thinkerGateResult.analysisText;
+
+    // Scan thinker analysis for cited memo IDs and persist them via the API.
+    // The completion handler reads task.context["_strategic_cited_memo_ids"] to
+    // count memos_cited — scanning the analysis text (where memos were shown
+    // to the agent) is reliable; the previous fallback scanned the status message
+    // (a mechanical template) which can never contain a memo task id.
+    const memoCitations = Array.isArray(payload.memo_citations)
+      ? payload.memo_citations as Array<Record<string, unknown>>
+      : [];
+    if (memoCitations.length > 0) {
+      const citedMemoIds = memoCitations
+        .filter(m => typeof m.task_id === 'string' && m.task_id && analysisText.includes(m.task_id))
+        .map(m => m.task_id as string);
+      try {
+        await apiPost('/api/agent/strategic', {
+          task_id: taskId,
+          op: 'cite_memos',
+          data: { cited_memo_ids: citedMemoIds },
+        });
+        sendLog(ws, `[INFO] Memo citations: ${citedMemoIds.length}/${memoCitations.length} cited\n`);
+      } catch (e) {
+        sendLog(ws, `[WARNING] Failed to persist memo citations (non-fatal): ${String(e)}\n`);
+      }
+    }
 
     // ── Pass 2: Executor — translate analysis into API calls ──
     // Short, focused pass. The analysis is done. This just calls the tools.

@@ -3664,6 +3664,42 @@ async def strategic_operation(
             {"status": "ok", "op": "set_evidence_progress", "count": len(cleaned_ep)}
         )
 
+    elif payload.op == "cite_memos":
+        # Store the memo task_ids the thinker cited in its analysis.
+        # The completion handler reads this to count memos_cited reliably —
+        # the previous text-scan approach always returned 0 because it scanned
+        # the status message (a mechanical template) rather than the thinker prose.
+        # data must be {"cited_memo_ids": [<uuid-string>, ...]}.
+        if not isinstance(data, dict) or not isinstance(
+            data.get("cited_memo_ids"), list
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail='cite_memos: data must be {"cited_memo_ids": [...]}',
+            )
+        raw_ids = data["cited_memo_ids"]
+        cited_ids = [
+            str(i).strip()[:64]
+            for i in raw_ids
+            if isinstance(i, str) and str(i).strip()
+        ]
+        ctx = task.context or {}
+        # NOTE: deliberately do NOT set _strategic_api_called here. cite_memos
+        # is auto-invoked by the thinker pass whenever memos exist (before the
+        # executor runs), so flagging api-usage would mask a no-op/broken
+        # executor cycle as a success and suppress the failure circuit-breaker.
+        task.context = {
+            **ctx,
+            "_strategic_cited_memo_ids": cited_ids,
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            f"[STRATEGIC API] Stored {len(cited_ids)} cited memo id(s) for task {task.id}"
+        )
+        return _resp({"status": "ok", "op": "cite_memos", "count": len(cited_ids)})
+
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")
 
