@@ -3746,11 +3746,24 @@ async def _record_promotion_success(
 
     # Open the next version (build phase) — base_sha is the freshly-promoted SHA
     # (the real main HEAD after the merge, not the now-superseded candidate).
+    # goal snapshots the project's current focus (see release_version.open_version).
+    _next_goal: str | None = None
+    try:
+        from app.problem_model import parse_problem_model
+
+        _next_goal = (
+            parse_problem_model(project.problem_model).intent.current_focus or None
+        )
+    except Exception:
+        logger.exception(
+            "[RELEASE_QUALIFIER] could not read current_focus for next version goal"
+        )
     next_version = await release_version.open_version(
         session,
         version.project_id,
         version_number=version.version_number + 1,
         base_sha=effective_sha,
+        goal=_next_goal,
     )
     logger.info(
         "[RELEASE_QUALIFIER] v%d promoted (sha=%s%s); opened v%d",
