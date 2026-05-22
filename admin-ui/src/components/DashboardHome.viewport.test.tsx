@@ -352,6 +352,28 @@ describe('DashboardHome — viewport regression', () => {
     }, { selector: 'button, a[href]' });
   });
 
+  test('phase-control buttons in version lifecycle panel meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DashboardHome
+            tasks={POPULATED_TASKS}
+            selectedProjectId="proj-abc"
+            onViewTask={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    }, { selector: '[data-testid="phase-controls"] button' });
+  });
+
   test('direction portfolio cards with realistic data do not overflow at 375px', async () => {
     vi.mocked(apiFetch).mockImplementationOnce(async (url: string) => {
       if (url.includes('/digest')) {

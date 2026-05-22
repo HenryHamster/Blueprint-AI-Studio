@@ -580,32 +580,29 @@ function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: 
               </div>
             )}
             {projectId && (
-              <div className="flex flex-wrap items-center gap-2 pt-1">
+              <div data-testid="phase-controls" className="flex flex-wrap items-center gap-2 pt-1">
                 {cv.phase === 'build' ? (
-                  // eslint-disable-next-line viewport/min-touch-target
                   <button
                     onClick={() => handleSetPhase('stabilize')}
                     disabled={actionLoading !== null}
-                    className="text-[10px] px-2 py-0.5 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'phase' ? '…' : '→ stabilize'}
                   </button>
                 ) : (
-                  // eslint-disable-next-line viewport/min-touch-target
                   <button
                     onClick={() => handleSetPhase('build')}
                     disabled={actionLoading !== null}
-                    className="text-[10px] px-2 py-0.5 rounded border border-blue-500/40 text-blue-400 hover:bg-blue-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-blue-500/40 text-blue-400 hover:bg-blue-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'phase' ? '…' : '→ build'}
                   </button>
                 )}
                 {cv.phase === 'stabilize' && (
-                  // eslint-disable-next-line viewport/min-touch-target
                   <button
                     onClick={handleQualify}
                     disabled={actionLoading !== null}
-                    className="text-[10px] px-2 py-0.5 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'qualify' ? '…' : 'Run Qualify'}
                   </button>

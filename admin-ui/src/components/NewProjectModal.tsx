@@ -237,7 +237,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
 
         <div className="p-5">
           {/* Step indicators — hidden in setup-guide re-entry mode */}
-          <div className={`flex items-center gap-2 mb-6 ${setupProject ? 'hidden' : ''}`} data-viewport-allow-truncation>
+          <div className={`flex items-center gap-2 mb-6 ${setupProject ? 'hidden' : ''}`}>
             {stepKeys.map((s, i) => {
               const isCompleted = i < currentStepIndex;
               const isCurrent = i === currentStepIndex;
@@ -252,7 +252,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   }`}>
                     {isCompleted ? <CheckCircle className="w-3 h-3" /> : i + 1}
                   </div>
-                  <span className={`text-[11px] transition-colors ${isCurrent ? 'text-neutral-200' : isCompleted ? 'text-neutral-400' : 'text-neutral-600'}`}>
+                  <span className={`text-[11px] transition-colors ${isCurrent ? 'text-neutral-200' : `hidden sm:inline ${isCompleted ? 'text-neutral-400' : 'text-neutral-600'}`}`}>
                     {STEP_LABELS[s]}
                   </span>
                   {i < stepKeys.length - 1 && <span className="text-neutral-700 text-xs mx-1">›</span>}
