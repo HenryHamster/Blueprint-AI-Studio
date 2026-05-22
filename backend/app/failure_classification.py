@@ -174,8 +174,33 @@ _VIEWPORT_PATTERNS: tuple[str, ...] = (
 # (Chromium missing, Docker fallback unavailable). Must be distinct from
 # _VIEWPORT_PATTERNS so infra shortfalls route to PROVISION_FAILURE rather
 # than VIEWPORT_REGRESSION or CODE_ERROR.
+#
+# Also includes raw Chromium/GTK host-library bootstrap-failure signatures that
+# surface when the agent exhausts in-task retries before the clean sentinel is
+# written. Cross-language contract with:
+#   check-viewport.sh  → BOOTSTRAP_PATTERNS regex
+#   agent/src/index.ts → VIEWPORT_BOOTSTRAP_PATTERNS array
+# Keep all three in sync so the layers agree on what constitutes a bootstrap failure.
 _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS: tuple[str, ...] = (
     "viewport_gate_infra_unavailable",
+    # GTK / Chromium shared-library names — only appear when the host VM is
+    # missing required Linux display/audio libraries for Playwright Chromium.
+    "libatk",
+    "libnss3",
+    "libgbm",
+    "libxkbcommon",
+    "libxcomposite",
+    "libasound",
+    # Generic library-load error (co-occurs with lib names above in practice).
+    "cannot open shared object file",
+    # Playwright-specific error messages.
+    "host system is missing dependencies",
+    "executable doesn't exist at",
+    "missing chromium",
+    "missing browser",
+    # Recurring production failure signature.
+    "playwright chromium install requires sudo",
+    "admin-ui viewport gate is blocked",
 )
 
 
@@ -693,6 +718,8 @@ def normalize_agent_failure_category(raw: str | None, task: "Task") -> str:
             override = _text_provider_failure_override(task, combined)
             if override:
                 return override
+            if any(kw in combined for kw in _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS):
+                return PROVISION_FAILURE
         if mapped == CODE_ERROR and label_lower in _ALL_GENERIC_CODE_ERROR_LABELS:
             if _account_was_rate_limited(task):
                 return RATE_LIMIT
@@ -1514,6 +1541,8 @@ def _classify_failure_class(
                     override = _text_provider_failure_override(task, combined)
                     if override:
                         return override
+                if any(kw in combined for kw in _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS):
+                    return PROVISION_FAILURE
                 if any(kw in combined for kw in _VIEWPORT_PATTERNS):
                     return VIEWPORT_REGRESSION
                 if (

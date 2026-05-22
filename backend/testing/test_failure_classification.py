@@ -354,6 +354,72 @@ class TestClassifyFailureViewportGateInfra:
         t = _task("expectNoTextTruncationAt(375) failed at DashboardHome")
         assert classify_failure(t) != CODE_ERROR
 
+    def test_raw_libatk_routes_to_provision_failure(self):
+        t = _task(
+            "error while loading shared libraries: libatk-1.0.so.0: cannot open shared object file"
+        )
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_raw_libnss3_routes_to_provision_failure(self):
+        t = _task("libnss3.so => not found when launching Chromium")
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_raw_libgbm_routes_to_provision_failure(self):
+        t = _task(
+            "libgbm.so.1: cannot open shared object file: No such file or directory"
+        )
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_host_system_missing_deps_routes_to_provision_failure(self):
+        t = _task("host system is missing dependencies required by Playwright Chromium")
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_playwright_sudo_routes_to_provision_failure(self):
+        t = _task(
+            "Playwright Chromium install requires sudo and the host library is missing"
+        )
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_admin_ui_gate_blocked_routes_to_provision_failure(self):
+        t = _task("admin-ui viewport gate is blocked in this VM due to missing libs")
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_verbatim_production_message_provision_failure(self):
+        # Verbatim production message that previously landed as CODE_ERROR
+        t = _task(
+            "Retries exhausted (3/3). admin-ui viewport gate is blocked in this VM: "
+            "Playwright Chromium install requires sudo and the host library lib..."
+        )
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_fast_path_code_error_context_overridden_by_bootstrap_patterns(self):
+        # task.context already has failure_category=CODE_ERROR (fast-path) but status
+        # message contains a bootstrap signature — must still return PROVISION_FAILURE.
+        t = _task(
+            "libatk-1.0.so.0: cannot open shared object file",
+            ctx={"failure_category": "claude_code_failed"},
+        )
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_normalize_agent_failure_category_bootstrap_returns_provision_failure(self):
+        t = _task(
+            "Playwright Chromium install requires sudo and the host library libatk is missing",
+        )
+        assert (
+            normalize_agent_failure_category("claude_code_failed", t)
+            == PROVISION_FAILURE
+        )
+
+    def test_bootstrap_not_viewport_regression(self):
+        t = _task(
+            "libgbm.so.1: cannot open shared object file: No such file or directory"
+        )
+        assert classify_failure(t) != VIEWPORT_REGRESSION
+
+    def test_bootstrap_not_code_error(self):
+        t = _task("host system is missing dependencies required for Playwright")
+        assert classify_failure(t) != CODE_ERROR
+
 
 class TestClassifyFailureProvision:
     @pytest.mark.parametrize(
@@ -2175,6 +2241,33 @@ class TestCrossLanguageClassificationContracts:
             "update _VIEWPORT_PATTERNS in failure_classification.py to match "
             "the new function name, or update viewport.ts to keep the same name."
         )
+
+    # ------------------------------------------------------------------
+    # Viewport bootstrap-failure signatures (cross-layer contract)
+    # ------------------------------------------------------------------
+
+    def test_viewport_bootstrap_patterns_in_agent_source(self):
+        """_VIEWPORT_INFRA_UNAVAILABLE_PATTERNS includes the same bootstrap
+        signatures as agent/src/index.ts VIEWPORT_BOOTSTRAP_PATTERNS.
+        If agent renames or removes any of these, the backend classifier would
+        fall back to CODE_ERROR for bootstrap failures it can no longer recognize.
+        """
+        src = self._src(_AGENT_INDEX)
+        for expected in (
+            "libatk",
+            "libgbm",
+            "libxkbcommon",
+            "libxcomposite",
+            "libasound",
+            "cannot open shared object file",
+            "host system is missing dependencies",
+            "executable doesn't exist at",
+        ):
+            assert expected in src, (
+                f"agent/src/index.ts VIEWPORT_BOOTSTRAP_PATTERNS no longer contains {expected!r}; "
+                "update _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS in failure_classification.py "
+                "to match the new pattern, or update the agent to keep the same string."
+            )
 
 
 class TestAccountStateRateLimitCorrelation:
