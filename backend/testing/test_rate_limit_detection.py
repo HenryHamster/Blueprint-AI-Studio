@@ -40,6 +40,7 @@ VERBATIM_POSITIVES = [
     "You've hit your limit · resets 5am (Asia/Seoul)",
     "You've hit your limit · resets 11:30pm (America/Los_Angeles)",
     "You've hit your usage limit - View usage",
+    "You've hit your session limit · resets 7:10am (UTC)",
     "Claude AI usage limit reached, please try again after 2pm",
     "You're out of extra usage · resets 11:30am (Asia/Colombo)",
     "5-hour limit reached - resets 9pm",
