@@ -779,12 +779,11 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
         {!collapsed && (
           <div className="flex flex-wrap items-center gap-1 sm:ml-2">
             {windowLabels.map(({ key, label }) => (
-              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
               <button
                 key={key}
                 onClick={() => setActiveWindow(key)}
                 aria-pressed={activeWindow === key}
-                className={`px-2 py-0.5 rounded-full text-[10px] font-medium transition-colors ${
+                className={`px-2 min-h-[44px] flex items-center rounded-full text-[10px] font-medium transition-colors ${
                   activeWindow === key
                     ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
                     : 'text-neutral-500 hover:text-neutral-300 border border-transparent'
@@ -1298,11 +1297,10 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                     <div className="flex flex-col gap-1.5">
                       {visibleItems.map(item => (
                         <div key={item.task_id} className="flex flex-col gap-1">
-                          {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                           <div
                             role="button"
                             tabIndex={0}
-                            className="flex flex-wrap items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
+                            className="flex flex-wrap items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50 min-h-[44px]"
                             onClick={() => onSelectTask({ id: item.task_id })}
                             onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: item.task_id }); } }}
                           >
@@ -1378,9 +1376,8 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                             )}
                             {/* Dismiss/snooze button */}
                             <div className="relative shrink-0" onClick={e => e.stopPropagation()}>
-                              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                               <button
-                                className="text-neutral-600 hover:text-neutral-400 transition-colors px-1 leading-none text-sm"
+                                className="text-neutral-600 hover:text-neutral-400 transition-colors min-h-[44px] min-w-[44px] flex items-center justify-center leading-none text-sm"
                                 title="Dismiss or snooze"
                                 aria-label="Dismiss or snooze this item"
                                 onClick={() => setOpenDropdown(openDropdown === item.task_id ? null : item.task_id)}
@@ -1466,9 +1463,8 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                                       {formatSnoozeRemaining((entry as { type: 'snooze'; until: number }).until)}
                                     </span>
                                   )}
-                                  {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                                   <button
-                                    className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded border bg-neutral-700/30 text-neutral-400 hover:bg-neutral-700/60 border-neutral-700/40 transition-colors"
+                                    className="shrink-0 text-[9px] font-semibold px-1.5 min-h-[44px] flex items-center rounded border bg-neutral-700/30 text-neutral-400 hover:bg-neutral-700/60 border-neutral-700/40 transition-colors"
                                     aria-label="Restore this item"
                                     onClick={() => restoreItem(item.task_id)}
                                   >
@@ -1500,12 +1496,11 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                   {activeExpanded && (
                     <div className="flex flex-col gap-1.5">
                       {(digest.active_tasks ?? []).map(t => (
-                        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                         <div
                           key={t.task_id}
                           role="button"
                           tabIndex={0}
-                          className="flex flex-wrap items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
+                          className="flex flex-wrap items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50 min-h-[44px]"
                           onClick={() => onSelectTask({ id: t.task_id })}
                           onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: t.task_id }); } }}
                         >
@@ -1599,7 +1594,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                       const isActive = activeTaxonomyFilter === cat;
                       const isDominant = ftd.dominant_category === cat;
                       return (
-                        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                         <button
                           key={cat}
                           type="button"
@@ -1609,7 +1603,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                             setFailuresExpanded(true);
                           }}
                           aria-pressed={isActive}
-                          className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border transition-all ${TAXONOMY_COLORS[cat]} ${isActive ? 'ring-2 ring-white/60' : isDominant ? 'ring-1 ring-amber-300/70 shadow-[0_0_0_1px_rgba(252,211,77,0.35)]' : 'hover:opacity-80'}`}
+                          className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 min-h-[44px] rounded border transition-all ${TAXONOMY_COLORS[cat]} ${isActive ? 'ring-2 ring-white/60' : isDominant ? 'ring-1 ring-amber-300/70 shadow-[0_0_0_1px_rgba(252,211,77,0.35)]' : 'hover:opacity-80'}`}
                           title={`${TAXONOMY_LABELS[cat]}: ${entry.count} (${Math.round(entry.percentage)}%)${cost ? ` · $${cost.toFixed(2)}` : ''}${isDominant ? ' — dominant category' : ''} — click to ${isActive ? 'clear' : 'filter'}`}
                         >
                           {isDominant && <span aria-label="dominant" className="text-amber-300">★</span>}
@@ -1650,7 +1644,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                     const isActive = activeStageFilter === stage;
                     const isDominant = fsd.dominant_stage === stage;
                     return (
-                      // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                       <button
                         key={stage}
                         type="button"
@@ -1660,7 +1653,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                           setFailuresExpanded(true);
                         }}
                         aria-pressed={isActive}
-                        className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border transition-all ${STAGE_COLORS[stage] ?? 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30'} ${isActive ? 'ring-2 ring-white/60' : isDominant ? 'ring-1 ring-amber-300/70 shadow-[0_0_0_1px_rgba(252,211,77,0.35)]' : 'hover:opacity-80'}`}
+                        className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 min-h-[44px] rounded border transition-all ${STAGE_COLORS[stage] ?? 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30'} ${isActive ? 'ring-2 ring-white/60' : isDominant ? 'ring-1 ring-amber-300/70 shadow-[0_0_0_1px_rgba(252,211,77,0.35)]' : 'hover:opacity-80'}`}
                         title={`${stage}: ${count}${isDominant ? ' — dominant stage' : ''} — click to ${isActive ? 'clear' : 'filter'}`}
                       >
                         {isDominant && <span aria-label="dominant" className="text-amber-300">★</span>}
@@ -1810,12 +1803,11 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                           .filter((s): s is string => !!s)
                           .map(s => s.length > 30 ? s.slice(0, 30) + '…' : s);
                         return (
-                          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                           <div
                             key={cluster.fingerprint}
                             role="button"
                             tabIndex={0}
-                            className="flex flex-col gap-0.5 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
+                            className="flex flex-col gap-0.5 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50 min-h-[44px]"
                             onClick={() => onSelectTask({ id: cluster.first_task_id })}
                             onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: cluster.first_task_id }); } }}
                           >
@@ -2487,11 +2479,10 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                               <div className="flex flex-col gap-1 ml-5 max-w-full">
                                 {group.tasks.map(t => (
                                   <div key={t.task_id} className="flex flex-col gap-0.5">
-                                    {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                                     <div
                                       role="button"
                                       tabIndex={0}
-                                      className="flex flex-wrap items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
+                                      className="flex flex-wrap items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50 min-h-[44px]"
                                       onClick={() => onSelectTask({ id: t.task_id })}
                                       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: t.task_id }); } }}
                                     >

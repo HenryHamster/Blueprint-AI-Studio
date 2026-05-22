@@ -160,19 +160,17 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
         const parentId = task.parent_task_id;
         return (
         <>
-          {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
           <button
             onClick={e => { e.stopPropagation(); onNavigateToParent?.(parentId); }}
-            className="text-[9px] text-amber-500/80 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 hover:text-amber-400 px-1.5 py-0.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
+            className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center text-[9px] text-amber-500/80 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 hover:text-amber-400 px-1.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
             title={`Copy parent task ID: ${parentId}`}
           >
             ↑ Parent on another page
           </button>
           {onUnarchiveParent && (
-            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
             <button
               onClick={e => { e.stopPropagation(); onUnarchiveParent(parentId); }}
-              className="text-[9px] text-emerald-500/80 border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 hover:text-emerald-400 px-1.5 py-0.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
+              className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center text-[9px] text-emerald-500/80 border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/20 hover:text-emerald-400 px-1.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
               title="Unarchive parent task (idempotent if already unarchived)"
             >
               ↪ Unarchive parent
@@ -198,13 +196,12 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
 
       {/* PR badge */}
       {task.pr_url && prNumberFromUrl(task.pr_url) != null && (
-        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
         <a
           href={task.pr_url}
           target="_blank"
           rel="noopener noreferrer"
           onClick={e => e.stopPropagation()}
-          className="text-[9px] text-sky-400/80 border border-sky-500/30 bg-sky-500/10 hover:bg-sky-500/20 hover:text-sky-300 px-1.5 py-0.5 rounded font-medium whitespace-nowrap flex items-center gap-0.5 shrink-0 transition-colors"
+          className="min-h-[44px] min-w-[44px] text-[9px] text-sky-400/80 border border-sky-500/30 bg-sky-500/10 hover:bg-sky-500/20 hover:text-sky-300 px-1.5 rounded font-medium whitespace-nowrap flex items-center justify-center gap-0.5 shrink-0 transition-colors"
         >
           PR #{prNumberFromUrl(task.pr_url)}<ExternalLink className="w-2.5 h-2.5" />
         </a>
@@ -355,10 +352,9 @@ function TreeBranch({
 
         <div className="flex items-center gap-1">
           {hasChildren && (
-            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
             <button
               onClick={e => { e.stopPropagation(); setChildrenExpanded(v => !v); }}
-              className="shrink-0 p-0.5 text-neutral-500 hover:text-neutral-300 transition-colors"
+              className="shrink-0 min-h-[44px] min-w-[44px] inline-flex items-center justify-center text-neutral-500 hover:text-neutral-300 transition-colors"
               title={childrenExpanded ? 'Collapse children' : 'Expand children'}
             >
               {childrenExpanded
@@ -496,10 +492,9 @@ function RootGroup({
           {isSynthetic && root.task.parent_task_id && (() => {
             const parentId = root.task.parent_task_id;
             return (
-            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
             <button
               onClick={() => onNavigateToParent?.(parentId)}
-              className="text-[9px] text-amber-500/70 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 hover:text-amber-400 px-1.5 py-0.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
+              className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center text-[9px] text-amber-500/70 border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 hover:text-amber-400 px-1.5 rounded font-medium whitespace-nowrap shrink-0 transition-colors cursor-pointer"
               title={`Copy parent task ID: ${root.task.parent_task_id}`}
             >
               ↑ Parent on another page
@@ -509,10 +504,9 @@ function RootGroup({
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
           {onArchiveGroup && runningInGroup === 0 && !isSynthetic && (
-            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
             <button
               onClick={e => { e.stopPropagation(); onArchiveGroup(collectAllIds(root).filter(id => !id.startsWith('synthetic-'))); }}
-              className="opacity-0 group-hover:opacity-100 transition-opacity text-[10px] text-neutral-500 hover:text-neutral-300 flex items-center gap-1 px-2 py-0.5 rounded border border-neutral-700 hover:border-neutral-600 mr-1"
+              className="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity text-[10px] text-neutral-500 hover:text-neutral-300 min-h-[44px] min-w-[44px] flex items-center justify-center gap-1 px-2 rounded border border-neutral-700 hover:border-neutral-600 mr-1"
               title="Archive this group"
             >
               <Archive className="w-3 h-3" />
@@ -710,18 +704,16 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
             <button className={btnClass} onClick={expandAll}>Expand all</button>
             <button className={btnClass} onClick={collapseAll}>Collapse all</button>
             {activeTaskIds.length > 0 && (
-              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
               <button
-                className="px-2 py-1 text-xs text-yellow-400 hover:text-yellow-300 bg-yellow-500/10 border border-yellow-500/30 rounded transition-colors"
+                className="min-h-[44px] min-w-[44px] inline-flex items-center justify-center px-2 text-xs text-yellow-400 hover:text-yellow-300 bg-yellow-500/10 border border-yellow-500/30 rounded transition-colors"
                 onClick={jumpToActive}
               >
                 Jump to active
               </button>
             )}
             {onArchiveGroup && donePipelineIds.length > 0 && (
-              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
               <button
-                className="px-2 py-1 text-xs text-neutral-500 hover:text-neutral-300 bg-neutral-900 border border-neutral-800 rounded transition-colors flex items-center gap-1"
+                className="min-h-[44px] min-w-[44px] flex items-center justify-center gap-1 px-2 text-xs text-neutral-500 hover:text-neutral-300 bg-neutral-900 border border-neutral-800 rounded transition-colors"
                 onClick={() => onArchiveGroup(donePipelineIds)}
               >
                 <Archive className="w-3 h-3" />

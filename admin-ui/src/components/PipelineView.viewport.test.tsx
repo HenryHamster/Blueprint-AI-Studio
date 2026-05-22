@@ -5,13 +5,6 @@ import { PipelineView } from './PipelineView';
 import type { Task } from './TaskCard';
 import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } from '../test/viewport';
 
-// PipelineView is a dense list UI where every button is deliberately compact
-// (filter chips, expand/collapse chevrons, PR/orphan badges). Small targets are
-// documented in PipelineView.tsx with inline disable comments for the
-// viewport/min-touch-target lint rule. The touch-target assertion below is
-// therefore scoped vacuously (selector: 'none') to document the intentional
-// exemption while satisfying the all-three-assertion-types viewport invariant.
-
 // PipelineView imports '../utils/time' internally; no API calls needed for this
 // test, so we don't mock apiFetch.
 
@@ -57,6 +50,24 @@ const sampleTasks: Task[] = [
     depends_on: ['task-child-1'],
     created_at: '2026-05-01T13:00:00Z',
     payloads: [{ pr_number: 42 }],
+  },
+];
+
+// Orphan tasks: parent_task_id points to a task NOT in the list, producing
+// a synthetic parent group and orphan badges (↑ Parent on another page,
+// ↪ Unarchive parent) so we can enforce touch targets on those controls.
+const orphanTasks: Task[] = [
+  ...sampleTasks,
+  {
+    id: 'task-orphan-1',
+    title: 'fix: orphan task whose parent is on another page',
+    description: '',
+    status: 'QUEUED',
+    task_type: 'fix',
+    created_by: 'test-user',
+    requires_approval: false,
+    parent_task_id: 'missing-parent-abc123',
+    created_at: '2026-05-01T14:00:00Z',
   },
 ];
 
@@ -145,11 +156,11 @@ describe('PipelineView — viewport regression', () => {
     });
   });
 
-  // Touch-target check is intentionally vacuous (selector: 'none'): PipelineView's
-  // controls are deliberately compact and exempt (see file header). This call
-  // documents the exemption and satisfies the viewport-coverage invariant, which
-  // requires an assertion of each type at every required width.
-  test('touch-target assertion is intentionally exempt at 375px', async () => {
+  // Touch-target check covers the controls fixed to meet 44px: expand/collapse
+  // chevrons, orphan navigation chips, and unarchive-parent buttons. The orphanTasks
+  // fixture includes a task whose parent is not in the list, which renders the
+  // synthetic parent group and orphan badges.
+  test('fixed controls meet 44px touch target at 375px', async () => {
     await expectMinTouchTargetAt(
       375,
       async () => {
@@ -164,13 +175,22 @@ describe('PipelineView — viewport regression', () => {
         await act(async () => {
           r.render(
             <PipelineView
-              tasks={sampleTasks}
+              tasks={orphanTasks}
               onViewLogs={() => {}}
+              onNavigateToParent={() => {}}
+              onUnarchiveTask={() => {}}
             />,
           );
         });
       },
-      { selector: 'none' },
+      {
+        selector: [
+          'button[title="Collapse children"]',
+          'button[title="Expand children"]',
+          'button[title^="Copy parent task ID"]',
+          'button[title^="Unarchive parent"]',
+        ].join(', '),
+      },
     );
   });
 });
