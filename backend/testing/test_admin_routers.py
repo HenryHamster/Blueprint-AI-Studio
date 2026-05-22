@@ -1169,6 +1169,63 @@ class TestMessagesLastSeen:
         assert put_resp.status_code == 404
 
 
+class TestLastVisitTimestamp:
+    @pytest.mark.asyncio
+    async def test_get_empty_returns_null(self, client: AsyncClient, db_session):
+        """Returns null when no MessagesLastSeen record exists for the operator."""
+        resp = await client.get("/api/admin/last-visit-timestamp")
+        assert resp.status_code == 200
+        assert resp.json()["last_visit_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_put_and_get_round_trip(self, client: AsyncClient, db_session):
+        """PUT persists the timestamp; GET returns it as the cross-project max."""
+        project = await _make_project(db_session)
+        ts = 1_700_000_000_000
+
+        put_resp = await client.put(
+            "/api/admin/last-visit-timestamp",
+            json={"project_id": str(project.id), "timestamp": ts},
+        )
+        assert put_resp.status_code == 200
+        assert put_resp.json()["last_visit_at"] == ts
+
+        get_resp = await client.get("/api/admin/last-visit-timestamp")
+        assert get_resp.status_code == 200
+        assert get_resp.json()["last_visit_at"] == ts
+
+    @pytest.mark.asyncio
+    async def test_get_returns_max_across_projects(
+        self, client: AsyncClient, db_session
+    ):
+        """GET returns the most recent timestamp across all user's projects."""
+        p1 = await _make_project(db_session)
+        p2 = await _make_project(db_session)
+        ts1, ts2 = 1_700_000_000_000, 1_700_000_060_000
+
+        await client.put(
+            "/api/admin/last-visit-timestamp",
+            json={"project_id": str(p1.id), "timestamp": ts1},
+        )
+        await client.put(
+            "/api/admin/last-visit-timestamp",
+            json={"project_id": str(p2.id), "timestamp": ts2},
+        )
+
+        resp = await client.get("/api/admin/last-visit-timestamp")
+        assert resp.json()["last_visit_at"] == ts2
+
+    @pytest.mark.asyncio
+    async def test_put_no_access_returns_404(self, client: AsyncClient, db_session):
+        """Cannot write last-visit-timestamp for a project the user is not a member of."""
+        random_pid = str(uuid.uuid4())
+        resp = await client.put(
+            "/api/admin/last-visit-timestamp",
+            json={"project_id": random_pid, "timestamp": 1_700_000_000_000},
+        )
+        assert resp.status_code == 404
+
+
 class TestMessagesSavedViews:
     @pytest.mark.asyncio
     async def test_get_saved_views_empty(self, client: AsyncClient, db_session):

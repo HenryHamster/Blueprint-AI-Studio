@@ -637,6 +637,7 @@ export default function App() {
           onBulkApprove={(taskIds) => s.handleBulkAction('approve', taskIds)}
           onBulkRetry={(taskIds) => s.handleBulkAction('retry', taskIds)}
           wsRef={s.wsRef}
+          userEmail={s.user?.email ?? null}
         />
       )}
 

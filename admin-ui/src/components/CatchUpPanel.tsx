@@ -15,7 +15,6 @@ import {
   saveDismissed,
   formatSnoozeRemaining,
   getLastCatchUpViewed,
-  markCatchUpViewed,
   windowToHours,
 } from './catchupHelpers';
 import type { RecentCompletion, TimeWindow, DismissedState } from './catchupHelpers';
@@ -356,12 +355,29 @@ export interface CatchUpPanelProps {
   onBulkApprove?: (taskIds: string[]) => void;
   onBulkRetry?: (taskIds: string[]) => void;
   wsRef?: RefObject<WebSocket | null>;
+  userEmail?: string | null;
 }
 
-export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: _lastVisitTimestamp, refreshInterval, onSelectTask, needsAttentionCount = 0, onApprove, onRetry, onBulkApprove, onBulkRetry, wsRef }: CatchUpPanelProps) {
+export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: _lastVisitTimestamp, refreshInterval, onSelectTask, needsAttentionCount = 0, onApprove, onRetry, onBulkApprove, onBulkRetry, wsRef, userEmail }: CatchUpPanelProps) {
+  // Per-operator localStorage key for catch-up viewed timestamp.
+  // Falls back to the legacy global key when unauthenticated or email unknown.
+  const catchUpViewedKey = userEmail
+    ? `blueprint-admin:lastCatchUpViewed:${userEmail}`
+    : 'blueprint-admin:lastCatchUpViewed';
+
   // Track when the user last viewed the catch-up panel (not page load).
   // Read once on mount; updated when the user collapses the panel after reading.
-  const [lastCatchUpViewed] = useState(() => getLastCatchUpViewed() ?? _lastVisitTimestamp);
+  // Per-operator key is preferred; falls back to global key (migration) then lastVisitTimestamp.
+  const [lastCatchUpViewed] = useState(() => {
+    try {
+      const stored = localStorage.getItem(catchUpViewedKey);
+      const ts = stored ? parseInt(stored, 10) : null;
+      if (ts && !isNaN(ts)) return ts;
+      // Migration: seed from global key if per-operator key is absent
+      if (userEmail) return getLastCatchUpViewed() ?? _lastVisitTimestamp;
+      return _lastVisitTimestamp;
+    } catch { return _lastVisitTimestamp; }
+  });
   const [collapsed, setCollapsed] = useState(() => {
     const wasCollapsed = localStorage.getItem('blueprint-admin:catchUpPanelCollapsed') === 'true';
     // Auto-expand on first session render if there are items needing attention
@@ -593,8 +609,8 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
   const toggle = () => {
     const next = !collapsed;
     if (next) {
-      // Collapsing → user has read the digest, record the timestamp
-      markCatchUpViewed();
+      // Collapsing → user has read the digest, record per-operator timestamp
+      try { localStorage.setItem(catchUpViewedKey, String(Date.now())); } catch { /* */ }
     }
     setCollapsed(next);
     localStorage.setItem('blueprint-admin:catchUpPanelCollapsed', String(next));

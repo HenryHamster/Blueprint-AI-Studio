@@ -100,4 +100,33 @@ describe('ActivityFeed — viewport regression', () => {
       });
     });
   });
+
+  test('renders without horizontal overflow at 375px with per-operator lastVisitTimestamp', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.width = '375px';
+      host.style.height = '700px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      // Simulate per-operator lastVisitTimestamp that arrives after async auth.
+      // Events in the mock are all recent, so all land after this timestamp,
+      // exercising the "New since your last visit" divider and Last Visit pill.
+      const lastVisit = Date.now() - 48 * 60 * 60 * 1000;
+      await act(async () => {
+        r.render(
+          <ActivityFeed
+            selectedProjectId={null}
+            refreshInterval={0}
+            onSelectTask={() => {}}
+            onClose={() => {}}
+            lastVisitTimestamp={lastVisit}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+    });
+  });
 });

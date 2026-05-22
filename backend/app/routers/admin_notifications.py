@@ -720,6 +720,71 @@ async def put_messages_saved_views(
     return {"status": "ok"}
 
 
+# ── Last-Visit-Timestamp Endpoints ───────────────────────────────────────────
+
+
+@router.get("/last-visit-timestamp")
+async def get_last_visit_timestamp(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Most-recent per-operator last-visit timestamp across all projects.
+
+    Reuses MessagesLastSeen so ActivityFeed and CatchUpPanel share the same
+    cross-device baseline as the Messages panel without a separate store.
+    """
+    max_ts = (
+        await session.execute(
+            select(func.max(MessagesLastSeen.last_seen_at)).where(
+                MessagesLastSeen.user_id == current_user["user_id"],
+            )
+        )
+    ).scalar_one_or_none()
+    return {"last_visit_at": int(max_ts.timestamp() * 1000) if max_ts else None}
+
+
+@router.put("/last-visit-timestamp")
+async def put_last_visit_timestamp(
+    payload: LastSeenUpdate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Persist the per-operator last-visit timestamp for cross-device home-panel baseline.
+
+    Writes to MessagesLastSeen (same store as the Messages panel last-seen
+    divider) so a single authoritative record drives all 'since last visit' UI.
+    """
+    try:
+        pid = uuid.UUID(payload.project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+    new_ts = datetime.fromtimestamp(
+        payload.timestamp / 1000.0, tz=timezone.utc
+    ).replace(tzinfo=None)
+    row = (
+        await session.execute(
+            select(MessagesLastSeen).where(
+                MessagesLastSeen.user_id == current_user["user_id"],
+                MessagesLastSeen.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = MessagesLastSeen(
+            user_id=current_user["user_id"],
+            project_id=pid,
+            last_seen_at=new_ts,
+            updated_at=new_ts,
+        )
+    else:
+        row.last_seen_at = new_ts
+        row.updated_at = _utcnow()
+    session.add(row)
+    await session.commit()
+    return {"status": "ok", "last_visit_at": int(new_ts.timestamp() * 1000)}
+
+
 # ── Admin Playbook Endpoints ──────────────────────────────────────────────────
 
 
