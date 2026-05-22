@@ -3,7 +3,7 @@ import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNo
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders } from '../api';
 import { parseTimestamp } from '../utils/time';
-import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, formatSinceTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP, type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes, ROUTINE_EVENT_LABELS, countHighSignalMessages, fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews } from './MessagesPanel.utils';
+import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, formatSinceTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, HIGH_SIGNAL_NOTE_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP, type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes, ROUTINE_EVENT_LABELS, countHighSignalMessages, fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews, fetchServerTempMutes, saveServerTempMutes, fetchServerMuteWindow, saveServerMuteWindow } from './MessagesPanel.utils';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -210,7 +210,7 @@ function ContextBadges({ context, fromType }: { context: Record<string, unknown>
   else if (eventType === 'pr_merged') badges.push({ label: 'PR Merged', className: 'text-green-400 bg-green-500/10 border-green-500/30' });
   else if (eventType === 'direction_milestone') badges.push({ label: (context.milestone as string) || 'Milestone', className: 'text-cyan-400 bg-cyan-500/10 border-cyan-500/30' });
   else if (eventType === 'cycle_summary') badges.push({ label: 'Cycle Summary', className: 'text-blue-400 bg-blue-500/10 border-blue-500/30' });
-  else if (eventType === 'failure_alert') badges.push({ label: 'Failure Alert', className: 'text-red-400 bg-red-500/10 border-red-500/30' });
+  else if (eventType && HIGH_SIGNAL_NOTE_BADGE_LABELS[eventType]) badges.push({ label: HIGH_SIGNAL_NOTE_BADGE_LABELS[eventType], className: 'text-red-400 bg-red-500/10 border-red-500/30 font-semibold' });
   else if (eventType === 'feedback_reply') badges.push({ label: 'Feedback Reply', className: 'text-purple-400 bg-purple-500/10 border-purple-500/30' });
 
   if (badges.length === 0) return null;
@@ -399,6 +399,24 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
         if (serverPrefs !== null) {
           setEventPrefs(serverPrefs);
           saveEventPrefs(auth.currentUser?.email, selectedProjectId, serverPrefs);
+        }
+      });
+      // Prefer server temp-mutes over localStorage — expiry semantics preserved (expired entries dropped).
+      fetchServerTempMutes(selectedProjectId).then(serverMutes => {
+        if (serverMutes !== null) {
+          setTempMutes(serverMutes);
+          saveTemporaryMutes(auth.currentUser?.email, selectedProjectId, serverMutes);
+        }
+      });
+      // Prefer server mute-window over localStorage — undefined = fetch failed, keep local fallback.
+      fetchServerMuteWindow(selectedProjectId).then(serverWin => {
+        if (serverWin !== undefined) {
+          setMuteWindow(serverWin);
+          if (serverWin !== null) {
+            saveMuteWindow(auth.currentUser?.email, selectedProjectId, serverWin);
+          } else {
+            clearMuteWindow(auth.currentUser?.email, selectedProjectId);
+          }
         }
       });
     }
@@ -626,6 +644,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     setTempMutes(prev => {
       const next = { ...prev, [eventType]: Date.now() + durationMs };
       saveTemporaryMutes(auth.currentUser?.email, selectedProjectId, next);
+      if (selectedProjectId) void saveServerTempMutes(selectedProjectId, next);
       return next;
     });
     setShowTempMuteMenu(false);
@@ -1440,6 +1459,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                         <button key={label} onClick={() => {
                           const updated = { expiresAt: (muteWindow!.expiresAt) + ms };
                           saveMuteWindow(auth.currentUser?.email, selectedProjectId, updated);
+                          if (selectedProjectId) void saveServerMuteWindow(selectedProjectId, updated);
                           setMuteWindow(updated);
                           setShowMuteMenu(false);
                         }} className="w-full text-left text-xs px-2 py-2 rounded text-neutral-300 hover:bg-neutral-800 transition-colors min-h-[44px] md:min-h-auto flex items-center">{label}</button>
@@ -1447,6 +1467,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                       <div className="border-t border-neutral-800 my-1" />
                       <button onClick={() => {
                         clearMuteWindow(auth.currentUser?.email, selectedProjectId);
+                        if (selectedProjectId) void saveServerMuteWindow(selectedProjectId, null);
                         setMuteWindow(null);
                         setShowMuteMenu(false);
                       }} className="w-full text-left text-xs px-2 py-2 rounded text-amber-400 hover:bg-amber-500/10 transition-colors min-h-[44px] md:min-h-auto flex items-center">End mute early</button>
@@ -1458,6 +1479,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                         <button key={label} onClick={() => {
                           const newWin = { expiresAt: Date.now() + ms };
                           saveMuteWindow(auth.currentUser?.email, selectedProjectId, newWin);
+                          if (selectedProjectId) void saveServerMuteWindow(selectedProjectId, newWin);
                           setMuteWindow(newWin);
                           setShowMuteMenu(false);
                         }} className="w-full text-left text-xs px-2 py-2 rounded text-neutral-300 hover:bg-neutral-800 transition-colors min-h-[44px] md:min-h-auto flex items-center">{label}</button>

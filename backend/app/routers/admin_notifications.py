@@ -75,6 +75,18 @@ class SavedViewsUpdate(BaseModel):
     saved_views: List[Dict[str, Any]] = Field(default_factory=list)
 
 
+class TempMutesUpdate(BaseModel):
+    project_id: str
+    temp_mutes: Dict[str, int] = Field(
+        default_factory=dict
+    )  # event_type -> expiry ms epoch
+
+
+class MuteWindowUpdate(BaseModel):
+    project_id: str
+    expires_at: Optional[int] = None  # ms epoch; None clears the mute window
+
+
 class AdminPlaybookSet(BaseModel):
     key: str = Field(
         ..., description="Playbook key: alphanumeric + hyphens, max 50 chars"
@@ -122,8 +134,20 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
         "fix_loop_divergence_regressed",
         "direction_outcome_stalled",
         "promotion_readiness_reached",
+        "release_calcifying",
+        "release_build_stalled",
+        "release_stabilize_stalled",
     }
 )
+
+
+# Reserved keys within MessagesNoisePrefs.prefs for temp-mutes and mute-window.
+# Prefixed with underscore to avoid collision with event-type visibility keys.
+_TEMP_MUTES_KEY = "_temp_mutes"
+_MUTE_WINDOW_KEY = "_mute_window"
+# These keys are owned by their own dedicated PUT endpoints; the noise-prefs
+# (event-visibility) endpoint must never write them, only preserve them.
+_RESERVED_PREFS_KEYS = (_TEMP_MUTES_KEY, _MUTE_WINDOW_KEY)
 
 
 def append_routine_digest(project: Project, event_type: str, summary: str) -> None:
@@ -652,14 +676,27 @@ async def put_messages_noise_prefs(
         )
     ).scalar_one_or_none()
 
+    # This endpoint only owns event-type visibility prefs. Strip any reserved
+    # keys from the incoming payload (they are owned by the temp-mutes and
+    # mute-window endpoints) and preserve the existing reserved values so a
+    # visibility save never clobbers an operator's active DND window or mutes.
+    visibility = {
+        k: v for k, v in payload.prefs.items() if k not in _RESERVED_PREFS_KEYS
+    }
+
     if row is None:
         row = MessagesNoisePrefs(
             user_id=current_user["user_id"],
             project_id=pid,
-            prefs=payload.prefs,
+            prefs=visibility,
         )
     else:
-        row.prefs = payload.prefs
+        existing = dict(row.prefs or {})
+        merged = dict(visibility)
+        for key in _RESERVED_PREFS_KEYS:
+            if key in existing:
+                merged[key] = existing[key]
+        row.prefs = merged
         flag_modified(row, "prefs")
 
     session.add(row)
@@ -729,6 +766,155 @@ async def put_messages_saved_views(
     else:
         row.saved_views = payload.saved_views
         flag_modified(row, "saved_views")
+
+    session.add(row)
+    await session.commit()
+    return {"status": "ok"}
+
+
+# ── Messages Temp-Mutes Endpoints ────────────────────────────────────────────
+
+
+@router.get("/messages/temp-mutes")
+async def get_messages_temp_mutes(
+    project_id: str = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return active (non-expired) temporary event-type mutes for the operator."""
+    try:
+        pid = uuid.UUID(project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    row = (
+        await session.execute(
+            select(MessagesNoisePrefs).where(
+                MessagesNoisePrefs.user_id == current_user["user_id"],
+                MessagesNoisePrefs.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+
+    raw: Dict[str, int] = (row.prefs.get(_TEMP_MUTES_KEY) or {}) if row else {}
+    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    return {"temp_mutes": {et: exp for et, exp in raw.items() if exp > now_ms}}
+
+
+@router.put("/messages/temp-mutes")
+async def put_messages_temp_mutes(
+    payload: TempMutesUpdate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Upsert temporary event-type mutes for the operator. Expired entries are dropped."""
+    try:
+        pid = uuid.UUID(payload.project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    active = {et: exp for et, exp in payload.temp_mutes.items() if exp > now_ms}
+
+    row = (
+        await session.execute(
+            select(MessagesNoisePrefs).where(
+                MessagesNoisePrefs.user_id == current_user["user_id"],
+                MessagesNoisePrefs.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+
+    if row is None:
+        row = MessagesNoisePrefs(
+            user_id=current_user["user_id"],
+            project_id=pid,
+            prefs={_TEMP_MUTES_KEY: active},
+        )
+    else:
+        prefs = dict(row.prefs or {})
+        prefs[_TEMP_MUTES_KEY] = active
+        row.prefs = prefs
+        flag_modified(row, "prefs")
+
+    session.add(row)
+    await session.commit()
+    return {"status": "ok"}
+
+
+# ── Messages Mute-Window Endpoints ────────────────────────────────────────────
+
+
+@router.get("/messages/mute-window")
+async def get_messages_mute_window(
+    project_id: str = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the active do-not-disturb mute window for the operator, or null if expired/unset."""
+    try:
+        pid = uuid.UUID(project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    row = (
+        await session.execute(
+            select(MessagesNoisePrefs).where(
+                MessagesNoisePrefs.user_id == current_user["user_id"],
+                MessagesNoisePrefs.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+
+    stored = (row.prefs.get(_MUTE_WINDOW_KEY)) if row else None
+    if not stored or not isinstance(stored, dict):
+        return {"mute_window": None}
+    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    if stored.get("expires_at", 0) <= now_ms:
+        return {"mute_window": None}
+    return {"mute_window": stored}
+
+
+@router.put("/messages/mute-window")
+async def put_messages_mute_window(
+    payload: MuteWindowUpdate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Upsert the do-not-disturb mute window. Set expires_at=null to clear it."""
+    try:
+        pid = uuid.UUID(payload.project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    entry = (
+        {"expires_at": payload.expires_at} if payload.expires_at is not None else None
+    )
+
+    row = (
+        await session.execute(
+            select(MessagesNoisePrefs).where(
+                MessagesNoisePrefs.user_id == current_user["user_id"],
+                MessagesNoisePrefs.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+
+    if row is None:
+        row = MessagesNoisePrefs(
+            user_id=current_user["user_id"],
+            project_id=pid,
+            prefs={_MUTE_WINDOW_KEY: entry},
+        )
+    else:
+        prefs = dict(row.prefs or {})
+        prefs[_MUTE_WINDOW_KEY] = entry
+        row.prefs = prefs
+        flag_modified(row, "prefs")
 
     session.add(row)
     await session.commit()

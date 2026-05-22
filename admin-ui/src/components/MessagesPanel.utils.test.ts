@@ -10,6 +10,7 @@ import {
   isFailingGroup,
   ESCALATION_EVENT_TYPES,
   ESCALATION_BADGE_LABELS,
+  HIGH_SIGNAL_NOTE_BADGE_LABELS,
   HIGH_SIGNAL_NOTE_EVENTS,
   CRITICAL_NOTE_EVENTS,
   classifySignalLevel,
@@ -34,6 +35,14 @@ import {
   fetchServerSavedViews,
   saveServerSavedViews,
   resolveServerSavedViews,
+  fetchServerTempMutes,
+  saveServerTempMutes,
+  resolveServerTempMutes,
+  fetchServerMuteWindow,
+  saveServerMuteWindow,
+  resolveServerMuteWindow,
+  type TemporaryMutes,
+  type MuteWindow,
   countHighSignalMessages,
   countNewSinceLastVisit,
 } from './MessagesPanel.utils';
@@ -261,6 +270,28 @@ describe('escalation event invariants', () => {
   test('feedback_acknowledgment classifies as routine (not high-signal)', () => {
     const base = { from_type: 'system', message_type: 'NOTE' as const };
     expect(classifySignalLevel({ ...base, context: { event_type: 'feedback_acknowledgment' } })).toBe('routine');
+  });
+});
+
+describe('HIGH_SIGNAL_NOTE_BADGE_LABELS invariants', () => {
+  test('every non-escalation HIGH_SIGNAL_NOTE_EVENTS entry has a badge label', () => {
+    for (const et of HIGH_SIGNAL_NOTE_EVENTS) {
+      if (ESCALATION_EVENT_TYPES.has(et)) continue;
+      expect(HIGH_SIGNAL_NOTE_BADGE_LABELS[et]).toBeTruthy();
+    }
+  });
+
+  test('HIGH_SIGNAL_NOTE_BADGE_LABELS has no entry for escalation event types', () => {
+    for (const et of Object.keys(HIGH_SIGNAL_NOTE_BADGE_LABELS)) {
+      expect(ESCALATION_EVENT_TYPES.has(et)).toBe(false);
+    }
+  });
+
+  test('HIGH_SIGNAL_NOTE_BADGE_LABELS has no entry for routine event types', () => {
+    const KNOWN_ROUTINE = ['pr_merged', 'direction_milestone', 'cycle_summary', 'auto_fix_spawned', 'auto_fix_result'];
+    for (const et of KNOWN_ROUTINE) {
+      expect(HIGH_SIGNAL_NOTE_BADGE_LABELS[et]).toBeUndefined();
+    }
   });
 });
 
@@ -912,6 +943,168 @@ describe('saveServerSavedViews', () => {
     vi.mocked(apiFetch).mockRejectedValue(new Error('network'));
     const views: SavedView[] = [];
     await expect(saveServerSavedViews('proj-123', views)).resolves.toBeUndefined();
+  });
+});
+
+// ── Server-side temp-mutes ───────────────────────────────────────────────────
+
+describe('resolveServerTempMutes', () => {
+  test('returns server mutes when server result is present', () => {
+    const local: TemporaryMutes = { pr_merged: Date.now() + 3600000 };
+    const server: TemporaryMutes = { cycle_summary: Date.now() + 7200000 };
+    expect(resolveServerTempMutes(local, server)).toEqual(server);
+  });
+
+  test('falls back to local when server is null (offline)', () => {
+    const local: TemporaryMutes = { pr_merged: Date.now() + 3600000 };
+    expect(resolveServerTempMutes(local, null)).toEqual(local);
+  });
+
+  test('returns empty object when server returns no active mutes', () => {
+    const local: TemporaryMutes = { pr_merged: Date.now() + 3600000 };
+    expect(resolveServerTempMutes(local, {})).toEqual({});
+  });
+});
+
+describe('fetchServerTempMutes', () => {
+  beforeEach(() => { vi.resetAllMocks(); });
+
+  test('returns active mutes on successful response, drops expired', async () => {
+    const future = Date.now() + 3600000;
+    const past = Date.now() - 1000;
+    vi.mocked(apiFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ temp_mutes: { pr_merged: future, cycle_summary: past } }),
+    } as Response);
+    const result = await fetchServerTempMutes('project-uuid');
+    expect(result).toEqual({ pr_merged: future });
+  });
+
+  test('returns null on non-ok response', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({ ok: false } as Response);
+    expect(await fetchServerTempMutes('project-uuid')).toBeNull();
+  });
+
+  test('returns null on network error', async () => {
+    vi.mocked(apiFetch).mockRejectedValue(new Error('network'));
+    expect(await fetchServerTempMutes('project-uuid')).toBeNull();
+  });
+
+  test('returns empty object when server has no active mutes', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ temp_mutes: {} }),
+    } as Response);
+    expect(await fetchServerTempMutes('project-uuid')).toEqual({});
+  });
+});
+
+describe('saveServerTempMutes', () => {
+  beforeEach(() => { vi.resetAllMocks(); });
+
+  test('calls PUT with correct project_id and temp_mutes', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({ ok: true } as Response);
+    const mutes: TemporaryMutes = { pr_merged: Date.now() + 3600000 };
+    await saveServerTempMutes('proj-123', mutes);
+    expect(vi.mocked(apiFetch)).toHaveBeenCalledWith(
+      expect.stringContaining('/api/admin/messages/temp-mutes'),
+      expect.objectContaining({ method: 'PUT', body: JSON.stringify({ project_id: 'proj-123', temp_mutes: mutes }) }),
+    );
+  });
+
+  test('silently swallows network errors', async () => {
+    vi.mocked(apiFetch).mockRejectedValue(new Error('network'));
+    await expect(saveServerTempMutes('proj-123', {})).resolves.toBeUndefined();
+  });
+});
+
+// ── Server-side mute-window ──────────────────────────────────────────────────
+
+describe('resolveServerMuteWindow', () => {
+  const win: MuteWindow = { expiresAt: Date.now() + 3600000 };
+
+  test('returns server window when server has an active mute', () => {
+    const local: MuteWindow = { expiresAt: Date.now() + 1000 };
+    expect(resolveServerMuteWindow(local, win)).toEqual(win);
+  });
+
+  test('returns null when server says mute is cleared (not offline)', () => {
+    const local: MuteWindow = { expiresAt: Date.now() + 3600000 };
+    expect(resolveServerMuteWindow(local, null)).toBeNull();
+  });
+
+  test('falls back to local when fetch failed (undefined)', () => {
+    const local: MuteWindow = { expiresAt: Date.now() + 3600000 };
+    expect(resolveServerMuteWindow(local, undefined)).toEqual(local);
+  });
+});
+
+describe('fetchServerMuteWindow', () => {
+  beforeEach(() => { vi.resetAllMocks(); });
+
+  test('returns MuteWindow with expiresAt when server has active window', async () => {
+    const future = Date.now() + 3600000;
+    vi.mocked(apiFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ mute_window: { expires_at: future } }),
+    } as Response);
+    const result = await fetchServerMuteWindow('project-uuid');
+    expect(result).toEqual({ expiresAt: future });
+  });
+
+  test('returns null when server mute_window is null', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ mute_window: null }),
+    } as Response);
+    expect(await fetchServerMuteWindow('project-uuid')).toBeNull();
+  });
+
+  test('returns null when server window is expired', async () => {
+    const past = Date.now() - 1000;
+    vi.mocked(apiFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ mute_window: { expires_at: past } }),
+    } as Response);
+    expect(await fetchServerMuteWindow('project-uuid')).toBeNull();
+  });
+
+  test('returns undefined on non-ok response (offline fallback)', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({ ok: false } as Response);
+    expect(await fetchServerMuteWindow('project-uuid')).toBeUndefined();
+  });
+
+  test('returns undefined on network error (offline fallback)', async () => {
+    vi.mocked(apiFetch).mockRejectedValue(new Error('network'));
+    expect(await fetchServerMuteWindow('project-uuid')).toBeUndefined();
+  });
+});
+
+describe('saveServerMuteWindow', () => {
+  beforeEach(() => { vi.resetAllMocks(); });
+
+  test('calls PUT with expires_at when mute window is active', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({ ok: true } as Response);
+    const win: MuteWindow = { expiresAt: 9999999999 };
+    await saveServerMuteWindow('proj-123', win);
+    expect(vi.mocked(apiFetch)).toHaveBeenCalledWith(
+      expect.stringContaining('/api/admin/messages/mute-window'),
+      expect.objectContaining({ method: 'PUT', body: JSON.stringify({ project_id: 'proj-123', expires_at: 9999999999 }) }),
+    );
+  });
+
+  test('calls PUT with expires_at=null to clear the mute window', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({ ok: true } as Response);
+    await saveServerMuteWindow('proj-123', null);
+    expect(vi.mocked(apiFetch)).toHaveBeenCalledWith(
+      expect.stringContaining('/api/admin/messages/mute-window'),
+      expect.objectContaining({ method: 'PUT', body: JSON.stringify({ project_id: 'proj-123', expires_at: null }) }),
+    );
+  });
+
+  test('silently swallows network errors', async () => {
+    vi.mocked(apiFetch).mockRejectedValue(new Error('network'));
+    await expect(saveServerMuteWindow('proj-123', null)).resolves.toBeUndefined();
   });
 });
 

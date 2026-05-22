@@ -68,6 +68,9 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "fix_loop_divergence_regressed",  # post_fix_loop_divergence_regression_message
         "direction_outcome_stalled",  # post_direction_outcome_stalled_message
         "promotion_readiness_reached",  # post_version_promotion_readiness_message
+        "release_calcifying",  # post_version_calcification_message
+        "release_build_stalled",  # post_version_build_stalled_message
+        "release_stabilize_stalled",  # post_version_stabilize_stalled_message
     }
 )
 

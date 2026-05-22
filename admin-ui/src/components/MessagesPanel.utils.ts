@@ -34,6 +34,22 @@ export const ESCALATION_BADGE_LABELS: Readonly<Record<string, string>> = {
   direction_churn_pause: 'Churn Pause',
 };
 
+// Badge labels for high-signal NOTE event types that are NOT escalations.
+// Every entry in HIGH_SIGNAL_NOTE_EVENTS that is not in ESCALATION_EVENT_TYPES
+// should have an entry here so ContextBadges can render a red/amber badge
+// without a separate else-if branch per type. The invariant test in
+// MessagesPanel.utils.test.ts guards against drift.
+export const HIGH_SIGNAL_NOTE_BADGE_LABELS: Readonly<Record<string, string>> = {
+  failure_alert: 'Failure Alert',
+  rollback_recommended: 'Rollback Recommended',
+  fix_loop_divergence_regressed: 'Fix Loop Diverged',
+  release_calcifying: 'Release Calcifying',
+  direction_outcome_stalled: 'Direction Stalled',
+  release_build_stalled: 'Build Stalled',
+  release_stabilize_stalled: 'Stabilize Stalled',
+  promotion_readiness_reached: 'Promotion Ready',
+};
+
 export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
   'failure_alert', 'rollback_recommended', 'fix_loop_divergence_regressed',
   'release_calcifying', 'direction_outcome_stalled', 'release_build_stalled',
@@ -747,4 +763,83 @@ export function resolveServerSavedViews(
   serverViews: SavedView[] | null,
 ): SavedView[] {
   return serverViews ?? localViews;
+}
+
+// ── Server-side temp-mutes (per-operator, per-project) ───────────────────────
+
+export async function fetchServerTempMutes(
+  projectId: string,
+): Promise<TemporaryMutes | null> {
+  try {
+    const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/temp-mutes?project_id=${encodeURIComponent(projectId)}`);
+    if (!res.ok) return null;
+    const data = await res.json() as { temp_mutes?: Record<string, unknown> };
+    const raw = data.temp_mutes ?? {};
+    const now = Date.now();
+    const mutes: TemporaryMutes = {};
+    for (const [et, exp] of Object.entries(raw)) {
+      if (typeof exp === 'number' && exp > now) mutes[et] = exp;
+    }
+    return mutes;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveServerTempMutes(
+  projectId: string,
+  mutes: TemporaryMutes,
+): Promise<void> {
+  try {
+    await apiFetch(`${API_BASE_URL}/api/admin/messages/temp-mutes`, {
+      method: 'PUT',
+      body: JSON.stringify({ project_id: projectId, temp_mutes: mutes }),
+    });
+  } catch { /* ignore — localStorage copy remains authoritative offline */ }
+}
+
+export function resolveServerTempMutes(
+  localMutes: TemporaryMutes,
+  serverMutes: TemporaryMutes | null,
+): TemporaryMutes {
+  return serverMutes ?? localMutes;
+}
+
+// ── Server-side mute-window (per-operator, per-project) ──────────────────────
+// Three-valued return: MuteWindow = active, null = server says cleared, undefined = fetch failed.
+// resolveServerMuteWindow uses undefined to distinguish offline from an intentional clear.
+
+export async function fetchServerMuteWindow(
+  projectId: string,
+): Promise<MuteWindow | null | undefined> {
+  try {
+    const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/mute-window?project_id=${encodeURIComponent(projectId)}`);
+    if (!res.ok) return undefined;
+    const data = await res.json() as { mute_window?: { expires_at?: unknown } | null };
+    const raw = data.mute_window;
+    if (!raw || typeof raw.expires_at !== 'number' || raw.expires_at <= Date.now()) return null;
+    return { expiresAt: raw.expires_at };
+  } catch {
+    return undefined;
+  }
+}
+
+export async function saveServerMuteWindow(
+  projectId: string,
+  muteWin: MuteWindow | null,
+): Promise<void> {
+  try {
+    await apiFetch(`${API_BASE_URL}/api/admin/messages/mute-window`, {
+      method: 'PUT',
+      body: JSON.stringify({ project_id: projectId, expires_at: muteWin ? muteWin.expiresAt : null }),
+    });
+  } catch { /* ignore — localStorage copy remains authoritative offline */ }
+}
+
+export function resolveServerMuteWindow(
+  localWin: MuteWindow | null,
+  serverWin: MuteWindow | null | undefined,
+): MuteWindow | null {
+  if (serverWin === undefined) return localWin;
+  return serverWin;
 }
