@@ -1032,6 +1032,7 @@ async def _spawn_pipeline_task(
     current_issues: list | None = None,
     ci_failure_logs: str = "",
     investigated_files: list[str] | None = None,
+    skip_rereview_minor_only: bool = False,
     suppress_warm_handoff: bool = False,
 ) -> tuple[Task | None, bool]:
     """Spawn a review or fix task as part of the automated review pipeline.
@@ -2157,6 +2158,14 @@ async def _spawn_pipeline_task(
         **(
             {"fix_agent_responses": accumulated_responses}
             if accumulated_responses
+            else {}
+        ),
+        # First-pass minor-only marker: when set, the fix-completion handler
+        # skips the follow-up re-review (CI gates the merge instead), since the
+        # fix only addressed minor nits. See task_lifecycle.py fix-completion.
+        **(
+            {"skip_rereview_minor_only": True}
+            if (task_type == "fix" and skip_rereview_minor_only)
             else {}
         ),
     }

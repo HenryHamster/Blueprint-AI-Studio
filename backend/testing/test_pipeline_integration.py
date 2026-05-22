@@ -738,6 +738,219 @@ async def test_fix_task_spawns_review_on_completion(
     assert nr_loop.get("iteration") == 3
 
 
+@pytest.mark.asyncio
+async def test_review_minor_only_verdict_marks_fix_skip_rereview(
+    client: AsyncClient, db_session, mocker
+):
+    """First-pass REQUEST_CHANGES where every blocking issue is minor → the
+    spawned fix carries review_loop.skip_rereview_minor_only so its completion
+    handler can skip the follow-up re-review."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.broadcast.broadcast_to_project")
+
+    project = Project(name="Minor-Only Verdict Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    review_task = Task(
+        project_id=project.id,
+        title="Review PR #61",
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 61,
+                "branch": "blueprint/task-minor061",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 61,
+                "branch": "blueprint/task-minor061",
+                "base_branch": "main",
+                "iteration": 1,
+            }
+        },
+        vm_instance_id="agent-vm-minor-review-001",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    verdict_json = json.dumps(
+        {
+            "verdict": "REQUEST_CHANGES",
+            "feedback": "A couple of nits",
+            "issues": [
+                {"severity": "minor", "description": "Rename variable x to count"},
+                {"severity": "minor", "description": "Add a docstring to helper()"},
+            ],
+        }
+    )
+    await _status(
+        client,
+        review_task,
+        status="COMPLETED",
+        verdict_json=verdict_json,
+        logs="Review: minor nits only",
+    )
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != review_task.id,
+        )
+    )
+    fix_tasks = [t for t in result.scalars().all() if _task_type(t) == "fix"]
+    assert len(fix_tasks) == 1
+    f_loop = _review_loop(fix_tasks[0])
+    assert f_loop.get("skip_rereview_minor_only") is True
+
+
+@pytest.mark.asyncio
+async def test_review_with_major_issue_does_not_mark_skip_rereview(
+    client: AsyncClient, db_session, mocker
+):
+    """A REQUEST_CHANGES verdict containing a major issue must NOT mark the
+    spawned fix skip_rereview_minor_only — the re-review is still needed."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.broadcast.broadcast_to_project")
+
+    project = Project(name="Major Issue Verdict Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    review_task = Task(
+        project_id=project.id,
+        title="Review PR #62",
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 62,
+                "branch": "blueprint/task-major062",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 62,
+                "branch": "blueprint/task-major062",
+                "base_branch": "main",
+                "iteration": 1,
+            }
+        },
+        vm_instance_id="agent-vm-major-review-001",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    verdict_json = json.dumps(
+        {
+            "verdict": "REQUEST_CHANGES",
+            "feedback": "Needs work",
+            "issues": [
+                {"severity": "major", "description": "Null deref on user.id"},
+                {"severity": "minor", "description": "Rename variable x"},
+            ],
+        }
+    )
+    await _status(
+        client,
+        review_task,
+        status="COMPLETED",
+        verdict_json=verdict_json,
+        logs="Review: one major issue",
+    )
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != review_task.id,
+        )
+    )
+    fix_tasks = [t for t in result.scalars().all() if _task_type(t) == "fix"]
+    assert len(fix_tasks) == 1
+    f_loop = _review_loop(fix_tasks[0])
+    assert not f_loop.get("skip_rereview_minor_only")
+
+
+@pytest.mark.asyncio
+async def test_fix_task_minor_only_skips_rereview(
+    client: AsyncClient, db_session, mocker
+):
+    """A fix task carrying skip_rereview_minor_only COMPLETED → no re-review is
+    spawned; the task parks in EVALUATING/ci_waiting so CI gates the merge."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main.provision_agent_vm", return_value=True)
+    mocker.patch("app.broadcast.broadcast_to_project")
+
+    project = Project(name="Minor-Only Skip Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fix_task = Task(
+        project_id=project.id,
+        title="Fix PR #63",
+        payloads=[
+            {
+                "type": "fix",
+                "pr_number": 63,
+                "branch": "blueprint/task-minor063",
+                "base_branch": "main",
+                "prompt": "Address the minor nits",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": 63,
+                "branch": "blueprint/task-minor063",
+                "base_branch": "main",
+                "iteration": 2,
+                "skip_rereview_minor_only": True,
+            }
+        },
+        vm_instance_id="agent-vm-minor-fix-001",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+    await db_session.refresh(fix_task)
+
+    await _status(
+        client,
+        fix_task,
+        status="COMPLETED",
+        logs="Renamed variable per minor nit",
+    )
+
+    await db_session.refresh(fix_task)
+    # Parks in EVALUATING waiting for CI rather than spawning a re-review.
+    assert fix_task.status == TaskStatus.EVALUATING
+    fix_loop = _review_loop(fix_task)
+    assert fix_loop.get("ci_waiting") is True
+    assert fix_loop.get("review_approved") is True
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != fix_task.id,
+        )
+    )
+    review_tasks = [t for t in result.scalars().all() if _task_type(t) == "review"]
+    assert len(review_tasks) == 0, (
+        f"minor-only fix must not spawn a re-review, found: "
+        f"{[t.id for t in review_tasks]}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Edge cases
 # ---------------------------------------------------------------------------
