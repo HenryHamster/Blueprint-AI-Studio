@@ -31,6 +31,11 @@ from app.shared_state import limiter
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
 from app.task_locking import lock_project_or_429
 from app import notification_dispatch as _nd
+from app.playbook_learning import (
+    _archive_least_useful_entry,
+    _playbook_size_bytes,
+    _PLAYBOOK_CAPACITY_BYTES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +73,18 @@ class NoisePrefUpdate(BaseModel):
 class SavedViewsUpdate(BaseModel):
     project_id: str
     saved_views: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class TempMutesUpdate(BaseModel):
+    project_id: str
+    temp_mutes: Dict[str, int] = Field(
+        default_factory=dict
+    )  # event_type -> expiry ms epoch
+
+
+class MuteWindowUpdate(BaseModel):
+    project_id: str
+    expires_at: Optional[int] = None  # ms epoch; None clears the mute window
 
 
 class AdminPlaybookSet(BaseModel):
@@ -117,8 +134,22 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
         "fix_loop_divergence_regressed",
         "direction_outcome_stalled",
         "promotion_readiness_reached",
+        "release_calcifying",
+        "release_build_stalled",
+        "release_stabilize_stalled",
+        "release_ci_unresolved_stall",
+        "release_auto_merge_stalled",
     }
 )
+
+
+# Reserved keys within MessagesNoisePrefs.prefs for temp-mutes and mute-window.
+# Prefixed with underscore to avoid collision with event-type visibility keys.
+_TEMP_MUTES_KEY = "_temp_mutes"
+_MUTE_WINDOW_KEY = "_mute_window"
+# These keys are owned by their own dedicated PUT endpoints; the noise-prefs
+# (event-visibility) endpoint must never write them, only preserve them.
+_RESERVED_PREFS_KEYS = (_TEMP_MUTES_KEY, _MUTE_WINDOW_KEY)
 
 
 def append_routine_digest(project: Project, event_type: str, summary: str) -> None:
@@ -512,11 +543,26 @@ async def delete_message(
 
 @router.get("/messages/last-seen")
 async def get_messages_last_seen(
-    project_id: str = Query(...),
+    project_id: Optional[str] = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Return the operator's last-seen timestamp (ms epoch) for the messages panel divider."""
+    """Return the operator's last-seen timestamp (ms epoch) for the messages panel divider.
+
+    When project_id is omitted, returns the maximum last-seen across all the operator's
+    projects — useful for the Catch-up digest panel which shows activity cross-project.
+    """
+    if project_id is None:
+        # Cross-project max: same store as per-project last-seen, used by CatchUp digest
+        max_ts = (
+            await session.execute(
+                select(func.max(MessagesLastSeen.last_seen_at)).where(
+                    MessagesLastSeen.user_id == current_user["user_id"],
+                )
+            )
+        ).scalar_one_or_none()
+        return {"last_seen_at": int(max_ts.timestamp() * 1000) if max_ts else None}
+
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
@@ -632,14 +678,27 @@ async def put_messages_noise_prefs(
         )
     ).scalar_one_or_none()
 
+    # This endpoint only owns event-type visibility prefs. Strip any reserved
+    # keys from the incoming payload (they are owned by the temp-mutes and
+    # mute-window endpoints) and preserve the existing reserved values so a
+    # visibility save never clobbers an operator's active DND window or mutes.
+    visibility = {
+        k: v for k, v in payload.prefs.items() if k not in _RESERVED_PREFS_KEYS
+    }
+
     if row is None:
         row = MessagesNoisePrefs(
             user_id=current_user["user_id"],
             project_id=pid,
-            prefs=payload.prefs,
+            prefs=visibility,
         )
     else:
-        row.prefs = payload.prefs
+        existing = dict(row.prefs or {})
+        merged = dict(visibility)
+        for key in _RESERVED_PREFS_KEYS:
+            if key in existing:
+                merged[key] = existing[key]
+        row.prefs = merged
         flag_modified(row, "prefs")
 
     session.add(row)
@@ -713,6 +772,220 @@ async def put_messages_saved_views(
     session.add(row)
     await session.commit()
     return {"status": "ok"}
+
+
+# ── Messages Temp-Mutes Endpoints ────────────────────────────────────────────
+
+
+@router.get("/messages/temp-mutes")
+async def get_messages_temp_mutes(
+    project_id: str = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return active (non-expired) temporary event-type mutes for the operator."""
+    try:
+        pid = uuid.UUID(project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    row = (
+        await session.execute(
+            select(MessagesNoisePrefs).where(
+                MessagesNoisePrefs.user_id == current_user["user_id"],
+                MessagesNoisePrefs.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+
+    raw: Dict[str, int] = (row.prefs.get(_TEMP_MUTES_KEY) or {}) if row else {}
+    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    return {"temp_mutes": {et: exp for et, exp in raw.items() if exp > now_ms}}
+
+
+@router.put("/messages/temp-mutes")
+async def put_messages_temp_mutes(
+    payload: TempMutesUpdate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Upsert temporary event-type mutes for the operator. Expired entries are dropped."""
+    try:
+        pid = uuid.UUID(payload.project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    active = {et: exp for et, exp in payload.temp_mutes.items() if exp > now_ms}
+
+    row = (
+        await session.execute(
+            select(MessagesNoisePrefs).where(
+                MessagesNoisePrefs.user_id == current_user["user_id"],
+                MessagesNoisePrefs.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+
+    if row is None:
+        row = MessagesNoisePrefs(
+            user_id=current_user["user_id"],
+            project_id=pid,
+            prefs={_TEMP_MUTES_KEY: active},
+        )
+    else:
+        prefs = dict(row.prefs or {})
+        prefs[_TEMP_MUTES_KEY] = active
+        row.prefs = prefs
+        flag_modified(row, "prefs")
+
+    session.add(row)
+    await session.commit()
+    return {"status": "ok"}
+
+
+# ── Messages Mute-Window Endpoints ────────────────────────────────────────────
+
+
+@router.get("/messages/mute-window")
+async def get_messages_mute_window(
+    project_id: str = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the active do-not-disturb mute window for the operator, or null if expired/unset."""
+    try:
+        pid = uuid.UUID(project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    row = (
+        await session.execute(
+            select(MessagesNoisePrefs).where(
+                MessagesNoisePrefs.user_id == current_user["user_id"],
+                MessagesNoisePrefs.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+
+    stored = (row.prefs.get(_MUTE_WINDOW_KEY)) if row else None
+    if not stored or not isinstance(stored, dict):
+        return {"mute_window": None}
+    now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    if stored.get("expires_at", 0) <= now_ms:
+        return {"mute_window": None}
+    return {"mute_window": stored}
+
+
+@router.put("/messages/mute-window")
+async def put_messages_mute_window(
+    payload: MuteWindowUpdate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Upsert the do-not-disturb mute window. Set expires_at=null to clear it."""
+    try:
+        pid = uuid.UUID(payload.project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    entry = (
+        {"expires_at": payload.expires_at} if payload.expires_at is not None else None
+    )
+
+    row = (
+        await session.execute(
+            select(MessagesNoisePrefs).where(
+                MessagesNoisePrefs.user_id == current_user["user_id"],
+                MessagesNoisePrefs.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+
+    if row is None:
+        row = MessagesNoisePrefs(
+            user_id=current_user["user_id"],
+            project_id=pid,
+            prefs={_MUTE_WINDOW_KEY: entry},
+        )
+    else:
+        prefs = dict(row.prefs or {})
+        prefs[_MUTE_WINDOW_KEY] = entry
+        row.prefs = prefs
+        flag_modified(row, "prefs")
+
+    session.add(row)
+    await session.commit()
+    return {"status": "ok"}
+
+
+# ── Last-Visit-Timestamp Endpoints ───────────────────────────────────────────
+
+
+@router.get("/last-visit-timestamp")
+async def get_last_visit_timestamp(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Most-recent per-operator last-visit timestamp across all projects.
+
+    Reuses MessagesLastSeen so ActivityFeed and CatchUpPanel share the same
+    cross-device baseline as the Messages panel without a separate store.
+    """
+    max_ts = (
+        await session.execute(
+            select(func.max(MessagesLastSeen.last_seen_at)).where(
+                MessagesLastSeen.user_id == current_user["user_id"],
+            )
+        )
+    ).scalar_one_or_none()
+    return {"last_visit_at": int(max_ts.timestamp() * 1000) if max_ts else None}
+
+
+@router.put("/last-visit-timestamp")
+async def put_last_visit_timestamp(
+    payload: LastSeenUpdate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Persist the per-operator last-visit timestamp for cross-device home-panel baseline.
+
+    Writes to MessagesLastSeen (same store as the Messages panel last-seen
+    divider) so a single authoritative record drives all 'since last visit' UI.
+    """
+    try:
+        pid = uuid.UUID(payload.project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+    new_ts = datetime.fromtimestamp(
+        payload.timestamp / 1000.0, tz=timezone.utc
+    ).replace(tzinfo=None)
+    row = (
+        await session.execute(
+            select(MessagesLastSeen).where(
+                MessagesLastSeen.user_id == current_user["user_id"],
+                MessagesLastSeen.project_id == pid,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = MessagesLastSeen(
+            user_id=current_user["user_id"],
+            project_id=pid,
+            last_seen_at=new_ts,
+            updated_at=new_ts,
+        )
+    else:
+        row.last_seen_at = new_ts
+        row.updated_at = _utcnow()
+    session.add(row)
+    await session.commit()
+    return {"status": "ok", "last_visit_at": int(new_ts.timestamp() * 1000)}
 
 
 # ── Admin Playbook Endpoints ──────────────────────────────────────────────────
@@ -853,16 +1126,22 @@ async def admin_playbook_set(
     }
     if payload.applicable_types is not None:
         new_entry["applicable_types"] = payload.applicable_types
-    doc[playbook_key] = new_entry
 
-    playbook_total = sum(
-        len(json.dumps(v)) for k, v in doc.items() if k.startswith("playbook/")
-    )
-    if playbook_total > 30_000:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Playbook too large ({playbook_total} bytes, max 30KB total)",
-        )
+    # Evict least-useful entries until the incoming write fits within capacity.
+    # Loop so a single large write or an already-over-cap playbook self-heals.
+    entry_estimate = len(json.dumps(new_entry).encode())
+    while _playbook_size_bytes(doc) + entry_estimate > _PLAYBOOK_CAPACITY_BYTES:
+        size_before = _playbook_size_bytes(doc)
+        doc = _archive_least_useful_entry(doc)
+        if _playbook_size_bytes(doc) == size_before:
+            # No candidates were evictable — hard cap as final backstop.
+            playbook_total = _playbook_size_bytes(doc)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Playbook too large ({playbook_total} bytes, max {_PLAYBOOK_CAPACITY_BYTES} bytes total) and no entries are evictable",
+            )
+
+    doc[playbook_key] = new_entry
 
     meta = doc.get("_meta", {"revision": 0})
     meta["revision"] = meta.get("revision", 0) + 1

@@ -1428,6 +1428,71 @@ async def get_commit_date(
         return None
 
 
+async def list_pull_requests_for_commit(
+    token: str,
+    owner: str,
+    repo: str,
+    sha: str,
+    project_id: str | None = None,
+) -> list[dict]:
+    """List the pull request(s) associated with a commit SHA.
+
+    Wraps ``GET /repos/{owner}/{repo}/commits/{sha}/pulls`` — for a commit on a
+    default / integration branch this returns the merged PR that introduced it,
+    plus any open PR whose head is the commit.
+
+    The release qualifier uses this to find the PR head commit where
+    ``pull_request``-triggered CI actually ran: a freshly-merged ``automain``
+    HEAD commit carries no check-runs of its own because CI runs only on
+    ``pull_request`` events.
+
+    Returns the raw list of PR dicts (each carries ``number``, ``state``,
+    ``merged_at``, ``head``, ``base``).  Returns ``[]`` on any non-200 response
+    or unparseable body — graceful degradation, never raises for an API error.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    all_prs: list[dict] = []
+    url: str | None = (
+        f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}/pulls?per_page=100"
+    )
+    while url:
+        response = await _github_request(
+            "GET",
+            url,
+            headers,
+            project_id=project_id,
+        )
+        if response.status_code != 200:
+            logger.warning(
+                "[GITHUB] list_pull_requests_for_commit: %s/%s commit %s returned %s",
+                owner,
+                repo,
+                sha[:8] if sha else sha,
+                response.status_code,
+            )
+            return []
+        try:
+            page = response.json()
+        except (ValueError, TypeError):
+            logger.warning(
+                "[GITHUB] list_pull_requests_for_commit: unparseable body for "
+                "%s/%s commit %s",
+                owner,
+                repo,
+                sha[:8] if sha else sha,
+            )
+            return []
+        if not isinstance(page, list):
+            return []
+        all_prs.extend(page)
+        url = response.links.get("next", {}).get("url")
+    return all_prs
+
+
 async def is_ancestor_of(
     token: str,
     owner: str,
@@ -1489,8 +1554,7 @@ async def is_ancestor_of(
         compare_status = response.json().get("status")
     except (ValueError, TypeError) as exc:
         logger.warning(
-            "[GITHUB] is_ancestor_of: unparseable compare response for "
-            "%s/%s: %s",
+            "[GITHUB] is_ancestor_of: unparseable compare response for %s/%s: %s",
             owner,
             repo,
             exc,
@@ -1499,6 +1563,63 @@ async def is_ancestor_of(
     # "identical" (same commit) or "ahead" (descendant strictly contains the
     # ancestor) both mean ancestor_sha is reachable from descendant_ref.
     return compare_status in ("identical", "ahead")
+
+
+async def get_files_changed_between_refs(
+    token: str,
+    owner: str,
+    repo: str,
+    base_ref: str,
+    head_ref: str,
+    project_id: str | None = None,
+) -> list[str] | None:
+    """Return filenames that differ between ``base_ref`` and ``head_ref``.
+
+    Uses ``GET /repos/{owner}/{repo}/compare/{base}...{head}`` and extracts
+    the ``files[].filename`` list.  This is the content-aware landing check
+    for the rollup-squash case: when a task's original commit SHA is not an
+    ancestor of automain (because rollup re-applied the content under a new
+    squashed commit), comparing the two branch tips answers "are these files
+    still different?" — if the fix's target files are NOT in the diff, the
+    fix landed.
+
+    Returns ``None`` on API error so callers can treat indeterminate results
+    as such rather than silently assuming "not changed" or "changed".
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = await _github_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/compare/{base_ref}...{head_ref}",
+        headers,
+        project_id=project_id,
+    )
+    if response.status_code != 200:
+        logger.warning(
+            "[GITHUB] get_files_changed_between_refs: compare %s...%s for %s/%s "
+            "returned %s — cannot determine changed files",
+            base_ref,
+            head_ref,
+            owner,
+            repo,
+            response.status_code,
+        )
+        return None
+    try:
+        files = response.json().get("files", [])
+        return [f["filename"] for f in files if "filename" in f]
+    except (ValueError, TypeError, KeyError) as exc:
+        logger.warning(
+            "[GITHUB] get_files_changed_between_refs: unparseable compare response "
+            "for %s/%s: %s",
+            owner,
+            repo,
+            exc,
+        )
+        return None
 
 
 async def create_pull_request(
@@ -2155,39 +2276,71 @@ async def get_check_runs(
     repo: str,
     ref: str,
     project_id: str | None = None,
+    *,
+    treat_missing_as_success: bool = True,
 ) -> dict:
     """Get CI check run results for a commit SHA.
 
     Returns:
-        {"status": "completed"|"in_progress"|"pending",
+        {"status": "completed"|"in_progress"|"pending"|"no_checks",
          "conclusion": "success"|"failure"|None,
          "details": [{"name": str, "status": str, "conclusion": str|None}],
          "failed_logs": str}
+
+    ``treat_missing_as_success`` (opt-in, default True — preserves the historic
+    behaviour for every existing caller): when a commit has NO check-runs at
+    all this fails OPEN (``status="completed", conclusion="success"``) so the
+    orchestrator's CI-wait loop and the webhook handlers do not hang forever on
+    repos that simply have no CI configured.  Pass ``False`` to make an empty
+    check-runs list resolve to a distinct ``status="no_checks"`` (conclusion
+    ``None``) instead — the release qualifier passes this so it can tell
+    'no CI ever verified this commit' apart from 'CI ran and passed' and
+    refuse to promote on the absence of a signal.
     """
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    response = await _github_request(
-        "GET",
-        f"https://api.github.com/repos/{owner}/{repo}/commits/{ref}/check-runs",
-        headers,
-        project_id=project_id,
-    )
-    if response.status_code != 200:
-        logger.error(f"Failed to get check runs for {ref}: {response.text}")
-        return {
-            "status": "pending",
-            "conclusion": None,
-            "details": [],
-            "failed_logs": "",
-        }
 
-    data = response.json()
-    check_runs = data.get("check_runs", [])
+    check_runs = []
+    url = f"https://api.github.com/repos/{owner}/{repo}/commits/{ref}/check-runs?per_page=100"
+
+    while url:
+        response = await _github_request(
+            "GET",
+            url,
+            headers,
+            project_id=project_id,
+        )
+        if response.status_code != 200:
+            logger.error(f"Failed to get check runs for {ref}: {response.text}")
+            return {
+                "status": "pending",
+                "conclusion": None,
+                "details": [],
+                "failed_logs": "",
+            }
+
+        data = response.json()
+        check_runs.extend(data.get("check_runs", []))
+
+        # Follow pagination link to next page
+        url = response.links.get("next", {}).get("url")
 
     if not check_runs:
+        if not treat_missing_as_success:
+            # Strict mode (opt-in — the release qualifier).  An empty
+            # check-runs list is NOT a pass: the caller must distinguish
+            # 'no CI ran on this commit' from 'CI ran and passed', so a
+            # promotion can never fire purely because nothing verified the
+            # candidate.  Reported as a distinct "no_checks" status.
+            return {
+                "status": "no_checks",
+                "conclusion": None,
+                "details": [],
+                "failed_logs": "",
+            }
         # No CI configured on this repo — treat as passed so the
         # orchestrator doesn't wait 30 min for checks that will never arrive.
         return {
@@ -2362,14 +2515,17 @@ async def get_check_runs(
 # adding any cross-cycle staleness risk beyond the poll interval itself.
 _CHECK_RUNS_CACHE_TTL_S = 30
 _CHECK_RUNS_CACHE_MAX = 500  # entries; cheap eviction when oversized
-_check_runs_cache: dict[tuple[str, str, str], tuple[dict, float]] = {}
+_check_runs_cache: dict[tuple[str, str, str, bool], tuple[dict, float]] = {}
 
 
 def invalidate_check_runs_cache(owner: str, repo: str, head_sha: str) -> None:
     """Drop the cached check-runs result for a SHA — call when the caller
     observes a transition it needs to see immediately (e.g. a webhook arrived
-    indicating a new run started).  Safe to call when the key isn't present."""
-    _check_runs_cache.pop((owner, repo, head_sha), None)
+    indicating a new run started).  Safe to call when the key isn't present.
+
+    Drops both the lenient and strict cache variants for the SHA."""
+    _check_runs_cache.pop((owner, repo, head_sha, True), None)
+    _check_runs_cache.pop((owner, repo, head_sha, False), None)
 
 
 async def get_check_runs_cached(
@@ -2380,6 +2536,7 @@ async def get_check_runs_cached(
     *,
     project_id: str | None = None,
     ttl: float = _CHECK_RUNS_CACHE_TTL_S,
+    treat_missing_as_success: bool = True,
 ) -> dict:
     """Cached wrapper around ``get_check_runs``.
 
@@ -2387,10 +2544,14 @@ async def get_check_runs_cached(
     the next orchestrator cycle — the cache exists purely to deduplicate
     simultaneous fan-out from siblings watching the same PR, not to mask
     status changes over time.
+
+    ``treat_missing_as_success`` is forwarded to ``get_check_runs`` (default
+    True preserves the fail-open behaviour) and is part of the cache key so the
+    lenient and strict interpretations never serve each other's result.
     """
     import app.shared_state as _ss
 
-    key = (owner, repo, head_sha)
+    key = (owner, repo, head_sha, treat_missing_as_success)
     now = time.time()
     cached = _check_runs_cache.get(key)
     if cached is not None and (now - cached[1]) < ttl:
@@ -2398,7 +2559,14 @@ async def get_check_runs_cached(
             _ss.github_cache_hits.get("check_runs", 0) + 1
         )
         return cached[0]
-    result = await get_check_runs(token, owner, repo, head_sha, project_id=project_id)
+    result = await get_check_runs(
+        token,
+        owner,
+        repo,
+        head_sha,
+        project_id=project_id,
+        treat_missing_as_success=treat_missing_as_success,
+    )
     _check_runs_cache[key] = (result, now)
     # Lazy eviction: when the dict gets oversized, drop anything older than
     # 2x TTL.  Cheap, avoids unbounded growth across long-lived processes.
