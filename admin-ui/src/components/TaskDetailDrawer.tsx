@@ -336,19 +336,17 @@ export function TaskDetailDrawer({
                       rows={3}
                     />
                     <div className="flex gap-2">
-                      {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                       <button
                         onClick={() => { onRequestChanges(task.id, changesFeedback, 'fix'); setShowChangesForm(false); setChangesFeedback(''); }}
                         disabled={!changesFeedback.trim() || !!actionLoading}
-                        className="flex-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/20 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-1.5"
+                        className="flex-1 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/20 py-2 min-h-[44px] rounded-lg text-sm font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-1.5"
                       >
                         {actionLoading === 'request-changes' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : null} Send Fix
                       </button>
-                      {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                       <button
                         onClick={() => { onRequestChanges(task.id, changesFeedback || 'Re-review requested', 'review'); setShowChangesForm(false); setChangesFeedback(''); }}
                         disabled={!!actionLoading}
-                        className="flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-2 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-1.5"
+                        className="flex-1 bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/20 py-2 min-h-[44px] rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-1.5"
                       >
                         Re-review
                       </button>

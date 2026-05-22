@@ -521,17 +521,15 @@ function DirectionCardImpl({
                             <p className="text-[11px] text-amber-300 font-medium mb-1">Force research?</p>
                             <p className="text-[10px] text-neutral-400 mb-2 leading-relaxed">Bypasses the cooldown and queues a research task immediately.</p>
                             <div className="flex gap-2">
-                              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                               <button
                                 onClick={() => triggerResearch(d.id, true)}
-                                className="flex-1 text-[10px] px-2 py-1 rounded border bg-amber-950/60 border-amber-900/50 text-amber-300 hover:bg-amber-900/50 font-medium transition-colors"
+                                className="flex-1 text-[10px] px-2 py-1 min-h-[44px] rounded border bg-amber-950/60 border-amber-900/50 text-amber-300 hover:bg-amber-900/50 font-medium transition-colors"
                               >
                                 Force
                               </button>
-                              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                               <button
                                 onClick={() => setForceConfirmId(null)}
-                                className="flex-1 text-[10px] px-2 py-1 rounded border bg-neutral-800 border-neutral-700 text-neutral-400 hover:text-neutral-200 font-medium transition-colors"
+                                className="flex-1 text-[10px] px-2 py-1 min-h-[44px] rounded border bg-neutral-800 border-neutral-700 text-neutral-400 hover:text-neutral-200 font-medium transition-colors"
                               >
                                 Cancel
                               </button>
@@ -1021,10 +1019,8 @@ function DirectionCardImpl({
                 <div className="text-neutral-500 italic mt-1">{d.pending_update.rationale}</div>
               )}
               <div className="flex gap-2 mt-2">
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-                <button onClick={() => applyDirectionUpdate(d)} className="text-xs px-2 py-0.5 rounded border bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40 transition-colors">Apply</button>
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
-                <button onClick={() => dismissDirectionUpdate(d.id)} className="text-xs px-2 py-0.5 rounded border bg-neutral-800/60 border-neutral-700/60 text-neutral-400 hover:text-neutral-300 transition-colors">Dismiss</button>
+                <button onClick={() => applyDirectionUpdate(d)} className="text-xs px-2 py-0.5 min-h-[44px] rounded border bg-emerald-950/40 border-emerald-900/50 text-emerald-400 hover:bg-emerald-900/40 transition-colors">Apply</button>
+                <button onClick={() => dismissDirectionUpdate(d.id)} className="text-xs px-2 py-0.5 min-h-[44px] rounded border bg-neutral-800/60 border-neutral-700/60 text-neutral-400 hover:text-neutral-300 transition-colors">Dismiss</button>
               </div>
             </div>
           )}
