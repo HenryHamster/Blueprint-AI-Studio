@@ -2777,6 +2777,7 @@ async def list_regression_cases(
                     RegressionRemediationCase.status == RegressionCaseStatus.CLOSED,
                 )
                 .order_by(RegressionRemediationCase.last_seen_at.desc())
+                .limit(limit)
             )
         )
         .scalars()
@@ -2868,12 +2869,17 @@ async def regression_cases_layer_defense_density(
         compute_layer_defense_density,
     )
 
+    lookback_cutoff = datetime.utcnow() - timedelta(days=days)
     cases = (
         (
             await session.execute(
-                select(RegressionRemediationCase).where(
+                select(RegressionRemediationCase)
+                .where(
                     RegressionRemediationCase.project_id == project_id,
+                    RegressionRemediationCase.updated_at >= lookback_cutoff,
                 )
+                .order_by(RegressionRemediationCase.updated_at.desc())
+                .limit(2000)
             )
         )
         .scalars()
@@ -6093,10 +6099,12 @@ async def _compute_digest(
     if project_id:
         _funnel_filters.append(Task.project_id == project_id)
     _inv_result = await session.execute(
-        select(Task).where(
+        select(Task)
+        .where(
             *_funnel_filters,
             Task.payloads[0]["type"].as_string() == "investigate",
         )
+        .limit(2000)
     )
     _inv_tasks = _inv_result.scalars().all()
     # R4-W2 (M3): ``has_key`` uses the JSONB ``?`` operator so the
@@ -6352,7 +6360,7 @@ async def _compute_digest(
     if project_id:
         _rr_spawned_filters.append(ResidualRemediationCase.project_id == project_id)
     _rr_spawned_result = await session.execute(
-        select(ResidualRemediationCase).where(*_rr_spawned_filters)
+        select(ResidualRemediationCase).where(*_rr_spawned_filters).limit(500)
     )
     _rr_cases = list(_rr_spawned_result.scalars().all())
     _rr_active_filters = [
@@ -6378,6 +6386,7 @@ async def _compute_digest(
         select(ResidualRemediationCase)
         .where(*_rr_open_filters)
         .order_by(ResidualRemediationCase.last_seen_at.desc())
+        .limit(500)
     )
     _rr_open_cases = list(_rr_open_result.scalars().all())
     residual_remediation_funnel: Dict[str, Any] = {

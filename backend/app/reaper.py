@@ -389,7 +389,15 @@ async def _sweep_orphan_direction_holds(session) -> int:
     )
 
     live_dids: set[str] = set()
-    projects = (await session.execute(select(Project))).scalars().all()
+    projects = (
+        (
+            await session.execute(
+                select(Project).options(load_only(Project.id, Project.directions))
+            )
+        )
+        .scalars()
+        .all()
+    )
     for proj in projects:
         for d in proj.directions or []:
             if d.get("status") in ("active", "paused", "proposed"):

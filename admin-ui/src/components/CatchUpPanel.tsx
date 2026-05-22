@@ -627,6 +627,55 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
     { key: '7d', label: 'Last 7d' },
   ];
 
+  const costs = useMemo(
+    () => (digest?.trend_history ?? []).filter(p => p.period_cost_usd != null).map(p => p.period_cost_usd as number),
+    [digest?.trend_history]
+  );
+
+  const directionCostTotals = useMemo(() => {
+    const totals: Record<string, number> = {};
+    for (const dp of digest?.direction_progress ?? []) {
+      if (!dp.cost_by_scope) continue;
+      for (const [scope, usd] of Object.entries(dp.cost_by_scope)) {
+        if (typeof usd === 'number' && usd > 0) {
+          totals[scope] = (totals[scope] ?? 0) + usd;
+        }
+      }
+    }
+    return totals;
+  }, [digest?.direction_progress]);
+
+  const FILTER_KEYS: { key: string; label: string }[] = [
+    { key: 'hash_dedup', label: 'hash dedup' },
+    { key: 'word_overlap', label: 'word overlap' },
+    { key: 'file_overlap', label: 'file overlap' },
+    { key: 'type_filtered', label: 'type filter' },
+    { key: 'empty_prompt', label: 'empty prompt' },
+    { key: 'batch_cap', label: 'batch cap' },
+  ];
+
+  const drops = useMemo(() => {
+    const ff = digest?.pipeline_filter_funnel;
+    if (!ff) return [];
+    return FILTER_KEYS
+      .map(f => ({ ...f, v: ff[f.key] ?? 0 }))
+      .filter(f => f.v > 0)
+      .sort((a, b) => b.v - a.v);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [digest?.pipeline_filter_funnel]);
+
+  const history = useMemo(() => digest?.trend_history ?? [], [digest?.trend_history]);
+
+  const trendFor = useCallback((cat: string): { arrow: string; color: string } => {
+    if (history.length < 4) return { arrow: '–', color: 'text-neutral-500' };
+    const sumAt = (arr: typeof history) => arr.reduce((a, p) => a + (p.failed_by_taxonomy?.[cat] ?? 0), 0);
+    const recent = sumAt(history.slice(-2));
+    const prior = sumAt(history.slice(-4, -2));
+    if (recent > prior) return { arrow: '↑', color: 'text-red-400' };
+    if (recent < prior) return { arrow: '↓', color: 'text-emerald-400' };
+    return { arrow: '–', color: 'text-neutral-500' };
+  }, [history]);
+
   return (
     <div className="mb-4 shrink-0">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-2">
@@ -999,7 +1048,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                   <span className="inline-flex items-center gap-0.5 text-neutral-500 font-mono" title="Total estimated spend">
                     <DollarSign className="w-2.5 h-2.5" />{digest.total_estimated_cost_usd.toFixed(2)} total
                     {(() => {
-                      const costs = (digest.trend_history ?? []).filter(p => p.period_cost_usd != null).map(p => p.period_cost_usd as number);
                       if (costs.length < 2) return null;
                       const curr = costs[costs.length - 1];
                       const prev = costs[costs.length - 2];
@@ -1028,26 +1076,16 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                   </span>
                 )}
                 {(() => {
-                  const dps = digest.direction_progress;
-                  if (!dps || dps.length === 0) return null;
-                  const totals: Record<string, number> = {};
-                  for (const dp of dps) {
-                    if (!dp.cost_by_scope) continue;
-                    for (const [scope, usd] of Object.entries(dp.cost_by_scope)) {
-                      if (typeof usd === 'number' && usd > 0) {
-                        totals[scope] = (totals[scope] ?? 0) + usd;
-                      }
-                    }
-                  }
+                  if (!digest.direction_progress || digest.direction_progress.length === 0) return null;
                   const order = ['small', 'medium', 'large'];
-                  const entries = order.filter(s => totals[s] != null);
+                  const entries = order.filter(s => directionCostTotals[s] != null);
                   if (entries.length === 0) return null;
-                  const title = `Cost by scope: ${entries.map(s => `${s} $${totals[s].toFixed(2)}`).join(' · ')}`;
+                  const title = `Cost by scope: ${entries.map(s => `${s} $${directionCostTotals[s].toFixed(2)}`).join(' · ')}`;
                   return (
                     <span className="inline-flex items-center gap-1 font-mono text-neutral-500" title={title}>
                       {entries.map(s => (
                         <span key={s} className="inline-flex items-center gap-0.5 rounded bg-neutral-100 px-1 py-0.5 text-[10px]">
-                          {s} ${totals[s].toFixed(2)}
+                          {s} ${directionCostTotals[s].toFixed(2)}
                         </span>
                       ))}
                     </span>
@@ -1118,18 +1156,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                 const produced = ff.findings_produced ?? 0;
                 const created = ff.tasks_created ?? 0;
                 const pct = produced > 0 ? Math.round((created / produced) * 100) : 0;
-                const FILTER_KEYS: { key: string; label: string }[] = [
-                  { key: 'hash_dedup', label: 'hash dedup' },
-                  { key: 'word_overlap', label: 'word overlap' },
-                  { key: 'file_overlap', label: 'file overlap' },
-                  { key: 'type_filtered', label: 'type filter' },
-                  { key: 'empty_prompt', label: 'empty prompt' },
-                  { key: 'batch_cap', label: 'batch cap' },
-                ];
-                const drops = FILTER_KEYS
-                  .map(f => ({ ...f, v: ff[f.key] ?? 0 }))
-                  .filter(f => f.v > 0)
-                  .sort((a, b) => b.v - a.v);
                 return (
                   <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-neutral-400">
                     <span className="text-[10px] text-neutral-500 uppercase tracking-wide">Research yield</span>
@@ -1477,16 +1503,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                     costByTaxonomy[t.taxonomy] = (costByTaxonomy[t.taxonomy] ?? 0) + perTask;
                   }
                 }
-                const history = digest.trend_history ?? [];
-                const trendFor = (cat: string): {arrow: string; color: string} => {
-                  if (history.length < 4) return {arrow: '–', color: 'text-neutral-500'};
-                  const sumAt = (arr: typeof history) => arr.reduce((a, p) => a + (p.failed_by_taxonomy?.[cat] ?? 0), 0);
-                  const recent = sumAt(history.slice(-2));
-                  const prior = sumAt(history.slice(-4, -2));
-                  if (recent > prior) return {arrow: '↑', color: 'text-red-400'};
-                  if (recent < prior) return {arrow: '↓', color: 'text-emerald-400'};
-                  return {arrow: '–', color: 'text-neutral-500'};
-                };
                 return (
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Root cause</span>

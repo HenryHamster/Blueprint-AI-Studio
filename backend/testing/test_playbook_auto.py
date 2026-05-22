@@ -1538,13 +1538,18 @@ def test_maybe_archive_for_capacity_triggers_at_threshold():
 
     current_size = _playbook_size_bytes(doc)
 
-    # If already over capacity, archiving should trigger
+    # If already over capacity, archiving should trigger and loop until under cap
     if current_size >= _PLAYBOOK_CAPACITY_BYTES:
+        from app.playbook_learning import _playbook_size_bytes
+
         keys_before = {k for k in doc if k.startswith("playbook/")}
         result = maybe_archive_for_capacity(doc, 0)
         keys_after = {k for k in result if k.startswith("playbook/")}
-        assert len(keys_after) < len(keys_before), "An entry should have been archived"
-        assert len(result.get("playbook_archive", [])) == 1
+        assert len(keys_after) < len(keys_before), (
+            "At least one entry should have been archived"
+        )
+        # Loop must evict enough entries to bring size under cap
+        assert _playbook_size_bytes(result) <= _PLAYBOOK_CAPACITY_BYTES
 
 
 def test_maybe_archive_for_capacity_no_op_when_under_limit():
@@ -1561,6 +1566,112 @@ def test_maybe_archive_for_capacity_no_op_when_under_limit():
     result = maybe_archive_for_capacity(doc, 0)
     assert "playbook/tiny" in result
     assert "playbook_archive" not in result
+
+
+def test_maybe_archive_for_capacity_loops_multiple_times_for_large_estimate():
+    """Loop evicts multiple entries when a single eviction is insufficient for the estimate."""
+    from app.playbook_learning import (
+        maybe_archive_for_capacity,
+        _PLAYBOOK_CAPACITY_BYTES,
+        _playbook_size_bytes,
+    )
+
+    # Build a doc over capacity with many small entries so one eviction won't suffice.
+    entry_count = 60
+    doc: dict = {}
+    for i in range(entry_count):
+        doc[f"playbook/entry-{i:03d}"] = {
+            "content": "x" * 430,  # ~450 B per entry → ~27 KB total
+            "confirmed_count": 0,
+            "updated_at": (_utcnow() - timedelta(days=i)).isoformat(),
+        }
+
+    # A large estimate forces multiple evictions to make room.
+    large_estimate = 5 * 1024  # 5 KB
+
+    keys_before = {k for k in doc if k.startswith("playbook/")}
+    result = maybe_archive_for_capacity(doc, large_estimate)
+    keys_after = {k for k in result if k.startswith("playbook/")}
+
+    evicted = len(keys_before) - len(keys_after)
+    assert evicted > 1, (
+        f"Expected more than 1 eviction for a {large_estimate}-byte estimate, got {evicted}"
+    )
+    archive = result.get("playbook_archive", [])
+    assert len(archive) == evicted, (
+        "Every evicted entry should appear in playbook_archive"
+    )
+    # Remaining playbook + estimate must fit within capacity.
+    assert _playbook_size_bytes(result) + large_estimate <= _PLAYBOOK_CAPACITY_BYTES
+
+
+def test_maybe_archive_for_capacity_exits_gracefully_when_no_evictable_entries():
+    """Loop exits without archiving when there are no playbook/* entries to evict."""
+    from app.playbook_learning import (
+        maybe_archive_for_capacity,
+        _PLAYBOOK_CAPACITY_BYTES,
+    )
+
+    # Non-playbook keys only — nothing archiveable.
+    doc: dict = {
+        "_meta": {"revision": 1},
+        "some_other_key": "not a playbook entry",
+    }
+
+    large_estimate = (
+        _PLAYBOOK_CAPACITY_BYTES + 1000
+    )  # would need eviction if entries existed
+    result = maybe_archive_for_capacity(doc, large_estimate)
+
+    assert "playbook_archive" not in result, (
+        "No archive created when nothing was evictable"
+    )
+    assert result is doc or result == doc, (
+        "Doc returned unchanged when nothing to evict"
+    )
+
+
+def test_maybe_archive_for_capacity_evicted_entry_triggers_resurrection_cooldown():
+    """An entry evicted via capacity management retains _archived_at, which blocks
+    _is_auto_playbook_suppressed from re-creating it within the cooldown window.
+    """
+    from app.playbook_learning import (
+        maybe_archive_for_capacity,
+        _is_auto_playbook_suppressed,
+        _PLAYBOOK_CAPACITY_BYTES,
+    )
+
+    victim_key = "playbook/auto-test-pattern"
+    # Two large entries so the playbook is over capacity; the older one (victim) evicts first.
+    half = _PLAYBOOK_CAPACITY_BYTES // 2
+    doc: dict = {
+        victim_key: {
+            "content": "y" * (half - 50),
+            "confirmed_count": 0,
+            "source": "auto-generated",
+            "updated_at": (_utcnow() - timedelta(days=60)).isoformat(),
+        },
+        "playbook/newer-entry": {
+            "content": "z" * (half - 50),
+            "confirmed_count": 5,
+            "source": "auto-generated",
+            "updated_at": _utcnow().isoformat(),
+        },
+    }
+
+    result = maybe_archive_for_capacity(doc, 500)
+
+    archive = result.get("playbook_archive", [])
+    assert any(e.get("_archived_key") == victim_key for e in archive), (
+        "Evicted entry must appear in playbook_archive"
+    )
+    assert victim_key not in result, (
+        "Evicted key must be removed from the active playbook"
+    )
+    # The cooldown must now block re-creation of the same key.
+    assert _is_auto_playbook_suppressed(result, victim_key), (
+        "Entry evicted for capacity should be suppressed within the resurrection cooldown window"
+    )
 
 
 @pytest.mark.asyncio

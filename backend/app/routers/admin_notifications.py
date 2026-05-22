@@ -31,6 +31,11 @@ from app.shared_state import limiter
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
 from app.task_locking import lock_project_or_429
 from app import notification_dispatch as _nd
+from app.playbook_learning import (
+    _archive_least_useful_entry,
+    _playbook_size_bytes,
+    _PLAYBOOK_CAPACITY_BYTES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -853,16 +858,22 @@ async def admin_playbook_set(
     }
     if payload.applicable_types is not None:
         new_entry["applicable_types"] = payload.applicable_types
-    doc[playbook_key] = new_entry
 
-    playbook_total = sum(
-        len(json.dumps(v)) for k, v in doc.items() if k.startswith("playbook/")
-    )
-    if playbook_total > 30_000:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Playbook too large ({playbook_total} bytes, max 30KB total)",
-        )
+    # Evict least-useful entries until the incoming write fits within capacity.
+    # Loop so a single large write or an already-over-cap playbook self-heals.
+    entry_estimate = len(json.dumps(new_entry).encode())
+    while _playbook_size_bytes(doc) + entry_estimate > _PLAYBOOK_CAPACITY_BYTES:
+        size_before = _playbook_size_bytes(doc)
+        doc = _archive_least_useful_entry(doc)
+        if _playbook_size_bytes(doc) == size_before:
+            # No candidates were evictable — hard cap as final backstop.
+            playbook_total = _playbook_size_bytes(doc)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Playbook too large ({playbook_total} bytes, max 30KB total) and no entries are evictable",
+            )
+
+    doc[playbook_key] = new_entry
 
     meta = doc.get("_meta", {"revision": 0})
     meta["revision"] = meta.get("revision", 0) + 1

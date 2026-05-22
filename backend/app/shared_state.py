@@ -798,10 +798,19 @@ async def hydrate_persistent_anomalies(session) -> int:
     """
     from app.models import Project
     from sqlmodel import select
+    from sqlalchemy.orm import load_only
 
     loaded = 0
     try:
-        projects = (await session.execute(select(Project))).scalars().all()
+        projects = (
+            (
+                await session.execute(
+                    select(Project).options(load_only(Project.id, Project.design_doc))
+                )
+            )
+            .scalars()
+            .all()
+        )
         for project in projects:
             stored = (project.design_doc or {}).get(_ANOMALY_FINGERPRINTS_KEY)
             if not isinstance(stored, dict) or not stored:
@@ -863,10 +872,21 @@ async def hydrate_regression_signal_state(session) -> int:
     """
     from app.models import Project
     from sqlmodel import select
+    from sqlalchemy.orm import load_only
 
     loaded = 0
     try:
-        projects = (await session.execute(select(Project))).scalars().all()
+        projects = (
+            (
+                await session.execute(
+                    select(Project).options(
+                        load_only(Project.id, Project.regression_signal_state)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
         for project in projects:
             stored = project.regression_signal_state
             if not isinstance(stored, dict) or not stored:

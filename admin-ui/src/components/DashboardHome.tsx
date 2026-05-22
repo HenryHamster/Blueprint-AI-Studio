@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import {
   TrendingUp,
   TrendingDown,
@@ -1162,19 +1162,18 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     return () => clearInterval(id);
   }, [fetchData]);
 
+  const { activeCount, queuedCount } = useMemo(() => ({
+    activeCount: tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length,
+    queuedCount: tasks.filter(t => t.status === 'QUEUED').length,
+  }), [tasks]);
+
   // Sparkline sampling
   useEffect(() => {
-    const active = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length;
-    const queued = tasks.filter(t => t.status === 'QUEUED').length;
     const failed = digest?.failed_count ?? 0;
-    const next = [...sparkRef.current, { active, queued, failed }].slice(-60);
+    const next = [...sparkRef.current, { active: activeCount, queued: queuedCount, failed }].slice(-60);
     sparkRef.current = next;
     setSparkData(next);
-  }, [tasks, digest?.failed_count]);
-
-  // Derived counts
-  const activeCount = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length;
-  const queuedCount = tasks.filter(t => t.status === 'QUEUED').length;
+  }, [activeCount, queuedCount, digest?.failed_count]);
   const failedCount = digest?.failed_count ?? 0;
   const successRate = digest?.success_rate;
 
@@ -1186,21 +1185,24 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const mergeEvents = (digest?.recent_completions ?? []).filter(e => e.pr_url);
 
   // Direction progress sorted by priority (high → medium → low)
-  const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
-  const directions = [...(digest?.direction_progress ?? [])].sort((a, b) => (priorityOrder[a.priority] ?? 9) - (priorityOrder[b.priority] ?? 9));
-  const totalDirPRs = directions.reduce((s, d) => s + d.prs_merged, 0);
-  const hasAttribution = directions.some(d => d.autonomous_prs_merged != null || d.assisted_prs_merged != null);
-  const totalAutonomousPRs = hasAttribution ? directions.reduce((s, d) => s + (d.autonomous_prs_merged ?? 0), 0) : null;
-  const totalAssistedPRs = hasAttribution ? directions.reduce((s, d) => s + (d.assisted_prs_merged ?? 0), 0) : null;
-  const selfSufficientCount = directions.filter(d => {
-    const history = d.research_history ?? [];
-    const histHasAttrib = history.some(e => e.autonomous_prs_merged != null);
-    const lifetimeAutonomous = histHasAttrib
-      ? history.reduce((s, e) => s + (e.autonomous_prs_merged ?? 0), 0) + ((d.history_aggregate?.total_autonomous_prs_merged as number | null) ?? 0)
-      : null;
-    const operatorActions = (d.history_aggregate?.total_operator_actions as number | null) ?? null;
-    return (lifetimeAutonomous ?? 0) >= 10 && operatorActions === 0;
-  }).length;
+  const { directions, totalDirPRs, hasAttribution, totalAutonomousPRs, totalAssistedPRs, selfSufficientCount } = useMemo(() => {
+    const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
+    const dirs = [...(digest?.direction_progress ?? [])].sort((a, b) => (priorityOrder[a.priority] ?? 9) - (priorityOrder[b.priority] ?? 9));
+    const totalDirPRs = dirs.reduce((s, d) => s + d.prs_merged, 0);
+    const hasAttribution = dirs.some(d => d.autonomous_prs_merged != null || d.assisted_prs_merged != null);
+    const totalAutonomousPRs = hasAttribution ? dirs.reduce((s, d) => s + (d.autonomous_prs_merged ?? 0), 0) : null;
+    const totalAssistedPRs = hasAttribution ? dirs.reduce((s, d) => s + (d.assisted_prs_merged ?? 0), 0) : null;
+    const selfSufficientCount = dirs.filter(d => {
+      const history = d.research_history ?? [];
+      const histHasAttrib = history.some(e => e.autonomous_prs_merged != null);
+      const lifetimeAutonomous = histHasAttrib
+        ? history.reduce((s, e) => s + (e.autonomous_prs_merged ?? 0), 0) + ((d.history_aggregate?.total_autonomous_prs_merged as number | null) ?? 0)
+        : null;
+      const operatorActions = (d.history_aggregate?.total_operator_actions as number | null) ?? null;
+      return (lifetimeAutonomous ?? 0) >= 10 && operatorActions === 0;
+    }).length;
+    return { directions: dirs, totalDirPRs, hasAttribution, totalAutonomousPRs, totalAssistedPRs, selfSufficientCount };
+  }, [digest?.direction_progress]);
   const productPct = digest?.overall_product_ratio != null ? Math.round(digest.overall_product_ratio * 100) : null;
 
   return (

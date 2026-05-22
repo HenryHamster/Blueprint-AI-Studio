@@ -1,8 +1,10 @@
+import json
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import Project
+from app.playbook_learning import _PLAYBOOK_CAPACITY_BYTES
 from testing.factories import make_membership
 
 
@@ -446,3 +448,88 @@ async def test_admin_playbook_patch_invalid_action(
         json={"action": "invalid"},
     )
     assert resp.status_code == 422
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_admin_playbook_set_evicts_at_cap(
+    client: AsyncClient, db_session, project_with_member
+):
+    """PUT /playbook evicts least-useful entry when playbook is at capacity."""
+    project = project_with_member
+
+    # Fill playbook beyond _PLAYBOOK_CAPACITY_BYTES with low-confirmed entries.
+    # Each entry: key + ~2000-byte content = ~2050 bytes; 13 entries ~ 26.6KB > 25KB cap.
+    filler_content = "x" * 1900
+    doc = {}
+    for i in range(13):
+        doc[f"playbook/filler-{i:02d}"] = {
+            "content": filler_content,
+            "source_task_id": None,
+            "updated_at": "2025-01-01T00:00:00",
+            "confirmed_count": 0,
+            "followed_count": 0,
+        }
+    assert (
+        len(
+            json.dumps(
+                {k: v for k, v in doc.items() if k.startswith("playbook/")}
+            ).encode()
+        )
+        > _PLAYBOOK_CAPACITY_BYTES
+    )
+
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.put(
+        f"/api/admin/projects/{project.id}/playbook",
+        json={"key": "new-entry", "value": "new knowledge"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(project)
+    # New entry was written.
+    assert "playbook/new-entry" in project.design_doc
+    # At least one filler entry was evicted to archive.
+    archive = project.design_doc.get("playbook_archive", [])
+    assert len(archive) >= 1
+    evicted_keys = {a.get("_archived_key") for a in archive}
+    assert any(k.startswith("playbook/filler-") for k in evicted_keys)
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_admin_playbook_set_fails_when_nothing_evictable(
+    client: AsyncClient, db_session, project_with_member, monkeypatch
+):
+    """PUT /playbook returns 400 when at cap and no entry can be evicted."""
+    import app.routers.admin_notifications as _router_mod
+
+    # Patch _archive_least_useful_entry to be a no-op (simulates all entries protected).
+    monkeypatch.setattr(_router_mod, "_archive_least_useful_entry", lambda doc: doc)
+
+    project = project_with_member
+    # Fill playbook so it exceeds capacity.
+    filler_content = "x" * 1900
+    doc = {}
+    for i in range(13):
+        doc[f"playbook/filler-{i:02d}"] = {
+            "content": filler_content,
+            "source_task_id": None,
+            "updated_at": "2025-01-01T00:00:00",
+            "confirmed_count": 0,
+        }
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.put(
+        f"/api/admin/projects/{project.id}/playbook",
+        json={"key": "new-entry", "value": "new knowledge"},
+    )
+    assert resp.status_code == 400
+    assert "evictable" in resp.json()["error"]["message"].lower()

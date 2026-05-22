@@ -562,15 +562,20 @@ def _mark_stale_review_entries(doc: dict) -> bool:
 
 
 def maybe_archive_for_capacity(doc: dict, new_entry_estimate: int = 0) -> dict:
-    """Archive the least-useful playbook entry if total size would exceed capacity.
+    """Archive least-useful playbook entries until the incoming write fits within capacity.
 
-    Call this *before* adding a new entry.  *new_entry_estimate* is the
-    approximate byte size of the entry that is about to be added.
+    Loops until either sufficient space is freed or nothing is evictable, so a
+    single large write or an already-over-cap playbook self-heals rather than
+    staying permanently unwritable. Call this *before* adding a new entry.
+    *new_entry_estimate* is the approximate byte size of the entry to be added.
 
     Returns the (possibly mutated) doc.
     """
-    if _playbook_size_bytes(doc) + new_entry_estimate > _PLAYBOOK_CAPACITY_BYTES:
+    while _playbook_size_bytes(doc) + new_entry_estimate > _PLAYBOOK_CAPACITY_BYTES:
+        size_before = _playbook_size_bytes(doc)
         doc = _archive_least_useful_entry(doc)
+        if _playbook_size_bytes(doc) >= size_before:
+            break  # nothing evictable; size didn't shrink
     return doc
 
 

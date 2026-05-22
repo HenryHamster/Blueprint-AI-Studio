@@ -433,8 +433,6 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     return ta - tb;
   };
 
-  const byTimeDesc = (a: ProjectMessage, b: ProjectMessage) => -byTime(a, b);
-
   const matchesSearch = (msg: ProjectMessage): boolean => {
     if (!searchQuery.trim()) return true;
     const q = searchQuery.toLowerCase();
@@ -450,30 +448,15 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     return false;
   };
 
-  const SEVERITY_RANK: Record<string, number> = { BLOCKER: 0, BUG_REPORT: 1, FEEDBACK: 2, NOTE: 3 };
-  const CONTEXT_SEVERITY_RANK: Record<string, number> = { high: 0, medium: 1, low: 2 };
-  const bySeverity = (a: ProjectMessage, b: ProjectMessage) => {
-    const ra = SEVERITY_RANK[a.message_type] ?? 3;
-    const rb = SEVERITY_RANK[b.message_type] ?? 3;
-    if (ra !== rb) return ra - rb;
-    // Same message_type, compare by context.severity
-    const sa = (a.context.severity as string | undefined) ?? 'undefined';
-    const sb = (b.context.severity as string | undefined) ?? 'undefined';
-    const sa_rank = CONTEXT_SEVERITY_RANK[sa] ?? 3;
-    const sb_rank = CONTEXT_SEVERITY_RANK[sb] ?? 3;
-    if (sa_rank !== sb_rank) return sa_rank - sb_rank;
-    return byTimeDesc(a, b);
-  };
-
-  const openMessages = messages.filter(m => m.status === 'open' && (!criticalOnly || isCriticalSeverity(m)));
-  const resolvedMessages = messages.filter(m => m.status === 'resolved');
-  const openFeedbackMessages = openMessages.filter(m => m.message_type === 'FEEDBACK' && matchesSearch(m));
-
-  // Filter to only new messages when showOnlyNew is enabled
-  const isNewMessage = (m: ProjectMessage): boolean => {
-    if (!showOnlyNew || !dividerTime || !m.created_at) return true;
-    return parseTimestamp(m.created_at).getTime() > dividerTime;
-  };
+  const { openMessages, resolvedMessages, openFeedbackMessages } = useMemo(() => {
+    const open = messages.filter(m => m.status === 'open' && (!criticalOnly || isCriticalSeverity(m)));
+    return {
+      openMessages: open,
+      resolvedMessages: messages.filter(m => m.status === 'resolved'),
+      openFeedbackMessages: open.filter(m => m.message_type === 'FEEDBACK' && matchesSearch(m)),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages, criticalOnly, searchQuery]);
 
   // Count new high-signal messages (created after divider time) — for visual divider only
   const newHighSignalCount = dividerTime
@@ -491,7 +474,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
   const highSignalCount = countHighSignalMessages(messages);
 
   // Count new messages by type for the summary card (respecting mute prefs and criticalOnly)
-  const newMessageCounts = dividerTime
+  const newMessageCounts = useMemo(() => dividerTime
     ? {
         blockers: openMessages.filter(m =>
           m.message_type === 'BLOCKER' &&
@@ -523,41 +506,74 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
           effectiveSignal(m, eventPrefs, tempMutes) === 'high'
         ).length,
       }
-    : { blockers: 0, feedback: 0, bugReports: 0, routine: 0, highSignalNotes: 0 };
+    : { blockers: 0, feedback: 0, bugReports: 0, routine: 0, highSignalNotes: 0 },
+  [openMessages, dividerTime, eventPrefs, tempMutes]);
 
   // Total new count: each message counted exactly once (high-signal and routine are disjoint)
   const totalNewCount = newHighSignalCount + newMessageCounts.routine;
 
   // Split open messages by signal level, respecting per-event-type prefs and temp mutes, then filter by search
   const muteActive = isMuteWindowActive(muteWindow);
-  const highSignalOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs, tempMutes) === 'high' && matchesSearch(m) && isNewMessage(m))]
-    .sort(sortMode === 'importance' ? bySeverity : byTimeDesc);
-  // Always compute routine messages; mute only filters them from the non-promoted routine section
-  const routineOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs, tempMutes) === 'routine' && matchesSearch(m) && isNewMessage(m))].sort(byTimeDesc);
+  const { highSignalOpen, routineOpen } = useMemo(() => {
+    const isNew = (m: ProjectMessage): boolean => {
+      if (!showOnlyNew || !dividerTime || !m.created_at) return true;
+      return parseTimestamp(m.created_at).getTime() > dividerTime;
+    };
+    const SEVERITY_RANK_INNER: Record<string, number> = { BLOCKER: 0, BUG_REPORT: 1, FEEDBACK: 2, NOTE: 3 };
+    const CONTEXT_SEVERITY_RANK_INNER: Record<string, number> = { high: 0, medium: 1, low: 2 };
+    const byTimeDescInner = (a: ProjectMessage, b: ProjectMessage) => {
+      const ta = a.created_at ? parseTimestamp(a.created_at).getTime() : 0;
+      const tb = b.created_at ? parseTimestamp(b.created_at).getTime() : 0;
+      return tb - ta;
+    };
+    const bySeverityInner = (a: ProjectMessage, b: ProjectMessage) => {
+      const ra = SEVERITY_RANK_INNER[a.message_type] ?? 3;
+      const rb = SEVERITY_RANK_INNER[b.message_type] ?? 3;
+      if (ra !== rb) return ra - rb;
+      const sa = (a.context.severity as string | undefined) ?? 'undefined';
+      const sb = (b.context.severity as string | undefined) ?? 'undefined';
+      const sa_rank = CONTEXT_SEVERITY_RANK_INNER[sa] ?? 3;
+      const sb_rank = CONTEXT_SEVERITY_RANK_INNER[sb] ?? 3;
+      if (sa_rank !== sb_rank) return sa_rank - sb_rank;
+      return byTimeDescInner(a, b);
+    };
+    return {
+      highSignalOpen: [...openMessages.filter(m => effectiveSignal(m, eventPrefs, tempMutes) === 'high' && matchesSearch(m) && isNew(m))]
+        .sort(sortMode === 'importance' ? bySeverityInner : byTimeDescInner),
+      // Always compute routine messages; mute only filters them from the non-promoted routine section
+      routineOpen: [...openMessages.filter(m => effectiveSignal(m, eventPrefs, tempMutes) === 'routine' && matchesSearch(m) && isNew(m))].sort(byTimeDescInner),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openMessages, eventPrefs, tempMutes, searchQuery, sortMode, showOnlyNew, dividerTime]);
 
   // In importance mode, pin BLOCKERs at the top with a visual divider
   const pinnedBlockers = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type === 'BLOCKER') : [];
   const otherHighSignal = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type !== 'BLOCKER') : highSignalOpen;
 
   // Failing routine groups auto-promoted above the routine ops section
-  const allRoutineRows = collapseStaleRoutineRows(groupRoutineMessages(routineOpen));
-  const promotedGroups = allRoutineRows.filter(
-    (r): r is RoutineRow<ProjectMessage> & { kind: 'group' } =>
-      r.kind === 'group' && isFailingGroup(r.msgs) && eventPrefs[r.event_type] !== 'mute',
-  );
-  const promotedKeys = new Set(promotedGroups.map(r => r.key));
-  // When mute is active, filter out routine messages from the remaining section, but keep promoted groups
-  const remainingRoutineRows = muteActive
-    ? allRoutineRows.filter(r => promotedKeys.has((r as RoutineRow<ProjectMessage> & { key?: string }).key ?? ''))
-    : allRoutineRows.filter(r => r.kind !== 'group' || !promotedKeys.has(r.key));
-
-  // Auto-expand groups that have search matches
-  const groupsWithMatches = new Set(
-    allRoutineRows
-      .filter((r): r is RoutineRow<ProjectMessage> & { kind: 'group' } => r.kind === 'group' && r.msgs.length > 0)
-      .map(r => r.key)
-  );
-  const autoExpandedKeys = searchQuery.trim() ? groupsWithMatches : new Set();
+  const { promotedGroups, remainingRoutineRows, autoExpandedKeys } = useMemo(() => {
+    const rows = collapseStaleRoutineRows(groupRoutineMessages(routineOpen));
+    const promoted = rows.filter(
+      (r): r is RoutineRow<ProjectMessage> & { kind: 'group' } =>
+        r.kind === 'group' && isFailingGroup(r.msgs) && eventPrefs[r.event_type] !== 'mute',
+    );
+    const promotedSet = new Set(promoted.map(r => r.key));
+    // When mute is active, filter out routine messages from the remaining section, but keep promoted groups
+    const remaining = muteActive
+      ? rows.filter(r => promotedSet.has((r as RoutineRow<ProjectMessage> & { key?: string }).key ?? ''))
+      : rows.filter(r => r.kind !== 'group' || !promotedSet.has(r.key));
+    // Auto-expand groups that have search matches
+    const withMatches = new Set(
+      rows
+        .filter((r): r is RoutineRow<ProjectMessage> & { kind: 'group' } => r.kind === 'group' && r.msgs.length > 0)
+        .map(r => r.key)
+    );
+    return {
+      promotedGroups: promoted,
+      remainingRoutineRows: remaining,
+      autoExpandedKeys: searchQuery.trim() ? withMatches : new Set<string>(),
+    };
+  }, [routineOpen, eventPrefs, muteActive, searchQuery]);
 
   // Calculate 24-hour volume for each event type and memoize event types
   const { eventType24hVolume, sortedEventTypes } = useMemo(() => {

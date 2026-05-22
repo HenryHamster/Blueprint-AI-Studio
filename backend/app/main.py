@@ -121,7 +121,7 @@ from app.strategic_constants import (
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0110"
+EXPECTED_SCHEMA_REVISION = "0112"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -952,8 +952,7 @@ async def _create_orchestrator_error_alerts(
         f"The orchestrator has encountered {consecutive_errors} consecutive errors. "
         "The pipeline may be stalled. Check logs for details."
     )
-    projects = (await session.execute(select(Project))).scalars().all()
-    project_ids = [p.id for p in projects]
+    project_ids = (await session.execute(select(Project.id))).scalars().all()
     existing_rows = (
         (
             await session.execute(
@@ -970,18 +969,18 @@ async def _create_orchestrator_error_alerts(
         else []
     )
     projects_with_alert = {row[0] for row in existing_rows}
-    for project in projects:
-        if project.id in projects_with_alert:
+    for pid in project_ids:
+        if pid in projects_with_alert:
             continue
         alert = Alert(
-            project_id=project.id,
+            project_id=pid,
             severity=AlertSeverity.ERROR,
             title=title,
             message=msg,
         )
         session.add(alert)
         await broadcast_to_project(
-            str(project.id),
+            str(pid),
             "alert_created",
             {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
         )
@@ -1001,17 +1000,17 @@ async def _create_halted_alerts(
         f"Halted at: {halted_at.isoformat()}. "
         "Pipeline will auto-recover after 1h cooldown, or manually set max VMs > 0."
     )
-    projects = (await session.execute(select(Project))).scalars().all()
-    for project in projects:
+    project_ids = (await session.execute(select(Project.id))).scalars().all()
+    for pid in project_ids:
         alert = Alert(
-            project_id=project.id,
+            project_id=pid,
             severity=AlertSeverity.ERROR,
             title=title,
             message=msg,
         )
         session.add(alert)
         await broadcast_to_project(
-            str(project.id),
+            str(pid),
             "alert_created",
             {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
         )
@@ -1028,8 +1027,7 @@ async def _create_rollback_alerts(
         f"Deployment automatically rolled back from {rolled_back_from[:8]} "
         f"to {rolled_back_to[:8]}."
     )
-    projects = (await session.execute(select(Project))).scalars().all()
-    project_ids = [p.id for p in projects]
+    project_ids = (await session.execute(select(Project.id))).scalars().all()
     existing_rows = (
         (
             await session.execute(
@@ -1045,18 +1043,18 @@ async def _create_rollback_alerts(
         else []
     )
     projects_with_alert = {row[0] for row in existing_rows}
-    for project in projects:
-        if project.id in projects_with_alert:
+    for pid in project_ids:
+        if pid in projects_with_alert:
             continue
         alert = Alert(
-            project_id=project.id,
+            project_id=pid,
             severity=AlertSeverity.WARNING,
             title=title,
             message=msg,
         )
         session.add(alert)
         await broadcast_to_project(
-            str(project.id),
+            str(pid),
             "alert_created",
             {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
         )
@@ -1066,8 +1064,7 @@ async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
     """Create INFO alerts and dismiss existing HALTED ERROR alerts when deployment auto-recovers."""
     recovery_title = "Deployment auto-recovered from HALTED state after 1h cooldown"
     now = _utcnow()
-    projects = (await session.execute(select(Project))).scalars().all()
-    project_ids = [p.id for p in projects]
+    project_ids = (await session.execute(select(Project.id))).scalars().all()
     # Single batched query for all undismissed HALTED ERROR alerts across all projects
     halted_alerts = (
         (
@@ -1086,21 +1083,21 @@ async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
     halted_by_project: dict = {}
     for h in halted_alerts:
         halted_by_project.setdefault(h.project_id, []).append(h)
-    for project in projects:
+    for pid in project_ids:
         # Dismiss existing HALTED ERROR alerts for this project
-        for h in halted_by_project.get(project.id, []):
+        for h in halted_by_project.get(pid, []):
             h.dismissed_at = now
             session.add(h)
         # Create INFO recovery alert
         alert = Alert(
-            project_id=project.id,
+            project_id=pid,
             severity=AlertSeverity.INFO,
             title=recovery_title,
             message=recovery_title,
         )
         session.add(alert)
         await broadcast_to_project(
-            str(project.id),
+            str(pid),
             "alert_created",
             {"alert_id": str(alert.id), "severity": "INFO", "title": alert.title},
         )
@@ -2301,6 +2298,10 @@ from app.payload_schemas import (
     ALL_TASK_TYPES as _VALID_TASK_TYPES,
     validate_internal_payload as _validate_internal_payload,
 )
+from app.playbook_learning import (
+    maybe_archive_for_capacity as _maybe_archive_for_capacity,
+    _playbook_size_bytes,
+)
 
 
 class PlaybookUpdate(BaseModel):
@@ -2427,16 +2428,22 @@ async def update_playbook(
         # when the task ultimately fails to land the code.
         if task.status != TaskStatus.COMPLETED:
             entry["pending_source"] = str(task.id)
+        # Evict least-useful entries until there is room for the new write.
+        # Loop so a single large write or an already-over-cap state self-heals.
+        entry_estimate = len(_json.dumps(entry).encode())
+        while _playbook_size_bytes(doc) + entry_estimate > 30_000:
+            size_before = _playbook_size_bytes(doc)
+            doc = _maybe_archive_for_capacity(doc, entry_estimate)
+            if _playbook_size_bytes(doc) >= size_before:
+                break  # nothing evictable; size didn't shrink
         doc[playbook_key] = entry
-        # Size check: all playbook/* keys combined max 30KB
-        playbook_total = sum(
-            len(_json.dumps(v)) for k, v in doc.items() if k.startswith("playbook/")
-        )
+        # Final hard-cap check — only triggers when nothing was evictable.
+        playbook_total = _playbook_size_bytes(doc)
         if playbook_total > 30_000:
             del doc[playbook_key]  # rollback
             raise HTTPException(
                 status_code=400,
-                detail=f"Playbook too large ({playbook_total} bytes, max 30KB total)",
+                detail=f"Playbook too large ({playbook_total} bytes, max 30KB total) and no evictable entries",
             )
     elif op == "delete":
         doc.pop(f"playbook/{key}", None)

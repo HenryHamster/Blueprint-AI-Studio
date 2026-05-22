@@ -456,7 +456,7 @@ class Task(SQLModel, table=True):
     # — these are accepted by the CHECK constraint but should not be
     # introduced in production code paths. Enforced server-side by
     # ``chk_task_created_by`` (alembic 0065 / audit L-S1, Postgres-only).
-    created_by: str = Field(default="USER")
+    created_by: str = Field(default="USER", index=True)
     launched_by_user_id: str | None = Field(
         default=None
     )  # Firebase UID of the user who launched this task (for launcher-pays billing)

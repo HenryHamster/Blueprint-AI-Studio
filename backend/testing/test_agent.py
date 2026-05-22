@@ -1463,14 +1463,10 @@ async def test_playbook_size_limits(client: AsyncClient, db_session):
     assert resp.status_code == 400, f"Expected 400, got: {resp.json()}"
     assert "2KB" in resp.json()["error"]["message"]
 
-    # Total playbook limit: fill up to near 30KB then overflow.
-    # Each entry ~1500 chars value; with the per-entry metadata overhead
-    # (source_task_id, updated_at, confirmed_count, and pending_source while
-    # the source task is still IN_PROGRESS) each row is ~1620B, so ~17 fit
-    # under 30KB. The point of this test is the OVERFLOW behaviour, not the
-    # exact entry count, so we keep going until the 400 fires.
+    # Total playbook limit: at capacity, new writes succeed by evicting old entries
+    # rather than hard-rejecting.  Each entry ~1500 chars value; with metadata
+    # overhead each row is ~1620B, so ~17 fit under 30KB before eviction kicks in.
     large_value = "y" * 1500
-    accepted = 0
     for i in range(40):
         r = await client.post(
             "/api/agent/playbook",
@@ -1482,18 +1478,70 @@ async def test_playbook_size_limits(client: AsyncClient, db_session):
             },
             headers=headers,
         )
-        if r.status_code == 200:
-            accepted += 1
-            continue
-        # First rejection must be the size cap with the right message.
-        assert r.status_code == 400, f"Entry {i} unexpected status: {r.json()}"
-        assert "30KB" in r.json()["error"]["message"]
-        break
-    else:  # pragma: no cover — only fires if cap never triggered
-        raise AssertionError(
-            f"Playbook size cap never triggered after {accepted} accepted entries"
+        assert r.status_code == 200, (
+            f"Entry {i} rejected (eviction should have made room): {r.json()}"
         )
-    assert accepted >= 10, f"Cap fired too early — only {accepted} entries accepted"
+
+    # After 40 writes the archive must have entries — eviction happened.
+    await db_session.refresh(project)
+    doc = project.design_doc or {}
+    assert len(doc.get("playbook_archive") or []) > 0, (
+        "Expected eviction to populate playbook_archive"
+    )
+    # Playbook must still respect the hard cap.
+    from app.playbook_learning import _playbook_size_bytes as _psb
+
+    assert _psb(doc) <= 30_000, f"Hard cap violated: {_psb(doc)} bytes"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_playbook_set_rejects_when_nothing_evictable(
+    client: AsyncClient, db_session
+):
+    """When nothing can be evicted and the playbook is at the hard cap, set returns 400."""
+    from unittest.mock import patch
+
+    project = Project(name="Playbook Evict Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "Fix it"}],
+        vm_instance_id="agent-vm-playbook-evict",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-playbook-evict")
+    headers = {"x-agent-token": token}
+
+    # Simulate a playbook that is already over cap and has nothing to evict.
+    # Patch _playbook_size_bytes to always report > 30KB, and
+    # _maybe_archive_for_capacity to return doc unchanged (nothing evictable).
+    with (
+        patch("app.main._playbook_size_bytes", return_value=31_000),
+        patch(
+            "app.main._maybe_archive_for_capacity", side_effect=lambda doc, est=0: doc
+        ),
+    ):
+        resp = await client.post(
+            "/api/agent/playbook",
+            json={
+                "task_id": str(task.id),
+                "op": "set",
+                "key": "blocked-key",
+                "value": "value",
+            },
+            headers=headers,
+        )
+
+    assert resp.status_code == 400, f"Expected 400, got: {resp.json()}"
+    assert "30KB" in resp.json()["error"]["message"]
 
 
 @pytest.mark.smoketest

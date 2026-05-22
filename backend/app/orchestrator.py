@@ -395,12 +395,27 @@ async def _emit_all_accounts_blocked_stall(
             "[ORCHESTRATOR] Failed to broadcast all_accounts_blocked throttle"
         )
     try:
-        project_ids = list((await session.execute(select(Project.id))).scalars().all())
-        # Dedup across the "Pipeline stalled — ..." family, not the exact
-        # title: with dynamic copy a new stall episode could otherwise stack
-        # a second alert if its blockage shape (rate-limit vs capacity) flips.
-        existing_rows = (
-            (
+        _stall_batch = 0
+        _stall_batch_size = 500
+        while True:
+            project_ids = list(
+                (
+                    await session.execute(
+                        select(Project.id)
+                        .order_by(Project.id)
+                        .offset(_stall_batch * _stall_batch_size)
+                        .limit(_stall_batch_size)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not project_ids:
+                break
+            # Dedup across the "Pipeline stalled — ..." family, not the exact
+            # title: with dynamic copy a new stall episode could otherwise stack
+            # a second alert if its blockage shape (rate-limit vs capacity) flips.
+            existing_rows = (
                 await session.execute(
                     select(Alert.project_id).where(
                         Alert.project_id.in_(project_ids),
@@ -411,35 +426,37 @@ async def _emit_all_accounts_blocked_stall(
                     )
                 )
             ).all()
-            if project_ids
-            else []
-        )
-        projects_with_alert = {row[0] for row in existing_rows}
-        for proj_id in project_ids:
-            if proj_id not in projects_with_alert:
-                alert = Alert(
-                    project_id=proj_id,
-                    severity=AlertSeverity.ERROR,
-                    title=title,
-                    message=msg,
+            projects_with_alert = {row[0] for row in existing_rows}
+            for proj_id in project_ids:
+                if proj_id not in projects_with_alert:
+                    alert = Alert(
+                        project_id=proj_id,
+                        severity=AlertSeverity.ERROR,
+                        title=title,
+                        message=msg,
+                    )
+                    session.add(alert)
+                    await broadcast_to_project(
+                        str(proj_id),
+                        "alert_created",
+                        {
+                            "alert_id": str(alert.id),
+                            "severity": "ERROR",
+                            "title": title,
+                        },
+                    )
+                asyncio.ensure_future(
+                    dispatch_external_notification(  # noqa: RUF006
+                        proj_id,
+                        "PIPELINE_STALLED",
+                        {
+                            "reason": "all_accounts_blocked",
+                            "earliest_recovery": recovery_iso or "",
+                            "detail": msg,
+                        },
+                    )
                 )
-                session.add(alert)
-                await broadcast_to_project(
-                    str(proj_id),
-                    "alert_created",
-                    {"alert_id": str(alert.id), "severity": "ERROR", "title": title},
-                )
-            asyncio.ensure_future(
-                dispatch_external_notification(  # noqa: RUF006
-                    proj_id,
-                    "PIPELINE_STALLED",
-                    {
-                        "reason": "all_accounts_blocked",
-                        "earliest_recovery": recovery_iso or "",
-                        "detail": msg,
-                    },
-                )
-            )
+            _stall_batch += 1
     except Exception:
         logger.exception(
             "[ORCHESTRATOR] Failed to create all-accounts-blocked stall alert"
@@ -1157,7 +1174,13 @@ async def orchestrator_worker():
                 try:
                     async with AsyncSessionLocal() as _rd_id_session:
                         _project_ids = (
-                            (await _rd_id_session.execute(select(Project.id)))
+                            (
+                                await _rd_id_session.execute(
+                                    select(Project.id).where(
+                                        Project.autonomous_enabled.is_(True)
+                                    )
+                                )
+                            )
                             .scalars()
                             .all()
                         )
@@ -2563,28 +2586,45 @@ async def orchestrator_worker():
                                 "Each type has >70% failure rate in the last 15 minutes. The pipeline will not dispatch "
                                 "new tasks until failure rates drop."
                             )
-                            _all_project_ids = list(
-                                (await session.execute(select(Project.id)))
+                            # Load already-alerted project IDs once so the batched
+                            # scan below avoids an N+1 existence check per project.
+                            _alerted_project_ids = set(
+                                (
+                                    await session.execute(
+                                        select(Alert.project_id).where(
+                                            Alert.task_id.is_(None),
+                                            Alert.severity == AlertSeverity.ERROR,
+                                            Alert.dismissed_at.is_(None),
+                                            Alert.title == _all_blocked_title,
+                                        )
+                                    )
+                                )
                                 .scalars()
                                 .all()
                             )
-                            for _proj_id in _all_project_ids:
-                                _existing_alert = (
+                            # Batch the project scan in chunks of 500 with a stable
+                            # ORDER BY so memory/lock duration stay bounded and no
+                            # project is skipped or duplicated across batches.
+                            _ab_batch = 0
+                            _ab_batch_size = 500
+                            while True:
+                                _all_project_ids = list(
                                     (
                                         await session.execute(
-                                            select(Alert).where(
-                                                Alert.project_id == _proj_id,
-                                                Alert.task_id.is_(None),
-                                                Alert.severity == AlertSeverity.ERROR,
-                                                Alert.dismissed_at.is_(None),
-                                                Alert.title == _all_blocked_title,
-                                            )
+                                            select(Project.id)
+                                            .order_by(Project.id)
+                                            .offset(_ab_batch * _ab_batch_size)
+                                            .limit(_ab_batch_size)
                                         )
                                     )
                                     .scalars()
-                                    .first()
+                                    .all()
                                 )
-                                if _existing_alert is None:
+                                if not _all_project_ids:
+                                    break
+                                for _proj_id in _all_project_ids:
+                                    if _proj_id in _alerted_project_ids:
+                                        continue
                                     _alert = Alert(
                                         project_id=_proj_id,
                                         severity=AlertSeverity.ERROR,
@@ -2601,6 +2641,7 @@ async def orchestrator_worker():
                                             "title": _all_blocked_title,
                                         },
                                     )
+                                _ab_batch += 1
                         except Exception:
                             logger.exception(
                                 "[ORCHESTRATOR] Failed to create all-types-blocked project alerts"
