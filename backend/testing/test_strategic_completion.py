@@ -5237,13 +5237,22 @@ def _scaffolding_history(cycles=4, created=3, merged=3, completed=3):
     ]
 
 
-def _scaffolding_direction(progress_window, **overrides):
+_EMPTY_SE_FP = (
+    "e3b0c44298fc1c14"  # sha256("")[:16] — stable fingerprint for no success_evidence
+)
+
+
+def _scaffolding_direction(progress_window, *, success_evidence_fps=None, **overrides):
     """Long-running healthy-merge direction with a given progress-signal window.
 
     total_cycles = 4 (history) + 10 (aggregate) = 14 >= default min_cycles (12);
     lifetime_merged = 12 + 8 = 20 with merge_rate 1.0 (no non-merging finished),
     so only the outcome-progress window decides whether scaffolding is flagged.
+
+    success_evidence_fps: optional list of fp strings, one per snapshot. When None
+    every snapshot gets the stable empty-string fingerprint (unchanged across window).
     """
+    fps = success_evidence_fps or [_EMPTY_SE_FP] * len(progress_window)
     d = {
         "id": "d-scaffold",
         "status": "active",
@@ -5255,7 +5264,10 @@ def _scaffolding_direction(progress_window, **overrides):
             "total_tasks_failed": 0,
             "total_tasks_failed_infra": 0,
         },
-        "outcome_progress_history": [{"progress": p} for p in progress_window],
+        "outcome_progress_history": [
+            {"progress": p, "success_evidence_fp": fp}
+            for p, fp in zip(progress_window, fps)
+        ],
     }
     d.update(overrides)
     return d
@@ -5348,8 +5360,10 @@ class TestCheckOutcomeScaffolding:
         assert ev["stall_run_cycles"] == 6
         assert ev["progress_signal"] == 5
 
-    def test_does_not_fire_on_advancing_direction(self):
-        d = _scaffolding_direction([1, 2, 3, 4, 5, 6])
+    def test_does_not_fire_when_success_evidence_advancing(self):
+        # success_evidence fingerprint varies across the window -> not stalled.
+        fps = [f"fp{i:015d}" for i in range(6)]
+        d = _scaffolding_direction([5, 5, 5, 5, 5, 5], success_evidence_fps=fps)
         assert _check_outcome_scaffolding(d) is None
 
     def test_does_not_fire_on_churn_burn_low_merge_rate(self):
@@ -5452,6 +5466,66 @@ class TestCheckOutcomeScaffolding:
             evidence_progress={"status": "advancing"},
         )
         assert _check_outcome_scaffolding(d) is None
+
+
+class TestOutcomeScaffoldingSuccessEvidenceFp:
+    def test_unchanged_success_evidence_with_merges_flagged(self):
+        # All snapshots share the same fp -> success_evidence never advanced -> flagged.
+        d = _scaffolding_direction([5, 5, 5, 5, 5, 5])
+        ev = _check_outcome_scaffolding(d)
+        assert ev is not None
+        assert ev["success_evidence_unchanged_cycles"] == 6
+
+    def test_changing_success_evidence_not_flagged(self):
+        # success_evidence text changed mid-window -> not flagged even with steady merges.
+        fps = [
+            _EMPTY_SE_FP,
+            _EMPTY_SE_FP,
+            _EMPTY_SE_FP,
+            "aabbccdd00112233",
+            "aabbccdd00112233",
+            "aabbccdd00112233",
+        ]
+        d = _scaffolding_direction([5, 5, 5, 5, 5, 5], success_evidence_fps=fps)
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_snapshot_records_success_evidence_fp(self):
+        d = {
+            "research_history": [],
+            "history_aggregate": {},
+            "research_context": "",
+            "context": {"success_evidence": "users can export reports as CSV"},
+        }
+        record_outcome_progress_snapshot(d)
+        snap = d["outcome_progress_history"][0]
+        assert "success_evidence_fp" in snap
+        fp = snap["success_evidence_fp"]
+        assert isinstance(fp, str) and len(fp) == 16
+        # Same text produces the same fp.
+        d2 = {
+            "research_history": [],
+            "history_aggregate": {},
+            "research_context": "",
+            "context": {"success_evidence": "users can export reports as CSV"},
+        }
+        record_outcome_progress_snapshot(d2)
+        assert d2["outcome_progress_history"][0]["success_evidence_fp"] == fp
+
+    def test_empty_success_evidence_fingerprints_consistently(self):
+        # Empty or missing success_evidence must produce a stable fp (no crash).
+        for se_val in [None, "", "  "]:
+            ctx = {} if se_val is None else {"success_evidence": se_val}
+            d = {
+                "research_history": [],
+                "history_aggregate": {},
+                "research_context": "",
+                "context": ctx,
+            }
+            record_outcome_progress_snapshot(d)
+            snap = d["outcome_progress_history"][0]
+            assert "success_evidence_fp" in snap
+            assert isinstance(snap["success_evidence_fp"], str)
+            assert len(snap["success_evidence_fp"]) == 16
 
 
 class TestApplyEvidenceProgressVerdicts:
@@ -5739,4 +5813,267 @@ async def test_memos_cited_filters_to_available_only(db_session, mocker):
     )
     assert meta.get("memos_cited") == 1, (
         f"memos_cited should be 1 (only memo_id intersects available set), got {meta.get('memos_cited')}"
+    )
+
+
+# ── Retirement memo spawn tests ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_spawn_retirement_memo_api_path(db_session, mocker):
+    """API path spawns a memo task for each retired direction."""
+    from unittest.mock import AsyncMock
+    from app.models import TaskStatus
+    from app.strategic_completion import (
+        _handle_strategic_completion,
+        _RETIRED_NOTE_PREFIX,
+    )
+    from sqlmodel import select
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    direction_id = "d-retire-api"
+    rationale_text = "Direction accomplished its goals"
+    direction = {
+        "id": direction_id,
+        "text": "Build the feature X end-to-end",
+        "status": "expired",  # already retired
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "notes": [
+            {
+                "text": f"{_RETIRED_NOTE_PREFIX}{rationale_text}",
+                "added_at": "2026-01-01T00:00:00",
+            }
+        ],
+    }
+    project = Project(
+        name="RetireMemoAPI",
+        user_id="u-retire-api",
+        vision={"purpose": "test", "revision": 1},
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    sr_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={
+            "_strategic_api_called": True,
+            "_strategic_retired_ids": [direction_id],
+            "_strategic_retired": 1,
+        },
+    )
+    db_session.add(sr_task)
+    await db_session.commit()
+    await db_session.refresh(sr_task)
+
+    await _handle_strategic_completion(sr_task, "", db_session)
+
+    memo_tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.created_by == "ORCHESTRATOR",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    retirement_memos = [
+        t
+        for t in memo_tasks
+        if isinstance(t.context, dict)
+        and t.context.get("memo_reasoning_kind") == "direction_retirement"
+    ]
+    assert len(retirement_memos) == 1, (
+        f"expected 1 retirement memo, got {len(retirement_memos)}"
+    )
+    memo = retirement_memos[0]
+    assert memo.context.get("memo_source_direction_id") == direction_id
+    assert "Build the feature X" in (memo.payloads[0].get("topic") or "")
+    assert memo.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_spawn_retirement_memo_fallback_path(db_session, mocker):
+    """Fallback (log-parse) path spawns a memo for each retired direction."""
+    from unittest.mock import AsyncMock
+    from app.models import TaskStatus
+    from app.strategic_completion import _handle_strategic_completion
+    from sqlmodel import select
+    import json
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    direction_id = "d-retire-fb"
+    direction = {
+        "id": direction_id,
+        "text": "Improve CI pipeline speed",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+    project = Project(
+        name="RetireMemoFallback",
+        user_id="u-retire-fb",
+        vision={"purpose": "test", "revision": 0},
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    direction_ops = [
+        {
+            "op": "retire",
+            "direction_id": direction_id,
+            "rationale": "CI speed goal met",
+        }
+    ]
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": direction_ops,
+        }
+    )
+    sr_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(sr_task)
+    await db_session.commit()
+    await db_session.refresh(sr_task)
+
+    await _handle_strategic_completion(sr_task, logs, db_session)
+
+    memo_tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.created_by == "ORCHESTRATOR",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    retirement_memos = [
+        t
+        for t in memo_tasks
+        if isinstance(t.context, dict)
+        and t.context.get("memo_reasoning_kind") == "direction_retirement"
+    ]
+    assert len(retirement_memos) == 1, (
+        f"expected 1 retirement memo, got {len(retirement_memos)}"
+    )
+    memo = retirement_memos[0]
+    assert memo.context.get("memo_source_direction_id") == direction_id
+    assert memo.status == TaskStatus.QUEUED
+    assert (memo.payloads[0].get("topic") or "").startswith("Direction retired:")
+
+
+@pytest.mark.asyncio
+async def test_retirement_memo_dedup_guard(db_session, mocker):
+    """No second retirement memo is spawned when one already exists within 90 days."""
+    from unittest.mock import AsyncMock
+    from app.models import TaskStatus
+    from app.strategic_completion import _handle_strategic_completion
+    from sqlmodel import select
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    direction_id = "d-retire-dedup"
+    direction = {
+        "id": direction_id,
+        "text": "Old direction already memed",
+        "status": "expired",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+    project = Project(
+        name="RetireMemoDedup",
+        user_id="u-retire-dedup",
+        vision={"purpose": "test", "revision": 1},
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Pre-existing retirement memo for the same direction
+    existing_memo = Task(
+        project_id=project.id,
+        title="Memo: direction retired — Old direction",
+        description="pre-existing",
+        payloads=[
+            {
+                "type": "memo",
+                "topic": "Direction retired: Old direction",
+                "reasoning_kind": "direction_retirement",
+            }
+        ],
+        context={
+            "memo_reasoning_kind": "direction_retirement",
+            "memo_source_direction_id": direction_id,
+        },
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(existing_memo)
+    await db_session.commit()
+
+    sr_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={
+            "_strategic_api_called": True,
+            "_strategic_retired_ids": [direction_id],
+            "_strategic_retired": 1,
+        },
+    )
+    db_session.add(sr_task)
+    await db_session.commit()
+    await db_session.refresh(sr_task)
+
+    await _handle_strategic_completion(sr_task, "", db_session)
+
+    all_retirement_memos = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.created_by == "ORCHESTRATOR",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    retirement_memos = [
+        t
+        for t in all_retirement_memos
+        if isinstance(t.context, dict)
+        and t.context.get("memo_reasoning_kind") == "direction_retirement"
+    ]
+    assert len(retirement_memos) == 1, (
+        f"dedup guard should prevent second memo; got {len(retirement_memos)}"
     )

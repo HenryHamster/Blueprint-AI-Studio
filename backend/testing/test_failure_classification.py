@@ -2373,3 +2373,67 @@ class TestAccountStateRateLimitCorrelation:
 
         task = _task("", ctx={"llm_account_id": account_id})
         assert normalize_agent_failure_category("incomplete", task) == CODE_ERROR
+
+
+class TestPoolWideRateLimitCorrelation:
+    """Pool-wide cooldown correlates generic deaths even when no account was assigned."""
+
+    def test_pre_assignment_death_pool_wide_block(self, monkeypatch):
+        """No account assigned, entire pool blocked → RATE_LIMIT (not CODE_ERROR)."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+        )
+        task = _task("", ctx={"failure_category": "incomplete"})
+        assert classify_failure(task) == RATE_LIMIT
+
+    def test_healthy_account_pool_wide_block_still_rate_limit(self, monkeypatch):
+        """Assigned account is healthy; pool-wide block drives RATE_LIMIT."""
+        account_id = "acct-healthy-pool"
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(
+            pool_mod,
+            "_account_by_id",
+            {account_id: {"enabled": True, "disabled_models": {}}},
+        )
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+        )
+        task = _task(
+            "", ctx={"failure_category": "incomplete", "llm_account_id": account_id}
+        )
+        assert classify_failure(task) == RATE_LIMIT
+
+    def test_pool_not_blocked_generic_failure_code_error(self, monkeypatch):
+        """Pool not in cooldown → generic incomplete stays CODE_ERROR."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+        task = _task("", ctx={"failure_category": "incomplete"})
+        assert classify_failure(task) == CODE_ERROR
+
+    def test_specific_label_not_overridden_by_pool_block(self, monkeypatch):
+        """Authoritative labels (test_failed) are not overridden by pool-wide block."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+        )
+        task = _task("", ctx={"failure_category": "test_failed"})
+        assert classify_failure(task) == CODE_ERROR
+
+    def test_pool_was_rate_limited_accepts_tz_aware_timestamp(self, monkeypatch):
+        """Tz-aware at_time must not raise — helper normalizes to naive UTC before calling pool check."""
+        from datetime import datetime, timezone
+
+        from app.failure_classification import _pool_was_rate_limited
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+        )
+        assert _pool_was_rate_limited(at_time=datetime.now(tz=timezone.utc)) is True

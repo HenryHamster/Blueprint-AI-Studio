@@ -1515,7 +1515,7 @@ async def test_lifecycle_flags_outcome_scaffolding_and_notifies_once(
 async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
     db_session, mocker
 ):
-    """Once the progress window shows growth, the advisory flag is cleared."""
+    """Once success-evidence advances across the window, the advisory flag is cleared."""
     mocker.patch(
         "app.notification_dispatch.post_direction_outcome_stalled_message",
         new_callable=AsyncMock,
@@ -1532,9 +1532,10 @@ async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
     await db_session.refresh(project)
     assert project.directions[0].get("outcome_scaffolding_flagged") is True
 
-    # Progress resumes -> window now shows an increase.
+    # Progress resumes -> the success-evidence fingerprint now varies across the
+    # window, which the detector reads as advancement.
     project.directions[0]["outcome_progress_history"] = [
-        {"progress": p} for p in [5, 5, 5, 5, 5, 7]
+        {"progress": 5, "success_evidence_fp": f"fp{i:015d}"} for i in range(6)
     ]
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -1551,3 +1552,110 @@ async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
     )
     await db_session.refresh(project)
     assert project.directions[0].get("outcome_scaffolding_flagged") is None
+
+
+@pytest.mark.asyncio
+async def test_scaffolding_memo_spawned_on_first_flag(db_session, mocker):
+    """A memo task is spawned the first time a direction is flagged as outcome-less scaffolding."""
+    from unittest.mock import AsyncMock
+    from sqlmodel import select
+
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    direction = _scaffolding_direction_for_lifecycle([5, 5, 5, 5, 5, 5])
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    assert project.directions[0].get("outcome_scaffolding_flagged") is True
+
+    memo_tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.created_by == "ORCHESTRATOR",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    scaffolding_memos = [
+        t
+        for t in memo_tasks
+        if isinstance(t.context, dict)
+        and t.context.get("memo_reasoning_kind") == "outcome_scaffolding"
+    ]
+    assert len(scaffolding_memos) == 1, (
+        f"expected 1 outcome_scaffolding memo, got {len(scaffolding_memos)}"
+    )
+    memo = scaffolding_memos[0]
+    assert memo.context.get("memo_source_direction_id") == direction["id"]
+    assert memo.status == TaskStatus.QUEUED
+    assert (memo.payloads[0].get("topic") or "").startswith("Outcome-less scaffolding:")
+
+
+@pytest.mark.asyncio
+async def test_scaffolding_memo_not_respawned_on_evidence_refresh(db_session, mocker):
+    """No additional memo is spawned on subsequent lifecycle passes while the flag is still set."""
+    from unittest.mock import AsyncMock
+    from sqlmodel import select
+
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    direction = _scaffolding_direction_for_lifecycle([5, 5, 5, 5, 5, 5])
+    project = await _make_cost_project(db_session, direction)
+
+    # First pass: flag is set and memo is spawned
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    assert project.directions[0].get("outcome_scaffolding_flagged") is True
+
+    # Second pass: flag already set, no new memo
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    memo_tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.created_by == "ORCHESTRATOR",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    scaffolding_memos = [
+        t
+        for t in memo_tasks
+        if isinstance(t.context, dict)
+        and t.context.get("memo_reasoning_kind") == "outcome_scaffolding"
+    ]
+    assert len(scaffolding_memos) == 1, (
+        f"expected exactly 1 memo (no re-spawn), got {len(scaffolding_memos)}"
+    )

@@ -1248,6 +1248,32 @@ def account_in_rate_limit_cooldown(account_id: str | None) -> bool:
     return False
 
 
+def pool_wide_rate_limit_cooldown(at_time: datetime | None = None) -> bool:
+    """Return True if every account in the pool is in rate-limit cooldown.
+
+    Fires when NO account is healthy or probing and at least one account has an
+    active rate-limit entry. Returns False when the pool is empty (no accounts
+    configured) or when any account is healthy/probing. Safe to call from
+    synchronous contexts — individual dict reads are atomic in CPython.
+    """
+    accts = _all_accounts()
+    if not accts:
+        return False
+    now = at_time if at_time is not None else _utcnow()
+    for acct in accts:
+        if _account_state_for_model(acct, None, now=now) in ("healthy", "probing"):
+            return False
+    # All accounts unavailable — confirm at least one has an active rate-limit entry.
+    for acct in accts:
+        for info in (acct.get("disabled_models") or {}).values():
+            at_dt = info.get("at")
+            if at_dt is not None and (
+                now - at_dt
+            ).total_seconds() < _cooldown_seconds_for_info(info):
+                return True
+    return False
+
+
 def describe_pool_blockage(model: str | None, user_id: str | None = None) -> str:
     """Human-readable description of why no account can pick up a task.
     Used by reaper queued-age alerts to distinguish rate-limit cooldown from

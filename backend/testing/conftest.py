@@ -73,6 +73,18 @@ else:
         expire_on_commit=False,
     )
 
+# Point the production lazy engine (used by `AsyncSessionLocal()` in background-task
+# and handler code paths that don't go through the overridden get_session dependency,
+# e.g. max_plan_pool._persist_rate_limit_state) at the test engine. The production
+# engine pools connections, so a pooled asyncpg connection created in one test's
+# event loop gets reused in a later test's loop and raises "got Future attached to a
+# different loop". Both test engines use a non-reusing pool (NullPool for Postgres,
+# StaticPool for SQLite), so binding here keeps every session on the same DB without
+# cross-loop connection reuse.
+import app.database as _app_database  # noqa: E402
+
+_app_database._LazyEngine._engine = engine
+
 
 @pytest_asyncio.fixture(scope="function")
 async def db_session():

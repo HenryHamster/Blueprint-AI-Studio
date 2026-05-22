@@ -5,6 +5,7 @@ completion handlers. Contains direction health/completion checks, duplicate dete
 and the _handle_strategic_completion handler.
 """
 
+import hashlib
 import json
 import logging
 import uuid
@@ -25,6 +26,7 @@ from app.models import (
     RECOMMENDED_MODE_META_KEY,
     RECOMMENDED_MODE_SOURCE_STRATEGIC,
     Task,
+    TaskStatus,
 )
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
@@ -604,6 +606,95 @@ def _collect_retirement_metrics(
     return result
 
 
+async def _spawn_retirement_memos(
+    session: AsyncSession,
+    project: Project,
+    task: Task,
+    retired_ids: list,
+    rationales: dict,
+) -> int:
+    """Spawn one memo task per newly-retired direction as a durable citable artifact.
+
+    The memo preserves the retirement rationale so strategic-cycle citation
+    queries can reference it.  Dedup guard: skips any direction that already
+    has a retirement memo in the last 90 days.
+    """
+    if not retired_ids:
+        return 0
+    from app.payload_schemas import validate_internal_payload
+    from app.plan_completion import TASK_PRIORITY_MAP
+
+    ninety_days_ago = _utcnow() - timedelta(days=90)
+    existing_rows = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.created_at >= ninety_days_ago,
+                    Task.created_by == "ORCHESTRATOR",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    already_memed: set[str] = {
+        str(t.context.get("memo_source_direction_id"))
+        for t in existing_rows
+        if isinstance(t.context, dict)
+        and t.context.get("memo_reasoning_kind") == "direction_retirement"
+        and t.context.get("memo_source_direction_id")
+    }
+
+    by_id = {d.get("id"): d for d in (project.directions or []) if d.get("id")}
+    spawned = 0
+    for did in retired_ids:
+        if did in already_memed:
+            logger.debug(
+                "[STRATEGIC] Skipping duplicate retirement memo for direction %s", did
+            )
+            continue
+        direction = by_id.get(did)
+        direction_text = (direction.get("text") or "") if direction else ""
+        rationale = rationales.get(did) or ""
+        topic = direction_text[:120] or f"Direction {did}"
+        memo_payload = validate_internal_payload(
+            {
+                "type": "memo",
+                "topic": f"Direction retired: {topic}",
+                "reasoning_kind": "direction_retirement",
+                "direction_id": did,
+                **({"retirement_rationale": rationale} if rationale else {}),
+            },
+            "strategic_completion:memo:direction_retirement",
+        )
+        memo_task = Task(
+            project_id=project.id,
+            title=f"Memo: direction retired — {topic[:100]}",
+            description="Reasoning memo for retired direction",
+            parent_task_id=task.id,
+            payloads=[memo_payload],
+            context={
+                "memo_reasoning_kind": "direction_retirement",
+                "memo_source_direction_id": did,
+                "memo_source_task_id": str(task.id),
+                **({"retirement_rationale": rationale} if rationale else {}),
+            },
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            priority=TASK_PRIORITY_MAP.get("low", 0),
+        )
+        session.add(memo_task)
+        spawned += 1
+        logger.info(
+            "[STRATEGIC] Spawned retirement memo task %s for direction %s",
+            memo_task.id,
+            did,
+        )
+    return spawned
+
+
 def _extract_cycle_reasoning(task: Task) -> str:
     """Extract a condensed reasoning summary for the completed cycle (≤500 chars).
 
@@ -994,11 +1085,14 @@ def record_outcome_progress_snapshot(direction: dict) -> None:
     total_merged = sum(e.get("prs_merged", 0) for e in history) + (
         agg.get("total_prs_merged") or 0
     )
+    se_text = ((direction.get("context") or {}).get("success_evidence") or "").encode()
+    success_evidence_fp = hashlib.sha256(se_text).hexdigest()[:16]
     snapshot = {
         "timestamp": _utcnow().isoformat(),
         "cycle_index": total_cycles,
         "progress": _compute_outcome_progress_signal(direction),
         "merged": total_merged,
+        "success_evidence_fp": success_evidence_fp,
     }
     snaps = list(direction.get("outcome_progress_history") or [])
     snaps.append(snapshot)
@@ -1047,12 +1141,12 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
         rate >= min_merge_rate, so churn/burn directions (low merge rate / high
         non-merge volume) are explicitly EXCLUDED — those are handled by the churn
         guardrail and lifetime-burn backstop in _check_direction_health;
-      - sustained no progress: the per-cycle progress signal is flat (no increase)
+      - sustained no progress: the success_evidence fingerprint is unchanged
         across the last stall_run snapshots AND the direction has never reached a
         'met' outcome.
     Guards hard against false positives: requires a FULL stall_run window of
-    snapshots, so a single low-progress cycle cannot trip the flag, and any increase
-    anywhere in the window clears it.
+    snapshots, so a single stalled cycle cannot trip the flag, and any change in
+    the success_evidence fingerprint anywhere in the window clears it.
     """
     if direction.get("outcome_progress_ever_met"):
         return None
@@ -1079,8 +1173,9 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
         return None
     window = snaps[-run:]
     progress_vals = [int(s.get("progress", 0) or 0) for s in window]
-    if max(progress_vals) > min(progress_vals):
-        return None  # progress increased somewhere in the window -> advancing
+    fp_vals = [s.get("success_evidence_fp") for s in window]
+    if len(set(fp_vals)) != 1:
+        return None  # success_evidence changed across the window -> advancing
     # Never met its outcome (current completion detector must also be negative).
     if _check_direction_completion(direction) is not None:
         return None
@@ -1096,6 +1191,7 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
         "stall_run_cycles": run,
         "progress_signal": progress_vals[-1],
         "outcome_progress_window": progress_vals,
+        "success_evidence_unchanged_cycles": run,
     }
 
 
@@ -1497,6 +1593,7 @@ async def _handle_strategic_completion(
         dirs_retired = (task.context or {}).get("_strategic_dirs_retired", 0)
         created_ids = list((task.context or {}).get("_strategic_created_ids", []))
         retired_ids = list((task.context or {}).get("_strategic_retired_ids", []))
+        retired_rationales: Dict[str, str] = {}
         if cycle_id:
             _vision_updated = (task.context or {}).get(
                 "_strategic_vision_set", False
@@ -1641,6 +1738,9 @@ async def _handle_strategic_completion(
         # Per-cycle message post removed: the strategic agent now maintains
         # project.running_update as a living markdown document it rewrites
         # each cycle. Replaces the previous one-message-per-cycle noise.
+        await _spawn_retirement_memos(
+            session, project, task, retired_ids, retired_rationales
+        )
         await session.commit()
         logger.info(
             f"[STRATEGIC] Task {task.id} complete via API: vision rev {vision_rev}, {active_dirs} active directions"
@@ -2489,6 +2589,9 @@ async def _handle_strategic_completion(
     # cycle; the user acknowledges to stamp a read-marker.
     task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} messages, {msgs_resolved} resolved"
     session.add(task)
+    await _spawn_retirement_memos(
+        session, project, task, retired_ids_fb, retired_rationales_fb
+    )
     await (
         session.commit()
     )  # Single commit: vision + directions + messages + task status

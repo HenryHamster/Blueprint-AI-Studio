@@ -1803,6 +1803,21 @@ async def test_regression_detection_injects_context_and_prompt(
             "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
         ),
         patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch(
+            "app.auto_remediation.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="fake-token",
+        ),
+        patch(
+            "app.auto_remediation.get_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merge_commit_sha": "abc123merge"},
+        ),
+        patch(
+            "app.auto_remediation.is_ancestor_of",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
     ):
         mock_ctx.return_value = (
             ["CI / tests"],
@@ -1826,6 +1841,216 @@ async def test_regression_detection_injects_context_and_prompt(
     assert new_task.context.get("regression_prior_pr_number") == 4242
     assert "REGRESSION DETECTED" in new_task.payloads[0]["prompt"]
     assert "#4242" in new_task.payloads[0]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_regression_of_confirmed_when_fix_is_ancestor(
+    db_session: AsyncSession,
+):
+    """When is_ancestor_of returns True, prior remediation is treated as a landed fix (regression)."""
+    project = await _create_project(db_session)
+    from app.anomaly_detection import _error_fingerprint
+    from app.failure_stage import _derive_failure_stage
+
+    err = "AssertionError: confirmed ancestor pattern"
+    fp = _error_fingerprint(err, _derive_failure_stage("CODE_ERROR", err))
+    prior = Task(
+        project_id=project.id,
+        title="Auto-fix: prior fix",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        auto_remediation=True,
+        previous_error_fingerprint=fp,
+        context={"ci_failure_branch": "main", "merged_pr_number": 9901},
+    )
+    db_session.add(prior)
+    await db_session.flush()
+
+    with (
+        patch(
+            "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+        ) as mock_ctx,
+        patch(
+            "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
+        ),
+        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch(
+            "app.auto_remediation.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="fake-token",
+        ),
+        patch(
+            "app.auto_remediation.get_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merge_commit_sha": "deadbeefmerge"},
+        ),
+        patch(
+            "app.auto_remediation.is_ancestor_of",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+    ):
+        mock_ctx.return_value = (
+            ["CI / tests"],
+            err,
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme",
+            repo="webapp",
+            head_sha="feedface",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(),
+            session=db_session,
+        )
+
+    spawned = await session_tasks(db_session, project.id)
+    new_task = next(t for t in spawned if t.id != prior.id)
+    # ancestry confirmed → regression path taken
+    assert new_task.context.get("regression_of_task_id") == str(prior.id)
+    assert "REGRESSION DETECTED" in new_task.payloads[0]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_regression_of_cleared_when_fix_not_ancestor(
+    db_session: AsyncSession,
+):
+    """When is_ancestor_of returns False, prior COMPLETED remediation is NOT treated as landed."""
+    project = await _create_project(db_session)
+    from app.anomaly_detection import _error_fingerprint
+    from app.failure_stage import _derive_failure_stage
+
+    err = "AssertionError: stranded fix pattern"
+    fp = _error_fingerprint(err, _derive_failure_stage("CODE_ERROR", err))
+    prior = Task(
+        project_id=project.id,
+        title="Auto-fix: stranded fix",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        auto_remediation=True,
+        previous_error_fingerprint=fp,
+        context={"ci_failure_branch": "main", "merged_pr_number": 9902},
+    )
+    db_session.add(prior)
+    await db_session.flush()
+
+    with (
+        patch(
+            "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+        ) as mock_ctx,
+        patch(
+            "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
+        ),
+        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch(
+            "app.auto_remediation.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="fake-token",
+        ),
+        patch(
+            "app.auto_remediation.get_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merge_commit_sha": "strandedshanotlanded"},
+        ),
+        patch(
+            "app.auto_remediation.is_ancestor_of",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
+    ):
+        mock_ctx.return_value = (
+            ["CI / tests"],
+            err,
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme",
+            repo="webapp",
+            head_sha="feedface",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(),
+            session=db_session,
+        )
+
+    spawned = await session_tasks(db_session, project.id)
+    new_task = next(t for t in spawned if t.id != prior.id)
+    # fix commit not on branch → not a regression, no regression_of_task_id
+    assert new_task.context.get("regression_of_task_id") is None
+    assert "REGRESSION DETECTED" not in new_task.payloads[0]["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_regression_of_cleared_when_ancestry_indeterminate(
+    db_session: AsyncSession,
+):
+    """When is_ancestor_of returns None (GitHub error), safe-degrade: not treated as landed."""
+    project = await _create_project(db_session)
+    from app.anomaly_detection import _error_fingerprint
+    from app.failure_stage import _derive_failure_stage
+
+    err = "AssertionError: indeterminate ancestry pattern"
+    fp = _error_fingerprint(err, _derive_failure_stage("CODE_ERROR", err))
+    prior = Task(
+        project_id=project.id,
+        title="Auto-fix: indeterminate prior",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        auto_remediation=True,
+        previous_error_fingerprint=fp,
+        context={"ci_failure_branch": "main", "merged_pr_number": 9903},
+    )
+    db_session.add(prior)
+    await db_session.flush()
+
+    with (
+        patch(
+            "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+        ) as mock_ctx,
+        patch(
+            "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
+        ),
+        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+        patch(
+            "app.auto_remediation.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="fake-token",
+        ),
+        patch(
+            "app.auto_remediation.get_pull_request",
+            new_callable=AsyncMock,
+            return_value={"merge_commit_sha": "someshagithubcantcheck"},
+        ),
+        patch(
+            "app.auto_remediation.is_ancestor_of",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+    ):
+        mock_ctx.return_value = (
+            ["CI / tests"],
+            err,
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme",
+            repo="webapp",
+            head_sha="feedface",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(),
+            session=db_session,
+        )
+
+    spawned = await session_tasks(db_session, project.id)
+    new_task = next(t for t in spawned if t.id != prior.id)
+    # indeterminate → safe-degrade to not-landed, no regression context
+    assert new_task.context.get("regression_of_task_id") is None
+    assert "REGRESSION DETECTED" not in new_task.payloads[0]["prompt"]
 
 
 @pytest.mark.asyncio

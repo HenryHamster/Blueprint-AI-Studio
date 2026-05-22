@@ -577,6 +577,13 @@ class Task(SQLModel, table=True):
     archived: bool = Field(default=False)
 
     # VM lifecycle timing for cost tracking
+    # Write-once timestamp recorded at initial dispatch (before GCE create call).
+    # Used as the anchor for vm_cold_start_ms so the measurement covers the full
+    # dispatch→agent-ready interval including GCE boot latency.  Never re-stamped.
+    vm_dispatched_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     vm_provisioned_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),

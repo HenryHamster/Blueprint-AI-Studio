@@ -95,6 +95,7 @@ _SR_CATCH_RATE_MIN_FINDINGS = (
 )
 _LONE_CHECKER_ALERT_TITLE = "SR lone-checker blind spot: ≥2 categories uncorroborated"
 _LONE_CHECKER_MIN_CATEGORIES = 2
+_ACTIVE_TASKS_QUERY_LIMIT = 500
 
 
 async def _evaluate_sr_catch_rate_targets(
@@ -2338,10 +2339,10 @@ async def compute_pipeline_health_summary(
                     [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
                 ),
                 Task.created_at >= ms_cutoff,
+                Task.context["scope"].as_string() == "medium",
             )
         )
-        ms_all = ms_result.scalars().all()
-        ms_medium = [t for t in ms_all if (t.context or {}).get("scope") == "medium"]
+        ms_medium = ms_result.scalars().all()
         if ms_medium:
             from app.routers.admin_scope_measurement import (
                 _compute_medium_scope_measurement,
@@ -4050,6 +4051,7 @@ async def _compute_digest(
             )
             .where(*active_filters)
             .order_by(Task.started_at.asc().nullsfirst())
+            .limit(_ACTIVE_TASKS_QUERY_LIMIT)
             .options(
                 load_only(
                     Task.id,
@@ -4075,6 +4077,7 @@ async def _compute_digest(
             select(Task)
             .where(*active_filters)
             .order_by(Task.started_at.asc().nullsfirst())
+            .limit(_ACTIVE_TASKS_QUERY_LIMIT)
             .options(
                 load_only(
                     Task.id,

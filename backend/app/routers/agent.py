@@ -882,12 +882,12 @@ async def claim_task(
         task.last_heartbeat = (
             _utcnow()
         )  # Immediate heartbeat — don't wait 30s for agent interval
-        # Record time-to-claim so we can measure the real distribution of VM cold-boot
-        # + auth validation + claim and tighten the reaper's pre-claim threshold later.
-        if task.vm_provisioned_at:
-            claim_latency = (
-                task.last_heartbeat - task.vm_provisioned_at
-            ).total_seconds()
+        # Record time-to-claim covering the full dispatch->agent-ready interval.
+        # Use vm_dispatched_at (set before GCE create call) when available;
+        # fall back to vm_provisioned_at for tasks created before migration 0113.
+        _cold_start_anchor = task.vm_dispatched_at or task.vm_provisioned_at
+        if _cold_start_anchor:
+            claim_latency = (task.last_heartbeat - _cold_start_anchor).total_seconds()
             task.context = {
                 **(task.context or {}),
                 "claim_latency_secs": round(claim_latency, 1),

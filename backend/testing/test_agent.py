@@ -9936,6 +9936,46 @@ async def test_heartbeat_beacon_does_not_set_vm_cold_start_ms(
 
 
 @pytest.mark.asyncio
+async def test_claim_uses_vm_dispatched_at_for_cold_start(
+    client: AsyncClient, db_session
+):
+    """vm_cold_start_ms must be anchored at vm_dispatched_at (dispatch time) when
+    both vm_dispatched_at and vm_provisioned_at are present, so that GCE boot
+    latency is included in the measurement."""
+    project = Project(name="Dispatch Cold Start", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # vm_dispatched_at set 20s ago (full dispatch→agent-ready window).
+    # vm_provisioned_at set only 5s ago (provision-confirm restamp; excludes boot).
+    dispatched = datetime.utcnow() - timedelta(seconds=20)
+    provisioned = datetime.utcnow() - timedelta(seconds=5)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "ls"}],
+        vm_instance_id="agent-vm-dispatched",
+        status=TaskStatus.QUEUED,
+        vm_dispatched_at=dispatched,
+        vm_provisioned_at=provisioned,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-dispatched")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.vm_cold_start_ms is not None
+    # Must reflect the full ~20s dispatch interval, not the 5s provision-confirm interval.
+    assert task.vm_cold_start_ms >= 15_000, (
+        f"Expected vm_cold_start_ms to reflect dispatch->claim (~20s), got {task.vm_cold_start_ms}ms"
+    )
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_persists_api_call_summary(client: AsyncClient, db_session):
     """Heartbeat persists llm_call_count + token totals into Task.api_call_summary."""
     project = Project(name="API Call Summary", user_id="test-user-123")

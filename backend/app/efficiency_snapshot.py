@@ -232,6 +232,13 @@ async def write_snapshot(
         if baseline.get("_schema_version") == 1:
             baseline[AXIS_MEDIAN_REVIEW_ITERATIONS] = None
             baseline["_schema_version"] = 2
+        # One-time migration: baselines captured before the vm_dispatched_at fix
+        # (schema_version 2) stored vm_cold_start_p50_ms anchored at
+        # provision-confirm time, excluding GCE boot latency. Clear and re-seed
+        # from the corrected dispatch->agent-ready measurement.
+        if baseline.get("_schema_version") == 2:
+            baseline[AXIS_VM_COLD_START_P50_MS] = None
+            baseline["_schema_version"] = 3
         # Re-seed any individual axes that were cleared (e.g. by the migration
         # above) once a valid current value is available.
         for axis in ALL_AXES:

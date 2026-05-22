@@ -3193,6 +3193,11 @@ async def orchestrator_worker():
                     # never claimed" from "agent claimed and crashed".
                     task.status = TaskStatus.PROVISIONING
                     task.started_at = _utcnow()
+                    # Write-once dispatch timestamp — anchors vm_cold_start_ms
+                    # to the full dispatch->agent-ready interval (includes GCE
+                    # boot latency). Never re-stamped on provision-confirm.
+                    if task.vm_dispatched_at is None:
+                        task.vm_dispatched_at = _utcnow()
                     task.vm_provisioned_at = _utcnow()
                     # Foundational scaffolding for vm_reuse_rate (efficiency
                     # direction d-91d8dede). There is no warm pool today, so

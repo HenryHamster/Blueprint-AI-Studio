@@ -18,7 +18,12 @@ from sqlmodel import select
 
 from app.database import AsyncSessionLocal
 from app.direction_lifecycle import _REMEDIATION_MONITOR_EXPIRY_DAYS
-from app.github import get_check_runs_cached, get_repo_installation_token
+from app.github import (
+    get_check_runs_cached,
+    get_pull_request,
+    get_repo_installation_token,
+    is_ancestor_of,
+)
 from app.models import Project, Task, TaskStatus
 from app.notification_dispatch import post_auto_fix_spawned_message
 from app.task_completion import _stamp_remediation_spawn_on_direction
@@ -449,6 +454,43 @@ async def _handle_main_branch_ci_failure_inner(
             fingerprint=_fingerprint_probe,
             session=session,
         )
+
+    # ── Ancestry verification: confirm the prior fix commit is actually on this branch ──
+    # A COMPLETED task whose PR was auto-closed, merged elsewhere, or never landed must
+    # not be treated as a held fix. Safe-degrade: unconfirmed ancestry → not-landed.
+    if regression_of is not None:
+        _reg_ctx = regression_of.context or {}
+        _reg_pr_num = _reg_ctx.get("merged_pr_number") or _reg_ctx.get("pr_number")
+        _ancestry_confirmed = False
+        try:
+            if _reg_pr_num:
+                _anc_token = await get_repo_installation_token(owner, repo)
+                if _anc_token:
+                    _pr_data = await get_pull_request(
+                        _anc_token, owner, repo, int(_reg_pr_num)
+                    )
+                    _merge_sha = _pr_data.get("merge_commit_sha")
+                    if _merge_sha:
+                        _is_anc = await is_ancestor_of(
+                            _anc_token, owner, repo, _merge_sha, head_branch
+                        )
+                        _ancestry_confirmed = _is_anc is True
+        except Exception as _anc_exc:
+            logger.warning(
+                "[AUTO-REMEDIATION] Ancestry check failed for prior remediation task %s"
+                " (PR #%s): %s — safe-degrading to not-landed.",
+                str(regression_of.id)[:8],
+                _reg_pr_num,
+                _anc_exc,
+            )
+        if not _ancestry_confirmed:
+            logger.info(
+                "[AUTO-REMEDIATION] Prior remediation task %s not confirmed as an ancestor"
+                " of %s — not treating as regression.",
+                str(regression_of.id)[:8],
+                head_branch,
+            )
+            regression_of = None
 
     # ── Create the fix task ──
     prompt = _build_remediation_prompt(

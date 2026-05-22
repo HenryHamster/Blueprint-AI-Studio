@@ -579,8 +579,11 @@ def _account_was_rate_limited(task: "Task", at_time: "datetime | None" = None) -
         if not dm:
             return False
         # Use naive UTC to match max_plan_pool's stored 'at' datetimes (naive via
-        # _utcnow at write time). An aware datetime here would raise TypeError.
+        # _utcnow at write time). Strip tzinfo if caller passed a tz-aware datetime
+        # to avoid TypeError in the subtraction instead of silently swallowing it.
         now = at_time if at_time is not None else _utcnow()
+        if getattr(now, "tzinfo", None) is not None:
+            now = now.replace(tzinfo=None)
         for info in dm.values():
             at_dt = info.get("at")
             if at_dt is None:
@@ -589,6 +592,36 @@ def _account_was_rate_limited(task: "Task", at_time: "datetime | None" = None) -
                 return True
         return False
     except Exception:
+        logger.debug(
+            "[FAILURE_CLASS] _account_was_rate_limited degraded to False for task %s",
+            getattr(task, "id", None),
+        )
+        return False
+
+
+def _pool_was_rate_limited(at_time: "datetime | None" = None) -> bool:
+    """Return True if the entire account pool was in rate-limit cooldown.
+
+    Complements _account_was_rate_limited for the pre-assignment case (task died
+    before an account was assigned) and the healthy-account-but-blocked-pool case.
+    Never raises — returns False with a debug log on any error.
+    """
+    try:
+        from app.max_plan_pool import pool_wide_rate_limit_cooldown
+
+        norm_time = at_time
+        if norm_time is not None and getattr(norm_time, "tzinfo", None) is not None:
+            norm_time = norm_time.replace(tzinfo=None)
+        result = pool_wide_rate_limit_cooldown(at_time=norm_time)
+        if not result:
+            logger.debug(
+                "[FAILURE_CLASS] pool_wide_rate_limit_cooldown: pool not fully blocked"
+            )
+        return result
+    except Exception:
+        logger.debug(
+            "[FAILURE_CLASS] pool_wide_rate_limit_cooldown check degraded to False"
+        )
         return False
 
 
@@ -721,7 +754,7 @@ def normalize_agent_failure_category(raw: str | None, task: "Task") -> str:
             if any(kw in combined for kw in _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS):
                 return PROVISION_FAILURE
         if mapped == CODE_ERROR and label_lower in _ALL_GENERIC_CODE_ERROR_LABELS:
-            if _account_was_rate_limited(task):
+            if _account_was_rate_limited(task) or _pool_was_rate_limited():
                 return RATE_LIMIT
         return mapped
     if label in INFRA_CLASSES or label == CODE_ERROR:
@@ -1545,9 +1578,9 @@ def _classify_failure_class(
                     return PROVISION_FAILURE
                 if any(kw in combined for kw in _VIEWPORT_PATTERNS):
                     return VIEWPORT_REGRESSION
-                if (
-                    agent_lower in _ALL_GENERIC_CODE_ERROR_LABELS
-                    and _account_was_rate_limited(task, at_time=at_time)
+                if agent_lower in _ALL_GENERIC_CODE_ERROR_LABELS and (
+                    _account_was_rate_limited(task, at_time=at_time)
+                    or _pool_was_rate_limited(at_time)
                 ):
                     return RATE_LIMIT
             return mapped
@@ -1825,10 +1858,14 @@ def _classify_failure_class(
         return VIEWPORT_REGRESSION
 
     # Account-state correlation: before defaulting to CODE_ERROR, check if the
-    # assigned account was in rate-limit cooldown. Generic failures (no keywords,
-    # no structured signal) during a multi-hour block are most likely throttling-
-    # induced; classifying as RATE_LIMIT avoids burning a retry attempt.
-    if _account_was_rate_limited(task, at_time=at_time):
+    # assigned account was in rate-limit cooldown, OR if the entire pool was blocked.
+    # Generic failures (no keywords, no structured signal) during a multi-hour block
+    # are most likely throttling-induced; classifying as RATE_LIMIT avoids burning a
+    # retry attempt. Pool-wide check fires even when no account was assigned (pre-
+    # assignment death) or when the assigned account itself was not flagged.
+    if _account_was_rate_limited(task, at_time=at_time) or _pool_was_rate_limited(
+        at_time
+    ):
         return RATE_LIMIT
 
     # Default: code error — record fingerprint for residual-pattern analysis.
