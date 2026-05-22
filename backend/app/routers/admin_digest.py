@@ -45,6 +45,7 @@ from app.models import (
     CLOSE_REASON_RECOVERED_UNATTENDED,
     CYCLE_META_MEMOS_AVAILABLE,
     CYCLE_META_MEMOS_CITED,
+    QualificationVerdict,
 )
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
@@ -9730,4 +9731,55 @@ async def set_version_phase(
         if open_ver.phase_changed_at
         else None,
         "phase_reasoning": open_ver.phase_reasoning,
+    }
+
+
+_VERDICT_HISTORY_LIMIT = 50
+
+
+@router.get("/projects/{project_id}/qualification-verdicts")
+async def list_qualification_verdicts(
+    project_id: uuid.UUID,
+    limit: int = Query(default=20, ge=1, le=_VERDICT_HISTORY_LIMIT),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return recent QualificationVerdict rows for a project, newest-first.
+
+    Viewer+ role required.  Returns a bounded list (max 50) of per-verdict
+    history rows covering both dry-run and promotion-enabled regimes, giving
+    operators a live view of qualifier behavior across the full history.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+
+    stmt = (
+        select(QualificationVerdict)
+        .where(QualificationVerdict.project_id == project_id)
+        .order_by(QualificationVerdict.created_at.desc())
+        .limit(limit)
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
+
+    return {
+        "verdicts": [
+            {
+                "id": str(v.id),
+                "release_version_id": str(v.release_version_id),
+                "candidate_sha": v.candidate_sha,
+                "confidence": v.confidence,
+                "sub_scores": v.sub_scores,
+                "blocker": v.blocker,
+                "would_promote": v.would_promote,
+                "promotion_enabled": v.promotion_enabled,
+                "terminal_status": v.terminal_status,
+                "threshold": v.threshold,
+                "started_at": v.started_at.isoformat() if v.started_at else None,
+                "finalized_at": v.finalized_at.isoformat() if v.finalized_at else None,
+                "created_at": v.created_at.isoformat(),
+            }
+            for v in rows
+        ],
+        "total": len(rows),
     }

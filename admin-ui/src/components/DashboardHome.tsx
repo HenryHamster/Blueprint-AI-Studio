@@ -11,7 +11,7 @@ import {
   Search,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { apiFetch, fetchSrUnhandledEdgesRetrospectives, setVersionPhase, triggerQualify, type PromptFingerprintAnalyticsResponse, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
+import { apiFetch, fetchQualificationVerdicts, fetchSrUnhandledEdgesRetrospectives, setVersionPhase, triggerQualify, type PromptFingerprintAnalyticsResponse, type QualificationVerdictRecord, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
@@ -467,6 +467,11 @@ function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadines
 function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: VersionLifecycleResponse | null; loading: boolean; projectId: string | null; onRefresh: () => void }) {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
+  const [verdicts, setVerdicts] = useState<QualificationVerdictRecord[]>([]);
+  useEffect(() => {
+    if (!projectId) { setVerdicts([]); return; }
+    fetchQualificationVerdicts(projectId, 10).then(r => setVerdicts(r.verdicts)).catch(() => {});
+  }, [projectId]);
 
   if (loading || !data || (!data.current_version && data.recent_versions.length === 0)) return null;
   const cv = data.current_version;
@@ -581,6 +586,24 @@ function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: 
           </div>
         )}
         {readiness !== undefined && <PromotionReadinessSummary readiness={readiness} />}
+        {verdicts.length > 0 && (
+          <div data-testid="verdict-history">
+            <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Verdict History</p>
+            <div className="space-y-1">
+              {verdicts.slice(0, 8).map(v => (
+                <div key={v.id} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] pl-2 border-l-2 border-neutral-700/40">
+                  <span className={`font-mono font-semibold ${v.would_promote ? 'text-emerald-400' : 'text-amber-400'}`}>{v.confidence != null ? `${Math.round(v.confidence * 100)}%` : '—'}</span>
+                  <span className={QUAL_VERDICT_COLOR[v.terminal_status ?? ''] ?? 'text-neutral-400'}>{v.terminal_status?.replace(/_/g, '-') ?? '?'}</span>
+                  {v.promotion_enabled && <span className="text-[9px] font-mono text-emerald-600">LIVE</span>}
+                  {v.sub_scores && <span className="text-neutral-600 font-mono text-[9px]">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)} s:{Math.round(v.sub_scores.smoketest * 100)}</span>}
+                  {v.blocker && <span className="text-red-400 truncate max-w-[120px]" title={v.blocker}>{v.blocker}</span>}
+                  <span className="text-neutral-700 font-mono">{v.candidate_sha.slice(0, 7)}</span>
+                  {v.finalized_at && <span className="text-neutral-600">{timeAgo(v.finalized_at)}</span>}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
         {recent.length > 0 && (
           <div>
             <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">History</p>

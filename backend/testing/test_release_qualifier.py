@@ -40,11 +40,13 @@ import json
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import func as sa_func
 from sqlalchemy import select
 
 from app import release_qualifier as rq
 from app import release_version as rv
 from app.models import (
+    Alert,
     Artifact,
     ArtifactType,
     Project,
@@ -2229,6 +2231,399 @@ async def test_finalize_project_not_found_breaks_pending_loop(db_session, mocker
 
 
 # ===========================================================================
+# _finalize_qualification — infra-failure detection (FAILED/CANCELLED children)
+# ===========================================================================
+
+
+async def _seed_infra_failure_children(
+    db_session,
+    project,
+    version,
+    *,
+    audit_status: TaskStatus,
+    smoke_status: TaskStatus = TaskStatus.COMPLETED,
+    smoketest_enabled: bool = True,
+    prior_infra_streak: int = 0,
+) -> tuple[Task, Task | None]:
+    """Create qualifier child tasks in requested statuses (no artifacts).
+
+    Use for infra-failure scenarios where children did not produce artifacts.
+    Stamps version.last_qualification as pending pointing to the children.
+    """
+    audit_task = Task(
+        project_id=project.id,
+        title="audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-infra",
+        status=audit_status,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    smoke_task: Task | None = None
+    if smoketest_enabled:
+        smoke_task = Task(
+            project_id=project.id,
+            title="smoke",
+            payloads=[{"type": "smoketest", "base_branch": "automain"}],
+            vm_instance_id="vm-smoke-infra",
+            status=smoke_status,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(smoke_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+    if smoke_task is not None:
+        await db_session.refresh(smoke_task)
+
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "dead" * 10,
+        "ci_green": True,
+        "smoketest_enabled": smoketest_enabled,
+        "started_at": "2026-05-19T00:00:00",
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": str(smoke_task.id) if smoke_task else None,
+        "prior_infra_streak": prior_infra_streak,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return audit_task, smoke_task
+
+
+class TestFinalizeInfraFailure:
+    """_finalize_qualification correctly distinguishes infra failures from verdicts."""
+
+    @pytest.mark.asyncio
+    async def test_audit_task_failed_records_infra_failure_not_verdict(
+        self, db_session
+    ):
+        """Audit FAILED → status='infra_failure', NO QualificationVerdict row.
+        Version returns to stabilize but is NOT blocked on a quality finding."""
+        project, version = await _make_project_and_version(db_session)
+        await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.FAILED,
+            smoke_status=TaskStatus.COMPLETED,
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert "audit_task_failed" in result["error"]
+
+        # Version back to stabilize — no quality judgement recorded.
+        await db_session.refresh(version)
+        assert version.status == "open"
+        assert version.phase == "stabilize"
+        assert version.last_qualification["status"] == "infra_failure"
+        assert version.last_qualification["error"] == "audit_task_failed"
+
+        # No QualificationVerdict row — the qualifier never rendered a verdict.
+        verdicts = (
+            (
+                await db_session.execute(
+                    select(QualificationVerdict).where(
+                        QualificationVerdict.release_version_id == version.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(verdicts) == 0
+
+        # An operator notification was posted with release_infra_failure event.
+        msgs = (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id,
+                        ProjectMessage.context["event_type"].as_string()
+                        == "release_infra_failure",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(msgs) == 1
+
+    @pytest.mark.asyncio
+    async def test_audit_task_cancelled_records_infra_failure(self, db_session):
+        """Audit CANCELLED also routes to the infra-failure path."""
+        project, version = await _make_project_and_version(db_session)
+        await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.CANCELLED,
+            smoke_status=TaskStatus.COMPLETED,
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert "audit_task_cancelled" in result["error"]
+
+        await db_session.refresh(version)
+        assert version.last_qualification["status"] == "infra_failure"
+        assert version.last_qualification["error"] == "audit_task_cancelled"
+
+        # No verdict row.
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_smoketest_task_failed_records_infra_failure_when_enabled(
+        self, db_session
+    ):
+        """When smoketest_enabled=True and smoketest FAILED, infra_failure is
+        recorded — NOT a quality verdict (even though audit may be COMPLETED)."""
+        project, version = await _make_project_and_version(db_session)
+        # Audit completed (no quality issue), smoketest FAILED (infra failure).
+        await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.COMPLETED,
+            smoke_status=TaskStatus.FAILED,
+            smoketest_enabled=True,
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert "smoketest_task_failed" in result["error"]
+
+        await db_session.refresh(version)
+        assert version.last_qualification["status"] == "infra_failure"
+
+        # No verdict row even though audit completed.
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_infra_failure_does_not_appear_in_promotion_readiness(
+        self, db_session
+    ):
+        """An infra-failure finalization writes no QualificationVerdict row, so
+        compute_promotion_readiness sees verdicts_evaluated == 0 (the infra
+        failure does not pollute the dry-run track record)."""
+        project, version = await _make_project_and_version(db_session)
+        await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.FAILED,
+            smoke_status=TaskStatus.COMPLETED,
+        )
+
+        await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        readiness = await rq.compute_promotion_readiness(db_session, project.id)
+        assert readiness["verdicts_evaluated"] == 0
+
+    @pytest.mark.asyncio
+    async def test_audit_completed_no_report_still_records_verdict(self, db_session):
+        """A COMPLETED audit task whose report is absent or unparseable routes
+        through the normal compute_composite path (audit_missing quality blocker)
+        — the existing 'quality verdict' code, NOT the new infra-failure path.
+        Preserves existing behaviour: a COMPLETED child with a missing artifact
+        is still a real quality blocker (the agent ran but produced no output)."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = True
+
+        project, version = await _make_project_and_version(db_session)
+        # Both children COMPLETED but NO artifacts seeded — the audit produced
+        # no report, which is a quality blocker, not an infra failure.
+        await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.COMPLETED,
+            smoke_status=TaskStatus.COMPLETED,
+            smoketest_enabled=True,
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # Routes to the quality path: audit_missing (or smoketest_startup_failed
+        # since smoketest also has no artifact).  Either way, a verdict IS recorded.
+        assert result["status"] in ("not_promoted", "dry_run")
+
+        # A QualificationVerdict row was written — quality verdict, not infra error.
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 1
+
+    @pytest.mark.asyncio
+    async def test_consecutive_infra_errors_backstop_fires_alert(self, db_session):
+        """After _MIN_INFRA_ERROR_STREAK consecutive infra failures, an Alert is
+        raised — the calcification guard is silent for infra failures, so this
+        backstop ensures a persistently broken qualifier pipeline surfaces."""
+        project, version = await _make_project_and_version(db_session)
+
+        # Simulate two prior infra failures already recorded (streak = 2).
+        # The third failure (current_streak = 3 == _MIN_INFRA_ERROR_STREAK)
+        # should trigger the alert.
+        await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.FAILED,
+            smoke_status=TaskStatus.COMPLETED,
+            prior_infra_streak=rq._MIN_INFRA_ERROR_STREAK - 1,
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["consecutive_infra_errors"] == rq._MIN_INFRA_ERROR_STREAK
+
+        # An Alert was raised for the consecutive infra-failure backstop.
+        alerts = (
+            (
+                await db_session.execute(
+                    select(Alert).where(Alert.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(alerts) == 1
+        assert "infrastructure" in alerts[0].title.lower()
+        assert str(rq._MIN_INFRA_ERROR_STREAK) in alerts[0].title
+
+    @pytest.mark.asyncio
+    async def test_infra_failure_streak_resets_after_quality_verdict(self, db_session):
+        """The infra-failure streak resets to 0 when a non-infra finalization
+        (a real quality verdict) occurs between infra failures."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+
+        project, version = await _make_project_and_version(db_session)
+
+        # Run a real quality verdict (not_promoted) to reset the streak.
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={
+                "audit_score": 0.5,
+                "test_erosion": {"deleted_test_files": [], "assertion_delta": 0},
+            },
+            smoke_logs={
+                "passed": False,
+                "tests": [{"name": "a", "status": "fail"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+        await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # Re-open for another qualification cycle (simulate new run_qualification).
+        # After a non-infra verdict, run_qualification should carry prior_infra_streak=0.
+        await db_session.refresh(version)
+        assert version.last_qualification["status"] in ("not_promoted", "dry_run")
+
+        # Now manually simulate the next run_qualification stamping prior_infra_streak=0
+        # (because the prior status was not infra_failure).
+        prior_qual = version.last_qualification or {}
+        prior_streak = (
+            int(prior_qual.get("consecutive_infra_errors") or 0)
+            if prior_qual.get("status") == "infra_failure"
+            else 0
+        )
+        assert prior_streak == 0  # streak reset after a real verdict
+
+    @pytest.mark.asyncio
+    async def test_smoketest_task_failed_when_disabled_does_not_route_infra_failure(
+        self, db_session
+    ):
+        """When smoketest_enabled=False, the smoketest child is not required.
+        A COMPLETED audit (even with an absent smoketest artifact) routes through
+        the normal compute_composite path — NOT the infra-failure path."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+
+        project, version = await _make_project_and_version(db_session)
+        # Audit COMPLETED with a valid report; smoketest disabled.
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[{"type": "release_audit", "base_branch": "main"}],
+            vm_instance_id="vm-audit-smoke-disabled",
+            status=TaskStatus.COMPLETED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        db_session.add(
+            Artifact(
+                task_id=audit_task.id,
+                artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+                logs=json.dumps(
+                    {
+                        "audit_score": 1.0,
+                        "test_erosion": {"deleted_test_files": []},
+                    }
+                ),
+            )
+        )
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "cafe" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_task_id": None,
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # Took the normal quality-verdict path (dry_run since promotion disabled).
+        assert result["status"] == "dry_run"
+        assert result["status"] != "infra_failure"
+
+
+# ===========================================================================
 # maybe_finalize_qualification — task-completion coordination glue
 # ===========================================================================
 
@@ -2971,7 +3366,6 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session):
     heartbeats-but-hangs."""
     from datetime import timedelta
 
-    from app.models import Alert
     from app.time_utils import _utcnow
     from sqlmodel import select as _select
 

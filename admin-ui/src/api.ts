@@ -837,3 +837,35 @@ export async function triggerQualify(projectId: string): Promise<QualifyTriggerR
   if (!res.ok) throw new Error(`Failed to trigger qualify: ${res.status}`);
   return res.json();
 }
+
+export interface QualificationVerdictRecord {
+  id: string;
+  release_version_id: string;
+  candidate_sha: string;
+  confidence: number | null;
+  sub_scores: VersionQualificationSubScores | null;
+  blocker: string | null;
+  would_promote: boolean | null;
+  promotion_enabled: boolean | null;
+  terminal_status: string | null;
+  threshold: number | null;
+  started_at: string | null;
+  finalized_at: string | null;
+  created_at: string;
+}
+
+export interface QualificationVerdictsResponse {
+  verdicts: QualificationVerdictRecord[];
+  total: number;
+}
+
+export async function fetchQualificationVerdicts(
+  projectId: string,
+  limit = 20,
+): Promise<QualificationVerdictsResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/qualification-verdicts?limit=${limit}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch qualification verdicts: ${res.status}`);
+  return res.json();
+}

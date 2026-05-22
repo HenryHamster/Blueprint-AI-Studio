@@ -214,6 +214,12 @@ _MAX_QUALIFICATION_DURATION_SECONDS = 6 * 60 * 60
 # the issue is not transient and the version is genuinely stuck.
 _MIN_CALCIFICATION_ATTEMPTS = 3
 
+# Minimum consecutive qualifier infrastructure errors (FAILED/CANCELLED
+# required child tasks) before raising a dedicated infra-failure alert.
+# Mirrors _MIN_CALCIFICATION_ATTEMPTS: three consecutive infra failures
+# strongly suggest the qualifier pipeline itself (agent VM / clone) is broken.
+_MIN_INFRA_ERROR_STREAK = 3
+
 # Build-phase calcification thresholds — the backstop for the OTHER end of the
 # lifecycle from _check_version_calcification.  build→stabilize is entirely
 # agent-driven (the strategic agent must emit a version_phase_decision); there
@@ -818,6 +824,17 @@ async def run_qualification(
         )
         return {"status": "already_dry_run"}
 
+    # Carry forward the infra-failure streak so _finalize_qualification can
+    # detect a persistently broken qualifier pipeline.  The streak is the count
+    # of consecutive infrastructure failures (FAILED/CANCELLED required child
+    # tasks) before the current pending run — it resets to 0 whenever a prior
+    # finalization wrote a non-infra_failure status.
+    prior_infra_streak: int = (
+        int(prior_qual.get("consecutive_infra_errors") or 0)
+        if prior_qual.get("status") == "infra_failure"
+        else 0
+    )
+
     # 5. Spawn the heavy children.
     started_at = _utcnow().isoformat()
     # The LTS branch is always "main" (deploy.yml deploys from main) — NOT
@@ -883,7 +900,9 @@ async def run_qualification(
     # 6. Stamp the pending qualification record.  smoketest_task_id is None
     #    when the smoketest subsystem is disabled — maybe_finalize_qualification
     #    and the reaper sweep both treat a None smoketest id as "no smoketest
-    #    child to wait on".
+    #    child to wait on".  prior_infra_streak carries the infra-failure streak
+    #    from the previous infra_failure finalization (0 when the previous
+    #    finalization was a quality verdict / dry-run / non-infra outcome).
     version.last_qualification = {
         "status": "pending",
         "candidate_sha": candidate_sha,
@@ -892,6 +911,7 @@ async def run_qualification(
         "started_at": started_at,
         "audit_task_id": audit_task_id,
         "smoketest_task_id": smoketest_task_id,
+        "prior_infra_streak": prior_infra_streak,
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
     # early returns, which run pre-lock and use the atomic
@@ -1378,6 +1398,134 @@ async def _record_qualification_verdict(
         )
 
 
+async def _handle_infra_failure(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    qual: dict[str, Any],
+    infra_error: str,
+) -> dict[str, Any]:
+    """Finalize a qualifier run that ended due to an infrastructure failure.
+
+    Called when a required qualifier child (release_audit or qualifier
+    smoketest) terminated as FAILED or CANCELLED rather than COMPLETED —
+    indicating the qualifier pipeline itself broke (agent VM crash, timeout,
+    clone failure), NOT a quality finding about the release candidate.
+
+    Distinct from a quality verdict in three ways:
+      1. Does NOT write a ``QualificationVerdict`` history row — no quality
+         judgement was rendered so the verdict history stays clean.
+      2. Returns the version to ``stabilize`` for a clean re-qualification,
+         exactly like an error path (``missing_candidate_sha``), but with a
+         clearly labelled ``infra_failure`` status.
+      3. Posts a ``release_infra_failure`` operator notification that
+         explicitly names this as an infrastructure failure — not a quality
+         blocker — so the operator can distinguish pipeline noise from real
+         candidate problems.
+
+    Consecutive infra-failure backstop: after ``_MIN_INFRA_ERROR_STREAK``
+    consecutive infrastructure failures the regular calcification guard is
+    silent (it only triggers on ``not_promoted`` with a quality blocker).
+    This backstop raises a separate Alert so a persistently broken qualifier
+    pipeline surfaces to the operator.
+    """
+    finalized_at = _utcnow().isoformat()
+    # Consecutive infra-failure streak: one more than whatever the previous
+    # qualifying run reported (carried forward via prior_infra_streak stamped
+    # by run_qualification; resets to 0 when a non-infra finalization wrote
+    # a different status).
+    prior_streak = int(qual.get("prior_infra_streak") or 0)
+    current_streak = prior_streak + 1
+
+    record: dict[str, Any] = {
+        "candidate_sha": qual.get("candidate_sha"),
+        "ci_green": qual.get("ci_green"),
+        "smoketest_enabled": qual.get("smoketest_enabled", True),
+        "status": "infra_failure",
+        "error": infra_error,
+        "consecutive_infra_errors": current_streak,
+        "started_at": qual.get("started_at"),
+        "finalized_at": finalized_at,
+        "audit_task_id": qual.get("audit_task_id"),
+        "smoketest_task_id": qual.get("smoketest_task_id"),
+    }
+    version.last_qualification = record
+    flag_modified(version, "last_qualification")
+    release_version.set_version_phase(
+        version,
+        "stabilize",
+        reasoning=(
+            f"qualification v{version.version_number}: infrastructure failure "
+            f"({infra_error}) — not a quality finding, returning to stabilize"
+        ),
+    )
+    session.add(version)
+
+    # Consecutive infra-error backstop alert.  The calcification guard never
+    # fires for infra_failure records (it requires not_promoted + a quality
+    # blocker), so a persistently broken qualifier pipeline would be invisible
+    # without this sibling backstop.  Alert at multiples of the streak
+    # threshold so an intermittently broken pipeline does not spam the operator.
+    if (
+        current_streak >= _MIN_INFRA_ERROR_STREAK
+        and current_streak % _MIN_INFRA_ERROR_STREAK == 0
+    ):
+        session.add(
+            Alert(
+                project_id=version.project_id,
+                severity=AlertSeverity.WARNING,
+                title=(
+                    f"Release qualifier v{version.version_number} infrastructure "
+                    f"failure: {current_streak} consecutive errors"
+                ),
+                message=(
+                    f"The release qualifier for v{version.version_number} has "
+                    f"failed {current_streak} consecutive time(s) due to "
+                    f"infrastructure errors ({infra_error!r}) — the qualifier "
+                    f"agent VM or clone pipeline is broken. This is NOT a "
+                    f"quality finding about the release candidate. Inspect the "
+                    f"release_audit / qualifier-smoketest agent infrastructure "
+                    f"and re-queue to retry once the issue is resolved."
+                ),
+            )
+        )
+        logger.warning(
+            "[RELEASE_QUALIFIER] infra-failure backstop: v%d has %d consecutive "
+            "infrastructure errors (error=%s) — alert raised",
+            version.version_number,
+            current_streak,
+            infra_error,
+        )
+
+    await _notify_operator(
+        session,
+        version,
+        "release_infra_failure",
+        (
+            f"v{version.version_number} qualifier infrastructure failure — "
+            f"{infra_error.replace('_', ' ')} (agent VM / clone failure, "
+            f"not a quality finding). Returned to stabilize for "
+            f"re-qualification. Consecutive infra errors: {current_streak}."
+        ),
+        extra={
+            "error": infra_error,
+            "consecutive_infra_errors": current_streak,
+        },
+    )
+
+    logger.warning(
+        "[RELEASE_QUALIFIER] v%d infra failure: %s (streak=%d) — "
+        "no verdict recorded, version returned to stabilize",
+        version.version_number,
+        infra_error,
+        current_streak,
+    )
+    return {
+        "status": "infra_failure",
+        "error": infra_error,
+        "consecutive_infra_errors": current_streak,
+    }
+
+
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -1421,6 +1569,56 @@ async def _finalize_qualification(
     smoketest_enabled = bool(qual.get("smoketest_enabled", True))
 
     policy = _load_policy()
+
+    # --- Infra-failure detection: check required child terminal statuses ------
+    # A FAILED or CANCELLED required child means the qualifier pipeline itself
+    # broke (agent VM crash, timeout, clone failure) — NOT a quality finding.
+    # Route these to _handle_infra_failure BEFORE reading artifacts so the
+    # quality-verdict path only sees COMPLETED children.  A COMPLETED child
+    # whose artifact is absent or unparseable still routes through the normal
+    # compute_composite path (audit_missing quality blocker — the real report
+    # was expected but absent, which is a candidate-scoring concern, not infra).
+    if audit_task_id:
+        try:
+            _audit_task_obj = await session.get(Task, uuid.UUID(str(audit_task_id)))
+            if _audit_task_obj is not None and _audit_task_obj.status in (
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            ):
+                return await _handle_infra_failure(
+                    session,
+                    version,
+                    qual,
+                    f"audit_task_{_audit_task_obj.status.lower()}",
+                )
+        except (ValueError, TypeError):
+            logger.warning(
+                "[RELEASE_QUALIFIER] invalid audit_task_id %s on version v%d "
+                "(skipping infra-failure check)",
+                audit_task_id,
+                version.version_number,
+            )
+
+    if smoketest_enabled and smoketest_task_id:
+        try:
+            _smoke_task_obj = await session.get(Task, uuid.UUID(str(smoketest_task_id)))
+            if _smoke_task_obj is not None and _smoke_task_obj.status in (
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            ):
+                return await _handle_infra_failure(
+                    session,
+                    version,
+                    qual,
+                    f"smoketest_task_{_smoke_task_obj.status.lower()}",
+                )
+        except (ValueError, TypeError):
+            logger.warning(
+                "[RELEASE_QUALIFIER] invalid smoketest_task_id %s on version v%d "
+                "(skipping infra-failure check)",
+                smoketest_task_id,
+                version.version_number,
+            )
 
     # --- Read the release_audit report -------------------------------------
     audit_report: dict[str, Any] | None = None
@@ -3846,6 +4044,36 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         "blocker": qual.get("blocker"),
         "started_at": qual.get("started_at"),
         "finalized_at": qual.get("finalized_at"),
+    }
+
+
+def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
+    """Return an operator-facing dict for a single QualificationVerdict row.
+
+    Serializes the ORM row into a stable, JSON-safe shape for the
+    qualification-verdict history endpoint.  Adds a human-readable ``outcome``
+    label alongside the raw ``terminal_status`` code so the UI can render
+    both without a second lookup.
+    """
+    return {
+        "id": str(verdict.id),
+        "release_version_id": str(verdict.release_version_id),
+        "candidate_sha": verdict.candidate_sha,
+        "confidence": verdict.confidence,
+        "sub_scores": verdict.sub_scores,
+        "blocker": verdict.blocker,
+        "would_promote": verdict.would_promote,
+        "promotion_enabled": verdict.promotion_enabled,
+        "terminal_status": verdict.terminal_status,
+        "outcome": _OUTCOME_LABELS.get(
+            verdict.terminal_status, verdict.terminal_status
+        ),
+        "threshold": verdict.threshold,
+        "started_at": verdict.started_at.isoformat() if verdict.started_at else None,
+        "finalized_at": verdict.finalized_at.isoformat()
+        if verdict.finalized_at
+        else None,
+        "created_at": verdict.created_at.isoformat(),
     }
 
 
