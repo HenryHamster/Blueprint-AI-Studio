@@ -85,6 +85,29 @@ const richTask: Task = {
   },
 };
 
+const memoTask: Task = {
+  id: 'task-memo-550e8400e29b41d4a716446655440000',
+  title: 'Memo: explain cache strategy',
+  description: 'Document reasoning about cache strategy',
+  status: 'COMPLETED',
+  task_type: 'memo',
+  created_at: '2024-01-01T00:00:00Z',
+  created_by: 'ORCHESTRATOR',
+  requires_approval: false,
+  context: {
+    research_task_id: 'task-research-550e8400e29b41d4a716446655440001',
+    finding_index: 2,
+  },
+  plan_output: {
+    memo: {
+      summary: 'Cache strategy: LRU with TTL provides optimal balance between memory and hit rate',
+      reasoning: 'After analyzing the workload patterns, LRU eviction with a 1-hour TTL achieves:\n• 92% cache hit rate under normal load\n• Predictable memory usage bounded at 512MB\n• Sub-100ms p99 latency for cache operations\n\nAlternatives like W-TinyLFU add complexity without measurable benefit here.',
+      citations: ['task:task-550e8400e29b41d4a716446655440005', 'direction:d-cache-analysis-1234'],
+      tags: ['optimization', 'performance', 'caching'],
+    },
+  },
+};
+
 describe('TaskDetailDrawerMeta DetailsTab — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
@@ -162,5 +185,47 @@ describe('TaskDetailDrawerMeta DetailsTab — viewport regression', () => {
       root = r;
       await act(async () => { r.render(<DetailsTab task={richTask} />); });
     }, { selector: 'button, a[href]' });
+  });
+
+  test('renders memo task with reasoning, citations, and tags at 375px without overflow', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => { r.render(<DetailsTab task={memoTask} />); });
+    });
+  });
+
+  test('memo section displays summary, reasoning, citations, and tags correctly', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+
+    await act(async () => { r.render(<DetailsTab task={memoTask} />); });
+
+    const content = host.textContent ?? '';
+    // Check summary is rendered
+    expect(content).toContain('LRU with TTL provides optimal balance');
+    // Check reasoning is rendered
+    expect(content).toContain('92% cache hit rate under normal load');
+    // Check tags are rendered
+    expect(content).toContain('optimization');
+    expect(content).toContain('performance');
+    expect(content).toContain('caching');
+    // Check citations are rendered
+    expect(content).toContain('task-550e8400e29b41d4a716446655440005');
+    expect(content).toContain('direction:d-cache-analysis-1234');
+  });
+
+  test('memo text does not silently clip at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => { r.render(<DetailsTab task={memoTask} />); });
+    });
   });
 });

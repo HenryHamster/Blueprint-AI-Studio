@@ -1046,7 +1046,99 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         );
       })()}
 
-      {task.plan_output && <>
+      {task.plan_output && (() => {
+        const planOut = task.plan_output as Record<string, unknown> | undefined;
+        const memoData = planOut?.memo as Record<string, unknown> | undefined;
+        return typeof memoData === 'object' && memoData !== null;
+      })() ? (() => {
+        const planOut = task.plan_output as Record<string, unknown>;
+        const memo = planOut.memo as {
+          summary?: string;
+          reasoning?: string;
+          citations?: string[];
+          tags?: string[];
+        } | undefined;
+        if (!memo) return null;
+
+        const renderCitationLabel = (citation: string): string => {
+          if (citation.startsWith('task:')) {
+            return citation.slice(5);
+          }
+          if (citation.startsWith('direction:')) {
+            return citation;
+          }
+          return citation;
+        };
+
+        const getCitationType = (citation: string): 'task' | 'direction' | 'other' => {
+          if (citation.startsWith('task:')) return 'task';
+          if (citation.startsWith('direction:')) return 'direction';
+          return 'other';
+        };
+
+        return (
+          <>
+            <SectionHeader>Memo Reasoning</SectionHeader>
+            <div className="space-y-3 bg-blue-950/10 rounded-lg p-3 border border-blue-900/30">
+              {memo.summary && (
+                <div className="flex items-start gap-2">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Summary</span>
+                  <p className="text-sm text-neutral-200 min-w-0 break-words">{memo.summary}</p>
+                </div>
+              )}
+              {memo.reasoning && (
+                <div className="flex items-start gap-2">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Reasoning</span>
+                  <p className="text-sm text-neutral-200 min-w-0 break-words whitespace-pre-wrap">{memo.reasoning}</p>
+                </div>
+              )}
+              {memo.tags && memo.tags.length > 0 && (
+                <div className="flex items-start gap-2">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Tags</span>
+                  <div className="flex flex-wrap gap-1.5 min-w-0">
+                    {memo.tags.map((tag, i) => (
+                      <span key={i} className="inline-block text-xs px-2 py-0.5 rounded bg-blue-900/40 text-blue-300 border border-blue-800/40">
+                        {tag}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {memo.citations && memo.citations.length > 0 && (
+                <div className="flex items-start gap-2">
+                  <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">Citations</span>
+                  <div className="space-y-1 min-w-0 flex-1">
+                    {memo.citations.map((citation, i) => {
+                      const type = getCitationType(citation);
+                      const label = renderCitationLabel(citation);
+                      return (
+                        <div key={i} className="text-sm">
+                          {type === 'task' ? (
+                            onNavigateToTask ? (
+                              <button
+                                onClick={() => onNavigateToTask(label)}
+                                className="text-blue-400 hover:text-blue-300 transition-colors font-mono break-all text-left"
+                              >
+                                {label}
+                              </button>
+                            ) : (
+                              <span className="text-blue-300 font-mono break-all">{label}</span>
+                            )
+                          ) : (
+                            <span className="text-neutral-300 break-all">{citation}</span>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          </>
+        );
+      })() : null}
+
+      {task.plan_output && task.task_type !== 'memo' && <>
         <SectionHeader>Plan Output</SectionHeader>
         <pre className="text-xs text-neutral-300 whitespace-pre-wrap break-words bg-purple-950/20 rounded-lg p-3 max-h-64 overflow-y-auto custom-scrollbar border border-purple-900/30 font-mono">{JSON.stringify(task.plan_output, null, 2)}</pre>
       </>}

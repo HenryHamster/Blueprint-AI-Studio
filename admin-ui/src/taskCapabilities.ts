@@ -162,6 +162,15 @@ export const TASK_CAPABILITIES = [
     synthetic: false,
   },
   {
+    id: 'memo',
+    label: 'Memo',
+    description: 'Reasoning artifact',
+    userLaunchable: false,
+    providerConfigurable: false,
+    filterVisible: true,
+    synthetic: false,
+  },
+  {
     id: 'rollup',
     label: 'Rollup',
     description: 'Rollup PR aggregation',
