@@ -30,10 +30,11 @@ const logMock = vi.hoisted(() => vi.fn());
 vi.mock('./index.js', () => ({
   cloneWithRetry: cloneWithRetryMock,
   log: logMock,
+  GIT_REFERENCE_CACHE_ROOT: '/opt/agent-cache/git',
 }));
 
 // ── Imports (after mocks) ────────────────────────────────────────────────────
-import { prepareWorkspaceForRole } from './workspacePrep.js';
+import { prepareWorkspaceForRole, resolveReferenceRepo } from './workspacePrep.js';
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 describe('prepareWorkspaceForRole', () => {
@@ -469,6 +470,104 @@ describe('prepareWorkspaceForRole', () => {
         'clone', '--branch', 'main',
         'https://x-access-token:tok@github.com/o/r.git', '/ws',
       ]);
+    });
+  });
+
+  // ── Cold path: pre-baked git object cache reuse ─────────────────────────────
+  //
+  // The image seeds a mirror at GIT_REFERENCE_CACHE_ROOT/<owner>/<repo>.git.
+  // The cold path appends `--reference-if-able <mirror>` when that path exists
+  // so every role's cold clone (review-fix / specialized / research /
+  // design-doc) gets the object-reuse speedup, not just setupWorkspace's
+  // standard path.
+  describe('cold path: reference-cache reuse', () => {
+    it('mirror exists → clone args include --reference-if-able', async () => {
+      // BLUEPRINT_WARM_HANDOFF unset (cold path). existsSync is only consulted
+      // by resolveReferenceRepo here; return true for the mirror path.
+      fsMocks.existsSync.mockImplementation((p: unknown) => {
+        const s = String(p).replace(/\\/g, '/');
+        return s.endsWith('/opt/agent-cache/git/o/r.git');
+      });
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feature/x',
+        depth: 50,
+      });
+
+      expect(cloneWithRetryMock).toHaveBeenCalledTimes(1);
+      expect(cloneWithRetryMock).toHaveBeenCalledWith([
+        'clone', '--depth', '50', '--branch', 'feature/x',
+        '--reference-if-able', '/opt/agent-cache/git/o/r.git',
+        'https://x-access-token:tok@github.com/o/r.git', '/ws',
+      ]);
+    });
+
+    it('mirror exists + depth=0 → --reference-if-able with full-clone args', async () => {
+      fsMocks.existsSync.mockImplementation((p: unknown) =>
+        String(p).replace(/\\/g, '/').endsWith('/opt/agent-cache/git/o/r.git'));
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'main',
+        depth: 0,
+      });
+
+      expect(cloneWithRetryMock).toHaveBeenCalledWith([
+        'clone', '--branch', 'main',
+        '--reference-if-able', '/opt/agent-cache/git/o/r.git',
+        'https://x-access-token:tok@github.com/o/r.git', '/ws',
+      ]);
+    });
+
+    it('mirror absent → clone args exclude --reference-if-able', async () => {
+      // existsSync returns false (the default) → no mirror → plain cold clone.
+      fsMocks.existsSync.mockReturnValue(false);
+
+      await prepareWorkspaceForRole({
+        workspace: '/ws',
+        repoUrl: 'https://x-access-token:tok@github.com/o/r.git',
+        githubToken: 'tok',
+        branch: 'feature/x',
+        depth: 50,
+      });
+
+      const cloneArgs = cloneWithRetryMock.mock.calls[0][0] as string[];
+      expect(cloneArgs).not.toContain('--reference-if-able');
+      expect(cloneArgs).toEqual([
+        'clone', '--depth', '50', '--branch', 'feature/x',
+        'https://x-access-token:tok@github.com/o/r.git', '/ws',
+      ]);
+    });
+  });
+
+  // ── resolveReferenceRepo unit behavior ──────────────────────────────────────
+  describe('resolveReferenceRepo', () => {
+    it('returns the mirror path when it exists on disk', () => {
+      fsMocks.existsSync.mockImplementation((p: unknown) =>
+        String(p).replace(/\\/g, '/').endsWith('/opt/agent-cache/git/o/r.git'));
+      expect(resolveReferenceRepo('https://x-access-token:tok@github.com/o/r.git'))
+        .toBe('/opt/agent-cache/git/o/r.git');
+    });
+
+    it('returns null when the mirror does not exist', () => {
+      fsMocks.existsSync.mockReturnValue(false);
+      expect(resolveReferenceRepo('https://x-access-token:tok@github.com/o/r.git')).toBeNull();
+    });
+
+    it('returns null for an unparseable URL', () => {
+      fsMocks.existsSync.mockReturnValue(true);
+      expect(resolveReferenceRepo('not a url')).toBeNull();
+    });
+
+    it('returns null when the path is not exactly owner/repo', () => {
+      fsMocks.existsSync.mockReturnValue(true);
+      // Nested path (owner/group/repo) — not the 2-segment owner/repo layout.
+      expect(resolveReferenceRepo('https://github.com/o/g/r.git')).toBeNull();
     });
   });
 });

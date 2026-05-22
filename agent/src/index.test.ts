@@ -1810,6 +1810,61 @@ describe('stale result retry envelopes', () => {
   });
 });
 
+// ── setupWorkspace: pre-baked git object cache reuse ─────────────────────────
+describe('setupWorkspace reference-cache reuse', () => {
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(fs.existsSync).mockReset();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** execFileSync stub: ls-remote throws so the stale-branch path is skipped;
+   *  every other git/rm/curl invocation succeeds. */
+  function stubExecFileSyncNoStaleBranch(): void {
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown, args: unknown) => {
+      const a = Array.isArray(args) ? (args as string[]) : [];
+      if (String(cmd) === 'git' && a[0] === 'ls-remote') {
+        throw new Error('fatal: branch not found'); // → staleBranchExists = false
+      }
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+  }
+
+  function findCloneArgs(): string[] {
+    const cloneCall = vi.mocked(execFileSync).mock.calls.find(
+      c => c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[])[0] === 'clone',
+    );
+    expect(cloneCall).toBeDefined();
+    return cloneCall?.[1] as string[];
+  }
+
+  it('clone args include --reference-if-able when the mirror exists', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true); // mirror present on disk
+    stubExecFileSyncNoStaleBranch();
+
+    await setupWorkspace('owner', 'repo', 'ghtoken', 'main', 'prefix', 'task-id', null, { value: '' });
+
+    const cloneArgs = findCloneArgs();
+    expect(cloneArgs).toContain('--reference-if-able');
+    // Reference path matches GIT_REFERENCE_CACHE_ROOT/<owner>/<repo>.git.
+    const refIdx = cloneArgs.indexOf('--reference-if-able');
+    expect(cloneArgs[refIdx + 1]).toBe('/opt/agent-cache/git/owner/repo.git');
+  });
+
+  it('clone args exclude --reference-if-able when the mirror is absent', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false); // no mirror seeded for this repo
+    stubExecFileSyncNoStaleBranch();
+
+    await setupWorkspace('owner', 'repo', 'ghtoken', 'main', 'prefix', 'task-id', null, { value: '' });
+
+    const cloneArgs = findCloneArgs();
+    expect(cloneArgs).not.toContain('--reference-if-able');
+  });
+});
+
 // ── Failure category classification ──────────────────────────────────────────
 describe('failure category classification', () => {
   beforeEach(() => {
