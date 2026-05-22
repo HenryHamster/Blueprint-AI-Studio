@@ -4,6 +4,7 @@ import {
   checkAllComponentsHaveTests,
   check375pxOverflow,
   checkBackendPatterns,
+  checkBackendEslintPattern,
   checkEscapeHatchBudget,
 } from './viewport-checks.js';
 
@@ -92,6 +93,23 @@ ${missing.map(p => `  "${p}"`).join('\n')}
         : '';
 
     expect(missing, errorMessage).toEqual([]);
+  });
+
+  it('backend admin_digest.py eslint-disable regex matches the canonical CI gate pattern', () => {
+    // The Viewport Debt panel counts eslint-disable viewport/* opt-outs using
+    // _ESLINT_VIEWPORT_RE in admin_digest.py.  It must use the same pattern as
+    // checkEscapeHatchBudget (ESLINT_VIEWPORT_PATTERN) so operators see counts
+    // that exactly match what CI enforces.
+    const violations = checkBackendEslintPattern();
+
+    const errorMessage =
+      violations.length > 0
+        ? `
+${violations.join('\n')}
+        `.trim()
+        : '';
+
+    expect(violations, errorMessage).toEqual([]);
   });
 
   it('fails CI when escape-hatch debt exceeds the per-component or total budget', () => {

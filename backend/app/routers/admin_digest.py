@@ -9068,9 +9068,10 @@ _VIEWPORT_DEBT_CACHE: Optional[
 _VIEWPORT_DEBT_CACHE_TTL = 300  # 5 minutes
 _VIEWPORT_DEBT_UNTESTED_CAP = 30
 
-_ESLINT_VIEWPORT_RE = _re.compile(
-    r"eslint-disable(?:-next-line)?.*viewport/(?:min-touch-target|no-fixed-width)"
-)
+# Matches any eslint-disable comment that references "viewport" — canonical pattern
+# shared with the CI gate in admin-ui/src/test/viewport-checks.js
+# (checkEscapeHatchBudget uses: /eslint-disable[^\n]*viewport/g).
+_ESLINT_VIEWPORT_RE = _re.compile(r"eslint-disable[^\n]*viewport")
 _DATA_SMALL_TARGET_RE = _re.compile(r"data-viewport-allow-small-target")
 _DATA_OVERFLOW_RE = _re.compile(r"data-viewport-allow-overflow")
 _DATA_TRUNCATION_RE = _re.compile(r"data-viewport-allow-truncation")
@@ -9084,6 +9085,24 @@ def _find_components_dir() -> Optional[_Path]:
             return candidate
         here = here.parent
     return None
+
+
+def _load_viewport_budget() -> Dict[str, Any]:
+    """Load viewport-escape-hatch-budget.json, returning empty dict on failure."""
+    here = _Path(__file__).resolve().parent
+    for _ in range(6):
+        candidate = (
+            here / "admin-ui" / "src" / "test" / "viewport-escape-hatch-budget.json"
+        )
+        if candidate.is_file():
+            try:
+                import json as _json
+
+                return _json.loads(candidate.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+        here = here.parent
+    return {}
 
 
 def _scan_viewport_debt_rows() -> tuple[
@@ -9102,13 +9121,21 @@ def _scan_viewport_debt_rows() -> tuple[
             "total_components": 0,
             "untested_count": 0,
             "untested_components": [],
+            "total_opt_outs": 0,
+            "total_budget": None,
+            "budget_headroom": None,
         }
         return [], [], empty_summary
+
+    budget = _load_viewport_budget()
+    per_component_budget: Dict[str, int] = budget.get("perComponent", {}) or {}
+    total_budget: Optional[int] = budget.get("total")
 
     rows = []
     untested_rows: List[Dict[str, Any]] = []
     untested_paths: List[str] = []
     total_components = 0
+    grand_total_opt_outs = 0
     for tsx_file in sorted(components_dir.glob("*.tsx")):
         name = tsx_file.name
         if ".test." in name or ".spec." in name:
@@ -9124,10 +9151,14 @@ def _scan_viewport_debt_rows() -> tuple[
         overflow = len(_DATA_OVERFLOW_RE.findall(content))
         truncation = len(_DATA_TRUNCATION_RE.findall(content))
         total = eslint_count + small_target + overflow + truncation
+        grand_total_opt_outs += total
 
         stem = tsx_file.stem  # e.g. "MessagesPanel"
         vp_test = (tsx_file.parent / f"{stem}.viewport.test.tsx").exists()
         rel_path = f"admin-ui/src/components/{name}"
+
+        cap: Optional[int] = per_component_budget.get(stem)
+        headroom: Optional[int] = (cap - total) if cap is not None else None
 
         if not vp_test:
             untested_paths.append(rel_path)
@@ -9142,6 +9173,8 @@ def _scan_viewport_debt_rows() -> tuple[
                         "data_viewport_allow_overflow": 0,
                         "data_viewport_allow_truncation": 0,
                         "total_opt_outs": 0,
+                        "budget_cap": cap,
+                        "headroom": headroom,
                         "has_viewport_test": False,
                         "regression_case_count": 0,
                         "regression_case_breakdown": {},
@@ -9158,6 +9191,8 @@ def _scan_viewport_debt_rows() -> tuple[
                 "data_viewport_allow_overflow": overflow,
                 "data_viewport_allow_truncation": truncation,
                 "total_opt_outs": total,
+                "budget_cap": cap,
+                "headroom": headroom,
                 "has_viewport_test": vp_test,
                 "regression_case_count": 0,
                 "regression_case_breakdown": {},
@@ -9168,10 +9203,16 @@ def _scan_viewport_debt_rows() -> tuple[
     rows.sort(key=lambda r: r["total_opt_outs"], reverse=True)
     untested_rows.sort(key=lambda r: r["component"])
 
+    budget_headroom: Optional[int] = (
+        (total_budget - grand_total_opt_outs) if total_budget is not None else None
+    )
     coverage_summary: Dict[str, Any] = {
         "total_components": total_components,
         "untested_count": len(untested_paths),
         "untested_components": sorted(untested_paths)[:50],
+        "total_opt_outs": grand_total_opt_outs,
+        "total_budget": total_budget,
+        "budget_headroom": budget_headroom,
     }
 
     rows = rows[:15]

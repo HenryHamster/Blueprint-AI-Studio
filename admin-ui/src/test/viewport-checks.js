@@ -13,6 +13,12 @@ const COMPONENTS_DIR = path.join(__dirname, '../components');
 const REQUIRED_JSON = path.join(__dirname, 'viewport-required.json');
 const BUDGET_JSON = path.join(__dirname, 'viewport-escape-hatch-budget.json');
 const BACKEND_PY = path.join(__dirname, '../../../backend/app/failure_classification.py');
+const ADMIN_DIGEST_PY = path.join(__dirname, '../../../backend/app/routers/admin_digest.py');
+
+// Canonical eslint-disable pattern for viewport escape-hatch counting.
+// Must stay in sync with _ESLINT_VIEWPORT_RE in backend/app/routers/admin_digest.py
+// so the count shown in the Viewport Debt panel matches the count CI enforces.
+export const ESLINT_VIEWPORT_PATTERN = 'eslint-disable[^\\n]*viewport';
 
 // Single source of truth for viewport-test exemptions.
 // Components listed here are internal/utility and never rendered standalone on
@@ -145,7 +151,25 @@ export function checkBackendPatterns() {
 }
 
 /**
- * Invariant 5: per-component and total viewport escape-hatch debt stays within
+ * Invariant 5: the backend admin_digest.py _ESLINT_VIEWPORT_RE must embed the
+ * canonical ESLINT_VIEWPORT_PATTERN so operator-visible counts equal CI counts.
+ * Returns human-readable violation strings (empty = pass).
+ */
+export function checkBackendEslintPattern() {
+  const src = fs.readFileSync(ADMIN_DIGEST_PY, 'utf-8');
+  if (!src.includes(ESLINT_VIEWPORT_PATTERN)) {
+    return [
+      `backend/app/routers/admin_digest.py _ESLINT_VIEWPORT_RE does not contain` +
+      ` the canonical pattern "${ESLINT_VIEWPORT_PATTERN}".` +
+      ` Update it to: re.compile(r"${ESLINT_VIEWPORT_PATTERN}")` +
+      ` so the Viewport Debt panel shows counts that match the CI gate.`,
+    ];
+  }
+  return [];
+}
+
+/**
+ * Invariant 6: per-component and total viewport escape-hatch debt stays within
  * the limits in viewport-escape-hatch-budget.json.
  * Returns human-readable violation strings (empty = pass).
  */
@@ -155,8 +179,11 @@ export function checkEscapeHatchBudget() {
     f => f.endsWith('.tsx') && !f.endsWith('.test.tsx') && !f.endsWith('.viewport.test.tsx')
   );
   // Matches all three escape-hatch data attributes and eslint-disable viewport/* comments.
-  const escapeHatchPattern =
-    /data-viewport-allow-overflow|data-viewport-allow-truncation|data-viewport-allow-small-target|eslint-disable[^\n]*viewport/g;
+  // Uses ESLINT_VIEWPORT_PATTERN (canonical) so counts match what admin_digest.py reports.
+  const escapeHatchPattern = new RegExp(
+    `data-viewport-allow-overflow|data-viewport-allow-truncation|data-viewport-allow-small-target|${ESLINT_VIEWPORT_PATTERN}`,
+    'g'
+  );
 
   const violations = [];
   let grandTotal = 0;
