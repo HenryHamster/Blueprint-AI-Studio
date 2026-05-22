@@ -9198,7 +9198,9 @@ async def test_sr_blind_spots_examples_capped_at_limit(client: AsyncClient, db_s
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Create more tasks than the example cap for a single theme
+    # Create more tasks than the example cap for a single theme. The blind-spot
+    # string must NOT match DISALLOWED_BLIND_SPOT_PATTERNS — intended-skip
+    # phrasings ("did not run the full ... suite") are filtered before themeing.
     for i in range(_BLIND_SPOT_EXAMPLES_PER_THEME + 2):
         db_session.add(
             make_task(
@@ -9210,7 +9212,7 @@ async def test_sr_blind_spots_examples_capped_at_limit(client: AsyncClient, db_s
                         "verdict": "pass",
                         "fixes_applied": False,
                         "check_results": {"correctness": {"passed": True}},
-                        "blind_spots": [f"did not run the full test suite variant {i}"],
+                        "blind_spots": [f"did not verify file path number {i}"],
                     }
                 },
             )
