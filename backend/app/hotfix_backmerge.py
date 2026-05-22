@@ -186,7 +186,15 @@ async def open_backmerge_pr(
     hotfix_task_id_str = str(hotfix_task_id) if hotfix_task_id is not None else None
     trigger_desc = _describe_trigger(merged_pr_url, hotfix_task_id_str)
 
-    project = await session.get(Project, project_id)
+    # populate_existing=True forces a fresh SELECT instead of returning a
+    # possibly-expired identity-map hit. The branch-reconciliation service
+    # (lifecycle._branch_reconciliation_service) reuses one long-lived session
+    # across all projects, committing/rolling back per iteration — both expire
+    # identity-map instances. Without the refresh, a later `project.github_owner`
+    # read in _resolve_github_with_session lazy-loads under async and raises
+    # MissingGreenlet, crash-looping the reconciler (so main→automain never
+    # back-merges and the branches silently diverge).
+    project = await session.get(Project, project_id, populate_existing=True)
     if project is None:
         logger.warning(
             "[BACKMERGE] open_backmerge_pr: project %s not found",

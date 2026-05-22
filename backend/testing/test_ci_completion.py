@@ -2208,3 +2208,137 @@ async def test_ci_failure_spawn_extracts_failing_test_names_into_prompt(
     )
     # And the broken-on-main fix-as-part-of-PR guidance should be there.
     assert "broken on `main`" in fix_prompt
+
+
+# ---------------------------------------------------------------------------
+# Promotion-carrier hooks — handle_ci_completion routes a promotion PR's
+# merge/CI-failure to the release qualifier instead of the normal rollup path.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_promotion_carrier_merge_calls_finalize(db_session, mocker):
+    """When a promotion-carrier PR merges, _attempt_merge_with_retry_and_escalation
+    calls release_qualifier.finalize_promotion_landed (the version bookkeeping)
+    — gated on context.is_promotion, so ordinary PRs never hit it."""
+    import uuid as _uuid
+    from unittest.mock import AsyncMock
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="mainmrg0" * 5),
+    )
+    finalize_spy = mocker.patch(
+        "app.release_qualifier.finalize_promotion_landed",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+
+    project = Project(name="Promo merge", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version_id = str(_uuid.uuid4())
+    task = Task(
+        project_id=project.id,
+        title="Promotion: release-v1 → main (PR #5)",
+        payloads=[{"type": "promotion_merge", "pr_number": 5, "base_branch": "main"}],
+        context={
+            "is_promotion": True,
+            "release_version_id": version_id,
+            "promotion_pr_url": "http://pr/5",
+            "review_loop": {
+                "pr_number": 5,
+                "branch": "release-v1",
+                "base_branch": "main",
+                "review_approved": True,
+            },
+        },
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    assert task.status == TaskStatus.COMPLETED
+    finalize_spy.assert_awaited_once()
+    assert finalize_spy.await_args.args[1] == version_id
+
+
+@pytest.mark.asyncio
+async def test_promotion_carrier_ci_failure_reverts_and_skips_fix(db_session, mocker):
+    """When a promotion-carrier PR's CI fails, handle_ci_completion reverts the
+    version (release_qualifier.revert_promotion_after_ci_failure) and marks the
+    carrier FAILED — it must NOT spawn a fix task (a red promotion candidate is
+    a version-quality signal, not a PR to fix)."""
+    import uuid as _uuid
+    from unittest.mock import AsyncMock
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    revert_spy = mocker.patch(
+        "app.release_qualifier.revert_promotion_after_ci_failure",
+        new=AsyncMock(return_value={"status": "reverted", "blocker": "ci_not_green"}),
+    )
+    # If the normal fix path were taken it would call _spawn_pipeline_task —
+    # spy on it to prove it is NOT invoked for a promotion carrier.
+    fix_spawn_spy = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, None)),
+    )
+
+    project = Project(name="Promo CI fail", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version_id = str(_uuid.uuid4())
+    task = Task(
+        project_id=project.id,
+        title="Promotion: release-v1 → main (PR #6)",
+        payloads=[{"type": "promotion_merge", "pr_number": 6, "base_branch": "main"}],
+        context={
+            "is_promotion": True,
+            "release_version_id": version_id,
+            "review_loop": {
+                "pr_number": 6,
+                "branch": "release-v1",
+                "base_branch": "main",
+                "review_approved": True,
+            },
+        },
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "details": [{"name": "CI / Backend", "status": "completed", "conclusion": "failure"}],
+        "failed_logs": "boom",
+    }
+    handled = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert handled is True
+    revert_spy.assert_awaited_once()
+    assert revert_spy.await_args.args[1] == version_id
+    fix_spawn_spy.assert_not_called()
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
