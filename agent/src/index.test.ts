@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, isViewportBootstrapFailure, runViewportSuiteWithFallback, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, isViewportBootstrapFailure, isInfrastructureFailure, runViewportSuiteWithFallback, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -774,6 +774,86 @@ describe('errorFingerprint', () => {
   });
 });
 
+// ── isInfrastructureFailure ──────────────────────────────────────────────────
+describe('isInfrastructureFailure', () => {
+  it('detects "command not found"', () => {
+    expect(isInfrastructureFailure('command not found: ruff')).toBe(true);
+  });
+
+  it('detects ENOENT', () => {
+    expect(isInfrastructureFailure('spawn ruff ENOENT')).toBe(true);
+  });
+
+  it('detects Cannot connect to Docker daemon', () => {
+    expect(isInfrastructureFailure('Cannot connect to Docker daemon')).toBe(true);
+  });
+
+  it('detects exit 137 (OOM)', () => {
+    expect(isInfrastructureFailure('Command failed with exit 137')).toBe(true);
+  });
+
+  it('detects EOOM (OOM code)', () => {
+    expect(isInfrastructureFailure('Error code: EOOM')).toBe(true);
+  });
+
+  it('detects out of memory', () => {
+    expect(isInfrastructureFailure('Process killed: out of memory')).toBe(true);
+  });
+
+  it('detects SIGKILL + OOM pattern', () => {
+    expect(isInfrastructureFailure('Killed signal: SIGKILL, reason: OOM')).toBe(true);
+  });
+
+  it('detects ETIMEDOUT', () => {
+    expect(isInfrastructureFailure('Error: ETIMEDOUT process timeout')).toBe(true);
+  });
+
+  it('detects spawn timeout', () => {
+    expect(isInfrastructureFailure('spawn timeout: process did not start')).toBe(true);
+  });
+
+  it('detects ECONNREFUSED (DNS/network)', () => {
+    expect(isInfrastructureFailure('ECONNREFUSED localhost:5432')).toBe(true);
+  });
+
+  it('detects ENOTFOUND (DNS)', () => {
+    expect(isInfrastructureFailure('getaddrinfo ENOTFOUND example.com')).toBe(true);
+  });
+
+  it('detects ENETUNREACH (network)', () => {
+    expect(isInfrastructureFailure('Network is unreachable ENETUNREACH')).toBe(true);
+  });
+
+  it('detects chromium + sudo issue', () => {
+    expect(isInfrastructureFailure('Chromium installation requires sudo: sudo apt-get install')).toBe(true);
+  });
+
+  it('detects chromium + permission denied', () => {
+    expect(isInfrastructureFailure('Chromium: permission denied when installing')).toBe(true);
+  });
+
+  it('detects docker daemon unavailable', () => {
+    expect(isInfrastructureFailure('Docker daemon is unavailable')).toBe(true);
+  });
+
+  it('returns false for genuine lint/code errors', () => {
+    expect(isInfrastructureFailure('error: unexpected semicolon on line 42')).toBe(false);
+  });
+
+  it('returns false for test assertion failures', () => {
+    expect(isInfrastructureFailure('AssertionError: expected foo to equal bar')).toBe(false);
+  });
+
+  it('returns false for type errors', () => {
+    expect(isInfrastructureFailure('TS2339: Property "foo" does not exist on type "Bar"')).toBe(false);
+  });
+
+  it('is case-insensitive', () => {
+    expect(isInfrastructureFailure('CANNOT CONNECT TO DOCKER DAEMON')).toBe(true);
+    expect(isInfrastructureFailure('Command NOT Found')).toBe(true);
+  });
+});
+
 describe('lintFixLoop early exit on identical errors', () => {
   beforeEach(() => {
     _resetFixLoopEventStateForTesting();
@@ -1011,6 +1091,119 @@ describe('lintFixLoop divergence detection', () => {
     expect(result.passed).toBe(false);
     // early_unchanged fires at attempt 2 (B == B); divergence never triggered
     expect(result.exitReason).toBe('early_unchanged');
+  });
+});
+
+// ── lintFixLoop infrastructure failure detection ────────────────────────────────
+describe('lintFixLoop infrastructure failure detection', () => {
+  beforeEach(() => {
+    _resetFixLoopEventStateForTesting();
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(spawn).mockReset();
+  });
+
+  it('detects docker unavailable and abandons without invoking Claude', async () => {
+    const infraError = 'Command failed: docker run -v /workspace:/workspace ... Cannot connect to Docker daemon';
+    const buildConfig = { directories: [{ path: 'admin-ui', type: 'node', lint_cmd: 'npm run lint' }] };
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'npm') throw new Error(infraError);
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+
+    const result = await lintFixLoop(['admin-ui/src/foo.tsx'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
+    expect(result.passed).toBe(false);
+    expect(result.setupFailed).toBe(true);
+    expect(result.infraFailureSummary).toContain('Cannot connect to Docker daemon');
+    // Claude MUST NOT be invoked for infra failures.
+    const claudeCalls = vi.mocked(spawn).mock.calls.filter(c => c[0].includes('claude')).length;
+    expect(claudeCalls).toBe(0);
+    // An infra abandon is NOT a lint outcome — it must emit no fix-loop event,
+    // matching the testFixLoop setup-failure precedent. Emitting one with
+    // exit_reason 'passed' (a backend _FIX_LOOP_SUCCESS_REASONS member) would
+    // misclassify the failure as a successful loop and hide it from operators.
+    expect(drainFixLoopEventBuffer()).toHaveLength(0);
+  });
+
+  it('detects chromium/sudo permission issue and abandons without invoking Claude', async () => {
+    const infraError = 'Error: Chromium installation requires sudo: sudo apt-get install ...';
+    const buildConfig = { directories: [{ path: 'admin-ui', type: 'node', lint_cmd: 'npm run lint' }] };
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'npm') throw new Error(infraError);
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+
+    const result = await lintFixLoop(['admin-ui/src/foo.tsx'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
+    expect(result.passed).toBe(false);
+    expect(result.setupFailed).toBe(true);
+    expect(result.infraFailureSummary).toContain('Chromium');
+    const claudeCalls = vi.mocked(spawn).mock.calls.filter(c => c[0].includes('claude')).length;
+    expect(claudeCalls).toBe(0);
+  });
+
+  it('detects ENOENT (command not found) and abandons without invoking Claude', async () => {
+    const infraError = 'Command failed: ruff\nError: spawn ruff ENOENT';
+    const buildConfig = { directories: [{ path: 'backend', type: 'python', lint_cmd: 'python3 -m ruff check' }] };
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'python3') throw new Error(infraError);
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+
+    const result = await lintFixLoop(['backend/app/foo.py'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
+    expect(result.passed).toBe(false);
+    expect(result.setupFailed).toBe(true);
+    const claudeCalls = vi.mocked(spawn).mock.calls.filter(c => c[0].includes('claude')).length;
+    expect(claudeCalls).toBe(0);
+  });
+
+  it('detects exit 137 (OOM) and abandons without invoking Claude', async () => {
+    const infraError = 'Command failed: npm run build\nexit 137 — out of memory';
+    const buildConfig = { directories: [{ path: 'admin-ui', type: 'node', build_cmd: 'npm run build' }] };
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      if (cmd === 'npm') throw new Error(infraError);
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+
+    const result = await lintFixLoop(['admin-ui/src/foo.tsx'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
+    expect(result.passed).toBe(false);
+    expect(result.setupFailed).toBe(true);
+    const claudeCalls = vi.mocked(spawn).mock.calls.filter(c => c[0].includes('claude')).length;
+    expect(claudeCalls).toBe(0);
+  });
+
+  it('still invokes Claude for genuine lint/build code errors (not infra)', async () => {
+    const lintError = 'error: unexpected semicolon on line 42';
+    const buildConfig = { directories: [{ path: 'agent', type: 'node', lint_cmd: 'npm run lint' }] };
+    let callCount = 0;
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
+      // First run: throw lint error. On retry after Claude, pass.
+      if (cmd === 'npm' && callCount === 0) {
+        callCount++;
+        throw new Error(lintError);
+      }
+      return '' as unknown as ReturnType<typeof execFileSync>;
+    });
+    vi.mocked(spawn).mockImplementation((_cmd: unknown) => {
+      // Claude (spawn, not execFileSync) succeeds on first call
+      const proc = {
+        stdin: { on: vi.fn(), end: vi.fn() },
+        stderr: { on: vi.fn() },
+        stdout: { on: vi.fn() },
+        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+          if (event === 'close') {
+            setImmediate(() => { cb(0); });
+          }
+        }),
+        kill: vi.fn(),
+      };
+      return proc as unknown as ReturnType<typeof spawn>;
+    });
+
+    const result = await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
+    expect(result.passed).toBe(true);
+    // Claude was invoked for the genuine lint error
+    const claudeCalls = vi.mocked(spawn).mock.calls.filter(c => c[0].includes('claude')).length;
+    expect(claudeCalls).toBeGreaterThan(0);
   });
 });
 

@@ -2161,6 +2161,33 @@ function buildFixLoopGuidanceSuffix(): string {
   return `\n\n${READ_THE_FAILURE_MESSAGE}\n${SIZE_GUARDRAIL_GUIDANCE}\n${PRIOR_ATTEMPT_DIVERGENCE}`;
 }
 
+/**
+ * Detect infrastructure-class failures that cannot be fixed by Claude.
+ * These include missing tools, Docker unavailability, OOM, DNS/network issues.
+ * Pattern set is conservative. Used by lintFixLoop's first-attempt abandon
+ * check; testFixLoop does its own runner-level setup-error detection and does
+ * not call this.
+ */
+export function isInfrastructureFailure(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  // Tool/command unavailable
+  if (lower.includes('command not found') || lower.includes('enoent')) return true;
+  // Docker daemon unavailable (Playwright, Docker-based tests)
+  if (lower.includes('cannot connect to docker daemon')) return true;
+  // OOM / SIGKILL (exit 137 shown as "killed" or "EOOM" code)
+  if (lower.includes('exit 137') || lower.includes('eoom') || lower.includes('out of memory')) return true;
+  if (lower.includes('killed') && (lower.includes('sigkill') || lower.includes('oom'))) return true;
+  // Process timeout / cannot spawn (ETIMEDOUT, spawn timeout)
+  if (lower.includes('etimedout') || lower.includes('spawn timeout')) return true;
+  // DNS / network errors
+  if (lower.includes('econnrefused') || lower.includes('enotfound') || lower.includes('enetunreach')) return true;
+  // Chromium/Playwright installation infrastructure failures
+  if (lower.includes('chromium') && (lower.includes('sudo') || lower.includes('permission denied'))) return true;
+  // Docker/container infrastructure issues
+  if (lower.includes('docker') && (lower.includes('daemon') || lower.includes('unavailable'))) return true;
+  return false;
+}
+
 export interface LintFixLoopResult {
   /** True if lint converged green within MAX_LINT_FIX_ATTEMPTS. */
   passed: boolean;
@@ -2168,6 +2195,10 @@ export interface LintFixLoopResult {
   lastErrorTail?: string;
   /** Why the loop stopped. */
   exitReason?: 'early_unchanged' | 'max_attempts' | 'divergence_oscillation' | 'divergence_similar_error' | 'divergence_diff_revert';
+  /** Infrastructure/setup failure detected; no fixer invoked. */
+  setupFailed?: boolean;
+  /** Summary of infrastructure failure when setupFailed=true. */
+  infraFailureSummary?: string;
   /** Per-attempt diff/error history, useful for downstream diagnosis. */
   attempts: FixAttempt[];
 }
@@ -2197,6 +2228,23 @@ export async function lintFixLoop(
       const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);
       lastErrorTail = msg;
       const fingerprint = errorFingerprint(msg);
+
+      // Infrastructure failure detection: on the first attempt, if the error
+      // is infrastructure-class (missing tool, Docker unavailable, OOM, DNS),
+      // abandon immediately without invoking Claude. This reduces wasted API
+      // calls on the failing tail and improves failure classification.
+      // Do NOT emit a fix-loop event here: this is not a lint outcome, and any
+      // exit_reason would either be misclassified as success ('passed' is in
+      // the backend's _FIX_LOOP_SUCCESS_REASONS) or be a misleading lint
+      // terminal reason. The infra abandon is surfaced via setupFailed=true so
+      // the caller classifies the task as an infra failure — matching the
+      // testFixLoop setup-failure precedent, which also returns without
+      // emitting a fix-loop event.
+      if (attempt === 0 && isInfrastructureFailure(msg)) {
+        sendLog(ws, `Lint check failed due to infrastructure issue (not a code/lint failure). Not invoking fixer.\n${msg.slice(0, 2000)}\n`);
+        return { passed: false, lastErrorTail, setupFailed: true, infraFailureSummary: msg.slice(0, 2000), attempts: prevAttempts };
+      }
+
       // Early exit: byte-identical consecutive error (existing behaviour).
       if (fingerprintHistory.length > 0 && fingerprint === fingerprintHistory[fingerprintHistory.length - 1]) {
         emitWrapperFixLoopEvent({

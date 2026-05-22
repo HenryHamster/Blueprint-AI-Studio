@@ -469,6 +469,49 @@ class TestShouldAutoApproveSmallDiff:
         skip, _ = should_auto_approve_diff(t, None)
         assert skip is True
 
+    def test_small_prod_change_with_large_test_file_auto_approves(self):
+        """Small prod change (20 lines) + large test file (100 lines) should
+        auto-approve because only non-test lines are counted in the budget."""
+        t = self._task(
+            files=["app/foo.py", "backend/testing/test_foo.py"],
+            diff=[
+                {"file": "app/foo.py", "added": 15, "removed": 5},
+                {"file": "backend/testing/test_foo.py", "added": 80, "removed": 20},
+            ],
+        )
+        skip, reason = should_auto_approve_diff(t, None)
+        assert skip is True
+        assert "auto-approve" in reason
+        assert "non-test lines" in reason
+
+    def test_large_prod_change_denied_regardless_of_test_lines(self):
+        """Large prod change (100 lines) should be denied even if test file
+        lines are excluded from the budget."""
+        t = self._task(
+            files=["app/foo.py", "backend/testing/test_foo.py"],
+            diff=[
+                {"file": "app/foo.py", "added": 60, "removed": 40},
+                {"file": "backend/testing/test_foo.py", "added": 100, "removed": 0},
+            ],
+        )
+        skip, reason = should_auto_approve_diff(t, None)
+        assert skip is False
+        assert "non-test lines" in reason
+
+    def test_test_only_change_auto_approves(self):
+        """A change that only touches test files should auto-approve."""
+        t = self._task(
+            files=["backend/testing/test_foo.py", "testing/test_bar.py"],
+            diff=[
+                {"file": "backend/testing/test_foo.py", "added": 40, "removed": 0},
+                {"file": "testing/test_bar.py", "added": 30, "removed": 0},
+            ],
+        )
+        skip, reason = should_auto_approve_diff(t, None)
+        assert skip is True
+        assert "auto-approve" in reason
+        assert "0 non-test lines" in reason
+
     def test_scope_overflow_warning_disables_auto_approve(self):
         t = self._task(
             scope="small",
@@ -872,9 +915,7 @@ async def test_supersede_cancelled_tasks_dont_count_toward_global_cap(
         base_branch="main",
         fix_prompt="Fix",
     )
-    assert result is not None, (
-        "Supersede-cancelled tasks must not count toward the cap"
-    )
+    assert result is not None, "Supersede-cancelled tasks must not count toward the cap"
     assert result.status == TaskStatus.QUEUED
 
 
