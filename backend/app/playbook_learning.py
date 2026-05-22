@@ -78,9 +78,8 @@ def _format_sr_alert_title(prefix: str, parts: list[str]) -> str:
 # ---------------------------------------------------------------------------
 
 # Total playbook size (JSON-serialised) above which the least-useful entry is
-# archived before a new one is added.  Leaves ~5 KB headroom below the 30 KB
-# total limit.
-_PLAYBOOK_CAPACITY_BYTES = 25 * 1024
+# archived before a new one is added.
+_PLAYBOOK_CAPACITY_BYTES = 30 * 1024
 
 # Cap on playbook_archive length. The archive exists for operator review of
 # retired playbook entries; there is no functional reason to keep more than

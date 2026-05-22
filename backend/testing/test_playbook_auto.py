@@ -1516,7 +1516,7 @@ def test_count_idle_auto_retired_within_window():
 
 
 def test_maybe_archive_for_capacity_triggers_at_threshold():
-    """maybe_archive_for_capacity archives when combined size exceeds 25KB."""
+    """maybe_archive_for_capacity archives when combined size exceeds 30KB."""
     from app.playbook_learning import (
         maybe_archive_for_capacity,
         _PLAYBOOK_CAPACITY_BYTES,
@@ -1676,10 +1676,10 @@ def test_maybe_archive_for_capacity_evicted_entry_triggers_resurrection_cooldown
 
 @pytest.mark.asyncio
 async def test_capture_success_archives_when_over_capacity(db_session: AsyncSession):
-    """capture_success_pattern archives the least-useful entry when total size exceeds 25KB."""
+    """capture_success_pattern archives the least-useful entry when total size exceeds 30KB."""
     from app.playbook_learning import capture_success_pattern, _PLAYBOOK_CAPACITY_BYTES
 
-    # Build a design_doc clearly over capacity: 28 entries × ~950 bytes ≈ 26.6 KB
+    # Build a design_doc clearly over capacity: 35 entries × ~1050 bytes ≈ 35.6 KB
     big_content = "x" * 900
     existing_doc: dict = {
         # A failure-derived entry (pre-existing playbook content)
@@ -1691,7 +1691,7 @@ async def test_capture_success_archives_when_over_capacity(db_session: AsyncSess
             "updated_at": _utcnow().isoformat(),
         },
     }
-    for i in range(27):
+    for i in range(34):
         existing_doc[f"playbook/old-entry-{i:03d}"] = {
             "content": big_content,
             "confirmed_count": 0,

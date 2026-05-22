@@ -1429,7 +1429,7 @@ async def test_design_doc_file_to_system_index(client: AsyncClient, db_session):
 @pytest.mark.smoketest
 @pytest.mark.asyncio
 async def test_playbook_size_limits(client: AsyncClient, db_session):
-    """Tests that per-entry 2KB and total 25KB size limits are enforced."""
+    """Tests that per-entry 2KB and total 30KB size limits are enforced."""
     project = Project(name="Playbook Size Test", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
@@ -1465,7 +1465,7 @@ async def test_playbook_size_limits(client: AsyncClient, db_session):
 
     # Total playbook limit: at capacity, new writes succeed by evicting old entries
     # rather than hard-rejecting.  Each entry ~1500 chars value; with metadata
-    # overhead each row is ~1620B, so ~15 fit under 25KB before eviction kicks in.
+    # overhead each row is ~1620B, so ~18 fit under 30KB before eviction kicks in.
     large_value = "y" * 1500
     for i in range(40):
         r = await client.post(
@@ -1490,7 +1490,6 @@ async def test_playbook_size_limits(client: AsyncClient, db_session):
     )
     # Playbook must still respect the hard cap.
     from app.playbook_learning import _playbook_size_bytes as _psb
-
     from app.playbook_learning import _PLAYBOOK_CAPACITY_BYTES as _cap
 
     assert _psb(doc) <= _cap, f"Hard cap violated: {_psb(doc)} bytes"
@@ -1523,10 +1522,10 @@ async def test_playbook_set_rejects_when_nothing_evictable(
     headers = {"x-agent-token": token}
 
     # Simulate a playbook that is already over cap and has nothing to evict.
-    # Patch _playbook_size_bytes to always report > 25KB cap, and
+    # Patch _playbook_size_bytes to always report > 30KB cap, and
     # _maybe_archive_for_capacity to return doc unchanged (nothing evictable).
     with (
-        patch("app.main._playbook_size_bytes", return_value=26_000),
+        patch("app.main._playbook_size_bytes", return_value=32_000),
         patch(
             "app.main._maybe_archive_for_capacity", side_effect=lambda doc, est=0: doc
         ),
@@ -1543,7 +1542,7 @@ async def test_playbook_set_rejects_when_nothing_evictable(
         )
 
     assert resp.status_code == 400, f"Expected 400, got: {resp.json()}"
-    assert "25600" in resp.json()["error"]["message"]
+    assert "30720" in resp.json()["error"]["message"]
 
 
 @pytest.mark.smoketest

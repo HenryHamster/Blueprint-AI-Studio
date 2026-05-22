@@ -18,6 +18,7 @@ from app.models import (
     TaskHistory,
     ProjectMessage,
     MessageType,
+    RECOMMENDED_MODE_META_KEY,
     _utcnow,
 )
 from app.auth import get_current_user
@@ -518,6 +519,22 @@ async def update_direction(
             status_code=400,
             detail=f"retirement_condition must be a string of at most {DIRECTION_CONTEXT_FIELD_MAX} characters",
         )
+    _VALID_RECOMMENDED_MODES = {"audit", "fundamentals", "ship", "pause"}
+    if (
+        "recommended_mode" in payload
+        and payload["recommended_mode"] is not None
+        and payload["recommended_mode"] not in _VALID_RECOMMENDED_MODES
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"recommended_mode must be one of: {sorted(_VALID_RECOMMENDED_MODES)}",
+        )
+    if "system_id" in payload and payload["system_id"] is not None:
+        if not isinstance(payload["system_id"], str) or len(payload["system_id"]) > 100:
+            raise HTTPException(
+                status_code=400,
+                detail="system_id must be a string of at most 100 characters",
+            )
 
     # Direction cap check: if reactivating, ensure we won't exceed the cap
     if payload.get("status") == "active":
@@ -626,6 +643,23 @@ async def update_direction(
                             "retirement_condition"
                         ]
                 d["context"] = context
+            if "recommended_mode" in payload:
+                if payload["recommended_mode"] is None:
+                    d.pop("recommended_mode", None)
+                    d.pop(RECOMMENDED_MODE_META_KEY, None)
+                else:
+                    mode = payload["recommended_mode"].strip().lower()
+                    d["recommended_mode"] = mode
+                    d[RECOMMENDED_MODE_META_KEY] = {
+                        "mode": mode,
+                        "source": "operator",
+                        "set_at": _utcnow().isoformat(),
+                    }
+            if "system_id" in payload:
+                if payload["system_id"] is None:
+                    d.pop("system_id", None)
+                else:
+                    d["system_id"] = payload["system_id"][:100]
             updated = True
             break
 

@@ -6487,9 +6487,20 @@ async def _compute_digest(
     ]
     if project_id:
         _cum_filters.append(Task.project_id == project_id)
-    _cum_result = await session.execute(select(Task).where(*_cum_filters))
+    _CUM_TASK_CAP = 10000
+    _cum_result = await session.execute(
+        select(Task).where(*_cum_filters).limit(_CUM_TASK_CAP)
+    )
     cumulative_merged_by_trigger_class: Dict[str, int] = {}
-    for r in _cum_result.scalars().all():
+    _cum_rows = _cum_result.scalars().all()
+    if len(_cum_rows) >= _CUM_TASK_CAP:
+        logger.warning(
+            "cumulative_merged_tasks: result capped at %d for project %s — "
+            "metrics may be truncated",
+            _CUM_TASK_CAP,
+            project_id,
+        )
+    for r in _cum_rows:
         ctx = r.context or {}
         trigger_cls = ctx.get("trigger_failure_class")
         if not trigger_cls:

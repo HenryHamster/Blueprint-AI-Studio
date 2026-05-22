@@ -459,10 +459,10 @@ async def test_admin_playbook_set_evicts_at_cap(
     project = project_with_member
 
     # Fill playbook beyond _PLAYBOOK_CAPACITY_BYTES with low-confirmed entries.
-    # Each entry: key + ~2000-byte content = ~2050 bytes; 13 entries ~ 26.6KB > 25KB cap.
+    # Each entry: key + ~2000-byte content = ~2050 bytes; 17 entries ~ 34.7KB > 30KB cap.
     filler_content = "x" * 1900
     doc = {}
-    for i in range(13):
+    for i in range(17):
         doc[f"playbook/filler-{i:02d}"] = {
             "content": filler_content,
             "source_task_id": None,
@@ -512,10 +512,10 @@ async def test_admin_playbook_set_fails_when_nothing_evictable(
     monkeypatch.setattr(_router_mod, "_archive_least_useful_entry", lambda doc: doc)
 
     project = project_with_member
-    # Fill playbook so it exceeds capacity.
+    # Fill playbook so it exceeds capacity (17 entries ~ 34.4KB > 30KB cap).
     filler_content = "x" * 1900
     doc = {}
-    for i in range(13):
+    for i in range(17):
         doc[f"playbook/filler-{i:02d}"] = {
             "content": filler_content,
             "source_task_id": None,
