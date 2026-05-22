@@ -217,6 +217,23 @@ export function useAppState() {
     } catch { /* ignore */ }
   }, [user]);
 
+  // Hydrate lastVisitTimestamp from backend (cross-device baseline via MessagesLastSeen store).
+  // No project_id → returns max last-seen across all operator projects. Backend wins when newer.
+  useEffect(() => {
+    if (!user) return;
+    authGet(`${API_BASE_URL}/api/admin/messages/last-seen`)
+      .then(res => res.ok ? res.json() : null)
+      .then((data: { last_seen_at?: number | null } | null) => {
+        const backendTs = (data && typeof data.last_seen_at === 'number' && data.last_seen_at > 0)
+          ? data.last_seen_at
+          : null;
+        if (backendTs !== null) {
+          setLastVisitTimestamp(prev => (prev == null || backendTs > prev) ? backendTs : prev);
+        }
+      })
+      .catch(() => {});
+  }, [user]);
+
   // Refresh indicator state
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
 

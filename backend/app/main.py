@@ -2301,6 +2301,7 @@ from app.payload_schemas import (
 from app.playbook_learning import (
     maybe_archive_for_capacity as _maybe_archive_for_capacity,
     _playbook_size_bytes,
+    _PLAYBOOK_CAPACITY_BYTES,
 )
 
 
@@ -2431,7 +2432,7 @@ async def update_playbook(
         # Evict least-useful entries until there is room for the new write.
         # Loop so a single large write or an already-over-cap state self-heals.
         entry_estimate = len(_json.dumps(entry).encode())
-        while _playbook_size_bytes(doc) + entry_estimate > 30_000:
+        while _playbook_size_bytes(doc) + entry_estimate > _PLAYBOOK_CAPACITY_BYTES:
             size_before = _playbook_size_bytes(doc)
             doc = _maybe_archive_for_capacity(doc, entry_estimate)
             if _playbook_size_bytes(doc) >= size_before:
@@ -2439,11 +2440,11 @@ async def update_playbook(
         doc[playbook_key] = entry
         # Final hard-cap check — only triggers when nothing was evictable.
         playbook_total = _playbook_size_bytes(doc)
-        if playbook_total > 30_000:
+        if playbook_total > _PLAYBOOK_CAPACITY_BYTES:
             del doc[playbook_key]  # rollback
             raise HTTPException(
                 status_code=400,
-                detail=f"Playbook too large ({playbook_total} bytes, max 30KB total) and no evictable entries",
+                detail=f"Playbook too large ({playbook_total} bytes, max {_PLAYBOOK_CAPACITY_BYTES} bytes) and no evictable entries",
             )
     elif op == "delete":
         doc.pop(f"playbook/{key}", None)

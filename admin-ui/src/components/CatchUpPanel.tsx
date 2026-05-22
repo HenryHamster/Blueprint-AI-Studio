@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { RefObject } from 'react';
 import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle, Loader2, Check, RotateCcw, DollarSign, Compass } from 'lucide-react';
-import { apiFetch } from '../api';
+import { apiFetch, API_BASE_URL } from '../api';
 import { timeAgo, parseTimestamp } from '../utils/time';
 import { isSafeUrl, TaskTypeBadge, TASK_TYPE_STYLES, FAILURE_CLASS_CONFIG } from './TaskCard';
 import type { TaskType } from './TaskCard';
@@ -342,6 +342,24 @@ interface DigestData {
   } | null;
 }
 
+async function fetchCatchUpLastSeen(projectId: string): Promise<number | null> {
+  try {
+    const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/last-seen?project_id=${encodeURIComponent(projectId)}`);
+    if (!res.ok) return null;
+    const { last_seen_at: val } = await res.json() as { last_seen_at?: number | null };
+    return typeof val === 'number' && val > 0 ? val : null;
+  } catch { return null; }
+}
+
+async function postCatchUpLastSeen(projectId: string, timestamp: number): Promise<void> {
+  try {
+    await apiFetch(`${API_BASE_URL}/api/admin/messages/last-seen`, {
+      method: 'PUT',
+      body: JSON.stringify({ project_id: projectId, timestamp }),
+    });
+  } catch { /* ignore — localStorage already saved */ }
+}
+
 export interface CatchUpPanelProps {
   selectedProjectId: string | null;
   projects?: Project[];
@@ -368,7 +386,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
   // Track when the user last viewed the catch-up panel (not page load).
   // Read once on mount; updated when the user collapses the panel after reading.
   // Per-operator key is preferred; falls back to global key (migration) then lastVisitTimestamp.
-  const [lastCatchUpViewed] = useState(() => {
+  const [lastCatchUpViewed, setLastCatchUpViewed] = useState<number | null>(() => {
     try {
       const stored = localStorage.getItem(catchUpViewedKey);
       const ts = stored ? parseInt(stored, 10) : null;
@@ -378,6 +396,9 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
       return _lastVisitTimestamp;
     } catch { return _lastVisitTimestamp; }
   });
+  // Ref keeps backend-updated value accessible in fetchDigest without re-adding to its deps.
+  const lastCatchUpViewedRef = useRef<number | null>(lastCatchUpViewed);
+  lastCatchUpViewedRef.current = lastCatchUpViewed;
   const [collapsed, setCollapsed] = useState(() => {
     const wasCollapsed = localStorage.getItem('blueprint-admin:catchUpPanelCollapsed') === 'true';
     // Auto-expand on first session render if there are items needing attention
@@ -432,7 +453,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
     if (!silent) setLoading(true);
     else setUpdatingDigest(true);
     try {
-      const hours = windowToHours(activeWindow, lastCatchUpViewed);
+      const hours = windowToHours(activeWindow, lastCatchUpViewedRef.current);
       const params = new URLSearchParams({ hours: String(hours) });
       if (selectedProjectId) params.set('project_id', selectedProjectId);
       const res = await apiFetch(`/api/admin/digest?${params}`);
@@ -451,7 +472,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
       if (!silent) setLoading(false);
       else setUpdatingDigest(false);
     }
-  }, [activeWindow, lastCatchUpViewed, selectedProjectId]);
+  }, [activeWindow, selectedProjectId]);
 
   // Load cached digest when project changes
   useEffect(() => {
@@ -463,6 +484,20 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
       setDigest(null);
     }
   }, [selectedProjectId]);
+
+  // Sync last-seen from backend (same messages endpoint) — backend wins when newer (cross-device).
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    fetchCatchUpLastSeen(selectedProjectId).then(backendTs => {
+      if (backendTs !== null && backendTs > (lastCatchUpViewedRef.current ?? 0)) {
+        lastCatchUpViewedRef.current = backendTs;
+        setLastCatchUpViewed(backendTs);
+        try { localStorage.setItem(catchUpViewedKey, String(backendTs)); } catch { /* */ }
+        fetchDigest(true);
+      }
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedProjectId, catchUpViewedKey]);
 
   // Fetch on mount and when window/project changes; silent when collapsed
   useEffect(() => {
@@ -609,8 +644,11 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
   const toggle = () => {
     const next = !collapsed;
     if (next) {
-      // Collapsing → user has read the digest, record per-operator timestamp
-      try { localStorage.setItem(catchUpViewedKey, String(Date.now())); } catch { /* */ }
+      // Collapsing → user has read the digest, record per-operator timestamp locally and cross-device
+      const now = Date.now();
+      lastCatchUpViewedRef.current = now;
+      try { localStorage.setItem(catchUpViewedKey, String(now)); } catch { /* */ }
+      if (selectedProjectId) void postCatchUpLastSeen(selectedProjectId, now);
     }
     setCollapsed(next);
     localStorage.setItem('blueprint-admin:catchUpPanelCollapsed', String(next));

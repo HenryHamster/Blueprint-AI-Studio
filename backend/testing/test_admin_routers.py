@@ -1168,6 +1168,37 @@ class TestMessagesLastSeen:
         )
         assert put_resp.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_get_without_project_id_returns_null_when_empty(
+        self, client: AsyncClient, db_session
+    ):
+        """GET without project_id returns null when no last-seen records exist."""
+        resp = await client.get("/api/admin/messages/last-seen")
+        assert resp.status_code == 200
+        assert resp.json()["last_seen_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_get_without_project_id_returns_max_across_projects(
+        self, client: AsyncClient, db_session
+    ):
+        """GET without project_id returns max last-seen across all operator projects."""
+        p1 = await _make_project(db_session)
+        p2 = await _make_project(db_session)
+        ts1, ts2 = 1_700_000_000_000, 1_700_000_060_000
+
+        await client.put(
+            "/api/admin/messages/last-seen",
+            json={"project_id": str(p1.id), "timestamp": ts1},
+        )
+        await client.put(
+            "/api/admin/messages/last-seen",
+            json={"project_id": str(p2.id), "timestamp": ts2},
+        )
+
+        resp = await client.get("/api/admin/messages/last-seen")
+        assert resp.status_code == 200
+        assert resp.json()["last_seen_at"] == ts2
+
 
 class TestLastVisitTimestamp:
     @pytest.mark.asyncio

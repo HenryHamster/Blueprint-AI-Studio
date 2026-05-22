@@ -5,6 +5,7 @@ import {
   markCatchUpViewed,
   formatDuration,
   windowToHours,
+  resolveLastCatchUpViewed,
 } from './catchupHelpers';
 
 describe('getCatchUpViewedKey', () => {
@@ -92,6 +93,32 @@ describe('formatDuration', () => {
 
   it('formats hours rounded for long durations', () => {
     expect(formatDuration(72000)).toBe('20h');
+  });
+});
+
+describe('resolveLastCatchUpViewed', () => {
+  it('returns null when both timestamps are null', () => {
+    expect(resolveLastCatchUpViewed(null, null)).toBeNull();
+  });
+
+  it('returns backend timestamp when local is null', () => {
+    expect(resolveLastCatchUpViewed(null, 1000)).toBe(1000);
+  });
+
+  it('returns local timestamp when backend is null', () => {
+    expect(resolveLastCatchUpViewed(1000, null)).toBe(1000);
+  });
+
+  it('prefers backend when backend is newer (cross-device)', () => {
+    expect(resolveLastCatchUpViewed(1000, 2000)).toBe(2000);
+  });
+
+  it('returns local when local is newer', () => {
+    expect(resolveLastCatchUpViewed(2000, 1000)).toBe(2000);
+  });
+
+  it('returns either when timestamps are equal', () => {
+    expect(resolveLastCatchUpViewed(1000, 1000)).toBe(1000);
   });
 });
 

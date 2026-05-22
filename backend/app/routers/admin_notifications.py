@@ -517,11 +517,26 @@ async def delete_message(
 
 @router.get("/messages/last-seen")
 async def get_messages_last_seen(
-    project_id: str = Query(...),
+    project_id: Optional[str] = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Return the operator's last-seen timestamp (ms epoch) for the messages panel divider."""
+    """Return the operator's last-seen timestamp (ms epoch) for the messages panel divider.
+
+    When project_id is omitted, returns the maximum last-seen across all the operator's
+    projects — useful for the Catch-up digest panel which shows activity cross-project.
+    """
+    if project_id is None:
+        # Cross-project max: same store as per-project last-seen, used by CatchUp digest
+        max_ts = (
+            await session.execute(
+                select(func.max(MessagesLastSeen.last_seen_at)).where(
+                    MessagesLastSeen.user_id == current_user["user_id"],
+                )
+            )
+        ).scalar_one_or_none()
+        return {"last_seen_at": int(max_ts.timestamp() * 1000) if max_ts else None}
+
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):

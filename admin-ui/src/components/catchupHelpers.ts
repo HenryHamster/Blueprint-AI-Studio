@@ -75,6 +75,12 @@ export function markCatchUpViewed(userEmail?: string | null): void {
   try { localStorage.setItem(getCatchUpViewedKey(userEmail), String(Date.now())); } catch { /* */ }
 }
 
+/** Merges local and backend last-seen timestamps, preferring the backend value when it is newer (cross-device). */
+export function resolveLastCatchUpViewed(localTs: number | null, backendTs: number | null): number | null {
+  if (backendTs != null && (localTs == null || backendTs > localTs)) return backendTs;
+  return localTs;
+}
+
 export function windowToHours(window: TimeWindow, lastViewed: number | null): number {
   switch (window) {
     case 'last_visit': {
