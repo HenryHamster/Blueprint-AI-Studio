@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import get_session
@@ -283,7 +284,19 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
         cost_rows = (
             (
                 await session.execute(
-                    select(Task).where(
+                    select(Task)
+                    .options(
+                        load_only(
+                            Task.vm_provisioned_at,
+                            Task.vm_stopped_at,
+                            Task.vm_spot,
+                            Task.status,
+                            Task.id,
+                            Task.context,
+                            Task.latest_status_message,
+                        )
+                    )
+                    .where(
                         Task.project_id == task.project_id,
                         Task.id != task.id,
                         Task.vm_stopped_at >= today_start,
@@ -732,8 +745,9 @@ async def _clear_post_commit_pending(factory, task_id) -> None:
                         return
                     await asyncio.sleep(1 + attempt)
                     continue
-                if not locked.post_commit_pending and "_post_commit_pending_meta" not in (
-                    locked.context or {}
+                if (
+                    not locked.post_commit_pending
+                    and "_post_commit_pending_meta" not in (locked.context or {})
                 ):
                     return  # already clear
                 locked.post_commit_pending = False

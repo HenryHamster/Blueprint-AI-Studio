@@ -371,7 +371,7 @@ class TestSourceRefParsing:
 class TestSourceRefValidation:
     """Validation of research finding source file references."""
 
-    def test_pr_source_passes_through(self):
+    async def test_pr_source_passes_through(self):
         """PR-type sources require no validation."""
         sources = [
             {
@@ -380,13 +380,13 @@ class TestSourceRefValidation:
                 "description": "PR that added feature X",
             }
         ]
-        validated = validate_source_refs(sources)
+        validated = await validate_source_refs(sources)
         assert len(validated) == 1
         assert validated[0]["type"] == "pr"
         # No "valid" field should be added for PR sources
         assert "valid" not in validated[0] or validated[0].get("valid") is not False
 
-    def test_message_source_passes_through(self):
+    async def test_message_source_passes_through(self):
         """Message-type sources require no validation."""
         sources = [
             {
@@ -395,18 +395,18 @@ class TestSourceRefValidation:
                 "description": "Team feedback on design",
             }
         ]
-        validated = validate_source_refs(sources)
+        validated = await validate_source_refs(sources)
         assert len(validated) == 1
         assert validated[0]["type"] == "message"
 
-    def test_file_source_valid(self, monkeypatch):
+    async def test_file_source_valid(self, monkeypatch):
         """Valid file source (file exists) passes validation."""
         # Mock the workspace helpers so the test doesn't depend on /tmp/workspace
         # being present in the test environment (it isn't, inside the Docker
         # backend test container).
         from app import source_ref_validation as srv
 
-        monkeypatch.setattr(srv, "_file_exists_at_head", lambda path: True)
+        monkeypatch.setattr(srv, "_file_exists_at_head", AsyncMock(return_value=True))
         sources = [
             {
                 "type": "file",
@@ -414,16 +414,16 @@ class TestSourceRefValidation:
                 "description": "Test file",
             }
         ]
-        validated = validate_source_refs(sources)
+        validated = await validate_source_refs(sources)
         assert len(validated) == 1
         # Should not have valid: false marker if validation passed
         assert validated[0].get("valid") != False  # noqa: E712
 
-    def test_file_source_missing_file(self, monkeypatch):
+    async def test_file_source_missing_file(self, monkeypatch):
         """Missing file gets marked with valid: false."""
         from app import source_ref_validation as srv
 
-        monkeypatch.setattr(srv, "_file_exists_at_head", lambda path: False)
+        monkeypatch.setattr(srv, "_file_exists_at_head", AsyncMock(return_value=False))
         sources = [
             {
                 "type": "file",
@@ -431,12 +431,12 @@ class TestSourceRefValidation:
                 "description": "Missing file",
             }
         ]
-        validated = validate_source_refs(sources)
+        validated = await validate_source_refs(sources)
         assert len(validated) == 1
         # Should be marked as invalid
         assert validated[0].get("valid") == False  # noqa: E712
 
-    def test_file_source_missing_ref(self):
+    async def test_file_source_missing_ref(self):
         """File source without ref field is dropped."""
         sources = [
             {
@@ -444,16 +444,16 @@ class TestSourceRefValidation:
                 "description": "File source without ref",
             }
         ]
-        validated = validate_source_refs(sources)
+        validated = await validate_source_refs(sources)
         # Should be dropped (not in validated list)
         assert len(validated) == 0
 
-    def test_file_source_with_line_valid(self, monkeypatch):
+    async def test_file_source_with_line_valid(self, monkeypatch):
         """File source with valid line number."""
         from app import source_ref_validation as srv
 
-        monkeypatch.setattr(srv, "_file_exists_at_head", lambda path: True)
-        monkeypatch.setattr(srv, "_file_has_line_count", lambda path, n: True)
+        monkeypatch.setattr(srv, "_file_exists_at_head", AsyncMock(return_value=True))
+        monkeypatch.setattr(srv, "_file_has_line_count", AsyncMock(return_value=True))
         sources = [
             {
                 "type": "file",
@@ -461,32 +461,32 @@ class TestSourceRefValidation:
                 "description": "File at line 5",
             }
         ]
-        validated = validate_source_refs(sources)
+        validated = await validate_source_refs(sources)
         assert len(validated) == 1
         assert validated[0].get("valid") != False  # noqa: E712
 
-    def test_non_dict_source_dropped(self):
+    async def test_non_dict_source_dropped(self):
         """Non-dict source entries are dropped."""
         sources = [
             "not a dict",
             {"type": "file", "ref": "backend/app/research_completion.py"},
         ]
-        validated = validate_source_refs(sources)
+        validated = await validate_source_refs(sources)
         # The string should be dropped, only the dict should remain
         assert len(validated) == 1
         assert validated[0]["type"] == "file"
 
-    def test_none_sources_returns_empty_list(self):
+    async def test_none_sources_returns_empty_list(self):
         """None sources input returns empty list."""
-        validated = validate_source_refs(None)
+        validated = await validate_source_refs(None)
         assert validated == []
 
-    def test_non_list_sources_returns_empty_list(self):
+    async def test_non_list_sources_returns_empty_list(self):
         """Non-list sources input returns empty list."""
-        validated = validate_source_refs("not a list")
+        validated = await validate_source_refs("not a list")
         assert validated == []
 
-    def test_mixed_source_types(self):
+    async def test_mixed_source_types(self):
         """Batch with mixed source types is validated correctly."""
         sources = [
             {
@@ -506,7 +506,7 @@ class TestSourceRefValidation:
                 "ref": "nonexistent/missing.py",
             },
         ]
-        validated = validate_source_refs(sources)
+        validated = await validate_source_refs(sources)
         # All sources should be present (even the missing file gets marked invalid)
         assert len(validated) == 4
         # Check types are preserved
@@ -517,7 +517,7 @@ class TestSourceRefValidation:
         # Check invalid file is marked
         assert validated[3].get("valid") == False  # noqa: E712
 
-    def test_unknown_source_type_passes_through(self):
+    async def test_unknown_source_type_passes_through(self):
         """Unknown source types pass through unchanged."""
         sources = [
             {
@@ -526,7 +526,7 @@ class TestSourceRefValidation:
                 "description": "Custom source",
             }
         ]
-        validated = validate_source_refs(sources)
+        validated = await validate_source_refs(sources)
         assert len(validated) == 1
         assert validated[0]["type"] == "custom_type"
 
@@ -661,10 +661,10 @@ class TestProvenanceWarningsAttachment:
     """End-to-end: validate_source_refs + summarize_broken_refs flow used by
     research_completion to attach provenance to findings."""
 
-    def test_clean_finding_has_no_provenance_key(self, monkeypatch):
+    async def test_clean_finding_has_no_provenance_key(self, monkeypatch):
         from app import source_ref_validation as srv
 
-        monkeypatch.setattr(srv, "_file_exists_at_head", lambda path: True)
+        monkeypatch.setattr(srv, "_file_exists_at_head", AsyncMock(return_value=True))
         finding = {
             "title": "F1",
             "description": "D1",
@@ -673,17 +673,21 @@ class TestProvenanceWarningsAttachment:
                 {"type": "pr", "ref": "https://github.com/o/r/pull/1"},
             ],
         }
-        finding["sources"] = validate_source_refs(finding["sources"])
+        finding["sources"] = await validate_source_refs(finding["sources"])
         prov = summarize_broken_refs(finding["sources"])
         if prov is not None:
             finding["_provenance_warnings"] = prov
         assert "_provenance_warnings" not in finding
 
-    def test_finding_with_one_broken_ref_gets_provenance(self, monkeypatch):
+    async def test_finding_with_one_broken_ref_gets_provenance(self, monkeypatch):
         from app import source_ref_validation as srv
 
         broken = "backend/app/missing.py"
-        monkeypatch.setattr(srv, "_file_exists_at_head", lambda path: path != broken)
+        monkeypatch.setattr(
+            srv,
+            "_file_exists_at_head",
+            AsyncMock(side_effect=lambda path: path != broken),
+        )
         finding = {
             "title": "F1",
             "description": "D1",
@@ -692,7 +696,7 @@ class TestProvenanceWarningsAttachment:
                 {"type": "file", "ref": broken},
             ],
         }
-        finding["sources"] = validate_source_refs(finding["sources"])
+        finding["sources"] = await validate_source_refs(finding["sources"])
         prov = summarize_broken_refs(finding["sources"])
         if prov is not None:
             finding["_provenance_warnings"] = prov
@@ -701,19 +705,21 @@ class TestProvenanceWarningsAttachment:
             "broken_refs": [broken],
         }
 
-    def test_finding_with_five_broken_refs_dedupes_paths(self, monkeypatch):
+    async def test_finding_with_five_broken_refs_dedupes_paths(self, monkeypatch):
         from app import source_ref_validation as srv
 
         broken_paths = {f"backend/app/missing_{i}.py" for i in range(5)}
         monkeypatch.setattr(
-            srv, "_file_exists_at_head", lambda path: path not in broken_paths
+            srv,
+            "_file_exists_at_head",
+            AsyncMock(side_effect=lambda path: path not in broken_paths),
         )
         # Two refs share a path with different line numbers — should dedupe.
         sources = [
             {"type": "file", "ref": f"backend/app/missing_{i}.py:5"} for i in range(5)
         ] + [{"type": "file", "ref": "backend/app/missing_0.py:99"}]
         finding = {"title": "F", "description": "D", "sources": sources}
-        finding["sources"] = validate_source_refs(finding["sources"])
+        finding["sources"] = await validate_source_refs(finding["sources"])
         prov = summarize_broken_refs(finding["sources"])
         finding["_provenance_warnings"] = prov
         assert finding["_provenance_warnings"]["broken_source_ref_count"] == 5

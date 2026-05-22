@@ -811,7 +811,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     s for s in _f["sources"] if isinstance(s, dict) and s.get("ref")
                 ]
                 # Validate file-type source refs at write time
-                _f["sources"] = validate_source_refs(_f["sources"])
+                _f["sources"] = await validate_source_refs(_f["sources"])
                 # Attach a structured provenance summary when the validation
                 # marks file refs invalid. The finding still spawns; the data
                 # is here so downstream consumers (admin UI, agent prompts)

@@ -2040,8 +2040,15 @@ async def orchestrator_worker():
                         )
                         if classified:
                             async with AsyncSessionLocal() as fix_session:
+                                _classified_ids = [tid for tid, _ in classified]
+                                _classified_result = await fix_session.execute(
+                                    select(Task).where(Task.id.in_(_classified_ids))
+                                )
+                                _tasks_by_id = {
+                                    t.id: t for t in _classified_result.scalars().all()
+                                }
                                 for task_id, reason in classified:
-                                    fix_task = await fix_session.get(Task, task_id)
+                                    fix_task = _tasks_by_id.get(task_id)
                                     if fix_task:
                                         if reason == "cycle":
                                             msg = "Dependencies cleared: dependency cycle detected"
@@ -2130,8 +2137,15 @@ async def orchestrator_worker():
                         )
                         if broad_classified:
                             async with AsyncSessionLocal() as fix_session:
+                                _broad_ids = [tid for tid, _ in broad_classified]
+                                _broad_result = await fix_session.execute(
+                                    select(Task).where(Task.id.in_(_broad_ids))
+                                )
+                                _broad_tasks_by_id = {
+                                    t.id: t for t in _broad_result.scalars().all()
+                                }
                                 for task_id, reason in broad_classified:
-                                    fix_task = await fix_session.get(Task, task_id)
+                                    fix_task = _broad_tasks_by_id.get(task_id)
                                     if fix_task:
                                         if reason == "cycle":
                                             msg = "Dependencies cleared: dependency cycle detected (broad scan)"

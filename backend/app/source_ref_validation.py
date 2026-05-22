@@ -6,9 +6,9 @@ valid: false or dropped, with warnings logged. The system degrades gracefully
 on validation failures — does not crash.
 """
 
+import asyncio
 import logging
 import re
-import subprocess
 from typing import Any, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -49,7 +49,7 @@ def _parse_ref(ref: str) -> Tuple[str, Optional[int], Optional[int]]:
     return ref, None, None
 
 
-def _file_exists_at_head(path: str) -> bool:
+async def _file_exists_at_head(path: str) -> bool:
     """Check if a file exists in the HEAD commit using 'git ls-files'.
 
     Returns False if git command fails, file doesn't exist, or path is invalid.
@@ -65,18 +65,25 @@ def _file_exists_at_head(path: str) -> bool:
         return False
 
     try:
-        result = subprocess.run(
-            ["git", "ls-files", "--", path],
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "ls-files",
+            "--",
+            path,
             cwd="/tmp/workspace",
-            capture_output=True,
-            text=True,
-            timeout=5,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            logger.warning(
+                f"[SOURCE_REF_VALIDATION] git ls-files timeout for path {path}"
+            )
+            return False
         # git ls-files returns 0 and outputs the path if it exists, empty otherwise
-        return result.returncode == 0 and path in result.stdout
-    except subprocess.TimeoutExpired:
-        logger.warning(f"[SOURCE_REF_VALIDATION] git ls-files timeout for path {path}")
-        return False
+        return proc.returncode == 0 and path in stdout.decode()
     except Exception as e:
         logger.warning(
             f"[SOURCE_REF_VALIDATION] Failed to check if file exists: {path}: {e}"
@@ -84,10 +91,10 @@ def _file_exists_at_head(path: str) -> bool:
         return False
 
 
-def _file_has_line_count(path: str, min_line: int) -> bool:
+async def _file_has_line_count(path: str, min_line: int) -> bool:
     """Check if a file has at least min_line lines.
 
-    Uses 'git show HEAD:path | wc -l' to count lines without checking out.
+    Uses 'git show HEAD:path' and counts newlines to validate without checkout.
     Returns False if the file doesn't exist, has fewer lines, or git fails.
     Does not raise exceptions — logs and returns False on errors.
     """
@@ -95,38 +102,31 @@ def _file_has_line_count(path: str, min_line: int) -> bool:
         return False
 
     try:
-        # Use git show to get file content, pipe to wc -l to count lines
-        show_proc = subprocess.Popen(
-            ["git", "show", f"HEAD:{path}"],
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "show",
+            f"HEAD:{path}",
             cwd="/tmp/workspace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        wc_proc = subprocess.Popen(
-            ["wc", "-l"],
-            stdin=show_proc.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        show_proc.stdout.close()  # Allow show_proc to receive SIGPIPE if wc exits
-        stdout, stderr = wc_proc.communicate(timeout=5)
-        show_proc.wait(timeout=5)
-
-        if wc_proc.returncode != 0:
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            proc.kill()
             logger.warning(
-                f"[SOURCE_REF_VALIDATION] Failed to count lines in {path}: {stderr.strip()}"
+                f"[SOURCE_REF_VALIDATION] Failed to validate line count for {path}"
             )
             return False
 
-        line_count = int(stdout.strip().split()[0])
+        if proc.returncode != 0:
+            logger.warning(
+                f"[SOURCE_REF_VALIDATION] Failed to count lines in {path}: {stderr.decode().strip()}"
+            )
+            return False
+
+        line_count = stdout.count(b"\n")
         return line_count >= min_line
-    except (subprocess.TimeoutExpired, ValueError):
-        logger.warning(
-            f"[SOURCE_REF_VALIDATION] Failed to validate line count for {path}"
-        )
-        return False
     except Exception as e:
         logger.warning(
             f"[SOURCE_REF_VALIDATION] Error validating line count for {path}: {e}"
@@ -216,7 +216,7 @@ def collect_stale_refs(validated_sources: list) -> list:
     ]
 
 
-def validate_source_refs(sources: Optional[list]) -> list:
+async def validate_source_refs(sources: Optional[list]) -> list:
     """Validate all file-type source refs in a sources list.
 
     For each source with type='file':
@@ -263,7 +263,7 @@ def validate_source_refs(sources: Optional[list]) -> list:
             path, start_line, end_line = _parse_ref(ref)
 
             # Validate path exists
-            if not _file_exists_at_head(path):
+            if not await _file_exists_at_head(path):
                 logger.warning(
                     f"[SOURCE_REF_VALIDATION] File not found in HEAD: {path} "
                     f"(from ref {ref})"
@@ -277,7 +277,7 @@ def validate_source_refs(sources: Optional[list]) -> list:
 
             # Validate line numbers if present
             if start_line is not None:
-                if not _file_has_line_count(path, start_line):
+                if not await _file_has_line_count(path, start_line):
                     logger.warning(
                         f"[SOURCE_REF_VALIDATION] Line number out of range: {path}:{start_line} "
                         f"(from ref {ref})"
@@ -298,7 +298,9 @@ def validate_source_refs(sources: Optional[list]) -> list:
                     validated.append(marked)
                     continue
 
-                if end_line is not None and not _file_has_line_count(path, end_line):
+                if end_line is not None and not await _file_has_line_count(
+                    path, end_line
+                ):
                     logger.warning(
                         f"[SOURCE_REF_VALIDATION] End line out of range: {path}:{start_line}-{end_line} "
                         f"(from ref {ref})"

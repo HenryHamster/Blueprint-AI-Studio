@@ -1513,6 +1513,7 @@ async def compute_pipeline_health_summary(
     # Query tasks from extended 48h window to compute both current and previous period.
     # Status is filtered in SQL to avoid loading IN_PROGRESS/QUEUED tasks; timestamp
     # window is post-filtered in Python via _derive_completed_at (uses status_log).
+    _HEALTH_SUMMARY_TASK_CAP = 5000
     tasks_result = await session.execute(
         select(Task)
         .where(
@@ -1532,8 +1533,17 @@ async def compute_pipeline_health_summary(
                 Task.status_log,
             )
         )
+        .order_by(Task.created_at.desc())
+        .limit(_HEALTH_SUMMARY_TASK_CAP)
     )
     all_tasks = tasks_result.scalars().all()
+    if len(all_tasks) >= _HEALTH_SUMMARY_TASK_CAP:
+        logger.warning(
+            "pipeline_health_summary: task result capped at %d for project %s — "
+            "metrics may be truncated; consider reducing the lookback window",
+            _HEALTH_SUMMARY_TASK_CAP,
+            project_id,
+        )
 
     # Post-filter by completion timestamp
     completed_tasks = [

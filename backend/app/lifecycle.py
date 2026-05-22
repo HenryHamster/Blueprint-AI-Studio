@@ -556,18 +556,18 @@ async def lifespan(app):
 
     regression_watchdog_task = asyncio.create_task(_regression_watchdog_scan_service())
 
-    # Start the Efficiency Snapshot service (weekly per-project axis snapshots).
+    # Start the Efficiency Snapshot service (daily per-project axis snapshots).
     async def _efficiency_snapshot_service():
-        """Hourly leader-only tick that writes a weekly efficiency snapshot per project.
+        """Hourly leader-only tick that writes a daily efficiency snapshot per project.
 
-        Cadence is enforced inside ``maybe_write_weekly_snapshot`` via the
+        Cadence is enforced inside ``maybe_write_daily_snapshot`` via the
         ``last_run_at`` marker stored under
         ``project.design_doc["efficiency_baseline"]``, so the in-instance
         sleep can be coarse without producing duplicate snapshots.
         """
         from app.efficiency_snapshot import (
             SNAPSHOT_INTERVAL_SECONDS,
-            maybe_write_weekly_snapshot,
+            maybe_write_daily_snapshot,
         )
 
         while True:
@@ -585,13 +585,13 @@ async def lifespan(app):
                     )
                     for project in projects:
                         try:
-                            written = await maybe_write_weekly_snapshot(
+                            written = await maybe_write_daily_snapshot(
                                 scan_session, project.id
                             )
                             if written is not None:
                                 await scan_session.commit()
                                 logger.info(
-                                    "[EFFICIENCY_SNAPSHOT] project=%s wrote weekly snapshot",
+                                    "[EFFICIENCY_SNAPSHOT] project=%s wrote daily snapshot",
                                     project.id,
                                 )
                         except Exception as proj_exc:

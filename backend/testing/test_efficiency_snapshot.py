@@ -17,7 +17,7 @@ from app.efficiency_snapshot import (
     DESIGN_DOC_KEY,
     _last_run_due,
     compute_current_axes,
-    maybe_write_weekly_snapshot,
+    maybe_write_daily_snapshot,
     read_baseline_with_drift,
     write_snapshot,
 )
@@ -384,18 +384,18 @@ def test_last_run_due_first_run():
 
 def test_last_run_due_recent_run_skips():
     now = _utcnow()
-    last = (now - timedelta(days=2)).isoformat()
+    last = (now - timedelta(hours=12)).isoformat()
     assert _last_run_due(last, now) is False
 
 
 def test_last_run_due_old_run_fires():
     now = _utcnow()
-    last = (now - timedelta(days=8)).isoformat()
+    last = (now - timedelta(days=2)).isoformat()
     assert _last_run_due(last, now) is True
 
 
 @pytest.mark.asyncio
-async def test_maybe_write_weekly_snapshot_skips_when_recent(db_session):
+async def test_maybe_write_daily_snapshot_skips_when_recent(db_session):
     project = make_project(
         design_doc={
             DESIGN_DOC_KEY: {
@@ -409,12 +409,12 @@ async def test_maybe_write_weekly_snapshot_skips_when_recent(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    written = await maybe_write_weekly_snapshot(db_session, project.id)
+    written = await maybe_write_daily_snapshot(db_session, project.id)
     assert written is None
 
 
 @pytest.mark.asyncio
-async def test_maybe_write_weekly_snapshot_fires_when_due(db_session):
+async def test_maybe_write_daily_snapshot_fires_when_due(db_session):
     project = make_project(design_doc={})
     db_session.add(project)
     await db_session.commit()
@@ -423,7 +423,7 @@ async def test_maybe_write_weekly_snapshot_fires_when_due(db_session):
     db_session.add(_make_efficient_task(project.id))
     await db_session.commit()
 
-    written = await maybe_write_weekly_snapshot(db_session, project.id)
+    written = await maybe_write_daily_snapshot(db_session, project.id)
     assert written is not None
     assert AXIS_COST_PER_MERGED_PR in written
 

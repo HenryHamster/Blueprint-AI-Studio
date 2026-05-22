@@ -1361,7 +1361,7 @@ async def _provision_gcp(
 
                 _time.sleep(
                     max(0, soonest_wait) + 1
-                )  # Safe to block — already in thread
+                )  # Safe to block — runs in a thread via asyncio.to_thread(_insert_instance)
                 # Retry the soonest zone
                 try:
                     instance_config.machine_type = (
