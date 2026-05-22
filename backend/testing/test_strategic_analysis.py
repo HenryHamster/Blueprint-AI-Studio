@@ -674,6 +674,170 @@ def test_success_evidence_absent_when_missing():
     assert "retirement_condition" not in d
 
 
+def test_success_evidence_updated_in_outcome():
+    """Outcome reflects updated success_evidence value."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "context": {
+                "success_evidence": "Initial evidence",
+                "retirement_condition": "Never retire",
+            },
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1},
+            ],
+        }
+    ]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert d["success_evidence"] == "Initial evidence"
+
+    # Simulate an update to success_evidence
+    directions[0]["context"]["success_evidence"] = "Updated evidence"
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert d["success_evidence"] == "Updated evidence"
+
+
+def test_retirement_condition_updated_in_outcome():
+    """Outcome reflects updated retirement_condition value."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "context": {
+                "success_evidence": "Some evidence",
+                "retirement_condition": "Old condition",
+            },
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1},
+            ],
+        }
+    ]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert d["retirement_condition"] == "Old condition"
+
+    # Simulate an update to retirement_condition
+    directions[0]["context"]["retirement_condition"] = "New condition"
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert d["retirement_condition"] == "New condition"
+
+
+def test_success_evidence_cleared_in_outcome():
+    """Outcome omits success_evidence when cleared."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "context": {
+                "success_evidence": "Evidence to clear",
+                "retirement_condition": "Keep this",
+            },
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1},
+            ],
+        }
+    ]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert "success_evidence" in d
+
+    # Simulate clearing success_evidence by removing it
+    directions[0]["context"]["success_evidence"] = ""
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert "success_evidence" not in d
+    assert d["retirement_condition"] == "Keep this"
+
+
+def test_retirement_condition_cleared_in_outcome():
+    """Outcome omits retirement_condition when cleared."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "context": {
+                "success_evidence": "Keep this",
+                "retirement_condition": "Condition to clear",
+            },
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1},
+            ],
+        }
+    ]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert "retirement_condition" in d
+
+    # Simulate clearing retirement_condition by removing it
+    directions[0]["context"]["retirement_condition"] = None
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert "retirement_condition" not in d
+    assert d["success_evidence"] == "Keep this"
+
+
+def test_both_fields_updated_together():
+    """Outcome reflects simultaneous updates to both fields."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "context": {
+                "success_evidence": "Old evidence",
+                "retirement_condition": "Old condition",
+            },
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1},
+            ],
+        }
+    ]
+
+    # Update both fields
+    directions[0]["context"]["success_evidence"] = "New evidence"
+    directions[0]["context"]["retirement_condition"] = "New condition"
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert d["success_evidence"] == "New evidence"
+    assert d["retirement_condition"] == "New condition"
+
+
+def test_success_evidence_truncation_after_update():
+    """Updated success_evidence longer than 500 chars is truncated."""
+    long_evidence = "X" * 700
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "context": {
+                "success_evidence": long_evidence,
+                "retirement_condition": "Some condition",
+            },
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1},
+            ],
+        }
+    ]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert d["success_evidence"] == "X" * 500
+    assert len(d["success_evidence"]) == 500
+
+
+def test_retirement_condition_truncation_after_update():
+    """Updated retirement_condition longer than 500 chars is truncated."""
+    long_condition = "Y" * 600
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "context": {
+                "success_evidence": "Some evidence",
+                "retirement_condition": long_condition,
+            },
+            "research_history": [
+                {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1},
+            ],
+        }
+    ]
+    d = _build_outcome_evaluation(_make_project(directions=directions))["directions"][0]
+    assert d["retirement_condition"] == "Y" * 500
+    assert len(d["retirement_condition"]) == 500
+
+
 def test_confirmed_and_proposed_findings():
     research_ctx = (
         "## Established Findings\n"

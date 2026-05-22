@@ -3616,3 +3616,134 @@ async def test_build_stall_nudge_tasks_merged_field_is_phase_scoped(db_session, 
         f"build_stall.tasks_merged should be phase-scoped count {post_phase_count}, "
         f"not version-lifetime count; got {reported_merged}"
     )
+
+
+# ── outcome_evaluation read path for success_evidence/retirement_condition ────
+
+
+@pytest.mark.asyncio
+async def test_outcome_evaluation_includes_success_evidence_and_retirement_condition(
+    db_session,
+):
+    """outcome_evaluation in strategic payload includes success_evidence and retirement_condition when set."""
+    long_evidence = "E" * 700
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-oe-ev01",
+                "status": "active",
+                "text": "Direction with outcome criteria",
+                "priority": "high",
+                "context": {
+                    "success_evidence": long_evidence,
+                    "retirement_condition": "  retire when fully satisfied  ",
+                },
+                "research_history": [
+                    {
+                        "prs_merged": 2,
+                        "prs_rejected": 0,
+                        "tasks_created": 5,
+                        "tasks_failed": 0,
+                    }
+                ],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+
+    assert "outcome_evaluation" in payload
+    outcome_eval = payload.get("outcome_evaluation", {})
+    directions = outcome_eval.get("directions", [])
+
+    assert len(directions) > 0, "outcome_evaluation should have directions"
+    outcome = next((o for o in directions if o["id"] == "d-oe-ev01"), None)
+    assert outcome is not None, "Direction should be in outcome_evaluation"
+    # success_evidence should be capped at 500 chars
+    assert outcome.get("success_evidence") == "E" * 500
+    # retirement_condition should be stripped and capped
+    assert outcome.get("retirement_condition") == "retire when fully satisfied"
+
+
+@pytest.mark.asyncio
+async def test_outcome_evaluation_omits_fields_when_not_set(db_session):
+    """outcome_evaluation omits success_evidence/retirement_condition when not in context."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-oe-ev02",
+                "status": "active",
+                "text": "Direction without outcome criteria",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    outcome_eval = payload.get("outcome_evaluation", {})
+    directions = outcome_eval.get("directions", [])
+
+    outcome = next((o for o in directions if o["id"] == "d-oe-ev02"), None)
+    assert outcome is not None
+    assert "success_evidence" not in outcome
+    assert "retirement_condition" not in outcome
+
+
+@pytest.mark.asyncio
+async def test_outcome_evaluation_handles_empty_strings(db_session):
+    """outcome_evaluation omits empty/whitespace-only success_evidence/retirement_condition."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-oe-ev03",
+                "status": "active",
+                "text": "Direction with empty criteria",
+                "priority": "low",
+                "context": {
+                    "success_evidence": "   ",  # whitespace only
+                    "retirement_condition": "",  # empty
+                },
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    outcome_eval = payload.get("outcome_evaluation", {})
+    directions = outcome_eval.get("directions", [])
+
+    outcome = next((o for o in directions if o["id"] == "d-oe-ev03"), None)
+    assert outcome is not None
+    assert "success_evidence" not in outcome
+    assert "retirement_condition" not in outcome

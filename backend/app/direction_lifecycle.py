@@ -608,6 +608,11 @@ async def _process_direction_lifecycle(
             d["status"] = "active"
             for k in ("auto_paused", "paused_reason", "paused_at"):
                 d.pop(k, None)
+            # Grace period: stamp recovery time so _check_direction_health can skip
+            # history-based health rules until at least one new cycle is appended.
+            # Without this, the same frozen research_history that triggered the pause
+            # immediately re-triggers it on the next lifecycle tick.
+            d["auto_recovered_at"] = _utcnow().isoformat()
             # Start remediation-effectiveness monitoring when recovering a direction whose
             # remediation task merged. Subsequent failures with the same error fingerprint
             # during this window signal the fix did not hold; escalation is triggered below
@@ -917,6 +922,7 @@ async def _process_direction_lifecycle(
             d["paused_at"] = _utcnow().isoformat()
             d["auto_paused"] = True
             d["auto_pause_count"] = d.get("auto_pause_count", 0) + 1
+            d.pop("auto_recovered_at", None)  # Grace period consumed on re-pause
             d.pop(
                 "diagnosis_stall_retry_count", None
             )  # Reset retries for this pause event

@@ -2707,22 +2707,27 @@ async def strategic_operation(
             data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
         )
         raw_dedup_reasoning = data.get("dedup_reasoning")
+        distinction = (
+            str(raw_dedup_reasoning.get("distinction") or "").strip()
+            if isinstance(raw_dedup_reasoning, dict)
+            else ""
+        )
         directions = list(project.directions or [])
         # Dedup: skip if semantically similar direction already exists
         _rejected_proposals = list(
             (project.vision or {}).get("rejected_proposals") or []
         )
-        if _is_direction_duplicate(text, directions, _rejected_proposals):
-            if isinstance(raw_dedup_reasoning, dict):
-                distinction = str(raw_dedup_reasoning.get("distinction") or "").strip()
-                if distinction:
-                    logger.warning(
-                        "[STRATEGIC_DEDUP_DISAGREEMENT] API path: direction rejected as duplicate but agent claimed "
-                        "distinction='%s'; matched text='%s'; project=%s",
-                        distinction[:200],
-                        text[:60],
-                        project.id,
-                    )
+        if _is_direction_duplicate(
+            text, directions, _rejected_proposals, distinction=distinction or None
+        ):
+            if distinction:
+                logger.warning(
+                    "[STRATEGIC_DEDUP_DISAGREEMENT] API path: direction rejected as duplicate but agent claimed "
+                    "distinction='%s'; matched text='%s'; project=%s",
+                    distinction[:200],
+                    text[:60],
+                    project.id,
+                )
             matched = _find_matching_direction(text, directions)
             if matched:
                 logger.info(
@@ -2740,10 +2745,8 @@ async def strategic_operation(
                 "matched_direction_id": matched.get("id") if matched else None,
                 "rejected_at": _utcnow().isoformat(),
             }
-            if isinstance(raw_dedup_reasoning, dict):
-                distinction = str(raw_dedup_reasoning.get("distinction") or "").strip()
-                if distinction:
-                    rejection_record["dedup_reasoning"] = distinction[:500]
+            if distinction:
+                rejection_record["dedup_reasoning"] = distinction[:500]
             dedup_rejections.append(rejection_record)
             task.context = {
                 **ctx,
@@ -2931,6 +2934,36 @@ async def strategic_operation(
                     mode = _normalize_recommended_mode(changes["recommended_mode"])
                     if mode is not None:
                         d["recommended_mode"] = mode
+                # Handle success_evidence and retirement_condition in context
+                _DIR_FIELD_MAX = 500
+                if "success_evidence" in changes:
+                    ctx = d.get("context", {})
+                    se = changes["success_evidence"]
+                    if se is None or se == "":
+                        # Clear success_evidence
+                        ctx.pop("success_evidence", None)
+                    else:
+                        ctx["success_evidence"] = _cap_str(
+                            se,
+                            _DIR_FIELD_MAX,
+                            "changes.success_evidence",
+                            warnings,
+                        )
+                    d["context"] = ctx
+                if "retirement_condition" in changes:
+                    ctx = d.get("context", {})
+                    rc = changes["retirement_condition"]
+                    if rc is None or rc == "":
+                        # Clear retirement_condition
+                        ctx.pop("retirement_condition", None)
+                    else:
+                        ctx["retirement_condition"] = _cap_str(
+                            rc,
+                            _DIR_FIELD_MAX,
+                            "changes.retirement_condition",
+                            warnings,
+                        )
+                    d["context"] = ctx
                 if rationale:
                     notes = d.get("notes", [])
                     notes.append(

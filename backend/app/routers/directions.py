@@ -34,6 +34,7 @@ router = APIRouter(
 
 DIRECTION_TEXT_MAX = 2000
 COMPLETION_CRITERIA_MAX = 500
+DIRECTION_CONTEXT_FIELD_MAX = 500
 
 
 def _compute_direction_merge_rate(d: dict) -> float:
@@ -493,6 +494,30 @@ async def update_direction(
             raise HTTPException(
                 status_code=400, detail="cost_budget_usd must be non-negative"
             )
+    if (
+        "success_evidence" in payload
+        and payload["success_evidence"] is not None
+        and (
+            not isinstance(payload["success_evidence"], str)
+            or len(payload["success_evidence"]) > DIRECTION_CONTEXT_FIELD_MAX
+        )
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"success_evidence must be a string of at most {DIRECTION_CONTEXT_FIELD_MAX} characters",
+        )
+    if (
+        "retirement_condition" in payload
+        and payload["retirement_condition"] is not None
+        and (
+            not isinstance(payload["retirement_condition"], str)
+            or len(payload["retirement_condition"]) > DIRECTION_CONTEXT_FIELD_MAX
+        )
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"retirement_condition must be a string of at most {DIRECTION_CONTEXT_FIELD_MAX} characters",
+        )
 
     # Direction cap check: if reactivating, ensure we won't exceed the cap
     if payload.get("status") == "active":
@@ -586,6 +611,21 @@ async def update_direction(
                     d.pop("cost_budget_usd", None)
                 else:
                     d["cost_budget_usd"] = float(payload["cost_budget_usd"])
+            if "success_evidence" in payload or "retirement_condition" in payload:
+                context = d.get("context") or {}
+                if "success_evidence" in payload:
+                    if payload["success_evidence"] is None:
+                        context.pop("success_evidence", None)
+                    else:
+                        context["success_evidence"] = payload["success_evidence"]
+                if "retirement_condition" in payload:
+                    if payload["retirement_condition"] is None:
+                        context.pop("retirement_condition", None)
+                    else:
+                        context["retirement_condition"] = payload[
+                            "retirement_condition"
+                        ]
+                d["context"] = context
             updated = True
             break
 

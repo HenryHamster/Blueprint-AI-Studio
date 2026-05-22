@@ -734,23 +734,38 @@ def _check_direction_health(direction: dict) -> str | None:
     """Return a pause reason if this direction should be auto-paused, else None."""
     history = direction.get("research_history") or []
 
-    # Rule 1: Persistent saturation — possibly_saturated AND last 5+ cycles all produced ≤1 task
-    if direction.get("possibly_saturated") and len(history) >= 5:
-        recent5 = history[-5:]
-        if all(entry.get("tasks_created", 0) <= 1 for entry in recent5):
-            return "Saturated: last 5 research cycles produced no actionable findings"
+    # Grace period: a just-recovered direction skips history-based rules (1, 2, 5, 6)
+    # until at least one new research cycle is appended after recovery. This prevents
+    # the frozen research_history that originally triggered the pause from immediately
+    # re-triggering it on the very next lifecycle tick. Code-failure rules (3, 4) are
+    # always evaluated so auto-retirement is never weakened by the grace period.
+    recovered_at = direction.get("auto_recovered_at")
+    in_grace = recovered_at is not None and not any(
+        (e.get("timestamp") or "") > recovered_at for e in history
+    )
 
-    # Rule 2: Zero merge rate — 5+ cycles with 0 PRs merged total, and the most
-    # recent cycle has no tasks still in-flight (tasks_created == tasks_completed + tasks_failed)
-    if len(history) >= 5:
-        total_merged = sum(entry.get("prs_merged", 0) for entry in history)
-        if total_merged == 0:
-            last = history[-1]
-            created = last.get("tasks_created", 0)
-            finished = last.get("tasks_completed", 0) + last.get("tasks_failed", 0)
-            if created == 0 or finished >= created:
-                total_created = sum(entry.get("tasks_created", 0) for entry in history)
-                return f"Unproductive: 0 PRs merged from {len(history)} research cycles ({total_created} tasks created)"
+    if not in_grace:
+        # Rule 1: Persistent saturation — possibly_saturated AND last 5+ cycles all produced ≤1 task
+        if direction.get("possibly_saturated") and len(history) >= 5:
+            recent5 = history[-5:]
+            if all(entry.get("tasks_created", 0) <= 1 for entry in recent5):
+                return (
+                    "Saturated: last 5 research cycles produced no actionable findings"
+                )
+
+        # Rule 2: Zero merge rate — 5+ cycles with 0 PRs merged total, and the most
+        # recent cycle has no tasks still in-flight (tasks_created == tasks_completed + tasks_failed)
+        if len(history) >= 5:
+            total_merged = sum(entry.get("prs_merged", 0) for entry in history)
+            if total_merged == 0:
+                last = history[-1]
+                created = last.get("tasks_created", 0)
+                finished = last.get("tasks_completed", 0) + last.get("tasks_failed", 0)
+                if created == 0 or finished >= created:
+                    total_created = sum(
+                        entry.get("tasks_created", 0) for entry in history
+                    )
+                    return f"Unproductive: 0 PRs merged from {len(history)} research cycles ({total_created} tasks created)"
 
     # Rule 3: High CODE failure rate — last 3 cycles have >70% tasks failed
     # for direction-attributable reasons (not infra failures like rate limits,
@@ -785,47 +800,48 @@ def _check_direction_health(direction: dict) -> str | None:
                 "Recent stall: last 3 research cycles all failed or produced no merges"
             )
 
-    # Rule 5: High non-merge churn — rolling window of finished tasks that did not merge.
-    # Only fires when non-merging volume is both absolutely high AND merge rate is very low,
-    # to avoid pausing productive high-throughput directions that simply have many tasks.
-    # research/investigate children are excluded conservatively by the default threshold.
-    churn_threshold = int(
-        _runtime_config.get("direction_churn_non_merge_threshold", 15) or 15
-    )
-    churn_min_merge_rate = float(
-        _runtime_config.get("direction_churn_min_merge_rate", 0.10) or 0.10
-    )
-    if churn_threshold > 0:
-        metrics = _compute_churn_metrics(direction)
-        if metrics and metrics["non_merge_finished"] >= churn_threshold:
-            if metrics["merge_rate"] < churn_min_merge_rate:
-                return (
-                    f"Churn guardrail: {metrics['non_merge_finished']} tasks finished "
-                    f"without merging, {metrics['merged']} merged in last "
-                    f"{metrics['window_cycles']} cycles "
-                    f"(merge rate {metrics['merge_rate']:.0%})"
-                )
+    if not in_grace:
+        # Rule 5: High non-merge churn — rolling window of finished tasks that did not merge.
+        # Only fires when non-merging volume is both absolutely high AND merge rate is very low,
+        # to avoid pausing productive high-throughput directions that simply have many tasks.
+        # research/investigate children are excluded conservatively by the default threshold.
+        churn_threshold = int(
+            _runtime_config.get("direction_churn_non_merge_threshold", 15) or 15
+        )
+        churn_min_merge_rate = float(
+            _runtime_config.get("direction_churn_min_merge_rate", 0.10) or 0.10
+        )
+        if churn_threshold > 0:
+            metrics = _compute_churn_metrics(direction)
+            if metrics and metrics["non_merge_finished"] >= churn_threshold:
+                if metrics["merge_rate"] < churn_min_merge_rate:
+                    return (
+                        f"Churn guardrail: {metrics['non_merge_finished']} tasks finished "
+                        f"without merging, {metrics['merged']} merged in last "
+                        f"{metrics['window_cycles']} cycles "
+                        f"(merge rate {metrics['merge_rate']:.0%})"
+                    )
 
-    # Rule 6: Lifetime cumulative burn backstop — catches slow-burn directions that stay
-    # just under the rolling-window threshold every window but accumulate hundreds of
-    # non-merging tasks over their lifetime. High threshold prevents pausing productive
-    # high-throughput directions. This pause requires manual operator intervention (retire
-    # vs. reset) because the lifetime metric will not drop on its own after auto-recovery.
-    lifetime_threshold = int(
-        _runtime_config.get("direction_lifetime_non_merge_threshold", 150) or 150
-    )
-    lifetime_min_merge_rate = float(
-        _runtime_config.get("direction_lifetime_min_merge_rate", 0.10) or 0.10
-    )
-    if lifetime_threshold > 0:
-        lm = _compute_lifetime_burn_metrics(direction)
-        if lm and lm["lifetime_non_merge_finished"] >= lifetime_threshold:
-            if lm["lifetime_merge_rate"] < lifetime_min_merge_rate:
-                return (
-                    f"Lifetime burn backstop: {lm['lifetime_non_merge_finished']} tasks "
-                    f"finished without merging lifetime, {lm['lifetime_merged']} merged "
-                    f"(lifetime merge rate {lm['lifetime_merge_rate']:.0%})"
-                )
+        # Rule 6: Lifetime cumulative burn backstop — catches slow-burn directions that stay
+        # just under the rolling-window threshold every window but accumulate hundreds of
+        # non-merging tasks over their lifetime. High threshold prevents pausing productive
+        # high-throughput directions. This pause requires manual operator intervention (retire
+        # vs. reset) because the lifetime metric will not drop on its own after auto-recovery.
+        lifetime_threshold = int(
+            _runtime_config.get("direction_lifetime_non_merge_threshold", 150) or 150
+        )
+        lifetime_min_merge_rate = float(
+            _runtime_config.get("direction_lifetime_min_merge_rate", 0.10) or 0.10
+        )
+        if lifetime_threshold > 0:
+            lm = _compute_lifetime_burn_metrics(direction)
+            if lm and lm["lifetime_non_merge_finished"] >= lifetime_threshold:
+                if lm["lifetime_merge_rate"] < lifetime_min_merge_rate:
+                    return (
+                        f"Lifetime burn backstop: {lm['lifetime_non_merge_finished']} tasks "
+                        f"finished without merging lifetime, {lm['lifetime_merged']} merged "
+                        f"(lifetime merge rate {lm['lifetime_merge_rate']:.0%})"
+                    )
 
     return None
 
@@ -1085,6 +1101,10 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
 
 _RETIRED_DIRECTION_STATUSES = frozenset({"expired", "retired", "superseded"})
 
+_MIN_DISTINCTION_CHARS = (
+    20  # well-formed distinction must be at least this many characters
+)
+
 _DIRECTION_DEDUP_STOPWORDS = frozenset(
     {
         "the",
@@ -1119,22 +1139,35 @@ _DIRECTION_DEDUP_STOPWORDS = frozenset(
 
 
 def _is_direction_duplicate(
-    proposal_text: str, existing_directions: list, rejected_proposals: list
+    proposal_text: str,
+    existing_directions: list,
+    rejected_proposals: list,
+    *,
+    distinction: str | None = None,
 ) -> bool:
     """Return True if proposal_text overlaps with an existing or recently rejected direction.
 
-    Retired directions (expired/retired/superseded) use a tighter threshold (3 shared
-    non-stopword tokens) to catch paraphrased retirements. Active directions keep
-    the default threshold of 4.
+    All directions (active and retired) use the same overlap threshold of 4 shared
+    non-stopword tokens. When a well-formed distinction is supplied and the only
+    matching directions are retired-status, the distinction overrides the block and
+    this function returns False. Matches against active directions and recently-rejected
+    proposals always block regardless of distinction.
     """
     words = set(proposal_text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS
     if len(words) < 2:
         return False
+    has_well_formed_distinction = bool(
+        distinction and len(distinction.strip()) >= _MIN_DISTINCTION_CHARS
+    )
     for d in existing_directions:
         existing_text = (d.get("text") or "").lower()
         existing_words = set(existing_text.split()) - _DIRECTION_DEDUP_STOPWORDS
-        threshold = 3 if d.get("status") in _RETIRED_DIRECTION_STATUSES else 4
-        if len(words & existing_words) >= threshold:
+        if len(words & existing_words) >= 4:
+            if (
+                has_well_formed_distinction
+                and d.get("status") in _RETIRED_DIRECTION_STATUSES
+            ):
+                continue  # distinction overrides match against retired direction
             return True
     cutoff = (_utcnow() - timedelta(days=30)).isoformat()
     for entry in rejected_proposals:
@@ -1165,8 +1198,7 @@ def _find_matching_direction(
         if existing_text == text_lower:
             return d
         existing_words = set(existing_text.split()) - _DIRECTION_DEDUP_STOPWORDS
-        threshold = 3 if d.get("status") in _RETIRED_DIRECTION_STATUSES else 4
-        if len(words & existing_words) >= threshold:
+        if len(words & existing_words) >= 4:
             return d
     return None
 
@@ -1917,22 +1949,28 @@ async def _handle_strategic_completion(
                 text = text[:STRATEGIC_DIRECTION_TEXT_MAX]
                 # Dedup: skip if a semantically similar direction already exists
                 raw_dedup_reasoning = op_entry.get("dedup_reasoning")
+                distinction = (
+                    str(raw_dedup_reasoning.get("distinction") or "").strip()
+                    if isinstance(raw_dedup_reasoning, dict)
+                    else ""
+                )
                 _rejected_proposals = list(
                     (project.vision or {}).get("rejected_proposals") or []
                 )
-                if _is_direction_duplicate(text, directions, _rejected_proposals):
-                    if isinstance(raw_dedup_reasoning, dict):
-                        distinction = str(
-                            raw_dedup_reasoning.get("distinction") or ""
-                        ).strip()
-                        if distinction:
-                            logger.warning(
-                                "[STRATEGIC_DEDUP_DISAGREEMENT] Fallback path: direction rejected as duplicate but "
-                                "agent claimed distinction='%s'; matched text='%s'; project=%s",
-                                distinction[:200],
-                                text[:60],
-                                project.id,
-                            )
+                if _is_direction_duplicate(
+                    text,
+                    directions,
+                    _rejected_proposals,
+                    distinction=distinction or None,
+                ):
+                    if distinction:
+                        logger.warning(
+                            "[STRATEGIC_DEDUP_DISAGREEMENT] Fallback path: direction rejected as duplicate but "
+                            "agent claimed distinction='%s'; matched text='%s'; project=%s",
+                            distinction[:200],
+                            text[:60],
+                            project.id,
+                        )
                     matched = _find_matching_direction(text, directions)
                     if matched:
                         logger.info(
