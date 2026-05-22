@@ -62,6 +62,7 @@ const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode
     oauth: [
       "you've hit your limit",
       "you've hit your usage limit",
+      "you've hit your session limit",
       'claude ai usage limit reached',
       "you're out of extra usage",
       '5-hour limit reached',
@@ -71,6 +72,7 @@ const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode
     api_key: [
       "you've hit your limit",
       "you've hit your usage limit",
+      "you've hit your session limit",
       'claude ai usage limit reached',
       "you're out of extra usage",
       '5-hour limit reached',
@@ -174,9 +176,15 @@ function getRateLimitPatterns(provider: ProviderName, authMode: AuthMode): reado
   return RATE_LIMIT_PATTERNS[provider][authMode] ?? RATE_LIMIT_PATTERNS[provider].oauth ?? [];
 }
 
+// Structured, provider-agnostic 429 detection: matches JSON-shaped key/value
+// pairs emitted in the streamed result event so future banner-wording changes
+// cannot silently regress rate-limit classification.
+const STRUCTURED_429_PATTERNS = ['"api_error_status":429', '"error":"rate_limit"'] as const;
+
 export function matchesRateLimit(text: string, provider: ProviderName = PROVIDER, authMode: AuthMode = AUTH_MODE): boolean {
   const lower = text.toLowerCase();
-  return getRateLimitPatterns(provider, authMode).some(p => lower.includes(p));
+  if (getRateLimitPatterns(provider, authMode).some(p => lower.includes(p))) return true;
+  return STRUCTURED_429_PATTERNS.some(p => text.includes(p));
 }
 
 // Thrown when Claude CLI output matches a rate-limit pattern. Carries the

@@ -1248,6 +1248,28 @@ describe('matchesRateLimit', () => {
   it('does not cross-match provider-specific rate limits', () => {
     expect(matchesRateLimit('Rate limit reached for gpt-5 in organization test', 'anthropic', 'oauth')).toBe(false);
   });
+
+  it('detects "you\'ve hit your session limit" for anthropic/oauth', () => {
+    expect(matchesRateLimit("You've hit your session limit · resets 7:10am (UTC)", 'anthropic', 'oauth')).toBe(true);
+  });
+
+  it('detects "you\'ve hit your session limit" case-insensitively', () => {
+    expect(matchesRateLimit("YOU'VE HIT YOUR SESSION LIMIT", 'anthropic', 'oauth')).toBe(true);
+  });
+
+  it('detects "you\'ve hit your session limit" for default provider (anthropic/oauth)', () => {
+    expect(matchesRateLimit("you've hit your session limit · resets 7:10am (UTC)")).toBe(true);
+  });
+
+  it('detects structured api_error_status:429 in transcript regardless of provider', () => {
+    const transcript = '{"type":"result","is_error":true,"api_error_status":429,"error":"rate_limit"}';
+    expect(matchesRateLimit(transcript)).toBe(true);
+    expect(matchesRateLimit(transcript, 'openai', 'api_key')).toBe(true);
+  });
+
+  it('does not match bare 429 without JSON key context', () => {
+    expect(matchesRateLimit('HTTP 429 received')).toBe(false);
+  });
 });
 
 describe('RateLimitError', () => {
