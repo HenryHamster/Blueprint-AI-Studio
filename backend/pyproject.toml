@@ -69,6 +69,15 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # admin.py and github.py raise HTTPException inside except blocks to convert errors to HTTP responses
 "app/admin.py" = ["B904"]
 "app/github.py" = ["B904"]
+# max_plan_pool.py hosts the account-pool background loops (recheck_disabled_accounts,
+# rate-limit/usage-cap persist-retry drains). Same log-and-continue policy: a transient
+# DB persist failure must be logged and retried, not crash the pool maintenance loop.
+"app/max_plan_pool.py" = ["BLE001"]
+# failure_classification.py is the failure classifier called in the status-handler hot
+# path. Its except blocks are intentional "degrade to a safe default (e.g. False) with a
+# debug log" guards — raising here would crash the caller's failure handling, which is
+# strictly worse than a conservative misclassification.
+"app/failure_classification.py" = ["BLE001"]
 
 [tool.mypy]
 python_version = "3.11"

@@ -753,9 +753,12 @@ def normalize_agent_failure_category(raw: str | None, task: "Task") -> str:
                 return override
             if any(kw in combined for kw in _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS):
                 return PROVISION_FAILURE
-        if mapped == CODE_ERROR and label_lower in _ALL_GENERIC_CODE_ERROR_LABELS:
-            if _account_was_rate_limited(task) or _pool_was_rate_limited():
-                return RATE_LIMIT
+        if (
+            mapped == CODE_ERROR
+            and label_lower in _ALL_GENERIC_CODE_ERROR_LABELS
+            and (_account_was_rate_limited(task) or _pool_was_rate_limited())
+        ):
+            return RATE_LIMIT
         return mapped
     if label in INFRA_CLASSES or label == CODE_ERROR:
         return label
@@ -911,6 +914,10 @@ def _external_api_subtype_from_message(combined: str) -> str:
         return EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
 
     # Provider auth — token/credential failures from any upstream API.
+    # `oauth_org_not_allowed` is the Anthropic 403 raised when an org has
+    # disabled OAuth for Claude Code; matched by its specific token (NOT bare
+    # "403", which collides with GitHub/FastAPI 403s) so it routes to infra/auth
+    # instead of burning task retries as CODE_ERROR.
     if any(
         kw in combined
         for kw in (
@@ -922,6 +929,7 @@ def _external_api_subtype_from_message(combined: str) -> str:
             "token revoked",
             "authentication failed",
             "invalid api key",
+            "oauth_org_not_allowed",
         )
     ):
         return EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
@@ -1025,6 +1033,30 @@ def _reactivate_residual_case(fingerprint: str) -> None:
 # Per-account failure class log — rolling 24h window, keyed account_id →
 # list[(failure_class, confidence, timestamp)].
 _account_failure_log: dict[str, list[tuple[str, float | None, float]]] = {}
+
+# Strong references to in-flight fire-and-forget DB tasks. Without this the event
+# loop only holds a weak reference and may GC the task mid-flight, silently
+# dropping the upsert (RUF006). Tasks self-remove via add_done_callback.
+_residual_bg_tasks: set = set()
+
+
+def _spawn_bg_task(coro) -> None:
+    """Fire-and-forget a coroutine on the running loop, keeping a strong ref so
+    it isn't GC'd before completion. No-op if no loop is running (e.g. sync
+    tests); the caller's in-memory path is then authoritative."""
+    import asyncio
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop (e.g. sync tests); close the coroutine so it doesn't
+        # surface a "coroutine was never awaited" warning. Caller's in-memory
+        # path is authoritative.
+        coro.close()
+        return
+    task = loop.create_task(coro)
+    _residual_bg_tasks.add(task)
+    task.add_done_callback(_residual_bg_tasks.discard)
 
 _RE_UUID = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
@@ -1391,15 +1423,9 @@ def _schedule_residual_db_upsert(
     sample_message: str,
 ) -> None:
     """Schedule a fire-and-forget DB upsert when an event loop is running."""
-    import asyncio
-
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(
-            _upsert_residual_case_async(project_id, fingerprint, now_dt, sample_message)
-        )
-    except RuntimeError:
-        pass  # No running loop (e.g. tests); in-memory store is the only path
+    _spawn_bg_task(
+        _upsert_residual_case_async(project_id, fingerprint, now_dt, sample_message)
+    )
 
 
 def get_top_residual_fingerprints(
@@ -1792,6 +1818,9 @@ def _classify_failure_class(
             "token expired",
             "token invalid",
             "token revoked",
+            # Anthropic 403 when an org has disabled OAuth for Claude Code —
+            # an auth/infra failure, not a code defect. Specific token only.
+            "oauth_org_not_allowed",
         ]
     ):
         return "EXTERNAL_API"
@@ -1913,32 +1942,31 @@ async def _transition_regression_case_async(
     status_filter = _status_filter.get(action)
 
     try:
-        async with AsyncSessionLocal() as session:
-            async with session.begin():
-                stmt = select(RegressionRemediationCase).where(
-                    RegressionRemediationCase.project_id == project_id,
-                    RegressionRemediationCase.regression_class == regression_class,
+        async with AsyncSessionLocal() as session, session.begin():
+            stmt = select(RegressionRemediationCase).where(
+                RegressionRemediationCase.project_id == project_id,
+                RegressionRemediationCase.regression_class == regression_class,
+            )
+            if status_filter is not None:
+                stmt = stmt.where(RegressionRemediationCase.status == status_filter)
+            stmt = stmt.with_for_update(skip_locked=True)
+            case = (await session.execute(stmt)).scalars().first()
+            if case is None:
+                return
+            if action == "merge":
+                case.mark_merged(
+                    kwargs["pr_number"],
+                    kwargs.get("signal_snapshot") or {},
+                    spawn_was_cross_layer=bool(
+                        kwargs.get("spawn_was_cross_layer", False)
+                    ),
+                    spawn_layers_enumerated=kwargs.get("spawn_layers_enumerated"),
                 )
-                if status_filter is not None:
-                    stmt = stmt.where(RegressionRemediationCase.status == status_filter)
-                stmt = stmt.with_for_update(skip_locked=True)
-                case = (await session.execute(stmt)).scalars().first()
-                if case is None:
-                    return
-                if action == "merge":
-                    case.mark_merged(
-                        kwargs["pr_number"],
-                        kwargs.get("signal_snapshot") or {},
-                        spawn_was_cross_layer=bool(
-                            kwargs.get("spawn_was_cross_layer", False)
-                        ),
-                        spawn_layers_enumerated=kwargs.get("spawn_layers_enumerated"),
-                    )
-                elif action == "recover":
-                    case.mark_closed()
-                elif action == "rearm":
-                    case.re_arm()
-                session.add(case)
+            elif action == "recover":
+                case.mark_closed()
+            elif action == "rearm":
+                case.re_arm()
+            session.add(case)
     except Exception:
         logger.exception(
             "[FAILURE_CLASS] Regression case transition failed (class=%r action=%s)",
@@ -1953,17 +1981,11 @@ def _schedule_regression_case_transition(
     action: str,
     **kwargs,
 ) -> None:
-    import asyncio
-
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(
-            _transition_regression_case_async(
-                project_id, regression_class, action, **kwargs
-            )
+    _spawn_bg_task(
+        _transition_regression_case_async(
+            project_id, regression_class, action, **kwargs
         )
-    except RuntimeError:
-        pass  # No running event loop (e.g. sync tests); caller must await directly
+    )
 
 
 def schedule_regression_close_loop_merge(

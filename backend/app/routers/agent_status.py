@@ -49,6 +49,7 @@ from app.max_plan_pool import (
     _extract_task_model,
     clear_rate_limit_state_on_success,
     clear_regression_on_success,
+    disable_account_for_auth,
     disable_account_model,
     get_task_llm_account_id,
     get_task_llm_auth_mode,
@@ -1890,9 +1891,10 @@ async def update_agent_status(
                                 task.latest_status_message = "External API model/config failure - update provider model/settings and retry."
                                 task.attempt_count = _runtime_config["max_retries"]
                                 should_requeue = False
-                        # Permanent auth failures (bad/expired credentials) should never be
-                        # retried — they will keep failing until the operator re-authenticates.
-                        # Detect these by inspecting the failure message before burning retries.
+                        # Permanent auth failures (bad/expired credentials, org-disabled
+                        # OAuth) should never be retried — they keep failing until the
+                        # operator re-authenticates. Detect these by inspecting the failure
+                        # message before burning retries.
                         elif any(
                             ind in (payload.logs or "").lower()
                             for ind in (
@@ -1901,6 +1903,7 @@ async def update_agent_status(
                                 "bad credentials",
                                 "unauthorized",
                                 "401",
+                                "oauth_org_not_allowed",
                             )
                         ):
                             logger.warning(
@@ -1915,6 +1918,51 @@ async def update_agent_status(
                             # (attempt_count < max_retries) also skips this task.
                             task.attempt_count = _runtime_config["max_retries"]
                             should_requeue = False
+                            # Hard-disable the offending account so NO further task selects
+                            # it and burns VM hours on a credential that will only 4xx
+                            # again. Non-recoverable: stays disabled until an operator
+                            # re-authenticates and re-enables it. Uses its own DB session
+                            # (won't poison this request's session).
+                            auth_acct_id = get_task_llm_account_id(task)
+                            if auth_acct_id:
+                                try:
+                                    newly_disabled = await disable_account_for_auth(
+                                        auth_acct_id,
+                                        "non-recoverable auth failure "
+                                        "(oauth_org_not_allowed / invalid credentials)",
+                                    )
+                                except Exception as _e:
+                                    newly_disabled = False
+                                    logger.warning(
+                                        f"[AGENT STATUS] Failed to auth-disable account "
+                                        f"{auth_acct_id} for task {task.id}: {_e}"
+                                    )
+                                if newly_disabled:
+                                    try:
+                                        from app.notification_dispatch import (
+                                            post_failure_alert_message,
+                                        )
+
+                                        await post_failure_alert_message(
+                                            session,
+                                            task.project_id,
+                                            "LLM account auto-disabled after a "
+                                            "non-recoverable auth failure "
+                                            "(e.g. oauth_org_not_allowed). Re-authenticate / "
+                                            "re-enable OAuth for Claude Code, then re-enable "
+                                            "the account.",
+                                            task.id,
+                                        )
+                                    except Exception as _e:
+                                        logger.warning(
+                                            f"[NOTIFY] Failed to post auth-disable alert: {_e}"
+                                        )
+                                        # post_event_message does session.add; an autoflush
+                                        # could poison the session before the early commit.
+                                        # Roll back defensively (same pattern as the circuit
+                                        # breaker alert path).
+                                        with contextlib.suppress(Exception):
+                                            await session.rollback()
                         else:
                             # Transient infrastructure outage: retry with exponential backoff.
                             # Budget is 5 retries (up from 3) to survive longer outages.

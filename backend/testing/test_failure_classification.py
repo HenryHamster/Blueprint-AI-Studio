@@ -550,6 +550,9 @@ class TestClassifyFailureExternalApi:
             "401 Unauthorized",
             "Bad credentials returned from GitHub",
             "token expired",
+            # Anthropic 403 when an org has disabled OAuth for Claude Code:
+            # an auth/infra failure, must NOT fall through to CODE_ERROR.
+            "Claude subprocess exited code 1: HTTP 403 oauth_org_not_allowed",
             "Error: Overloaded",
             # Provider model-config rejections — upstream 400s (not code defects,
             # not rate limits, not auth failures). Our OpenAI/Gemini adapter
@@ -1724,6 +1727,15 @@ class TestExternalApiSubtypeFromMessage:
             == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
         )
 
+    def test_provider_auth_oauth_org_disabled(self):
+        # Anthropic 403 when an org has disabled OAuth for Claude Code.
+        assert (
+            _external_api_subtype_from_message(
+                "HTTP 403 oauth_org_not_allowed: organization has disabled this"
+            )
+            == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
+        )
+
     def test_github_pr_create(self):
         assert (
             _external_api_subtype_from_message(
@@ -2009,22 +2021,21 @@ class TestResidualFingerprintDbWrite:
         monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
 
         await _upsert_residual_case_async(project_id, "fp-closed", now_dt, "err")
-        async with session_factory() as session:
-            async with session.begin():
-                row = (
-                    (
-                        await session.execute(
-                            select(ResidualRemediationCase).where(
-                                ResidualRemediationCase.project_id == project_id,
-                                ResidualRemediationCase.fingerprint == "fp-closed",
-                            )
+        async with session_factory() as session, session.begin():
+            row = (
+                (
+                    await session.execute(
+                        select(ResidualRemediationCase).where(
+                            ResidualRemediationCase.project_id == project_id,
+                            ResidualRemediationCase.fingerprint == "fp-closed",
                         )
                     )
-                    .scalars()
-                    .first()
                 )
-                row.status = ResidualCaseStatus.CLOSED_ORGANICALLY
-                session.add(row)
+                .scalars()
+                .first()
+            )
+            row.status = ResidualCaseStatus.CLOSED_ORGANICALLY
+            session.add(row)
 
         await _upsert_residual_case_async(project_id, "fp-closed", now_dt, "err again")
 
@@ -2059,22 +2070,21 @@ class TestResidualFingerprintDbWrite:
         monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
 
         await _upsert_residual_case_async(project_id, "fp-ignored", now_dt, "err")
-        async with session_factory() as session:
-            async with session.begin():
-                row = (
-                    (
-                        await session.execute(
-                            select(ResidualRemediationCase).where(
-                                ResidualRemediationCase.project_id == project_id,
-                                ResidualRemediationCase.fingerprint == "fp-ignored",
-                            )
+        async with session_factory() as session, session.begin():
+            row = (
+                (
+                    await session.execute(
+                        select(ResidualRemediationCase).where(
+                            ResidualRemediationCase.project_id == project_id,
+                            ResidualRemediationCase.fingerprint == "fp-ignored",
                         )
                     )
-                    .scalars()
-                    .first()
                 )
-                row.status = ResidualCaseStatus.IGNORED
-                session.add(row)
+                .scalars()
+                .first()
+            )
+            row.status = ResidualCaseStatus.IGNORED
+            session.add(row)
 
         await _upsert_residual_case_async(project_id, "fp-ignored", now_dt, "err2")
 
