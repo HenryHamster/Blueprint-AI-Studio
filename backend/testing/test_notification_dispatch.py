@@ -33,6 +33,7 @@ from app.notification_dispatch import (
     post_review_feedback_message,
     post_version_build_stalled_message,
     post_version_calcification_message,
+    post_version_ci_unresolved_stall_message,
     post_version_stabilize_stalled_message,
 )
 from app.models import (
@@ -1984,3 +1985,38 @@ async def test_post_version_stabilize_stalled_message_fires_external_webhook(
     assert payload["age_days"] == 16
     assert payload["tasks_merged"] == 38
     assert "summary" in payload and "stabilize" in payload["summary"]
+
+
+# ---------------------------------------------------------------------------
+# post_version_ci_unresolved_stall_message
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_post_version_ci_unresolved_stall_message_creates_message(
+    db_session,
+):
+    """post_version_ci_unresolved_stall_message posts a ProjectMessage with
+    event_type 'release_ci_unresolved_stall' and the correct context fields."""
+    project = Project(name="CI Unresolved Stall Test", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+
+    version_id = str(uuid.uuid4())
+    msg = await post_version_ci_unresolved_stall_message(
+        db_session,
+        project.id,
+        version_number=4,
+        version_id=version_id,
+        qualification_attempts=3,
+        age_days=2,
+    )
+    await db_session.commit()
+
+    assert msg.context["event_type"] == "release_ci_unresolved_stall"
+    assert msg.context["version_number"] == 4
+    assert msg.context["version_id"] == version_id
+    assert msg.context["qualification_attempts"] == 3
+    assert msg.context["age_days"] == 2
+    assert "CI cannot be resolved" in msg.content
+    assert "GitHub connectivity" in msg.content

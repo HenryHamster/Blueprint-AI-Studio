@@ -89,6 +89,7 @@ from app.notification_dispatch import (
     post_event_message,
     post_version_build_stalled_message,
     post_version_calcification_message,
+    post_version_ci_unresolved_stall_message,
     post_version_promotion_readiness_message,
     post_version_stabilize_stalled_message,
 )
@@ -2795,6 +2796,88 @@ async def _check_version_calcification(
     return True
 
 
+async def _check_version_ci_unresolved_stall(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Post a deduplicated alert when CI state cannot be resolved repeatedly.
+
+    Fires when a version in the stabilize phase has accumulated
+    ``_MIN_CALCIFICATION_ATTEMPTS`` or more qualification attempts all
+    finalizing as not_promoted with blocker ``ci_unresolved`` — meaning CI
+    checks are pending, no check-runs exist for the candidate, or GitHub I/O
+    is degraded.  This is the infrastructure-path counterpart to
+    ``_check_version_calcification``, which explicitly skips ``ci_unresolved``
+    because it is not a quality regression about the release candidate.
+
+    Deduplication: uses the version's ``calcification_alerted_blocker`` column
+    (same durable anchor as calcification — no collision because calcification
+    never writes ``ci_unresolved`` to that field).  A new alert fires only when
+    the field is not already ``"ci_unresolved"``.  If CI later resolves (blocker
+    changes or the version is promoted/closed), the version leaves the
+    open+stabilize guard and subsequent sweeps are no-ops.
+
+    Does NOT commit the session — the caller must commit after a ``True`` return.
+    """
+    if version.status != "open" or version.phase != "stabilize":
+        return False
+
+    attempts = version.qualification_attempts or 0
+    if attempts < _MIN_CALCIFICATION_ATTEMPTS:
+        return False
+
+    qual = version.last_qualification or {}
+    if qual.get("status") != "not_promoted":
+        return False
+    if qual.get("blocker") != "ci_unresolved":
+        return False
+
+    # Durable dedup: already alerted for this ci_unresolved stall.
+    if version.calcification_alerted_blocker == "ci_unresolved":
+        return False
+
+    alert_title = f"Release v{version.version_number}: CI state unresolvable"
+
+    age_days: int = 0
+    ref_time = version.phase_changed_at or version.opened_at
+    if ref_time is not None:
+        age_days = max(0, (_utcnow() - ref_time).days)
+
+    session.add(
+        Alert(
+            project_id=version.project_id,
+            severity=AlertSeverity.WARNING,
+            title=alert_title,
+            message=(
+                f"Release v{version.version_number} has been stuck in the "
+                f"stabilize phase for {age_days} day(s) with {attempts} "
+                f"qualification attempt(s) unable to resolve CI state (checks "
+                f"pending, no check-runs, or GitHub I/O degraded). This is a "
+                f"CI infrastructure or configuration problem — investigate CI "
+                f"connectivity and check-run reporting, not the release candidate."
+            ),
+        )
+    )
+    await post_version_ci_unresolved_stall_message(
+        session,
+        version.project_id,
+        version_number=version.version_number,
+        version_id=str(version.id),
+        qualification_attempts=attempts,
+        age_days=age_days,
+    )
+    version.calcification_alerted_blocker = "ci_unresolved"
+    session.add(version)
+    logger.warning(
+        "[RELEASE_QUALIFIER] ci_unresolved stall alert for v%d: %d attempts "
+        "unable to resolve CI state over %d day(s)",
+        version.version_number,
+        attempts,
+        age_days,
+    )
+    return True
+
+
 async def _check_version_build_stall(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -3217,6 +3300,10 @@ async def sweep_stuck_qualifications(
                 if v is None:
                     continue
                 alerted = await _check_version_calcification(alert_session, v)
+                alerted = (
+                    await _check_version_ci_unresolved_stall(alert_session, v)
+                    or alerted
+                )
                 alerted = await _check_version_build_stall(alert_session, v) or alerted
                 alerted = (
                     await _check_version_stabilize_stall(alert_session, v) or alerted
@@ -4334,8 +4421,7 @@ async def _record_promotion_success(
         _project = await session.get(Project, version.project_id)
         if _project is not None:
             _next_goal = (
-                parse_problem_model(_project.problem_model).intent.current_focus
-                or None
+                parse_problem_model(_project.problem_model).intent.current_focus or None
             )
     except Exception:
         logger.exception(

@@ -145,6 +145,12 @@
       "source_fn": "post_version_stabilize_stalled_message"
     },
     {
+      "name": "release_ci_unresolved_stall",
+      "classification": "high_signal",
+      "message_type": "NOTE",
+      "source_fn": "post_version_ci_unresolved_stall_message"
+    },
+    {
       "name": "direction_burn_pause",
       "classification": "escalation",
       "message_type": "BLOCKER",

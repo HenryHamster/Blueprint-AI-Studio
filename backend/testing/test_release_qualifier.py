@@ -7941,3 +7941,341 @@ async def test_check_promotion_readiness_messaging_failure_is_nonfatal(
 
     assert result is False
     assert version.promotion_ready_notified is False
+
+
+# ===========================================================================
+# Connected promotion lifecycle integration tests
+# ===========================================================================
+# The unit tests above verify individual helpers in isolation.  These two
+# integration tests drive the FULL connected path — _finalize_qualification
+# → promote → v(N+1) opens — so that regressions in the wiring (not just the
+# helpers) are caught together.
+
+
+@pytest.mark.asyncio
+async def test_connected_success_promotion_lifecycle_includes_goal_snapshot(
+    db_session, mocker
+):
+    """Success branch: _finalize_qualification with a confident composite
+    promotes, records v1 as promoted, opens v2 with base_sha = the real merge
+    commit AND goal snapshotted from the project's current_focus.
+
+    The goal regression (goal=None on every promotion — a NameError in
+    _record_promotion_success that was always swallowed) is only caught in the
+    CONNECTED flow because the isolated promote() unit test passes the project
+    in directly, bypassing the load path that previously referenced an undefined
+    variable.  This test exercises the connected chain.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+
+    focus = "Stabilise the qualifier loop and ship the promotion gate."
+    project.problem_model = {"intent": {"current_focus": focus}}
+    db_session.add(project)
+    await db_session.commit()
+
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 8,
+                "test_count_delta": 3,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "smoke-a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    merge_sha = "merged01" * 5
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(main=merge_sha))
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 301, "html_url": "http://pr/301"}),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+    mocker.patch(
+        "app.github.create_tag",
+        new=AsyncMock(return_value={"ref": "refs/tags/v1"}),
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # The connected finalize → promote chain produced a promoted verdict.
+    assert result["status"] == "promoted"
+    assert result["promoted_sha"] == merge_sha
+    assert result["next_version_number"] == 2
+
+    # v1 is closed as promoted.
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.promoted_sha == merge_sha
+
+    # v2 was opened: base_sha = the REAL merge commit AND goal = current_focus.
+    next_version = await rv.current_open_version(db_session, project.id)
+    assert next_version is not None
+    assert next_version.version_number == 2
+    assert next_version.phase == "build"
+    assert next_version.base_sha == merge_sha
+    assert next_version.goal == focus
+
+
+@pytest.mark.asyncio
+async def test_connected_conflict_promotion_lifecycle(db_session, mocker):
+    """Conflict branch: _finalize_qualification with a confident composite but a
+    conflicting GitHub merge records promotion_failed with conflict=True, keeps
+    v1 open in stabilize, emits the release_promotion_failed operator message,
+    and triggers the post-conflict main->automain reconciliation via
+    _maybe_reconcile_after_promotion_conflict.
+
+    This is the operator's ONLY proactive signal that promotion is stuck on a
+    conflict — and the reconciliation is the self-healing trigger.  Neither was
+    covered by any previous test in the connected form.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 4,
+                "test_count_delta": 1,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "smoke-a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 302, "html_url": "http://pr/302"}),
+    )
+    # GitHub returns a merge conflict — the promotion cannot land.
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merged": False,
+                "conflict": True,
+                "message": "merge conflict",
+            }
+        ),
+    )
+    recon_mock = mocker.patch(
+        "app.hotfix_backmerge.reconcile_main_into_automain",
+        new=AsyncMock(return_value={"status": "merged"}),
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # The finalize chain saw a conflict → promotion_failed with conflict flag.
+    assert result["status"] == "promotion_failed"
+    assert result.get("conflict") is True
+
+    # v1 stays open — a failed promotion never closes the version.
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "promotion_failed"
+
+    # No v2 was opened — promotion did not succeed.
+    next_version = await rv.current_open_version(db_session, project.id)
+    assert next_version is None or next_version.version_number == 1
+
+    # The operator received a release_promotion_failed message.
+    msgs = await _messages_for(db_session, project.id, "release_promotion_failed")
+    assert len(msgs) == 1
+    assert msgs[0].context["error"] == "merge_blocked"
+
+    # Verify the post-conflict reconciliation wiring: _maybe_reconcile_after_
+    # promotion_conflict fires when result has status=promotion_failed + conflict=True.
+    # In production this is triggered by _finalize_in_dedicated_session after
+    # its session commits; here we call it directly to assert the wiring is in
+    # place and that the reconciler is invoked exactly once for a conflict result.
+    await rq._maybe_reconcile_after_promotion_conflict(
+        version.id,
+        result,
+        session_factory=_shared_session_factory(db_session),
+    )
+    recon_mock.assert_awaited_once()
+
+
+# ===========================================================================
+# CI-unresolved stall alerting — _check_version_ci_unresolved_stall
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_ci_unresolved_stall_alert_fires_after_threshold(db_session):
+    """_check_version_ci_unresolved_stall posts an Alert and a
+    release_ci_unresolved_stall message after _MIN_CALCIFICATION_ATTEMPTS
+    ci_unresolved verdicts."""
+    from app.models import Alert as _Alert
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.qualification_attempts = rq._MIN_CALCIFICATION_ATTEMPTS
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_unresolved",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    alerted = await rq._check_version_ci_unresolved_stall(db_session, version)
+    await db_session.commit()
+
+    assert alerted is True
+    alerts = (
+        (
+            await db_session.execute(
+                select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "CI state unresolvable" in alerts[0].title
+    assert "CI infrastructure" in alerts[0].message
+
+    msgs = await _messages_for(db_session, project.id, "release_ci_unresolved_stall")
+    assert len(msgs) == 1
+    assert version.calcification_alerted_blocker == "ci_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_ci_unresolved_stall_dedup_suppresses_repeat(db_session):
+    """A second sweep call with the same ci_unresolved stall is a no-op —
+    the alert fires only once per distinct stall."""
+    from app.models import Alert as _Alert
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.qualification_attempts = rq._MIN_CALCIFICATION_ATTEMPTS
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_unresolved",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    first = await rq._check_version_ci_unresolved_stall(db_session, version)
+    await db_session.commit()
+    second = await rq._check_version_ci_unresolved_stall(db_session, version)
+    await db_session.commit()
+
+    assert first is True
+    assert second is False
+    alerts = (
+        (
+            await db_session.execute(
+                select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_ci_unresolved_stall_does_not_fire_below_threshold(db_session):
+    """Fewer than _MIN_CALCIFICATION_ATTEMPTS ci_unresolved verdicts do not
+    trigger the stall alert — the unresolved state may be transient."""
+    from app.models import Alert as _Alert
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.qualification_attempts = rq._MIN_CALCIFICATION_ATTEMPTS - 1
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_unresolved",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    alerted = await rq._check_version_ci_unresolved_stall(db_session, version)
+
+    assert alerted is False
+    alerts = (
+        (
+            await db_session.execute(
+                select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_ci_unresolved_stall_distinct_from_calcification_alert(db_session):
+    """ci_not_green triggers calcification but NOT ci_unresolved stall, and
+    ci_unresolved triggers ci_unresolved stall but NOT calcification."""
+    # ci_not_green: calcification fires, ci_unresolved stall does not.
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.qualification_attempts = rq._MIN_CALCIFICATION_ATTEMPTS
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_not_green",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    calc_fired = await rq._check_version_calcification(db_session, version)
+    ci_stall_fired = await rq._check_version_ci_unresolved_stall(db_session, version)
+    await db_session.commit()
+
+    assert calc_fired is True
+    assert ci_stall_fired is False
+
+    # ci_unresolved: ci_unresolved stall fires, calcification does not.
+    project2, version2 = await _make_project_and_version(db_session, phase="stabilize")
+    version2.qualification_attempts = rq._MIN_CALCIFICATION_ATTEMPTS
+    version2.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_unresolved",
+    }
+    db_session.add(version2)
+    await db_session.commit()
+    await db_session.refresh(version2)
+
+    calc_fired2 = await rq._check_version_calcification(db_session, version2)
+    ci_stall_fired2 = await rq._check_version_ci_unresolved_stall(db_session, version2)
+    await db_session.commit()
+
+    assert calc_fired2 is False
+    assert ci_stall_fired2 is True

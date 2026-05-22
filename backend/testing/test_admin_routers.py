@@ -1065,6 +1065,7 @@ class TestMessages:
             "release_calcifying",
             "release_build_stalled",
             "release_stabilize_stalled",
+            "release_ci_unresolved_stall",
         ],
     )
     async def test_list_messages_guarantees_high_signal_notes_with_routine_flood(
