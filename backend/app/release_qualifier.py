@@ -372,13 +372,16 @@ def compute_composite(
     policy: dict[str, Any],
     *,
     smoketest_enabled: bool = True,
+    ci_state: str = "red",  # _CI_RED — defined later in module; use literal here
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
 
     Hard blockers — each forces ``confidence = 0.0`` and ``promote = False``.
     They are evaluated in this order, and ``blocker`` reports the first match:
-      * ``not ci_green``           — CI is not green on the candidate SHA
+      * ``not ci_green`` + ``ci_state == _CI_RED``  — confirmed failing build
         (``"ci_not_green"``).
+      * ``not ci_green`` + ``ci_state != _CI_RED``  — CI could not be evaluated
+        (pending, no check-runs, or I/O degraded) (``"ci_unresolved"``).
       * ``smoketest_score`` is None — the smoketest never produced a usable
         score, treated as a startup-suite failure
         (``"smoketest_startup_failed"``).  ONLY checked when
@@ -448,7 +451,10 @@ def compute_composite(
     # audit report itself was present (audit_score not None).
     blocker: str | None = None
     if not ci_green:
-        blocker = "ci_not_green"
+        # Distinguish a confirmed red build from an unresolved CI state (pending,
+        # no check-runs, or GitHub I/O degraded).  Only a real red build is a
+        # quality blocker; unresolved CI is a resolution/infrastructure concern.
+        blocker = "ci_not_green" if ci_state == _CI_RED else "ci_unresolved"
     elif smoketest_enabled and smoketest_score is None:
         # Only a hard blocker when the smoketest subsystem was actually
         # enabled — a disabled subsystem legitimately produces no score.
@@ -1457,6 +1463,7 @@ def _score_smoketest(result: dict[str, Any] | None) -> float | None:
 # Human-readable rendering of the compute_composite() hard-blocker codes.
 _BLOCKER_LABELS: dict[str, str] = {
     "ci_not_green": "CI is not green on the candidate",
+    "ci_unresolved": "CI state could not be evaluated (pending, no check-runs, or GitHub I/O degraded)",
     "smoketest_startup_failed": "the smoketest startup suite failed",
     "audit_missing": "the release audit produced no usable report",
     "test_file_deleted": "the diff deleted a test file",
@@ -1983,6 +1990,7 @@ async def _finalize_qualification(
         smoketest_score=smoketest_score,
         policy=policy,
         smoketest_enabled=smoketest_enabled,
+        ci_state=ci_resolution.get("state", _CI_RED),
     )
 
     finalized_at = _utcnow().isoformat()
@@ -2728,6 +2736,11 @@ async def _check_version_calcification(
     # Only alert for hard-blocker failures (not below-threshold near-misses,
     # which have blocker=None and may self-correct without intervention).
     if qual_status != "not_promoted" or not blocker:
+        return False
+
+    # ci_unresolved is a resolution/infrastructure concern, not a quality
+    # regression — it must not trip the quality calcification alert.
+    if blocker == "ci_unresolved":
         return False
 
     # Durable dedup: the version remembers the blocker it last alerted on.
@@ -4581,9 +4594,12 @@ async def compute_promotion_readiness(
             break
 
     # Blocker frequency across the window (only non-promote verdicts carry one).
+    # ci_unresolved is a resolution/infrastructure concern and must not be counted
+    # as a quality recurring blocker — it would pollute the readiness signal and
+    # misdirect the strategic agent toward a non-existent build problem.
     blocker_counts: dict[str, int] = {}
     for v in verdicts:
-        if v.blocker:
+        if v.blocker and v.blocker != "ci_unresolved":
             blocker_counts[v.blocker] = blocker_counts.get(v.blocker, 0) + 1
     recurring_blockers = {
         code: n
