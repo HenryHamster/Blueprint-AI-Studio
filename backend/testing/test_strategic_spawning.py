@@ -163,6 +163,19 @@ def _patch_spawning_deps(mocker):
     )
 
 
+@pytest.fixture
+def _lts_split_active():
+    """Activate the LTS split for version-lifecycle tests.
+
+    The strategic version-phase block is gated on the integration branch being
+    a real trunk distinct from "main"; set it for the test and restore after.
+    """
+    _prev = _shared_state.runtime_config.get("integration_branch", "main")
+    _shared_state.runtime_config["integration_branch"] = "automain"
+    yield
+    _shared_state.runtime_config["integration_branch"] = _prev
+
+
 # ── Type selection: arch_frequency / strategic_cycle_count ────────────────────
 
 
@@ -3186,7 +3199,9 @@ async def _ensure_releaseversion_table(session):
 
 
 @pytest.mark.asyncio
-async def test_version_phase_includes_promotion_readiness(db_session, mocker):
+async def test_version_phase_includes_promotion_readiness(
+    db_session, mocker, _lts_split_active
+):
     """When is_self_repo=True and QualificationVerdict rows exist, the strategic
     payload's version_phase block carries promotion_readiness with ready,
     would_promote_rate, and recurring_blockers keys."""
@@ -3259,7 +3274,9 @@ async def test_version_phase_includes_promotion_readiness(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_version_phase_includes_recent_versions(db_session, mocker):
+async def test_version_phase_includes_recent_versions(
+    db_session, mocker, _lts_split_active
+):
     """When is_self_repo=True and closed ReleaseVersion rows exist, version_phase
     carries a recent_versions list."""
     from datetime import datetime, timedelta
@@ -3330,7 +3347,9 @@ async def test_version_phase_includes_recent_versions(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_stabilize_stall_hint_fires_for_old_stabilize_version(db_session, mocker):
+async def test_stabilize_stall_hint_fires_for_old_stabilize_version(
+    db_session, mocker, _lts_split_active
+):
     """An open stabilize-phase version older than _STABILIZE_STALL_AGE_DAYS with
     no qualification attempt gets a STALLED nudge in the strategic prompt_suffix
     and a stabilize_stall block in version_phase."""
@@ -3391,7 +3410,9 @@ async def test_stabilize_stall_hint_fires_for_old_stabilize_version(db_session, 
 
 
 @pytest.mark.asyncio
-async def test_stabilize_stall_hint_suppressed_for_dry_run(db_session, mocker):
+async def test_stabilize_stall_hint_suppressed_for_dry_run(
+    db_session, mocker, _lts_split_active
+):
     """A dry-run hold (passing candidate, promotion_enabled=False) is healthy
     and must NOT trigger the stalled nudge."""
     from datetime import timedelta
@@ -3449,7 +3470,7 @@ async def test_stabilize_stall_hint_suppressed_for_dry_run(db_session, mocker):
 
 @pytest.mark.asyncio
 async def test_build_stall_nudge_counts_build_phase_merges_not_version_lifetime(
-    db_session, mocker
+    db_session, mocker, _lts_split_active
 ):
     """A version that cycled build→stabilize→build must NOT fire the build-stall
     nudge prematurely based on the inflated version-lifetime merge count.
@@ -3527,7 +3548,9 @@ async def test_build_stall_nudge_counts_build_phase_merges_not_version_lifetime(
 
 
 @pytest.mark.asyncio
-async def test_build_stall_nudge_tasks_merged_field_is_phase_scoped(db_session, mocker):
+async def test_build_stall_nudge_tasks_merged_field_is_phase_scoped(
+    db_session, mocker, _lts_split_active
+):
     """When the build-stall nudge fires, version_phase['build_stall']['tasks_merged']
     must equal only the post-phase_changed_at merge count, not the version-lifetime count.
     """

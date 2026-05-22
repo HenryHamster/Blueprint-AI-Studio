@@ -1739,11 +1739,13 @@ async def _spawn_strategic_review(
     except Exception:
         logger.exception("[STRATEGIC] drift signal computation failed; continuing")
         drift_summary = {}
-    # LTS version/phase context — only for self-repo projects.  Best-effort:
-    # if release_version is not yet deployed (pre-Phase 2a), _open_version stays None.
+    # LTS version/phase context — active whenever the integration branch is a
+    # real trunk distinct from "main" (i.e. the LTS split is on).  Project-generic:
+    # gated on integration_branch, not project.is_self_repo.  Best-effort.
     _open_version = None
     _version_phase_block: dict | None = None
-    if project.is_self_repo:
+    _integration_branch = _runtime_config.get("integration_branch", "main")
+    if _integration_branch != "main":
         try:
             from app.release_version import (
                 count_merged_since,
@@ -1755,11 +1757,9 @@ async def _spawn_strategic_review(
 
             _open_version = await current_open_version(session, project.id)
             if _open_version is None:
-                # No open version: attempt bootstrap if the integration branch
-                # is a real trunk distinct from "main" (i.e. the LTS split is
-                # active). Try to resolve the integration-branch HEAD SHA so the
-                # qualifier's diff is meaningful; fall back to None on any error.
-                _integration_branch = _runtime_config.get("integration_branch", "main")
+                # No open version: bootstrap v1.  Resolve the integration-branch
+                # HEAD SHA so the qualifier's diff is meaningful; fall back to
+                # None on any error.
                 _bootstrap_sha: str | None = None
                 try:
                     from app import github as _github
@@ -1775,11 +1775,25 @@ async def _spawn_strategic_review(
                     logger.exception(
                         "[STRATEGIC] could not resolve integration branch SHA for bootstrap"
                     )
+                # Snapshot the project's current focus as the version's goal.
+                _bootstrap_goal: str | None = None
+                try:
+                    from app.problem_model import parse_problem_model
+
+                    _bootstrap_goal = (
+                        parse_problem_model(project.problem_model).intent.current_focus
+                        or None
+                    )
+                except Exception:
+                    logger.exception(
+                        "[STRATEGIC] could not read current_focus for version goal"
+                    )
                 _open_version = await ensure_initial_release_version(
                     session,
                     project.id,
                     integration_branch=_integration_branch,
                     base_sha=_bootstrap_sha,
+                    goal=_bootstrap_goal,
                 )
             if _open_version is not None:
                 _tasks_merged = await count_merged_since(

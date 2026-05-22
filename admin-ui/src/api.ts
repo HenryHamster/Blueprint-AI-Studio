@@ -748,6 +748,7 @@ export interface CurrentVersion {
   phase: string;
   phase_changed_at: string | null;
   phase_reasoning: string | null;
+  goal: string | null;
   opened_at: string;
   qualification_attempts: number;
   merged_task_count: number;

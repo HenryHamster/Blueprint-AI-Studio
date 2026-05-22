@@ -2350,6 +2350,16 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(String(32), nullable=False, server_default="open"),
     )
 
+    # The version's goal — a point-in-time snapshot of
+    # ProblemModel.intent.current_focus captured when this version opened.
+    # Frozen for the version's lifetime so each version keeps a stable record
+    # of what it was for, even after current_focus drifts on.  Nullable:
+    # pre-0111 rows and projects with no current_focus carry no goal.
+    goal: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+
     opened_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
