@@ -22,7 +22,7 @@ from app.models import (
 )
 from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role
-from app.payload_schemas import pack_under_budget, validate_internal_payload
+from app.payload_schemas import validate_internal_payload
 from app.task_locking import lock_project_or_429
 
 logger = logging.getLogger(__name__)
@@ -724,239 +724,68 @@ async def trigger_strategic_cycle(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Manually trigger a strategic cycle. Phase: 'design_doc' (Phase 1 → chains to Phase 2) or 'strategic_review' (Phase 2 only)."""
+    """Manually trigger a strategic cycle.
+
+    phase 'design_doc' (Phase 1, chains to Phase 2) or 'strategic_review'
+    (Phase 2 only).  Delegates to the SAME spawn functions the autonomous
+    research loop uses (_spawn_design_doc_update / _spawn_strategic_review), so a
+    manual trigger is identical to a standard cycle -- there is no parallel
+    inline payload builder that can drift out of sync (e.g. silently omitting
+    the version-phase block / v1 bootstrap).
+    """
+    if phase not in ("design_doc", "strategic_review"):
+        raise HTTPException(
+            status_code=400, detail="Phase must be 'design_doc' or 'strategic_review'"
+        )
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
 
-    # Guard: no strategic task already running. Lock the project row so the
-    # check+insert is transactionally atomic with concurrent spawn attempts
-    # (design_doc completion chain, autonomous-research tick, other manual triggers).
-    # Phase A1: skip_locked + 429 on contention so 30s lock_timeout doesn't
-    # propagate as 500 and trigger Cloud Run instance quarantine.
+    # Lock the project row so the spawn function's _has_active_strategic_task
+    # check + insert is atomic against concurrent spawns (design-doc completion
+    # chain, autonomous tick, other manual triggers).  Phase A1: skip_locked +
+    # 429 on contention so a 30s lock_timeout can't 500 -> instance quarantine.
     await lock_project_or_429(session, project.id)
-    active = (
-        (
-            await session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                    Task.status.in_(
-                        [
-                            TaskStatus.QUEUED,
-                            TaskStatus.PROVISIONING,
-                            TaskStatus.IN_PROGRESS,
-                        ]
-                    ),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    for t in active:
-        t_type = (t.first_payload).get("type")
-        if t_type in ("design_doc_update", "strategic_review"):
-            raise HTTPException(
-                status_code=409, detail=f"A {t_type} task is already active: {t.id}"
-            )
 
-    from app.shared_state import runtime_config as _runtime_config
-
-    # Strip agent-unused / operator-only keys (e.g. playbook_archive) before
-    # shipping the design_doc. See _agent_view_design_doc for rationale.
-    from app.strategic_spawning import _agent_view_design_doc  # noqa: PLC0415
-
-    design_doc_for_agent = _agent_view_design_doc(project.design_doc)
-
-    # Use the same pack_under_budget schemas as the autonomous path so manual
-    # triggers can't generate payloads that pass schema validation (256KB cap)
-    # but exceed the DB chk_task_payloads_size constraint (200KB on payloads
-    # column). Strategic payloads grow with design_doc + directions_summary +
-    # conversation_thread and reliably overflow without packing.
-    from app.strategic_spawning import (  # noqa: PLC0415
-        _DESIGN_DOC_UPDATE_SCHEMA,
-        _STRATEGIC_REVIEW_SCHEMA,
+    # One code path with the autonomous spawns -- no drift possible.
+    from app.strategic_spawning import (
+        _spawn_design_doc_update,
+        _spawn_strategic_review,
     )
 
     if phase == "design_doc":
-        # Fetch open messages
-        open_msgs_result = await session.execute(
-            select(ProjectMessage)
-            .where(
-                ProjectMessage.project_id == project.id,
-                ProjectMessage.status == "open",
-            )
-            .order_by(ProjectMessage.created_at.asc())
-            .limit(50)
-        )
-        open_msgs = [
-            {
-                "id": str(m.id),
-                "type": m.message_type,
-                "content": m.content,
-                "context": m.context,
-                "from": m.from_type,
-                "created_at": m.created_at.isoformat() if m.created_at else None,
-            }
-            for m in open_msgs_result.scalars().all()
-        ]
-        doc_model = (
-            _runtime_config.get("task_type_models", {}).get("design_doc_update")
-            or _runtime_config.get("task_type_models", {}).get("research")
-            or None
-        )
-        doc_effort = (
-            _runtime_config.get("task_type_efforts", {}).get("design_doc_update")
-            or _runtime_config.get("task_type_efforts", {}).get("research")
-            or None
-        )
-        payload = pack_under_budget(
-            {
-                "type": "design_doc_update",
-                "design_doc": design_doc_for_agent,
-                "proposed_changes": (project.design_doc or {}).get(
-                    "proposed_changes", []
-                ),
-                "project_name": project.name,
-                "vision": project.vision or {},
-                "open_messages": open_msgs,
-                "base_branch": _runtime_config.get("integration_branch", "main"),
-                **({"model": doc_model} if doc_model else {}),
-                **({"effort": doc_effort} if doc_effort else {}),
-            },
-            _DESIGN_DOC_UPDATE_SCHEMA,
-        )
-        title = f"Architecture review: {project.name}"
-    elif phase == "strategic_review":
-        # Build direction stats — include both active and proposed so the
-        # strategic agent can approve/reject pending proposals.
-        from app.strategic_analysis import _build_outcome_evaluation
-
-        reviewable = [
-            d
-            for d in (project.directions or [])
-            if d.get("status") in ("active", "proposed")
-        ]
-        direction_stats = []
-        for d in reviewable:
-            history = d.get("research_history", [])
-            agg = d.get("history_aggregate", {})
-            total_cycles = len(history) + (agg.get("total_cycles") or 0)
-            total_merged = sum(h.get("prs_merged", 0) for h in history) + (
-                agg.get("total_prs_merged") or 0
-            )
-            total_failed = sum(h.get("tasks_failed", 0) for h in history) + (
-                agg.get("total_tasks_failed") or 0
-            )
-            stat = {
-                "id": d.get("id"),
-                "text": d.get("text"),
-                "priority": d.get("priority"),
-                "status": d.get("status"),
-                "total_cycles": total_cycles,
-                "prs_merged": total_merged,
-                "tasks_failed": total_failed,
-            }
-            if d.get("completion_criteria"):
-                stat["completion_criteria"] = d["completion_criteria"]
-            if d.get("category"):
-                stat["category"] = d["category"]
-            if d.get("status") == "proposed":
-                if d.get("proposed_by"):
-                    stat["proposed_by"] = str(d["proposed_by"])
-                if d.get("proposal_rationale"):
-                    stat["proposal_rationale"] = d["proposal_rationale"]
-                if d.get("proposed_at"):
-                    stat["proposed_at"] = d["proposed_at"]
-            direction_stats.append(stat)
-        # Unified conversation thread — last 30 messages chronologically
-        thread_result = await session.execute(
-            select(ProjectMessage)
-            .where(
-                ProjectMessage.project_id == project.id,
-            )
-            .order_by(ProjectMessage.created_at.desc())
-            .limit(30)
-        )
-        all_thread_msgs = list(reversed(thread_result.scalars().all()))
-        conversation_thread = [
-            {
-                "id": str(m.id),
-                "type": m.message_type,
-                "content": m.content,
-                "context": m.context,
-                "from": m.from_type,
-                "status": m.status,
-                "resolution": m.resolution,
-                "created_at": m.created_at.isoformat() if m.created_at else None,
-                "resolved_at": m.resolved_at.isoformat() if m.resolved_at else None,
-            }
-            for m in all_thread_msgs
-        ]
-        open_msgs = [msg for msg in conversation_thread if msg["status"] == "open"]
-        review_model = (
-            _runtime_config.get("task_type_models", {}).get("strategic_review")
-            or _runtime_config.get("task_type_models", {}).get("research")
-            or None
-        )
-        review_effort = (
-            _runtime_config.get("task_type_efforts", {}).get("strategic_review")
-            or _runtime_config.get("task_type_efforts", {}).get("research")
-            or None
-        )
-        payload = pack_under_budget(
-            {
-                "type": "strategic_review",
-                "research_mode": "strategic",
-                "design_doc": design_doc_for_agent,
-                "vision": project.vision or {},
-                "directions_summary": direction_stats,
-                "outcome_evaluation": _build_outcome_evaluation(project),
-                "project_name": project.name,
-                "open_messages": open_msgs,
-                "conversation_thread": conversation_thread,
-                "base_branch": _runtime_config.get("integration_branch", "main"),
-                **({"model": review_model} if review_model else {}),
-                **({"effort": review_effort} if review_effort else {}),
-            },
-            _STRATEGIC_REVIEW_SCHEMA,
-        )
-        title = f"Strategic review: {project.name}"
+        spawned = await _spawn_design_doc_update(project, session)
     else:
+        spawned = await _spawn_strategic_review(project, session)
+
+    if not spawned:
         raise HTTPException(
-            status_code=400, detail="Phase must be 'design_doc' or 'strategic_review'"
+            status_code=409,
+            detail=(
+                "A strategic cycle (design_doc_update or strategic_review) is "
+                "already active for this project."
+            ),
         )
 
-    task_type = payload.get("type", phase)
-    payload = validate_internal_payload(payload, f"directions:{task_type}")
-    new_task = Task(
-        project_id=project.id,
-        title=title,
-        description=title,
-        payloads=[payload],
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        status=TaskStatus.QUEUED,
-        created_by="USER",
+    # The spawn function created and committed the task; surface the newest
+    # task so callers (ops.py) can print its id.
+    new_task = (
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.project_id == project.id)
+                .order_by(Task.created_at.desc())
+            )
+        )
+        .scalars()
+        .first()
     )
-    session.add(new_task)
-    history = TaskHistory(
-        task_id=new_task.id,
-        action="CREATED",
-        details={
-            "created_by": "USER",
-            "method": "manual_strategic_cycle",
-            "phase": phase,
-        },
-    )
-    session.add(history)
-    await session.commit()
-    await session.refresh(new_task)
-
     return {
-        "id": str(new_task.id),
+        "id": str(new_task.id) if new_task else None,
+        "task_id": str(new_task.id) if new_task else None,
         "project_id": str(project.id),
-        "title": new_task.title,
-        "status": new_task.status,
+        "title": new_task.title if new_task else None,
+        "status": new_task.status if new_task else None,
         "phase": phase,
     }
 
