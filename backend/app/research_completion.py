@@ -43,6 +43,7 @@ from app.finding_deduplication import (
     build_dedup_state,
     deduplicate_findings,
     extract_retired_failed_approaches,
+    extract_archived_diagnoses,
     finding_hash as _finding_hash,  # noqa: F401 — re-exported for callers/tests
     is_duplicate as _is_duplicate,  # noqa: F401 — re-exported for callers/tests
 )
@@ -110,6 +111,41 @@ _SCOPE_AWARE_EFFORT_TYPES = frozenset({"create", "fix", "refactor", "plan"})
 # collapsing to 0 for a direction with no successful medium merges, which would
 # permanently shut down medium exploration and prevent data collection.
 MEDIUM_EXPLORATION_FLOOR = 0.05
+
+# Max memo tasks spawned per research cycle for dropped findings. Independent
+# of the implementation-task spawn cap (_DEGRADED_SPAWN_CAP / batch cap): memos
+# are read-only and cheap, so a flood of dropped findings is bounded here rather
+# than stampeding memo creation.
+MEMO_SPAWN_CAP_PER_CYCLE = 5
+
+
+def _trim_finding_for_memo(finding: Dict[str, Any]) -> Dict[str, Any]:
+    """Trim a dropped finding to a bounded dict for embedding in a MemoPayload.
+
+    Keeps the identifying/contextual fields a memo agent needs and drops bulky
+    internal calibration fields (``_complexity_signals`` etc.) and unbounded
+    text so the memo payload stays well under the payload size budget.
+    """
+    trimmed: Dict[str, Any] = {}
+    for key in (
+        "title",
+        "type",
+        "scope",
+        "risk",
+        "priority",
+        "actionability_grade",
+        "direction_id",
+    ):
+        val = finding.get(key)
+        if val is not None:
+            trimmed[key] = val
+    desc = finding.get("description")
+    if isinstance(desc, str) and desc:
+        trimmed["description"] = desc[:1000]
+    related = finding.get("related_files")
+    if isinstance(related, list) and related:
+        trimmed["related_files"] = [str(f) for f in related[:20]]
+    return trimmed
 
 
 def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:
@@ -1074,6 +1110,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 }
             )
     _retired_failed_approaches = extract_retired_failed_approaches(_retired_ctx_list)
+    _archived_diagnoses = extract_archived_diagnoses(
+        project_obj.design_doc if project_obj else None
+    )
 
     recent_finding_hashes, failed_hashes, prior_failure_by_hash = build_dedup_state(
         recent_tasks_for_dedup,
@@ -1127,6 +1166,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         existing_tasks_with_dirs,
         open_pr_files,
         retired_failed_approaches=_retired_failed_approaches,
+        archived_diagnoses=_archived_diagnoses,
     )
     deduplicated = _dedup_outcome.deduplicated
     hash_dedup_count = _dedup_outcome.hash_dedup_count
@@ -2102,12 +2142,69 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             for f in _low_conf_skipped_findings
         ]
     )
-    if _all_deferred or _scope_skip_counts:
+    # Spawn memo tasks for findings dropped for outcome-blind reasons
+    # (low_actionability / degradation_gate). These would otherwise vanish
+    # without a trace; a terminal memo records the reasoning so strategic
+    # review can cite it by id. Bounded by MEMO_SPAWN_CAP_PER_CYCLE, which is
+    # independent of the implementation-task spawn caps (memos are read-only).
+    _spawned_memo_ids: list[str] = []
+    _memo_candidates: list[tuple[dict, str]] = [
+        (f, "low_actionability") for f in _low_actionability_deferred
+    ] + [(f, "degradation_gate") for f in _degradation_gate_deferred]
+    _research_direction_id = (task.context or {}).get("direction_id")
+    for _mf, _drop_reason in _memo_candidates[:MEMO_SPAWN_CAP_PER_CYCLE]:
+        _memo_topic = str(
+            _mf.get("title")
+            or (_mf.get("description") or "")[:80]
+            or "Dropped research finding"
+        )[:200]
+        _memo_dir_id = _mf.get("direction_id") or _research_direction_id
+        _memo_payload = validate_internal_payload(
+            {
+                "type": "memo",
+                "topic": _memo_topic,
+                "reasoning_kind": "deferred_finding",
+                "source_task_id": str(task.id),
+                "source_finding": _trim_finding_for_memo(_mf),
+                **({"direction_id": _memo_dir_id} if _memo_dir_id else {}),
+            },
+            "research_completion:memo:deferred_finding",
+        )
+        _memo_task = Task(
+            project_id=task.project_id,
+            title=f"Memo: {_memo_topic[:120]}",
+            description=f"Reasoning memo for dropped finding ({_drop_reason})",
+            parent_task_id=task.id,
+            payloads=[_memo_payload],
+            context={
+                "memo_source_task_id": str(task.id),
+                "memo_reasoning_kind": "deferred_finding",
+                "memo_drop_reason": _drop_reason,
+                **({"direction_id": _memo_dir_id} if _memo_dir_id else {}),
+            },
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            depends_on=[],
+            priority=TASK_PRIORITY_MAP.get("low", 0),
+        )
+        session.add(_memo_task)
+        _spawned_memo_ids.append(str(_memo_task.id))
+    if _spawned_memo_ids:
+        logger.info(
+            "[RESEARCH] Spawned %d memo task(s) for dropped findings (task %s)",
+            len(_spawned_memo_ids),
+            task.id,
+        )
+
+    if _all_deferred or _scope_skip_counts or _spawned_memo_ids:
         ctx = dict(task.context or {})
         if _all_deferred:
             ctx["deferred_findings"] = _all_deferred
         if _scope_skip_counts:
             ctx["skipped_low_confidence_by_scope"] = _scope_skip_counts
+        if _spawned_memo_ids:
+            ctx["spawned_memo_ids"] = _spawned_memo_ids
         task.context = ctx
         flag_modified(task, "context")
         session.add(task)
@@ -2225,6 +2322,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             },
             "spawn_ratio": (_impl_spawned / _denom) if _denom > 0 else None,
         }
+        if _spawned_memo_ids:
+            _deferred_stats["memo_ids"] = _spawned_memo_ids
         _proj = await session.get(Project, task.project_id)
         if _proj and _proj.directions:
             _dirs = list(_proj.directions)

@@ -986,6 +986,65 @@ async def test_recently_completed_tasks_include_outcome_context(
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_injects_sr_co_failure_pairs(client: AsyncClient, db_session):
+    """The claim response injects sr_co_failure_pairs from recent completed tasks.
+
+    Regression: the scan once filtered + ordered by a non-existent
+    ``Task.completed_at`` column (that name is a property on the strategic-cycle
+    model, not Task). The query raised AttributeError on every code-change
+    claim; the catch-all swallowed it, so the injection silently produced
+    nothing — 11x ERROR-log noise and a 100%-dead feature.
+    """
+    project = Project(name="SR Co-Failure", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # >= _SR_MIN_SAMPLE (5) completed code-change tasks whose self-review failed
+    # the same two categories together → a clear co-failure pair.
+    for i in range(6):
+        db_session.add(
+            Task(
+                project_id=project.id,
+                title=f"Completed {i}",
+                payloads=[{"type": "create", "prompt": "x"}],
+                status=TaskStatus.COMPLETED,
+                context={
+                    "_self_review_outcome": {
+                        "check_results": {
+                            "correctness": {"passed": False},
+                            "error-handling": {"passed": False},
+                        }
+                    }
+                },
+            )
+        )
+    await db_session.commit()
+
+    claim_task = Task(
+        project_id=project.id,
+        title="Claimer",
+        payloads=[{"type": "create", "prompt": "Build a thing"}],
+        vm_instance_id="agent-vm-cofail-claimer",
+    )
+    db_session.add(claim_task)
+    await db_session.commit()
+    await db_session.refresh(claim_task)
+
+    token = create_agent_token(str(claim_task.id), "agent-vm-cofail-claimer")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    pairs = resp.json()["project_context"].get("sr_co_failure_pairs")
+    assert pairs, "sr_co_failure_pairs missing — the completed-task scan failed"
+    cats = {p["cat_a"] for p in pairs} | {p["cat_b"] for p in pairs}
+    assert "correctness" in cats
+    assert "error-handling" in cats
+    for p in pairs:
+        assert {"cat_a", "cat_b", "lift"} <= set(p)
+
+
+@pytest.mark.asyncio
 async def test_lessons_include_first_feedback_when_distinct(
     client: AsyncClient, db_session
 ):
@@ -3831,6 +3890,110 @@ async def test_claim_injects_self_review_catch_rate_with_fp_calibration(
     assert type_sec["false_positive_rate"] == 0.6
     assert type_sec["precision"] == round(1 - 0.6, 3)
     assert type_sec["sr_flag_sample_size"] == 10
+
+
+@pytest.mark.asyncio
+async def test_claim_injects_self_review_catch_rate_failure_mode_fields(
+    client: AsyncClient, db_session
+):
+    """Claim endpoint forwards trend, below_floor, engagement_thinning, and miss_mode_breakdown.
+
+    These fields drive the agent-side failure-mode hint
+    (self-review.ts:formatFailureModeHintForSrPrompt) and the thinning
+    reasoning gate (standard.ts:getThinningCategories). If _cat_entry drops
+    them at the backend->agent boundary, the hint never renders.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "security": {
+                    "miss_rate": 0.30,
+                    "trend": "decreasing",
+                    "below_floor": True,
+                    "engagement_thinning": True,
+                    "miss_mode_breakdown": {
+                        "reading_gap": 5,
+                        "judgment_gap": 1,
+                        "coverage_gap": 0,
+                        "dominant_mode": "reading_gap",
+                    },
+                },
+                "correctness": {
+                    "miss_rate": 0.10,
+                    # No regression signals — fields should be omitted.
+                },
+            },
+            "by_task_type": {
+                "create": {
+                    "security": {
+                        "miss_rate": 0.25,
+                        "trend": "stable",
+                        "below_floor": False,
+                        "miss_mode_breakdown": {
+                            "reading_gap": 0,
+                            "judgment_gap": 3,
+                            "coverage_gap": 1,
+                            "dominant_mode": "judgment_gap",
+                        },
+                    },
+                },
+            },
+        },
+    }
+    project = Project(
+        name="SR Failure Mode Test",
+        user_id="test-user-123",
+        design_doc=design_doc,
+    )
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Add feature"}],
+        vm_instance_id="agent-vm-sr-failure-mode",
+        context={"related_files": ["backend/app/foo.py"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-sr-failure-mode")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    project_ctx = resp.json().get("project_context", {})
+    sr = project_ctx.get("self_review_catch_rate")
+    assert sr is not None, (
+        f"expected self_review_catch_rate in project_context, got {list(project_ctx.keys())}"
+    )
+
+    sec = sr["categories"]["security"]
+    assert sec["trend"] == "decreasing"
+    assert sec["below_floor"] is True
+    assert sec["engagement_thinning"] is True
+    assert sec["miss_mode_breakdown"] == {
+        "reading_gap": 5,
+        "judgment_gap": 1,
+        "coverage_gap": 0,
+        "dominant_mode": "reading_gap",
+    }
+
+    # Category without regression signals: fields must be absent.
+    corr = sr["categories"]["correctness"]
+    assert "trend" not in corr
+    assert "below_floor" not in corr
+    assert "engagement_thinning" not in corr
+    assert "miss_mode_breakdown" not in corr
+
+    # for_task_type passthrough preserves the same fields.
+    type_sec = sr["for_task_type"]["security"]
+    assert type_sec["trend"] == "stable"
+    assert type_sec["below_floor"] is False
+    assert type_sec["miss_mode_breakdown"]["dominant_mode"] == "judgment_gap"
 
 
 @pytest.mark.asyncio
@@ -7681,6 +7844,60 @@ async def test_next_role_claims_warm_pinned_queued_task(
 
 
 @pytest.mark.asyncio
+async def test_next_role_returns_204_when_warm_continuity_suppressed(
+    client: AsyncClient, db_session, mocker
+):
+    """Circuit breaker: next-role returns 204 (skipping warm claim) when
+    is_warm_continuity_suppressed() returns True, even if a pinned QUEUED task exists."""
+    from datetime import timedelta
+
+    project = Project(name="Next-Role CB Suppressed", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review"}],
+        vm_instance_id="agent-vm-cb-suppressed",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(prior_task)
+    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    pinned_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "pr_number": 9999}],
+        status=TaskStatus.QUEUED,
+        context={
+            "warm_target_vm_id": "agent-vm-cb-suppressed",
+            "warm_handoff_deadline": deadline,
+        },
+    )
+    db_session.add(pinned_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+    await db_session.refresh(pinned_task)
+
+    mocker.patch("app.shared_state.is_warm_continuity_suppressed", return_value=True)
+
+    token = create_agent_token(str(prior_task.id), "agent-vm-cb-suppressed")
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": "agent-vm-cb-suppressed",
+            "prior_task_id": str(prior_task.id),
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 204
+
+    await db_session.refresh(pinned_task)
+    assert pinned_task.status == TaskStatus.QUEUED, (
+        "Circuit breaker must not claim the pinned task"
+    )
+
+
+@pytest.mark.asyncio
 async def test_next_role_refuses_warm_claim_on_doomed_vm(
     client: AsyncClient, db_session
 ):
@@ -9611,6 +9828,65 @@ async def test_claim_records_vm_cold_start_ms_once(client: AsyncClient, db_sessi
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_beacon_does_not_set_vm_cold_start_ms(
+    client: AsyncClient, db_session
+):
+    """Pre-claim provisioning beacons must NOT set vm_cold_start_ms.
+
+    Boot beacon heartbeats arrive long before the agent process exists and
+    therefore before any /claim call. The IS-NULL-guarded heartbeat fallback
+    was removed so that beacon timing no longer corrupts this metric. The claim
+    endpoint remains the sole writer. Warm-claimed tasks must stay unmeasured.
+    """
+    project = Project(name="Beacon Cold Start", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    provisioned = datetime.utcnow() - timedelta(seconds=8)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "ls"}],
+        vm_instance_id="agent-vm-beacon-test",
+        status=TaskStatus.QUEUED,
+        vm_provisioned_at=provisioned,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    assert task.vm_cold_start_ms is None
+
+    token = create_agent_token(str(task.id), "agent-vm-beacon-test")
+
+    # Simulate several provisioning-phase beacon heartbeats before /claim.
+    for beacon_msg in (
+        "PROVISION_CREDENTIALS_FETCHED",
+        "PROVISION_ENV_MATERIALIZED",
+        "PROVISION_PAYLOAD_DOWNLOADED",
+        "AGENT_BOOTED",
+    ):
+        hb_resp = await client.post(
+            "/api/agent/heartbeat",
+            json={"task_id": str(task.id), "status_message": beacon_msg},
+            headers={"x-agent-token": token},
+        )
+        assert hb_resp.status_code == 200
+
+    await db_session.refresh(task)
+    # Beacons must not set vm_cold_start_ms — that field belongs to /claim.
+    assert task.vm_cold_start_ms is None
+
+    # Now claim; cold-start should be recorded from dispatch-to-claim latency.
+    claim_resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert claim_resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.vm_cold_start_ms is not None
+    # ~8s elapsed, so cold-start should be ≥6s and ≤20s (test slack).
+    assert 6_000 <= task.vm_cold_start_ms <= 20_000
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_persists_api_call_summary(client: AsyncClient, db_session):
     """Heartbeat persists llm_call_count + token totals into Task.api_call_summary."""
     project = Project(name="API Call Summary", user_id="test-user-123")
@@ -10179,9 +10455,7 @@ async def test_hotfix_backmerge_runs_for_hotfix_merge_to_main(db_session, mocker
         "app.github.merge_pull_request",
         new=AsyncMock(return_value={"merged": True}),
     )
-    mocker.patch(
-        "app.hotfix_backmerge.broadcast_to_project", new_callable=AsyncMock
-    )
+    mocker.patch("app.hotfix_backmerge.broadcast_to_project", new_callable=AsyncMock)
 
     result = await hotfix_backmerge.open_backmerge_pr(
         db_session,
@@ -10425,9 +10699,7 @@ async def test_hotfix_backmerge_gate_distinguishes_hotfix_rollup_and_promotion()
 
     # Normal (non-hotfix) rollup merged to main → no back-merge.
     assert not _backmerge_should_fire(True, "main", {"type": "plan"})
-    assert not _backmerge_should_fire(
-        True, "main", {"type": "plan", "hotfix": False}
-    )
+    assert not _backmerge_should_fire(True, "main", {"type": "plan", "hotfix": False})
 
     # Promotion: automain -> main is opened by release_qualifier.promote(), not
     # a rollup-merge review task, so is_rollup_merge is False → no back-merge
@@ -10474,9 +10746,7 @@ def test_ci_gate_runs_for_integration_trunk_and_main():
 
 
 @pytest.mark.asyncio
-async def test_hotfix_plan_subtasks_carry_hotfix_and_high_priority(
-    db_session, mocker
-):
+async def test_hotfix_plan_subtasks_carry_hotfix_and_high_priority(db_session, mocker):
     """A hotfix plan task's subtasks carry hotfix:true and priority >= 90.
 
     Exercises the Phase 5 propagation in plan_completion._handle_plan_completion:
@@ -10718,3 +10988,155 @@ async def test_review_spawned_for_normal_subtask_has_no_hotfix(db_session, mocke
     assert was_created is True
     assert review_task is not None
     assert "hotfix" not in review_task.first_payload
+
+
+@pytest.mark.asyncio
+async def test_viewport_failure_screenshot_upload_url(
+    client: AsyncClient, db_session, mocker
+):
+    """Viewport failure screenshot endpoint returns stable GCS path and stamps task context."""
+    import asyncio
+
+    project = Project(name="Viewport Screenshot Test", user_id="user-viewport-001")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "fix viewport overflow"}],
+        vm_instance_id="vm-viewport-001",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    fake_url = "https://storage.googleapis.com/bucket/viewport-failures/signed?X-Goog-Signature=abc"
+    mocker.patch.object(asyncio, "to_thread", new=AsyncMock(return_value=fake_url))
+
+    token = create_agent_token(str(task.id), "vm-viewport-001")
+    resp = await client.post(
+        "/api/agent/viewport/failure-screenshot-upload-url",
+        json={"task_id": str(task.id), "component": "MessagesPanel", "width": 375},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["upload_url"] == fake_url
+    # Stable path is keyed by project_id/component-width — not task-scoped
+    assert (
+        f"viewport-failures/{project.id}/MessagesPanel-375.png" in body["storage_uri"]
+    )
+
+    await db_session.refresh(task)
+    assert task.context["viewport_failure_screenshot_uri"] == body["storage_uri"]
+
+
+@pytest.mark.asyncio
+async def test_viewport_failure_screenshot_upload_url_rejects_wrong_task(
+    client: AsyncClient, db_session
+):
+    """Endpoint rejects requests where task_id doesn't match the agent token."""
+    project = Project(name="Viewport Screenshot Auth Test", user_id="user-viewport-002")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task1 = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id="vm-viewport-002",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    task2 = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id="vm-viewport-003",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task1)
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task1)
+    await db_session.refresh(task2)
+
+    # Token for task1 but request uses task2's ID
+    token = create_agent_token(str(task1.id), "vm-viewport-002")
+    resp = await client.post(
+        "/api/agent/viewport/failure-screenshot-upload-url",
+        json={"task_id": str(task2.id), "component": "MessagesPanel", "width": 375},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_viewport_failure_screenshot_download_url(
+    client: AsyncClient, db_session, mocker
+):
+    """Download endpoint reconstructs the exact GCS path the agent uploads to."""
+    project = Project(name="Viewport Download Test", user_id="user-viewport-dl-001")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    captured = {}
+    fake_url = (
+        "https://storage.googleapis.com/bucket/signed-download?X-Goog-Signature=xyz"
+    )
+
+    def _fake_blob(object_name):
+        captured["object_name"] = object_name
+        blob = mocker.MagicMock()
+        blob.generate_signed_url.return_value = fake_url
+        return blob
+
+    fake_client = mocker.MagicMock()
+    fake_client.bucket.return_value.blob.side_effect = _fake_blob
+    mocker.patch("google.cloud.storage.Client", return_value=fake_client)
+
+    resp = await client.get(
+        "/api/admin/viewport-failures/download-url",
+        params={
+            "project_id": str(project.id),
+            "component": "MessagesPanel",
+            "width": 375,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == fake_url
+    # Path must exactly mirror the agent upload endpoint's object path
+    # (viewport-failures/{project_id}/{component}-{width}.png) so the download
+    # endpoint can actually serve the screenshot the agent uploaded.
+    assert (
+        captured["object_name"]
+        == f"viewport-failures/{project.id}/MessagesPanel-375.png"
+    )
+
+
+@pytest.mark.asyncio
+async def test_viewport_failure_screenshot_download_url_storage_failure(
+    client: AsyncClient, db_session, mocker
+):
+    """A GCS failure surfaces as a 503, not an unhandled 500."""
+    project = Project(
+        name="Viewport Download Failure Test", user_id="user-viewport-dl-002"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "google.cloud.storage.Client", side_effect=RuntimeError("gcs unavailable")
+    )
+
+    resp = await client.get(
+        "/api/admin/viewport-failures/download-url",
+        params={
+            "project_id": str(project.id),
+            "component": "MessagesPanel",
+            "width": 375,
+        },
+    )
+    assert resp.status_code == 503

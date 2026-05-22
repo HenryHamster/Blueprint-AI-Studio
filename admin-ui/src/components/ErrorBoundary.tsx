@@ -32,16 +32,18 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     if (!this.state.error) return this.props.children;
 
     if (this.props.fallback) {
-      return typeof this.props.fallback === 'function'
-        ? this.props.fallback(this.state.error, this.reset)
-        : this.props.fallback;
+      const node =
+        typeof this.props.fallback === 'function'
+          ? this.props.fallback(this.state.error, this.reset)
+          : this.props.fallback;
+      return <div data-error-boundary-fallback style={{ display: 'contents' }}>{node}</div>;
     }
 
     const level = this.props.level ?? 'panel';
 
     if (level === 'app') {
       return (
-        <div className="min-h-screen bg-neutral-950 flex items-center justify-center p-8">
+        <div data-error-boundary-fallback className="min-h-screen bg-neutral-950 flex items-center justify-center p-8">
           <div className="max-w-md w-full bg-neutral-900 border border-red-900/50 rounded-lg p-6 text-center">
             <AlertTriangle className="w-12 h-12 text-red-400 mx-auto mb-4" />
             <h1 className="text-xl font-semibold text-neutral-200 mb-2">Something went wrong</h1>
@@ -60,7 +62,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
 
     if (level === 'widget') {
       return (
-        <div className="border border-red-900/50 rounded-md p-2 text-center bg-red-950/20">
+        <div data-error-boundary-fallback className="border border-red-900/50 rounded-md p-2 text-center bg-red-950/20">
           <p className="text-xs text-red-400">Error rendering</p>
           <button onClick={this.reset} className="text-xs text-red-300 underline mt-1">Retry</button>
         </div>
@@ -69,7 +71,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
 
     // panel level (default)
     return (
-      <div className="border border-red-900/50 rounded-lg p-4 bg-red-950/20">
+      <div data-error-boundary-fallback className="border border-red-900/50 rounded-lg p-4 bg-red-950/20">
         <div className="flex items-center gap-2 mb-2">
           <AlertTriangle className="w-5 h-5 text-red-400" />
           <h3 className="text-sm font-medium text-red-300">Something went wrong</h3>

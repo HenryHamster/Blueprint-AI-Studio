@@ -92,6 +92,42 @@ describe('ErrorBoundary', () => {
     expect(screen.getByText('Recovered')).toBeInTheDocument();
   });
 
+  it('app-level fallback has data-error-boundary-fallback attribute', () => {
+    const { container } = render(
+      <ErrorBoundary level="app">
+        <ThrowingComponent shouldThrow />
+      </ErrorBoundary>
+    );
+    expect(container.querySelector('[data-error-boundary-fallback]')).toBeInTheDocument();
+  });
+
+  it('panel-level fallback has data-error-boundary-fallback attribute', () => {
+    const { container } = render(
+      <ErrorBoundary level="panel">
+        <ThrowingComponent shouldThrow />
+      </ErrorBoundary>
+    );
+    expect(container.querySelector('[data-error-boundary-fallback]')).toBeInTheDocument();
+  });
+
+  it('widget-level fallback has data-error-boundary-fallback attribute', () => {
+    const { container } = render(
+      <ErrorBoundary level="widget">
+        <ThrowingComponent shouldThrow />
+      </ErrorBoundary>
+    );
+    expect(container.querySelector('[data-error-boundary-fallback]')).toBeInTheDocument();
+  });
+
+  it('custom fallback has data-error-boundary-fallback attribute', () => {
+    const { container } = render(
+      <ErrorBoundary fallback={<div>Custom</div>}>
+        <ThrowingComponent shouldThrow />
+      </ErrorBoundary>
+    );
+    expect(container.querySelector('[data-error-boundary-fallback]')).toBeInTheDocument();
+  });
+
   it('uses custom fallback function', () => {
     render(
       <ErrorBoundary fallback={(error, reset) => (

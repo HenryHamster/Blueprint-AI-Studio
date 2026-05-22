@@ -2,7 +2,7 @@
 Pydantic-based payload validation for all supported task types.
 
 Provides:
-  - TaskType enum listing all 19 handler types
+  - TaskType enum listing all 20 handler types
   - ALL_TASK_TYPES frozenset for backward-compat consumers
   - Per-type payload models with required-field enforcement
   - validate_task_payload()  — strict, raises ValueError on bad input
@@ -234,6 +234,16 @@ class StrategicReviewPayload(_SystemPopulated):
     # Current LTS version/phase context. Keys: version_number, phase,
     # phase_changed_at, tasks_merged_this_version, last_qualification.
     version_phase: dict[str, Any] | None = None
+    # Citable memo summaries (terminal reasoning artifacts spawned from dropped
+    # research findings) for this cycle window. Optional + default-None so
+    # existing consumers and tests are unaffected. Each entry:
+    # {task_id, summary_excerpt}. The reviewer prompt can cite memos by task_id.
+    memo_citations: list[dict[str, Any]] | None = None
+    # Per-axis efficiency snapshot with drift vs baseline. Keys: axes (dict of
+    # axis_name → {current, baseline, drift_pct, history_tail}),
+    # baseline_captured_at, last_snapshot_at. Optional; absent when no snapshot
+    # data exists yet (cold-start projects).
+    efficiency_snapshot: dict[str, Any] | None = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):
@@ -291,6 +301,23 @@ class PerfPayload(_SystemPopulated):
     prompt: str | None = None
 
 
+class MemoPayload(BasePayload):
+    """Payload for a terminal reasoning-artifact task (no PR, no child spawn).
+
+    Memo tasks are dispatched when the system wants to record reasoning that
+    strategic review can cite later (e.g. a dropped finding worth keeping as
+    context, or a strategic note). All fields are optional — the agent reads
+    whatever context is available and produces a structured JSON artifact.
+    """
+
+    topic: str | None = None
+    reasoning_kind: str | None = None
+    source_task_id: str | None = None
+    source_finding: dict[str, Any] | None = None
+    direction_id: str | None = None
+    prompt: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Dispatch table
 # ---------------------------------------------------------------------------
@@ -315,6 +342,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.perf: PerfPayload,
     TaskType.self_audit: SelfAuditPayload,
     TaskType.release_audit: ReleaseAuditPayload,
+    TaskType.memo: MemoPayload,
 }
 
 

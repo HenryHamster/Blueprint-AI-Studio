@@ -1979,6 +1979,16 @@ async def claim_task(
                     logger.debug(
                         "[AGENT] Idle auto-entry retirement skipped (non-critical)"
                     )
+                # Low-success-rate maintenance: archive auto-generated entries
+                # whose confirmed/followed rate has fallen below threshold.
+                try:
+                    from app.playbook_learning import retire_ineffective_patterns
+
+                    retire_ineffective_patterns(doc)
+                except Exception:  # noqa: BLE001 — best-effort, never block claim
+                    logger.debug(
+                        "[AGENT] Low-success-rate retirement skipped (non-critical)"
+                    )
                 project_for_playbook.design_doc = doc
                 flag_modified(project_for_playbook, "design_doc")
                 session.add(project_for_playbook)
@@ -2766,6 +2776,31 @@ async def claim_task(
                     sev_cal = data.get("severity_calibration")
                     if isinstance(sev_cal, dict):
                         entry["severity_calibration"] = sev_cal
+                    quadrant = data.get("precision_recall_quadrant")
+                    if isinstance(quadrant, str) and quadrant:
+                        entry["precision_recall_quadrant"] = quadrant
+                    p_delta = data.get("precision_delta")
+                    if isinstance(p_delta, (int, float)):
+                        entry["precision_delta"] = p_delta
+                    r_delta = data.get("recall_delta")
+                    if isinstance(r_delta, (int, float)):
+                        entry["recall_delta"] = r_delta
+                    # Regression signals consumed by the agent-side
+                    # failure-mode hint (self-review.ts:formatFailureModeHintForSrPrompt):
+                    # it renders only when below_floor/trend marks the category
+                    # regressing AND miss_mode_breakdown carries a dominant_mode.
+                    trend = data.get("trend")
+                    if isinstance(trend, str) and trend:
+                        entry["trend"] = trend
+                    below_floor = data.get("below_floor")
+                    if isinstance(below_floor, bool):
+                        entry["below_floor"] = below_floor
+                    engagement_thinning = data.get("engagement_thinning")
+                    if isinstance(engagement_thinning, bool):
+                        entry["engagement_thinning"] = engagement_thinning
+                    miss_mode_breakdown = data.get("miss_mode_breakdown")
+                    if isinstance(miss_mode_breakdown, dict):
+                        entry["miss_mode_breakdown"] = miss_mode_breakdown
                     return entry
 
                 cats = {
@@ -2872,9 +2907,16 @@ async def claim_task(
                 .where(
                     Task.project_id == project_for_playbook.id,
                     Task.status == TaskStatus.COMPLETED,
-                    Task.completed_at > _utcnow() - timedelta(days=14),
+                    # Task has no `completed_at` column — that name is a property
+                    # on the strategic-cycle model, not Task. For a COMPLETED
+                    # task, created_at bounds the recent-window scan (mirrors
+                    # sr_blind_spots._scan_fp_stats, the sibling 14-day SR scan).
+                    Task.created_at > _utcnow() - timedelta(days=14),
                 )
-                .order_by(Task.completed_at.desc())
+                .options(
+                    load_only(Task.id, Task.context, Task.payloads, Task.created_at)
+                )
+                .order_by(Task.created_at.desc())
                 .limit(2000)
             )
             pairs = aggregate_sr_co_failure_pairs(high_iter_tasks)
@@ -2896,7 +2938,7 @@ async def claim_task(
         try:
             from app.pipeline_regression_dispatcher import (
                 get_sr_persistent_blind_spot_hint,
-            )  # noqa: PLC0415
+            )
 
             _pbs = await get_sr_persistent_blind_spot_hint(
                 session, project_for_playbook.id
@@ -3132,6 +3174,82 @@ async def get_upload_url(
     return {"upload_url": url, "storage_uri": storage_uri}
 
 
+class ViewportFailureScreenshotUrlRequest(BaseModel):
+    task_id: uuid.UUID
+    component: str = Field(max_length=200)
+    width: int = Field(ge=1, le=4096)
+
+
+@router.post("/viewport/failure-screenshot-upload-url")
+@limiter.limit("120/minute")
+async def get_viewport_failure_screenshot_upload_url(
+    request: Request,
+    req: ViewportFailureScreenshotUrlRequest,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Generate a signed upload URL for a viewport failure screenshot at a stable
+    per-project/component/width GCS path.
+
+    The stable path (viewport-failures/{project_id}/{component}-{width}.png) lets the
+    regression panel construct a download URL without a per-task DB lookup.  The GCS URI
+    is also stamped onto task.context so the regression dispatcher can propagate it to the
+    RegressionRemediationCase.failure_screenshot_url when that column is added.
+    """
+    if str(req.task_id) != token.get("sub"):
+        raise HTTPException(status_code=403, detail="Task ID mismatch")
+
+    stmt = select(Task).where(Task.id == req.task_id)
+    task = (await session.execute(stmt)).scalars().first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    import datetime as _dt
+    import re as _re
+
+    from google.cloud import storage as _gcs
+
+    from app.storage import ARTIFACT_BUCKET_NAME, GCP_PROJECT_ID
+
+    safe_component = _re.sub(r"[^A-Za-z0-9._-]", "_", req.component)[:100]
+    object_name = (
+        f"viewport-failures/{task.project_id}/{safe_component}-{req.width}.png"
+    )
+    storage_uri = f"gs://{ARTIFACT_BUCKET_NAME}/{object_name}"
+
+    def _generate() -> str:
+        blob = (
+            _gcs.Client(project=GCP_PROJECT_ID)
+            .bucket(ARTIFACT_BUCKET_NAME)
+            .blob(object_name)
+        )
+        return blob.generate_signed_url(
+            version="v4",
+            expiration=_dt.timedelta(minutes=15),
+            method="PUT",
+            content_type="image/png",
+        )
+
+    try:
+        upload_url = await asyncio.to_thread(_generate)
+    except Exception as exc:
+        logger.warning(
+            "[VIEWPORT] signed upload URL failed for %s: %s", object_name, exc
+        )
+        raise HTTPException(
+            status_code=503, detail="Artifact storage unavailable"
+        ) from exc
+
+    ctx = dict(task.context or {})
+    ctx["viewport_failure_screenshot_uri"] = storage_uri
+    task.context = ctx
+    flag_modified(task, "context")
+    session.add(task)
+    await session.commit()
+
+    return {"upload_url": upload_url, "storage_uri": storage_uri}
+
+
 @router.post("/heartbeat")
 @limiter.limit("600/minute")
 async def agent_heartbeat(
@@ -3194,16 +3312,6 @@ async def agent_heartbeat(
     if task.vm_started_at is None:
         task.vm_started_at = _utcnow()
 
-    # Cold-start fallback: /claim is the canonical first-contact site that
-    # writes vm_cold_start_ms, but if a heartbeat ever lands before a claim
-    # row was committed (or for the warm-VM continuity path), derive it here
-    # too. Guard with IS NULL so a re-provision restamp of vm_provisioned_at
-    # cannot overwrite a real first-heartbeat measurement.
-    if task.vm_cold_start_ms is None and task.vm_provisioned_at is not None:
-        cold_start_ms = (
-            task.last_heartbeat - task.vm_provisioned_at
-        ).total_seconds() * 1000
-        task.vm_cold_start_ms = max(0, int(cold_start_ms))
     if req.status_message:
         task.latest_status_message = req.status_message
         # Log interesting lifecycle beacons so they're visible in Cloud
@@ -3446,6 +3554,91 @@ async def vm_heartbeat(
     return Response(status_code=204)
 
 
+async def _finalize_warm_claim(
+    session: AsyncSession,
+    task: Task,
+    vm_instance_id: str,
+    *,
+    origin: str,
+) -> dict:
+    """Flip a locked QUEUED task to IN_PROGRESS for a warm VM and build the
+    /next-role claim response.
+
+    Shared by the chain-continuity (``origin="next_role_endpoint"``) and the
+    backlog-reuse (``origin="backlog_reuse"``) paths so both stamp warm
+    telemetry identically. Sets ``context._timing.warm_start`` and resets
+    ``vm_provisioned_at`` to now so the task is counted as warm (and pays ~0
+    cold-start) by the efficiency snapshot, mints a fresh task-scoped JWT,
+    commits, and broadcasts the status change. On JWT-mint failure it rolls
+    back (restoring QUEUED) and raises 500.
+    """
+    from app.compute import VM_PROVISIONING_MODEL
+
+    task.vm_instance_id = vm_instance_id
+    task.status = TaskStatus.IN_PROGRESS
+    task.last_heartbeat = _utcnow()
+    # vm_provisioned_at marks when the VM was made available to the task. For
+    # warm-start we set it to "now" so claim_latency / reaper logic operates on
+    # a fresh window — and so the subsequent idempotent /claim never stamps a
+    # cold-start sample (the warm task stays vm_cold_start_ms=NULL).
+    task.vm_provisioned_at = _utcnow()
+    task.vm_spot = VM_PROVISIONING_MODEL == "SPOT"
+    if task.started_at is None:
+        task.started_at = _utcnow()
+    # Carry warm-start signal forward into context._timing. setdefault keeps
+    # this server-side write idempotent; the agent's status update remains the
+    # authoritative source and may overwrite warm_start. warm_claim_origin
+    # distinguishes chain continuity from backlog reuse for post-mortem and
+    # telemetry (efficiency direction d-91d8dede).
+    ctx = dict(task.context or {})
+    existing_timing = dict(ctx.get("_timing") or {})
+    existing_timing.setdefault("warm_start", True)
+    existing_timing["warm_claim_origin"] = origin
+    existing_timing["prior_role_vm_id"] = vm_instance_id
+    ctx["_timing"] = existing_timing
+    task.context = ctx
+    flag_modified(task, "context")
+    # Mint the new JWT BEFORE committing the IN_PROGRESS transition. If mint
+    # raises, the rollback restores QUEUED so a retry can succeed instead of
+    # leaving the task stuck IN_PROGRESS with no live agent.
+    task_type = ""
+    try:
+        payloads = task.payloads or []
+        if payloads and isinstance(payloads[0], dict):
+            task_type = str(payloads[0].get("type") or "")
+    except Exception:  # noqa: BLE001 — task_type is best-effort metadata
+        task_type = ""
+    try:
+        agent_token = create_agent_token(
+            task_id=str(task.id),
+            vm_instance_id=vm_instance_id,
+            task_type=task_type,
+            project_id=str(task.project_id) if task.project_id else "",
+        )
+    except Exception as exc:
+        await session.rollback()
+        logger.exception("[NEXT-ROLE] JWT mint failed; rolling back warm-claim")
+        raise HTTPException(status_code=500, detail="token_mint_failed") from exc
+
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    # Broadcast AFTER the commit so a rollback path doesn't fire a spurious
+    # event.
+    await broadcast_to_project(
+        str(task.project_id),
+        "task_updated",
+        {"task_id": str(task.id), "status": TaskStatus.IN_PROGRESS},
+    )
+    return {
+        "action": "claim",
+        "task_id": str(task.id),
+        "warm_start": True,
+        "agent_token": agent_token,
+    }
+
+
 @router.post("/next-role")
 @limiter.limit("600/minute")
 async def next_role(
@@ -3494,113 +3687,104 @@ async def next_role(
         )
         return Response(status_code=204)
 
-    # Look up a QUEUED task pinned to this VM.
-    #
-    # On Postgres, lead with ``has_key`` so the JSONB ``?`` operator can use
-    # ``ix_task_context_gin`` before the ``->>`` equality cast. SQLite lacks
-    # that operator, so test runs fall back to the portable JSON-extract form.
-    # Optional prior_pr_number filter narrows further so a stray pin from an
-    # unrelated chain doesn't get claimed.
+    # Postgres can use the JSONB ``?`` operator (``has_key``) against
+    # ``ix_task_context_gin``; SQLite test runs fall back to the portable
+    # JSON-extract form. Computed once here because both the chain-continuity
+    # lookup and the chain-fork exit below need it.
     use_jsonb_has_key = session.get_bind().dialect.name == "postgresql"
-    warm_vm_filters = [Task.status == TaskStatus.QUEUED]
-    if use_jsonb_has_key:
-        warm_vm_filters.append(Task.context.has_key("warm_target_vm_id"))
-    warm_vm_filters.append(
-        Task.context["warm_target_vm_id"].as_string() == req.vm_instance_id
+
+    # Circuit-breaker / feature-flag gate: if warm continuity is disabled or
+    # auto-suppressed (pin-clear rate exceeded the threshold), skip the warm-
+    # chain-continuity lookup so no new warm chains start. The orchestrator's
+    # provisioning loop clears outstanding warm pins when the breaker is active;
+    # skipping the lookup here closes the brief race window between the breaker
+    # tripping and the next orchestrator cycle. This gate governs ONLY
+    # chain-continuity claims — backlog-reuse (its own ``warm_backlog_reuse_enabled``
+    # flag) and the chain-fork exit below still run.
+    warm_continuity_active = (
+        _shared_state.runtime_config.get("warm_continuity_enabled", True)
+        and not _shared_state.is_warm_continuity_suppressed()
     )
-    stmt = select(Task).where(*warm_vm_filters)
-    if req.prior_pr_number is not None:
-        prior_pr_filters = []
+    if warm_continuity_active:
+        # Look up a QUEUED task pinned to this VM. Optional prior_pr_number
+        # filter narrows further so a stray pin from an unrelated chain
+        # doesn't get claimed.
+        warm_vm_filters = [Task.status == TaskStatus.QUEUED]
         if use_jsonb_has_key:
-            prior_pr_filters.append(Task.context.has_key("warm_target_pr"))
-        prior_pr_filters.append(
-            Task.context["warm_target_pr"].as_string() == str(req.prior_pr_number)
+            warm_vm_filters.append(Task.context.has_key("warm_target_vm_id"))
+        warm_vm_filters.append(
+            Task.context["warm_target_vm_id"].as_string() == req.vm_instance_id
         )
-        stmt = stmt.where(*prior_pr_filters)
-    stmt = stmt.with_for_update(skip_locked=True)
-
-    task = (await session.execute(stmt)).scalars().first()
-
-    if task is not None:
-        from app.compute import VM_PROVISIONING_MODEL
-
-        task.vm_instance_id = req.vm_instance_id
-        task.status = TaskStatus.IN_PROGRESS
-        task.last_heartbeat = _utcnow()
-        # vm_provisioned_at marks when the VM was made available to the
-        # task. For warm-start we set it to "now" so existing
-        # claim_latency / reaper logic operates on a fresh window.
-        task.vm_provisioned_at = _utcnow()
-        # vm_spot mirrors orchestrator-mode for cost accounting; warm-start VMs
-        # are spawned by orchestrator with the same provisioning model as cold.
-        task.vm_spot = VM_PROVISIONING_MODEL == "SPOT"
-        if task.started_at is None:
-            task.started_at = _utcnow()
-        # Carry warm-start signal forward into context._timing so the
-        # status-update path can add the agent-side setup_secs to the
-        # same record on completion.
-        #
-        # Issue H3 (warm-VM rev, deferred): the agent's status update is the
-        # authoritative source for warm_start (task_lifecycle._process_post_commit
-        # runs existing.update(_timing_payload), so an explicit False from the
-        # agent would correctly overwrite a stale True written here). Use
-        # setdefault so this server-side write is idempotent — preserving any
-        # prior value if a warm-claim already happened — and add a sibling
-        # warm_claim_origin marker so post-mortem inspection can distinguish
-        # server-side seeded values from agent-reported ones.
-        ctx = dict(task.context or {})
-        existing_timing = dict(ctx.get("_timing") or {})
-        existing_timing.setdefault("warm_start", True)
-        existing_timing["warm_claim_origin"] = "next_role_endpoint"
-        existing_timing["prior_role_vm_id"] = req.vm_instance_id
-        ctx["_timing"] = existing_timing
-        task.context = ctx
-        flag_modified(task, "context")
-        # Mint the new JWT BEFORE committing the IN_PROGRESS transition. If
-        # mint raises, the rollback below restores the task to QUEUED so a
-        # retry can succeed instead of leaving it stuck IN_PROGRESS with no
-        # live agent (Phase 2 issue #5).
-        task_type = ""
-        try:
-            payloads = task.payloads or []
-            if payloads and isinstance(payloads[0], dict):
-                task_type = str(payloads[0].get("type") or "")
-        except Exception:  # noqa: BLE001 — task_type is best-effort metadata
-            task_type = ""
-        try:
-            agent_token = create_agent_token(
-                task_id=str(task.id),
-                vm_instance_id=req.vm_instance_id,
-                task_type=task_type,
-                project_id=str(task.project_id) if task.project_id else "",
+        stmt = select(Task).where(*warm_vm_filters)
+        if req.prior_pr_number is not None:
+            prior_pr_filters = []
+            if use_jsonb_has_key:
+                prior_pr_filters.append(Task.context.has_key("warm_target_pr"))
+            prior_pr_filters.append(
+                Task.context["warm_target_pr"].as_string() == str(req.prior_pr_number)
             )
-        except Exception as exc:
-            await session.rollback()
-            logger.exception("[NEXT-ROLE] JWT mint failed; rolling back warm-claim")
-            raise HTTPException(status_code=500, detail="token_mint_failed") from exc
+            stmt = stmt.where(*prior_pr_filters)
+        stmt = stmt.with_for_update(skip_locked=True)
 
-        session.add(task)
-        await session.commit()
-        await session.refresh(task)
+        task = (await session.execute(stmt)).scalars().first()
 
-        # Broadcast status change to frontend so the UI doesn't lag until
-        # the next status update (Phase 2 issue #10). Placed AFTER the
-        # commit so a rollback path doesn't fire a spurious event.
-        await broadcast_to_project(
-            str(task.project_id),
-            "task_updated",
-            {"task_id": str(task.id), "status": TaskStatus.IN_PROGRESS},
-        )
+        if task is not None:
+            result = await _finalize_warm_claim(
+                session, task, req.vm_instance_id, origin="next_role_endpoint"
+            )
+            logger.info(
+                f"[NEXT-ROLE] Warm-start claim (chain): task={result['task_id']} "
+                f"vm={req.vm_instance_id} prior_task={req.prior_task_id} "
+                f"prior_pr={req.prior_pr_number}"
+            )
+            return result
+    else:
         logger.info(
-            f"[NEXT-ROLE] Warm-start claim: task={task.id} vm={req.vm_instance_id} "
-            f"prior_task={req.prior_task_id} prior_pr={req.prior_pr_number}"
+            "[NEXT-ROLE] Warm continuity disabled/suppressed (circuit breaker) — "
+            "skipping chain-continuity claim for VM %s",
+            req.vm_instance_id,
         )
-        return {
-            "action": "claim",
-            "task_id": str(task.id),
-            "warm_start": True,
-            "agent_token": agent_token,
-        }
+
+    # Backlog-reuse branch (efficiency direction d-91d8dede). When the flag is
+    # enabled an idle VM with no chain-pinned follow-on may claim the next
+    # eligible QUEUED task from its project's general backlog and run it warm.
+    # Attempted BEFORE the chain-fork exit below so a forked chain doesn't
+    # strand an otherwise reusable VM. When the flag is OFF this whole block is
+    # skipped and behavior is byte-for-byte the pre-existing chain-only path —
+    # including, on no claim, the chain-fork exit / 204 so no idle VM is kept
+    # alive when there is no genuine pending work to reuse it for.
+    if _shared_state.runtime_config.get("warm_backlog_reuse_enabled", False):
+        _project_claim = token.get("project_id")
+        _project_uuid = None
+        if _project_claim:
+            try:
+                _project_uuid = uuid.UUID(str(_project_claim))
+            except (ValueError, TypeError):
+                _project_uuid = None
+        if _project_uuid is not None:
+            # Refresh the project's first-refusal window so the orchestrator
+            # holds off cold-provisioning eligible backlog tasks while this VM
+            # polls — biasing the race toward reuse. The SKIP-LOCKED claim
+            # below still guarantees no double-provision if both race.
+            _shared_state.register_backlog_first_refusal(str(_project_uuid))
+            from app.warm_backlog_reuse import select_backlog_reuse_candidate
+
+            backlog_task = await select_backlog_reuse_candidate(
+                session, _project_uuid, req.vm_instance_id
+            )
+            if backlog_task is not None:
+                result = await _finalize_warm_claim(
+                    session,
+                    backlog_task,
+                    req.vm_instance_id,
+                    origin="backlog_reuse",
+                )
+                logger.info(
+                    f"[NEXT-ROLE] Warm-start claim (backlog_reuse): "
+                    f"task={result['task_id']} vm={req.vm_instance_id} "
+                    f"project={_project_uuid}"
+                )
+                return result
 
     # No matching warm-pinned task. Check whether another VM owns an
     # IN_PROGRESS task for this PR — if so, the warm chain has already
@@ -4169,3 +4353,72 @@ async def agent_fetch_gap(
                     "from_archive": archived_flag,
                 }
     raise HTTPException(status_code=404, detail="Gap not found")
+
+
+class ReviewerMergeRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    reviewer_findings: list[dict]
+    reviewer_edges_considered: list[dict] = []
+
+
+@router.post("/tasks/{original_task_id}/reviewer-merge")
+@limiter.limit("30/minute")
+async def merge_operator_reviewer_findings(
+    request: Request,
+    original_task_id: uuid.UUID,
+    req: ReviewerMergeRequest,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Merge operator-requested fresh-reviewer findings into an existing task's SR outcome."""
+    requesting_task_id = token.get("sub")
+    if not requesting_task_id:
+        raise HTTPException(status_code=403, detail="No task in token")
+
+    requesting_task = await session.get(Task, uuid.UUID(requesting_task_id))
+    if not requesting_task:
+        raise HTTPException(status_code=404, detail="Requesting task not found")
+
+    ctx = requesting_task.context or {}
+    if str(ctx.get("operator_requested_review_for")) != str(original_task_id):
+        raise HTTPException(
+            status_code=403, detail="Not authorized for this target task"
+        )
+
+    original_task = await session.get(Task, original_task_id)
+    if not original_task:
+        raise HTTPException(status_code=404, detail="Original task not found")
+
+    orig_ctx = dict(original_task.context or {})
+    sr = dict(orig_ctx.get("_self_review_outcome") or {})
+    sr["reviewer_findings"] = req.reviewer_findings
+    sr["reviewer_recovery_origin"] = "operator_requested_recovery"
+
+    check_results = dict(sr.get("check_results") or {})
+    for finding in req.reviewer_findings:
+        cat = finding.get("category")
+        if cat:
+            existing = check_results.get(cat)
+            if not existing or existing.get("passed") is True:
+                check_results[cat] = {
+                    "passed": False,
+                    "issue": f"[reviewer] {finding.get('description', '')}",
+                    "origin": "operator_requested_recovery",
+                }
+    sr["check_results"] = check_results
+
+    if req.reviewer_edges_considered:
+        sr["reviewer_edges_considered"] = req.reviewer_edges_considered
+
+    orig_ctx["_self_review_outcome"] = sr
+    original_task.context = orig_ctx
+    flag_modified(original_task, "context")
+    session.add(original_task)
+    await session.commit()
+
+    await broadcast_to_project(
+        str(original_task.project_id),
+        "task_updated",
+        {"task_id": str(original_task_id)},
+    )
+    return {"status": "merged", "finding_count": len(req.reviewer_findings)}

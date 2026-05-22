@@ -80,11 +80,18 @@ from app.models import (
     Artifact,
     ArtifactType,
     Project,
+    QualificationVerdict,
     Task,
     TaskHistory,
     TaskStatus,
 )
-from app.notification_dispatch import post_event_message
+from app.notification_dispatch import (
+    post_event_message,
+    post_version_build_stalled_message,
+    post_version_calcification_message,
+    post_version_promotion_readiness_message,
+    post_version_stabilize_stalled_message,
+)
 from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
@@ -153,8 +160,7 @@ def _load_policy() -> dict[str, Any]:
         weight_sum = weights["audit"] + weights["test_erosion"] + weights["smoketest"]
         if abs(weight_sum - 1.0) > 0.01:
             raise ValueError(
-                f"promotion_policy.yaml weights sum to {weight_sum:.4f}, "
-                f"expected ~1.0"
+                f"promotion_policy.yaml weights sum to {weight_sum:.4f}, expected ~1.0"
             )
 
         return {"weights": weights, "threshold": threshold}
@@ -202,6 +208,46 @@ _TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
 # progressing two-task pipeline (including retries) to finish, short enough
 # that a wedged qualification surfaces within a useful operator window.
 _MAX_QUALIFICATION_DURATION_SECONDS = 6 * 60 * 60
+
+# Minimum consecutive hard-blocker failures before raising a calcification
+# alert.  Conservative: three failures on the same blocker strongly suggest
+# the issue is not transient and the version is genuinely stuck.
+_MIN_CALCIFICATION_ATTEMPTS = 3
+
+# Build-phase calcification thresholds — the backstop for the OTHER end of the
+# lifecycle from _check_version_calcification.  build→stabilize is entirely
+# agent-driven (the strategic agent must emit a version_phase_decision); there
+# is no cadence and no automatic backstop, so a conservative or distracted
+# strategic agent can leave an open version accumulating merged tasks in the
+# 'build' phase indefinitely, never reaching qualify/promote.  A build-phase
+# version that has sat for this many days OR accumulated this many merged tasks
+# since the phase started has likely stalled.  EITHER trigger fires the alert.
+# These are deliberately CONSERVATIVE: the goal is to catch a genuine stall,
+# not nag a normally-progressing build.
+_BUILD_STALL_AGE_DAYS = 14
+_BUILD_STALL_MERGED_TASKS = 40
+
+# Stabilize-phase stall thresholds — the backstop for the stabilize→qualify
+# edge of the lifecycle.  A version that enters stabilize but never gets
+# qualified falls through both the build-stall guard (wrong phase) and the
+# calcification guard (requires repeated hard-blocker failures).  These
+# conservative thresholds catch a genuine stall without nagging a normally-
+# progressing stabilize phase.  EITHER trigger fires the alert.
+_STABILIZE_STALL_AGE_DAYS = 14
+_STABILIZE_STALL_MERGED_TASKS = 40
+
+
+def _is_build_stalled(age_days: int, merged_count: int) -> bool:
+    """Return True iff a build-phase version's age OR merged-task count is past
+    the conservative build-stall threshold.
+
+    Shared by ``_check_version_calcification``'s build-phase sibling
+    (``_check_version_build_stall``) and the strategic build-stall nudge so both
+    judge a stall by the exact same rule.
+    """
+    return (
+        age_days >= _BUILD_STALL_AGE_DAYS or merged_count >= _BUILD_STALL_MERGED_TASKS
+    )
 
 
 async def _qualification_in_flight(
@@ -482,12 +528,16 @@ async def _resolve_github_with_session(
         from app.secrets_manager import get_user_secret
 
         integration = (
-            await session.execute(
-                select(UserIntegration).where(
-                    UserIntegration.user_id == project.user_id
+            (
+                await session.execute(
+                    select(UserIntegration).where(
+                        UserIntegration.user_id == project.user_id
+                    )
                 )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         if integration and integration.github_installation_id:
             try:
                 token = await generate_installation_access_token(
@@ -495,8 +545,7 @@ async def _resolve_github_with_session(
                 )
             except Exception:  # noqa: BLE001
                 logger.debug(
-                    "[RELEASE_QUALIFIER] stored installation token failed for "
-                    "%s/%s",
+                    "[RELEASE_QUALIFIER] stored installation token failed for %s/%s",
                     owner,
                     repo,
                 )
@@ -704,12 +753,16 @@ async def run_qualification(
     #    second caller blocks here until the first commits, then sees the
     #    pending record and short-circuits at the in-flight guard below.
     locked_version = (
-        await session.execute(
-            select(release_version.ReleaseVersion)
-            .where(release_version.ReleaseVersion.id == version.id)
-            .with_for_update()
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == version.id)
+                .with_for_update()
+            )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
     if locked_version is None:
         logger.warning(
             "[RELEASE_QUALIFIER] run_qualification: version row %s vanished "
@@ -982,27 +1035,21 @@ async def _spawn_qualifier_smoketest_task(
     type_model = (_runtime_config.get("task_type_models", {}) or {}).get("smoketest")
     if type_model:
         payload["model"] = type_model
-    type_effort = (_runtime_config.get("task_type_efforts", {}) or {}).get(
-        "smoketest"
-    )
+    type_effort = (_runtime_config.get("task_type_efforts", {}) or {}).get("smoketest")
     if type_effort:
         payload["effort"] = type_effort
     health_check_urls = _runtime_config.get("health_check_urls") or []
     if health_check_urls:
         payload["health_check_urls"] = health_check_urls
     try:
-        payload = validate_internal_payload(
-            payload, "release_qualifier:smoketest"
-        )
+        payload = validate_internal_payload(payload, "release_qualifier:smoketest")
     except PayloadTooLargeError:
         raise
 
     task = Task(
         project_id=project_id,
         title=f"Qualifier smoketest: candidate {candidate_sha[:8]}",
-        description=(
-            f"Qualify-time smoketest of release candidate {candidate_sha}"
-        ),
+        description=(f"Qualify-time smoketest of release candidate {candidate_sha}"),
         payloads=[payload],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
@@ -1049,16 +1096,20 @@ async def _latest_artifact_logs(
     import json
 
     artifact = (
-        await session.execute(
-            select(Artifact)
-            .where(
-                Artifact.task_id == task_id,
-                Artifact.artifact_type == artifact_type,
+        (
+            await session.execute(
+                select(Artifact)
+                .where(
+                    Artifact.task_id == task_id,
+                    Artifact.artifact_type == artifact_type,
+                )
+                .order_by(Artifact.created_at.desc())
+                .limit(1)
             )
-            .order_by(Artifact.created_at.desc())
-            .limit(1)
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
     if artifact is None or not artifact.logs:
         return None
     try:
@@ -1152,9 +1203,7 @@ def _score_smoketest(result: dict[str, Any] | None) -> float | None:
     # status) contributes 0.  This is intentionally conservative: a skipped
     # qualifier test is unverified coverage, so it should pull the score down
     # rather than be treated as a pass.
-    passed = sum(
-        1 for t in tests if isinstance(t, dict) and t.get("status") == "pass"
-    )
+    passed = sum(1 for t in tests if isinstance(t, dict) and t.get("status") == "pass")
     return _clamp01(passed / total) if total else 0.0
 
 
@@ -1237,6 +1286,94 @@ async def _notify_operator(
             "[RELEASE_QUALIFIER] failed to post operator notification %s "
             "(non-fatal): %s",
             event_type,
+            exc,
+        )
+
+
+def _parse_iso_dt(raw: Any) -> datetime | None:
+    """Parse an ISO-8601 timestamp string to a datetime, or None.
+
+    Used to coerce the ``started_at`` / ``finalized_at`` ISO strings carried in
+    a qualification ``base_record`` into datetime columns on the verdict-history
+    row.  Returns None on a missing / non-string / unparseable value — recording
+    is best-effort, so a bad timestamp must never raise.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+async def _record_qualification_verdict(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    base_record: dict[str, Any],
+    *,
+    terminal_status: str,
+    would_promote: bool,
+    promotion_enabled: bool,
+) -> None:
+    """Best-effort: append ONE immutable ``QualificationVerdict`` history row.
+
+    Phase 4 (calibration) durable evidence trail.  ``last_qualification`` is
+    OVERWRITTEN on every finalize, so this appends a never-overwritten per-verdict
+    row that ``compute_promotion_readiness`` reads across versions to reconstruct
+    the dry-run track record.  Purely additive — ``last_qualification`` is still
+    written exactly as before; this does not touch it.
+
+    CRITICAL: recording must NEVER break or roll back a qualification/promotion.
+    The verdict INSERT runs inside a SAVEPOINT (``begin_nested``) wrapped in
+    try/except.  Before opening the savepoint the caller's already-staged
+    mutations (``last_qualification`` etc.) are flushed into the OUTER
+    transaction, so the savepoint contains ONLY the verdict INSERT — a rollback
+    of that savepoint can never drop the qualification's own write.  Any failure
+    (a malformed row, or — until the sibling Alembic migration lands — a missing
+    ``qualificationverdict`` table) surfaces inside the savepoint, is rolled back
+    to the savepoint leaving the outer transaction intact, and is logged and
+    swallowed.  Purely additive: ``last_qualification`` is written exactly as
+    before and the surrounding qualification/promotion is unaffected.
+    """
+    try:
+        sub_scores = base_record.get("sub_scores")
+        confidence = base_record.get("confidence")
+        threshold = base_record.get("threshold")
+        verdict = QualificationVerdict(
+            project_id=version.project_id,
+            release_version_id=version.id,
+            candidate_sha=base_record.get("candidate_sha"),
+            confidence=(
+                float(confidence)
+                if isinstance(confidence, (int, float))
+                and not isinstance(confidence, bool)
+                else 0.0
+            ),
+            sub_scores=sub_scores if isinstance(sub_scores, dict) else None,
+            blocker=base_record.get("blocker"),
+            would_promote=bool(would_promote),
+            promotion_enabled=bool(promotion_enabled),
+            terminal_status=terminal_status,
+            threshold=(
+                float(threshold)
+                if isinstance(threshold, (int, float))
+                and not isinstance(threshold, bool)
+                else None
+            ),
+            started_at=_parse_iso_dt(base_record.get("started_at")),
+            finalized_at=_parse_iso_dt(base_record.get("finalized_at")),
+        )
+        # Flush the caller's staged mutations into the outer transaction first,
+        # so the savepoint below isolates ONLY the verdict INSERT.
+        await session.flush()
+        async with session.begin_nested():
+            session.add(verdict)
+            await session.flush()
+    except Exception as exc:  # noqa: BLE001 — recording is best-effort, never fatal
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to record qualification verdict for v%s "
+            "(non-fatal — additive history only): %s",
+            getattr(version, "version_number", "?"),
             exc,
         )
 
@@ -1381,6 +1518,14 @@ async def _finalize_qualification(
             )
         release_version.set_version_phase(version, "stabilize", reasoning=reason)
         session.add(version)
+        await _record_qualification_verdict(
+            session,
+            version,
+            record,
+            terminal_status="not_promoted",
+            would_promote=False,
+            promotion_enabled=promotion_enabled,
+        )
         scores_str = _fmt_sub_scores(
             composite["sub_scores"], smoketest_enabled=smoketest_enabled
         )
@@ -1427,6 +1572,14 @@ async def _finalize_qualification(
         version.last_qualification = record
         flag_modified(version, "last_qualification")
         session.add(version)
+        await _record_qualification_verdict(
+            session,
+            version,
+            record,
+            terminal_status="dry_run",
+            would_promote=True,
+            promotion_enabled=False,
+        )
         logger.info(
             "[RELEASE_QUALIFIER] v%d would promote (confidence=%.4f) but "
             "promotion_enabled=False — dry-run, not promoting",
@@ -1581,6 +1734,61 @@ async def _required_children_terminal(
     return True
 
 
+async def _maybe_reconcile_after_promotion_conflict(
+    version_id: uuid.UUID,
+    result: dict[str, Any] | None,
+    *,
+    session_factory=None,
+) -> None:
+    """Best-effort: when a promotion failed on a merge CONFLICT, kick off a
+    ``main → automain`` reconciliation so the version self-heals.
+
+    A promotion conflict (``automain → main`` will not merge) always means
+    ``main`` advanced past ``automain`` with conflicting content — a back-merge
+    that should have happened did not.  Triggering the reconciler resolves
+    ``main`` into ``automain`` (raising a conflict-resolution plan when the
+    merge itself conflicts); once ``automain`` absorbs ``main`` the next
+    qualify cycle promotes cleanly instead of dead-ending in stabilize.
+
+    Runs AFTER the dedicated finalize session has committed and closed — never
+    under the ``ReleaseVersion`` row lock, and never inside the dedicated
+    session whose commit semantics ``promote()`` depends on.  A failure here
+    never propagates: the promotion-failure record is already committed, and
+    the periodic branch reconciler is the backstop if this best-effort call
+    does not land.  ``session_factory`` is threaded through for test injection.
+    """
+    if not result or result.get("status") != "promotion_failed":
+        return
+    if not result.get("conflict"):
+        return
+    try:
+        # Lazy import — release_qualifier <-> hotfix_backmerge is otherwise circular.
+        from app import hotfix_backmerge
+
+        factory = session_factory or AsyncSessionLocal
+        async with factory() as session:
+            version = await session.get(release_version.ReleaseVersion, version_id)
+            if version is None:
+                return
+            recon = await hotfix_backmerge.reconcile_main_into_automain(
+                session, version.project_id
+            )
+            await session.commit()
+            logger.info(
+                "[RELEASE_QUALIFIER] promotion of v%d conflicted — triggered a "
+                "main -> automain reconciliation: %s",
+                version.version_number,
+                recon.get("status"),
+            )
+    except Exception as exc:  # noqa: BLE001 — best-effort; the periodic reconciler backstops
+        logger.warning(
+            "[RELEASE_QUALIFIER] post-promotion-conflict reconciliation failed "
+            "for version %s (non-fatal — periodic reconciler will retry): %s",
+            version_id,
+            exc,
+        )
+
+
 async def _finalize_in_dedicated_session(
     version_id: uuid.UUID,
     *,
@@ -1648,9 +1856,7 @@ async def _finalize_in_dedicated_session(
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
         try:
-            return await _finalize_locked_version(
-                session, version_id, timeout_now
-            )
+            result = await _finalize_locked_version(session, version_id, timeout_now)
         except Exception:
             # Roll back this dedicated session's partial work before unwinding.
             # In production each dedicated session is independent and the
@@ -1662,11 +1868,21 @@ async def _finalize_in_dedicated_session(
                 await session.rollback()
             except Exception:
                 logger.exception(
-                    "[RELEASE_QUALIFIER] finalize: rollback failed for "
-                    "version %s",
+                    "[RELEASE_QUALIFIER] finalize: rollback failed for version %s",
                     version_id,
                 )
             raise
+
+    # The dedicated finalize session has now committed + closed.  When the
+    # finalize ran a promotion that failed on a merge CONFLICT, kick off a
+    # main -> automain reconciliation HERE — outside the dedicated session and
+    # the ReleaseVersion row lock — so the version self-heals instead of
+    # dead-ending in stabilize (automain/LTS promotion-conflict recovery).
+    # Best-effort: a failure never propagates and never alters ``result``.
+    await _maybe_reconcile_after_promotion_conflict(
+        version_id, result, session_factory=session_factory
+    )
+    return result
 
 
 async def _finalize_locked_version(
@@ -1684,12 +1900,16 @@ async def _finalize_locked_version(
     # Lock the version row — the single serialization point for the whole
     # finalize→promote critical section (concern d).
     version: release_version.ReleaseVersion | None = (
-        await session.execute(
-            select(release_version.ReleaseVersion)
-            .where(release_version.ReleaseVersion.id == version_id)
-            .with_for_update()
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == version_id)
+                .with_for_update()
+            )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
 
     if version is None:
         logger.debug(
@@ -1734,9 +1954,7 @@ async def _finalize_locked_version(
             # fallbacks.  A corrupt started_at must never defeat the backstop
             # (audit R4-H5).
             timeout_clock = (
-                version.updated_at
-                or version.phase_changed_at
-                or version.opened_at
+                version.updated_at or version.phase_changed_at or version.opened_at
             )
             if timeout_clock is not None:
                 logger.warning(
@@ -1931,9 +2149,7 @@ async def _force_finalize_timed_out_qualification(
         Alert(
             project_id=version.project_id,
             severity=AlertSeverity.WARNING,
-            title=(
-                f"Release qualification v{version.version_number} timed out"
-            ),
+            title=(f"Release qualification v{version.version_number} timed out"),
             message=(
                 f"Qualification for release v{version.version_number} was "
                 f"stuck pending for {age_minutes:.0f} minutes — a qualifier "
@@ -1950,6 +2166,417 @@ async def _force_finalize_timed_out_qualification(
         version.version_number,
         age_minutes,
     )
+
+
+async def _check_version_calcification(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Post a deduplicated calcification alert when a version is stuck.
+
+    A version calcifies when it has accumulated ``_MIN_CALCIFICATION_ATTEMPTS``
+    or more qualification attempts in the stabilize phase, all failing on the
+    same hard blocker, with no indication it will self-heal.
+
+    CRITICAL: a version whose last qualification is ``status="dry_run"`` is a
+    PASSING candidate held back only by ``promotion_enabled=False`` — that is
+    healthy operation and must NOT trigger this alert.  Only repeated hard-blocker
+    failures (``status="not_promoted"`` with a non-None blocker) qualify.
+
+    Deduplication: compares the version's durable
+    ``calcification_alerted_blocker`` column against the current blocker.  If
+    they match, the alert has already been posted for this stall and is
+    skipped; a new alert is posted only when the blocker changes or the field
+    is NULL.  Storing the dedup anchor on the version (rather than relying on
+    Alert-row existence) keeps the once-per-stall guarantee even after an
+    operator clears alerts.
+
+    Does NOT commit the session — the caller must commit after a ``True`` return.
+    """
+    if version.status != "open" or version.phase != "stabilize":
+        return False
+
+    attempts = version.qualification_attempts or 0
+    if attempts < _MIN_CALCIFICATION_ATTEMPTS:
+        return False
+
+    qual = version.last_qualification or {}
+    qual_status = qual.get("status")
+    blocker = qual.get("blocker")
+
+    # A dry-run hold is healthy — the version passed and is waiting for
+    # promotion_enabled.  Do not alert.
+    if qual_status == "dry_run":
+        return False
+
+    # Only alert for hard-blocker failures (not below-threshold near-misses,
+    # which have blocker=None and may self-correct without intervention).
+    if qual_status != "not_promoted" or not blocker:
+        return False
+
+    # Durable dedup: the version remembers the blocker it last alerted on.
+    # Same blocker → already notified for this stall; skip.
+    if version.calcification_alerted_blocker == blocker:
+        return False
+
+    alert_title = f"Release v{version.version_number} calcifying: {blocker}"
+
+    age_days: int = 0
+    ref_time = version.phase_changed_at or version.opened_at
+    if ref_time is not None:
+        age_days = max(0, (_utcnow() - ref_time).days)
+
+    blocker_label = _BLOCKER_LABELS.get(blocker, blocker)
+    session.add(
+        Alert(
+            project_id=version.project_id,
+            severity=AlertSeverity.WARNING,
+            title=alert_title,
+            message=(
+                f"Release v{version.version_number} has been stuck in the "
+                f"stabilize phase for {age_days} day(s) with {attempts} "
+                f"qualification attempt(s), each blocked by: {blocker_label}. "
+                f"The integration trunk may be drifting from the deployed "
+                f"branch. Resolve the blocker to restore promotion."
+            ),
+        )
+    )
+    await post_version_calcification_message(
+        session,
+        version.project_id,
+        version_number=version.version_number,
+        version_id=str(version.id),
+        qualification_attempts=attempts,
+        blocker=blocker,
+        blocker_label=blocker_label,
+        age_days=age_days,
+    )
+    # Record the durable dedup anchor so subsequent sweeps don't re-alert for
+    # the same stall (survives an operator clearing the Alert row).
+    version.calcification_alerted_blocker = blocker
+    session.add(version)
+    logger.warning(
+        "[RELEASE_QUALIFIER] calcification alert for v%d: %d attempts "
+        "blocked by %s over %d day(s)",
+        version.version_number,
+        attempts,
+        blocker,
+        age_days,
+    )
+    return True
+
+
+async def _check_version_build_stall(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Post a deduplicated build-stall alert when a version sits too long in
+    the ``build`` phase without advancing to ``stabilize``.
+
+    This is the sibling backstop to ``_check_version_calcification``: that guard
+    covers a version repeatedly failing qualification in the ``stabilize`` phase,
+    while this one covers the OTHER end of the lifecycle.  ``build → stabilize``
+    is entirely agent-driven (the strategic agent must emit a
+    ``version_phase_decision``); there is no cadence or automatic backstop, so a
+    conservative or distracted strategic agent can leave an open version
+    accumulating merged tasks in ``build`` for many cycles, never reaching
+    qualify/promote — the lifecycle silently failing to advance.
+
+    Fires when an open ``build``-phase version's phase age (days since the build
+    phase started) OR its merged-task count since the phase started crosses the
+    conservative ``_is_build_stalled`` threshold.  Phase age derives from
+    ``phase_changed_at`` falling back to ``opened_at`` (a freshly-opened build
+    version has ``phase_changed_at = None``) — exactly as
+    ``_check_version_calcification`` derives its age.  The merged-task count uses
+    ``release_version.count_merged_since`` from that same build-phase-start
+    reference time.
+
+    Deduplication: compares the version's durable ``build_stall_alerted_at``
+    column against the current build-phase-start reference time.  If they match,
+    the alert has already been posted for this stall and is skipped; a new alert
+    is posted only when the reference differs (or the field is NULL).  Because a
+    version can move ``build → stabilize → build`` again (each transition
+    re-stamps ``phase_changed_at``), storing the reference time lets the dedup
+    reset naturally for a fresh build phase while never re-firing for the same
+    stall.
+
+    All messaging is best-effort wrapped so it can NEVER break the qualifier
+    sweep.  Does NOT commit the session — the caller must commit after a ``True``
+    return.
+    """
+    if version.status != "open" or version.phase != "build":
+        return False
+
+    ref_time = version.phase_changed_at or version.opened_at
+    if ref_time is None:
+        return False
+
+    age_days = max(0, (_utcnow() - ref_time).days)
+
+    try:
+        merged_count = await release_version.count_merged_since(
+            session, version.project_id, ref_time
+        )
+    except Exception as exc:  # noqa: BLE001 — a count failure must not break the sweep
+        logger.warning(
+            "[RELEASE_QUALIFIER] build-stall merged-task count failed for v%d "
+            "(non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+        merged_count = 0
+
+    if not _is_build_stalled(age_days, merged_count):
+        return False
+
+    # Durable dedup: the version remembers the build-phase reference time it
+    # last alerted on.  Same reference → already notified for this stall; skip.
+    if version.build_stall_alerted_at == ref_time:
+        return False
+
+    session.add(
+        Alert(
+            project_id=version.project_id,
+            severity=AlertSeverity.WARNING,
+            title=f"Release v{version.version_number} stalled in build phase",
+            message=(
+                f"Release v{version.version_number} has been in the build phase "
+                f"for {age_days} day(s) with {merged_count} merged task(s) and "
+                f"has not advanced to stabilize. build→stabilize is agent-driven "
+                f"with no automatic cadence — the strategic agent may need to "
+                f"emit a version_phase_decision to move it to stabilize so it can "
+                f"progress toward qualification and promotion."
+            ),
+        )
+    )
+    # post_version_build_stalled_message is itself defensive, but wrap the whole
+    # messaging block so a transient failure can never abort the sweep.
+    try:
+        await post_version_build_stalled_message(
+            session,
+            version.project_id,
+            version_number=version.version_number,
+            version_id=str(version.id),
+            age_days=age_days,
+            tasks_merged=merged_count,
+        )
+    except Exception as exc:  # noqa: BLE001 — messaging must never break the sweep
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to post build-stall message for v%d "
+            "(non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+
+    # Record the durable dedup anchor so subsequent sweeps don't re-alert for
+    # the same stall (survives an operator clearing the Alert row).
+    version.build_stall_alerted_at = ref_time
+    session.add(version)
+    logger.warning(
+        "[RELEASE_QUALIFIER] build-stall alert for v%d: %d day(s), %d merged "
+        "task(s) in build phase without advancing",
+        version.version_number,
+        age_days,
+        merged_count,
+    )
+    return True
+
+
+async def _check_version_stabilize_stall(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Post a deduplicated stabilize-stall alert when a version sits too long
+    in the ``stabilize`` phase without making progress toward qualification.
+
+    This is the third lifecycle backstop alongside ``_check_version_build_stall``
+    and ``_check_version_calcification``:
+      * build-stall: ``build`` phase too long without advancing to stabilize.
+      * stabilize-stall (this): ``stabilize`` phase too long without a
+        qualify_request — covers zero-attempt or soft-near-miss stalls that the
+        calcification guard ignores (it requires repeated hard-blocker failures).
+      * calcification: repeated hard-blocker failures blocking the qualify step.
+
+    After this backstop lands, no lifecycle transition (build→stabilize,
+    stabilize→qualify, qualify→promote) can stall unseen.
+
+    Fires when an open stabilize-phase version's phase age OR its merged-task
+    count crosses the conservative threshold AND neither the calcification guard
+    (hard-blocker stall already covered) nor a dry-run hold (healthy pass
+    waiting for promotion_enabled) applies.
+
+    Deduplication: compares the version's durable ``stabilize_stall_alerted_at``
+    column against the current stabilize-phase reference time.  Same reference →
+    already notified for this stall; new reference (phase re-entered, so
+    phase_changed_at re-stamped) → fresh stall can alert again.
+
+    All messaging is best-effort wrapped so it can NEVER break the qualifier
+    sweep.  Does NOT commit the session — the caller must commit after a True return.
+    """
+    if version.status != "open" or version.phase != "stabilize":
+        return False
+
+    qual = version.last_qualification or {}
+    qual_status = qual.get("status")
+
+    # A dry-run hold is a passing candidate waiting for promotion_enabled —
+    # healthy, not stalled.
+    if qual_status == "dry_run":
+        return False
+
+    # A version with repeated hard-blocker failures is covered by the
+    # calcification alert — don't double-alert on the same stall.
+    if qual_status == "not_promoted" and qual.get("blocker"):
+        return False
+
+    ref_time = version.phase_changed_at or version.opened_at
+    if ref_time is None:
+        return False
+
+    age_days = max(0, (_utcnow() - ref_time).days)
+
+    try:
+        merged_count = await release_version.count_merged_since(
+            session, version.project_id, ref_time
+        )
+    except Exception as exc:  # noqa: BLE001 — a count failure must not break the sweep
+        logger.warning(
+            "[RELEASE_QUALIFIER] stabilize-stall merged-task count failed for v%d "
+            "(non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+        merged_count = 0
+
+    if not (
+        age_days >= _STABILIZE_STALL_AGE_DAYS
+        or merged_count >= _STABILIZE_STALL_MERGED_TASKS
+    ):
+        return False
+
+    # Durable dedup: the version remembers the stabilize-phase reference time it
+    # last alerted on.  Same reference → already notified for this stall; skip.
+    if version.stabilize_stall_alerted_at == ref_time:
+        return False
+
+    session.add(
+        Alert(
+            project_id=version.project_id,
+            severity=AlertSeverity.WARNING,
+            title=f"Release v{version.version_number} stalled in stabilize phase",
+            message=(
+                f"Release v{version.version_number} has been in the stabilize "
+                f"phase for {age_days} day(s) with {merged_count} merged task(s) "
+                f"but has not been qualified. stabilize→qualify requires a "
+                f"qualify_request from the strategic agent — consider requesting "
+                f"qualification now or addressing what is preventing readiness."
+            ),
+        )
+    )
+    try:
+        await post_version_stabilize_stalled_message(
+            session,
+            version.project_id,
+            version_number=version.version_number,
+            version_id=str(version.id),
+            age_days=age_days,
+            tasks_merged=merged_count,
+        )
+    except Exception as exc:  # noqa: BLE001 — messaging must never break the sweep
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to post stabilize-stall message for v%d "
+            "(non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+
+    # Record the durable dedup anchor so subsequent sweeps don't re-alert for
+    # the same stall (survives an operator clearing the Alert row).
+    version.stabilize_stall_alerted_at = ref_time
+    session.add(version)
+    logger.warning(
+        "[RELEASE_QUALIFIER] stabilize-stall alert for v%d: %d day(s), %d merged "
+        "task(s) in stabilize phase without qualifying",
+        version.version_number,
+        age_days,
+        merged_count,
+    )
+    return True
+
+
+async def _check_version_promotion_readiness(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Notify operator once when the dry-run track record first reaches readiness.
+
+    Fires exactly once per not-ready → ready transition while promotion is
+    disabled; resets the dedup flag when readiness lapses so recovery can
+    notify again.  Messaging is best-effort — failure never breaks the sweep.
+    Does NOT commit — caller commits on True return.
+    """
+    if version.status != "open":
+        return False
+    if bool(_runtime_config.get("promotion_enabled")):
+        return False  # promotion already on → operator acted
+
+    try:
+        readiness = await compute_promotion_readiness(session, version.project_id)
+    except Exception as exc:  # noqa: BLE001 — failure must not break the sweep
+        logger.warning(
+            "[RELEASE_QUALIFIER] promotion-readiness check failed for v%d "
+            "(non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+        return False
+
+    if not readiness.get("ready"):
+        # Reset dedup flag so the next not-ready→ready recovery can notify.
+        # Return True when we actually clear the flag so the caller commits the
+        # reset — otherwise the sweep (which only commits on a True return) rolls
+        # it back on session close, leaving the flag True and suppressing the
+        # next ready re-notification.
+        if version.promotion_ready_notified:
+            version.promotion_ready_notified = False
+            session.add(version)
+            return True
+        return False
+
+    if version.promotion_ready_notified:
+        return False  # already notified for this ready window
+
+    try:
+        await post_version_promotion_readiness_message(
+            session,
+            version.project_id,
+            version_number=version.version_number,
+            version_id=str(version.id),
+            verdicts_evaluated=readiness["verdicts_evaluated"],
+            would_promote_rate=readiness["would_promote_rate"],
+            consecutive_clean_passes=readiness["consecutive_clean_passes"],
+            reason=readiness["reason"],
+        )
+    except Exception as exc:  # noqa: BLE001 — messaging must never break the sweep
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to post promotion-readiness message "
+            "for v%d (non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+        return False
+
+    version.promotion_ready_notified = True
+    session.add(version)
+    logger.info(
+        "[RELEASE_QUALIFIER] promotion-readiness notification sent for v%d: "
+        "%d clean passes, rate %.2f, %d verdict(s)",
+        version.version_number,
+        readiness["consecutive_clean_passes"],
+        readiness["would_promote_rate"],
+        readiness["verdicts_evaluated"],
+    )
+    return True
 
 
 async def sweep_stuck_qualifications(
@@ -2045,6 +2672,38 @@ async def sweep_stuck_qualifications(
             "[RELEASE_QUALIFIER] sweep finalized %d stuck qualification(s)",
             finalized,
         )
+
+    # Lifecycle-stall checks: alert when an open version is stuck at either end
+    # of the lifecycle — calcifying in stabilize (repeated hard-blocker
+    # failures) or stalled in build (sitting too long without advancing).  The
+    # two checks are mutually exclusive per version (each early-returns on the
+    # wrong phase) but both run so whichever applies fires.  Each version gets
+    # its own dedicated session (same isolation pattern as the finalize loop
+    # above) so a messaging failure on one version can't affect another.
+    factory = session_factory or AsyncSessionLocal
+    for version in open_versions:
+        try:
+            async with factory() as alert_session:
+                v = await alert_session.get(release_version.ReleaseVersion, version.id)
+                if v is None:
+                    continue
+                alerted = await _check_version_calcification(alert_session, v)
+                alerted = await _check_version_build_stall(alert_session, v) or alerted
+                alerted = (
+                    await _check_version_stabilize_stall(alert_session, v) or alerted
+                )
+                alerted = (
+                    await _check_version_promotion_readiness(alert_session, v)
+                    or alerted
+                )
+                if alerted:
+                    await alert_session.commit()
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] lifecycle-stall check failed for version %s",
+                version.id,
+            )
+
     return finalized
 
 
@@ -2188,9 +2847,7 @@ async def _promotion_pr_landed(
     )
     if not candidate_sha:
         return False
-    return await _candidate_already_on_main(
-        token, owner, repo, candidate_sha, version
-    )
+    return await _candidate_already_on_main(token, owner, repo, candidate_sha, version)
 
 
 def _idempotent_pr_url(base_record: dict[str, Any] | None) -> str:
@@ -2276,13 +2933,17 @@ async def _relock_version_for_promotion_write(
     # lock_released=True — re-read + re-lock from authoritative DB state.
     session.expire(version)
     relocked = (
-        await session.execute(
-            select(release_version.ReleaseVersion)
-            .where(release_version.ReleaseVersion.id == version.id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == version.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
     if relocked is None:
         logger.warning(
             "[RELEASE_QUALIFIER] promote: version row %s vanished before the "
@@ -2394,7 +3055,10 @@ async def promote(
         # This runs BEFORE the intermediate commit, so the version row is still
         # locked by this transaction — write directly (lock_released=False).
         return await _record_promotion_failure(
-            session, version, base_record, "project_not_found",
+            session,
+            version,
+            base_record,
+            "project_not_found",
             lock_released=False,
         )
 
@@ -2431,8 +3095,12 @@ async def promote(
             )
         # The rollback released the lock — the failure record must re-lock.
         return await _record_promotion_failure(
-            session, version, base_record, "lock_release_failed",
-            detail=str(exc)[:300], lock_released=True,
+            session,
+            version,
+            base_record,
+            "lock_release_failed",
+            detail=str(exc)[:300],
+            lock_released=True,
         )
 
     # The row lock is now released — all the I/O below runs unlocked.
@@ -2440,7 +3108,10 @@ async def promote(
         resolved = await _resolve_github_with_session(session, project)
         if resolved is None:
             return await _record_promotion_failure(
-                session, version, base_record, "no_credentials",
+                session,
+                version,
+                base_record,
+                "no_credentials",
                 lock_released=True,
             )
         token, owner, repo = resolved
@@ -2531,8 +3202,7 @@ async def promote(
             owner,
             repo,
             title=(
-                f"Release v{version.version_number}: promote "
-                f"{release_branch} → main"
+                f"Release v{version.version_number}: promote {release_branch} → main"
             ),
             head=release_branch,
             base="main",
@@ -2628,8 +3298,12 @@ async def promote(
             token, owner, repo, release_branch, version
         )
         return await _record_promotion_failure(
-            session, version, base_record, "pr_missing_number",
-            pr_url=pr_url, lock_released=True,
+            session,
+            version,
+            base_record,
+            "pr_missing_number",
+            pr_url=pr_url,
+            lock_released=True,
         )
 
     # 2. Merge the PR — merge_method="merge" preserves integration history.
@@ -2865,7 +3539,7 @@ async def _record_promotion_failure(
     )
     if locked is None:
         # Row vanished (project deleted mid-promotion) — nothing to record.
-        return {"status": "promotion_failed", "error": error}
+        return {"status": "promotion_failed", "error": error, "conflict": conflict}
     version = locked
     # Re-check under the re-lock (Round 9 — data integrity): a concurrent
     # finalize / crash-retry may have already PROMOTED this version while this
@@ -2887,8 +3561,7 @@ async def _record_promotion_failure(
         existing = version.last_qualification or {}
         return {
             "status": existing.get("status", version.status),
-            "promoted_sha": existing.get("promoted_sha")
-            or version.promoted_sha,
+            "promoted_sha": existing.get("promoted_sha") or version.promoted_sha,
             "next_version_number": None,
             "already_promoted": True,
         }
@@ -2918,6 +3591,17 @@ async def _record_promotion_failure(
             ),
         )
     session.add(version)
+    # Phase 4: durable verdict-history row.  A promotion_failed candidate DID
+    # clear the qualifier (would_promote=True) — the failure is in the merge
+    # infrastructure, not the score — and promotion only ever runs when enabled.
+    await _record_qualification_verdict(
+        session,
+        version,
+        record,
+        terminal_status="promotion_failed",
+        would_promote=True,
+        promotion_enabled=True,
+    )
     logger.warning(
         "[RELEASE_QUALIFIER] promotion of v%d failed (%s) — version stays open, "
         "phase=stabilize",
@@ -2942,7 +3626,7 @@ async def _record_promotion_failure(
             "conflict": conflict,
         },
     )
-    return {"status": "promotion_failed", "error": error}
+    return {"status": "promotion_failed", "error": error, "conflict": conflict}
 
 
 async def _record_promotion_success(
@@ -3049,6 +3733,16 @@ async def _record_promotion_success(
     version.promoted_at = now
     version.promoted_sha = effective_sha
     session.add(version)
+    # Phase 4: durable verdict-history row for a successful promotion.  This
+    # only ever runs with promotion enabled (the dry_run branch returns earlier).
+    await _record_qualification_verdict(
+        session,
+        version,
+        record,
+        terminal_status="promoted",
+        would_promote=True,
+        promotion_enabled=True,
+    )
 
     # Open the next version (build phase) — base_sha is the freshly-promoted SHA
     # (the real main HEAD after the merge, not the now-superseded candidate).
@@ -3115,4 +3809,234 @@ async def _record_promotion_success(
         "status": "promoted",
         "promoted_sha": effective_sha,
         "next_version_number": next_version.version_number,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Public display helpers — stable API for the operator lifecycle panel.
+# ---------------------------------------------------------------------------
+
+# Maps the internal last_qualification status code to a human-readable label
+# for the version-lifecycle panel.
+_OUTCOME_LABELS: dict[str, str] = {
+    "pending": "In progress",
+    "dry_run": "Dry-run (would promote)",
+    "promoted": "Promoted",
+    "not_promoted": "Below threshold",
+    "error": "Error",
+}
+
+
+def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
+    """Return an operator-facing summary of a ``last_qualification`` record.
+
+    Normalizes the raw qualification dict stored on ``ReleaseVersion`` into
+    a stable shape suitable for the version-lifecycle panel.  Adds a
+    human-readable ``outcome`` label alongside the raw ``status`` code.
+
+    Safe to call with an empty dict — all fields default to ``None``.
+    """
+    status = qual.get("status")
+    return {
+        "status": status,
+        "outcome": _OUTCOME_LABELS.get(status, status),
+        "confidence": qual.get("confidence"),
+        "threshold": qual.get("threshold"),
+        "sub_scores": qual.get("sub_scores"),
+        "blocker": qual.get("blocker"),
+        "started_at": qual.get("started_at"),
+        "finalized_at": qual.get("finalized_at"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Promotion-readiness aggregation — the calibration evidence (design Phase 4).
+# ---------------------------------------------------------------------------
+#
+# These constants gate the human-facing recommendation only.  Per design
+# decision D2 the recommendation NEVER auto-flips runtime_config["promotion_
+# enabled"] — it summarizes the durable dry-run track record so an operator can
+# answer "is the qualifier trustworthy enough to enable autonomous promotion
+# yet?" from real data and flip the switch themselves.  Kept deliberately
+# CONSERVATIVE: signalling ready prematurely is the costly error (it invites a
+# human to hand the qualifier the keys to production main).
+
+# How many most-recent dry-run-regime verdicts to consider.
+_READINESS_HISTORY_WINDOW = 50
+# Minimum number of evaluated dry-run-regime verdicts before any "ready" signal.
+# A handful of passes is not yet a track record.
+_READINESS_MIN_VERDICTS = 5
+# Minimum run of the MOST-RECENT consecutive clean would-promote verdicts (no
+# blocker) — recent stability matters more than a good-then-bad history.
+_READINESS_MIN_CLEAN_STREAK = 3
+# Minimum would-promote rate across the evaluated window.
+_READINESS_MIN_WOULD_PROMOTE_RATE = 0.80
+# A blocker code seen at least this many times in the window is "recurring" —
+# the qualifier keeps tripping on the same hard problem, so NOT ready.
+_READINESS_RECURRING_BLOCKER_MIN = 2
+# Confidence-spread ceiling for the advisory "stable" flag (evidence only — not
+# a hard readiness gate).
+_READINESS_CONFIDENCE_STDEV_MAX = 0.15
+
+
+def _empty_readiness(thresholds: dict[str, Any]) -> dict[str, Any]:
+    """The not-ready summary returned when there is no verdict history yet."""
+    return {
+        "ready": False,
+        "reason": "no qualification verdicts recorded yet — nothing to evaluate",
+        "verdicts_evaluated": 0,
+        "would_promote_count": 0,
+        "would_promote_rate": 0.0,
+        "consecutive_clean_passes": 0,
+        "confidence": {
+            "mean": None,
+            "stdev": None,
+            "min": None,
+            "max": None,
+            "stable": False,
+        },
+        "recurring_blockers": {},
+        "blocker_counts": {},
+        "thresholds": thresholds,
+    }
+
+
+async def compute_promotion_readiness(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> dict[str, Any]:
+    """Summarize the dry-run qualification track record into a readiness verdict.
+
+    Reads the durable :class:`QualificationVerdict` history (the most recent
+    ``_READINESS_HISTORY_WINDOW`` verdicts recorded while promotion was DISABLED
+    — the dry-run regime, where every finalize lands as ``dry_run`` /
+    ``not_promoted``) and returns a conservative ``ready`` / not-ready
+    recommendation plus the supporting evidence.
+
+    EVIDENCE + RECOMMENDATION ONLY (design decision D2): this NEVER flips
+    ``promotion_enabled``.  ``ready=True`` requires ALL of:
+
+      * at least ``_READINESS_MIN_VERDICTS`` evaluated verdicts, AND
+      * a most-recent consecutive-clean would-promote streak of at least
+        ``_READINESS_MIN_CLEAN_STREAK``, AND
+      * a would-promote rate >= ``_READINESS_MIN_WOULD_PROMOTE_RATE``, AND
+      * NO recurring hard blocker (a blocker code seen
+        >= ``_READINESS_RECURRING_BLOCKER_MIN`` times in the window).
+
+    Returns a dict with ``ready``, a human-readable ``reason``, the raw evidence
+    (``verdicts_evaluated``, ``would_promote_count``, ``would_promote_rate``,
+    ``consecutive_clean_passes``, a ``confidence`` distribution + advisory
+    ``stable`` flag, ``blocker_counts`` and the subset that is ``recurring_
+    blockers``) and the ``thresholds`` used so the recommendation is auditable.
+    """
+    thresholds: dict[str, Any] = {
+        "min_verdicts": _READINESS_MIN_VERDICTS,
+        "min_clean_streak": _READINESS_MIN_CLEAN_STREAK,
+        "min_would_promote_rate": _READINESS_MIN_WOULD_PROMOTE_RATE,
+        "recurring_blocker_min": _READINESS_RECURRING_BLOCKER_MIN,
+        "history_window": _READINESS_HISTORY_WINDOW,
+    }
+
+    # Only the dry-run regime (promotion_enabled is False) is evidence for
+    # whether to flip the switch — verdicts recorded after promotion was enabled
+    # are post-decision and excluded.  Newest-first so the leading run is the
+    # most-recent consecutive-clean streak.
+    stmt = (
+        select(QualificationVerdict)
+        .where(
+            QualificationVerdict.project_id == project_id,
+            QualificationVerdict.promotion_enabled.is_(False),
+        )
+        .order_by(QualificationVerdict.created_at.desc())
+        .limit(_READINESS_HISTORY_WINDOW)
+    )
+    verdicts = list((await session.execute(stmt)).scalars().all())
+
+    evaluated = len(verdicts)
+    if evaluated == 0:
+        return _empty_readiness(thresholds)
+
+    would_promote_count = sum(1 for v in verdicts if v.would_promote)
+    would_promote_rate = round(would_promote_count / evaluated, 4)
+
+    # Leading run of clean would-promote passes (would_promote AND no blocker).
+    consecutive_clean = 0
+    for v in verdicts:
+        if v.would_promote and not v.blocker:
+            consecutive_clean += 1
+        else:
+            break
+
+    # Blocker frequency across the window (only non-promote verdicts carry one).
+    blocker_counts: dict[str, int] = {}
+    for v in verdicts:
+        if v.blocker:
+            blocker_counts[v.blocker] = blocker_counts.get(v.blocker, 0) + 1
+    recurring_blockers = {
+        code: n
+        for code, n in blocker_counts.items()
+        if n >= _READINESS_RECURRING_BLOCKER_MIN
+    }
+
+    # Confidence distribution + an advisory stability measure (population stdev).
+    confidences = [float(v.confidence) for v in verdicts]
+    conf_mean = round(sum(confidences) / evaluated, 4)
+    conf_min = round(min(confidences), 4)
+    conf_max = round(max(confidences), 4)
+    if evaluated > 1:
+        variance = sum((c - conf_mean) ** 2 for c in confidences) / evaluated
+        conf_stdev = round(variance**0.5, 4)
+    else:
+        conf_stdev = 0.0
+    conf_stable = conf_stdev <= _READINESS_CONFIDENCE_STDEV_MAX
+
+    reasons: list[str] = []
+    if evaluated < _READINESS_MIN_VERDICTS:
+        reasons.append(
+            f"only {evaluated} dry-run verdict(s) evaluated "
+            f"(need >= {_READINESS_MIN_VERDICTS})"
+        )
+    if consecutive_clean < _READINESS_MIN_CLEAN_STREAK:
+        reasons.append(
+            f"consecutive-clean streak is {consecutive_clean} "
+            f"(need >= {_READINESS_MIN_CLEAN_STREAK})"
+        )
+    if would_promote_rate < _READINESS_MIN_WOULD_PROMOTE_RATE:
+        reasons.append(
+            f"would-promote rate is {would_promote_rate:.2f} "
+            f"(need >= {_READINESS_MIN_WOULD_PROMOTE_RATE:.2f})"
+        )
+    if recurring_blockers:
+        formatted = ", ".join(
+            f"{code}x{n}" for code, n in sorted(recurring_blockers.items())
+        )
+        reasons.append(f"recurring hard blocker(s): {formatted}")
+
+    ready = not reasons
+    if ready:
+        reason = (
+            f"qualifier looks trustworthy: {would_promote_count}/{evaluated} "
+            f"would-promote (rate {would_promote_rate:.2f}), {consecutive_clean} "
+            f"consecutive clean passes, no recurring blockers"
+        )
+    else:
+        reason = "; ".join(reasons)
+
+    return {
+        "ready": ready,
+        "reason": reason,
+        "verdicts_evaluated": evaluated,
+        "would_promote_count": would_promote_count,
+        "would_promote_rate": would_promote_rate,
+        "consecutive_clean_passes": consecutive_clean,
+        "confidence": {
+            "mean": conf_mean,
+            "stdev": conf_stdev,
+            "min": conf_min,
+            "max": conf_max,
+            "stable": conf_stable,
+        },
+        "recurring_blockers": recurring_blockers,
+        "blocker_counts": blocker_counts,
+        "thresholds": thresholds,
     }

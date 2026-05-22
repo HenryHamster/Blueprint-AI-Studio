@@ -1351,7 +1351,11 @@ async def update_agent_status(
                                             f"and produce subtasks to fix them."
                                         ),
                                         "base_branch": base_branch,
-                                        **({"hotfix": True} if is_post_promotion else {}),
+                                        **(
+                                            {"hotfix": True}
+                                            if is_post_promotion
+                                            else {}
+                                        ),
                                         **({"model": type_model} if type_model else {}),
                                         **(
                                             {"effort": type_effort}
@@ -1707,7 +1711,9 @@ async def update_agent_status(
                                     },
                                 )
                             )
-                            del _regression_future  # fire-and-forget; stored to satisfy RUF006
+                            del (
+                                _regression_future
+                            )  # fire-and-forget; stored to satisfy RUF006
                     except Exception as e:
                         logger.warning(
                             f"[STATUS] regression recovery failed for {acct_id_clear}: {e}",
@@ -2086,7 +2092,40 @@ async def update_agent_status(
         # await, so the reaper sees the orchestrator action immediately.
         from app.main import fire_and_forget_vm_delete
 
-        fire_and_forget_vm_delete(old_vm_id, reason="agent_completion")
+        # Backlog reuse (efficiency direction d-91d8dede): a COMPLETED task's
+        # agent re-enters its /next-role poll loop, so if backlog reuse is
+        # enabled and the project has eligible QUEUED work this VM could run,
+        # defer teardown for a bounded window so it can claim that work warm
+        # instead of being torn down and cold-re-provisioned. FAILED agents
+        # re-throw and exit without polling, so only COMPLETED is deferred (a
+        # deferred FAILED VM would never poll and would just waste VM time).
+        _teardown_deferred = False
+        if (
+            payload.status == TaskStatus.COMPLETED
+            and old_vm_id
+            and _shared_state.runtime_config.get("warm_backlog_reuse_enabled", False)
+        ):
+            try:
+                from app.warm_backlog_reuse import has_eligible_backlog_task
+
+                if await has_eligible_backlog_task(session, task.project_id, old_vm_id):
+                    from app.main import schedule_deferred_backlog_teardown
+
+                    _shared_state.register_backlog_first_refusal(str(task.project_id))
+                    schedule_deferred_backlog_teardown(old_vm_id)
+                    _teardown_deferred = True
+                    logger.info(
+                        f"[BACKLOG-REUSE] Deferring teardown of VM {old_vm_id} "
+                        f"(task {task.id} COMPLETED) — eligible backlog work in "
+                        f"project {task.project_id}"
+                    )
+            except Exception:
+                logger.exception(
+                    "[BACKLOG-REUSE] Teardown-defer check failed — tearing down"
+                )
+                _teardown_deferred = False
+        if not _teardown_deferred:
+            fire_and_forget_vm_delete(old_vm_id, reason="agent_completion")
 
         # Open-PR handoff: if a previous attempt already pushed a branch and
         # opened a PR, retrying from scratch will collide with the agent's

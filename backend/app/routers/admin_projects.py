@@ -26,49 +26,116 @@ router = APIRouter(
 @limiter.limit("30/minute")
 async def get_all_projects(
     request: Request,
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    # Join projects with membership to get user's role on each project
-    query = (
-        select(Project, ProjectMember.role)
+    # Select only lightweight columns — large JSONB (directions, vision, design_doc,
+    # problem_model, self_reflection_log, running_update) are excluded here and
+    # available via GET /api/admin/projects/{project_id}.
+    stmt = (
+        select(
+            Project.id,
+            Project.name,
+            Project.created_at,
+            Project.status,
+            Project.user_id,
+            Project.github_owner,
+            Project.github_repo,
+            Project.is_self_repo,
+            Project.autonomous_enabled,
+            Project.build_config,
+            Project.sr_catch_rate_targets,
+            Project.running_update_acknowledged_at,
+            func.coalesce(func.jsonb_array_length(Project.directions), 0).label(
+                "directions_count"
+            ),
+            ProjectMember.role.label("my_role"),
+        )
         .join(ProjectMember, ProjectMember.project_id == Project.id)
         .where(ProjectMember.user_id == current_user["user_id"])
         .order_by(Project.created_at.desc())
+        .limit(limit + 1)
+        .offset(offset)
     )
-    rows = (await session.execute(query)).all()
-    result = []
-    for project, role in rows:
-        # Serialize project and add my_role
-        data = {
-            "id": str(project.id),
-            "name": project.name,
-            "user_id": project.user_id,
-            "status": project.status,
-            "github_owner": project.github_owner,
-            "github_repo": project.github_repo,
-            "created_at": project.created_at.isoformat()
-            if project.created_at
-            else None,
-            "directions": project.directions,
-            "vision": project.vision or {},
-            "design_doc": project.design_doc or {},
-            "problem_model": project.problem_model or {},
-            "running_update": project.running_update or [],
-            "running_update_acknowledged_at": (
-                project.running_update_acknowledged_at.isoformat()
-                if project.running_update_acknowledged_at
-                else None
-            ),
-            "self_reflection_log": project.self_reflection_log or [],
-            "build_config": project.build_config or {},
-            "autonomous_enabled": project.autonomous_enabled,
-            "is_self_repo": project.is_self_repo,
-            "sr_catch_rate_targets": project.sr_catch_rate_targets or {},
-            "my_role": role,
-        }
-        result.append(data)
-    return result
+    rows = (await session.execute(stmt)).all()
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+    return {
+        "items": [
+            {
+                "id": str(row.id),
+                "name": row.name,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "status": row.status,
+                "user_id": row.user_id,
+                "github_owner": row.github_owner,
+                "github_repo": row.github_repo,
+                "is_self_repo": row.is_self_repo,
+                "autonomous_enabled": row.autonomous_enabled,
+                "build_config": row.build_config or {},
+                "sr_catch_rate_targets": row.sr_catch_rate_targets or {},
+                "running_update_acknowledged_at": (
+                    row.running_update_acknowledged_at.isoformat()
+                    if row.running_update_acknowledged_at
+                    else None
+                ),
+                "directions_count": row.directions_count,
+                "my_role": row.my_role,
+            }
+            for row in page_rows
+        ],
+        "has_more": has_more,
+    }
+
+
+@router.get("/projects/{project_id}")
+@limiter.limit("30/minute")
+async def get_project(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the full project record including all JSONB detail columns."""
+    query = (
+        select(Project, ProjectMember.role)
+        .join(ProjectMember, ProjectMember.project_id == Project.id)
+        .where(
+            Project.id == project_id,
+            ProjectMember.user_id == current_user["user_id"],
+        )
+    )
+    row = (await session.execute(query)).one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    project, role = row
+    return {
+        "id": str(project.id),
+        "name": project.name,
+        "user_id": project.user_id,
+        "status": project.status,
+        "github_owner": project.github_owner,
+        "github_repo": project.github_repo,
+        "created_at": project.created_at.isoformat() if project.created_at else None,
+        "directions": project.directions,
+        "vision": project.vision or {},
+        "design_doc": project.design_doc or {},
+        "problem_model": project.problem_model or {},
+        "running_update": project.running_update,
+        "running_update_acknowledged_at": (
+            project.running_update_acknowledged_at.isoformat()
+            if project.running_update_acknowledged_at
+            else None
+        ),
+        "self_reflection_log": project.self_reflection_log or [],
+        "build_config": project.build_config or {},
+        "autonomous_enabled": project.autonomous_enabled,
+        "is_self_repo": project.is_self_repo,
+        "sr_catch_rate_targets": project.sr_catch_rate_targets or {},
+        "my_role": role,
+    }
 
 
 class ProjectUpdate(BaseModel):

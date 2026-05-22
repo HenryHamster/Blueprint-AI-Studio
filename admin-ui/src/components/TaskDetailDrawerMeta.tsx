@@ -4,7 +4,7 @@ import { getHeartbeatStatus, isSafeUrl, useElapsedTime, linkifyStatusMessage, Re
 import type { Task } from './TaskCard';
 import { formatAbsolute, parseTimestamp, timeAgo } from '../utils/time';
 import { hasTransitiveCycle } from '../utils/taskGraph';
-import { authGet, API_BASE_URL, fetchTaskSerialConsole } from '../api';
+import { authGet, API_BASE_URL, fetchTaskSerialConsole, apiFetch } from '../api';
 import type { SerialConsoleResponse } from '../types/task';
 import { TaskFixLoopPanel } from './TaskFixLoopPanel';
 
@@ -20,13 +20,13 @@ function CopyableId({ value }: { value: string }) {
   return (
     <button
       onClick={handleCopy}
-      className="inline-flex items-center gap-1.5 font-mono text-sm text-neutral-200 hover:text-white transition-colors group min-h-[44px]"
+      className="flex flex-wrap items-center gap-1.5 font-mono text-sm text-neutral-200 hover:text-white transition-colors group min-h-[44px] min-w-0"
     >
-      <span>{value}</span>
+      <span className="break-all min-w-0">{value}</span>
       {copied ? (
-        <Check className="w-3.5 h-3.5 text-emerald-400" />
+        <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
       ) : (
-        <Copy className="w-3.5 h-3.5 text-neutral-500 group-hover:text-neutral-300 transition-colors" />
+        <Copy className="w-3.5 h-3.5 text-neutral-500 group-hover:text-neutral-300 transition-colors shrink-0" />
       )}
     </button>
   );
@@ -38,9 +38,9 @@ function SectionHeader({ children }: { children: ReactNode }) {
 
 function DetailRow({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <div className="flex items-start gap-3 py-1.5">
+    <div className="flex items-start gap-3 py-1.5 min-w-0">
       <span className="text-xs text-neutral-500 w-28 shrink-0 pt-0.5">{label}</span>
-      <div className="text-sm text-neutral-200 min-w-0">{children}</div>
+      <div className="text-sm text-neutral-200 min-w-0 flex-1">{children}</div>
     </div>
   );
 }
@@ -508,6 +508,28 @@ function SelfReviewPanel({ task }: { task: Task }) {
   const outcome = ctx?._self_review_outcome as SelfReviewOutcome | undefined;
   const humanCategories = ctx?._first_attempt_rejection_categories as Record<string, unknown> | undefined;
   const [open, setOpen] = useState(false);
+  const [requestingFreshReview, setRequestingFreshReview] = useState(false);
+  const [freshReviewResult, setFreshReviewResult] = useState<'success' | 'cooldown' | string | null>(null);
+
+  const handleRequestFreshReview = async () => {
+    setRequestingFreshReview(true);
+    setFreshReviewResult(null);
+    try {
+      const res = await apiFetch(`/api/admin/tasks/${task.id}/request-fresh-reviewer`, { method: 'POST' });
+      if (res.ok) {
+        setFreshReviewResult('success');
+      } else if (res.status === 429) {
+        setFreshReviewResult('cooldown');
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setFreshReviewResult((data as { detail?: string }).detail ?? `Error ${res.status}`);
+      }
+    } catch {
+      setFreshReviewResult('Request failed');
+    } finally {
+      setRequestingFreshReview(false);
+    }
+  };
 
   if (!outcome) return null;
 
@@ -735,6 +757,29 @@ function SelfReviewPanel({ task }: { task: Task }) {
                   )}
                 </div>
               )}
+
+              {task.status === 'COMPLETED' && (
+                <div className="border-t border-neutral-700/50 pt-3">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <button
+                      onClick={handleRequestFreshReview}
+                      disabled={requestingFreshReview || freshReviewResult === 'success'}
+                      className="text-xs px-2.5 py-1.5 rounded border border-blue-700/50 bg-blue-950/30 text-blue-400 hover:bg-blue-950/50 hover:border-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                    >
+                      {requestingFreshReview ? 'Requesting…' : 'Request fresh review'}
+                    </button>
+                    {freshReviewResult === 'success' && (
+                      <span className="text-xs text-emerald-400">Queued — findings will appear here when complete.</span>
+                    )}
+                    {freshReviewResult === 'cooldown' && (
+                      <span className="text-xs text-amber-400">Cooldown active — a fresh-reviewer pass was recently run.</span>
+                    )}
+                    {freshReviewResult && freshReviewResult !== 'success' && freshReviewResult !== 'cooldown' && (
+                      <span className="text-xs text-red-400">{freshReviewResult}</span>
+                    )}
+                  </div>
+                </div>
+              )}
             </>
           )}
         </div>
@@ -819,18 +864,19 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         );
       })()}
       <ResearchOriginSection task={task} tasks={tasks} onNavigateToTask={onNavigateToTask} />
-      {task.project_id && <DetailRow label="Project ID"><span className="font-mono text-sm">{task.project_id}</span></DetailRow>}
+      {task.project_id && <DetailRow label="Project ID"><span className="font-mono text-sm break-all min-w-0">{task.project_id}</span></DetailRow>}
       {task.vm_instance_id && (
         <DetailRow label="VM Instance">
-          <span className="inline-flex items-center gap-1.5">
-            <span className="font-mono text-sm">{task.vm_instance_id}</span>
+          <span className="inline-flex items-center gap-1.5 flex-wrap min-w-0">
+            <span className="font-mono text-sm break-all min-w-0">{task.vm_instance_id}</span>
             <a
               href={gcpProjectId
                 ? `https://console.cloud.google.com/compute/instances?project=${gcpProjectId}`
                 : `https://console.cloud.google.com/compute/instances`}
               target="_blank"
               rel="noopener noreferrer"
-              className="text-gray-400 hover:text-gray-200 transition-colors"
+              data-viewport-allow-small-target
+              className="text-gray-400 hover:text-gray-200 transition-colors shrink-0 p-1 -m-1"
               title="Open in GCP Console"
             >
               <ExternalLink className="w-3.5 h-3.5" />
@@ -983,19 +1029,19 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           <>
             <SectionHeader>Task Config</SectionHeader>
             {prompt && prompt !== task.description && <DetailRow label="Prompt"><pre className="text-sm text-neutral-200 whitespace-pre-wrap break-words bg-neutral-900/50 rounded-lg p-3 max-h-32 overflow-y-auto custom-scrollbar border border-neutral-800">{prompt}</pre></DetailRow>}
-            {baseBranch && <DetailRow label="Base Branch"><span className="font-mono text-sm">{baseBranch}</span></DetailRow>}
+            {baseBranch && <DetailRow label="Base Branch"><span className="font-mono text-sm break-all min-w-0">{baseBranch}</span></DetailRow>}
             {prNumber && (
               <DetailRow label="PR Number">
                 {prLink && isSafeUrl(prLink) ? (
-                  <a href={prLink} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 font-mono text-sm text-blue-400 hover:text-blue-300 transition-colors">
-                    #{prNumber}<ExternalLink className="w-3 h-3" />
+                  <a href={prLink} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 font-mono text-sm text-blue-400 hover:text-blue-300 transition-colors min-h-[44px] px-1.5">
+                    #{prNumber}<ExternalLink className="w-3 h-3 shrink-0" />
                   </a>
                 ) : (
                   <span className="font-mono text-sm">#{prNumber}</span>
                 )}
               </DetailRow>
             )}
-            {branch && <DetailRow label="Branch"><span className="font-mono text-sm">{branch}</span></DetailRow>}
+            {branch && <DetailRow label="Branch"><span className="font-mono text-sm break-all min-w-0">{branch}</span></DetailRow>}
           </>
         );
       })()}
@@ -1206,21 +1252,21 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
                           href={a.pr_url}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors"
+                          className="flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors break-all min-w-0 min-h-[44px]"
                         >
                           {a.pr_url}
-                          <ExternalLink className="w-3.5 h-3.5" />
+                          <ExternalLink className="w-3.5 h-3.5 shrink-0" />
                         </a>
                       ) : null)}
                       {commits.map((a, i) => (
-                        <div key={i} className="flex items-center gap-2 text-sm font-mono text-neutral-300">
+                        <div key={i} className="flex items-center gap-2 text-sm font-mono text-neutral-300 flex-wrap min-w-0">
                           {a.commit_hash && <span className="text-emerald-400">{a.commit_hash.slice(0, 8)}</span>}
                           {a.repo_url && isSafeUrl(a.repo_url) ? (
-                            <a href={a.repo_url} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 transition-colors flex items-center gap-1">
-                              {a.repo_url}<ExternalLink className="w-3 h-3" />
+                            <a href={a.repo_url} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 transition-colors flex items-center gap-1 break-all min-w-0 min-h-[44px]">
+                              {a.repo_url}<ExternalLink className="w-3 h-3 shrink-0" />
                             </a>
                           ) : a.repo_url ? (
-                            <span className="text-neutral-400">{a.repo_url}</span>
+                            <span className="text-neutral-400 break-all min-w-0">{a.repo_url}</span>
                           ) : null}
                         </div>
                       ))}
@@ -1240,10 +1286,10 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
                 href={task.pr_url}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors"
+                className="flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors break-all min-w-0 min-h-[44px]"
               >
                 {task.pr_url}
-                <ExternalLink className="w-3.5 h-3.5" />
+                <ExternalLink className="w-3.5 h-3.5 shrink-0" />
               </a>
             )}
             {task.commit_hash && (
@@ -1257,10 +1303,10 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
                 href={`${task.repo_url}/pulls`}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors"
+                className="flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors min-h-[44px]"
               >
                 View Pull Requests
-                <ExternalLink className="w-3.5 h-3.5" />
+                <ExternalLink className="w-3.5 h-3.5 shrink-0" />
               </a>
             )}
           </div>
@@ -1272,10 +1318,10 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
             href={`${task.repo_url}/pulls`}
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors"
+            className="flex items-center gap-1.5 text-sm text-blue-400 hover:text-blue-300 transition-colors min-h-[44px]"
           >
             View Pull Requests
-            <ExternalLink className="w-3.5 h-3.5" />
+            <ExternalLink className="w-3.5 h-3.5 shrink-0" />
           </a>
         </>
       ) : null}
@@ -1294,12 +1340,12 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           <SectionHeader>Child Tasks</SectionHeader>
           <div className="space-y-1">
             {task.child_task_ids.map((childId) => (
-              <div key={childId} className="font-mono text-sm text-neutral-300 flex items-center gap-1.5">
-                <ChevronRight className="w-3 h-3 text-neutral-600" />
+              <div key={childId} className="font-mono text-sm text-neutral-300 flex items-center gap-1.5 flex-wrap min-w-0">
+                <ChevronRight className="w-3 h-3 text-neutral-600 shrink-0" />
                 {onNavigateToTask ? (
                   <button
                     onClick={() => onNavigateToTask(childId)}
-                    className="text-blue-400 hover:text-blue-300 transition-colors text-left"
+                    className="text-blue-400 hover:text-blue-300 transition-colors text-left break-all min-w-0"
                   >
                     {childId}
                   </button>

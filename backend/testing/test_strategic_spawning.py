@@ -468,6 +468,79 @@ async def test_operator_rejection_rate_absent_when_no_rejections(db_session):
 
 
 @pytest.mark.asyncio
+async def test_success_evidence_present_in_direction_stats(db_session):
+    """success_evidence/retirement_condition from context reach the direction stat entry, capped."""
+    long_evidence = "E" * 700
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-se01",
+                "status": "active",
+                "text": "Direction with stated outcome",
+                "priority": "medium",
+                "context": {
+                    "success_evidence": long_evidence,
+                    "retirement_condition": "  retire when X happens  ",
+                },
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-se01")
+
+    assert d_stat["success_evidence"] == "E" * 500, (
+        "success_evidence should be capped at 500"
+    )
+    assert d_stat["retirement_condition"] == "retire when X happens", (
+        "retirement_condition should be stripped and surfaced"
+    )
+
+
+@pytest.mark.asyncio
+async def test_success_evidence_absent_when_not_in_context(db_session):
+    """success_evidence/retirement_condition are omitted when not set on context."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-se02",
+                "status": "active",
+                "text": "Direction without stated outcome",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-se02")
+
+    assert "success_evidence" not in d_stat
+    assert "retirement_condition" not in d_stat
+
+
+@pytest.mark.asyncio
 async def test_operator_rejection_rate_uses_history_aggregate(db_session):
     """operator_rejection_rate aggregates from both research_history and history_aggregate."""
     project = _make_project(
@@ -2571,6 +2644,157 @@ async def test_strategic_review_payload_documents_recommended_mode(db_session):
 
 
 # ---------------------------------------------------------------------------
+# efficiency_snapshot in strategic payload
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_includes_efficiency_snapshot_when_data_present(
+    db_session,
+):
+    """efficiency_snapshot is present in the payload when baseline data exists."""
+    from unittest.mock import AsyncMock, patch
+
+    project = _make_project(
+        directions=[
+            {"id": "d-eff01", "status": "active", "text": "x", "priority": "medium"}
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _sample_snapshot = {
+        "axes": {
+            "cost_per_merged_pr": {
+                "current": 1.5,
+                "baseline": 2.0,
+                "drift_pct": -25.0,
+                "history": [],
+            },
+            "vm_reuse_rate": {
+                "current": 0.6,
+                "baseline": 0.5,
+                "drift_pct": 20.0,
+                "history": [],
+            },
+            "vm_cold_start_p50_ms": {
+                "current": 500.0,
+                "baseline": 600.0,
+                "drift_pct": -16.67,
+                "history": [],
+            },
+            "median_api_calls_per_task": {
+                "current": 40.0,
+                "baseline": 50.0,
+                "drift_pct": -20.0,
+                "history": [],
+            },
+            "median_review_iterations": {
+                "current": 1.5,
+                "baseline": 2.0,
+                "drift_pct": -25.0,
+                "history": [],
+            },
+        },
+        "baseline_captured_at": "2026-04-05T00:00:00",
+        "last_snapshot_at": "2026-05-01T00:00:00",
+    }
+
+    with patch(
+        "app.efficiency_snapshot.read_baseline_with_drift",
+        new=AsyncMock(return_value=_sample_snapshot),
+    ):
+        spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    payload = tasks[0].payloads[0]
+    assert "efficiency_snapshot" in payload
+    snap = payload["efficiency_snapshot"]
+    assert "axes" in snap
+    assert "cost_per_merged_pr" in snap["axes"]
+    assert snap["axes"]["cost_per_merged_pr"]["drift_pct"] == -25.0
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_omits_efficiency_snapshot_when_no_data(db_session):
+    """efficiency_snapshot is omitted when all current axis values are None."""
+    from unittest.mock import AsyncMock, patch
+
+    project = _make_project(
+        directions=[
+            {"id": "d-eff02", "status": "active", "text": "x", "priority": "medium"}
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _empty_snapshot = {
+        "axes": {
+            "cost_per_merged_pr": {
+                "current": None,
+                "baseline": None,
+                "drift_pct": None,
+                "history": [],
+            },
+            "vm_reuse_rate": {
+                "current": None,
+                "baseline": None,
+                "drift_pct": None,
+                "history": [],
+            },
+            "vm_cold_start_p50_ms": {
+                "current": None,
+                "baseline": None,
+                "drift_pct": None,
+                "history": [],
+            },
+            "median_api_calls_per_task": {
+                "current": None,
+                "baseline": None,
+                "drift_pct": None,
+                "history": [],
+            },
+            "median_review_iterations": {
+                "current": None,
+                "baseline": None,
+                "drift_pct": None,
+                "history": [],
+            },
+        },
+        "baseline_captured_at": None,
+        "last_snapshot_at": None,
+    }
+
+    with patch(
+        "app.efficiency_snapshot.read_baseline_with_drift",
+        new=AsyncMock(return_value=_empty_snapshot),
+    ):
+        spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    payload = tasks[0].payloads[0]
+    assert "efficiency_snapshot" not in payload
+
+
+# ---------------------------------------------------------------------------
 # _build_failure_feedback_mitigation unit tests
 # ---------------------------------------------------------------------------
 
@@ -2936,4 +3160,459 @@ async def test_drift_signals_survives_budget_pressure(db_session):
     # drift_signals must not be among the dropped fields
     assert "drift_signals" not in dropped_keys, (
         f"drift_signals should not be dropped; dropped={dropped_keys}"
+    )
+
+
+# ── version_phase: promotion_readiness + recent_versions enrichment ───────────
+
+
+async def _ensure_verdict_table(session):
+    """Create qualificationverdict table idempotently (mirrors test_release_qualifier pattern)."""
+    from app.models import QualificationVerdict as _QV
+
+    conn = await session.connection()
+    await conn.run_sync(lambda c: _QV.__table__.create(c, checkfirst=True))
+    await session.commit()
+
+
+async def _ensure_releaseversion_table(session):
+    """Create releaseversion table idempotently."""
+    from app.models import ReleaseVersion as _RV
+
+    conn = await session.connection()
+    await conn.run_sync(lambda c: _RV.__table__.create(c, checkfirst=True))
+    await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_version_phase_includes_promotion_readiness(db_session, mocker):
+    """When is_self_repo=True and QualificationVerdict rows exist, the strategic
+    payload's version_phase block carries promotion_readiness with ready,
+    would_promote_rate, and recurring_blockers keys."""
+    from datetime import datetime
+    from app.models import ReleaseVersion, QualificationVerdict
+
+    await _ensure_releaseversion_table(db_session)
+    await _ensure_verdict_table(db_session)
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Open version in stabilize phase
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    await db_session.refresh(version)
+
+    # Seed QualificationVerdict rows (promotion_enabled=False = dry-run regime)
+    for i in range(3):
+        db_session.add(
+            QualificationVerdict(
+                project_id=project.id,
+                release_version_id=version.id,
+                would_promote=True,
+                blocker=None,
+                confidence=0.85 + i * 0.01,
+                promotion_enabled=False,
+            )
+        )
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    vp = payload.get("version_phase")
+    assert vp is not None, "version_phase block should be present for is_self_repo=True"
+    pr = vp.get("promotion_readiness")
+    assert pr is not None, "promotion_readiness should be present when verdicts exist"
+    assert "ready" in pr, "promotion_readiness must have 'ready' key"
+    assert "would_promote_rate" in pr, (
+        "promotion_readiness must have 'would_promote_rate' key"
+    )
+    assert "recurring_blockers" in pr, (
+        "promotion_readiness must have 'recurring_blockers' key"
+    )
+
+
+@pytest.mark.asyncio
+async def test_version_phase_includes_recent_versions(db_session, mocker):
+    """When is_self_repo=True and closed ReleaseVersion rows exist, version_phase
+    carries a recent_versions list."""
+    from datetime import datetime, timedelta
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+
+    # One closed (promoted) version
+    closed = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=10),
+        promoted_at=now - timedelta(days=2),
+    )
+    db_session.add(closed)
+
+    # One open version
+    open_v = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="build",
+        status="open",
+        opened_at=now,
+    )
+    db_session.add(open_v)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    payload = tasks[0].payloads[0]
+
+    vp = payload.get("version_phase")
+    assert vp is not None
+    rv = vp.get("recent_versions")
+    assert rv is not None, (
+        "recent_versions should be present when closed versions exist"
+    )
+    assert isinstance(rv, list)
+    assert len(rv) >= 1
+    # Each entry should have version_number and status
+    for entry in rv:
+        assert "version_number" in entry
+        assert "status" in entry
+
+
+# ── stabilize-stall strategic nudge ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_stabilize_stall_hint_fires_for_old_stabilize_version(db_session, mocker):
+    """An open stabilize-phase version older than _STABILIZE_STALL_AGE_DAYS with
+    no qualification attempt gets a STALLED nudge in the strategic prompt_suffix
+    and a stabilize_stall block in version_phase."""
+    from datetime import timedelta
+    from app.models import ReleaseVersion
+    from app.release_qualifier import _STABILIZE_STALL_AGE_DAYS
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Version stuck in stabilize well past the age threshold
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="stabilize",
+        status="open",
+        opened_at=now - timedelta(days=_STABILIZE_STALL_AGE_DAYS + 5),
+        phase_changed_at=now - timedelta(days=_STABILIZE_STALL_AGE_DAYS + 5),
+        last_qualification=None,
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "STALLED" in suffix, (
+        f"Expected STALLED nudge in prompt_suffix; got: {suffix}"
+    )
+    assert "stabilize" in suffix.lower()
+
+    vp = payload.get("version_phase")
+    assert vp is not None
+    stall_block = vp.get("stabilize_stall")
+    assert stall_block is not None, (
+        "stabilize_stall block should appear in version_phase"
+    )
+    assert stall_block.get("age_days", 0) >= _STABILIZE_STALL_AGE_DAYS
+
+
+@pytest.mark.asyncio
+async def test_stabilize_stall_hint_suppressed_for_dry_run(db_session, mocker):
+    """A dry-run hold (passing candidate, promotion_enabled=False) is healthy
+    and must NOT trigger the stalled nudge."""
+    from datetime import timedelta
+    from app.models import ReleaseVersion
+    from app.release_qualifier import _STABILIZE_STALL_AGE_DAYS
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=4,
+        phase="stabilize",
+        status="open",
+        opened_at=now - timedelta(days=_STABILIZE_STALL_AGE_DAYS + 5),
+        phase_changed_at=now - timedelta(days=_STABILIZE_STALL_AGE_DAYS + 5),
+        last_qualification={"status": "dry_run", "candidate_sha": "abc123"},
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "STALLED" not in suffix, (
+        "dry_run hold should suppress the stabilize-stall nudge"
+    )
+    vp = payload.get("version_phase") or {}
+    assert "stabilize_stall" not in vp, (
+        "stabilize_stall block must not appear for dry_run hold"
+    )
+
+
+# ── build-stall strategic nudge ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_build_stall_nudge_counts_build_phase_merges_not_version_lifetime(
+    db_session, mocker
+):
+    """A version that cycled build→stabilize→build must NOT fire the build-stall
+    nudge prematurely based on the inflated version-lifetime merge count.
+
+    Setup: version re-entered the build phase recently (phase_changed_at = now).
+    There are many pre-phase-change tasks (version-lifetime count > threshold)
+    but zero post-phase-change tasks (phase-scoped count = 0).  The nudge must
+    NOT fire because neither age nor phase-scoped count exceed the threshold.
+    """
+    from app.models import ReleaseVersion
+    from app.release_qualifier import _BUILD_STALL_MERGED_TASKS
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    # Version just re-entered build phase (age = 0 days)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=5,
+        phase="build",
+        status="open",
+        opened_at=now - timedelta(days=60),
+        phase_changed_at=now,  # just re-entered build from stabilize
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    # Seed tasks merged BEFORE the phase transition (pre-phase-change, version-lifetime)
+    pre_phase_count = _BUILD_STALL_MERGED_TASKS + 5
+    for i in range(pre_phase_count):
+        t = Task(
+            project_id=project.id,
+            title=f"Pre-phase task {i}",
+            description="test",
+            payloads=[{"type": "create"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"pr_merged": True, "direction_id": "d-old"},
+        )
+        t.updated_at = now - timedelta(days=30 + i)
+        db_session.add(t)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "BUILD — STALLED" not in suffix, (
+        "build-stall nudge must NOT fire when phase-scoped count is 0 "
+        f"(only version-lifetime count {pre_phase_count} exceeds threshold); got: {suffix}"
+    )
+    vp = payload.get("version_phase") or {}
+    assert "build_stall" not in vp, (
+        "build_stall block must not appear when phase-scoped merge count is below threshold"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_stall_nudge_tasks_merged_field_is_phase_scoped(db_session, mocker):
+    """When the build-stall nudge fires, version_phase['build_stall']['tasks_merged']
+    must equal only the post-phase_changed_at merge count, not the version-lifetime count.
+    """
+    from app.models import ReleaseVersion
+    from app.release_qualifier import _BUILD_STALL_AGE_DAYS
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    # Version re-entered build phase past the age threshold
+    phase_entry = now - timedelta(days=_BUILD_STALL_AGE_DAYS + 2)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=6,
+        phase="build",
+        status="open",
+        opened_at=now - timedelta(days=60),
+        phase_changed_at=phase_entry,
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    # Tasks merged BEFORE phase re-entry (should NOT be counted by nudge)
+    for i in range(10):
+        t = Task(
+            project_id=project.id,
+            title=f"Pre-entry task {i}",
+            description="test",
+            payloads=[{"type": "create"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"pr_merged": True, "direction_id": "d-old"},
+        )
+        t.updated_at = phase_entry - timedelta(days=1 + i)
+        db_session.add(t)
+
+    # Tasks merged AFTER phase re-entry (should be counted)
+    post_phase_count = 3
+    for i in range(post_phase_count):
+        t = Task(
+            project_id=project.id,
+            title=f"Post-entry task {i}",
+            description="test",
+            payloads=[{"type": "create"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            context={"pr_merged": True, "direction_id": "d-new"},
+        )
+        t.updated_at = phase_entry + timedelta(hours=1 + i)
+        db_session.add(t)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    # Nudge fires because age threshold is exceeded
+    suffix = payload.get("prompt_suffix", "")
+    assert "BUILD — STALLED" in suffix, (
+        f"Expected build-stall nudge to fire on age; got: {suffix}"
+    )
+
+    vp = payload.get("version_phase") or {}
+    stall_block = vp.get("build_stall")
+    assert stall_block is not None, "build_stall block must appear in version_phase"
+    reported_merged = stall_block.get("tasks_merged")
+    assert reported_merged == post_phase_count, (
+        f"build_stall.tasks_merged should be phase-scoped count {post_phase_count}, "
+        f"not version-lifetime count; got {reported_merged}"
     )

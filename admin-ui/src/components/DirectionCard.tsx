@@ -559,6 +559,12 @@ function DirectionCardImpl({
               <span className="italic">{d.completion_criteria}</span>
             </p>
           )}
+          {d.context?.success_evidence && (
+            <p className="mt-1.5 text-[11px] text-neutral-500 leading-relaxed">
+              <span className="font-medium text-neutral-600">Success evidence: </span>
+              <span className="italic">{d.context.success_evidence}</span>
+            </p>
+          )}
           {/* Last researched / cooldown subtitle */}
           {key === 'active' && (() => {
             const cooldownStatus = getCooldownStatus(d, cooldownMinutes);
@@ -618,10 +624,17 @@ function DirectionCardImpl({
                   <AlertTriangle className="w-3 h-3 text-red-400 shrink-0 mt-0.5" />
                   <div className="flex-1 min-w-0">
                     <p className="text-[11px] text-red-300 font-medium leading-tight">Manual intervention needed</p>
-                    <p className="text-[10px] text-red-400/80 leading-relaxed mt-0.5">
-                      Auto-remediation escalated after {d.remediation_attempts ?? 0} failed attempt{(d.remediation_attempts ?? 0) !== 1 ? 's' : ''}.
-                      {d.diagnosis_summary && <span className="block mt-0.5 text-neutral-400 italic">{d.diagnosis_summary}</span>}
-                    </p>
+                    {d.paused_reason?.startsWith('Lifetime burn backstop:') && d.lifetime_burn_pause_evidence ? (
+                      <p className="text-[10px] text-red-400/80 leading-relaxed mt-0.5">
+                        Direction has accumulated {d.lifetime_burn_pause_evidence.lifetime_non_merge_finished} non-merging tasks with only {d.lifetime_burn_pause_evidence.lifetime_merged} merged ({Math.round(d.lifetime_burn_pause_evidence.lifetime_merge_rate * 100)}% lifetime rate).
+                        <span className="block mt-0.5">Operator decision required: retire this direction or reset its accumulated history.</span>
+                      </p>
+                    ) : (
+                      <p className="text-[10px] text-red-400/80 leading-relaxed mt-0.5">
+                        Auto-remediation escalated after {d.remediation_attempts ?? 0} failed attempt{(d.remediation_attempts ?? 0) !== 1 ? 's' : ''}.
+                        {d.diagnosis_summary && <span className="block mt-0.5 text-neutral-400 italic">{d.diagnosis_summary}</span>}
+                      </p>
+                    )}
                   </div>
                 </div>
               ) : (
@@ -864,6 +877,40 @@ function DirectionCardImpl({
               return (
                 <span className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-emerald-950/40 text-emerald-400 border-emerald-900/50">
                   Ready
+                </span>
+              );
+            })()}
+            {/* Churn warning badge — non-merge volume approaching or at auto-pause threshold */}
+            {d.churn_metrics && (() => {
+              const { non_merge_finished, merged, merge_rate, threshold, min_merge_rate, window_cycles } = d.churn_metrics;
+              const atThreshold = non_merge_finished >= threshold && merge_rate < min_merge_rate;
+              const approaching = non_merge_finished >= Math.floor(threshold * 0.5) && merge_rate < min_merge_rate * 2;
+              if (!approaching && !atThreshold) return null;
+              const color = atThreshold ? 'red' : 'amber';
+              return (
+                <span
+                  title={`Non-merge churn: ${non_merge_finished} tasks finished without merging, ${merged} merged in last ${window_cycles} cycles — ${Math.round(merge_rate * 100)}% merge rate (pause threshold: ${threshold} tasks at <${Math.round(min_merge_rate * 100)}% rate)`}
+                  className={`text-[10px] px-1.5 py-0.5 rounded border font-medium bg-${color}-950/40 border-${color}-900/50 text-${color}-400`}
+                >
+                  {non_merge_finished}/{threshold} non-merge · {Math.round(merge_rate * 100)}%
+                </span>
+              );
+            })()}
+            {/* Outcome-less scaffolding warning — advisory: long-running direction
+                keeps merging PRs at a healthy rate but shows no progress toward its
+                stated success_evidence. A consideration to surface, not an enforced pause. */}
+            {d.outcome_scaffolding_flagged && (() => {
+              const ev = d.outcome_scaffolding_evidence;
+              const tooltip = ev
+                ? `Possible outcome-less scaffolding: ${ev.total_cycles} cycles, ${ev.lifetime_merged} merges at ${Math.round(ev.lifetime_merge_rate * 100)}% rate, but progress toward success_evidence has been flat for the last ${ev.stall_run_cycles} cycles. Advisory only — consider whether this direction is still advancing its goal.`
+                : 'Possible outcome-less scaffolding: keeps merging PRs but shows no progress toward its stated success_evidence. Advisory only.';
+              return (
+                <span
+                  title={tooltip}
+                  className="text-[10px] px-1.5 py-0.5 rounded border font-medium bg-amber-950/40 border-amber-900/50 text-amber-400"
+                >
+                  Outcome-less scaffolding?
+                  {ev ? ` · ${ev.stall_run_cycles}-cycle stall` : ''}
                 </span>
               );
             })()}

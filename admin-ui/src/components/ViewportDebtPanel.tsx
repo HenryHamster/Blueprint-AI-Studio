@@ -12,6 +12,7 @@ export interface ViewportDebtRow {
   total_opt_outs: number;
   has_viewport_test: boolean;
   regression_case_count: number;
+  regression_case_breakdown?: Record<string, number>;
   source_url: string | null;
   introducing_pr_number?: number | null;
   introducing_commit_sha?: string | null;
@@ -28,6 +29,49 @@ interface ViewportDebtResponse {
   untested_rows?: ViewportDebtRow[];
   scanned_at: string;
   coverage_summary?: CoverageSummary;
+}
+
+function formatBreakdown(breakdown: Record<string, number>): string {
+  return Object.entries(breakdown)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([type, count]) => count + ' ' + type)
+    .join(', ');
+}
+
+function renderMobileDebtRow(row: ViewportDebtRow) {
+  const shortName = row.component
+    .replace(/^admin-ui\/src\/components\//, '')
+    .replace(/\.tsx$/, '');
+  return (
+    <div key={row.component} className="px-3 py-2 text-[10px]">
+      <div className="flex items-start justify-between gap-2 mb-1">
+        <span className="font-mono text-neutral-300 break-all" title={row.component}>{shortName}</span>
+        <div className="flex items-center gap-1 shrink-0">
+          {row.has_viewport_test ? (
+            <CheckCircle className="w-3 h-3 text-emerald-400" />
+          ) : (
+            <XCircle className="w-3 h-3 text-red-400" />
+          )}
+          {row.source_url && isSafeUrl(row.source_url) && (
+            <a href={row.source_url} target="_blank" rel="noopener noreferrer"
+              className="text-neutral-500 hover:text-neutral-300 inline-flex items-center justify-center min-h-[44px] min-w-[44px]"
+              aria-label={`Open source for ${shortName}`}>
+              <ExternalLink className="w-3 h-3" />
+            </a>
+          )}
+        </div>
+      </div>
+      <div className="grid grid-cols-3 gap-x-2 gap-y-0.5 text-neutral-500">
+        <span>eslint: <span className={row.eslint_disable_count > 0 ? 'text-amber-400 font-medium' : 'text-neutral-600'}>{row.eslint_disable_count}</span></span>
+        <span>target: <span className={row.data_viewport_allow_small_target > 0 ? 'text-amber-400 font-medium' : 'text-neutral-600'}>{row.data_viewport_allow_small_target}</span></span>
+        <span>overflow: <span className={row.data_viewport_allow_overflow > 0 ? 'text-amber-400 font-medium' : 'text-neutral-600'}>{row.data_viewport_allow_overflow}</span></span>
+        <span>trunc: <span className={row.data_viewport_allow_truncation > 0 ? 'text-amber-400 font-medium' : 'text-neutral-600'}>{row.data_viewport_allow_truncation}</span></span>
+        <span className="col-span-2">total: <span className={row.total_opt_outs > 0 ? 'text-white font-semibold' : 'text-neutral-600'}>{row.total_opt_outs}</span>
+          {row.regression_case_count > 0 && <span className="ml-2 text-red-400">{row.regression_case_count} case{row.regression_case_count !== 1 ? 's' : ''}</span>}
+        </span>
+      </div>
+    </div>
+  );
 }
 
 function renderDebtRow(row: ViewportDebtRow) {
@@ -76,6 +120,11 @@ function renderDebtRow(row: ViewportDebtRow) {
         <span className={row.regression_case_count > 0 ? 'text-red-400 font-medium' : 'text-neutral-600'}>
           {row.regression_case_count > 0 ? row.regression_case_count : '—'}
         </span>
+        {row.regression_case_count > 0 && row.regression_case_breakdown && (
+          <span className="block text-[9px] text-neutral-500 leading-tight whitespace-nowrap">
+            {formatBreakdown(row.regression_case_breakdown)}
+          </span>
+        )}
         {row.regression_case_count > 0 && row.introducing_pr_number != null && (
           <span
             className="block text-[9px] text-neutral-500 leading-tight"
@@ -182,44 +231,54 @@ export function ViewportDebtPanel({ projectId }: { projectId: string }) {
             {' '}component{remainingUntested.length === 1 ? '' : 's'} not shown.
           </div>
         )}
-        <div className="overflow-x-auto" data-viewport-allow-overflow>
-          {/* eslint-disable-next-line viewport/no-fixed-width -- intentional scrollable table on mobile; overflow contained by parent overflow-x-auto */}
-          <table className="w-full text-[10px] min-w-[520px]">
-            <thead>
-              <tr className="border-b border-neutral-800/50 text-neutral-500">
-                <th className="text-left px-3 py-1.5 font-medium">Component</th>
-                <th className="text-right px-2 py-1.5 font-medium" title="eslint-disable viewport/min-touch-target lines">eslint</th>
-                <th className="text-right px-2 py-1.5 font-medium" title="data-viewport-allow-small-target attributes">target</th>
-                <th className="text-right px-2 py-1.5 font-medium" title="data-viewport-allow-overflow attributes">overflow</th>
-                <th className="text-right px-2 py-1.5 font-medium" title="data-viewport-allow-truncation attributes">trunc</th>
-                <th className="text-right px-2 py-1.5 font-medium" title="Total opt-out count">total</th>
-                <th className="text-center px-2 py-1.5 font-medium">test</th>
-                <th className="text-right px-2 py-1.5 font-medium" title="Viewport regression dispatcher cases (30d)">cases</th>
-                <th className="px-2 py-1.5"></th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-neutral-800/30">
-              {renderRowGroup(visibleOptOutRows)}
-            </tbody>
-            {visibleUntestedRows.length > 0 && (
-              <>
-                <tbody>
-                  <tr className="border-t border-neutral-800/50">
-                    <td
-                      colSpan={9}
-                      className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-neutral-500 bg-neutral-900/40"
-                    >
-                      Untested (no viewport test)
-                    </td>
-                  </tr>
-                </tbody>
-                <tbody className="divide-y divide-neutral-800/30">
-                  {renderRowGroup(visibleUntestedRows)}
-                </tbody>
-              </>
-            )}
-          </table>
+        {/* Mobile: stacked card layout */}
+        <div className="sm:hidden divide-y divide-neutral-800/30">
+          {visibleOptOutRows.map((row) => renderMobileDebtRow(row))}
+          {visibleUntestedRows.length > 0 && (
+            <>
+              <div className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-neutral-500 bg-neutral-900/40 border-t border-neutral-800/50">
+                Untested (no viewport test)
+              </div>
+              {visibleUntestedRows.map((row) => renderMobileDebtRow(row))}
+            </>
+          )}
         </div>
+        {/* Desktop: table layout */}
+        <table className="hidden sm:table w-full text-[10px]">
+          <thead>
+            <tr className="border-b border-neutral-800/50 text-neutral-500">
+              <th className="text-left px-3 py-1.5 font-medium">Component</th>
+              <th className="text-right px-2 py-1.5 font-medium" title="viewport/* rule suppression count (eslint-disable lines)">eslint</th>
+              <th className="text-right px-2 py-1.5 font-medium" title="viewport small-target override count">target</th>
+              <th className="text-right px-2 py-1.5 font-medium" title="viewport overflow override count">overflow</th>
+              <th className="text-right px-2 py-1.5 font-medium" title="viewport truncation override count">trunc</th>
+              <th className="text-right px-2 py-1.5 font-medium" title="Total opt-out count">total</th>
+              <th className="text-center px-2 py-1.5 font-medium">test</th>
+              <th className="text-right px-2 py-1.5 font-medium" title="Viewport regression dispatcher cases (30d)">cases</th>
+              <th className="px-2 py-1.5"></th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-neutral-800/30">
+            {renderRowGroup(visibleOptOutRows)}
+          </tbody>
+          {visibleUntestedRows.length > 0 && (
+            <>
+              <tbody>
+                <tr className="border-t border-neutral-800/50">
+                  <td
+                    colSpan={9}
+                    className="px-3 py-1.5 text-[10px] uppercase tracking-wider text-neutral-500 bg-neutral-900/40"
+                  >
+                    Untested (no viewport test)
+                  </td>
+                </tr>
+              </tbody>
+              <tbody className="divide-y divide-neutral-800/30">
+                {renderRowGroup(visibleUntestedRows)}
+              </tbody>
+            </>
+          )}
+        </table>
       </div>
     </section>
   );

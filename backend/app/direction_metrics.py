@@ -26,6 +26,8 @@ _HISTORY_AGG_DEFAULTS = {
     "total_prs_merged": 0,
     "total_prs_rejected": 0,
     "total_tasks_failed": 0,
+    "total_tasks_failed_infra": 0,
+    "total_tasks_completed": 0,
     "total_tasks_cancelled": 0,
     "first_cycle_at": None,
     "total_autonomous_prs_merged": 0,
@@ -59,6 +61,8 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         agg["total_prs_merged"] += ev.get("prs_merged", 0)
         agg["total_prs_rejected"] += ev.get("prs_rejected", 0)
         agg["total_tasks_failed"] += ev.get("tasks_failed", 0)
+        agg["total_tasks_failed_infra"] += ev.get("tasks_failed_infra", 0)
+        agg["total_tasks_completed"] += ev.get("tasks_completed", 0)
         agg["total_tasks_cancelled"] += ev.get("tasks_cancelled", 0)
         # Legacy fallback: pre-attribution entries have no autonomous_prs_merged;
         # treat all merges as autonomous so CPM is conservative for old data.

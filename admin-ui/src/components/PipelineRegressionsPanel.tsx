@@ -4,6 +4,7 @@ import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tool
 import { apiFetch, fetchCanonicalRegressionLayers, CANONICAL_LAYER_NAMES } from '../api';
 import type { MttaClassRow, RegressionMttaResponse, CanonicalRegressionLayer } from '../api';
 import { timeAgo, parseTimestamp, formatTimeToDetect, formatTimeToInvestigate } from '../utils/time';
+import { parseViewportSubkey } from '../utils/viewportRegression';
 import { LayersAffectedBadges, type LayerSummary } from './LayersAffectedBadges';
 import { PhaseChip } from './regressionPhaseChips';
 
@@ -109,7 +110,7 @@ export function DispatcherHealthPanel({ projectId }: Props) {
         <div className="space-y-2">
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex flex-wrap gap-x-4 gap-y-1">
             <span><span className="text-white font-medium">{data.aggregate.cycles}</span> cycles</span>
-            <span><span className="text-white font-medium">{data.aggregate.signals_tripped}</span> signals tripped</span>
+            <span>signals: <span className="text-white font-medium">{data.aggregate.signals_evaluated}</span> checked, <span className="text-white font-medium">{data.aggregate.signals_tripped}</span> tripped</span>
             <span><span className="text-emerald-400 font-medium">{data.aggregate.spawns}</span> spawns</span>
             <span><span className="text-amber-400 font-medium">{data.aggregate.rejections.cooldown}</span> cooldown</span>
             <span><span className="text-red-400 font-medium">{data.aggregate.rejections.system_cap}</span> cap</span>
@@ -171,13 +172,13 @@ export function ClassKpisPanel({ projectId, filterClass, onClassSelect }: Props)
           <option value={720}>30d</option>
         </select>
       </div>
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-x-auto">
         <table className="w-full text-[10px]">
           <thead>
             <tr className="border-b border-neutral-800/50 text-neutral-500">
               <th className="text-left px-3 py-1.5 font-medium">Class</th>
-              <th className="text-right px-2 py-1.5 font-medium">Opened</th>
-              <th className="text-right px-2 py-1.5 font-medium">Closed</th>
+              <th className="text-right px-2 py-1.5 font-medium hidden sm:table-cell">Opened</th>
+              <th className="text-right px-2 py-1.5 font-medium hidden sm:table-cell">Closed</th>
               <th className="text-right px-2 py-1.5 font-medium">MTTD</th>
               <th className="text-right px-2 py-1.5 font-medium">MTTR</th>
               <th className="text-right px-3 py-1.5 font-medium">Success</th>
@@ -193,8 +194,8 @@ export function ClassKpisPanel({ projectId, filterClass, onClassSelect }: Props)
                   className={`transition-colors ${onClassSelect ? 'cursor-pointer' : ''} ${active ? 'bg-blue-950/30' : onClassSelect ? 'hover:bg-neutral-800/30' : ''}`}
                 >
                   <td className="px-3 py-1.5 max-w-[160px] overflow-hidden"><RegressionClassLabel cls={row.regression_class} /></td>
-                  <td className="px-2 py-1.5 text-right text-white">{row.cases_opened}</td>
-                  <td className="px-2 py-1.5 text-right text-emerald-400">{row.cases_closed}</td>
+                  <td className="px-2 py-1.5 text-right text-white hidden sm:table-cell">{row.cases_opened}</td>
+                  <td className="px-2 py-1.5 text-right text-emerald-400 hidden sm:table-cell">{row.cases_closed}</td>
                   <td className="px-2 py-1.5 text-right text-neutral-400">{formatMttd(row.mean_time_to_detect_seconds)}</td>
                   <td className="px-2 py-1.5 text-right text-neutral-400">{formatMttd(row.mean_time_to_remediate_seconds)}</td>
                   <td className="px-3 py-1.5 text-right">
@@ -244,6 +245,7 @@ interface ManualInterventionCase {
   recurrence_count?: number;
   layer_summary?: LayerSummary | null;
   untargeted_layers?: string[];
+  failure_screenshot_url?: string | null;
 }
 
 const ESCALATION_REASON_LABELS: Record<string, string> = {
@@ -375,43 +377,37 @@ function snapshotSummary(snap: Record<string, unknown> | null): string {
   return entries.length ? entries.join(', ') : '—';
 }
 
-/** Collapsible image disclosure for viewport_regression cases. Shows the saved
- * baseline PNG (written by viewport.ts when VITE_CAPTURE_BASELINES=true); falls
- * back gracefully when no baseline exists yet. */
-function ViewportBaselineDisclosure({ regressionClass }: { regressionClass: string }) {
+/** Collapsible failure-screenshot disclosure for viewport_regression cases.
+ * Shows the GCS-stored failure PNG so the operator can inspect it without
+ * leaving the admin UI. Hidden when no screenshot URL is available (baselines
+ * were never persisted or served, so only the actual failure image is shown). */
+function ViewportBaselineDisclosure({ regressionClass, failureScreenshotUrl }: {
+  regressionClass: string;
+  failureScreenshotUrl?: string | null;
+}) {
   const [open, setOpen] = useState(false);
-  const [missing, setMissing] = useState(false);
+  const [failureMissing, setFailureMissing] = useState(false);
 
-  // regression_class format: "viewport_regression:ComponentName@375"
+  if (!failureScreenshotUrl) return null;
+
   const inner = regressionClass.slice('viewport_regression:'.length);
-  const atIdx = inner.lastIndexOf('@');
-  const component = atIdx !== -1 ? inner.slice(0, atIdx) : inner;
-  const width = atIdx !== -1 ? inner.slice(atIdx + 1) : '375';
-  // viewport.ts strips ".viewport.test.tsx" suffix when naming the file
+  const { component, width = '375' } = parseViewportSubkey(inner);
   const stem = component.replace(/\.viewport\.test\.tsx$/i, '');
-  const baselineUrl = `/viewport-baselines/${stem}-${width}px.png`;
 
   return (
     <div className="mt-1.5">
-      {/* eslint-disable-next-line viewport/min-touch-target -- inline disclosure toggle in dense regression row */}
       <button type="button" onClick={() => setOpen(v => !v)}
         className="flex items-center gap-1 text-[10px] text-violet-400 hover:text-violet-300 transition-colors">
         {open ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-        images
+        failure screenshot
       </button>
-      {open && (
+      {open && !failureMissing && (
         <div className="mt-1 space-y-1">
-          <div className="text-[9px] text-neutral-500 font-medium uppercase tracking-wide">Baseline (passing at {width}px)</div>
-          {missing ? (
-            <div className="text-[9px] text-neutral-600 italic">
-              no baseline yet — captured on main when VITE_CAPTURE_BASELINES=true
-            </div>
-          ) : (
-            <img src={baselineUrl} alt={`${stem} at ${width}px`}
-              style={{ maxWidth: `${width}px` }}
-              className="rounded border border-neutral-700/50 max-w-full"
-              onError={() => setMissing(true)} />
-          )}
+          <div className="text-[9px] text-red-400 font-medium uppercase tracking-wide">Latest failure</div>
+          <img src={failureScreenshotUrl} alt={`${stem} failure at ${width}px`}
+            style={{ maxWidth: `${width}px` }}
+            className="rounded border border-red-900/40 max-w-full"
+            onError={() => setFailureMissing(true)} />
         </div>
       )}
     </div>
@@ -662,7 +658,7 @@ export function ManualInterventionPanel({ projectId, filterClass }: Props) {
                       );
                     })()}
                     {c.regression_class.startsWith('viewport_regression:') && (
-                      <ViewportBaselineDisclosure regressionClass={c.regression_class} />
+                      <ViewportBaselineDisclosure regressionClass={c.regression_class} failureScreenshotUrl={c.failure_screenshot_url} />
                     )}
                   </div>
                 </div>
@@ -1223,6 +1219,79 @@ export function EscalationOutcomePanel({ projectId }: Props) {
                 </td>
               </tr>
             ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+interface ComplianceTrendWindow {
+  window_start: string;
+  window_end: string;
+  first_attempt_compliant: number;
+  followup_rescued: number;
+  awaiting_backfill: number;
+  rate: number | null;
+}
+
+interface FirstAttemptComplianceTrendData {
+  windows: ComplianceTrendWindow[];
+  num_windows: number;
+  window_days: number;
+  generated_at: string;
+}
+
+export function FirstAttemptComplianceTrendPanel({ projectId }: Props) {
+  const [data, setData] = useState<FirstAttemptComplianceTrendData | null>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch(`/api/admin/regression-cases/first-attempt-compliance-trend?project_id=${encodeURIComponent(projectId)}`)
+      .then(async (res) => { if (!cancelled && res.ok) setData(await res.json()); })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setLoaded(true); });
+    return () => { cancelled = true; };
+  }, [projectId]);
+
+  if (!loaded || !data || !Array.isArray(data.windows)) return null;
+  if (!data.windows.some(w => w.first_attempt_compliant + w.followup_rescued + w.awaiting_backfill > 0)) return null;
+
+  return (
+    <section data-testid="first-attempt-compliance-trend-panel" className="mb-4">
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2 flex items-center gap-1.5">
+        <Shield className="w-3 h-3" />
+        Cross-Layer First-Attempt Rate ({data.window_days}d windows)
+      </h2>
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+        <table className="w-full text-[10px]">
+          <thead>
+            <tr className="border-b border-neutral-800/50 text-neutral-500">
+              <th className="text-left px-3 py-1.5 font-medium">Window end</th>
+              <th className="text-right px-2 py-1.5 font-medium">1st-ok</th>
+              <th className="text-right px-2 py-1.5 font-medium">rescued</th>
+              <th className="text-right px-2 py-1.5 font-medium">pending</th>
+              <th className="text-right px-3 py-1.5 font-medium">Rate</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-neutral-800/30">
+            {data.windows.map((w) => {
+              const label = new Date(w.window_end).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+              const rateColor = w.rate === null ? 'text-neutral-600' : w.rate >= 0.8 ? 'text-emerald-400' : w.rate >= 0.5 ? 'text-amber-400' : 'text-red-400';
+              const anyData = w.first_attempt_compliant + w.followup_rescued + w.awaiting_backfill > 0;
+              return (
+                <tr key={w.window_end} className={anyData ? '' : 'opacity-30'}>
+                  <td className="px-3 py-1.5 text-neutral-400">{label}</td>
+                  <td className="px-2 py-1.5 text-right text-emerald-400">{w.first_attempt_compliant > 0 ? w.first_attempt_compliant : <span className="text-neutral-700">—</span>}</td>
+                  <td className="px-2 py-1.5 text-right text-amber-400">{w.followup_rescued > 0 ? w.followup_rescued : <span className="text-neutral-700">—</span>}</td>
+                  <td className="px-2 py-1.5 text-right text-neutral-500">{w.awaiting_backfill > 0 ? w.awaiting_backfill : <span className="text-neutral-700">—</span>}</td>
+                  <td className={`px-3 py-1.5 text-right font-medium ${rateColor}`}>
+                    {w.rate !== null ? `${Math.round(w.rate * 100)}%` : '—'}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>

@@ -34,7 +34,11 @@ async def test_warm_vm_state_empty(client: AsyncClient, db_session):
         assert body["warm_pin_metrics"]["clears_last_24h"] == 0
         assert body["warm_pin_metrics"]["active_pinned_queued_total"] == 0
         assert body["warm_pin_metrics"]["active_warm_chains"] == 0
+        assert body["warm_pin_metrics"]["active_backlog_reuse_claims"] == 0
+        assert body["warm_pin_metrics"]["active_chain_continuity_claims"] == 0
         assert "warm_continuity_enabled" in body
+        assert "warm_backlog_reuse_enabled" in body
+        assert isinstance(body["warm_backlog_reuse_enabled"], bool)
         assert isinstance(body["next_role_poll_timeout_secs"], int)
     finally:
         _shared_state.vm_last_heartbeat.clear()
@@ -148,6 +152,69 @@ async def test_warm_vm_state_active_chain(client: AsyncClient, db_session):
         _shared_state.vm_last_heartbeat.update(saved_hb)
         _shared_state.warm_pin_clear_events.clear()
         _shared_state.warm_pin_clear_events.extend(saved_clears)
+
+
+@pytest.mark.asyncio
+async def test_warm_vm_state_backlog_reuse_attribution(client: AsyncClient, db_session):
+    """A backlog-reuse warm-start claim is attributed distinctly from chain
+    continuity: it counts toward active_backlog_reuse_claims (not chain), and
+    the per-VM current_task exposes warm_claim_origin == 'backlog_reuse'."""
+    saved_hb = dict(_shared_state.vm_last_heartbeat)
+    _shared_state.vm_last_heartbeat.clear()
+
+    project = Project(name="Backlog-Reuse Test", user_id="test-user-456")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-backlog-reuse"
+    _shared_state.record_vm_heartbeat(vm_id)
+
+    current = Task(
+        project_id=project.id,
+        title="feat: a backlog-reused task",
+        payloads=[{"type": "create"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+        started_at=datetime.utcnow(),
+        last_heartbeat=datetime.utcnow(),
+        context={
+            "_timing": {
+                "warm_start": True,
+                "warm_claim_origin": "backlog_reuse",
+                "prior_role_vm_id": vm_id,
+                "setup_secs": 2.1,
+            }
+        },
+    )
+    db_session.add(current)
+    await db_session.commit()
+    try:
+        resp = await client.get("/api/admin/warm-vm-state")
+        assert resp.status_code == 200
+        body = resp.json()
+        ours = next(
+            (v for v in body["active_vms"] if v["vm_instance_id"] == vm_id), None
+        )
+        assert ours is not None, f"vm {vm_id} missing from {body['active_vms']}"
+        cur = ours["current_task"]
+        assert cur is not None
+        assert cur["warm_start"] is True
+        assert cur["warm_claim_origin"] == "backlog_reuse"
+
+        metrics = body["warm_pin_metrics"]
+        assert metrics["active_backlog_reuse_claims"] >= 1
+        # This warm-start task is backlog reuse, so it must NOT inflate the
+        # chain-continuity count, and the two partitions must never exceed the
+        # total warm-chain population.
+        assert (
+            metrics["active_backlog_reuse_claims"]
+            + metrics["active_chain_continuity_claims"]
+            == metrics["active_warm_chains"]
+        )
+    finally:
+        _shared_state.vm_last_heartbeat.clear()
+        _shared_state.vm_last_heartbeat.update(saved_hb)
 
 
 @pytest.mark.asyncio

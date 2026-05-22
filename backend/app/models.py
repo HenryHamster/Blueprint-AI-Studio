@@ -94,6 +94,7 @@ class ArtifactType(str, Enum):
     INVESTIGATION_REPORT = "INVESTIGATION_REPORT"
     SELF_AUDIT_REPORT = "SELF_AUDIT_REPORT"
     RELEASE_AUDIT_REPORT = "RELEASE_AUDIT_REPORT"
+    MEMO = "MEMO"
 
 
 class LLMProviderName(str, Enum):
@@ -357,6 +358,71 @@ class MessagesLastSeen(SQLModel, table=True):
     __table_args__ = (
         UniqueConstraint(
             "user_id", "project_id", name="uq_messageslastseen_user_project"
+        ),
+    )
+
+
+class MessagesNoisePrefs(SQLModel, table=True):
+    """Per-operator, per-project messages-panel noise-control preferences.
+
+    Persists the operator's per-event-type visibility choices and saved filter
+    views server-side so they follow the operator across devices. localStorage
+    remains the offline fallback; this table is the authoritative source when
+    the backend is reachable.
+
+    prefs shape (stored as JSONB, validated by the admin_notifications router):
+      {
+        "event_type_visibility": {<event_type>: "show"|"mute"|"routine"},
+        "saved_filter_views": [{"name": str, "filters": {...}}, ...]
+      }
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    user_id: str = Field(index=True, max_length=128)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    prefs: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "project_id", name="uq_messagesnoiseprefs_user_project"
+        ),
+    )
+
+
+class MessagesSavedViews(SQLModel, table=True):
+    """Per-operator, per-project saved views for the messages panel.
+
+    Persists named filter/sort combinations (saved views) server-side so they
+    follow the operator across devices. localStorage remains the offline fallback;
+    this table is the authoritative source when the backend is reachable.
+
+    saved_views shape (stored as JSONB, validated by the admin_notifications router):
+      [{"name": str, "query": str, "event_prefs": {...}, "sort_mode": str,
+        "show_resolved": bool, "show_routine": bool, "only_new": bool}, ...]
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    user_id: str = Field(index=True, max_length=128)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    saved_views: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "project_id", name="uq_messagessavedviews_user_project"
         ),
     )
 
@@ -888,7 +954,17 @@ class Alert(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
 
-    __table_args__ = (Index("ix_alert_task_id_dismissed", "task_id", "dismissed_at"),)
+    __table_args__ = (
+        Index("ix_alert_task_id_dismissed", "task_id", "dismissed_at"),
+        Index("ix_alert_project_id_dismissed", "project_id", "dismissed_at"),
+    )
+
+
+# Keys used in StrategicCycle.cycle_metadata for per-cycle memo-pathway tracking.
+# Stored as plain integers so operators and digest endpoints can read them without
+# knowing the exact key strings.
+CYCLE_META_MEMOS_AVAILABLE = "memos_available"
+CYCLE_META_MEMOS_CITED = "memos_cited"
 
 
 class StrategicCycle(SQLModel, table=True):
@@ -999,6 +1075,18 @@ class StrategicCycle(SQLModel, table=True):
             "completed_at": self.completed_at.isoformat()
             if self.completed_at
             else None,
+        }
+
+    def memo_stats(self) -> Dict[str, int]:
+        """Return per-cycle memo counts from cycle_metadata.
+
+        Keys match CYCLE_META_MEMOS_AVAILABLE / CYCLE_META_MEMOS_CITED constants.
+        Returns zeros when not yet recorded (cycle in progress or pre-feature rows).
+        """
+        meta = self.cycle_metadata or {}
+        return {
+            CYCLE_META_MEMOS_AVAILABLE: int(meta.get(CYCLE_META_MEMOS_AVAILABLE) or 0),
+            CYCLE_META_MEMOS_CITED: int(meta.get(CYCLE_META_MEMOS_CITED) or 0),
         }
 
 
@@ -1747,6 +1835,16 @@ class RegressionRemediationCase(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    # Running count of compliance follow-up tasks spawned for this case.
+    # The dispatcher compares this against a max cap to prevent a cross-layer
+    # mandate that is permanently unsatisfiable (e.g. requires unmodifiable
+    # CI_WORKFLOW layer) from re-spawning a compliance-followup indefinitely.
+    # Incremented each time _run_compliance_followup_once spawns a task for
+    # this case; never decremented. Migration: alembic 0102.
+    compliance_followup_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
     # Attribution for the PR/commit that introduced this regression. Set when
     # a new case is first created or re-tripped after CLOSED. Null for legacy
     # rows and cases where attribution could not be determined.
@@ -1808,11 +1906,36 @@ class RegressionRemediationCase(SQLModel, table=True):
         delta = int((self.investigate_spawned_at - self.first_seen_at).total_seconds())
         return delta if delta >= 0 else None
 
+    def _current_episode_investigate_start(self) -> datetime | None:
+        """Return the investigation-start anchor for the current fix episode.
+
+        For the first episode this equals investigate_spawned_at.  After each
+        completed recovery cycle (mark_closed writes a recovered_at entry) the
+        anchor advances to that cycle's recovered_at, so per-episode
+        investigate→merge durations are not inflated by earlier cycles.
+        This mirrors the ep_investigate_start advancement applied by
+        get_regression_mtta / get_regression_mtta_data.
+        """
+        anchor = self.investigate_spawned_at
+        for entry in self.fingerprint_to_fix_log or []:
+            if not isinstance(entry, dict):
+                continue
+            recovered_raw = entry.get("recovered_at")
+            if recovered_raw:
+                try:
+                    anchor = datetime.fromisoformat(
+                        str(recovered_raw).replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
+                except (ValueError, TypeError):
+                    pass
+        return anchor
+
     def mark_merged(
         self,
         pr_number: int,
         signal_snapshot: Dict[str, Any],
         layers_targeted: List[str] | None = None,
+        recommended_unmodifiable_layers: List[str] | None = None,
         *,
         spawn_was_cross_layer: bool = False,
         spawn_layers_enumerated: List[str] | None = None,
@@ -1832,6 +1955,11 @@ class RegressionRemediationCase(SQLModel, table=True):
         "unclassified", not "no layers". Existing fix-log entries written
         before this field existed remain readable everywhere.
 
+        ``recommended_unmodifiable_layers`` (optional) records layers the agent
+        identified as needing changes but could not modify (e.g. CI_WORKFLOW).
+        Credited toward the >=2-layer compliance total by the watchdog so a fix
+        that correctly documents an unmodifiable layer is not flagged non-compliant.
+
         ``spawn_was_cross_layer`` / ``spawn_layers_enumerated`` record the
         dispatcher's cross-layer escalation context at spawn time so the
         compliance metric can compare layers observed vs layers touched.
@@ -1842,17 +1970,27 @@ class RegressionRemediationCase(SQLModel, table=True):
         self.signal_snapshot_at_merge = signal_snapshot
         self.last_remediation_pr_number = pr_number
         self.last_remediation_result = "merged"
+        ep_start = self._current_episode_investigate_start()
         log_entry: Dict[str, Any] = {
             "fingerprint": self.regression_class,
             "fix_pr_number": pr_number,
             "merged_at": _utcnow().isoformat(),
         }
+        if ep_start is not None:
+            log_entry["episode_investigate_started_at"] = ep_start.isoformat()
         if layers_targeted:
             log_entry["layers_targeted"] = list(layers_targeted)
+        if recommended_unmodifiable_layers:
+            log_entry["recommended_unmodifiable_layers"] = list(
+                recommended_unmodifiable_layers
+            )
         if spawn_was_cross_layer:
             log_entry["spawn_was_cross_layer"] = True
             log_entry["spawn_layers_enumerated"] = list(spawn_layers_enumerated or [])
-        self.fingerprint_to_fix_log = [*list(self.fingerprint_to_fix_log or []), log_entry]
+        self.fingerprint_to_fix_log = [
+            *list(self.fingerprint_to_fix_log or []),
+            log_entry,
+        ]
         self.status = RegressionCaseStatus.MERGED
 
     def mark_closed(
@@ -1877,7 +2015,10 @@ class RegressionRemediationCase(SQLModel, table=True):
                 "recovered_at": recovered_at or _utcnow().isoformat(),
                 "post_merge_value": post_merge_value,
             }
-            self.fingerprint_to_fix_log = [*list(self.fingerprint_to_fix_log or []), entry]
+            self.fingerprint_to_fix_log = [
+                *list(self.fingerprint_to_fix_log or []),
+                entry,
+            ]
 
     def prior_attempt_context_suffix(self) -> str:
         """Return a formatted prior-attempt context block for re-spawned prompts.
@@ -2219,6 +2360,58 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(Text, nullable=True),
     )
 
+    # Durable deduplication anchor for calcification alerting.
+    # Set to the blocker code when _check_version_calcification posts an alert.
+    # The next sweep compares this field against the current blocker: if they
+    # match, the alert has already been posted for this stall and is skipped;
+    # if they differ (or the field is NULL), a new alert is warranted.
+    # Storing the dedup state here avoids relying solely on Alert row existence
+    # (which can be lost when an operator clears alerts).
+    calcification_alerted_blocker: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True),
+    )
+
+    # Durable deduplication anchor for build-stall alerting.
+    # Set to the build-phase START reference time (phase_changed_at, falling
+    # back to opened_at) when the build-stall sweep posts an alert for a version
+    # sitting too long in the 'build' phase without advancing. The next sweep
+    # compares this field against the current build-phase reference time: if
+    # they match, the alert has already been posted for this stall and is
+    # skipped; if they differ (or the field is NULL), a new alert is warranted.
+    # Because a version can move build → stabilize → build again (each
+    # transition re-stamps phase_changed_at), storing the reference time lets
+    # the dedup reset naturally when a fresh build phase begins while never
+    # re-firing for the same stall. Storing the dedup state here avoids relying
+    # solely on Alert row existence (which can be lost when an operator clears
+    # alerts).
+    build_stall_alerted_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    # Durable deduplication anchor for stabilize-stall alerting.
+    # Set to the stabilize-phase START reference time (phase_changed_at,
+    # falling back to opened_at) when the stabilize-stall sweep posts an
+    # alert for a version sitting too long in 'stabilize' without requesting
+    # qualification.  Same dedup semantics as build_stall_alerted_at: storing
+    # the reference time lets the dedup reset naturally when a fresh stabilize
+    # phase begins (phase_changed_at re-stamped) while never re-firing for the
+    # same stall.
+    stabilize_stall_alerted_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    # Durable deduplication anchor for promotion-readiness alerting.
+    # Set to True when a promotion_readiness_reached notification fires for
+    # the current ready window. Reset to False when compute_promotion_readiness
+    # returns ready=False so the next not-ready→ready recovery can notify again.
+    promotion_ready_notified: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
+    )
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
@@ -2239,5 +2432,114 @@ class ReleaseVersion(SQLModel, table=True):
             "project_id",
             "version_number",
             name="uq_releaseversion_project_version",
+        ),
+    )
+
+
+class QualificationVerdict(SQLModel, table=True):
+    """Immutable per-verdict history of release-qualifier finalize outcomes.
+
+    Phase 4 ("Calibration") of the automain LTS design.  ``ReleaseVersion.
+    last_qualification`` is OVERWRITTEN on every finalize, so only the latest
+    verdict survives there — and while ``promotion_enabled`` is False the open
+    version is never closed, so cross-version history cannot be reconstructed.
+    This table appends ONE row per finalized qualification verdict that is never
+    overwritten, so the dry-run track record is durably retained and can be
+    aggregated into a promotion-readiness recommendation
+    (``release_qualifier.compute_promotion_readiness``).
+
+    Additive only: it lives ALONGSIDE ``last_qualification`` and does not change
+    how that field is written.  Writes are best-effort — a failure to record
+    must never break or roll back a qualification or promotion.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    release_version_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("releaseversion.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+
+    # The automain HEAD SHA that was scored.  Nullable per migration linter rules.
+    candidate_sha: str | None = Field(
+        default=None,
+        sa_column=Column(String(40), nullable=True),
+    )
+
+    # Composite promotion confidence in [0,1].
+    confidence: float = Field(
+        default=0.0,
+        sa_column=Column(Float, nullable=False, server_default=text("0")),
+    )
+
+    # Per-dimension sub-scores: {audit, test_erosion, smoketest}.
+    sub_scores: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    # Hard-blocker code (compute_composite), or NULL when none fired.
+    blocker: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
+    # Whether the candidate cleared the promotion threshold.
+    would_promote: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
+    )
+
+    # The runtime_config["promotion_enabled"] state AT THE TIME of this verdict.
+    promotion_enabled: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=text("false")),
+    )
+
+    # Terminal outcome: dry_run | not_promoted | promoted | promotion_failed.
+    terminal_status: str = Field(
+        default="",
+        sa_column=Column(String(32), nullable=False, server_default=""),
+    )
+
+    # The promotion threshold in force when this verdict was scored.
+    threshold: float | None = Field(
+        default=None,
+        sa_column=Column(Float, nullable=True),
+    )
+
+    # When the qualification started / finalized (carried from the verdict).
+    started_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    finalized_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_qualificationverdict_project_created",
+            "project_id",
+            "created_at",
         ),
     )

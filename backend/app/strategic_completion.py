@@ -211,6 +211,20 @@ _QUALIFY_REQUEST_REASON_MAX = 500
 # never drift.
 QUALIFY_REQUEST_CONTEXT_KEY = "_strategic_qualify_request"
 
+# OPTIONAL agent verdict that refines the deterministic outcome-progress
+# (scaffolding) detector. For each long-running ACTIVE direction the strategic
+# agent may record one verdict — advancing | stalled | met — that raises the
+# detector's precision: advancing/met SUPPRESS the advisory scaffolding flag
+# (the agent confirms genuine progress toward success_evidence), stalled
+# reinforces it. An OMITTED verdict changes nothing, so the deterministic
+# detector remains the guaranteed backstop. main.strategic_operation stashes the
+# cleaned list under EVIDENCE_PROGRESS_CONTEXT_KEY; _apply_evidence_progress_verdicts
+# persists it onto each matching direction here.
+_VALID_EVIDENCE_PROGRESS = frozenset({"advancing", "stalled", "met"})
+_EVIDENCE_PROGRESS_SUPPRESSING = frozenset({"advancing", "met"})
+_EVIDENCE_PROGRESS_RATIONALE_MAX = 300
+EVIDENCE_PROGRESS_CONTEXT_KEY = "_strategic_evidence_progress"
+
 
 def _normalize_version_phase(value: object) -> str | None:
     """Return a canonical version phase string or None.
@@ -392,9 +406,7 @@ async def _apply_qualify_request(
     if not request or not isinstance(request, dict):
         return
     reason_raw = request.get("reason")
-    reason = (
-        reason_raw.strip() or None if isinstance(reason_raw, str) else None
-    )
+    reason = reason_raw.strip() or None if isinstance(reason_raw, str) else None
     try:
         from app import release_qualifier as _rq
         from app import release_version as _rv
@@ -646,6 +658,78 @@ def format_findings_for_prompt(
     return "\n".join(lines)
 
 
+def _compute_churn_metrics(direction: dict) -> dict | None:
+    """Return windowed churn metrics for a direction, or None if history is insufficient.
+
+    Counts finished tasks that did not result in a merged PR over the rolling
+    window: completed-but-unmerged tasks plus code failures. Infra failures are
+    excluded because they are uncorrelated with direction quality. The count is
+    operator-facing (pause reason string and churn badge), so it reports the real
+    non-merging finished-task volume with no baseline adjustment. research/
+    investigate/memo children that legitimately finish without a PR are absorbed
+    conservatively by the pause threshold instead.
+    """
+    history = direction.get("research_history") or []
+    churn_window = int(_runtime_config.get("direction_churn_window_cycles", 5) or 5)
+    if len(history) < 3 or churn_window <= 0:
+        return None
+    window = history[-churn_window:]
+    merged = sum(e.get("prs_merged", 0) for e in window)
+    tasks_complete = sum(e.get("tasks_completed", 0) for e in window)
+    code_failed = sum(
+        max(0, e.get("tasks_failed", 0) - e.get("tasks_failed_infra", 0))
+        for e in window
+    )
+    non_merge_finished = max(0, tasks_complete + code_failed - merged)
+    total_finished = merged + non_merge_finished
+    merge_rate = merged / total_finished if total_finished > 0 else 0.0
+    return {
+        "window_cycles": len(window),
+        "merged": merged,
+        "non_merge_finished": non_merge_finished,
+        "merge_rate": round(merge_rate, 3),
+    }
+
+
+def _compute_lifetime_burn_metrics(direction: dict) -> dict | None:
+    """Return lifetime/cumulative non-merge burn metrics combining research_history and history_aggregate.
+
+    Uses the same non-merge definition as _compute_churn_metrics (tasks_completed +
+    code_failed - prs_merged) but across the direction's entire lifetime. Returns
+    None when there is no meaningful lifetime data.
+    """
+    history = direction.get("research_history") or []
+    agg = direction.get("history_aggregate") or {}
+
+    window_merged = sum(e.get("prs_merged", 0) for e in history)
+    window_completed = sum(e.get("tasks_completed", 0) for e in history)
+    window_code_failed = sum(
+        max(0, e.get("tasks_failed", 0) - e.get("tasks_failed_infra", 0))
+        for e in history
+    )
+    agg_merged = agg.get("total_prs_merged", 0)
+    agg_completed = agg.get("total_tasks_completed", 0)
+    agg_code_failed = max(
+        0, agg.get("total_tasks_failed", 0) - agg.get("total_tasks_failed_infra", 0)
+    )
+
+    lifetime_merged = window_merged + agg_merged
+    lifetime_non_merge_finished = max(
+        0,
+        (window_completed + window_code_failed + agg_completed + agg_code_failed)
+        - lifetime_merged,
+    )
+    total_finished = lifetime_merged + lifetime_non_merge_finished
+    if total_finished == 0:
+        return None
+    lifetime_merge_rate = lifetime_merged / total_finished
+    return {
+        "lifetime_merged": lifetime_merged,
+        "lifetime_non_merge_finished": lifetime_non_merge_finished,
+        "lifetime_merge_rate": round(lifetime_merge_rate, 3),
+    }
+
+
 def _check_direction_health(direction: dict) -> str | None:
     """Return a pause reason if this direction should be auto-paused, else None."""
     history = direction.get("research_history") or []
@@ -700,6 +784,48 @@ def _check_direction_health(direction: dict) -> str | None:
             return (
                 "Recent stall: last 3 research cycles all failed or produced no merges"
             )
+
+    # Rule 5: High non-merge churn — rolling window of finished tasks that did not merge.
+    # Only fires when non-merging volume is both absolutely high AND merge rate is very low,
+    # to avoid pausing productive high-throughput directions that simply have many tasks.
+    # research/investigate children are excluded conservatively by the default threshold.
+    churn_threshold = int(
+        _runtime_config.get("direction_churn_non_merge_threshold", 15) or 15
+    )
+    churn_min_merge_rate = float(
+        _runtime_config.get("direction_churn_min_merge_rate", 0.10) or 0.10
+    )
+    if churn_threshold > 0:
+        metrics = _compute_churn_metrics(direction)
+        if metrics and metrics["non_merge_finished"] >= churn_threshold:
+            if metrics["merge_rate"] < churn_min_merge_rate:
+                return (
+                    f"Churn guardrail: {metrics['non_merge_finished']} tasks finished "
+                    f"without merging, {metrics['merged']} merged in last "
+                    f"{metrics['window_cycles']} cycles "
+                    f"(merge rate {metrics['merge_rate']:.0%})"
+                )
+
+    # Rule 6: Lifetime cumulative burn backstop — catches slow-burn directions that stay
+    # just under the rolling-window threshold every window but accumulate hundreds of
+    # non-merging tasks over their lifetime. High threshold prevents pausing productive
+    # high-throughput directions. This pause requires manual operator intervention (retire
+    # vs. reset) because the lifetime metric will not drop on its own after auto-recovery.
+    lifetime_threshold = int(
+        _runtime_config.get("direction_lifetime_non_merge_threshold", 150) or 150
+    )
+    lifetime_min_merge_rate = float(
+        _runtime_config.get("direction_lifetime_min_merge_rate", 0.10) or 0.10
+    )
+    if lifetime_threshold > 0:
+        lm = _compute_lifetime_burn_metrics(direction)
+        if lm and lm["lifetime_non_merge_finished"] >= lifetime_threshold:
+            if lm["lifetime_merge_rate"] < lifetime_min_merge_rate:
+                return (
+                    f"Lifetime burn backstop: {lm['lifetime_non_merge_finished']} tasks "
+                    f"finished without merging lifetime, {lm['lifetime_merged']} merged "
+                    f"(lifetime merge rate {lm['lifetime_merge_rate']:.0%})"
+                )
 
     return None
 
@@ -768,6 +894,193 @@ def _check_direction_completion(direction: dict) -> str | None:
             f"{len(history)} cycles, last 2 cycles low-yield"
         )
     return None
+
+
+# ── Outcome-progress (scaffolding) detector ──────────────────────────────────
+# Advisory axis catching the INVERSE of every existing health rule: a direction
+# with a HEALTHY merge rate that keeps shipping refactor/scaffolding PRs while
+# never advancing its stated success_evidence. Such a direction scores high on
+# quality_score and looks 'stable' on merge-rate trend, so it can burn dozens of
+# cycles unnoticed. This is SURFACING-only — it sets an advisory flag for the
+# strategic agent / operator and never auto-pauses (no 7th pause rule).
+
+_OUTCOME_PROGRESS_HISTORY_HARD_CAP = 20
+
+
+def _outcome_progress_config() -> dict:
+    """Read outcome-progress thresholds from runtime_config with hardcoded fallbacks.
+
+    Mirrors the direction_churn_* / direction_lifetime_* convention: defaults live
+    in shared_state.runtime_config and are read via .get(key, fallback) so a missing
+    key never raises.
+    """
+
+    def _int(key: str, fallback: int) -> int:
+        try:
+            return int(_runtime_config.get(key, fallback) or fallback)
+        except (TypeError, ValueError):
+            return fallback
+
+    def _float(key: str, fallback: float) -> float:
+        try:
+            return float(_runtime_config.get(key, fallback) or fallback)
+        except (TypeError, ValueError):
+            return fallback
+
+    return {
+        "min_cycles": _int("direction_outcome_progress_min_cycles", 12),
+        "merge_floor": _int("direction_outcome_progress_merge_floor", 8),
+        "min_merge_rate": _float("direction_outcome_progress_min_merge_rate", 0.5),
+        "stall_run": _int("direction_outcome_progress_stall_run", 6),
+        "history_max": _int(
+            "direction_outcome_progress_history_max",
+            _OUTCOME_PROGRESS_HISTORY_HARD_CAP,
+        ),
+    }
+
+
+def _compute_outcome_progress_signal(direction: dict) -> int:
+    """Deterministic outcome-progress proxy: count of confirmed established findings.
+
+    Counts confirmed (non-proposed) entries in the direction's accumulated
+    research_context. This grows when a direction lands durable confirmed evidence
+    toward its success_evidence and stays flat when it merely ships
+    scaffolding/refactor PRs that produce no new confirmed findings — which is
+    exactly the signal the scaffolding detector keys off of.
+    """
+    from app.research_context import _parse_research_context
+
+    ctx = direction.get("research_context") or ""
+    if not ctx:
+        return 0
+    parsed = _parse_research_context(ctx)
+    return sum(1 for item in parsed.get("established", []) if "(proposed)" not in item)
+
+
+def record_outcome_progress_snapshot(direction: dict) -> None:
+    """Append a per-cycle outcome-progress snapshot to the direction (bounded).
+
+    Records the current progress signal alongside the cumulative cycle count and
+    lifetime merged volume, capping the list the same way recent_findings_evidence
+    and drift-snapshot retention are capped (sliding window, no new table). Also
+    latches ``outcome_progress_ever_met`` when the positive-completion detector
+    (``_check_direction_completion``) trips or the direction is flagged
+    possibly_complete, so the scaffolding detector can require a direction to have
+    NEVER met its outcome.
+
+    Called once per research cycle from research_direction_state.apply_post_spawn_state
+    after research_context has been rebuilt for the cycle.
+    """
+    cfg = _outcome_progress_config()
+    history = direction.get("research_history") or []
+    agg = direction.get("history_aggregate") or {}
+    total_cycles = len(history) + (agg.get("total_cycles") or 0)
+    total_merged = sum(e.get("prs_merged", 0) for e in history) + (
+        agg.get("total_prs_merged") or 0
+    )
+    snapshot = {
+        "timestamp": _utcnow().isoformat(),
+        "cycle_index": total_cycles,
+        "progress": _compute_outcome_progress_signal(direction),
+        "merged": total_merged,
+    }
+    snaps = list(direction.get("outcome_progress_history") or [])
+    snaps.append(snapshot)
+    cap = max(1, cfg["history_max"])
+    if len(snaps) > cap:
+        snaps = snaps[-cap:]
+    direction["outcome_progress_history"] = snaps
+    if _check_direction_completion(direction) is not None or direction.get(
+        "possibly_complete"
+    ):
+        direction["outcome_progress_ever_met"] = True
+
+
+def _evidence_progress_suppresses_scaffolding(
+    direction: dict, total_cycles: int, stall_run: int
+) -> bool:
+    """True if a current agent evidence_progress verdict confirms advancement.
+
+    An ``advancing`` or ``met`` verdict recorded within the last ``stall_run``
+    cycles suppresses the advisory scaffolding flag — the agent has confirmed
+    genuine progress, so the deterministic detector defers to it. A ``stalled``
+    verdict (which reinforces the deterministic signal) or NO verdict at all
+    never suppresses, so the deterministic detector stays the guaranteed
+    backstop whenever the agent omits the optional assessment. The verdict
+    expires after a full stall window so a stale "advancing" cannot mask a
+    direction that later genuinely stalls.
+    """
+    ep = direction.get("evidence_progress")
+    if not isinstance(ep, dict):
+        return False
+    if ep.get("status") not in _EVIDENCE_PROGRESS_SUPPRESSING:
+        return False
+    recorded_cycle = ep.get("cycle_index")
+    if not isinstance(recorded_cycle, int):
+        # Undated verdict — trust the agent's confirmation (treat as current).
+        return True
+    return (total_cycles - recorded_cycle) < max(1, stall_run)
+
+
+def _check_outcome_scaffolding(direction: dict) -> dict | None:
+    """Return advisory evidence dict if a direction looks like outcome-less scaffolding.
+
+    ADVISORY ONLY — callers must NOT auto-pause on this. Returns None unless ALL hold:
+      - long-running: cumulative cycle count >= min_cycles (default ~12);
+      - keeps shipping merges: lifetime merged >= merge_floor AND lifetime merge
+        rate >= min_merge_rate, so churn/burn directions (low merge rate / high
+        non-merge volume) are explicitly EXCLUDED — those are handled by the churn
+        guardrail and lifetime-burn backstop in _check_direction_health;
+      - sustained no progress: the per-cycle progress signal is flat (no increase)
+        across the last stall_run snapshots AND the direction has never reached a
+        'met' outcome.
+    Guards hard against false positives: requires a FULL stall_run window of
+    snapshots, so a single low-progress cycle cannot trip the flag, and any increase
+    anywhere in the window clears it.
+    """
+    if direction.get("outcome_progress_ever_met"):
+        return None
+    cfg = _outcome_progress_config()
+    history = direction.get("research_history") or []
+    agg = direction.get("history_aggregate") or {}
+    total_cycles = len(history) + (agg.get("total_cycles") or 0)
+    if total_cycles < cfg["min_cycles"]:
+        return None
+    # Keeps shipping merges at a healthy rate (excludes churn/burn).
+    lm = _compute_lifetime_burn_metrics(direction)
+    if not lm:
+        return None
+    lifetime_merged = lm["lifetime_merged"]
+    merge_rate = lm["lifetime_merge_rate"]
+    if lifetime_merged < cfg["merge_floor"]:
+        return None
+    if merge_rate < cfg["min_merge_rate"]:
+        return None
+    # Sustained no progress across a full run of recorded snapshots.
+    run = cfg["stall_run"]
+    snaps = direction.get("outcome_progress_history") or []
+    if run < 2 or len(snaps) < run:
+        return None
+    window = snaps[-run:]
+    progress_vals = [int(s.get("progress", 0) or 0) for s in window]
+    if max(progress_vals) > min(progress_vals):
+        return None  # progress increased somewhere in the window -> advancing
+    # Never met its outcome (current completion detector must also be negative).
+    if _check_direction_completion(direction) is not None:
+        return None
+    # OPTIONAL agent refinement: a current advancing/met verdict suppresses the
+    # advisory flag (the agent confirms genuine progress). A stalled verdict or
+    # an omitted verdict never suppresses — the deterministic detector fires.
+    if _evidence_progress_suppresses_scaffolding(direction, total_cycles, run):
+        return None
+    return {
+        "total_cycles": total_cycles,
+        "lifetime_merged": lifetime_merged,
+        "lifetime_merge_rate": round(merge_rate, 3),
+        "stall_run_cycles": run,
+        "progress_signal": progress_vals[-1],
+        "outcome_progress_window": progress_vals,
+    }
 
 
 _RETIRED_DIRECTION_STATUSES = frozenset({"expired", "retired", "superseded"})
@@ -1042,6 +1355,57 @@ async def _check_direction_starvation(
             )
 
 
+def _apply_evidence_progress_verdicts(task: Task, project: Project) -> int:
+    """Persist agent evidence_progress verdicts onto matching active directions.
+
+    Reads the OPTIONAL list stashed by main.strategic_operation under
+    EVIDENCE_PROGRESS_CONTEXT_KEY and writes ``direction["evidence_progress"]``
+    = {status, rationale, recorded_at, cycle_index, cycle_task_id} onto each
+    matching ACTIVE direction. The verdict lives alongside the deterministic
+    ``outcome_progress_history`` and is read back by ``_check_outcome_scaffolding``
+    to refine (suppress/reinforce) the advisory flag. Returns the count of
+    directions updated; a no-op returning 0 when the agent omitted the optional
+    assessment, so the deterministic backstop is unaffected.
+    """
+    verdicts = (task.context or {}).get(EVIDENCE_PROGRESS_CONTEXT_KEY)
+    if not isinstance(verdicts, list) or not verdicts:
+        return 0
+    by_id = {
+        v["direction_id"]: v
+        for v in verdicts
+        if isinstance(v, dict) and v.get("direction_id")
+    }
+    if not by_id:
+        return 0
+    now_iso = _utcnow().isoformat()
+    applied = 0
+    for d in project.directions or []:
+        if d.get("status") != "active":
+            continue
+        verdict = by_id.get(d.get("id"))
+        if not verdict:
+            continue
+        status = str(verdict.get("status", "")).strip().lower()
+        if status not in _VALID_EVIDENCE_PROGRESS:
+            continue
+        history = d.get("research_history") or []
+        agg = d.get("history_aggregate") or {}
+        cycle_index = len(history) + (agg.get("total_cycles") or 0)
+        d["evidence_progress"] = {
+            "status": status,
+            "rationale": str(verdict.get("rationale", ""))[
+                :_EVIDENCE_PROGRESS_RATIONALE_MAX
+            ],
+            "recorded_at": now_iso,
+            "cycle_index": cycle_index,
+            "cycle_task_id": str(task.id),
+        }
+        applied += 1
+    if applied:
+        flag_modified(project, "directions")
+    return applied
+
+
 async def _handle_strategic_completion(
     task: Task,
     logs: str,
@@ -1146,16 +1510,45 @@ async def _handle_strategic_completion(
                     f"[STRATEGIC] Task {task.id}: failed to fetch findings index (non-fatal)",
                     exc_info=True,
                 )
+            _memo_citations: list = []
+            try:
+                _memo_citations = await strategic_cycle.query_recent_memo_citations(
+                    session, project.id
+                )
+                if _memo_citations:
+                    _extra["memo_citations"] = _memo_citations
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    f"[STRATEGIC] Task {task.id}: failed to fetch memo citations (non-fatal)",
+                    exc_info=True,
+                )
+            _cycle_reasoning = _extract_cycle_reasoning(task)
+            _memos_available = len(_memo_citations)
+            _memos_cited = strategic_cycle.count_cited_memos(
+                _memo_citations, _cycle_reasoning
+            )
             await strategic_cycle.mark_phase2_completed(
                 session,
                 cycle_id,
                 summary_text=_summary,
-                cycle_reasoning=_extract_cycle_reasoning(task),
+                cycle_reasoning=_cycle_reasoning,
                 directions_created=dirs_created,
                 directions_retired=dirs_retired,
                 tasks_spawned=tasks_spawned,
                 vision_updated=_vision_updated,
+                memos_available=_memos_available,
+                memos_cited=_memos_cited,
                 extra_metadata=_extra,
+            )
+        # OPTIONAL refinement: persist per-direction evidence_progress verdicts
+        # (advancing|stalled|met) onto active directions. Independent of cycle_id
+        # — a no-op when the agent omitted the assessment, leaving the
+        # deterministic scaffolding detector as the guaranteed backstop.
+        _ep_applied = _apply_evidence_progress_verdicts(task, project)
+        if _ep_applied:
+            logger.info(
+                f"[STRATEGIC] Task {task.id}: applied {_ep_applied} "
+                f"evidence_progress verdict(s) to directions"
             )
         await _check_direction_starvation(project, dirs_created, session)
         session.add(project)
@@ -1869,9 +2262,7 @@ async def _handle_strategic_completion(
         _vpd_parsed, task, project, session, path="fallback"
     )
     _qr_parsed = parsed.get("qualify_request")
-    await _apply_qualify_request(
-        _qr_parsed, task, project, session, path="fallback"
-    )
+    await _apply_qualify_request(_qr_parsed, task, project, session, path="fallback")
 
     # Update cycle history with final outcome
     # Audit W2: cycle outcome lives on the StrategicCycle row.

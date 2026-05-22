@@ -1043,3 +1043,39 @@ class TestRecordResearchTaskFailureScopeEmpty:
         assert len(history) == 1
         assert history[0]["research_task_failed"] is True
         assert history[0]["failure_category"] == "SCOPE_EMPTY"
+
+
+class TestTrimFindingForMemo:
+    """_trim_finding_for_memo: bounds a dropped finding for memo embedding."""
+
+    def test_keeps_core_fields_and_trims_text(self):
+        from app.research_completion import _trim_finding_for_memo
+
+        finding = {
+            "title": "T",
+            "type": "improvement",
+            "scope": "small",
+            "risk": "low",
+            "priority": "medium",
+            "actionability_grade": "LOW",
+            "direction_id": "d-1",
+            "description": "x" * 5000,
+            "related_files": [f"f{i}.py" for i in range(50)],
+            "_complexity_signals": {"a": 1},
+            "claims": ["c"],
+        }
+        out = _trim_finding_for_memo(finding)
+        assert out["title"] == "T"
+        assert out["actionability_grade"] == "LOW"
+        assert out["direction_id"] == "d-1"
+        assert len(out["description"]) == 1000
+        assert len(out["related_files"]) == 20
+        # Bulky internal/unused fields are dropped.
+        assert "_complexity_signals" not in out
+        assert "claims" not in out
+
+    def test_omits_missing_fields(self):
+        from app.research_completion import _trim_finding_for_memo
+
+        out = _trim_finding_for_memo({"title": "Only title"})
+        assert out == {"title": "Only title"}

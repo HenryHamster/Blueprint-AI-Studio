@@ -109,6 +109,12 @@ _RETIRE_MAX_SUCCESS_RATE = 0.20
 # EXEMPT — only entries with source == 'auto-generated' decay on idleness.
 _IDLE_RETIRE_DAYS = 30
 
+# Cooldown window (days) during which a recently-archived auto-playbook entry
+# cannot be re-created.  Prevents "resurrection" of entries pruned for capacity,
+# idle decay, or low success rate.  Configurable via
+# runtime_config["auto_playbook_resurrection_cooldown_days"].
+_AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS = 30
+
 # Review-extracted playbook entries are refreshed in-place when their
 # updated_at exceeds _REVIEW_PLAYBOOK_REFRESH_DAYS, and flagged
 # potentially_stale once they exceed _REVIEW_PLAYBOOK_STALE_DAYS without
@@ -568,6 +574,55 @@ def maybe_archive_for_capacity(doc: dict, new_entry_estimate: int = 0) -> dict:
     return doc
 
 
+def _get_prior_archive_entry(doc: dict, full_key: str) -> dict | None:
+    """Return the most recent ``playbook_archive`` entry for *full_key*, or None."""
+    for entry in reversed(list(doc.get("playbook_archive") or [])):
+        if entry.get("_archived_key") == full_key:
+            return entry
+    return None
+
+
+def _is_auto_playbook_suppressed(doc: dict, full_key: str) -> bool:
+    """Return True when *full_key* must not be re-created.
+
+    Checks (in priority order):
+
+    1. ``playbook_deleted_keys`` — keys explicitly deleted by an operator.
+       These are suppressed until they age off the 200-entry cap.
+    2. ``playbook_archive`` — keys retired for capacity, idle decay, or low
+       success rate whose ``_archived_at`` is within the cooldown window
+       (``auto_playbook_resurrection_cooldown_days``, default 30 days).
+    """
+    import app.shared_state as _ss  # noqa: PLC0415
+
+    if full_key in (doc.get("playbook_deleted_keys") or []):
+        return True
+
+    cooldown_days: int = _ss.runtime_config.get(
+        "auto_playbook_resurrection_cooldown_days",
+        _AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS,
+    )
+    if cooldown_days <= 0:
+        return False
+
+    cutoff = _utcnow() - timedelta(days=cooldown_days)
+    for entry in reversed(list(doc.get("playbook_archive") or [])):
+        if entry.get("_archived_key") != full_key:
+            continue
+        archived_at_str = entry.get("_archived_at", "")
+        if not archived_at_str:
+            return True  # Archived but no timestamp: suppress conservatively
+        try:
+            archived_at = datetime.fromisoformat(archived_at_str.replace("Z", "+00:00"))
+            if archived_at.tzinfo is not None:
+                archived_at = archived_at.replace(tzinfo=None)
+        except (ValueError, TypeError):
+            return True  # Can't parse: suppress conservatively
+        if archived_at >= cutoff:
+            return True
+    return False
+
+
 def record_playbook_applied(doc: dict, key: str) -> None:
     """Increment followed_count when a playbook entry is applied to a task prompt.
 
@@ -620,6 +675,8 @@ def retire_ineffective_patterns(
         if not k.startswith("playbook/") or not isinstance(doc.get(k), dict):
             continue
         entry = doc[k]
+        if entry.get("source") != "auto-generated":
+            continue
         followed = entry.get("followed_count", 0)
         if followed < min_followed:
             continue
@@ -738,6 +795,38 @@ def count_idle_auto_retired_within(doc: dict, *, hours: int = 24) -> int:
             continue
         reason = entry.get("_retirement_reason") or ""
         if not reason.startswith("idle_auto_entry"):
+            continue
+        ts_str = entry.get("_archived_at")
+        if not ts_str:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+            if ts.tzinfo is not None:
+                ts = ts.replace(tzinfo=None)
+        except (ValueError, TypeError):
+            continue
+        if ts >= cutoff:
+            count += 1
+    return count
+
+
+def count_low_success_retired_within(doc: dict, *, hours: int = 24) -> int:
+    """Count playbook_archive entries retired by ``retire_ineffective_patterns``
+    within the last ``hours``. Used by admin_digest to surface auto-entry pruning.
+    """
+    if not doc:
+        return 0
+    archive = doc.get("playbook_archive") or []
+    if not archive:
+        return 0
+    now = _utcnow()
+    cutoff = now - timedelta(hours=hours)
+    count = 0
+    for entry in archive:
+        if not isinstance(entry, dict):
+            continue
+        reason = entry.get("_retirement_reason") or ""
+        if not reason.startswith("low_success_rate"):
             continue
         ts_str = entry.get("_archived_at")
         if not ts_str:
@@ -1000,6 +1089,16 @@ async def _maybe_auto_playbook(
         )
         return None
 
+    # ── 3b. Suppression check (recently pruned / operator-deleted) ────────────
+    prior = _get_prior_archive_entry(doc, playbook_full_key)
+    if _is_auto_playbook_suppressed(doc, playbook_full_key):
+        logger.debug(
+            "[AUTO_PLAYBOOK] project=%s key='%s' suppressed (pruned within cooldown) — skipping",
+            task.project_id,
+            key,
+        )
+        return None
+
     # ── 4. Create auto-generated playbook entry ─────────────────────────────
     recent_ids = [str(t.id) for t in matching[-2:]] + [str(task.id)]
     hint = _hint_for_failure_class(failure_class)
@@ -1032,23 +1131,31 @@ async def _maybe_auto_playbook(
         entry_scope = "universal"
         learned_from_direction = None
 
+    # Carry forward confirmed_count and retirement reason from prior archive entry
+    # (only reached when cooldown has elapsed — prior may be None for first-ever creation)
+    prior_confirmed: int = (prior or {}).get("confirmed_count", 0)
+    prior_retirement_reason: Optional[str] = (prior or {}).get("_retirement_reason")
+
     new_entry = {
         "content": content,
         "source_task_id": str(task.id),
         "updated_at": _utcnow().isoformat(),
-        "confirmed_count": 0,
+        "confirmed_count": prior_confirmed,
         "source": "auto-generated",
     }
     doc = maybe_archive_for_capacity(doc, len(json.dumps(new_entry).encode()))
-    doc[playbook_full_key] = {
+    recreated_entry: dict = {
         "content": content,
         "source_task_id": str(task.id),
         "updated_at": _utcnow().isoformat(),
-        "confirmed_count": 0,
+        "confirmed_count": prior_confirmed,
         "source": "auto-generated",
         "scope": entry_scope,
         "learned_from_direction": learned_from_direction,
     }
+    if prior_retirement_reason:
+        recreated_entry["prior_retirement_reason"] = prior_retirement_reason
+    doc[playbook_full_key] = recreated_entry
 
     meta = dict(doc.get("_meta", {"revision": 0}))
     meta["revision"] = meta.get("revision", 0) + 1
@@ -1875,7 +1982,7 @@ def _maybe_auto_playbook_from_first_attempt(
         dir_slug = direction_key[:8].replace("-", "").replace("_", "") or "proj"
         key = f"first-attempt-{dir_slug}-{cat}"
         full_key = f"playbook/{key}"
-        if full_key in doc:
+        if full_key in doc or _is_auto_playbook_suppressed(doc, full_key):
             continue
         content = (
             f"First-attempt rejection pattern (direction {direction_key[:16]}): "
@@ -2079,6 +2186,10 @@ _MIN_REVIEW_SAMPLE = 10
 # Rate-of-change threshold below which a category is considered "stable" vs
 # "decreasing" / "increasing".  A 5pp shift is distinguishable from noise.
 _TREND_DELTA_THRESHOLD = 0.05
+# Minimum z-score (two-proportion z-test) required to assert a trend direction.
+# z=1.28 ≈ 80% CI two-tailed; gates directional labels against sampling noise
+# while preserving large genuine shifts even at small sample sizes.
+_TREND_Z_MIN = 1.28
 # Threshold for precision/recall quadrant classification (5pp absolute change).
 _PRECISION_RECALL_QUADRANT_THRESHOLD = 0.05
 _SR_SEVERITY_DELTA_THRESHOLDS: dict[str, float] = {
@@ -2329,6 +2440,15 @@ async def compute_review_effectiveness(
 # rejection categories required per window.  Half the human-review threshold
 # since SR data is sparser.
 _MIN_SR_SAMPLE = 5
+# Minimum total reviewer findings (across categories in a window) required for
+# the catch-rate and its cycle-over-cycle trend to be considered well-sampled.
+# Matches _MIN_SR_SAMPLE so the gate is on the true catch-rate denominator
+# (finding count) rather than task count; a window with ≥_MIN_SR_SAMPLE tasks
+# may still have fewer findings when most tasks flag zero or one category.
+_MIN_SR_FINDINGS = 5
+# Minimum total reviewer findings (across tasks in a window) required to emit
+# a hallucination-rate value; prevents noisy rates on tiny windows.
+_HALLUCINATION_RATE_MIN_FINDINGS = 10
 _MIN_DIRECTION_SR_SAMPLE = 3
 
 # Example-collection caps for miss-example surfacing in the agent prompt.
@@ -3617,6 +3737,25 @@ def _compute_miss_latency_stats(tasks: list) -> dict:
     return result
 
 
+def _is_trend_significant(p1: float, n1: int, p2: float, n2: int) -> bool:
+    """Two-proportion z-test: return True when the observed difference exceeds
+    what sampling noise alone predicts at the _TREND_Z_MIN threshold.
+
+    Uses a pooled proportion under H0 (no real difference).  Falls back to the
+    raw delta >= _TREND_DELTA_THRESHOLD when the pooled SE is degenerate (both
+    rates are 0 or 1 and the standard error collapses to zero).
+    """
+    if n1 < 1 or n2 < 1:
+        return False
+    pooled_p = (p1 * n1 + p2 * n2) / (n1 + n2)
+    if pooled_p <= 0 or pooled_p >= 1:
+        return abs(p1 - p2) >= _TREND_DELTA_THRESHOLD
+    se = (pooled_p * (1 - pooled_p) * (1 / n1 + 1 / n2)) ** 0.5
+    if se == 0:
+        return False
+    return abs(p1 - p2) / se >= _TREND_Z_MIN
+
+
 async def compute_sr_catch_rate_trends(
     project_id: uuid.UUID,
     session: AsyncSession,
@@ -3740,7 +3879,16 @@ async def compute_sr_catch_rate_trends(
         current_window_tasks = cal_current
         previous_window_tasks = cal_previous
 
-    if current_count < _MIN_SR_SAMPLE or previous_count < _MIN_SR_SAMPLE:
+    # Gate on finding count (true catch-rate denominator), not task count.
+    # finding_count = total reviewer-flagged (task, category) pairs in the window.
+    current_finding_count = sum(s.get("human_count", 0) for s in current_stats.values())
+    previous_finding_count = sum(
+        s.get("human_count", 0) for s in previous_stats.values()
+    )
+    if (
+        current_finding_count < _MIN_SR_FINDINGS
+        or previous_finding_count < _MIN_SR_FINDINGS
+    ):
         return None
 
     all_cats = (
@@ -3789,16 +3937,40 @@ async def compute_sr_catch_rate_trends(
             else None
         )
 
-        if current_hit_rate is not None and previous_hit_rate is not None:
+        # Only compute trend when both windows have enough findings for the
+        # delta to be meaningful; fewer findings make the delta pure noise.
+        # A two-proportion z-test additionally gates directional labels: even
+        # with _MIN_SR_FINDINGS samples a delta near the floor threshold can
+        # be pure sampling noise, so we require statistical significance before
+        # asserting "increasing" / "decreasing".
+        _curr_findings = curr.get("human_count", 0)
+        _prev_findings = prev.get("human_count", 0)
+        _has_trend_data = (
+            current_hit_rate is not None
+            and previous_hit_rate is not None
+            and _curr_findings >= _MIN_SR_FINDINGS
+            and _prev_findings >= _MIN_SR_FINDINGS
+        )
+        if _has_trend_data:
             delta = current_hit_rate - previous_hit_rate
-            if delta >= _TREND_DELTA_THRESHOLD:
+            _sig = _is_trend_significant(
+                current_hit_rate,
+                _curr_findings,
+                previous_hit_rate,
+                _prev_findings,
+            )
+            if _sig and delta >= _TREND_DELTA_THRESHOLD:
                 trend = "increasing"
-            elif delta <= -_TREND_DELTA_THRESHOLD:
+            elif _sig and delta <= -_TREND_DELTA_THRESHOLD:
                 trend = "decreasing"
             else:
                 trend = "stable"
+            trend_significant: Optional[bool] = (
+                _sig and abs(delta) >= _TREND_DELTA_THRESHOLD
+            )
         else:
             trend = "stable"
+            trend_significant = None
 
         w_total = curr.get("w_total", 0.0)
         weighted_miss_rate = (
@@ -3882,6 +4054,7 @@ async def compute_sr_catch_rate_trends(
             "previous_hit_rate": previous_hit_rate,
             "current_human_count": int(curr.get("human_count") or 0),
             "previous_human_count": int(prev.get("human_count") or 0),
+            "low_confidence_finding_count": _curr_findings < _MIN_SR_FINDINGS,
             "sr_alone_hit_count": int(curr.get("sr_alone_hit_count") or 0),
             "reviewer_save_hit_count": int(curr.get("reviewer_save_hit_count") or 0),
             "sr_alone_hit_rate": sr_alone_hit_rate,
@@ -3889,6 +4062,7 @@ async def compute_sr_catch_rate_trends(
             "miss_rate": miss_rate,
             "weighted_miss_rate": weighted_miss_rate,
             "trend": trend,
+            "trend_significant": trend_significant,
             "false_positive_rate": current_fp_rate,
             "previous_fp_rate": previous_fp_rate,
             "fp_trend": fp_trend,
@@ -3965,6 +4139,22 @@ async def compute_sr_catch_rate_trends(
         categories[cat]["reasoning_quality_rate"] = cat_eng["reasoning_quality_rate"]
         categories[cat]["reasoning_engagement_with"] = cat_eng["with_reasoning"]
         categories[cat]["reasoning_engagement_total"] = cat_eng["total_passes"]
+
+    # Attach engagement_thinning flag for each category.
+    # Mirrors the thinning Alert predicate (lines ~4918) but also fires for regressing
+    # categories — the agent gate consumer takes the union of regressing+thinning itself.
+    _eng_threshold: float = float(
+        doc.get("sr_engagement_threshold") or _SR_ENGAGEMENT_THRESHOLD
+    )
+    _eng_min_passes: int = int(
+        doc.get("sr_engagement_min_passes") or _SR_ENGAGEMENT_MIN_PASSES
+    )
+    for cat, data in categories.items():
+        _rate = data.get("reasoning_engagement_rate")
+        _total = data.get("reasoning_engagement_total") or 0
+        data["engagement_thinning"] = bool(
+            _rate is not None and _rate < _eng_threshold and _total >= _eng_min_passes
+        )
 
     # Attach false-positive stats: SR flagged but reviewer didn't independently flag.
     # Both windows use _compute_cat_fp_stats so reviewer_findings count as confirmations
@@ -4213,6 +4403,34 @@ async def compute_sr_catch_rate_trends(
 
     edges_stats = _compute_edges_stats(all_tasks)
 
+    # Compute overall (aggregate) hit rates across all categories, weighted by human_count.
+    # This represents the true cycle-over-cycle change of the headline metric.
+    current_total_hits = 0
+    current_total_humans = 0
+    previous_total_hits = 0
+    previous_total_humans = 0
+    for data in categories.values():
+        curr_hit_rate = data.get("current_hit_rate")
+        curr_human_count = data.get("current_human_count", 0)
+        prev_hit_rate = data.get("previous_hit_rate")
+        prev_human_count = data.get("previous_human_count", 0)
+        if curr_hit_rate is not None and curr_human_count > 0:
+            current_total_hits += round(curr_hit_rate * curr_human_count)
+            current_total_humans += curr_human_count
+        if prev_hit_rate is not None and prev_human_count > 0:
+            previous_total_hits += round(prev_hit_rate * prev_human_count)
+            previous_total_humans += prev_human_count
+    overall_hit_rate = (
+        round(current_total_hits / current_total_humans, 3)
+        if current_total_humans > 0
+        else None
+    )
+    previous_overall_hit_rate = (
+        round(previous_total_hits / previous_total_humans, 3)
+        if previous_total_humans > 0
+        else None
+    )
+
     # Prompt-version awareness: detect mixed-regime windows so the agent can
     # caveat calibration surfaces and avoid mistaking prompt rollouts for regressions.
     pv_counter = _collect_prompt_versions(current_window_tasks)
@@ -4238,6 +4456,10 @@ async def compute_sr_catch_rate_trends(
         "edges_considered_stats": edges_stats,
         "sr_skip_rate": sr_skip_rate,
         "sr_skip_reason_distribution": sr_skip_dist if sr_skip_dist is not None else {},
+        "overall_hit_rate": overall_hit_rate,
+        "previous_overall_hit_rate": previous_overall_hit_rate,
+        "current_finding_count": current_finding_count,
+        "previous_finding_count": previous_finding_count,
     }
     if current_prompt_version is not None:
         result["prompt_version"] = current_prompt_version
@@ -4274,10 +4496,81 @@ async def compute_sr_catch_rate_trends(
     exec_evidence = _compute_execution_evidence_miss_rates(current_window_tasks)
     result["execution_evidence_miss_rates"] = exec_evidence or {}
 
-    from app.sr_blind_spots import aggregate_sr_co_failure_pairs  # noqa: PLC0415
+    from app.sr_blind_spots import (
+        aggregate_sr_co_failure_pairs,
+        _count_reviewer_disagreement_directions,
+    )  # noqa: PLC0415
 
     co_pairs = aggregate_sr_co_failure_pairs(current_window_tasks)
     result["co_failure_pairs"] = co_pairs or []
+
+    # Attach per-category failure-mode breakdown (reading_gap / judgment_gap / coverage_gap).
+    # Uses origin tags set by the fresh-reviewer pass in standard.ts:441-457.
+    failure_mode_dir_counts = _count_reviewer_disagreement_directions(
+        current_window_tasks
+    )
+    cat_failure_modes: dict[str, dict[str, int]] = {}
+    for (cat, _ttype), bucket in failure_mode_dir_counts.items():
+        if cat not in cat_failure_modes:
+            cat_failure_modes[cat] = {
+                "reading_gap": 0,
+                "judgment_gap": 0,
+                "coverage_gap": 0,
+            }
+        cat_failure_modes[cat]["reading_gap"] += bucket["miss_recovery_incomplete"]
+        cat_failure_modes[cat]["judgment_gap"] += bucket["miss_disagreement"]
+        cat_failure_modes[cat]["coverage_gap"] += bucket["miss_coverage_gap"]
+    for cat, data in categories.items():
+        modes = cat_failure_modes.get(cat)
+        if modes and sum(modes.values()) > 0:
+            dominant = max(modes.items(), key=lambda x: x[1])
+            data["miss_mode_breakdown"] = {**modes, "dominant_mode": dominant[0]}
+
+    # Reviewer hallucination rate: proportion of reviewer findings filtered as phantom file refs.
+    # Uses reviewer_findings_filtered written by the fresh-reviewer pass in standard.ts.
+    curr_hall_total = 0
+    curr_hall_filtered = 0
+    for _t in current_window_tasks:
+        _sro = (getattr(_t, "context", None) or {}).get("_self_review_outcome") or {}
+        _rff = _sro.get("reviewer_findings_filtered") or {}
+        _t_total = _rff.get("total_reviewer_findings")
+        _t_filtered = _rff.get("filtered_count")
+        if isinstance(_t_total, int) and isinstance(_t_filtered, int):
+            curr_hall_total += _t_total
+            curr_hall_filtered += _t_filtered
+    prev_hall_total = 0
+    prev_hall_filtered = 0
+    for _t in previous_window_tasks:
+        _sro = (getattr(_t, "context", None) or {}).get("_self_review_outcome") or {}
+        _rff = _sro.get("reviewer_findings_filtered") or {}
+        _t_total = _rff.get("total_reviewer_findings")
+        _t_filtered = _rff.get("filtered_count")
+        if isinstance(_t_total, int) and isinstance(_t_filtered, int):
+            prev_hall_total += _t_total
+            prev_hall_filtered += _t_filtered
+    curr_hall_rate: Optional[float] = (
+        round(curr_hall_filtered / curr_hall_total, 3)
+        if curr_hall_total >= _HALLUCINATION_RATE_MIN_FINDINGS
+        else None
+    )
+    prev_hall_rate: Optional[float] = (
+        round(prev_hall_filtered / prev_hall_total, 3)
+        if prev_hall_total >= _HALLUCINATION_RATE_MIN_FINDINGS
+        else None
+    )
+    if curr_hall_rate is not None or prev_hall_rate is not None:
+        hall_delta: Optional[float] = (
+            round(curr_hall_rate - prev_hall_rate, 3)
+            if curr_hall_rate is not None and prev_hall_rate is not None
+            else None
+        )
+        result["reviewer_hallucination_rate"] = {
+            "current_rate": curr_hall_rate,
+            "previous_rate": prev_hall_rate,
+            "current_sample": curr_hall_total,
+            "previous_sample": prev_hall_total,
+            "delta": hall_delta,
+        }
 
     doc["sr_catch_rate_trends"] = result
     project.design_doc = doc
@@ -6168,18 +6461,18 @@ async def compute_sr_false_attestation_trends(
                 .scalars()
                 .all()
             )
-            for a in existing_alerts:
-                if a.title != new_title:
+            if not any(a.title == new_title for a in existing_alerts):
+                for a in existing_alerts:
                     a.dismissed_at = now
                     session.add(a)
-            session.add(
-                Alert(
-                    project_id=project_id,
-                    severity=AlertSeverity.WARNING,
-                    title=new_title,
-                    message=description,
+                session.add(
+                    Alert(
+                        project_id=project_id,
+                        severity=AlertSeverity.WARNING,
+                        title=new_title,
+                        message=description,
+                    )
                 )
-            )
         except Exception:
             logger.exception(
                 "[SR_FALSE_ATTESTATION] alert emission failed (non-critical)"

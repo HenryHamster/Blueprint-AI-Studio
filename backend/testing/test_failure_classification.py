@@ -1,6 +1,7 @@
 """Tests for failure_classification subtype helpers and classify_failure()."""
 
 import uuid
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -335,6 +336,23 @@ class TestClassifyFailureViewportGateInfra:
     def test_regular_viewport_failure_still_routes_to_viewport_regression(self):
         t = _task("expectnooverflowat( failed at 375px width")
         assert classify_failure(t) == VIEWPORT_REGRESSION
+
+    def test_text_truncation_routes_to_viewport_regression(self):
+        t = _task(
+            "expectNoTextTruncationAt(375) detected clipped text in MessagesPanel"
+        )
+        assert classify_failure(t) == VIEWPORT_REGRESSION
+
+    def test_text_truncation_in_logs_routes_to_viewport_regression(self):
+        t = _task("")
+        result = classify_failure(
+            t, logs="expectNoTextTruncationAt(375): silent truncation detected"
+        )
+        assert result == VIEWPORT_REGRESSION
+
+    def test_text_truncation_not_code_error(self):
+        t = _task("expectNoTextTruncationAt(375) failed at DashboardHome")
+        assert classify_failure(t) != CODE_ERROR
 
 
 class TestClassifyFailureProvision:
@@ -2049,3 +2067,111 @@ class TestResidualFingerprintDbWrite:
             )
         assert row is not None
         assert row.hit_count == N
+
+
+# ---------------------------------------------------------------------------
+# Cross-language contract / drift tests
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).parents[2]
+_AGENT_INDEX = _REPO_ROOT / "agent" / "src" / "index.ts"
+_VIEWPORT_TS = _REPO_ROOT / "admin-ui" / "src" / "test" / "viewport.ts"
+
+
+class TestCrossLanguageClassificationContracts:
+    """Contract tests: assert each classification-critical literal still exists
+    in its source of truth.
+
+    If one of these tests fails, a string has drifted.  Fix it by updating the
+    matching side — either the emitting source (agent/src/index.ts or
+    admin-ui/src/test/viewport.ts) or the classifier pattern in
+    backend/app/failure_classification.py — so both stay in sync.
+
+    Failures here are at *change time*, before any misclassification occurs in
+    production.
+    """
+
+    @staticmethod
+    def _src(path: Path) -> str:
+        if not path.exists():
+            pytest.skip(
+                f"{path} not available in this environment — the backend test "
+                "image ships neither agent/ nor admin-ui/ (build context is "
+                "./backend) and CI mounts neither. This cross-language drift "
+                "guard runs wherever the full repo tree is checked out (local "
+                "dev, agent VM workspace)."
+            )
+        return path.read_text(encoding="utf-8").lower()
+
+    # ------------------------------------------------------------------
+    # Agent heartbeat / status strings
+    # ------------------------------------------------------------------
+
+    def test_pr_creation_heartbeat_prefix_in_agent_source(self):
+        """failure_classification.py checks 'creating pull request for blueprint/'
+        (after lowercasing).  The agent emits this via sendHeartbeatSync() at
+        agent/src/index.ts.  If the agent renames the string, tasks reaped
+        mid-PR-push will fall through to CODE_ERROR and generate spurious
+        residual fingerprints.
+        """
+        src = self._src(_AGENT_INDEX)
+        assert "creating pull request for" in src, (
+            "agent/src/index.ts no longer emits 'Creating pull request for …'; "
+            "update the 'creating pull request for blueprint/' pattern in "
+            "failure_classification._classify_failure_class to match the new string, "
+            "or update the agent to keep the same prefix."
+        )
+
+    def test_using_tool_heartbeat_in_agent_source(self):
+        """failure_classification.py checks 'using tool: ' (after lowercasing).
+        The agent sets statusRef.value = `Using tool: ${toolName}` during every
+        Claude Code tool call.  If renamed, tasks reaped mid-tool-call will fall
+        through to CODE_ERROR instead of AGENT_TIMEOUT.
+        """
+        src = self._src(_AGENT_INDEX)
+        assert "using tool:" in src, (
+            "agent/src/index.ts no longer emits 'Using tool: <Name>'; "
+            "update the 'using tool: ' pattern in "
+            "failure_classification._classify_failure_class to match the new string, "
+            "or update the agent to keep the same prefix."
+        )
+
+    # ------------------------------------------------------------------
+    # Viewport helper function names (thrown in error messages)
+    # ------------------------------------------------------------------
+
+    def test_expect_no_overflow_at_in_viewport_ts(self):
+        """_VIEWPORT_PATTERNS checks 'expectnooverflowat(' (lowercase).
+        This substring appears in the Error messages thrown by expectNoOverflowAt()
+        in admin-ui/src/test/viewport.ts.  If the helper is renamed, viewport
+        failures will silently dissolve into CODE_ERROR residuals instead of
+        routing to VIEWPORT_REGRESSION.
+        """
+        src = self._src(_VIEWPORT_TS)
+        assert "expectnooverflowat(" in src, (
+            "admin-ui/src/test/viewport.ts no longer defines 'expectNoOverflowAt'; "
+            "update _VIEWPORT_PATTERNS in failure_classification.py to match "
+            "the new function name, or update viewport.ts to keep the same name."
+        )
+
+    def test_expect_no_text_truncation_at_in_viewport_ts(self):
+        """_VIEWPORT_PATTERNS checks 'expectnotexttruncationat(' (lowercase).
+        Mirrors expectNoTextTruncationAt() in admin-ui/src/test/viewport.ts.
+        """
+        src = self._src(_VIEWPORT_TS)
+        assert "expectnotexttruncationat(" in src, (
+            "admin-ui/src/test/viewport.ts no longer defines 'expectNoTextTruncationAt'; "
+            "update _VIEWPORT_PATTERNS in failure_classification.py to match "
+            "the new function name, or update viewport.ts to keep the same name."
+        )
+
+    def test_expect_min_touch_target_at_in_viewport_ts(self):
+        """_VIEWPORT_PATTERNS checks 'expectmintouchtargetat(' (lowercase).
+        Mirrors expectMinTouchTargetAt() in admin-ui/src/test/viewport.ts.
+        """
+        src = self._src(_VIEWPORT_TS)
+        assert "expectmintouchtargetat(" in src, (
+            "admin-ui/src/test/viewport.ts no longer defines 'expectMinTouchTargetAt'; "
+            "update _VIEWPORT_PATTERNS in failure_classification.py to match "
+            "the new function name, or update viewport.ts to keep the same name."
+        )

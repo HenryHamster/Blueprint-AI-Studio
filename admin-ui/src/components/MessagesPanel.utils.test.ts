@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, test } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, test, vi } from 'vitest';
 import {
   loadEventPrefs,
   saveEventPrefs,
@@ -28,7 +28,22 @@ import {
   loadLastSeen,
   saveLastSeen,
   resolveLastSeen,
+  resolveNoisePrefs,
+  fetchServerNoisePrefs,
+  saveServerNoisePrefs,
+  fetchServerSavedViews,
+  saveServerSavedViews,
+  resolveServerSavedViews,
+  countHighSignalMessages,
+  countNewSinceLastVisit,
 } from './MessagesPanel.utils';
+
+vi.mock('../api', () => ({
+  apiFetch: vi.fn(),
+  API_BASE_URL: '',
+}));
+
+import { apiFetch } from '../api';
 
 describe('MessagesPanel.utils - Event Preferences', () => {
   beforeEach(() => {
@@ -239,6 +254,7 @@ describe('escalation event invariants', () => {
     const base = { from_type: 'system', message_type: 'NOTE' as const };
     expect(classifySignalLevel({ ...base, context: { event_type: 'failure_alert' } })).toBe('high');
     expect(classifySignalLevel({ ...base, context: { event_type: 'rollback_recommended' } })).toBe('high');
+    expect(classifySignalLevel({ ...base, context: { event_type: 'fix_loop_divergence_regressed' } })).toBe('high');
     expect(classifySignalLevel({ ...base, context: { event_type: 'pr_merged' } })).toBe('routine');
   });
 
@@ -749,5 +765,282 @@ describe('resolveLastSeen (backend + localStorage merge)', () => {
 
   test('returns null when both sources are null', () => {
     expect(resolveLastSeen(null, null)).toBeNull();
+  });
+});
+
+// ── Server-side noise prefs ───────────────────────────────────────────────────
+
+describe('resolveNoisePrefs', () => {
+  test('returns server prefs when server result is present', () => {
+    const local: Record<string, EventPref> = { pr_merged: 'mute' };
+    const server: Record<string, EventPref> = { pr_merged: 'surfaced', cycle_summary: 'routine' };
+    expect(resolveNoisePrefs(local, server)).toEqual(server);
+  });
+
+  test('falls back to local when server is null (offline)', () => {
+    const local: Record<string, EventPref> = { pr_merged: 'mute' };
+    expect(resolveNoisePrefs(local, null)).toEqual(local);
+  });
+
+  test('returns empty server object when server returns empty prefs', () => {
+    const local: Record<string, EventPref> = { pr_merged: 'mute' };
+    expect(resolveNoisePrefs(local, {})).toEqual({});
+  });
+});
+
+describe('fetchServerNoisePrefs', () => {
+
+  beforeEach(() => { vi.resetAllMocks(); });
+
+  test('returns sanitized prefs on successful response', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ prefs: { pr_merged: 'mute', cycle_summary: 'invalid', failure_alert: 'surfaced' } }),
+    } as Response);
+    const result = await fetchServerNoisePrefs('project-uuid');
+    expect(result).toEqual({ pr_merged: 'mute', failure_alert: 'surfaced' }); // 'invalid' dropped
+  });
+
+  test('returns null on non-ok response', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({ ok: false } as Response);
+    expect(await fetchServerNoisePrefs('project-uuid')).toBeNull();
+  });
+
+  test('returns null on network error', async () => {
+    vi.mocked(apiFetch).mockRejectedValue(new Error('network'));
+    expect(await fetchServerNoisePrefs('project-uuid')).toBeNull();
+  });
+});
+
+describe('saveServerNoisePrefs', () => {
+
+  beforeEach(() => { vi.resetAllMocks(); });
+
+  test('calls PUT with the correct project_id and prefs', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({ ok: true } as Response);
+    const prefs: Record<string, EventPref> = { pr_merged: 'mute' };
+    await saveServerNoisePrefs('proj-123', prefs);
+    expect(vi.mocked(apiFetch)).toHaveBeenCalledWith(
+      expect.stringContaining('/api/admin/messages/noise-prefs'),
+      expect.objectContaining({ method: 'PUT', body: JSON.stringify({ project_id: 'proj-123', prefs }) }),
+    );
+  });
+
+  test('silently swallows network errors', async () => {
+    vi.mocked(apiFetch).mockRejectedValue(new Error('network'));
+    await expect(saveServerNoisePrefs('proj-123', {})).resolves.toBeUndefined();
+  });
+});
+
+// ── Server-side saved views ───────────────────────────────────────────────────
+
+describe('resolveServerSavedViews', () => {
+  const view: SavedView = {
+    id: 'v1', name: 'Blockers', query: 'blocker', prefs: {},
+    sort: 'importance', showResolved: false, routineExpanded: false,
+    showOnlyNew: false, createdAt: 1000,
+  };
+
+  test('returns server views when server result is present', () => {
+    const local = [{ ...view, id: 'local' }];
+    const server = [view];
+    expect(resolveServerSavedViews(local, server)).toEqual(server);
+  });
+
+  test('falls back to local when server is null (offline)', () => {
+    const local = [view];
+    expect(resolveServerSavedViews(local, null)).toEqual(local);
+  });
+
+  test('returns empty array when server returns empty views', () => {
+    expect(resolveServerSavedViews([view], [])).toEqual([]);
+  });
+});
+
+describe('fetchServerSavedViews', () => {
+  beforeEach(() => { vi.resetAllMocks(); });
+
+  test('returns sanitized views on successful response', async () => {
+    const raw = { id: 'v1', name: 'All', query: '', prefs: { pr_merged: 'mute' }, sort: 'importance', showResolved: false, routineExpanded: false, showOnlyNew: false, createdAt: 1000 };
+    vi.mocked(apiFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ saved_views: [raw, { bad: true }] }),
+    } as Response);
+    const result = await fetchServerSavedViews('project-uuid');
+    expect(result).toHaveLength(1);
+    expect(result![0].id).toBe('v1');
+    expect(result![0].prefs).toEqual({ pr_merged: 'mute' });
+  });
+
+  test('returns null on non-ok response', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({ ok: false } as Response);
+    expect(await fetchServerSavedViews('project-uuid')).toBeNull();
+  });
+
+  test('returns null on network error', async () => {
+    vi.mocked(apiFetch).mockRejectedValue(new Error('network'));
+    expect(await fetchServerSavedViews('project-uuid')).toBeNull();
+  });
+
+  test('returns empty array when server returns no views', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ saved_views: [] }),
+    } as Response);
+    expect(await fetchServerSavedViews('project-uuid')).toEqual([]);
+  });
+});
+
+describe('saveServerSavedViews', () => {
+  beforeEach(() => { vi.resetAllMocks(); });
+
+  test('calls PUT with the correct project_id and saved_views', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({ ok: true } as Response);
+    const views: SavedView[] = [{
+      id: 'v1', name: 'Blockers', query: 'blocker', prefs: {},
+      sort: 'importance', showResolved: false, routineExpanded: false,
+      showOnlyNew: false, createdAt: 1000,
+    }];
+    await saveServerSavedViews('proj-123', views);
+    expect(vi.mocked(apiFetch)).toHaveBeenCalledWith(
+      expect.stringContaining('/api/admin/messages/saved-views'),
+      expect.objectContaining({ method: 'PUT', body: JSON.stringify({ project_id: 'proj-123', saved_views: views }) }),
+    );
+  });
+
+  test('silently swallows network errors', async () => {
+    vi.mocked(apiFetch).mockRejectedValue(new Error('network'));
+    const views: SavedView[] = [];
+    await expect(saveServerSavedViews('proj-123', views)).resolves.toBeUndefined();
+  });
+});
+
+// ── High-signal NOTE flood survival ──────────────────────────────────────────
+// Regression guard: countHighSignalMessages must count each of the three
+// high-signal system NOTE event types (failure_alert, rollback_recommended,
+// fix_loop_divergence_regressed) correctly even when buried under a routine
+// flood of messages that would exceed a typical page limit.
+
+describe('countHighSignalMessages — high-signal NOTE flood survival', () => {
+  const makeRoutineFlood = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      id: `routine-${i}`,
+      message_type: 'NOTE' as const,
+      from_type: 'system',
+      status: 'open',
+      context: { event_type: 'pr_merged' },
+    }));
+
+  const makeHighSignalNote = (et: string, status = 'open') => ({
+    id: `hs-${et}`,
+    message_type: 'NOTE' as const,
+    from_type: 'system',
+    status,
+    context: { event_type: et },
+  });
+
+  test('failure_alert is counted amid routine flood exceeding page limit', () => {
+    const messages = [...makeRoutineFlood(100), makeHighSignalNote('failure_alert')];
+    expect(countHighSignalMessages(messages)).toBe(1);
+  });
+
+  test('rollback_recommended is counted amid routine flood exceeding page limit', () => {
+    const messages = [...makeRoutineFlood(100), makeHighSignalNote('rollback_recommended')];
+    expect(countHighSignalMessages(messages)).toBe(1);
+  });
+
+  test('fix_loop_divergence_regressed is counted amid routine flood exceeding page limit', () => {
+    const messages = [...makeRoutineFlood(100), makeHighSignalNote('fix_loop_divergence_regressed')];
+    expect(countHighSignalMessages(messages)).toBe(1);
+  });
+
+  test('all three high-signal NOTE types are counted independently amid routine flood', () => {
+    const messages = [
+      ...makeRoutineFlood(100),
+      makeHighSignalNote('failure_alert'),
+      makeHighSignalNote('rollback_recommended'),
+      makeHighSignalNote('fix_loop_divergence_regressed'),
+    ];
+    expect(countHighSignalMessages(messages)).toBe(3);
+  });
+
+  test('resolved high-signal NOTEs are excluded from count', () => {
+    const messages = [
+      ...makeRoutineFlood(50),
+      makeHighSignalNote('failure_alert', 'resolved'),
+      makeHighSignalNote('rollback_recommended'),
+    ];
+    expect(countHighSignalMessages(messages)).toBe(1);
+  });
+
+  test('routine flood alone counts zero', () => {
+    expect(countHighSignalMessages(makeRoutineFlood(100))).toBe(0);
+  });
+});
+
+// ── countNewSinceLastVisit ────────────────────────────────────────────────────
+
+describe('countNewSinceLastVisit', () => {
+  const base = Date.now();
+  const tsOld = new Date(base - 10000).toISOString();
+  const tsNew = new Date(base + 10000).toISOString();
+
+  const makeMsg = (opts: {
+    event_type?: string;
+    message_type?: string;
+    from_type?: string;
+    status?: string;
+    created_at?: string | null;
+  }) => ({
+    message_type: opts.message_type ?? 'NOTE',
+    from_type: opts.from_type ?? 'system',
+    status: opts.status ?? 'open',
+    context: { event_type: opts.event_type ?? 'failure_alert' },
+    created_at: opts.created_at !== undefined ? opts.created_at : tsNew,
+  });
+
+  test('returns 0 when lastSeenTs is null (no baseline)', () => {
+    const msgs = [makeMsg({ event_type: 'failure_alert' })];
+    expect(countNewSinceLastVisit(msgs, null)).toBe(0);
+  });
+
+  test('returns 0 when all high-signal messages predate lastSeenTs', () => {
+    const msgs = [makeMsg({ event_type: 'failure_alert', created_at: tsOld })];
+    expect(countNewSinceLastVisit(msgs, base)).toBe(0);
+  });
+
+  test('counts high-signal messages newer than lastSeenTs', () => {
+    const msgs = [makeMsg({ event_type: 'failure_alert', created_at: tsNew })];
+    expect(countNewSinceLastVisit(msgs, base)).toBe(1);
+  });
+
+  test('excludes routine-signal messages even if newer than lastSeenTs', () => {
+    const msgs = [makeMsg({ event_type: 'pr_merged', created_at: tsNew })];
+    expect(countNewSinceLastVisit(msgs, base)).toBe(0);
+  });
+
+  test('excludes resolved messages even if high-signal and newer', () => {
+    const msgs = [makeMsg({ event_type: 'failure_alert', status: 'resolved', created_at: tsNew })];
+    expect(countNewSinceLastVisit(msgs, base)).toBe(0);
+  });
+
+  test('excludes messages with no created_at', () => {
+    const msgs = [makeMsg({ event_type: 'failure_alert', created_at: null })];
+    expect(countNewSinceLastVisit(msgs, base)).toBe(0);
+  });
+
+  test('counts user messages as high-signal when newer than lastSeenTs', () => {
+    const msgs = [makeMsg({ message_type: 'FEEDBACK', from_type: 'user', created_at: tsNew })];
+    expect(countNewSinceLastVisit(msgs, base)).toBe(1);
+  });
+
+  test('mixed messages: only counts open high-signal newer items', () => {
+    const msgs = [
+      makeMsg({ event_type: 'failure_alert', created_at: tsNew }),   // counts
+      makeMsg({ event_type: 'failure_alert', created_at: tsOld }),   // too old
+      makeMsg({ event_type: 'pr_merged', created_at: tsNew }),        // routine
+      makeMsg({ event_type: 'failure_alert', status: 'resolved', created_at: tsNew }), // resolved
+    ];
+    expect(countNewSinceLastVisit(msgs, base)).toBe(1);
   });
 });

@@ -76,6 +76,17 @@ describe('TaskStreamPanel — viewport regression', () => {
           />,
         );
       });
+      // Assert panel's bounding box fits entirely within viewport (both edges)
+      const panel = document.querySelector<HTMLDivElement>('[class*="fixed"][class*="bottom-0"]');
+      if (panel) {
+        const rect = panel.getBoundingClientRect();
+        if (rect.left < 0) {
+          throw new Error(`TaskStreamPanel left edge (${Math.round(rect.left)}px) extends off-screen at 375px viewport`);
+        }
+        if (rect.right > 375) {
+          throw new Error(`TaskStreamPanel right edge (${Math.round(rect.right)}px) exceeds 375px viewport`);
+        }
+      }
     });
   });
 
@@ -100,6 +111,17 @@ describe('TaskStreamPanel — viewport regression', () => {
           />,
         );
       });
+      // Assert panel's bounding box fits entirely within viewport (both edges)
+      const panel = document.querySelector<HTMLDivElement>('[class*="fixed"][class*="bottom-0"]');
+      if (panel) {
+        const rect = panel.getBoundingClientRect();
+        if (rect.left < 0) {
+          throw new Error(`TaskStreamPanel left edge (${Math.round(rect.left)}px) extends off-screen at 375px viewport`);
+        }
+        if (rect.right > 375) {
+          throw new Error(`TaskStreamPanel right edge (${Math.round(rect.right)}px) exceeds 375px viewport`);
+        }
+      }
     });
   });
 });

@@ -236,6 +236,34 @@ describe('AutoRecoveredPanel — layer badges', () => {
 const escalationResponse = (byReason: Record<string, unknown>): Response =>
   ({ ok: true, status: 200, json: async () => ({ by_reason: byReason, lookback_days: 30 }) }) as Response;
 
+describe('ManualInterventionPanel — viewport failure screenshot disclosure', () => {
+  const viewportCase = {
+    ...baseCase,
+    regression_class: 'viewport_regression:MessagesPanel@375',
+  };
+
+  it('shows failure screenshot when failure_screenshot_url is set', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([{
+      ...viewportCase,
+      failure_screenshot_url: '/uploads/viewport-failures/MessagesPanel-375px-abc.png',
+    }]));
+    render(<ManualInterventionPanel projectId="proj-1" />);
+    await screen.findByText('viewport regression');
+    const toggle = screen.getByRole('button', { name: /failure screenshot/ });
+    fireEvent.click(toggle);
+    expect(screen.queryByAltText('MessagesPanel baseline at 375px')).toBeNull();
+    expect(screen.getByAltText('MessagesPanel failure at 375px')).toBeInTheDocument();
+    expect(screen.getByText('Latest failure')).toBeInTheDocument();
+  });
+
+  it('hides the disclosure button when failure_screenshot_url is null', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([{ ...viewportCase, failure_screenshot_url: null }]));
+    render(<ManualInterventionPanel projectId="proj-1" />);
+    await screen.findByText('viewport regression');
+    expect(screen.queryByRole('button', { name: /failure screenshot/ })).toBeNull();
+  });
+});
+
 describe('EscalationOutcomePanel — compliance_followup bucket', () => {
   it('renders both cross-layer baseline and compliance_followup rows as separate entries', async () => {
     apiFetchMock.mockResolvedValueOnce(escalationResponse({
@@ -261,5 +289,42 @@ describe('EscalationOutcomePanel — compliance_followup bucket', () => {
     // baseline durable_resolution_rate = 50%; followup = 100%
     expect(screen.getByText('50%')).toBeInTheDocument();
     expect(screen.getByText('100%')).toBeInTheDocument();
+  });
+});
+
+describe('ManualInterventionPanel — viewport regression class parsing', () => {
+  it('parses component name correctly for new-format regression (Component:assertion_type@Width)', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([
+      {
+        ...baseCase,
+        id: 'vp-1',
+        regression_class: 'viewport_regression:MessagesPanel:overflow@375',
+        signal_name: 'viewport overflow',
+        failure_screenshot_url: '/uploads/viewport-failures/MessagesPanel-375px-abc.png',
+      },
+    ]));
+    render(<ManualInterventionPanel projectId="proj-1" />);
+    await waitFor(() => expect(screen.getByText('viewport overflow')).toBeInTheDocument());
+    const button = screen.getAllByRole('button', { name: /failure screenshot/ })[0];
+    fireEvent.click(button);
+    // Alt text uses component name without the assertion_type segment
+    expect(screen.getByAltText('MessagesPanel failure at 375px')).toBeInTheDocument();
+  });
+
+  it('parses component name correctly for legacy-format regression (Component@Width)', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([
+      {
+        ...baseCase,
+        id: 'vp-2',
+        regression_class: 'viewport_regression:TaskCard@768',
+        signal_name: 'viewport legacy',
+        failure_screenshot_url: '/uploads/viewport-failures/TaskCard-768px-xyz.png',
+      },
+    ]));
+    render(<ManualInterventionPanel projectId="proj-1" />);
+    await waitFor(() => expect(screen.getByText('viewport legacy')).toBeInTheDocument());
+    const button = screen.getAllByRole('button', { name: /failure screenshot/ })[0];
+    fireEvent.click(button);
+    expect(screen.getByAltText('TaskCard failure at 768px')).toBeInTheDocument();
   });
 });

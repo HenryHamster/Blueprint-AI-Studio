@@ -7,6 +7,7 @@ Covers:
   - _record_strategic_task_failure: circuit-breaker increment and cycle history update
 """
 
+import uuid
 import pytest
 import pytest_asyncio
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,13 @@ from app.strategic_completion import (
     _collect_rationales,
     _extract_cycle_reasoning,
     _extract_rationale_from_notes,
+    _compute_churn_metrics,
+    _compute_lifetime_burn_metrics,
+    _compute_outcome_progress_signal,
+    record_outcome_progress_snapshot,
+    _check_outcome_scaffolding,
+    _apply_evidence_progress_verdicts,
+    EVIDENCE_PROGRESS_CONTEXT_KEY,
     _CREATED_NOTE_PREFIX,
     _RETIRED_NOTE_PREFIX,
 )
@@ -293,6 +301,322 @@ class TestCheckDirectionHealth:
         result = _check_direction_health({"possibly_saturated": False})
         assert result is None
 
+    # --- Rule 5: High non-merge churn ---
+
+    def test_rule5_churn_guardrail_fires_at_default_threshold(self):
+        # 5 cycles: 3 completed, 0 merged each
+        # non_merge_finished = max(0, 15+0-0) = 15 == threshold, merge_rate = 0%
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=5, tasks_completed=3, tasks_failed=0, prs_merged=0
+            )
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Churn guardrail" in result
+        assert "15" in result
+        assert "0%" in result
+
+    def test_rule5_not_triggered_when_merge_rate_adequate(self):
+        # 5 cycles: 8 completed, 3 merged → merge_rate ≈ 38%, well above 10% minimum
+        # non_merge_finished = max(0, 40+0-15) = 25 >= 15, but merge_rate is too high
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=10, tasks_completed=8, tasks_failed=0, prs_merged=3
+            )
+        )
+        result = _check_direction_health(d)
+        assert result is None
+
+    def test_rule5_not_triggered_below_non_merge_threshold(self):
+        # 5 cycles: 2 completed, 0 merged → non_merge_finished = max(0,10+0-0) = 10 < 15
+        # tasks_created=4 with tasks_completed=2 → still in-flight guard also prevents Rule 2
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=4, tasks_completed=2, tasks_failed=0, prs_merged=0
+            )
+        )
+        result = _check_direction_health(d)
+        assert result is None
+
+    def test_rule5_config_threshold_honored(self, mocker):
+        # Lower threshold to 5; direction with non_merge_finished=15 now fires
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"direction_churn_non_merge_threshold": 5},
+            clear=False,
+        )
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=4, tasks_completed=3, tasks_failed=0, prs_merged=0
+            )
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Churn guardrail" in result
+
+    def test_rule5_config_window_honored(self, mocker):
+        # window=3 focuses on last 3 bad cycles, ignoring earlier good ones that
+        # would raise the merge rate high enough to suppress the rule
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"direction_churn_window_cycles": 3},
+            clear=False,
+        )
+        good = _history(
+            7, tasks_created=5, tasks_completed=4, tasks_failed=0, prs_merged=3
+        )
+        bad = _history(
+            3, tasks_created=7, tasks_completed=6, tasks_failed=0, prs_merged=0
+        )
+        d = _direction(research_history=good + bad)
+        # With window=3 (bad only): non_merge_finished=18, merge_rate=0% → fires
+        # With default window=5 (2 good + 3 bad): merge_rate≈23% → would not fire
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Churn guardrail" in result
+
+    def test_rule5_pause_reason_includes_machine_readable_counts(self):
+        # Verify the reason includes window_cycles and merged count for operator tooling
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=5, tasks_completed=4, tasks_failed=0, prs_merged=0
+            )
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        # non_merge_finished=20, merged=0, window_cycles=5
+        assert "0 merged" in result
+        assert "5 cycles" in result
+
+    # --- Rule 6: Lifetime cumulative burn backstop ---
+
+    def test_rule6_fires_when_aggregate_pushes_lifetime_over_threshold(self):
+        # Window: 10 non-merging tasks (< Rule-5 threshold of 15) — Rule 5 stays silent.
+        # Aggregate adds 150 more → lifetime_non_merge=160 ≥ 150 at 0% rate → Rule 6 fires.
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=3, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+            history_aggregate={
+                "total_tasks_completed": 150,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+                "total_prs_merged": 0,
+                "total_cycles": 30,
+            },
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Lifetime burn backstop" in result
+
+    def test_rule6_not_triggered_at_healthy_lifetime_merge_rate(self):
+        # Window: 5 merged in 5 cycles keeps Rule-5 quiet.
+        # Aggregate: 25 merged across 200 completed → lifetime merge rate ≈14% > 10% → Rule 6 off.
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=3, tasks_completed=2, tasks_failed=0, prs_merged=1
+            ),
+            history_aggregate={
+                "total_tasks_completed": 200,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+                "total_prs_merged": 25,
+                "total_cycles": 40,
+            },
+        )
+        result = _check_direction_health(d)
+        assert result is None or "Lifetime burn backstop" not in result
+
+    def test_rule6_independent_of_rolling_window_rule5(self):
+        # Window non_merge=10 < Rule-5 threshold (15) → Rule 5 does NOT fire.
+        # Lifetime aggregate pushes total to 160 non-merging at 0% → Rule 6 fires.
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=3, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+            history_aggregate={
+                "total_tasks_completed": 150,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+                "total_prs_merged": 0,
+                "total_cycles": 30,
+            },
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Lifetime burn backstop" in result
+        assert "Churn guardrail" not in result
+
+    def test_rule6_config_threshold_honored(self, mocker):
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"direction_lifetime_non_merge_threshold": 50},
+            clear=False,
+        )
+        # Window: 10 non-merge (< Rule-5 default 15). Aggregate: 50 completed → lifetime=60 ≥ 50.
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=3, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+            history_aggregate={
+                "total_tasks_completed": 50,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+                "total_prs_merged": 0,
+                "total_cycles": 10,
+            },
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Lifetime burn backstop" in result
+
+    def test_rule6_message_includes_machine_readable_counts(self):
+        # lifetime_non_merge_finished=160, lifetime_merged=0, rate=0%
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=3, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+            history_aggregate={
+                "total_tasks_completed": 150,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+                "total_prs_merged": 0,
+                "total_cycles": 30,
+            },
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "160" in result
+        assert "0 merged" in result
+        assert "0%" in result
+
+    def test_rule6_not_classified_as_code_failure(self):
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=3, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+            history_aggregate={
+                "total_tasks_completed": 150,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+                "total_prs_merged": 0,
+                "total_cycles": 30,
+            },
+        )
+        reason = _check_direction_health(d)
+        assert reason is not None
+        assert "Lifetime burn backstop" in reason
+        assert _is_code_failure_pause_reason(reason) is False
+
+
+# ── _compute_churn_metrics ────────────────────────────────────────────────────
+
+
+class TestComputeChurnMetrics:
+    def test_returns_none_when_fewer_than_3_cycles(self):
+        d = _direction(
+            research_history=_history(
+                2, tasks_completed=5, tasks_failed=0, prs_merged=0
+            )
+        )
+        assert _compute_churn_metrics(d) is None
+
+    def test_returns_none_for_empty_history(self):
+        assert _compute_churn_metrics(_direction(research_history=[])) is None
+
+    def test_basic_non_merge_computation(self):
+        # 3 cycles: 5 completed, 0 merged each
+        # non_merge_finished = max(0, 15+0-0) = 15
+        d = _direction(
+            research_history=_history(
+                3, tasks_completed=5, tasks_failed=0, prs_merged=0
+            )
+        )
+        m = _compute_churn_metrics(d)
+        assert m is not None
+        assert m["non_merge_finished"] == 15
+        assert m["merged"] == 0
+        assert m["window_cycles"] == 3
+        assert m["merge_rate"] == 0.0
+
+    def test_non_merge_finished_floored_at_zero(self):
+        # No completed or failed tasks at all — floor prevents negative values
+        d = _direction(
+            research_history=_history(
+                3, tasks_completed=0, tasks_failed=0, prs_merged=0
+            )
+        )
+        m = _compute_churn_metrics(d)
+        assert m is not None
+        assert m["non_merge_finished"] == 0
+
+    def test_code_failed_tasks_counted_as_finished_non_merge(self):
+        # 3 cycles: 0 completed, 4 code-failed, 0 merged
+        # code_failed = 12; non_merge_finished = max(0, 0+12-0) = 12
+        d = _direction(
+            research_history=_history(
+                3, tasks_completed=0, tasks_failed=4, tasks_failed_infra=0, prs_merged=0
+            )
+        )
+        m = _compute_churn_metrics(d)
+        assert m is not None
+        assert m["non_merge_finished"] == 12
+
+    def test_infra_failures_excluded_from_non_merge_count(self):
+        # 3 cycles: all 4 failures are infra → code_failed=0 → non_merge_finished=0
+        d = _direction(
+            research_history=_history(
+                3, tasks_completed=0, tasks_failed=4, tasks_failed_infra=4, prs_merged=0
+            )
+        )
+        m = _compute_churn_metrics(d)
+        assert m is not None
+        assert m["non_merge_finished"] == 0
+
+    def test_merge_rate_computed_correctly(self):
+        # 3 cycles: 4 completed, 1 merged each
+        # merged=3, non_merge_finished=max(0,12+0-3)=9
+        # total_finished=12, merge_rate=3/12=0.25
+        d = _direction(
+            research_history=_history(
+                3, tasks_completed=4, tasks_failed=0, prs_merged=1
+            )
+        )
+        m = _compute_churn_metrics(d)
+        assert m is not None
+        assert m["merged"] == 3
+        assert m["non_merge_finished"] == 9
+        assert abs(m["merge_rate"] - 0.25) < 0.001
+
+    def test_zero_total_finished_gives_zero_merge_rate(self):
+        # No completed or failed tasks → total_finished=0, no division by zero
+        d = _direction(
+            research_history=_history(
+                3, tasks_completed=0, tasks_failed=0, prs_merged=0
+            )
+        )
+        m = _compute_churn_metrics(d)
+        # non_merge_finished=0, total_finished=0 → merge_rate=0.0
+        assert m is not None
+        assert m["merge_rate"] == 0.0
+
+    def test_uses_rolling_window(self, mocker):
+        # window=3: only last 3 "bad" cycles counted, not the 3 "clean" ones before
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"direction_churn_window_cycles": 3},
+            clear=False,
+        )
+        clean = _history(3, tasks_completed=1, tasks_failed=0, prs_merged=0)
+        bad = _history(3, tasks_completed=5, tasks_failed=0, prs_merged=0)
+        d = _direction(research_history=clean + bad)
+        m = _compute_churn_metrics(d)
+        # Only last 3 "bad" cycles: non_merge_finished=max(0,15-0)=15
+        assert m is not None
+        assert m["window_cycles"] == 3
+        assert m["non_merge_finished"] == 15
+
 
 # ── _is_code_failure_pause_reason ────────────────────────────────────────────
 
@@ -342,6 +666,19 @@ class TestIsCodeFailurePauseReason:
         )
         reason = _check_direction_health(d)
         assert reason is not None
+        assert _is_code_failure_pause_reason(reason) is False
+
+    def test_rule5_churn_guardrail_not_classified_as_code_failure(self):
+        # Rule 5 (churn) is an unproductive-volume signal, not a code error;
+        # it must NOT trigger a root-cause investigation.
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=5, tasks_completed=4, tasks_failed=0, prs_merged=0
+            )
+        )
+        reason = _check_direction_health(d)
+        assert reason is not None
+        assert "Churn guardrail" in reason
         assert _is_code_failure_pause_reason(reason) is False
 
     def test_none_reason_returns_false(self):
@@ -2229,6 +2566,74 @@ async def test_retirement_critiques_persisted_via_context_injection(db_session, 
 
 
 @pytest.mark.asyncio
+async def test_memo_citations_persisted_in_cycle_metadata(db_session, mocker):
+    """A COMPLETED memo task in the project window populates
+    cycle_metadata['memo_citations'] with {task_id, summary_excerpt} entries."""
+    from unittest.mock import AsyncMock
+    from app.models import TaskStatus
+    from app.strategic_completion import _handle_strategic_completion
+    from app import strategic_cycle
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="Memo-Cite",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A COMPLETED memo task with a parseable summary in plan_output.
+    memo_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "memo", "topic": "Dropped finding X"}],
+        status=TaskStatus.COMPLETED,
+        plan_output={
+            "memo": {
+                "summary": "Summary of dropped finding X reasoning.",
+                "reasoning": "Detail.",
+                "citations": [],
+                "tags": [],
+            }
+        },
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(memo_task)
+    await db_session.commit()
+    await db_session.refresh(memo_task)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"_strategic_vision_set": True, "strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _handle_strategic_completion(task, "", db_session)
+
+    await db_session.refresh(cycle)
+    meta = cycle.cycle_metadata or {}
+    assert "memo_citations" in meta, (
+        "memo_citations must be persisted in cycle_metadata"
+    )
+    cites = meta["memo_citations"]
+    assert len(cites) == 1
+    assert cites[0]["task_id"] == str(memo_task.id)
+    assert cites[0]["summary_excerpt"].startswith("Summary of dropped finding X")
+
+
+@pytest.mark.asyncio
 async def test_retirement_critiques_persisted_via_fallback_path(db_session, mocker):
     """Fallback (log-parse) path: retired_direction_critiques from JSON output ends up in cycle metadata."""
     import json
@@ -2960,6 +3365,167 @@ async def test_set_retirement_critiques_invalid_dict_returns_400(
     assert resp.status_code == 400, resp.text
 
 
+# ── set_evidence_progress HTTP API path ────────────────────────────────────────
+
+
+async def _make_strategic_task(db_session, *, name, vm, directions=None):
+    """Build a committed project + cycle + strategic_review task; return the task."""
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name=name,
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=directions or [],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=vm,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_set_evidence_progress_list_via_http(client, db_session):
+    """HTTP API: a valid list payload returns 200 and stashes verdicts in task.context."""
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(db_session, name="EP-HTTP", vm="vm-ep")
+    token = create_agent_token(str(task.id), "vm-ep", task_type="strategic_review")
+    verdicts = [
+        {"direction_id": "d-1", "status": "advancing", "rationale": "landed finding F"},
+        {"direction_id": "d-2", "status": "stalled", "rationale": "no new evidence"},
+    ]
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={"task_id": str(task.id), "op": "set_evidence_progress", "data": verdicts},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["op"] == "set_evidence_progress"
+    assert body["count"] == 2
+
+    await db_session.refresh(task)
+    stored = (task.context or {}).get(EVIDENCE_PROGRESS_CONTEXT_KEY)
+    assert stored == verdicts
+    assert (task.context or {}).get("_strategic_api_called") is True
+
+
+@pytest.mark.asyncio
+async def test_set_evidence_progress_invalid_status_returns_400(client, db_session):
+    """HTTP API: an out-of-enum status rejects the whole payload with 400."""
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(db_session, name="EP-BADSTATUS", vm="vm-ep-bs")
+    token = create_agent_token(str(task.id), "vm-ep-bs", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_evidence_progress",
+            "data": [
+                {"direction_id": "d-1", "status": "progressing", "rationale": "x"}
+            ],
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 400, resp.text
+    await db_session.refresh(task)
+    assert EVIDENCE_PROGRESS_CONTEXT_KEY not in (task.context or {})
+
+
+@pytest.mark.asyncio
+async def test_set_evidence_progress_non_list_returns_400(client, db_session):
+    """HTTP API: a non-list payload (dict) is rejected with 400."""
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(db_session, name="EP-NONLIST", vm="vm-ep-nl")
+    token = create_agent_token(str(task.id), "vm-ep-nl", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_evidence_progress",
+            "data": {"direction_id": "d-1", "status": "advancing"},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.asyncio
+async def test_set_evidence_progress_end_to_end_persists_on_direction(
+    client, db_session, mocker
+):
+    """Smoke: submit verdict via HTTP -> stash -> completion handler persists on direction."""
+    from unittest.mock import AsyncMock
+    from app.auth import create_agent_token
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    task = await _make_strategic_task(
+        db_session,
+        name="EP-E2E",
+        vm="vm-ep-e2e",
+        directions=[
+            {
+                "id": "d-live",
+                "status": "active",
+                "text": "Long runner",
+                "research_history": [{}, {}, {}],
+                "history_aggregate": {"total_cycles": 9},
+            }
+        ],
+    )
+    token = create_agent_token(str(task.id), "vm-ep-e2e", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_evidence_progress",
+            "data": [
+                {
+                    "direction_id": "d-live",
+                    "status": "met",
+                    "rationale": "evidence satisfied",
+                }
+            ],
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(task)
+    project = await db_session.get(Project, task.project_id)
+    await _handle_strategic_completion(task, "", db_session, project=project)
+
+    await db_session.refresh(project)
+    ep = project.directions[0]["evidence_progress"]
+    assert ep["status"] == "met"
+    assert ep["rationale"] == "evidence satisfied"
+    assert ep["cycle_index"] == 12  # 3 history + 9 aggregate
+    assert ep["cycle_task_id"] == str(task.id)
+
+
 # ── superseded status + successor linkage ─────────────────────────────────────
 
 
@@ -3547,9 +4113,7 @@ async def test_version_phase_decision_flows_end_to_end(client, db_session, mocke
     await db_session.commit()
     await db_session.refresh(task)
 
-    token = create_agent_token(
-        str(task.id), "vm-vpd-e2e", task_type="strategic_review"
-    )
+    token = create_agent_token(str(task.id), "vm-vpd-e2e", task_type="strategic_review")
 
     # The agent embeds version_phase_decision as a TOP-LEVEL SIBLING of the
     # problem_model fields — exactly what the research-plan executor prompt
@@ -3700,9 +4264,7 @@ async def test_set_problem_model_ignores_invalid_version_phase_decision(
     await db_session.commit()
     await db_session.refresh(task)
 
-    token = create_agent_token(
-        str(task.id), "vm-vpd-bad", task_type="strategic_review"
-    )
+    token = create_agent_token(str(task.id), "vm-vpd-bad", task_type="strategic_review")
     resp = await client.post(
         "/api/agent/strategic",
         json={
@@ -3792,9 +4354,7 @@ async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
     await db_session.commit()
     await db_session.refresh(task)
 
-    token = create_agent_token(
-        str(task.id), "vm-qr-e2e", task_type="strategic_review"
-    )
+    token = create_agent_token(str(task.id), "vm-qr-e2e", task_type="strategic_review")
 
     # The agent embeds qualify_request as a TOP-LEVEL SIBLING of the
     # problem_model fields — exactly what the research-plan executor prompt
@@ -3932,9 +4492,7 @@ async def test_qualify_request_skipped_when_version_not_in_stabilize(
 
 
 @pytest.mark.asyncio
-async def test_set_problem_model_with_qualify_request_does_not_400(
-    client, db_session
-):
+async def test_set_problem_model_with_qualify_request_does_not_400(client, db_session):
     """Embedding qualify_request in set_problem_model must not break the
     problem_model write itself.
 
@@ -3988,3 +4546,597 @@ async def test_set_problem_model_with_qualify_request_does_not_400(
     # problem_model write succeeded: revision bumped off the empty baseline.
     assert body["revision"] == 1
     assert body["qualify_request_received"] is True
+
+
+# ── _compute_lifetime_burn_metrics ───────────────────────────────────────────
+
+
+class TestComputeLifetimeBurnMetrics:
+    def test_returns_none_when_no_history_and_no_aggregate(self):
+        d = _direction(research_history=[], history_aggregate={})
+        assert _compute_lifetime_burn_metrics(d) is None
+
+    def test_window_only_no_aggregate(self):
+        # 5 cycles: 5 completed, 0 merged each → lifetime_non_merge_finished=25
+        d = _direction(
+            research_history=_history(
+                5, tasks_completed=5, tasks_failed=0, prs_merged=0
+            )
+        )
+        m = _compute_lifetime_burn_metrics(d)
+        assert m is not None
+        assert m["lifetime_non_merge_finished"] == 25
+        assert m["lifetime_merged"] == 0
+        assert m["lifetime_merge_rate"] == 0.0
+
+    def test_aggregate_and_window_combined(self):
+        # aggregate has 100 completed/0 merged (evicted cycles)
+        # window has 5 cycles: 10 completed, 0 merged
+        agg = {
+            "total_prs_merged": 0,
+            "total_tasks_completed": 100,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        }
+        d = _direction(
+            research_history=_history(
+                5, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+            history_aggregate=agg,
+        )
+        m = _compute_lifetime_burn_metrics(d)
+        assert m is not None
+        assert m["lifetime_non_merge_finished"] == 110  # 100 + 10
+        assert m["lifetime_merged"] == 0
+
+    def test_healthy_direction_high_merge_rate(self):
+        # 5 cycles × (5 completed, 4 merged) → 25 completed, 20 merged
+        # non_merge=max(0,25-20)=5, total_finished=25 → merge_rate=20/25=80%
+        d = _direction(
+            research_history=_history(
+                5, tasks_completed=5, tasks_failed=0, prs_merged=4
+            ),
+        )
+        m = _compute_lifetime_burn_metrics(d)
+        assert m is not None
+        assert m["lifetime_merge_rate"] == 0.8
+
+    def test_infra_failures_excluded_from_non_merge(self):
+        # 5 cycles: tasks_failed=2 (all infra), tasks_completed=3, prs_merged=0
+        # code_failed = max(0, 2-2) = 0 → non_merge = max(0, 3+0-0) = 3 per cycle
+        d = _direction(
+            research_history=_history(
+                5, tasks_completed=3, tasks_failed=2, tasks_failed_infra=2, prs_merged=0
+            )
+        )
+        m = _compute_lifetime_burn_metrics(d)
+        assert m is not None
+        assert m["lifetime_non_merge_finished"] == 15  # 5 * 3
+
+    def test_aggregate_infra_failures_excluded(self):
+        agg = {
+            "total_prs_merged": 0,
+            "total_tasks_completed": 10,
+            "total_tasks_failed": 20,
+            "total_tasks_failed_infra": 20,  # all infra → code_failed=0
+        }
+        d = _direction(research_history=[], history_aggregate=agg)
+        m = _compute_lifetime_burn_metrics(d)
+        assert m is not None
+        assert m["lifetime_non_merge_finished"] == 10  # only tasks_completed counts
+
+
+# ── Rule 6: Lifetime burn backstop ───────────────────────────────────────────
+
+
+class TestRule6LifetimeBurnBackstop:
+    def test_fires_when_aggregate_plus_window_exceed_threshold(self, mocker):
+        # Window: 5 cycles × 2 completed, 0 merged = 10 non-merge (below Rule 5 threshold 15)
+        # Aggregate: 145 completed, 0 merged
+        # Lifetime total: 155 > 150 → Rule 6 fires, merge_rate = 0%
+        # tasks_created=5 > tasks_completed=2 prevents Rule 2 in-flight guard from firing
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {
+                "direction_lifetime_non_merge_threshold": 150,
+                "direction_lifetime_min_merge_rate": 0.10,
+            },
+            clear=False,
+        )
+        agg = {
+            "total_prs_merged": 0,
+            "total_tasks_completed": 145,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        }
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=5, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+            history_aggregate=agg,
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Lifetime burn backstop" in result
+        assert "155" in result
+
+    def test_not_fired_when_healthy_lifetime_merge_rate(self, mocker):
+        # 200 non-merge finished but 200 merged → merge_rate=50%, above 10% floor
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {
+                "direction_lifetime_non_merge_threshold": 150,
+                "direction_lifetime_min_merge_rate": 0.10,
+            },
+            clear=False,
+        )
+        agg = {
+            "total_prs_merged": 200,
+            "total_tasks_completed": 400,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        }
+        d = _direction(research_history=[], history_aggregate=agg)
+        result = _check_direction_health(d)
+        assert result is None
+
+    def test_independent_of_windowed_rule5(self, mocker):
+        # Window is clean (below Rule 5 threshold) but aggregate pushes lifetime over Rule 6 threshold
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {
+                "direction_churn_non_merge_threshold": 15,
+                "direction_churn_min_merge_rate": 0.10,
+                "direction_lifetime_non_merge_threshold": 150,
+                "direction_lifetime_min_merge_rate": 0.10,
+            },
+            clear=False,
+        )
+        # Window: 5 cycles × 2 completed, 0 merged = 10 non_merge (below Rule 5 threshold 15)
+        # Aggregate: 145 completed, 0 merged
+        # Lifetime total: 10 + 145 = 155 > 150 → Rule 6 fires
+        # tasks_created=5 > finished=2 keeps tasks in-flight so Rule 2's
+        # zero-merge guard does not fire before Rule 6.
+        agg = {
+            "total_prs_merged": 0,
+            "total_tasks_completed": 145,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        }
+        d = _direction(
+            research_history=_history(
+                5, tasks_created=5, tasks_completed=2, tasks_failed=0, prs_merged=0
+            ),
+            history_aggregate=agg,
+        )
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Lifetime burn backstop" in result
+
+    def test_not_fired_below_lifetime_threshold(self, mocker):
+        # Only 100 lifetime non-merge finished, threshold is 150 → no pause
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {
+                "direction_lifetime_non_merge_threshold": 150,
+                "direction_lifetime_min_merge_rate": 0.10,
+            },
+            clear=False,
+        )
+        agg = {
+            "total_prs_merged": 0,
+            "total_tasks_completed": 100,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        }
+        d = _direction(research_history=[], history_aggregate=agg)
+        result = _check_direction_health(d)
+        # Should not fire Rule 6 (only 100 < 150), though Rule 2 (zero merges) may fire
+        # We only assert Rule 6 is NOT the trigger
+        assert result is None or "Lifetime burn backstop" not in result
+
+    def test_lifetime_backstop_not_classified_as_code_failure(self, mocker):
+        # Rule 6 is a volume/burn signal, not a code error — must not trigger investigation
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {
+                "direction_lifetime_non_merge_threshold": 150,
+                "direction_lifetime_min_merge_rate": 0.10,
+            },
+            clear=False,
+        )
+        agg = {
+            "total_prs_merged": 0,
+            "total_tasks_completed": 160,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        }
+        d = _direction(research_history=[], history_aggregate=agg)
+        reason = _check_direction_health(d)
+        assert reason is not None
+        assert "Lifetime burn backstop" in reason
+        assert _is_code_failure_pause_reason(reason) is False
+
+
+# ── Outcome-progress (scaffolding) detector ───────────────────────────────────
+
+
+def _scaffolding_history(cycles=4, created=3, merged=3, completed=3):
+    """research_history entries for a healthy-merging direction (no failures)."""
+    return [
+        {
+            "tasks_created": created,
+            "tasks_completed": completed,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": merged,
+        }
+        for _ in range(cycles)
+    ]
+
+
+def _scaffolding_direction(progress_window, **overrides):
+    """Long-running healthy-merge direction with a given progress-signal window.
+
+    total_cycles = 4 (history) + 10 (aggregate) = 14 >= default min_cycles (12);
+    lifetime_merged = 12 + 8 = 20 with merge_rate 1.0 (no non-merging finished),
+    so only the outcome-progress window decides whether scaffolding is flagged.
+    """
+    d = {
+        "id": "d-scaffold",
+        "status": "active",
+        "research_history": _scaffolding_history(),
+        "history_aggregate": {
+            "total_cycles": 10,
+            "total_prs_merged": 8,
+            "total_tasks_completed": 8,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        },
+        "outcome_progress_history": [{"progress": p} for p in progress_window],
+    }
+    d.update(overrides)
+    return d
+
+
+class TestComputeOutcomeProgressSignal:
+    def test_counts_confirmed_excludes_proposed(self):
+        ctx = (
+            "## Established Findings\n"
+            "- Finding A\n"
+            "- Finding B (proposed)\n"
+            "- Finding C\n"
+        )
+        d = {"research_context": ctx}
+        assert _compute_outcome_progress_signal(d) == 2
+
+    def test_empty_context_returns_zero(self):
+        assert _compute_outcome_progress_signal({}) == 0
+        assert _compute_outcome_progress_signal({"research_context": ""}) == 0
+
+
+class TestRecordOutcomeProgressSnapshot:
+    def test_appends_snapshot_with_expected_fields(self):
+        d = {
+            "research_history": _scaffolding_history(cycles=2),
+            "history_aggregate": {"total_cycles": 3, "total_prs_merged": 1},
+            "research_context": "## Established Findings\n- A\n",
+        }
+        record_outcome_progress_snapshot(d)
+        snaps = d["outcome_progress_history"]
+        assert len(snaps) == 1
+        snap = snaps[0]
+        assert snap["progress"] == 1
+        assert snap["cycle_index"] == 5  # 2 history + 3 aggregate
+        assert snap["merged"] == 7  # 2*3 history + 1 aggregate
+        assert "timestamp" in snap
+
+    def test_history_capped_at_configured_max(self):
+        d = {"research_history": [], "history_aggregate": {}, "research_context": ""}
+        for _ in range(25):
+            record_outcome_progress_snapshot(d)
+        # default direction_outcome_progress_history_max == 20
+        assert len(d["outcome_progress_history"]) == 20
+
+    def test_latches_ever_met_when_completion_detected(self):
+        # 4 cycles, >=3 merged, last 2 low-yield -> _check_direction_completion fires
+        history = [
+            {
+                "tasks_created": 3,
+                "tasks_completed": 3,
+                "tasks_failed": 0,
+                "prs_merged": 2,
+            },
+            {
+                "tasks_created": 3,
+                "tasks_completed": 3,
+                "tasks_failed": 0,
+                "prs_merged": 2,
+            },
+            {
+                "tasks_created": 1,
+                "tasks_completed": 1,
+                "tasks_failed": 0,
+                "prs_merged": 0,
+            },
+            {
+                "tasks_created": 1,
+                "tasks_completed": 1,
+                "tasks_failed": 0,
+                "prs_merged": 0,
+            },
+        ]
+        d = {
+            "research_history": history,
+            "history_aggregate": {},
+            "research_context": "",
+        }
+        record_outcome_progress_snapshot(d)
+        assert d.get("outcome_progress_ever_met") is True
+
+
+class TestCheckOutcomeScaffolding:
+    def test_fires_on_long_running_healthy_no_progress_direction(self):
+        d = _scaffolding_direction([5, 5, 5, 5, 5, 5])
+        ev = _check_outcome_scaffolding(d)
+        assert ev is not None
+        assert ev["total_cycles"] == 14
+        assert ev["lifetime_merged"] == 20
+        assert ev["lifetime_merge_rate"] == 1.0
+        assert ev["stall_run_cycles"] == 6
+        assert ev["progress_signal"] == 5
+
+    def test_does_not_fire_on_advancing_direction(self):
+        d = _scaffolding_direction([1, 2, 3, 4, 5, 6])
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_does_not_fire_on_churn_burn_low_merge_rate(self):
+        # lifetime_merged still >= floor, but merge_rate is far below the min,
+        # so the churn/burn exclusion (not the progress check) keeps it clear.
+        d = _scaffolding_direction(
+            [5, 5, 5, 5, 5, 5],
+            research_history=_scaffolding_history(
+                cycles=4, created=5, merged=1, completed=5
+            ),
+            history_aggregate={
+                "total_cycles": 10,
+                "total_prs_merged": 8,
+                "total_tasks_completed": 60,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+            },
+        )
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_does_not_fire_before_min_cycles(self):
+        d = _scaffolding_direction(
+            [5, 5, 5, 5, 5, 5],
+            history_aggregate={"total_cycles": 2, "total_prs_merged": 8},
+        )
+        # total_cycles = 4 + 2 = 6 < 12
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_single_low_progress_cycle_does_not_trip(self):
+        # Only 3 snapshots recorded; default stall_run is 6 -> not enough history.
+        d = _scaffolding_direction([5, 5, 5])
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_does_not_fire_when_outcome_ever_met(self):
+        d = _scaffolding_direction([5, 5, 5, 5, 5, 5], outcome_progress_ever_met=True)
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_does_not_fire_below_merge_floor(self):
+        d = _scaffolding_direction(
+            [5, 5, 5, 5, 5, 5],
+            research_history=_scaffolding_history(
+                cycles=4, created=1, merged=0, completed=1
+            ),
+            history_aggregate={
+                "total_cycles": 10,
+                "total_prs_merged": 2,
+                "total_tasks_completed": 2,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+            },
+        )
+        # lifetime_merged = 0 + 2 = 2 < default merge_floor (8)
+        assert _check_outcome_scaffolding(d) is None
+
+    # ── Agent evidence_progress verdict refinement ──────────────────────────
+    # _scaffolding_direction has total_cycles=14, stall_run=6, so a verdict at
+    # cycle_index >= 9 is "current" (14 - cycle_index < 6) and one at <= 8 is stale.
+
+    def test_advancing_verdict_suppresses_flag(self):
+        d = _scaffolding_direction(
+            [5, 5, 5, 5, 5, 5],
+            evidence_progress={"status": "advancing", "cycle_index": 14},
+        )
+        # Deterministic detector would fire, but the agent confirms advancement.
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_met_verdict_suppresses_flag(self):
+        d = _scaffolding_direction(
+            [5, 5, 5, 5, 5, 5],
+            evidence_progress={"status": "met", "cycle_index": 14},
+        )
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_stalled_verdict_does_not_suppress_flag(self):
+        d = _scaffolding_direction(
+            [5, 5, 5, 5, 5, 5],
+            evidence_progress={"status": "stalled", "cycle_index": 14},
+        )
+        # A stalled verdict reinforces the deterministic signal — flag still fires.
+        assert _check_outcome_scaffolding(d) is not None
+
+    def test_omitted_verdict_lets_detector_fire(self):
+        # No evidence_progress key at all -> deterministic backstop unaffected.
+        d = _scaffolding_direction([5, 5, 5, 5, 5, 5])
+        assert "evidence_progress" not in d
+        assert _check_outcome_scaffolding(d) is not None
+
+    def test_stale_advancing_verdict_does_not_suppress(self):
+        # A verdict recorded a full stall window ago has expired -> detector fires.
+        d = _scaffolding_direction(
+            [5, 5, 5, 5, 5, 5],
+            evidence_progress={"status": "advancing", "cycle_index": 5},
+        )
+        assert _check_outcome_scaffolding(d) is not None
+
+    def test_undated_advancing_verdict_suppresses(self):
+        # No cycle_index -> trust the agent's confirmation as current.
+        d = _scaffolding_direction(
+            [5, 5, 5, 5, 5, 5],
+            evidence_progress={"status": "advancing"},
+        )
+        assert _check_outcome_scaffolding(d) is None
+
+
+class TestApplyEvidenceProgressVerdicts:
+    def _task(self, verdicts):
+        return Task(
+            project_id=uuid.uuid4(),
+            payloads=[{"type": "strategic_review", "prompt": "x"}],
+            context={EVIDENCE_PROGRESS_CONTEXT_KEY: verdicts},
+        )
+
+    def _project(self, directions):
+        return Project(
+            name="EP",
+            user_id="u1",
+            vision={"purpose": "p", "revision": 1},
+            directions=directions,
+        )
+
+    def test_persists_verdict_onto_matching_active_direction(self):
+        project = self._project(
+            [
+                {
+                    "id": "d-1",
+                    "status": "active",
+                    "research_history": [{}, {}],
+                    "history_aggregate": {"total_cycles": 10},
+                }
+            ]
+        )
+        task = self._task(
+            [{"direction_id": "d-1", "status": "advancing", "rationale": "shipped X"}]
+        )
+        applied = _apply_evidence_progress_verdicts(task, project)
+        assert applied == 1
+        ep = project.directions[0]["evidence_progress"]
+        assert ep["status"] == "advancing"
+        assert ep["rationale"] == "shipped X"
+        assert ep["cycle_index"] == 12  # 2 history + 10 aggregate
+        assert ep["cycle_task_id"] == str(task.id)
+        assert "recorded_at" in ep
+
+    def test_skips_inactive_and_unmatched_directions(self):
+        project = self._project(
+            [
+                {"id": "d-1", "status": "expired"},
+                {"id": "d-2", "status": "active"},
+            ]
+        )
+        task = self._task(
+            [
+                {"direction_id": "d-1", "status": "met", "rationale": "done"},
+                {"direction_id": "d-x", "status": "stalled", "rationale": "no match"},
+            ]
+        )
+        applied = _apply_evidence_progress_verdicts(task, project)
+        assert applied == 0
+        assert "evidence_progress" not in project.directions[0]
+        assert "evidence_progress" not in project.directions[1]
+
+    def test_no_verdicts_is_noop(self):
+        project = self._project([{"id": "d-1", "status": "active"}])
+        task = Task(
+            project_id=uuid.uuid4(),
+            payloads=[{"type": "strategic_review", "prompt": "x"}],
+            context={},
+        )
+        assert _apply_evidence_progress_verdicts(task, project) == 0
+        assert "evidence_progress" not in project.directions[0]
+
+    def test_idempotent_last_write_wins(self):
+        project = self._project([{"id": "d-1", "status": "active"}])
+        task = self._task(
+            [{"direction_id": "d-1", "status": "stalled", "rationale": "first"}]
+        )
+        _apply_evidence_progress_verdicts(task, project)
+        task.context = {
+            EVIDENCE_PROGRESS_CONTEXT_KEY: [
+                {"direction_id": "d-1", "status": "advancing", "rationale": "second"}
+            ]
+        }
+        _apply_evidence_progress_verdicts(task, project)
+        assert project.directions[0]["evidence_progress"]["status"] == "advancing"
+        assert project.directions[0]["evidence_progress"]["rationale"] == "second"
+
+
+@pytest.mark.asyncio
+async def test_memo_available_and_cited_counts_persisted(db_session, mocker):
+    """memos_available and memos_cited are computed and stored in cycle_metadata.
+
+    memos_available == number of memo tasks returned by query_recent_memo_citations.
+    memos_cited == how many of those task_ids appear in the cycle reasoning text.
+    """
+    from unittest.mock import AsyncMock
+    from app.models import TaskStatus
+    from app.strategic_completion import _handle_strategic_completion
+    from app import strategic_cycle
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="MemoCount",
+        user_id="u-memo",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    memo_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "memo", "topic": "Cache strategy analysis"}],
+        status=TaskStatus.COMPLETED,
+        plan_output={"memo": {"summary": "Cache strategy reasoning.", "citations": []}},
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(memo_task)
+    await db_session.commit()
+    await db_session.refresh(memo_task)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    memo_id = str(memo_task.id)
+    sr_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={
+            "_strategic_vision_set": True,
+            "strategic_cycle_id": cycle.id,
+        },
+        strategic_cycle_id=cycle.id,
+        plan_output={"reasoning": f"Referenced memo {memo_id} for cache strategy."},
+    )
+    db_session.add(sr_task)
+    await db_session.commit()
+    await db_session.refresh(sr_task)
+
+    await _handle_strategic_completion(sr_task, "", db_session)
+
+    await db_session.refresh(cycle)
+    meta = cycle.cycle_metadata or {}
+    assert meta.get("memos_available") == 1, (
+        f"memos_available should be 1 (one memo task), got {meta.get('memos_available')}"
+    )
+    assert meta.get("memos_cited") == 1, (
+        f"memos_cited should be 1 (memo_id appears in reasoning), got {meta.get('memos_cited')}"
+    )

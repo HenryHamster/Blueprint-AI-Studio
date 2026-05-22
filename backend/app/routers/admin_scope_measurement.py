@@ -674,12 +674,23 @@ async def get_medium_scope_measurement(
     """
     cutoff = _utcnow() - timedelta(days=lookback_days)
     result = await session.execute(
-        select(Task).where(
+        select(Task)
+        .where(
             Task.status.in_(
                 [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
             ),
             Task.created_at >= cutoff,
             Task.project_id == project_id,
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.context,
+                Task.created_at,
+                Task.updated_at,
+                Task.title,
+            )
         )
     )
     all_tasks = result.scalars().all()

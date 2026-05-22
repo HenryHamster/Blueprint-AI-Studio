@@ -2991,9 +2991,7 @@ async def test_autonomous_research_spawn_uses_integration_branch(
     routing contract that every autonomous spawn-time base_branch default
     relies on. A regression here would silently route autonomous tasks at the
     frozen LTS main after the Phase-1 cutover."""
-    monkeypatch.setitem(
-        _shared_state.runtime_config, "integration_branch", "automain"
-    )
+    monkeypatch.setitem(_shared_state.runtime_config, "integration_branch", "automain")
     project = Project(
         name="Integration Branch Routing",
         user_id="test-user-123",
@@ -3007,9 +3005,7 @@ async def test_autonomous_research_spawn_uses_integration_branch(
 
     await _spawn_research_task(project, db_session)
 
-    result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     spawned = result.scalars().all()
     assert spawned, "expected an autonomous task to be spawned"
     for t in spawned:
@@ -3037,9 +3033,7 @@ async def test_autonomous_research_spawn_defaults_to_main(db_session, monkeypatc
 
     await _spawn_research_task(project, db_session)
 
-    result = await db_session.execute(
-        select(Task).where(Task.project_id == project.id)
-    )
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     spawned = result.scalars().all()
     assert spawned, "expected an autonomous task to be spawned"
     for t in spawned:
@@ -5550,7 +5544,11 @@ async def test_health_gate_zone_exhaustion_caps_spawn(db_session, mocker):
     result = await db_session.execute(
         select(Task).where(Task.project_id == project.id, Task.id != task.id)
     )
-    child_tasks = result.scalars().all()
+    # degradation_gate-deferred findings now also spawn read-only memo tasks;
+    # the implementation-task spawn cap applies to non-memo tasks only.
+    child_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") != "memo"
+    ]
     assert len(child_tasks) == _DEGRADED_SPAWN_CAP, (
         f"Should spawn only {_DEGRADED_SPAWN_CAP} tasks when zones exhausted"
     )
@@ -5598,7 +5596,11 @@ async def test_health_gate_account_unavailable_caps_spawn(db_session, mocker):
     result = await db_session.execute(
         select(Task).where(Task.project_id == project.id, Task.id != task.id)
     )
-    child_tasks = result.scalars().all()
+    # degradation_gate-deferred findings now also spawn read-only memo tasks;
+    # the implementation-task spawn cap applies to non-memo tasks only.
+    child_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") != "memo"
+    ]
     assert len(child_tasks) == _DEGRADED_SPAWN_CAP
 
     await db_session.refresh(task)
@@ -5686,6 +5688,150 @@ async def test_deferred_stats_persisted_on_research_history_entry(db_session, mo
     assert stats["by_reason"]["batch_cap"] == 0
     assert stats["by_reason"]["ultra_low_confidence"] == 0
     assert 0 < stats["spawn_ratio"] < 1
+
+
+@pytest.mark.asyncio
+async def test_low_actionability_finding_spawns_memo(db_session, mocker):
+    """A low-actionability finding is deferred and spawns a terminal memo task
+    (not a research/plan/create child); the memo id is recorded in
+    task.context['spawned_memo_ids'] and the direction's deferred_stats."""
+    direction_id = "d-memo0001"
+    direction = _active_direction(direction_id, "Memo spawn from dropped finding")
+    project = Project(
+        name="Memo Spawn",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    low_finding = _make_finding("Underspecified idea", direction_id)
+    low_finding["actionability_grade"] = "LOW"
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[low_finding],
+    )
+    # Pipeline healthy — the only drop reason is low_actionability.
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, ""),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    children = result.scalars().all()
+    # Exactly one task spawned, and it is a memo — not a research/plan/create child.
+    assert len(children) == 1
+    memo = children[0]
+    assert memo.first_payload["type"] == "memo"
+    assert memo.parent_task_id == task.id
+    assert memo.first_payload["reasoning_kind"] == "deferred_finding"
+    assert memo.first_payload["source_task_id"] == str(task.id)
+    assert memo.first_payload["source_finding"]["title"] == "Underspecified idea"
+    assert memo.first_payload.get("direction_id") == direction_id
+
+    await db_session.refresh(task)
+    spawned = (task.context or {}).get("spawned_memo_ids", [])
+    assert str(memo.id) in spawned
+
+
+@pytest.mark.asyncio
+async def test_degradation_gate_memo_ids_recorded_in_deferred_stats(db_session, mocker):
+    """Memos spawned for degradation-gate-deferred findings are recorded both in
+    task.context['spawned_memo_ids'] and on the direction's deferred_stats."""
+    from app.research_completion import _DEGRADED_SPAWN_CAP
+
+    direction_id = "d-memodef01"
+    direction = _active_direction(direction_id, "Memo deferred-stats")
+    project = Project(
+        name="Memo Deferred Stats",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    # 5 findings, cap=2 → 2 impl spawn, 3 degradation_gate-deferred → 3 memos.
+    findings = [_make_finding(f"Finding {i}", direction_id) for i in range(5)]
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=findings
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(True, "high failure rate"),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    memos = [t for t in result.scalars().all() if t.first_payload.get("type") == "memo"]
+    assert len(memos) == 5 - _DEGRADED_SPAWN_CAP
+
+    await db_session.refresh(task)
+    spawned = set((task.context or {}).get("spawned_memo_ids", []))
+    assert spawned == {str(m.id) for m in memos}
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][-1]
+    assert set(entry["deferred_stats"].get("memo_ids", [])) == spawned
+
+
+@pytest.mark.asyncio
+async def test_memo_spawn_capped_per_cycle(db_session, mocker):
+    """Memo spawns are bounded by MEMO_SPAWN_CAP_PER_CYCLE even when many
+    findings are dropped for the same outcome-blind reason."""
+    from app.research_completion import MEMO_SPAWN_CAP_PER_CYCLE
+
+    direction_id = "d-memocap01"
+    direction = _active_direction(direction_id, "Memo cap test")
+    project = Project(
+        name="Memo Cap",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+
+    _patch_research_externals(mocker)
+    findings = []
+    for i in range(MEMO_SPAWN_CAP_PER_CYCLE + 3):
+        f = _make_finding(f"Underspecified {i}", direction_id)
+        f["actionability_grade"] = "LOW"
+        findings.append(f)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=findings
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, ""),
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
+    )
+    memos = [t for t in result.scalars().all() if t.first_payload.get("type") == "memo"]
+    assert len(memos) == MEMO_SPAWN_CAP_PER_CYCLE
 
 
 @pytest.mark.asyncio
@@ -5887,7 +6033,11 @@ async def test_prior_deferred_findings_still_capped_if_pipeline_degraded(
     result = await db_session.execute(
         select(Task).where(Task.project_id == project.id, Task.id != task.id)
     )
-    child_tasks = result.scalars().all()
+    # degradation_gate-deferred findings now also spawn read-only memo tasks;
+    # the implementation-task spawn cap applies to non-memo tasks only.
+    child_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") != "memo"
+    ]
     assert len(child_tasks) == _DEGRADED_SPAWN_CAP, (
         f"Cap still applies even with prior deferred findings: expected {_DEGRADED_SPAWN_CAP}, got {len(child_tasks)}"
     )
@@ -6252,7 +6402,11 @@ async def test_batch_cap_and_health_gate_deferrals_combine(db_session, mocker):
     result = await db_session.execute(
         select(Task).where(Task.project_id == project.id, Task.id != task.id)
     )
-    child_tasks = result.scalars().all()
+    # degradation_gate-deferred findings now also spawn read-only memo tasks;
+    # the implementation-task spawn cap applies to non-memo tasks only.
+    child_tasks = [
+        t for t in result.scalars().all() if t.first_payload.get("type") != "memo"
+    ]
     assert len(child_tasks) == _DEGRADED_SPAWN_CAP
 
     await db_session.refresh(task)
@@ -10232,3 +10386,58 @@ async def test_followed_count_not_incremented_when_no_impl_spawned(db_session, m
     assert shown["followed_count"] == 3, (
         "followed_count must not change when no impl tasks are spawned"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PayloadTooLargeError: strategic payload bloat marker
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_payload_too_large_writes_vision_bloat_marker(db_session, mocker):
+    """When PayloadTooLargeError fires during strategic spawn, project.vision gets a
+    _strategic_payload_bloat_skip marker with skipped_at, size, and top_contributors."""
+    from app.payload_schemas import PayloadTooLargeError
+
+    # Project with no purpose → force_strategic fires without active directions.
+    project = Project(
+        name="Bloat Test Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[],
+        vision={},  # no "purpose" key → force_strategic=True
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    bloat_error = PayloadTooLargeError(
+        size=310000,
+        limit=262144,
+        top_keys=[("design_doc", 250000), ("problem_model", 50000), ("vision", 10000)],
+    )
+
+    # Patch both strategic spawner paths so PayloadTooLargeError is raised
+    # regardless of which cycle type is selected.
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        side_effect=bloat_error,
+    )
+    mocker.patch(
+        "app.strategic_spawning._spawn_strategic_review",
+        side_effect=bloat_error,
+    )
+
+    await _spawn_research_task(project, db_session)
+
+    await db_session.refresh(project)
+    marker = (project.vision or {}).get("_strategic_payload_bloat_skip")
+    assert marker is not None, (
+        "Expected _strategic_payload_bloat_skip to be set in vision"
+    )
+    assert marker["size"] == 310000
+    assert "skipped_at" in marker
+    contributors = marker["top_contributors"]
+    assert len(contributors) >= 1
+    assert contributors[0]["key"] == "design_doc"
+    assert contributors[0]["size"] == 250000

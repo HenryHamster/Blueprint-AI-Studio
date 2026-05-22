@@ -1935,3 +1935,74 @@ describe('TargetHealthSummaryCard in SrTrendBreakdown', () => {
     expect(screen.queryByTestId('newly-recovered-indicator')).not.toBeInTheDocument();
   });
 });
+
+describe('SrTrendBreakdown finding-count gating (catch-rate true denominator)', () => {
+  it('shows too-small with finding count when current_finding_count < MIN_SAMPLE_SIZE even if current_human_count is large', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          current_hit_rate: 0.8,
+          previous_hit_rate: 0.6,
+          miss_rate: 0.2,
+          trend: 'stable',
+          current_human_count: 50,  // many tasks
+          current_finding_count: 3,  // but very few reviewer findings
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.getByText(/too small/)).toBeInTheDocument();
+    // Should show finding count (3), not task count (50)
+    expect(screen.getByText(/3 — too small/)).toBeInTheDocument();
+  });
+
+  it('suppresses cycle-over-cycle delta when previous window has too few findings', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          current_hit_rate: 0.9,
+          previous_hit_rate: 0.5,
+          miss_rate: 0.1,
+          trend: 'increasing',
+          current_finding_count: 20,  // enough in current window
+          previous_finding_count: 2,  // but too few in previous window
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    // delta would be +40pp but previous window is too small to trust
+    expect(screen.queryByTitle(/cycle-over-cycle change/)).not.toBeInTheDocument();
+  });
+
+  it('shows delta only when both current and previous finding counts are sufficient', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          current_hit_rate: 0.9,
+          previous_hit_rate: 0.7,
+          miss_rate: 0.1,
+          trend: 'increasing',
+          current_finding_count: 15,
+          previous_finding_count: 10,
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.getByTitle(/cycle-over-cycle change/)).toBeInTheDocument();
+  });
+
+  it('falls back to current_human_count when current_finding_count is absent (backward compat)', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.3,
+          trend: 'stable',
+          current_human_count: 3,  // no finding_count — falls back to human_count
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.getByText(/too small/)).toBeInTheDocument();
+    expect(screen.getByText(/3 — too small/)).toBeInTheDocument();
+  });
+});

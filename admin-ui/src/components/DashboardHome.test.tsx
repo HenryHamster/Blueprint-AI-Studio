@@ -155,6 +155,7 @@ function setupApiMocks({
     if (url.includes('/api/admin/scope-baselines')) return Promise.resolve(jsonResponse(scopeBaselines ?? {}));
     if (url.includes('/api/admin/max-plan-accounts/health')) return Promise.resolve(jsonResponse(accountHealth ?? { accounts: [] }));
     if (url.includes('/system-maturity')) return Promise.resolve(jsonResponse(systemMaturity ?? []));
+    if (url.includes('/version-lifecycle')) return Promise.resolve(notFoundResponse());
     if (url.includes('/direction-sr-breakdown')) return Promise.resolve(directionSrBreakdown ? jsonResponse(directionSrBreakdown) : notFoundResponse());
     if (url.includes('/prompt-fingerprint-analytics')) return Promise.resolve(promptFingerprintAnalytics ? jsonResponse(promptFingerprintAnalytics) : notFoundResponse());
     // Unmatched endpoints (sr-blind-spots, sr-reviewer-disagreements,
@@ -1334,5 +1335,213 @@ describe('DashboardHome', () => {
       await screen.findByText('All systems healthy');
       expect(screen.queryByTestId('sr-false-attestation-tile')).not.toBeInTheDocument();
     });
+  });
+
+  it('computes SR Catch Rate delta from overall hit rate, not average category delta', async () => {
+    setupApiMocks({
+      digest: {
+        failed_count: 0,
+        pending_approval_count: 0,
+        completed_count: 5,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+        self_review_prediction_accuracy: {
+          prediction_hit_rate: 0.75,
+          miss_rate: 0.25,
+          false_alarm_rate: 0.1,
+          sample_size: 20,
+        },
+        self_review_prediction_accuracy_trends: {
+          overall_hit_rate: 0.75,
+          previous_overall_hit_rate: 0.70,
+          computed_at: '2026-05-20T00:00:00Z',
+          categories: {
+            correctness: {
+              current_hit_rate: 0.80,
+              previous_hit_rate: 0.60,
+              current_human_count: 10,
+              previous_human_count: 8,
+            },
+            type_safety: {
+              current_hit_rate: 0.70,
+              previous_hit_rate: 0.80,
+              current_human_count: 5,
+              previous_human_count: 6,
+            },
+            error_handling: {
+              current_hit_rate: 0.75,
+              previous_hit_rate: 0.75,
+              current_human_count: 5,
+              previous_human_count: 6,
+            },
+          },
+        },
+      },
+      diagnostics: makeDiagnostics(),
+    });
+
+    render(
+      <DashboardHome
+        tasks={[]}
+        selectedProjectId="proj1"
+        onViewTask={vi.fn()}
+      />,
+    );
+
+    const card = await screen.findByText('SR Catch Rate').then((el) => el.closest('div[class*="rounded-lg"]'));
+    expect(card).toBeInTheDocument();
+    expect(card).toHaveTextContent('75%');
+    expect(card).toHaveTextContent('+5pp');
+    // n= shows reviewer finding count (10+5+5=20), not task count
+    expect(card).toHaveTextContent('n=20 findings');
+  });
+
+  it('SR Catch Rate card shows too small when reviewer finding count is below threshold', async () => {
+    setupApiMocks({
+      digest: {
+        failed_count: 0,
+        pending_approval_count: 0,
+        completed_count: 5,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+        self_review_prediction_accuracy: {
+          prediction_hit_rate: 0.75,
+          miss_rate: 0.25,
+          false_alarm_rate: 0.1,
+          sample_size: 20,
+        },
+        self_review_prediction_accuracy_trends: {
+          overall_hit_rate: 0.75,
+          previous_overall_hit_rate: 0.70,
+          computed_at: '2026-05-20T00:00:00Z',
+          categories: {
+            correctness: {
+              current_hit_rate: 0.80,
+              previous_hit_rate: 0.60,
+              current_human_count: 2,
+              previous_human_count: 8,
+            },
+            type_safety: {
+              current_hit_rate: 0.70,
+              previous_hit_rate: 0.80,
+              current_human_count: 2,
+              previous_human_count: 6,
+            },
+          },
+        },
+      },
+      diagnostics: makeDiagnostics(),
+    });
+
+    render(
+      <DashboardHome
+        tasks={[]}
+        selectedProjectId="proj1"
+        onViewTask={vi.fn()}
+      />,
+    );
+
+    const card = await screen.findByText('SR Catch Rate').then((el) => el.closest('div[class*="rounded-lg"]'));
+    expect(card).toBeInTheDocument();
+    expect(card).toHaveTextContent('too small');
+    // Shows finding count, not task count
+    expect(card).toHaveTextContent('n=4 findings');
+    expect(card).not.toHaveTextContent('75%');
+  });
+
+  it('SR Unfixed Flags tile shows the self-flagged shipped-unfixed rate, not the catch hit rate', async () => {
+    setupApiMocks({
+      digest: {
+        failed_count: 0,
+        pending_approval_count: 0,
+        completed_count: 5,
+        failure_groups: [],
+        direction_progress: [],
+        recent_completions: [],
+        self_review_prediction_accuracy: {
+          prediction_hit_rate: 0.75,
+          miss_rate: 0.25,
+          false_alarm_rate: 0.1,
+          sample_size: 20,
+          self_flagged_shipped_unfixed_task_rate: 0.5,
+          self_flagged_shipped_unfixed_task_count: 7,
+        },
+        // A high catch hit rate must NOT leak into the high=bad tile.
+        self_review_prediction_accuracy_trends: {
+          overall_hit_rate: 0.9,
+          previous_overall_hit_rate: 0.85,
+          computed_at: '2026-05-20T00:00:00Z',
+          categories: {},
+        },
+      },
+      diagnostics: makeDiagnostics(),
+    });
+
+    render(
+      <DashboardHome
+        tasks={[]}
+        selectedProjectId="proj1"
+        onViewTask={vi.fn()}
+      />,
+    );
+
+    const tile = await screen.findByTestId('sr-self-flagged-unresolved-tile');
+    // Rate comes from self_flagged_shipped_unfixed_task_rate (0.5), not overall_hit_rate (0.9).
+    expect(tile).toHaveTextContent('50%');
+    expect(tile).not.toHaveTextContent('90%');
+    // Adjacent count comes from the same metric.
+    expect(tile).toHaveTextContent('7 tasks');
+    // High unfixed rate renders as red (high=bad).
+    expect(tile.querySelector('.text-red-400')).not.toBeNull();
+  });
+
+  it('renders version lifecycle panel with current version and qualification details', async () => {
+    apiFetchMock.mockImplementation((url: string) => {
+      if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse({ failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] }));
+      if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+      if (url.includes('/version-lifecycle')) return Promise.resolve(jsonResponse({
+        current_version: {
+          version_number: 42,
+          phase: 'stabilize',
+          phase_changed_at: '2026-05-20T12:00:00Z',
+          opened_at: '2026-05-15T00:00:00Z',
+          qualification_attempts: 2,
+          merged_task_count: 15,
+          last_qualification: { status: 'dry_run', confidence: 0.78, threshold: 0.80, sub_scores: { audit: 0.85, test_erosion: 0.70, smoketest: 0.90 }, blocker: null, finalized_at: null },
+        },
+        recent_versions: [
+          { version_number: 41, status: 'promoted', opened_at: '2026-05-10T00:00:00Z', promoted_at: '2026-05-15T00:00:00Z', qualification_attempts: 1, last_qualification: { status: 'promoted', confidence: 0.85, threshold: 0.80, sub_scores: null, blocker: null, finalized_at: null } },
+        ],
+      }));
+      return Promise.resolve(notFoundResponse());
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    const panel = await screen.findByTestId('version-lifecycle-panel');
+    expect(panel).toHaveTextContent('Version Lifecycle');
+    expect(panel).toHaveTextContent('v42');
+    expect(panel).toHaveTextContent('stabilize');
+    expect(panel).toHaveTextContent('15 tasks merged');
+    expect(panel).toHaveTextContent('78%/80% dry-run');
+    expect(panel).toHaveTextContent('audit 85%');
+    expect(panel).toHaveTextContent('History');
+    expect(panel).toHaveTextContent('v41');
+    expect(panel).toHaveTextContent('promoted');
+  });
+
+  it('does not render version lifecycle panel when project has no lifecycle data', async () => {
+    setupApiMocks({
+      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+      diagnostics: makeDiagnostics(),
+    });
+    // /version-lifecycle returns 404 via setupApiMocks default
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    await screen.findByText('All systems healthy');
+    expect(screen.queryByTestId('version-lifecycle-panel')).not.toBeInTheDocument();
   });
 });

@@ -9,15 +9,6 @@ VPORT_ARGS=(
   VITE_FIREBASE_PROJECT_ID=ci
 )
 
-# Capture baseline screenshots on main-branch runs (or explicit opt-in via CAPTURE_BASELINES=true).
-# viewport.ts writes PNGs to admin-ui/viewport-baselines/<component>-<width>px.png when this is set.
-CURRENT_BRANCH=$(git -C /tmp/workspace rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-DOCKER_BASELINE_ARGS=()
-if [ "${CAPTURE_BASELINES:-}" = "true" ] || [ "$CURRENT_BRANCH" = "main" ]; then
-  VPORT_ARGS+=(VITE_CAPTURE_BASELINES=true)
-  DOCKER_BASELINE_ARGS=(-e VITE_CAPTURE_BASELINES=true)
-fi
-
 BOOTSTRAP_PATTERNS="libatk|libxcomposite|libgbm|libnss3|libasound|cannot open shared object file|executable doesn|host system is missing|please install|npx playwright install|run: playwright install|missing browser|missing chromium|eacces.*unlink.*vite|permission denied.*unlink"
 
 cd /tmp/workspace/admin-ui
@@ -27,7 +18,12 @@ OUT=$(env "${VPORT_ARGS[@]}" npm run test:viewport 2>&1)
 STATUS=$?
 echo "$OUT"
 if [ "$STATUS" -eq 0 ]; then
-  exit 0
+  # Confirm tests actually ran and passed
+  if echo "$OUT" | grep -qE "Tests +[0-9]+ passed"; then
+    exit 0
+  fi
+  echo "[check] admin-ui viewport: test suite exited 0 but no test assertions found"
+  exit 1
 fi
 
 # Native failed — check if it's a Chromium bootstrap failure
@@ -54,14 +50,18 @@ DOCKER_OUT=$(docker run --rm \
   -e VITE_FIREBASE_API_KEY=ci \
   -e VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com \
   -e VITE_FIREBASE_PROJECT_ID=ci \
-  "${DOCKER_BASELINE_ARGS[@]}" \
   "$PLAYWRIGHT_IMAGE" npm run test:viewport 2>&1)
 DOCKER_STATUS=$?
 echo "$DOCKER_OUT"
 
 if [ "$DOCKER_STATUS" -eq 0 ]; then
-  echo "[check] admin-ui viewport passed in Docker."
-  exit 0
+  # Confirm tests actually ran and passed
+  if echo "$DOCKER_OUT" | grep -qE "Tests +[0-9]+ passed"; then
+    echo "[check] admin-ui viewport passed in Docker."
+    exit 0
+  fi
+  echo "[check] admin-ui viewport: Docker run exited 0 but no test assertions found"
+  exit 1
 fi
 
 # Docker also failed — check whether any test ASSERTIONS failed (vs file-import errors only)
@@ -76,5 +76,6 @@ if echo "$DOCKER_OUT" | grep -qiE "$BOOTSTRAP_PATTERNS"; then
   exit 75
 fi
 
-echo "[check] WARNING: admin-ui viewport has file-import errors in Docker (pre-existing env issue); no test assertions failed. CI will enforce full coverage."
-exit 0
+# Docker run failed without detected test assertions or bootstrap errors
+echo "[check] admin-ui viewport Docker run failed (exit $DOCKER_STATUS) without recognized test assertions or bootstrap errors — blocking."
+exit 1

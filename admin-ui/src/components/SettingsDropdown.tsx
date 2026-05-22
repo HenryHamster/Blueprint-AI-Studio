@@ -22,6 +22,9 @@ interface SettingsDropdownProps {
   showSettings: boolean;
   onToggleSettings: () => void;
   settingsRef: React.RefObject<HTMLDivElement | null>;
+  // When the panel is opened via a deep-link CTA, jump straight to this section
+  // instead of the default General tab.
+  initialSection?: SectionId | null;
   // Defaults
   defaultTaskType: UserLaunchableTaskType;
   onUpdateDefaultTaskType: (value: UserLaunchableTaskType) => void;
@@ -239,7 +242,7 @@ const CREDENTIAL_GUIDES: Record<string, CredentialGuide> = {
   },
 };
 
-type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation' | 'auto-review';
+export type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation' | 'auto-review';
 
 const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean; projectOnly?: boolean }[] = [
   { id: 'general', label: 'General', icon: Sliders },
@@ -271,6 +274,7 @@ export function SettingsDropdown({
   showSettings,
   onToggleSettings,
   settingsRef,
+  initialSection,
   defaultTaskType,
   onUpdateDefaultTaskType,
   viewMode,
@@ -440,6 +444,11 @@ export function SettingsDropdown({
     }
   }, [newAccountAuthMode, newAccountProvider, providers, setNewAccountAuthMode]);
 
+  // Jump to a requested section when the panel is opened via a deep-link CTA.
+  useEffect(() => {
+    if (showSettings && initialSection) setActiveSection(initialSection);
+  }, [showSettings, initialSection]);
+
   // Close on Escape
   useEffect(() => {
     if (!showSettings) return;
@@ -501,7 +510,7 @@ export function SettingsDropdown({
         {/* Defaults */}
         <div>
           <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Defaults</h3>
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Default Task Type</label>
               <select
@@ -564,7 +573,7 @@ export function SettingsDropdown({
         {/* UI Preferences */}
         <div>
           <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">UI Preferences</h3>
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Auto-Refresh Interval</label>
               <div className="flex gap-1 mb-1.5">
@@ -704,7 +713,7 @@ export function SettingsDropdown({
       <div className="space-y-6">
         <div>
           <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Pipeline Settings</h3>
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Max Concurrent VMs (0-100)</label>
               <input
@@ -762,7 +771,7 @@ export function SettingsDropdown({
           <p className="text-xs text-neutral-500 mb-3">
             Archives tasks when EITHER cap hits: age (days since terminal) or per-project count (keep most-recent N).
           </p>
-          <div className="grid grid-cols-4 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
             <div>
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Enabled</label>
               <div className="flex items-center gap-3 bg-neutral-950 border border-neutral-700 rounded-lg px-3 py-2">
@@ -809,7 +818,7 @@ export function SettingsDropdown({
         {/* Autonomous Research */}
         <div>
           <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Autonomous Research</h3>
-          <div className="grid grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
             <div>
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Research Interval (min)</label>
               <input
@@ -1075,7 +1084,7 @@ export function SettingsDropdown({
                   {isCapExpanded && (
                     <div className="mt-2 pt-2 border-t border-neutral-800/50 space-y-2">
                       <div className="text-[10px] uppercase tracking-wider text-neutral-500">Usage caps</div>
-                      <div className="grid grid-cols-3 gap-2">
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
                         <label className="block">
                           <div className="text-[10px] text-neutral-500 mb-1">Tasks/day</div>
                           <input
@@ -1160,7 +1169,7 @@ export function SettingsDropdown({
                   <X className="w-4 h-4" />
                 </button>
               </div>
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
                 <div>
                   <div className="text-[10px] text-neutral-500 mb-1 uppercase">Provider</div>
                   <select
@@ -1213,7 +1222,7 @@ export function SettingsDropdown({
                 />
               </div>
               {requiredMetadataFields.length > 0 && (
-                <div className="grid grid-cols-2 gap-2">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
                   {requiredMetadataFields.map(field => {
                     const hint = METADATA_HINTS[field];
                     return (
@@ -1301,7 +1310,7 @@ export function SettingsDropdown({
                 Usage limits (optional)
               </button>
               {showAddAccountCaps && (
-                <div className="grid grid-cols-3 gap-2 bg-neutral-950 border border-neutral-800 rounded-lg p-3">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-2 bg-neutral-950 border border-neutral-800 rounded-lg p-3">
                   <label className="block">
                     <div className="text-[10px] text-neutral-500 mb-1 flex items-center gap-1">
                       Tasks/day

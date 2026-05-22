@@ -395,8 +395,7 @@ async def _emit_all_accounts_blocked_stall(
             "[ORCHESTRATOR] Failed to broadcast all_accounts_blocked throttle"
         )
     try:
-        projects = (await session.execute(select(Project))).scalars().all()
-        project_ids = [p.id for p in projects]
+        project_ids = list((await session.execute(select(Project.id))).scalars().all())
         # Dedup across the "Pipeline stalled — ..." family, not the exact
         # title: with dynamic copy a new stall episode could otherwise stack
         # a second alert if its blockage shape (rate-limit vs capacity) flips.
@@ -416,23 +415,23 @@ async def _emit_all_accounts_blocked_stall(
             else []
         )
         projects_with_alert = {row[0] for row in existing_rows}
-        for proj in projects:
-            if proj.id not in projects_with_alert:
+        for proj_id in project_ids:
+            if proj_id not in projects_with_alert:
                 alert = Alert(
-                    project_id=proj.id,
+                    project_id=proj_id,
                     severity=AlertSeverity.ERROR,
                     title=title,
                     message=msg,
                 )
                 session.add(alert)
                 await broadcast_to_project(
-                    str(proj.id),
+                    str(proj_id),
                     "alert_created",
                     {"alert_id": str(alert.id), "severity": "ERROR", "title": title},
                 )
             asyncio.ensure_future(
                 dispatch_external_notification(  # noqa: RUF006
-                    proj.id,
+                    proj_id,
                     "PIPELINE_STALLED",
                     {
                         "reason": "all_accounts_blocked",
@@ -1330,6 +1329,8 @@ async def orchestrator_worker():
                             "max_provision_retries", 3
                         ):
                             fresh_t.status = TaskStatus.FAILED
+                            if fresh_t.vm_provisioned_at:
+                                fresh_t.vm_stopped_at = _utcnow()
                             fresh_t.latest_status_message = (
                                 f"Failed after {provision_failures} provision attempts"
                             )
@@ -1874,6 +1875,8 @@ async def orchestrator_worker():
                             cancel_task = await cancel_session.get(Task, task.id)
                             if cancel_task:
                                 cancel_task.status = TaskStatus.CANCELLED
+                                if cancel_task.vm_provisioned_at:
+                                    cancel_task.vm_stopped_at = _utcnow()
                                 cancel_task.latest_status_message = (
                                     "Cancelled: dependency task failed"
                                 )
@@ -1909,6 +1912,8 @@ async def orchestrator_worker():
                                 )
                                 for child in children:
                                     child.status = TaskStatus.CANCELLED
+                                    if child.vm_provisioned_at:
+                                        child.vm_stopped_at = _utcnow()
                                     child.latest_status_message = (
                                         "Cancelled: parent dependency failed"
                                     )
@@ -2558,15 +2563,17 @@ async def orchestrator_worker():
                                 "Each type has >70% failure rate in the last 15 minutes. The pipeline will not dispatch "
                                 "new tasks until failure rates drop."
                             )
-                            _projects = (
-                                (await session.execute(select(Project))).scalars().all()
+                            _all_project_ids = list(
+                                (await session.execute(select(Project.id)))
+                                .scalars()
+                                .all()
                             )
-                            for _proj in _projects:
+                            for _proj_id in _all_project_ids:
                                 _existing_alert = (
                                     (
                                         await session.execute(
                                             select(Alert).where(
-                                                Alert.project_id == _proj.id,
+                                                Alert.project_id == _proj_id,
                                                 Alert.task_id.is_(None),
                                                 Alert.severity == AlertSeverity.ERROR,
                                                 Alert.dismissed_at.is_(None),
@@ -2579,14 +2586,14 @@ async def orchestrator_worker():
                                 )
                                 if _existing_alert is None:
                                     _alert = Alert(
-                                        project_id=_proj.id,
+                                        project_id=_proj_id,
                                         severity=AlertSeverity.ERROR,
                                         title=_all_blocked_title,
                                         message=_all_blocked_msg,
                                     )
                                     session.add(_alert)
                                     await broadcast_to_project(
-                                        str(_proj.id),
+                                        str(_proj_id),
                                         "alert_created",
                                         {
                                             "alert_id": str(_alert.id),
@@ -2660,12 +2667,16 @@ async def orchestrator_worker():
                         else:
                             _warm_expired = True
 
-                        if not _warm_expired and _shared_state.is_vm_alive(
-                            _warm_target_vm_id
+                        _cb_suppressed = _shared_state.is_warm_continuity_suppressed()
+                        if (
+                            not _warm_expired
+                            and not _cb_suppressed
+                            and _shared_state.is_vm_alive(_warm_target_vm_id)
                         ):
-                            # (b) Skip provision: the warm VM is alive. Leave
-                            # the task QUEUED — the agent's /next-role poll
-                            # will claim it without a fresh provision.
+                            # (b) Skip provision: the warm VM is alive and the
+                            # circuit breaker is not tripped. Leave the task
+                            # QUEUED — the agent's /next-role poll will claim it
+                            # without a fresh provision.
                             logger.info(
                                 f"[ORCHESTRATOR] Warm-pin skip-provision for task {task.id}: "
                                 f"target_vm={_warm_target_vm_id} (heartbeat fresh, deadline {_warm_deadline_iso})"
@@ -2673,7 +2684,7 @@ async def orchestrator_worker():
                             await session.rollback()
                             continue
 
-                        # (a) or (c): clear warm fields and fall through.
+                        # (a), (c), or (d): clear warm fields and fall through.
                         _new_ctx = {
                             k: v
                             for k, v in _warm_ctx.items()
@@ -2688,9 +2699,12 @@ async def orchestrator_worker():
                         from sqlalchemy.orm.attributes import flag_modified
 
                         flag_modified(task, "context")
-                        _clear_reason = (
-                            "deadline_expired" if _warm_expired else "vm_unresponsive"
-                        )
+                        if _cb_suppressed:
+                            _clear_reason = "circuit_breaker"
+                        elif _warm_expired:
+                            _clear_reason = "deadline_expired"
+                        else:
+                            _clear_reason = "vm_unresponsive"
                         # Phase 2e observability: track clear-out rate so we
                         # can detect warm-VM instability. Sustained >5/hour
                         # means the warm chain is failing more than expected.
@@ -2698,9 +2712,12 @@ async def orchestrator_worker():
                         # that persists the warm-field clear lands — if the
                         # commit fails and we retry next cycle we'd otherwise
                         # double-count the metric (Issue 11).
+                        # Circuit-breaker suppressions are not counted as pin-clear
+                        # events to avoid a feedback loop that deepens suppression.
                         _pending_warm_pin_clear: tuple[str, str] | None = (
-                            _warm_target_vm_id,
-                            _clear_reason,
+                            None
+                            if _clear_reason == "circuit_breaker"
+                            else (_warm_target_vm_id, _clear_reason)
                         )
                         logger.info(
                             f"[ORCHESTRATOR] Warm-pin cleared for task {task.id}: "
@@ -2708,6 +2725,32 @@ async def orchestrator_worker():
                         )
                     else:
                         _pending_warm_pin_clear = None
+
+                    # Backlog-reuse first-refusal (efficiency direction d-91d8dede):
+                    # if an idle warm VM is actively polling /next-role for this
+                    # project, hold off cold-provisioning this eligible backlog task
+                    # for a bounded window so the warm VM can claim it first. Scoped
+                    # to no-dependency, non-chain-pinned tasks — exactly the set
+                    # /next-role's backlog branch will claim — so dependency-bearing
+                    # or chain work is never starved. The atomic SKIP-LOCKED claim in
+                    # /next-role still guarantees no double-provision if both race;
+                    # this only biases the race toward reuse. The window auto-expires,
+                    # so a VM that dies mid-poll delays this task by at most that bound.
+                    if (
+                        _runtime_config.get("warm_backlog_reuse_enabled", False)
+                        and not _warm_target_vm_id
+                        and not task.depends_on
+                        and _shared_state.is_backlog_first_refusal_active(
+                            str(task.project_id)
+                        )
+                    ):
+                        logger.info(
+                            f"[ORCHESTRATOR] Backlog-reuse first-refusal: holding off "
+                            f"cold-provision of task {task.id} (project {task.project_id}) "
+                            f"— idle warm VM has first claim"
+                        )
+                        await session.rollback()
+                        continue
 
                     # Ensure VM ID exists (cleared during stale PROVISIONING recovery
                     # OR set to None for warm-pinned tasks whose pin was just cleared).
@@ -2901,6 +2944,8 @@ async def orchestrator_worker():
                                         f"Pool state: {_blockage}."
                                     )
                                     task.status = TaskStatus.FAILED
+                                    if task.vm_provisioned_at:
+                                        task.vm_stopped_at = _utcnow()
                                     task.latest_status_message = _exhaust_msg[:500]
                                     persist_failure_category(
                                         task, "retry_after_exhausted"
@@ -3853,6 +3898,8 @@ async def orchestrator_worker():
                                         f"[CI] {_pr_gone_msg} for task {ci_task.id}"
                                     )
                                     ci_task.status = TaskStatus.FAILED
+                                    if ci_task.vm_provisioned_at:
+                                        ci_task.vm_stopped_at = _utcnow()
                                     ci_task.latest_status_message = _pr_gone_msg
                                     from app.failure_classification import (
                                         persist_failure_category,
@@ -4013,6 +4060,8 @@ async def orchestrator_worker():
                                     and not ci_task.requires_approval
                                 ):
                                     ci_task.status = TaskStatus.FAILED
+                                    if ci_task.vm_provisioned_at:
+                                        ci_task.vm_stopped_at = _utcnow()
                                     ci_task.requires_approval = True
                                     ci_task.latest_status_message = (
                                         f"PR #{ci_pr_number} reopen failed {_reopen_attempts} times — "
@@ -4087,6 +4136,8 @@ async def orchestrator_worker():
                                 # parents don't silently report success.
                                 _closed_msg = f"PR #{ci_pr_number} was closed without being merged"
                                 ci_task.status = TaskStatus.FAILED
+                                if ci_task.vm_provisioned_at:
+                                    ci_task.vm_stopped_at = _utcnow()
                                 ci_task.latest_status_message = _closed_msg
                                 from app.failure_classification import (
                                     persist_failure_category as _pfc_closed,
@@ -4551,6 +4602,8 @@ async def orchestrator_worker():
                                     )
                                 else:
                                     ci_task.status = TaskStatus.FAILED
+                                    if ci_task.vm_provisioned_at:
+                                        ci_task.vm_stopped_at = _utcnow()
                                     ci_task.requires_approval = True
                                     ci_task.latest_status_message = f"PR #{ci_pr_number} has merge conflicts — fix iterations exhausted, requires manual intervention"
                                     logger.warning(
@@ -4777,6 +4830,8 @@ async def orchestrator_worker():
                             status_code = getattr(e, "status_code", None)
                             if status_code == 404:
                                 ci_task.status = TaskStatus.FAILED
+                                if ci_task.vm_provisioned_at:
+                                    ci_task.vm_stopped_at = _utcnow()
                                 ci_task.latest_status_message = "CI polling failed: PR not found (404) — PR may have been deleted"
                                 _pr_num_404 = (
                                     (ci_task.context or {})

@@ -5,6 +5,7 @@ import {
   WORKSPACE, strVal, sendLog, validateBranchName,
   persistAndPostStatus, git, setupWorkspace, runClaudeCode,
   captureTestBaseline, getProviderRunner, setCurrentPromptFingerprint, sendHeartbeatSync,
+  apiPost,
 } from '../index.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
@@ -16,9 +17,10 @@ import {
   discoverAffectedConsumers, type PlaybookEntry, computePromptFingerprint,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
-import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT } from '../constants.js';
+import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT, DEFAULT_CLONE_DEPTH } from '../constants.js';
+import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { runCodeChangeTask } from './code-change.js';
-import { formatExecutionEvidenceForSrPrompt, formatHighFpRateLoosenHintForSrPrompt, formatSrCoFailurePairsForSrPrompt, formatSeverityCalibrationHintForSrPrompt } from '../prompts/self-review.js';
+import { formatExecutionEvidenceForSrPrompt, formatHighFpRateLoosenHintForSrPrompt, formatSrCoFailurePairsForSrPrompt, formatSeverityCalibrationHintForSrPrompt, formatPrecisionRecallQuadrantHintForSrPrompt } from '../prompts/self-review.js';
 
 // ── Standard Handler Helper ───────────────────────────────────────────────
 
@@ -164,6 +166,49 @@ export function buildSmallScopeCallerNote(relatedFiles: string[]): string {
 }
 
 const FRESH_REVIEWER_MIN_LINES = 20;
+const FRESH_REVIEWER_MEDIUM_EFFORT_THRESHOLD = 300;
+const SENSITIVE_PATHS = [
+  'backend/app/auth',
+  'backend/app/security',
+  'backend/app/routers/agent',
+  'backend/app/jwt_revocation',
+];
+
+/**
+ * Determines the fresh-reviewer effort level based on risk signals.
+ * Returns 'medium' when (a) loneCheckerRecovery=true, (b) incompleteSrRecovery=true,
+ * (c) diff exceeds threshold (>300 changed lines), or (d) any sensitive file is touched.
+ * Otherwise returns 'low'.
+ */
+export function pickFreshReviewerEffort(opts: {
+  loneCheckerRecovery?: boolean;
+  incompleteSrRecovery?: boolean;
+  changedLineCount?: number;
+  changedFiles?: string[];
+}): 'low' | 'medium' {
+  const { loneCheckerRecovery, incompleteSrRecovery, changedLineCount = 0, changedFiles = [] } = opts;
+
+  // Escalate on recovery paths
+  if (loneCheckerRecovery || incompleteSrRecovery) {
+    return 'medium';
+  }
+
+  // Escalate on large diffs
+  if (changedLineCount > FRESH_REVIEWER_MEDIUM_EFFORT_THRESHOLD) {
+    return 'medium';
+  }
+
+  // Escalate if any sensitive file is touched
+  for (const file of changedFiles) {
+    for (const sensitivePrefix of SENSITIVE_PATHS) {
+      if (file.startsWith(sensitivePrefix)) {
+        return 'medium';
+      }
+    }
+  }
+
+  return 'low';
+}
 
 const VIEWPORT_INFRA_SKIP_GUIDANCE = `## Viewport gate: infra-skip sentinel
 
@@ -199,6 +244,7 @@ type SRCatchRateCategory = {
   sr_flag_sample_size?: number;
   examples?: SRCatchRateExample[];
   time_to_miss_detect_lone_checker?: boolean;
+  engagement_thinning?: boolean;
 };
 
 function formatFreshReviewerCalibrationSection(
@@ -252,6 +298,19 @@ function getRegressingCategories(
   return Object.entries(categories)
     .filter(([, data]) => typeof data.miss_rate === 'number' && data.miss_rate > 0)
     .sort((a, b) => (b[1].weighted_miss_rate ?? b[1].miss_rate ?? 0) - (a[1].weighted_miss_rate ?? a[1].miss_rate ?? 0))
+    .map(([cat]) => cat);
+}
+
+function getThinningCategories(
+  projectContext: Record<string, unknown> | undefined,
+): string[] {
+  const srCatchRate = projectContext?.self_review_catch_rate as {
+    categories?: Record<string, SRCatchRateCategory>;
+  } | null | undefined;
+  const categories = srCatchRate?.categories;
+  if (!categories) return [];
+  return Object.entries(categories)
+    .filter(([, data]) => data.engagement_thinning === true)
     .map(([cat]) => cat);
 }
 
@@ -331,6 +390,8 @@ export async function runFreshReviewerPass(
   projectContext?: Record<string, unknown>,
   incompleteSrRecovery?: boolean,
   loneCheckerRecovery?: boolean,
+  operatorRequestedRecovery?: boolean,
+  originalTaskId?: string,
 ): Promise<void> {
   let baseCommit = '';
   try { baseCommit = fs.readFileSync(`/tmp/base_commit_${taskId}`, 'utf-8').trim(); } catch { /* ok */ }
@@ -386,8 +447,16 @@ Output ONLY a JSON object:
 Category IDs: correctness, error-handling, security, type-safety, scope-drift, regression_risk, architecture, test-coverage, test_assertion_quality
 If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
 
+  const changedFiles = extractChangedFilesFromDiff(diff);
+  const effort = pickFreshReviewerEffort({
+    loneCheckerRecovery,
+    incompleteSrRecovery,
+    changedLineCount: changed,
+    changedFiles: Array.from(changedFiles),
+  });
+
   const { exitCode, lastResultText } = await runClaudeCode(
-    prompt, ws, statusRef, model, 'low',
+    prompt, ws, statusRef, model, effort,
     ['Write', 'Edit', 'NotebookEdit'],
   );
   statusRef.value = prevStatus;
@@ -406,13 +475,20 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
   }
 
   const findings = parsed.reviewer_findings as Array<{ category: string; severity: string; description: string }>;
-  const changedFiles = extractChangedFilesFromDiff(diff);
   const groundedFindings: typeof findings = [];
   let hallucinatedCount = 0;
+  const phantomPaths: string[] = [];
 
   for (const f of findings) {
     if (isHallucinatedFinding(f, changedFiles)) {
       hallucinatedCount++;
+      if (phantomPaths.length < 5) {
+        for (const p of extractCandidateFilePaths(f.description)) {
+          if (!changedFiles.has(p) && phantomPaths.length < 5) {
+            phantomPaths.push(p);
+          }
+        }
+      }
     } else {
       groundedFindings.push(f);
     }
@@ -447,6 +523,8 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
         entry.origin = 'reviewer_recovery_after_incomplete_sr';
       } else if (loneCheckerRecovery) {
         entry.origin = 'lone_checker_recovery';
+      } else if (operatorRequestedRecovery) {
+        entry.origin = 'operator_requested_recovery';
       } else if (existing?.passed === true) {
         entry.origin = 'reviewer_disagreement';
       } else {
@@ -461,6 +539,8 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
     sr.reviewer_recovery_origin = 'reviewer_recovery_after_incomplete_sr';
   } else if (loneCheckerRecovery) {
     sr.reviewer_recovery_origin = 'lone_checker_recovery';
+  } else if (operatorRequestedRecovery) {
+    sr.reviewer_recovery_origin = 'operator_requested_recovery';
   }
 
   // Merge reviewer-enumerated edges. Filter defensively to entries with a
@@ -546,11 +626,29 @@ If no issues found: {"reviewer_findings": [], "reviewer_edges_considered": []}`;
     }
   }
 
+  sr.reviewer_findings_filtered = {
+    total_reviewer_findings: findings.length,
+    filtered_count: hallucinatedCount,
+    sampled_phantom_paths: phantomPaths,
+  };
+
   try {
     fs.writeFileSync(srPath, JSON.stringify(sr, null, 2), { mode: 0o644 });
     sendLog(ws, '[FreshReview] Reviewer findings merged into self-review JSON.\n');
   } catch (e) {
     sendLog(ws, `[FreshReview] Failed to write self-review: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+
+  if (originalTaskId) {
+    try {
+      await apiPost(`/api/agent/tasks/${originalTaskId}/reviewer-merge`, {
+        reviewer_findings: groundedFindings,
+        reviewer_edges_considered: Array.isArray(parsed.reviewer_edges_considered) ? parsed.reviewer_edges_considered as Record<string, unknown>[] : [],
+      });
+      sendLog(ws, '[FreshReview] Findings posted to original task.\n');
+    } catch (e) {
+      sendLog(ws, `[FreshReview] Failed to post findings to original task: ${e instanceof Error ? e.message : String(e)}\n`);
+    }
   }
 }
 
@@ -687,12 +785,13 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const taskTypeFocusBlock = getTaskTypeFocusBlock(taskTypeKey);
   const executionEvidenceSection = formatExecutionEvidenceForSrPrompt();
   const projectCtxForSr = task.project_context as Record<string, unknown> | undefined;
-  const srCategories = (projectCtxForSr?.self_review_catch_rate as { categories?: Record<string, { false_positive_rate?: number; precision?: number; sr_flag_sample_size?: number; severity_calibration?: Record<string, unknown> }> } | null | undefined)?.categories;
+  const srCategories = (projectCtxForSr?.self_review_catch_rate as { categories?: Record<string, { false_positive_rate?: number; precision?: number; sr_flag_sample_size?: number; severity_calibration?: Record<string, unknown>; precision_recall_quadrant?: string; precision_delta?: number; recall_delta?: number }> } | null | undefined)?.categories;
   const loosenHintSection = formatHighFpRateLoosenHintForSrPrompt(srCategories);
   const coFailurePairs = projectCtxForSr?.sr_co_failure_pairs as Array<{ cat_a: string; cat_b: string; lift: number }> | null | undefined;
   const coFailurePairsSection = formatSrCoFailurePairsForSrPrompt(coFailurePairs);
   const severityCalibrationHintSection = formatSeverityCalibrationHintForSrPrompt(srCategories);
-  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
+  const precisionRecallQuadrantHintSection = formatPrecisionRecallQuadrantHintForSrPrompt(srCategories);
+  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, buildConfig);
   writePlaybookHelper(taskId);
@@ -940,6 +1039,9 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   // runCodeChangeTask. Claude owns its own loop via ./check + ./pr +
   // ./done + ./fail helpers. Wrapper just runs Claude, watches markers,
   // and posts terminal status. See agent/src/handlers/code-change.ts.
+  const regressingCats = getRegressingCategories(projectCtxForSr);
+  const thinningCats = getThinningCategories(projectCtxForSr);
+  const reasoningGateCats = [...new Set([...regressingCats, ...thinningCats])];
   await runCodeChangeTask({
     taskId,
     prompt: finalPromptWithTree,
@@ -956,6 +1058,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     disallowedTools,
     noChangesMessage,
     analysisContext,
+    regressingCategories: reasoningGateCats.length > 0 ? reasoningGateCats : undefined,
   });
 
   // Fresh reviewer pass: read-only second session to catch what the implementing
@@ -1083,6 +1186,25 @@ export async function handleCreate(
     ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
     []
   );
+
+  // Operator-requested fresh-reviewer: clone the original PR branch, run the pass, and return.
+  const operatorReviewFor = taskCtx?.operator_requested_review_for as string | undefined;
+  if (operatorReviewFor) {
+    const prBranch = validateBranchName(strVal(payload.branch), 'branch');
+    const prBaseBranch = validateBranchName(strVal(payload.base_branch, 'main'), 'base_branch');
+    const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+    sendLog(ws, `[FreshReview] Operator-requested pass — cloning ${owner}/${repo} branch ${prBranch}\n`);
+    await prepareWorkspaceForRole({ workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken, branch: prBranch, baseBranch: prBaseBranch, depth: DEFAULT_CLONE_DEPTH });
+    try { git(['fetch', 'origin', `+refs/heads/${prBaseBranch}:refs/remotes/origin/${prBaseBranch}`, '--depth', String(DEFAULT_CLONE_DEPTH)]); } catch { /* ok */ }
+    try {
+      const mergeBase = git(['merge-base', 'HEAD', `origin/${prBaseBranch}`]).trim();
+      if (mergeBase) fs.writeFileSync(`/tmp/base_commit_${taskId}`, mergeBase);
+    } catch { /* ok */ }
+    const title = strVal(task.title) || 'Operator-requested fresh review';
+    await runFreshReviewerPass(taskId, title, rawPrompt || '', relatedFiles, ws, statusRef, model, task.project_context as Record<string, unknown> | undefined, false, false, true, operatorReviewFor);
+    return;
+  }
+
   const createBuildConfig = resolveBuildConfig(task);
   const relatedTestContext = discoverRelatedTests(ws, relatedFiles, createBuildConfig);
   const createScope = taskCtx?.scope as string | undefined;

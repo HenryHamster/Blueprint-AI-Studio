@@ -1,3 +1,5 @@
+import re
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -84,6 +86,7 @@ def _build_notification_config_response(config: dict, *, is_admin: bool) -> dict
                 "REMEDIATION_ESCALATED",
                 "DIRECTION_MILESTONE",
                 "RESIDUAL_FIX_ESCALATED",
+                "DIRECTION_BURN_PAUSE",
             ],
         ),
         "throttle_seconds": config.get("throttle_seconds", 30),
@@ -186,14 +189,13 @@ async def get_settings(
         # automain/LTS release-qualifier control flags — kept in sync with the
         # _apply_settings write path and the runtime_config_json persistence.
         "integration_branch": _runtime_config.get("integration_branch", "main"),
-        "promotion_enabled": bool(
-            _runtime_config.get("promotion_enabled", False)
-        ),
-        "smoketest_enabled": bool(
-            _runtime_config.get("smoketest_enabled", False)
-        ),
+        "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
+        "smoketest_enabled": bool(_runtime_config.get("smoketest_enabled", False)),
         "warm_continuity_enabled": bool(
             _runtime_config.get("warm_continuity_enabled", False)
+        ),
+        "warm_backlog_reuse_enabled": bool(
+            _runtime_config.get("warm_backlog_reuse_enabled", False)
         ),
         "next_role_poll_timeout_secs": int(
             _runtime_config.get("next_role_poll_timeout_secs", 180)
@@ -244,6 +246,7 @@ async def get_settings(
                         "REMEDIATION_ESCALATED",
                         "DIRECTION_MILESTONE",
                         "RESIDUAL_FIX_ESCALATED",
+                        "DIRECTION_BURN_PAUSE",
                     ],
                     "throttle_seconds": 30,
                 },
@@ -427,11 +430,28 @@ async def _apply_settings(
     # runtime_config_json below and synced back into runtime_config every ~15s.
     if "integration_branch" in payload:
         val = str(payload["integration_branch"] or "").strip()
-        if not val or len(val) > 200 or any(c.isspace() for c in val):
+        _branch_pattern = re.compile(r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$")
+        if not val or len(val) > 200 or not _branch_pattern.match(val):
             raise HTTPException(
                 status_code=400,
-                detail="integration_branch must be a non-empty branch name",
+                detail="integration_branch must be a valid branch name",
             )
+        for part in val.split("/"):
+            if part in (".git", ".lock"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"integration_branch contains reserved component: {part}",
+                )
+            if part.startswith("."):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"integration_branch component cannot start with a dot: {part}",
+                )
+            if ".." in part:
+                raise HTTPException(
+                    status_code=400,
+                    detail="integration_branch component cannot contain '..'",
+                )
         _runtime_config["integration_branch"] = val
     if "promotion_enabled" in payload:
         _runtime_config["promotion_enabled"] = bool(payload["promotion_enabled"])
@@ -515,6 +535,14 @@ async def _apply_settings(
                 status_code=400, detail="warm_continuity_enabled must be a boolean"
             )
         _runtime_config["warm_continuity_enabled"] = val
+    if "warm_backlog_reuse_enabled" in payload:
+        val = payload["warm_backlog_reuse_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="warm_backlog_reuse_enabled must be a boolean",
+            )
+        _runtime_config["warm_backlog_reuse_enabled"] = val
     if "drift_over_claim_min_claims" in payload:
         try:
             val = int(payload["drift_over_claim_min_claims"])
@@ -1224,6 +1252,10 @@ async def _apply_settings(
                 "RESIDUAL_FIX_UNSUSPENDED",
                 # Escalation fired when a case is deferred by audit too many times.
                 "RESIDUAL_FIX_AUDIT_DEFERRED",
+                # Direction auto-paused for lifetime burn (non-merging finished
+                # tasks beyond the rolling-window threshold). BLOCKER severity /
+                # manual-intervention-required, so it joins the default-on list.
+                "DIRECTION_BURN_PAUSE",
             ]
         )
         enabled_events = val.get(
@@ -1235,6 +1267,7 @@ async def _apply_settings(
                 "REMEDIATION_ESCALATED",
                 "DIRECTION_MILESTONE",
                 "RESIDUAL_FIX_ESCALATED",
+                "DIRECTION_BURN_PAUSE",
             ],
         )
         if not isinstance(enabled_events, list):
@@ -1426,6 +1459,9 @@ async def _apply_settings(
                     "warm_continuity_enabled": bool(
                         _runtime_config.get("warm_continuity_enabled", False)
                     ),
+                    "warm_backlog_reuse_enabled": bool(
+                        _runtime_config.get("warm_backlog_reuse_enabled", False)
+                    ),
                     "next_role_poll_timeout_secs": int(
                         _runtime_config.get("next_role_poll_timeout_secs", 180)
                     ),
@@ -1455,6 +1491,7 @@ async def _apply_settings(
                                 "DEPLOY_HEALTH_ALERT",
                                 "REMEDIATION_ESCALATED",
                                 "RESIDUAL_FIX_ESCALATED",
+                                "DIRECTION_BURN_PAUSE",
                             ],
                             "throttle_seconds": 30,
                         },

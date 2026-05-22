@@ -121,7 +121,7 @@ from app.strategic_constants import (
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0100"
+EXPECTED_SCHEMA_REVISION = "0110"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -318,6 +318,75 @@ def fire_and_forget_vm_delete(
     # misclassify the orchestrator action as spot-preemption.
     _orchestrator_deleted_vms[vm_id] = (time.time(), reason)
     bg = asyncio.create_task(_ensure_vm_deleted(vm_id, reason=reason))
+    _background_vm_deletes.add(bg)
+    bg.add_done_callback(_background_vm_deletes.discard)
+
+
+async def _deferred_backlog_teardown(vm_id: str, reason: str) -> None:
+    """Hold a just-idle VM's teardown briefly so it can claim backlog work.
+
+    Backlog reuse (efficiency direction d-91d8dede): when a COMPLETED task's
+    VM has eligible QUEUED backlog work in its project, this defers teardown
+    for WARM_BACKLOG_TEARDOWN_DEFER_SECS so the agent's /next-role poll can
+    claim that work and run it warm. After the window, the VM is deleted iff
+    it never claimed anything.
+
+    Crucially this does NOT pre-record the orchestrator-deleted marker (unlike
+    fire_and_forget_vm_delete): that marker makes is_orchestrator_initiated_delete
+    return True, and the /next-role doomed-VM guard would then refuse the VM's
+    own warm claim. The marker is only written if/when we actually delete.
+    """
+    from app.warm_backlog_reuse import WARM_BACKLOG_TEARDOWN_DEFER_SECS
+
+    await asyncio.sleep(WARM_BACKLOG_TEARDOWN_DEFER_SECS)
+    try:
+        async with AsyncSessionLocal() as s:
+            claimed = (
+                await s.execute(
+                    select(Task.id)
+                    .where(
+                        Task.vm_instance_id == vm_id,
+                        Task.status.in_(
+                            [
+                                TaskStatus.PROVISIONING,
+                                TaskStatus.IN_PROGRESS,
+                                TaskStatus.EVALUATING,
+                            ]
+                        ),
+                    )
+                    .limit(1)
+                )
+            ).first()
+    except Exception:
+        # If the re-check query fails, fall through to teardown — never leak a
+        # VM by assuming it was reused.
+        logger.exception(
+            "[BACKLOG-REUSE] Deferred-teardown re-check failed for VM %s — "
+            "tearing down",
+            vm_id,
+        )
+        claimed = None
+    if claimed is not None:
+        logger.info(
+            "[BACKLOG-REUSE] VM %s claimed backlog work during defer window — "
+            "skipping teardown",
+            vm_id,
+        )
+        return
+    logger.info(
+        "[BACKLOG-REUSE] VM %s claimed nothing within defer window — tearing down",
+        vm_id,
+    )
+    await _ensure_vm_deleted(vm_id, reason=reason)
+
+
+def schedule_deferred_backlog_teardown(
+    vm_id: str, *, reason: str = "agent_completion"
+) -> None:
+    """Fire-and-forget the deferred-teardown coroutine (see above)."""
+    if not vm_id:
+        return
+    bg = asyncio.create_task(_deferred_backlog_teardown(vm_id, reason))
     _background_vm_deletes.add(bg)
     bg.add_done_callback(_background_vm_deletes.discard)
 
@@ -960,22 +1029,24 @@ async def _create_rollback_alerts(
         f"to {rolled_back_to[:8]}."
     )
     projects = (await session.execute(select(Project))).scalars().all()
-    for project in projects:
-        existing = (
-            (
-                await session.execute(
-                    select(Alert).where(
-                        Alert.project_id == project.id,
-                        Alert.task_id.is_(None),
-                        Alert.dismissed_at.is_(None),
-                        Alert.title.contains("Automatic rollback"),
-                    )
+    project_ids = [p.id for p in projects]
+    existing_rows = (
+        (
+            await session.execute(
+                select(Alert.project_id).where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.task_id.is_(None),
+                    Alert.dismissed_at.is_(None),
+                    Alert.title.contains("Automatic rollback"),
                 )
             )
-            .scalars()
-            .first()
-        )
-        if existing is not None:
+        ).all()
+        if project_ids
+        else []
+    )
+    projects_with_alert = {row[0] for row in existing_rows}
+    for project in projects:
+        if project.id in projects_with_alert:
             continue
         alert = Alert(
             project_id=project.id,
@@ -996,23 +1067,28 @@ async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
     recovery_title = "Deployment auto-recovered from HALTED state after 1h cooldown"
     now = _utcnow()
     projects = (await session.execute(select(Project))).scalars().all()
-    for project in projects:
-        # Dismiss existing HALTED ERROR alerts for this project
-        existing_halted = (
-            (
-                await session.execute(
-                    select(Alert).where(
-                        Alert.project_id == project.id,
-                        Alert.severity == AlertSeverity.ERROR,
-                        Alert.dismissed_at.is_(None),
-                        Alert.title.contains("HALTED"),
-                    )
+    project_ids = [p.id for p in projects]
+    # Single batched query for all undismissed HALTED ERROR alerts across all projects
+    halted_alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.severity == AlertSeverity.ERROR,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title.contains("HALTED"),
                 )
             )
-            .scalars()
-            .all()
         )
-        for h in existing_halted:
+        .scalars()
+        .all()
+    )
+    halted_by_project: dict = {}
+    for h in halted_alerts:
+        halted_by_project.setdefault(h.project_id, []).append(h)
+    for project in projects:
+        # Dismiss existing HALTED ERROR alerts for this project
+        for h in halted_by_project.get(project.id, []):
             h.dismissed_at = now
             session.add(h)
         # Create INFO recovery alert
@@ -1308,10 +1384,12 @@ async def debug_orchestrator(
         }
 
     hung = False
-    if _orch._orchestrator_cycle_started and _orch._orchestrator_last_cycle and _orch._orchestrator_cycle_started > _orch._orchestrator_last_cycle:
-        hung_seconds = (
-            _utcnow() - _orch._orchestrator_cycle_started
-        ).total_seconds()
+    if (
+        _orch._orchestrator_cycle_started
+        and _orch._orchestrator_last_cycle
+        and _orch._orchestrator_cycle_started > _orch._orchestrator_last_cycle
+    ):
+        hung_seconds = (_utcnow() - _orch._orchestrator_cycle_started).total_seconds()
         hung = hung_seconds > 300  # 5 minutes without completing a cycle
 
     return {
@@ -1611,6 +1689,52 @@ async def get_version():
     return {"sha": _current_sha, "revision": _current_revision}
 
 
+@app.get("/api/admin/viewport-failures/download-url")
+async def get_viewport_failure_screenshot_download_url(
+    project_id: uuid.UUID,
+    component: str,
+    width: int,
+    current_user: dict = Depends(get_current_user),
+):
+    """Generate a 1-hour signed download URL for a viewport failure screenshot.
+
+    The GCS object path is reconstructed to exactly mirror what the agent
+    uploads via POST /api/agent/viewport/failure-screenshot-upload-url
+    (viewport-failures/{project_id}/{component}-{width}.png), so the regression
+    panel can display screenshots from the stable per-project/component/width
+    path without a per-task DB lookup. The component is sanitized with the same
+    rule the upload endpoint applies so the two paths always agree.
+    """
+    import datetime as _dt
+    import re as _re
+
+    from google.cloud import storage as _gcs
+
+    from app.storage import ARTIFACT_BUCKET_NAME, GCP_PROJECT_ID
+
+    safe_component = _re.sub(r"[^A-Za-z0-9._-]", "_", component)[:100]
+    object_name = f"viewport-failures/{project_id}/{safe_component}-{width}.png"
+
+    def _generate() -> str:
+        blob = (
+            _gcs.Client(project=GCP_PROJECT_ID)
+            .bucket(ARTIFACT_BUCKET_NAME)
+            .blob(object_name)
+        )
+        return blob.generate_signed_url(
+            version="v4", expiration=_dt.timedelta(hours=1), method="GET"
+        )
+
+    try:
+        url = await asyncio.to_thread(_generate)
+    except Exception as exc:
+        logger.warning(
+            "[VIEWPORT] signed download URL failed for %s: %s", object_name, exc
+        )
+        raise HTTPException(status_code=503, detail="Artifact storage unavailable")
+    return {"url": url}
+
+
 @app.get("/health")
 async def health_check():
     """Unauthenticated health endpoint for external monitoring (Cloud Function, load balancer)."""
@@ -1640,10 +1764,12 @@ async def health_check():
 
     # Detect hung orchestrator (cycle started but not completed in 5+ minutes)
     orchestrator_hung = False
-    if _orch._orchestrator_cycle_started and _orch._orchestrator_last_cycle and _orch._orchestrator_cycle_started > _orch._orchestrator_last_cycle:
-        hung_seconds = (
-            _utcnow() - _orch._orchestrator_cycle_started
-        ).total_seconds()
+    if (
+        _orch._orchestrator_cycle_started
+        and _orch._orchestrator_last_cycle
+        and _orch._orchestrator_cycle_started > _orch._orchestrator_last_cycle
+    ):
+        hung_seconds = (_utcnow() - _orch._orchestrator_cycle_started).total_seconds()
         orchestrator_hung = hung_seconds > 300
 
     # Only DB is critical for 503 — provider or external API outages shouldn't remove us from LB.
@@ -3213,9 +3339,7 @@ async def strategic_operation(
         version_phase_decision = extract_version_phase_decision(
             pm_data.pop("version_phase_decision", None)
         )
-        qualify_request = extract_qualify_request(
-            pm_data.pop("qualify_request", None)
-        )
+        qualify_request = extract_qualify_request(pm_data.pop("qualify_request", None))
         try:
             new_pm_raw, pm_diff = apply_agent_update(
                 current_raw=project.problem_model,
@@ -3444,6 +3568,61 @@ async def strategic_operation(
             f"[STRATEGIC API] Stored {n} retirement critique(s) for task {task.id}"
         )
         return _resp({"status": "ok", "op": "set_retirement_critiques", "count": n})
+
+    elif payload.op == "set_evidence_progress":
+        # OPTIONAL refinement of the deterministic outcome-progress (scaffolding)
+        # detector. data is a list of {direction_id, status, rationale} items;
+        # status ∈ {advancing, stalled, met}. advancing/met SUPPRESS the advisory
+        # scaffolding flag, stalled reinforces it. Stashed in task.context for the
+        # completion handler to persist onto directions. Idempotent (last write
+        # wins). Omitting this op entirely leaves the deterministic backstop intact.
+        from app.strategic_completion import (
+            EVIDENCE_PROGRESS_CONTEXT_KEY,
+            _EVIDENCE_PROGRESS_RATIONALE_MAX,
+            _VALID_EVIDENCE_PROGRESS,
+        )
+
+        if not isinstance(data, list):
+            raise HTTPException(
+                status_code=400,
+                detail="set_evidence_progress: data must be a list of {direction_id, status, rationale} objects",
+            )
+        cleaned_ep = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            direction_id = str(item.get("direction_id", "")).strip()
+            status = str(item.get("status", "")).strip().lower()
+            rationale = str(item.get("rationale", "")).strip()
+            if not direction_id:
+                continue
+            if status not in _VALID_EVIDENCE_PROGRESS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"set_evidence_progress: invalid status '{status}' (must be one of: advancing, stalled, met)",
+                )
+            cleaned_ep.append(
+                {
+                    "direction_id": direction_id[:64],
+                    "status": status,
+                    "rationale": rationale[:_EVIDENCE_PROGRESS_RATIONALE_MAX],
+                }
+            )
+        ctx = task.context or {}
+        task.context = {
+            **ctx,
+            EVIDENCE_PROGRESS_CONTEXT_KEY: cleaned_ep,
+            "_strategic_api_called": True,
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            f"[STRATEGIC API] Stored {len(cleaned_ep)} evidence_progress verdict(s) for task {task.id}"
+        )
+        return _resp(
+            {"status": "ok", "op": "set_evidence_progress", "count": len(cleaned_ep)}
+        )
 
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")

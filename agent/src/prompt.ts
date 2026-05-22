@@ -120,6 +120,7 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'strategic_review', // Reuses research handler with research_mode branch; uses bespoke assembly
   'smoketest',        // Uses specialized.ts bespoke prompt assembly
   'design_doc_update', // Uses design-doc.ts bespoke prompt assembly
+  'memo',             // Uses memo.ts bespoke prompt assembly (no-clone reasoning artifact)
 ]);
 
 // ── Dynamic Task Type Hints (based on project build configuration) ───────────
@@ -527,6 +528,7 @@ export function writeCodeChangeHelpers(cfg: CodeChangeHelperConfig): void {
 }
 
 function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
+  validateCfgShellSafety(cfg);
   // Auto-detects which stacks were touched (admin-ui / agent / backend) by
   // inspecting `git diff --name-only` against the base branch + uncommitted.
   // Runs the corresponding lint/build commands plus the admin-ui browser-mode
@@ -880,7 +882,30 @@ function loadSrSectionScriptB64(): string {
   }
 }
 
+const BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
+const OWNER_REPO_RE = /^[A-Za-z0-9._-]+$/;
+const TASK_ID_RE = /^[A-Za-z0-9-]+$/;
+
+function validateCfgShellSafety(cfg: CodeChangeHelperConfig): void {
+  if (!TASK_ID_RE.test(cfg.taskId)) {
+    throw new Error(`taskId contains unsafe characters for shell interpolation: ${cfg.taskId}`);
+  }
+  if (!BRANCH_RE.test(cfg.workBranch)) {
+    throw new Error(`workBranch contains unsafe characters for shell interpolation: ${cfg.workBranch}`);
+  }
+  if (!BRANCH_RE.test(cfg.baseBranch)) {
+    throw new Error(`baseBranch contains unsafe characters for shell interpolation: ${cfg.baseBranch}`);
+  }
+  if (!OWNER_REPO_RE.test(cfg.owner)) {
+    throw new Error(`owner contains unsafe characters for shell interpolation: ${cfg.owner}`);
+  }
+  if (!OWNER_REPO_RE.test(cfg.repo)) {
+    throw new Error(`repo contains unsafe characters for shell interpolation: ${cfg.repo}`);
+  }
+}
+
 function writePrHelper(cfg: CodeChangeHelperConfig): void {
+  validateCfgShellSafety(cfg);
   // Idempotent push + PR creation/update. Gates on ./check first.
   // Writes /tmp/pr_url_<task_id> on success so the wrapper + ./done can
   // pick up the URL without re-querying GitHub.
@@ -1268,6 +1293,7 @@ echo "[pr] Next: ./done   (or call ./pr again if you push more commits)"
 }
 
 function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
+  validateCfgShellSafety(cfg);
   // Posts COMPLETED to the orchestrator with the PR URL from /tmp/pr_url_<task_id>.
   // Also writes /tmp/done_<task_id> as a marker for the wrapper to detect on
   // exit and skip its fallback push.
@@ -1387,11 +1413,18 @@ MISSING_REASONING=()
 for _CAT in "\${REGRESSING_CATS[@]}"; do
   _R=$(printf '%s' "$SELF_REVIEW_JSON" | jq -r --arg c "$_CAT" '.check_results[$c].reasoning // ""' 2>/dev/null || echo "")
   if [ "\${#_R}" -lt 10 ]; then
-    MISSING_REASONING+=("$_CAT")
+    # Short reasoning passes if it contains a file:line evidence anchor
+    _HAS_ANCHOR=0
+    if printf '%s' "$_R" | grep -qE '[a-zA-Z0-9._/-]+[.][a-z]+:[0-9]+' 2>/dev/null; then
+      _HAS_ANCHOR=1
+    fi
+    if [ "\${_HAS_ANCHOR}" = "0" ]; then
+      MISSING_REASONING+=("$_CAT")
+    fi
   fi
 done
 if [ "\${#MISSING_REASONING[@]}" -gt 0 ]; then
-  echo "[done] Regressing categories need a reasoning field (>=10 chars) in check_results:" >&2
+  echo "[done] Regressing categories need a reasoning field (>=10 chars, or a file:line anchor) in check_results:" >&2
   for _CAT in "\${MISSING_REASONING[@]}"; do echo "  - $_CAT" >&2; done
   echo "Update /tmp/self_review_${cfg.taskId}.json and re-run ./done." >&2
   exit 1
@@ -1399,21 +1432,29 @@ fi`
   : '# No regressing categories for this task type — reasoning check skipped.'}
 
 # High-stakes-category evidence-anchor gate: require concrete evidence anchors for PASS verdicts
-# on correctness, error-handling, security, regression_risk. Anchors must be file:line or >=10
-# char quoted snippet. If any are missing, print the gap and exit so Claude can fix the SR JSON.
-HIGH_STAKES_CATS=("correctness" "error-handling" "security" "regression_risk")
+# on correctness, error-handling, security, regression_risk, and scope-drift. Anchors must be
+# file:line, diff stats reference, or file-list reference. If any are missing, print the gap and
+# exit so Claude can fix the SR JSON.
+HIGH_STAKES_CATS=("correctness" "error-handling" "security" "regression_risk" "scope-drift")
 MISSING_EVIDENCE=()
 for _CAT in "\${HIGH_STAKES_CATS[@]}"; do
   _PASSED=$(printf '%s' "$SELF_REVIEW_JSON" | jq -r --arg c "$_CAT" '.check_results[$c].passed // false' 2>/dev/null || echo "false")
   _REASONING=$(printf '%s' "$SELF_REVIEW_JSON" | jq -r --arg c "$_CAT" '.check_results[$c].reasoning // ""' 2>/dev/null || echo "")
 
   if [ "$_PASSED" = "true" ]; then
-    # Check if reasoning has evidence anchor: file:line format or quoted code (10+ chars)
+    # Check if reasoning has evidence anchor: file:line format, diff stats, or file list reference
     _HAS_ANCHOR=0
+    # File:line reference (e.g., path/to/file.ts:42)
     if printf '%s' "$_REASONING" | grep -E '[a-zA-Z0-9._/-]+[.][a-z]+:[0-9]+' > /dev/null 2>&1; then
       _HAS_ANCHOR=1
+    # Diff-stat reference (e.g., "lines / files" or "diff:")
+    elif printf '%s' "$_REASONING" | grep -iE 'diff.*lines|files|threshold' > /dev/null 2>&1; then
+      _HAS_ANCHOR=1
+    # File-list reference (e.g., "related_files" or list of files)
+    elif printf '%s' "$_REASONING" | grep -iE 'related_files|modified files|checked.*files?' > /dev/null 2>&1; then
+      _HAS_ANCHOR=1
+    # Substantial reasoning (20+ chars)
     elif printf '%s' "$_REASONING" | grep '.' > /dev/null 2>&1 && [ "\${#_REASONING}" -ge 20 ]; then
-      # Heuristic: if reasoning is substantial (20+ chars), assume it contains evidence
       _HAS_ANCHOR=1
     fi
     if [ "\${_HAS_ANCHOR}" = "0" ]; then
@@ -1422,10 +1463,31 @@ for _CAT in "\${HIGH_STAKES_CATS[@]}"; do
   fi
 done
 if [ "\${#MISSING_EVIDENCE[@]}" -gt 0 ]; then
-  echo "[done] PASS verdicts on high-stakes categories must include evidence anchors (file:line or code reference):" >&2
+  echo "[done] PASS verdicts on high-stakes categories must include evidence anchors (file:line, diff stats, or file list):" >&2
   for _CAT in "\${MISSING_EVIDENCE[@]}"; do echo "  - $_CAT" >&2; done
   echo "Update /tmp/self_review_${cfg.taskId}.json with evidence anchors in reasoning and re-run ./done." >&2
   exit 1
+fi
+
+# scope-drift overage gate: if the diff materially exceeds the "large" scope threshold
+# (800 lines / 15 files), do not allow scope-drift PASS — the agent must mark it FAIL.
+# This catches cases where the diff is unexpectedly huge despite a smaller scope declaration.
+_SCOPE_DRIFT_PASSED=$(printf '%s' "$SELF_REVIEW_JSON" | jq -r '.check_results["scope-drift"].passed // false' 2>/dev/null || echo "false")
+if [ "$_SCOPE_DRIFT_PASSED" = "true" ]; then
+  _DIFF_STAT=$(git -C "${WORKSPACE}" diff --stat HEAD 2>/dev/null | tail -1 || echo "")
+  if [ -n "$_DIFF_STAT" ]; then
+    # Parse "X files changed, Y insertions(+), Z deletions(-)" — extract files and total lines
+    _FILES=$(printf '%s' "$_DIFF_STAT" | grep -oE '^[[:space:]]*[0-9]+' | xargs)
+    _LINES=$(printf '%s' "$_DIFF_STAT" | grep -oE '[0-9]+[[:space:]]*(insertion|deletion)' | grep -oE '[0-9]+' | paste -sd+ | bc 2>/dev/null || echo "0")
+    # If diff exceeds large threshold (800 lines, 15 files), block PASS
+    if [ "$_FILES" -gt 15 ] || [ "$_LINES" -gt 800 ]; then
+      echo "[done] scope-drift cannot be PASS when diff exceeds large threshold (800 lines / 15 files):" >&2
+      echo "       Detected: $_LINES lines / $_FILES files" >&2
+      echo "       Mark scope-drift as FAIL with the overage details, or revise your scope claim." >&2
+      echo "       Update /tmp/self_review_${cfg.taskId}.json and re-run ./done." >&2
+      exit 1
+    fi
+  fi
 fi
 
 # Optional enrichment: changed_files from git diff — review-pipeline scope
@@ -1531,6 +1593,7 @@ echo "[done] OK — wrapper will exit cleanly. PR: $PR_URL"
 }
 
 function writeFailHelper(cfg: CodeChangeHelperConfig): void {
+  validateCfgShellSafety(cfg);
   // Explicit failure signal — Claude calls this when it determines the task
   // can't be completed (e.g. scope is wrong, blocker found, conflicting
   // requirements). Posts FAILED with the reason. Wrapper sees the marker
@@ -1587,6 +1650,7 @@ echo "[fail] Posted FAILED status. Reason: $REASON"
 }
 
 function writeBlockedHelper(cfg: CodeChangeHelperConfig): void {
+  validateCfgShellSafety(cfg);
   // Explicit precondition-blocked signal — Claude calls this when a real
   // code change has been made and ./check still fails identically (or the
   // failure is at the toolchain/system-library layer, where no code edit
@@ -2177,12 +2241,21 @@ schema (no \`reasoning\` required). If \`./done\` exits with a "Regressing categ
 reasoning field" error, update the SR JSON and re-run \`./done\`.
 
 **Evidence anchors for PASS verdicts on high-stakes categories:**
-When you mark any of these four categories as \`"passed": true\` — \`correctness\`, \`error-handling\`, \`security\`, or \`regression_risk\` — your \`reasoning\` field MUST include a concrete evidence anchor. Valid anchors are:
+When you mark any of these five categories as \`"passed": true\` — \`correctness\`, \`error-handling\`, \`security\`, \`regression_risk\`, or \`scope-drift\` — your \`reasoning\` field MUST include a concrete evidence anchor. Valid anchors depend on the category:
+
+For \`correctness\`, \`error-handling\`, \`security\`, \`regression_risk\`:
 - A file reference with line number: \`path/to/file.ts:42\`
 - A backtick-quoted code snippet ≥10 characters from the diff: \`\`\`const result = validate(...)\`\`\`
 - A named test file: \`testing/test_security.py\` with the assertion that proved the claim
 
-For example: \`"reasoning": "Checked \`path/to/foo.ts:89\` — the null guard handles undefined payload fields, verified in test_agent.py:156"\`. PASS without an anchor on these high-stakes categories is unsubstantiated — downgrade to FAIL or \`unknown\` instead. This requirement does not apply to lower-stakes categories (style-conventions, documentation, performance, architecture).
+For \`scope-drift\` PASS verdicts specifically:
+- Trigger A evidence (diff size vs. threshold): reference the diff-stat numbers and how they compare to the scope threshold, e.g. \`"diff: 42 lines / 2 files — small scope threshold: 50 lines / 2 files"\`
+- Trigger B evidence (files vs. related_files): reference the file-set check you performed, e.g. \`"checked modified files against related_files: [agent/src/prompt.ts, agent/src/prompt.test.ts]"\`
+
+Example for correctness: \`"reasoning": "Checked \`path/to/foo.ts:89\` — the null guard handles undefined payload fields, verified in test_agent.py:156"\`.
+Example for scope-drift: \`"reasoning": "Trigger A: diff 45 lines / 2 files vs. small threshold 50/2 (within bounds). Trigger B: all modified files in related_files set."\`
+
+PASS without an anchor on these high-stakes categories is unsubstantiated — downgrade to FAIL or \`unknown\` instead. This requirement does not apply to lower-stakes categories (style-conventions, documentation, performance, architecture).
 
 \`fixes_applied: true\` means YOU caught something during self-review and
 fixed it before pushing. A degraded \`{"verdict":"unknown","check_results":{},"blind_spots":["..."]}\`

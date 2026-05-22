@@ -54,7 +54,7 @@ export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasP
       <div className="flex items-center gap-1.5 mb-2">
         <button
           onClick={() => setExpanded(!expanded)}
-          className="flex items-center gap-1.5 group"
+          className="flex items-center justify-center gap-1.5 group min-h-11 px-2"
         >
           <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Open PRs</h2>
           <span className="text-[10px] text-neutral-500 font-mono">{openPRs.length}</span>

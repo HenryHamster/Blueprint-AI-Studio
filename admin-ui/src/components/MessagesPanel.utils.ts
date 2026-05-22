@@ -1,3 +1,5 @@
+import { apiFetch, API_BASE_URL } from '../api';
+
 // Canonical set of escalation event types emitted by backend/app/notification_dispatch.py.
 // One source of truth: high-signal classification, error toast severity, and ContextBadges
 // all read from this set, so a new escalation type added here automatically gets surfaced
@@ -16,6 +18,8 @@ export const ESCALATION_EVENT_TYPES: ReadonlySet<string> = new Set([
   'residual_fix_escalated',
   'residual_fix_audit_deferred',
   'remediation_escalated',
+  'direction_burn_pause',
+  'direction_churn_pause',
 ]);
 
 // Per-event-type label and Tailwind class for the ContextBadges escalation badge.
@@ -26,15 +30,21 @@ export const ESCALATION_BADGE_LABELS: Readonly<Record<string, string>> = {
   residual_fix_escalated: 'Residual Fix Escalated',
   residual_fix_audit_deferred: 'Audit Deferred',
   remediation_escalated: 'Remediation Escalated',
+  direction_burn_pause: 'Burn Pause',
+  direction_churn_pause: 'Churn Pause',
 };
 
 export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
   'failure_alert', 'rollback_recommended', 'fix_loop_divergence_regressed',
+  'release_calcifying', 'direction_outcome_stalled', 'release_build_stalled',
+  'release_stabilize_stalled', 'promotion_readiness_reached',
   ...ESCALATION_EVENT_TYPES,
 ]);
 
 export const CRITICAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
   'failure_alert', 'rollback_recommended', 'fix_loop_divergence_regressed',
+  'release_calcifying', 'direction_outcome_stalled', 'release_build_stalled',
+  'release_stabilize_stalled', 'promotion_readiness_reached',
   ...ESCALATION_EVENT_TYPES,
 ]);
 
@@ -565,6 +575,33 @@ export function isEventTypeTemporarilyMuted(eventType: string | undefined, tempM
   return expiresAt !== undefined && expiresAt > Date.now();
 }
 
+// Count high-signal open messages (genuine operator attention items, excluding routine ops chatter).
+// High-signal includes: user messages, FEEDBACK/BLOCKER/BUG_REPORT types, and critical escalation NOTEs.
+// This computation is used consistently whether the messages panel is open or closed.
+export function countHighSignalMessages(messages: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown> }>): number {
+  return messages.filter(m =>
+    m.status === 'open' && classifySignalLevel(m) === 'high'
+  ).length;
+}
+
+// Count high-signal open messages that arrived after the operator's last panel visit.
+// Returns 0 when lastSeenTs is null (new operator with no baseline yet) so we never
+// mislabel all messages as new. Only counts messages with a valid created_at timestamp
+// that is strictly newer than lastSeenTs.
+export function countNewSinceLastVisit(
+  messages: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown>; created_at?: string | null }>,
+  lastSeenTs: number | null,
+): number {
+  if (lastSeenTs === null) return 0;
+  return messages.filter(m => {
+    if (m.status !== 'open') return false;
+    if (classifySignalLevel(m) !== 'high') return false;
+    if (!m.created_at) return false;
+    const ts = new Date(m.created_at.endsWith('Z') || m.created_at.includes('+') ? m.created_at : m.created_at + 'Z').getTime();
+    return !isNaN(ts) && ts > lastSeenTs;
+  }).length;
+}
+
 // Collapses stale routine rows (older than STALE_ROUTINE_COLLAPSE_AGE_MS) into per-day digest
 // entries. Failing groups and high-signal events are never collapsed.
 export function collapseStaleRoutineRows<T extends { id: string; context: Record<string, unknown>; created_at?: string | null }>(
@@ -622,4 +659,92 @@ export function formatDailyDigestSummary(breakdown: Record<string, number>): str
     .slice(0, 3)
     .map(([et, cnt]) => `${cnt} ${ROUTINE_EVENT_LABELS[et] ?? et.replace(/_/g, ' ')}`)
     .join(', ');
+}
+
+// ── Server-side noise prefs (per-operator, per-project) ──────────────────────
+// Mirrors the existing per-operator last-seen persistence pattern. localStorage
+// remains the offline fallback; on successful fetch the server value wins.
+
+function sanitizeServerEventPrefs(raw: Record<string, unknown>): Record<string, EventPref> {
+  const out: Record<string, EventPref> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (v === 'mute' || v === 'routine' || v === 'surfaced') out[k] = v;
+  }
+  return out;
+}
+
+export async function fetchServerNoisePrefs(
+  projectId: string,
+): Promise<Record<string, EventPref> | null> {
+  try {
+    const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/noise-prefs?project_id=${encodeURIComponent(projectId)}`);
+    if (!res.ok) return null;
+    const data = await res.json() as { prefs?: Record<string, unknown> };
+    return sanitizeServerEventPrefs(data.prefs ?? {});
+  } catch {
+    return null;
+  }
+}
+
+export async function saveServerNoisePrefs(
+  projectId: string,
+  prefs: Record<string, EventPref>,
+): Promise<void> {
+  try {
+    await apiFetch(`${API_BASE_URL}/api/admin/messages/noise-prefs`, {
+      method: 'PUT',
+      body: JSON.stringify({ project_id: projectId, prefs }),
+    });
+  } catch { /* ignore — localStorage copy remains authoritative offline */ }
+}
+
+// Merges local and server noise prefs, preferring server when available.
+// Pass null serverPrefs to fall back to local (offline or fetch failed).
+export function resolveNoisePrefs(
+  localPrefs: Record<string, EventPref>,
+  serverPrefs: Record<string, EventPref> | null,
+): Record<string, EventPref> {
+  return serverPrefs ?? localPrefs;
+}
+
+// ── Server-side saved views (per-operator, per-project) ──────────────────────
+// Mirrors the noise-prefs server persistence pattern. localStorage remains the
+// offline fallback; on successful fetch the server value wins.
+
+export async function fetchServerSavedViews(
+  projectId: string,
+): Promise<SavedView[] | null> {
+  try {
+    const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/saved-views?project_id=${encodeURIComponent(projectId)}`);
+    if (!res.ok) return null;
+    const data = await res.json() as { saved_views?: unknown[] };
+    if (!Array.isArray(data.saved_views)) return [];
+    const out: SavedView[] = [];
+    for (const item of data.saved_views) {
+      const v = sanitizeSavedView(item);
+      if (v) out.push(v);
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveServerSavedViews(
+  projectId: string,
+  views: SavedView[],
+): Promise<void> {
+  try {
+    await apiFetch(`${API_BASE_URL}/api/admin/messages/saved-views`, {
+      method: 'PUT',
+      body: JSON.stringify({ project_id: projectId, saved_views: views }),
+    });
+  } catch { /* ignore — localStorage copy remains authoritative offline */ }
+}
+
+export function resolveServerSavedViews(
+  localViews: SavedView[],
+  serverViews: SavedView[] | null,
+): SavedView[] {
+  return serverViews ?? localViews;
 }

@@ -11,6 +11,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, update
 from sqlalchemy.orm.attributes import flag_modified
+from sqlalchemy.orm import load_only
 
 from app.database import get_session
 from app.shared_state import limiter
@@ -292,6 +293,7 @@ async def get_all_tasks(
     created_after: datetime | None = Query(None),
     direction_id: str | None = Query(None),
     task_type: str | None = Query(None),
+    spawned_by: str | None = Query(None, max_length=100),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -326,6 +328,8 @@ async def get_all_tasks(
         filters.append(Task.context["direction_id"].as_string() == direction_id)
     if task_type:
         filters.append(Task.payloads[0]["type"].as_string() == task_type)
+    if spawned_by:
+        filters.append(Task.context["spawned_by"].as_string() == spawned_by)
 
     count_query = select(func.count()).select_from(Task)
     for f in filters:
@@ -518,6 +522,7 @@ async def bulk_archive_tasks(
 ):
     user_project_ids = _user_project_ids(current_user["user_id"])
     if request.task_ids is not None:
+
         def _safe_uuid(raw: str) -> uuid.UUID | None:
             try:
                 return uuid.UUID(raw)
@@ -553,6 +558,7 @@ async def bulk_archive_tasks(
                 Task.status.in_(statuses),
                 Task.project_id.in_(user_project_ids),
             )
+            .limit(5000)
             .with_for_update(skip_locked=True)
         )
     else:
@@ -577,7 +583,7 @@ async def bulk_archive_tasks(
         )
     )
     await session.commit()
-    return {"archived_count": len(lockable_ids)}
+    return {"archived_count": len(lockable_ids), "has_more": len(lockable_ids) == 5000}
 
 
 class BulkActionRequest(BaseModel):
@@ -1030,6 +1036,8 @@ async def bulk_action_tasks(
                                 if not review_task:
                                     task.requires_approval = True
                                     task.status = TaskStatus.FAILED
+                                    if task.vm_provisioned_at:
+                                        task.vm_stopped_at = _utcnow()
                                     task.latest_status_message = "Iteration cap reached — no follow-on task spawned"
                                     from app.failure_classification import (
                                         persist_failure_category,
@@ -1077,6 +1085,8 @@ async def bulk_action_tasks(
                     continue
 
                 task.status = TaskStatus.CANCELLED
+                if task.vm_provisioned_at:
+                    task.vm_stopped_at = _utcnow()
                 task.requires_approval = False
 
                 # Suppress low-priority tasks with finding_hash for 180 days
@@ -1141,6 +1151,8 @@ async def bulk_action_tasks(
                 )
                 for child in active_children:
                     child.status = TaskStatus.CANCELLED
+                    if child.vm_provisioned_at:
+                        child.vm_stopped_at = _utcnow()
                     child.requires_approval = False
                     session.add(child)
                 await session.commit()
@@ -1662,6 +1674,123 @@ async def request_changes(
     raise HTTPException(status_code=500, detail="Failed to spawn task (iteration cap?)")
 
 
+_FRESH_REVIEWER_COOLDOWN_SECS = 3600  # 1 hour
+
+# Maps a task's payload ``type`` to the branch prefix the agent uses when
+# deriving the work branch. Mirrors the agent's branchPrefix wiring
+# (agent/src/handlers/standard.ts: create/qa->task, refactor->refactor,
+# docs->docs, deps->deps; handlers/specialized.ts->migrate). Fix tasks reuse
+# an existing branch carried in the payload, so they never need this fallback.
+_TASK_TYPE_BRANCH_PREFIX = {
+    "create": "task",
+    "qa": "task",
+    "fix": "task",
+    "refactor": "refactor",
+    "docs": "docs",
+    "deps": "deps",
+    "migrate": "migrate",
+}
+
+
+def _derive_task_branch(task_id: uuid.UUID, task_type: str | None) -> str:
+    """Derive an agent work branch name from the task type.
+
+    Mirrors the agent's branch derivation (``blueprint/{prefix}-{8hex}``,
+    agent/src/index.ts and handlers/specialized.ts) where ``8hex`` is the
+    dashless task UUID prefix and ``prefix`` depends on the task type.
+    """
+    prefix = _TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
+    return f"blueprint/{prefix}-{str(task_id).replace('-', '')[:8]}"
+
+
+@router.post("/tasks/{task_id}/request-fresh-reviewer")
+@limiter.limit("10/minute")
+async def request_fresh_reviewer(
+    request: Request,
+    task_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Spawn an operator-requested fresh-reviewer pass against a completed task's PR diff."""
+    task = await _get_user_task_with_role(
+        task_id, current_user["user_id"], session, "member"
+    )
+
+    ctx = dict(task.context or {})
+    last_req = ctx.get("_operator_fresh_reviewer_requested_at")
+    if last_req:
+        elapsed = (
+            datetime.now(timezone.utc) - datetime.fromisoformat(last_req)
+        ).total_seconds()
+        if elapsed < _FRESH_REVIEWER_COOLDOWN_SECS:
+            raise HTTPException(
+                status_code=429,
+                detail="Cooldown active — a fresh-reviewer pass was recently requested",
+            )
+
+    artifact = (
+        (
+            await session.execute(
+                select(Artifact).where(
+                    Artifact.task_id == task_id,
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if not artifact or not artifact.pr_url:
+        raise HTTPException(status_code=400, detail="No PR found for this task")
+
+    pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
+    task_payload = task.first_payload
+    review_loop = ctx.get("review_loop") or {}
+    branch = (
+        review_loop.get("branch")
+        or task_payload.get("branch")
+        or _derive_task_branch(task_id, task_payload.get("type"))
+    )
+    base_branch = task_payload.get("base_branch", "main")
+    related_files = task_payload.get("related_files") or ctx.get("related_files") or []
+
+    reviewer_task = Task(
+        project_id=task.project_id,
+        title=f"Operator fresh review: {task.title or str(task_id)[:8]}",
+        description=f"Operator-requested fresh-reviewer pass for task {task_id}",
+        payloads=[
+            {
+                "type": "create",
+                "prompt": f"Operator-requested fresh-reviewer pass for task {task_id}.",
+                "pr_number": pr_number,
+                "branch": branch,
+                "base_branch": base_branch,
+                "related_files": related_files,
+            }
+        ],
+        context={
+            "operator_requested_review_for": str(task_id),
+            "operator_requested_by": str(current_user["user_id"]),
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="USER",
+        launched_by_user_id=current_user["user_id"],
+    )
+    session.add(reviewer_task)
+
+    ctx["_operator_fresh_reviewer_requested_at"] = datetime.now(
+        timezone.utc
+    ).isoformat()
+    task.context = ctx
+    flag_modified(task, "context")
+    session.add(task)
+
+    await session.commit()
+
+    return {"spawned_task_id": str(reviewer_task.id)}
+
+
 @router.post("/tasks/{task_id}/archive")
 async def archive_task(
     task_id: uuid.UUID,
@@ -1713,18 +1842,26 @@ async def reset_iteration_cap(
             detail="Task has no PR number in context.review_loop.pr_number or context.rollup_pr_number",
         )
 
-    # Archive FAILED review/fix tasks on this PR so they drop from the global count
+    # Archive FAILED review/fix tasks on this PR so they drop from the global count.
+    # _pr_number_match is dialect-conditional: on SQLite, .as_string() JSON_QUOTE-
+    # double-quotes the int and never matches, so reuse the shared helper which
+    # falls back to func.json_extract for SQLite.
+    from app.ci_completion import _pr_number_match
+
     failed_result = await session.execute(
-        select(Task).where(
+        select(Task)
+        .where(
             Task.project_id == task.project_id,
             Task.status == TaskStatus.FAILED,
             Task.archived.is_(False),
+            _pr_number_match(session, pr_number),
         )
+        .options(load_only(Task.id, Task.archived, Task.payloads))
     )
     archived_count = 0
     for t in failed_result.scalars().all():
         fp = t.first_payload
-        if fp.get("pr_number") != pr_number or fp.get("type") not in ("review", "fix"):
+        if fp.get("type") not in ("review", "fix"):
             continue
         t.archived = True
         session.add(t)
@@ -1877,6 +2014,8 @@ async def modify_task(
                 )
                 for child in active_children:
                     child.status = TaskStatus.CANCELLED
+                    if child.vm_provisioned_at:
+                        child.vm_stopped_at = _utcnow()
                     child.requires_approval = False
                     children_cleanup_for_bg.append(
                         (
@@ -2200,6 +2339,8 @@ async def modify_task(
                             # Iteration cap reached — revert requires_approval and return error
                             task.requires_approval = True
                             task.status = TaskStatus.FAILED
+                            if task.vm_provisioned_at:
+                                task.vm_stopped_at = _utcnow()
                             task.latest_status_message = (
                                 "Iteration cap reached — no follow-on task spawned"
                             )
@@ -2484,7 +2625,9 @@ async def trigger_qualify(
             detail="No open release version found for this project.",
         )
 
-    result = await release_qualifier.run_qualification(session, project_id, open_version)
+    result = await release_qualifier.run_qualification(
+        session, project_id, open_version
+    )
     await session.commit()
     return result
 
@@ -2642,6 +2785,8 @@ async def trigger_rollup(
                 # Terminal failure (iteration cap, stuck cycle, blocked repeat,
                 # or unknown). Operator must intervene.
                 task.status = TaskStatus.FAILED
+                if task.vm_provisioned_at:
+                    task.vm_stopped_at = _utcnow()
                 task.latest_status_message = (
                     f"Rollup PR #{rollup_pr_number} created but review not spawned — {spawn_reason_msg}"
                     if spawn_reason_msg

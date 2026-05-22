@@ -399,6 +399,7 @@ class DedupOutcome:
     file_overlap_count: int = 0
     evidence_overlap_count: int = 0
     retired_approach_count: int = 0
+    archived_diagnoses_count: int = 0
     # Per-skip reason records: {title, direction_id, reason} for each filtered
     # finding, so the research agent can be told exactly what was rejected and
     # why on its next cycle. Reasons are short literals (≤80 chars).
@@ -499,7 +500,7 @@ def deduplicate_findings(
                 logger.info(
                     f"[RESEARCH] Skipping finding '{title}' — matches archived diagnosis"
                 )
-                outcome.retired_approach_count += 1
+                outcome.archived_diagnoses_count += 1
                 reason = f"archived diagnosis: {matched_diagnosis[:60]}"
                 outcome.filtered.append(
                     {

@@ -405,13 +405,27 @@ def test_to_phase_block_shape():
         status="open",
         opened_at=_utcnow(),
         phase_changed_at=_utcnow(),
+        phase_reasoning="ready to qualify",
         last_qualification={"status": "pending"},
     )
     block = rv.to_phase_block(version)
     assert block["version_number"] == 3
     assert block["phase"] == "stabilize"
     assert block["phase_changed_at"] is not None
+    assert block["phase_reasoning"] == "ready to qualify"
     assert block["last_qualification"] == {"status": "pending"}
+
+
+def test_to_phase_block_phase_reasoning_none_when_absent():
+    """A version with no phase_reasoning yields None for that key."""
+    version = ReleaseVersion(
+        version_number=1,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+    )
+    block = rv.to_phase_block(version)
+    assert block["phase_reasoning"] is None
 
 
 def test_to_phase_block_handles_none_phase_changed_at():
@@ -424,3 +438,187 @@ def test_to_phase_block_handles_none_phase_changed_at():
     )
     block = rv.to_phase_block(version)
     assert block["phase_changed_at"] is None
+
+
+# ===========================================================================
+# recent_closed_versions
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_recent_closed_versions_returns_empty_for_no_history(db_session):
+    """A project with only an open version (no closed history) returns []."""
+    project = await _make_project(db_session)
+    await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    rows = await rv.recent_closed_versions(db_session, project.id)
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_recent_closed_versions_returns_closed_rows_newest_first(db_session):
+    """Closed versions are returned newest-first, open version is excluded."""
+    project = await _make_project(db_session)
+
+    older = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="build",
+        status="promoted",
+        opened_at=_utcnow() - timedelta(hours=4),
+    )
+    newer = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="stabilize",
+        status="promoted",
+        opened_at=_utcnow() - timedelta(hours=2),
+    )
+    open_v = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="build",
+        status="open",
+        opened_at=_utcnow(),
+    )
+    for v in (older, newer, open_v):
+        db_session.add(v)
+    await db_session.commit()
+
+    rows = await rv.recent_closed_versions(db_session, project.id)
+    assert len(rows) == 2
+    assert rows[0].version_number == 2
+    assert rows[1].version_number == 1
+
+
+@pytest.mark.asyncio
+async def test_recent_closed_versions_respects_limit(db_session):
+    """Passing limit=2 returns at most 2 rows even with more history."""
+    project = await _make_project(db_session)
+
+    for i in range(1, 5):
+        db_session.add(
+            ReleaseVersion(
+                project_id=project.id,
+                version_number=i,
+                phase="build",
+                status="promoted",
+                opened_at=_utcnow() - timedelta(hours=10 - i),
+            )
+        )
+    await db_session.commit()
+
+    rows = await rv.recent_closed_versions(db_session, project.id, limit=2)
+    assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_recent_closed_versions_scoped_to_project(db_session):
+    """Closed versions belonging to another project are not returned."""
+    project_a = await _make_project(db_session, name="RV-A")
+    project_b = await _make_project(db_session, name="RV-B")
+
+    db_session.add(
+        ReleaseVersion(
+            project_id=project_a.id,
+            version_number=1,
+            phase="build",
+            status="promoted",
+            opened_at=_utcnow(),
+        )
+    )
+    await db_session.commit()
+
+    assert await rv.recent_closed_versions(db_session, project_a.id) != []
+    assert await rv.recent_closed_versions(db_session, project_b.id) == []
+
+
+# ===========================================================================
+# ensure_initial_release_version
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_ensure_initial_release_version_creates_stabilize_version(db_session):
+    """When no version rows exist and branch != 'main', version 1 is opened in
+    the 'stabilize' phase (ready to qualify immediately, not waiting on build)."""
+    project = await _make_project(db_session)
+    version = await rv.ensure_initial_release_version(
+        db_session,
+        project.id,
+        integration_branch="automain",
+        base_sha="deadbeef",
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version is not None
+    assert version.version_number == 1
+    assert version.phase == "stabilize"
+    assert version.status == "open"
+    assert version.base_sha == "deadbeef"
+
+
+@pytest.mark.asyncio
+async def test_ensure_initial_release_version_noop_when_main_branch(db_session):
+    """integration_branch='main' is degenerate (main…HEAD diff is empty) — no row
+    is created and None is returned."""
+    project = await _make_project(db_session)
+    result = await rv.ensure_initial_release_version(
+        db_session,
+        project.id,
+        integration_branch="main",
+        base_sha="abc123",
+    )
+    await db_session.commit()
+
+    assert result is None
+    assert await rv.current_open_version(db_session, project.id) is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_initial_release_version_idempotent_open_exists(db_session):
+    """If an open version already exists the function is a no-op and returns None."""
+    project = await _make_project(db_session)
+    await rv.open_version(db_session, project.id, version_number=1, base_sha="sha1")
+    await db_session.commit()
+
+    result = await rv.ensure_initial_release_version(
+        db_session,
+        project.id,
+        integration_branch="automain",
+        base_sha="sha2",
+    )
+    assert result is None
+
+    open_ver = await rv.current_open_version(db_session, project.id)
+    assert open_ver is not None
+    assert open_ver.version_number == 1
+    assert open_ver.base_sha == "sha1"
+
+
+@pytest.mark.asyncio
+async def test_ensure_initial_release_version_noop_when_history_exists(db_session):
+    """If any version row exists (even promoted, not open), return None — the
+    lifecycle has already started and bootstrapping would skip gaps."""
+    project = await _make_project(db_session)
+
+    promoted = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="build",
+        status="promoted",
+        opened_at=_utcnow() - timedelta(hours=1),
+    )
+    db_session.add(promoted)
+    await db_session.commit()
+
+    result = await rv.ensure_initial_release_version(
+        db_session,
+        project.id,
+        integration_branch="automain",
+        base_sha="newsha",
+    )
+    assert result is None
+    assert await rv.current_open_version(db_session, project.id) is None

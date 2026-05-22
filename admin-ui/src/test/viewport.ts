@@ -2,24 +2,31 @@ import { page } from 'vitest/browser';
 
 // Extract the *.viewport.test.tsx filename from the call stack so failures
 // embed the component reference that the backend regression classifier needs
-// (pattern: `(\w+)\.viewport\.test\.tsx`).
+// (pattern: `([\w-]+)\.viewport\.test\.tsx` — hyphens included for composed-page filenames).
 function _callerTestFile(): string {
   const stack = new Error().stack ?? '';
-  const m = stack.match(/(\w+\.viewport\.test\.tsx)/i);
+  const m = stack.match(/([\w-]+\.viewport\.test\.tsx)/i);
   return m ? m[1] : '';
 }
 
-// When VITE_CAPTURE_BASELINES=true (set on main-branch CI runs), save a PNG
-// of the component after each passing assertion. One file per component per
-// width — overwriting keeps storage bounded to one baseline per slot.
-async function _captureBaselineIfEnabled(callerFile: string, width: number): Promise<void> {
-  if (import.meta.env.VITE_CAPTURE_BASELINES !== 'true') return;
-  const name = callerFile.replace(/\.viewport\.test\.tsx$/i, '') || 'unknown';
-  try {
-    await page.screenshot({ path: `viewport-baselines/${name}-${width}px.png` });
-  } catch {
-    // Never fail a passing test because of screenshot I/O
-  }
+/**
+ * Internal guard: if an ErrorBoundary fallback is present in the rendered tree,
+ * throw immediately with a descriptive [assertion_type:error_boundary] message.
+ * Called by each exported assertion function after layout settles, so a crashed
+ * panel can never produce a false-green by presenting a tiny fallback box that
+ * doesn't overflow, isn't truncated, and has no controls.
+ */
+function _assertNoErrorBoundaryFallback(width: number, callerFile: string): void {
+  const fallbacks = document.querySelectorAll<HTMLElement>('[data-error-boundary-fallback]');
+  if (fallbacks.length === 0) return;
+  const excerpts = Array.from(fallbacks)
+    .slice(0, 3)
+    .map((el) => el.outerHTML.slice(0, 200))
+    .join('\n');
+  const fileTag = callerFile ? ` [${callerFile}]` : '';
+  throw new Error(
+    `[assertion_type:error_boundary]${fileTag}: ${fallbacks.length} ErrorBoundary fallback(s) found at width=${width}px — component did not render real content:\n${excerpts}`,
+  );
 }
 
 /**
@@ -78,6 +85,8 @@ export async function expectNoOverflowAt(
     await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
   }
 
+  _assertNoErrorBoundaryFallback(width, callerFile);
+
   const limit = width + tolerance;
   const docScrollWidth = document.documentElement.scrollWidth;
 
@@ -117,7 +126,6 @@ export async function expectNoOverflowAt(
     );
   }
 
-  await _captureBaselineIfEnabled(callerFile, width);
 }
 
 /**
@@ -173,6 +181,8 @@ export async function expectNoTextTruncationAt(
     await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
   }
 
+  _assertNoErrorBoundaryFallback(width, callerFile);
+
   const truncated: { tag: string; overflow: number; html: string }[] = [];
   const all = document.querySelectorAll<HTMLElement>(selector);
   for (const el of all) {
@@ -207,7 +217,6 @@ export async function expectNoTextTruncationAt(
     );
   }
 
-  await _captureBaselineIfEnabled(callerFile, width);
 }
 
 /**
@@ -258,6 +267,8 @@ export async function expectMinTouchTargetAt(
     await new Promise<void>((resolve) => setTimeout(resolve, waitMs));
   }
 
+  _assertNoErrorBoundaryFallback(width, callerFile);
+
   const undersized: { tag: string; width: number; height: number; html: string }[] = [];
   const all = document.querySelectorAll<HTMLElement>(selector);
   for (const el of all) {
@@ -287,7 +298,6 @@ export async function expectMinTouchTargetAt(
     );
   }
 
-  await _captureBaselineIfEnabled(callerFile, width);
 }
 
 /**

@@ -473,15 +473,24 @@ export function useAppState() {
 
   const fetchProjects = async (silent = false) => {
     try {
-      const res = await authGet(`${API_BASE_URL}/api/admin/projects`);
-      if (res.ok) {
-        const data = await res.json();
-        setProjects(data || []);
-        setProjectsFetchError(null);
-      } else {
-        setProjectsFetchError('Failed to load projects');
-        if (!silent) addToast('Failed to load projects', 'error');
+      const PAGE_LIMIT = 50;
+      const allItems: unknown[] = [];
+      let offset = 0;
+      let hasMore = true;
+      while (hasMore) {
+        const res = await authGet(`${API_BASE_URL}/api/admin/projects?limit=${PAGE_LIMIT}&offset=${offset}`);
+        if (!res.ok) {
+          setProjectsFetchError('Failed to load projects');
+          if (!silent) addToast('Failed to load projects', 'error');
+          return;
+        }
+        const data = await res.json() as { items: unknown[]; has_more: boolean };
+        allItems.push(...(data.items || []));
+        hasMore = data.has_more ?? false;
+        offset += PAGE_LIMIT;
       }
+      setProjects(allItems as never[]);
+      setProjectsFetchError(null);
     } catch (err) {
       console.error('Failed to fetch projects:', err);
       setProjectsFetchError('Failed to load projects');

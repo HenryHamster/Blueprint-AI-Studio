@@ -361,7 +361,7 @@ describe('MessagesPanel — viewport regression', () => {
     expect(bubbles.length).toBe(2);
   });
 
-  test('calls onMessageCountChange with newHighSignalCount when high-signal messages arrive', async () => {
+  test('calls onMessageCountChange with all high-signal messages (consistent with closed-panel behavior)', async () => {
     const now = Date.now();
     const dividerTime = now - 3600000; // 1 hour ago
     localStorage.setItem(`messages_panel_last_seen:anonymous:project-123`, String(dividerTime));
@@ -415,15 +415,16 @@ describe('MessagesPanel — viewport regression', () => {
     });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 100)); });
 
-    // Should have called with newHighSignalCount (2: blocker-2 and feedback-1)
-    expect(countChanges).toContain(2);
+    // Should have called with all high-signal count (3: all blockers and feedback, regardless of divider time)
+    expect(countChanges).toContain(3);
 
     localStorage.removeItem(`messages_panel_last_seen:anonymous:project-123`);
   });
 
-  test('resets document.title when panel opens and divider is dismissed', async () => {
-    // This test verifies the integration: when newHighSignalCount becomes 0,
-    // the callback reports 0, and App.tsx can use this to clear the title.
+  test('maintains high-signal count when divider is dismissed (all-messages behavior)', async () => {
+    // This test verifies that dismissing the divider does not change the badge count.
+    // The count reflects all high-signal messages, not just new ones, so it remains
+    // consistent whether the divider is visible or dismissed.
     const now = Date.now();
     const dividerTime = now - 3600000;
     localStorage.setItem(`messages_panel_last_seen:anonymous:project-123`, String(dividerTime));
@@ -465,7 +466,7 @@ describe('MessagesPanel — viewport regression', () => {
     });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 100)); });
 
-    // Initially should report 1 new high-signal message
+    // Initially should report 1 high-signal message (the blocker)
     expect(countChanges).toContain(1);
 
     // Find and click the "Mark all read" button to dismiss divider
@@ -483,8 +484,8 @@ describe('MessagesPanel — viewport regression', () => {
 
     if (foundDismiss) {
       await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 100)); });
-      // After dismissing, newHighSignalCount should be 0
-      expect(countChanges[countChanges.length - 1]).toBe(0);
+      // After dismissing the divider, the count should remain 1 (blocker is still open)
+      expect(countChanges[countChanges.length - 1]).toBe(1);
     }
 
     localStorage.removeItem(`messages_panel_last_seen:anonymous:project-123`);

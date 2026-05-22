@@ -71,6 +71,8 @@ import {
   readProgressArtifact,
   buildPortfolioComposition,
   buildVersionPhaseSection,
+  buildMemoCitationsSection,
+  buildEfficiencySnapshotSection,
   buildThinkerPrompt,
   runThinkerWithGate,
   type ThinkerPromptParams,
@@ -1230,6 +1232,188 @@ describe('buildVersionPhaseSection', () => {
     const result = buildVersionPhaseSection({ version_number: 1, phase: 'build' });
     expect(result).toMatch(/omit|no change|do NOT emit/i);
   });
+
+  it('renders promotion_readiness block when present', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 3,
+      phase: 'stabilize',
+      promotion_readiness: {
+        ready: true,
+        would_promote_rate: 0.9,
+        consecutive_clean_passes: 4,
+        verdicts_evaluated: 5,
+        reason: 'qualifier looks trustworthy',
+        recurring_blockers: {},
+        confidence: { mean: 0.87, stdev: 0.03, stable: true },
+      },
+    });
+    expect(result).toContain('Promotion readiness');
+    expect(result).toContain('ready=YES');
+    expect(result).toContain('would_promote_rate=0.9');
+    expect(result).toContain('consecutive_clean_passes=4');
+    expect(result).toContain('verdicts_evaluated=5');
+    expect(result).toContain('qualifier looks trustworthy');
+    expect(result).toContain('confidence_mean=0.87');
+    expect(result).toContain('stable');
+  });
+
+  it('renders recurring_blockers in promotion_readiness when present', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 3,
+      phase: 'stabilize',
+      promotion_readiness: {
+        ready: false,
+        would_promote_rate: 0.3,
+        consecutive_clean_passes: 0,
+        verdicts_evaluated: 5,
+        reason: 'recurring hard blocker: ci_red',
+        recurring_blockers: { ci_red: 3 },
+        confidence: { mean: 0.5, stdev: 0.1, stable: false },
+      },
+    });
+    expect(result).toContain('ready=NO');
+    expect(result).toContain('Recurring blockers');
+    expect(result).toContain('ci_redx3');
+  });
+
+  it('omits promotion_readiness block gracefully when absent', () => {
+    const result = buildVersionPhaseSection({ version_number: 1, phase: 'build' });
+    expect(result).not.toContain('Promotion readiness');
+    expect(result).not.toContain('Recurring blockers');
+    expect(result).toContain('Version Phase');
+  });
+
+  it('renders recent_versions list when present', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 3,
+      phase: 'stabilize',
+      recent_versions: [
+        { version_number: 2, status: 'promoted', last_qualification: { status: 'promoted', confidence: 0.91 } },
+        { version_number: 1, status: 'promoted', last_qualification: { status: 'promoted', confidence: 0.85 } },
+      ],
+    });
+    expect(result).toContain('Recent versions');
+    expect(result).toContain('v2');
+    expect(result).toContain('promoted');
+    expect(result).toContain('qual=promoted');
+    expect(result).toContain('confidence=0.91');
+    expect(result).toContain('v1');
+  });
+
+  it('omits recent_versions gracefully when absent', () => {
+    const result = buildVersionPhaseSection({ version_number: 2, phase: 'stabilize' });
+    expect(result).not.toContain('Recent versions');
+    expect(result).toContain('Version Phase');
+  });
+
+  it('renders recent_versions blocker when present', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      recent_versions: [
+        { version_number: 3, status: 'promoted', last_qualification: { status: 'not_promoted', confidence: 0.5, blocker: 'ci_red' } },
+      ],
+    });
+    expect(result).toContain('blocker=ci_red');
+  });
+});
+
+describe('buildMemoCitationsSection', () => {
+  it('returns empty string when memo citations are absent', () => {
+    expect(buildMemoCitationsSection(undefined)).toBe('');
+    expect(buildMemoCitationsSection(null)).toBe('');
+  });
+
+  it('returns empty string for a non-array value', () => {
+    expect(buildMemoCitationsSection({ task_id: 'x' })).toBe('');
+    expect(buildMemoCitationsSection('memo')).toBe('');
+  });
+
+  it('returns empty string for an empty array', () => {
+    expect(buildMemoCitationsSection([])).toBe('');
+  });
+
+  it('renders a header and one bullet per memo with task id and excerpt', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-aaa', summary_excerpt: 'Caching layer is the bottleneck.' },
+      { task_id: 'memo-bbb', summary_excerpt: 'Auth retries mask a real timeout.' },
+    ]);
+    expect(result).toContain('## Memo Citations');
+    expect(result).toContain('memo memo-aaa: Caching layer is the bottleneck.');
+    expect(result).toContain('memo memo-bbb: Auth retries mask a real timeout.');
+  });
+
+  it('instructs the reviewer to cite memos by task id', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-aaa', summary_excerpt: 'A finding.' },
+    ]);
+    expect(result).toMatch(/cite it by task id/i);
+  });
+
+  it('falls back gracefully when an entry is missing fields', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-ccc' },
+      { summary_excerpt: 'no id here' },
+      'not-an-object',
+    ]);
+    expect(result).toContain('memo memo-ccc: (no summary)');
+    expect(result).toContain('memo ?: no id here');
+  });
+});
+
+describe('buildEfficiencySnapshotSection', () => {
+  it('returns data-unavailable marker when called with null', () => {
+    const result = buildEfficiencySnapshotSection(null);
+    expect(result).toContain('Pipeline Efficiency Axes');
+    expect(result).toContain('data unavailable');
+  });
+
+  it('returns data-unavailable marker when axes is empty', () => {
+    const result = buildEfficiencySnapshotSection({ axes: {} });
+    expect(result).toContain('data unavailable');
+  });
+
+  it('renders axis table with current, baseline, and drift when data is present', () => {
+    const snapshot = {
+      axes: {
+        cost_per_merged_pr: { current: 1.5, baseline: 2.0, drift_pct: -25.0 },
+        median_api_calls_per_task: { current: 40, baseline: 50, drift_pct: -20.0 },
+      },
+      baseline_captured_at: '2026-04-05T00:00:00',
+      last_snapshot_at: '2026-05-01T00:00:00',
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('Pipeline Efficiency Axes');
+    expect(result).toContain('Cost/merged PR');
+    expect(result).toContain('1.5');
+    expect(result).toContain('| 2 |');
+    expect(result).toContain('-25.0%');
+    expect(result).toContain('2026-04-05');
+    expect(result).toContain('2026-05-01');
+  });
+
+  it('formats null current/baseline as n/a and null drift_pct as n/a', () => {
+    const snapshot = {
+      axes: {
+        vm_reuse_rate: { current: null, baseline: null, drift_pct: null },
+      },
+      baseline_captured_at: null,
+      last_snapshot_at: null,
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('VM reuse rate');
+    expect(result).toMatch(/n\/a.*n\/a/);
+  });
+
+  it('renders positive drift with + sign', () => {
+    const snapshot = {
+      axes: {
+        vm_cold_start_p50_ms: { current: 600, baseline: 500, drift_pct: 20.0 },
+      },
+    };
+    const result = buildEfficiencySnapshotSection(snapshot);
+    expect(result).toContain('+20.0%');
+  });
 });
 
 describe('buildThinkerPrompt', () => {
@@ -1263,6 +1447,8 @@ describe('buildThinkerPrompt', () => {
     threadSection: '',
     taskId: 'test-task-123',
     versionPhaseSection: '',
+    memoCitationsSection: '',
+    efficiencySnapshotSection: '',
   };
 
   it('includes required structural headers when inputs are populated', () => {
@@ -1333,6 +1519,13 @@ describe('buildThinkerPrompt', () => {
     expect(without).not.toContain('## Drift Signals');
   });
 
+  it('efficiency snapshot section rendered when efficiencySnapshotSection is non-empty', () => {
+    const section = '\n## Pipeline Efficiency Axes\nsome data\n';
+    const prompt = buildThinkerPrompt({ ...base, efficiencySnapshotSection: section });
+    expect(prompt).toContain('## Pipeline Efficiency Axes');
+    expect(prompt).toContain('some data');
+  });
+
   it('self-improvement block rendered only when isSelfRepo=true', () => {
     const selfRepoPrompt = buildThinkerPrompt({
       ...base,
@@ -1395,6 +1588,29 @@ describe('buildThinkerPrompt', () => {
     expect(phaseIdx).toBeGreaterThan(-1);
     expect(jobIdx).toBeGreaterThan(-1);
     expect(phaseIdx).toBeLessThan(jobIdx);
+  });
+
+  it('memoCitationsSection rendered only when non-empty', () => {
+    const withMemos = buildThinkerPrompt({
+      ...base,
+      memoCitationsSection: '\n## Memo Citations\n- memo memo-xyz: a finding\n',
+    });
+    expect(withMemos).toContain('## Memo Citations');
+    expect(withMemos).toContain('memo memo-xyz: a finding');
+
+    const withoutMemos = buildThinkerPrompt({ ...base, memoCitationsSection: '' });
+    expect(withoutMemos).not.toContain('## Memo Citations');
+  });
+
+  it('renders the memo citations digest produced by buildMemoCitationsSection', () => {
+    const memoCitationsSection = buildMemoCitationsSection([
+      { task_id: 'memo-digest-1', summary_excerpt: 'The provisioning path leaks VMs.' },
+    ]);
+    const prompt = buildThinkerPrompt({ ...base, memoCitationsSection });
+    expect(prompt).toContain('## Memo Citations');
+    expect(prompt).toContain('memo memo-digest-1: The provisioning path leaks VMs.');
+    // Digest must land before the output instructions so the reviewer sees it.
+    expect(prompt.indexOf('## Memo Citations')).toBeLessThan(prompt.indexOf('# Your job'));
   });
 
   it('does not contain banned legacy directive phrases', () => {
@@ -1796,6 +2012,35 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     // Step 5 cross-references step 1's cat-based set-problem-model call.
     expect(step5Text).toContain('set-problem-model');
     expect(step5Text).toMatch(/re-read|cat /i);
+  });
+
+  // ── evidence_progress verdict (OPTIONAL agent refinement) ──────────────────
+  it('thinker prompt has Section 3.6 evidence-progress assessment for long-running directions', async () => {
+    await captureExecutorPrompt();
+    const thinker = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(thinker).toContain('Evidence-progress assessment');
+    expect(thinker).toContain('advancing | stalled | met');
+    // It must point the executor at the persistence command.
+    expect(thinker).toContain('set-evidence-progress');
+  });
+
+  it('executor prompt offers the OPTIONAL set-evidence-progress command', async () => {
+    const p = await captureExecutorPrompt();
+    expect(p).toContain('set-evidence-progress');
+    // Must be marked optional, never folded into the REQUIRED required-call gate.
+    expect(p).toMatch(/OPTIONAL[\s\S]*set-evidence-progress/i);
+  });
+
+  it('strategic helper script maps set-evidence-progress to the set_evidence_progress op', async () => {
+    await captureExecutorPrompt();
+    const writeCalls = vi.mocked(fs.writeFileSync).mock.calls as unknown as [string, string][];
+    const helperCall = writeCalls.find(([path]) => path.endsWith('/strategic'));
+    expect(helperCall).toBeDefined();
+    const script = helperCall ? helperCall[1] : '';
+    expect(script).toContain('set-evidence-progress)');
+    expect(script).toContain('_call "set_evidence_progress"');
+    // Usage string advertises the new op.
+    expect(script).toContain('set-evidence-progress <json-or-file>');
   });
 });
 

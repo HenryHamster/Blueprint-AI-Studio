@@ -22,7 +22,7 @@ import uuid
 from datetime import timedelta
 from typing import Any, Mapping, Optional
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -214,11 +214,19 @@ async def mark_phase2_completed(
     directions_retired: int = 0,
     tasks_spawned: int = 0,
     vision_updated: bool = False,
+    memos_available: int = 0,
+    memos_cited: int = 0,
     extra_metadata: Optional[Mapping[str, Any]] = None,
 ) -> Optional[StrategicCycle]:
     """Phase 2 task reached a terminal status with parsed output. Records
     the outcome accounting and merges any per-direction maps into
-    cycle_metadata (preserving baseline_vision)."""
+    cycle_metadata (preserving baseline_vision).
+
+    ``memos_available`` is the number of memo artifacts fed to the strategic
+    agent as citable context; ``memos_cited`` is the count whose task_ids
+    appeared in the agent's output. Both are stored in cycle_metadata so
+    operators can verify the direction success criterion (≥1 cited per cycle).
+    """
     cycle = await get(session, cycle_id)
     if cycle is None:
         return None
@@ -230,13 +238,96 @@ async def mark_phase2_completed(
     cycle.directions_retired = directions_retired
     cycle.tasks_spawned = tasks_spawned
     cycle.vision_updated = vision_updated
+    new_meta = dict(cycle.cycle_metadata or {})
+    new_meta["memos_available"] = memos_available
+    new_meta["memos_cited"] = memos_cited
     if extra_metadata:
-        new_meta = dict(cycle.cycle_metadata or {})
         new_meta.update(extra_metadata)
-        cycle.cycle_metadata = new_meta
-        flag_modified(cycle, "cycle_metadata")
+    cycle.cycle_metadata = new_meta
+    flag_modified(cycle, "cycle_metadata")
     session.add(cycle)
     return cycle
+
+
+async def query_recent_memo_citations(
+    session: AsyncSession,
+    project_id,
+    *,
+    cap: int = 25,
+) -> list[dict[str, Any]]:
+    """Citable memo summaries for the current strategic cycle window.
+
+    Window: COMPLETED memo tasks created since the *previous* strategic cycle
+    started for this project (the cycle before the most recent one). When the
+    project has fewer than two cycles the lower bound is unbounded.
+
+    Returns ``[{"task_id": str, "summary_excerpt": str}]`` newest-first, capped
+    at ``cap`` (oldest dropped). ``summary_excerpt`` is the first ~200 chars of
+    ``plan_output['memo']['summary']`` — empty string when the memo has no
+    parseable summary.
+    """
+    from app.models import Task, TaskStatus  # noqa: PLC0415
+
+    recent_starts = (
+        await session.execute(
+            select(StrategicCycle.phase1_started_at)
+            .where(StrategicCycle.project_id == project_id)
+            .order_by(desc(StrategicCycle.phase1_started_at))
+            .limit(2)
+        )
+    ).all()
+    window_start = recent_starts[1][0] if len(recent_starts) >= 2 else None
+
+    stmt = select(Task).where(
+        Task.project_id == project_id,
+        Task.status == TaskStatus.COMPLETED,
+        Task.payloads[0]["type"].as_string() == "memo",
+    )
+    if window_start is not None:
+        stmt = stmt.where(Task.created_at >= window_start)
+    stmt = stmt.order_by(desc(Task.created_at)).limit(cap)
+    rows = (await session.execute(stmt)).scalars().all()
+
+    citations: list[dict[str, Any]] = []
+    for t in rows:
+        plan = t.plan_output if isinstance(t.plan_output, dict) else {}
+        memo = plan.get("memo") if isinstance(plan.get("memo"), dict) else {}
+        summary = str((memo or {}).get("summary") or "")
+        citations.append({"task_id": str(t.id), "summary_excerpt": summary[:200]})
+    return citations
+
+
+async def count_memo_exits(
+    session: AsyncSession,
+    project_id,
+) -> int:
+    """Count all COMPLETED tasks that exited via the memo pathway for a project.
+
+    Supports verifying the direction success criterion of 5+ memo-pathway exits.
+    """
+    from app.models import Task, TaskStatus  # noqa: PLC0415
+
+    result = await session.execute(
+        select(func.count())
+        .select_from(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
+            Task.payloads[0]["type"].as_string() == "memo",
+        )
+    )
+    return result.scalar() or 0
+
+
+def count_cited_memos(memo_citations: list[dict[str, Any]], text: str) -> int:
+    """Count how many memo task_ids from memo_citations appear in text.
+
+    Callers pass the agent's cycle_reasoning/summary output so the cited count
+    can be stored alongside memos_available in cycle_metadata.
+    """
+    if not text or not memo_citations:
+        return 0
+    return sum(1 for m in memo_citations if m.get("task_id") and m["task_id"] in text)
 
 
 def baseline_vision(cycle: StrategicCycle) -> dict[str, Any]:

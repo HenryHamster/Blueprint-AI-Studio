@@ -616,6 +616,24 @@ async def _run_regression_scan_and_notify(session) -> int:
     return len(fired)
 
 
+async def _purge_stale_routine_messages(session, retention_days: int = 7) -> int:
+    """Delete open system-authored routine messages older than retention_days. Returns count."""
+    from app.models import ProjectMessage
+    from app.routers.admin_notifications import ROUTINE_EVENT_TYPES
+    from sqlalchemy import delete
+
+    cutoff = _utcnow() - timedelta(days=retention_days)
+    res = await session.execute(
+        delete(ProjectMessage).where(
+            ProjectMessage.created_at < cutoff,
+            ProjectMessage.from_type == "system",
+            ProjectMessage.status == "open",
+            ProjectMessage.context["event_type"].astext.in_(list(ROUTINE_EVENT_TYPES)),
+        )
+    )
+    return res.rowcount
+
+
 async def reaper_service():
     """
     Background worker that scans for orphaned VMs.
@@ -789,8 +807,7 @@ async def reaper_service():
                             < _progress_stale_cutoff(task, now)
                             and (
                                 task.started_at is None
-                                or task.started_at
-                                < _progress_stale_cutoff(task, now)
+                                or task.started_at < _progress_stale_cutoff(task, now)
                             )
                         ):
                             # Stalled-but-heartbeating: agent process is alive (fresh
@@ -811,10 +828,8 @@ async def reaper_service():
                             and task.last_heartbeat >= hb_cutoff
                             and task.last_tool_use_at is None
                             and task.started_at
-                            and task.started_at
-                            < _progress_stale_cutoff(task, now)
-                            and (task.context or {}).get("llm_provider")
-                            == "anthropic"
+                            and task.started_at < _progress_stale_cutoff(task, now)
+                            and (task.context or {}).get("llm_provider") == "anthropic"
                         ):
                             # Stalled-but-heartbeating with zero tool calls ever.
                             # Provider-gated to anthropic only because the agent
@@ -978,8 +993,7 @@ async def reaper_service():
                                 and t.last_tool_use_at is None
                                 and t.started_at
                                 and t.started_at < _progress_stale_cutoff(t, now)
-                                and (t.context or {}).get("llm_provider")
-                                == "anthropic"
+                                and (t.context or {}).get("llm_provider") == "anthropic"
                             ):
                                 # Verification-loop mirror of step-1 guard.
                                 # Provider-gated to anthropic only because the
@@ -1722,6 +1736,8 @@ async def reaper_service():
                             f"marking FAILED"
                         )
                         task.status = TaskStatus.FAILED
+                        if task.vm_provisioned_at:
+                            task.vm_stopped_at = _utcnow()
                         task.vm_instance_id = None
                         task.last_heartbeat = None
                         task.latest_status_message = (
@@ -2070,6 +2086,8 @@ async def reaper_service():
                             fail_reason = f"failed after {class_budget} retries ({reap_failure_class})"
                         logger.error(f"[REAPER] Task {task.id} {fail_reason}.")
                         task.status = TaskStatus.FAILED
+                        if task.vm_provisioned_at:
+                            task.vm_stopped_at = _utcnow()
                         if is_provision_failure:
                             ctx = task.context or {}
                             provision_zone = ctx.get("provision_zone", "unknown zone")
@@ -2303,19 +2321,23 @@ async def reaper_service():
                 # because the ``Task.latest_status_message``/``Task.status`` event
                 # listeners (models.py ~360) read status_log on every set; under
                 # async sessions a deferred-column fetch raises MissingGreenlet.
-                _children_by_parent: Dict[uuid.UUID, list] = {}
                 # Plain-tuple snapshot of (id, status, context) per child, captured
-                # at SELECT time. Step 4 iterates this rather than touching live
-                # ORM children: ``_check_and_trigger_rollup`` in Step 3 may commit
+                # at SELECT time. Steps 3 AND 4 iterate this rather than touching
+                # live ORM rows: ``_check_and_trigger_rollup`` in Step 3 may commit
                 # or trigger a session rollback (via inner DB error), which under
                 # SQLAlchemy expires every loaded instance — a subsequent
-                # ``c.status`` read fires a sync lazy-load that can't acquire a
-                # connection if the underlying asyncpg socket is dead, crashing
-                # the entire reaper cycle. Snapshotting decouples Step 4 from
-                # session state. (Production 2026-05-08: 26x crashes at
-                # reaper.py:2407 over a 45 min Cloud SQL instability window.)
+                # ``parent.id`` / ``child.status`` read fires a sync lazy-load that
+                # can't acquire a connection if the underlying asyncpg socket is
+                # dead, crashing the entire reaper cycle. Snapshotting + re-fetching
+                # via ``session.get`` decouples both steps from session state.
+                # (Production 2026-05-08: 26x crashes at reaper.py:2407; recurred
+                # 2026-05-21 at reaper.py:2385/2420 — Step 3/4 still read parent.id
+                # and child.status off the now-stale batch.)
                 _children_snapshot_by_parent: Dict[uuid.UUID, list[tuple]] = {}
                 evaluating_parents = []
+                # Plain UUID list — Steps 3 & 4 iterate this, never the live
+                # ``evaluating_parents`` ORM objects (see snapshot note above).
+                _parent_ids: list = []
                 try:
                     stale_cutoff = now - timedelta(minutes=15)
                     evaluating_parents = (
@@ -2370,28 +2392,34 @@ async def reaper_service():
                             .all()
                         )
                         for _c in _all_children:
-                            _children_by_parent.setdefault(
-                                _c.parent_task_id, []
-                            ).append(_c)
                             _children_snapshot_by_parent.setdefault(
                                 _c.parent_task_id, []
                             ).append((_c.id, _c.status, _c.context or {}))
-                    for parent in evaluating_parents:
-                        # Find a completed child to use as the trigger for _check_and_trigger_rollup
-                        child = next(
+                    for parent_id in _parent_ids:
+                        # Find a COMPLETED child id from the plain-tuple snapshot,
+                        # then re-fetch it fresh. An earlier iteration's
+                        # _check_and_trigger_rollup may have committed or rolled
+                        # back — reading parent.id / child.status off the now-stale
+                        # ORM batch fires a sync lazy-load that crashes the cycle
+                        # on an unhealthy connection.
+                        completed_child_id = next(
                             (
-                                c
-                                for c in _children_by_parent.get(parent.id, [])
-                                if c.status == TaskStatus.COMPLETED
+                                cid
+                                for cid, c_status, _ in _children_snapshot_by_parent.get(
+                                    parent_id, []
+                                )
+                                if c_status == TaskStatus.COMPLETED
                             ),
                             None,
                         )
-                        if child:
+                        if completed_child_id is not None:
                             try:
-                                await _check_and_trigger_rollup(child, session)
+                                child = await session.get(Task, completed_child_id)
+                                if child is not None:
+                                    await _check_and_trigger_rollup(child, session)
                             except Exception as e:  # noqa: BLE001
                                 logger.warning(
-                                    f"[REAPER] Evaluating sweep rollup failed for parent {parent.id}: {e}",
+                                    f"[REAPER] Evaluating sweep rollup failed for parent {parent_id}: {e}",
                                     exc_info=True,
                                 )
                     if evaluating_parents:
@@ -2416,26 +2444,38 @@ async def reaper_service():
                         TaskStatus.CANCELLED,
                     }
                     rescued = 0
-                    for parent in evaluating_parents:
-                        children_snap = _children_snapshot_by_parent.get(parent.id, [])
+                    for parent_id in _parent_ids:
+                        children_snap = _children_snapshot_by_parent.get(parent_id, [])
                         if not children_snap:
                             continue
-                        if any(status not in _terminal for _, status, _ in children_snap):
+                        if any(
+                            status not in _terminal for _, status, _ in children_snap
+                        ):
                             # At least one child still running — not safe to rescue yet.
                             continue
-                        if any(status == TaskStatus.COMPLETED for _, status, _ in children_snap):
+                        if any(
+                            status == TaskStatus.COMPLETED
+                            for _, status, _ in children_snap
+                        ):
                             # Step 3 handles this; skip.
                             continue
                         # All children are terminal and none completed — attempt re-evaluation
                         # via _requeue_parent_task which clones failed children with retry
                         # guidance (up to MAX_PARENT_REQUEUES attempts).  If attempts are
                         # exhausted it marks the parent FAILED and fires a failure alert.
+                        # Re-fetch the parent fresh — Step 3 may have committed or
+                        # rolled back, expiring the live ``evaluating_parents`` batch.
+                        parent = await session.get(Task, parent_id)
+                        if parent is None:
+                            continue
                         failed_children = [
-                            (cid, ctx) for cid, status, ctx in children_snap
+                            (cid, ctx)
+                            for cid, status, ctx in children_snap
                             if status == TaskStatus.FAILED
                         ]
                         cancelled_children = [
-                            cid for cid, status, _ in children_snap
+                            cid
+                            for cid, status, _ in children_snap
                             if status == TaskStatus.CANCELLED
                         ]
                         # Build a diagnostic message including child failure classes.
@@ -2452,7 +2492,9 @@ async def reaper_service():
                         if cancelled_children:
                             parts.append(f"{len(cancelled_children)} cancelled")
                         diag = (
-                            "; ".join(parts) if parts else f"{len(children_snap)} terminal"
+                            "; ".join(parts)
+                            if parts
+                            else f"{len(children_snap)} terminal"
                         )
                         parent.latest_status_message = (
                             f"All child tasks terminated without success: {diag}"
@@ -2997,26 +3039,75 @@ async def reaper_service():
                 # lifecycle backstop missed it (e.g. orchestrator restart between
                 # task termination and post-commit). Mark them stalled so the
                 # strategic agent can see the failure on the next run.
+                #
+                # Reconciliation with linked task state (R-SC1):
+                # Before declaring a cycle stalled we inspect the linked task:
+                #   - Terminal task → mark stalled (crashed-chain case, original intent)
+                #   - Non-terminal + stale heartbeat → terminate task first so the
+                #     spawn gate (_has_active_strategic_task) clears, then mark stalled
+                #   - Non-terminal + fresh heartbeat → skip; the cycle is slow, not
+                #     stalled, and falsely killing a live task would corrupt state
                 try:
                     from app import strategic_cycle
                     from app.models import Alert, AlertSeverity
                     from app.broadcast import broadcast_to_project as _bcast
 
                     stalled = await strategic_cycle.find_stalled(session)
+                    _step7_now = _utcnow()
+                    actually_stalled: list = []
                     for c in stalled:
+                        # Determine which phase (and linked task) before mutating outcome
                         if c.outcome in (
                             strategic_cycle.OUTCOME_IN_PROGRESS,
                             strategic_cycle.OUTCOME_PHASE1_RUNNING,
                             strategic_cycle.OUTCOME_PHASE1_DONE,
                         ):
-                            c.outcome = strategic_cycle.OUTCOME_STALLED_PHASE1
                             stalled_phase = "phase1"
+                            linked_task_id = c.phase1_task_id
+                        else:
+                            stalled_phase = "phase2"
+                            linked_task_id = c.phase2_task_id
+
+                        # Reconcile with the linked task's real status
+                        if linked_task_id is not None:
+                            linked_task = await session.get(Task, linked_task_id)
+                            if linked_task is not None and linked_task.status in (
+                                TaskStatus.QUEUED,
+                                TaskStatus.PROVISIONING,
+                                TaskStatus.IN_PROGRESS,
+                            ):
+                                hb = linked_task.last_heartbeat
+                                hb_cutoff = _heartbeat_stale_cutoff(
+                                    linked_task, _step7_now
+                                )
+                                if hb is not None and hb >= hb_cutoff:
+                                    # Task is genuinely alive — cycle is slow, not stalled
+                                    logger.info(
+                                        f"[REAPER] Cycle {c.id} in {stalled_phase} >3h "
+                                        f"but linked task {linked_task_id} has fresh "
+                                        f"heartbeat ({hb}) — skipping stall declaration"
+                                    )
+                                    continue
+                                # Task is dead/stale — terminate it so spawn gate clears
+                                linked_task.status = TaskStatus.FAILED
+                                linked_task.latest_status_message = (
+                                    f"Force-terminated by stalled-cycle reaper — "
+                                    f"cycle {c.id} declared stalled after >3h"
+                                )
+                                session.add(linked_task)
+                                logger.info(
+                                    f"[REAPER] Force-terminated stale task "
+                                    f"{linked_task_id} linked to stalled cycle {c.id}"
+                                )
+
+                        if stalled_phase == "phase1":
+                            c.outcome = strategic_cycle.OUTCOME_STALLED_PHASE1
                         else:
                             c.outcome = strategic_cycle.OUTCOME_STALLED_PHASE2
-                            stalled_phase = "phase2"
                         if c.failure_reason is None:
                             c.failure_reason = f"reaper_stall: cycle in {stalled_phase} >3h with no completion"
                         session.add(c)
+                        actually_stalled.append(c)
                         try:
                             alert = Alert(
                                 project_id=c.project_id,
@@ -3043,10 +3134,10 @@ async def reaper_service():
                             logger.exception(
                                 f"[REAPER] Failed to create stalled-cycle alert for {c.id}"
                             )
-                    if stalled:
+                    if actually_stalled:
                         await session.commit()
                         logger.info(
-                            f"[REAPER] Marked {len(stalled)} strategic cycle(s) stalled"
+                            f"[REAPER] Marked {len(actually_stalled)} strategic cycle(s) stalled"
                         )
                 except Exception as e:
                     logger.error(
@@ -3126,6 +3217,16 @@ async def reaper_service():
                         f"[REAPER] Stuck qualification sweep error: {e}",
                         exc_info=True,
                     )
+                # Step 10: Routine message retention — purge stale routine ops messages.
+                try:
+                    _purged = await _purge_stale_routine_messages(session)
+                    if _purged:
+                        await session.commit()
+                        logger.info(
+                            f"[REAPER] Purged {_purged} stale routine message(s)"
+                        )
+                except Exception as e:
+                    logger.error(f"[REAPER] Routine message purge: {e}", exc_info=True)
             consecutive_errors = 0
             # Liveness telemetry: only bump on the success path. If the
             # cycle body raised above, neither this counter nor the

@@ -1,7 +1,7 @@
 import { useMemo, useState, useEffect } from 'react';
 import { parseTimestamp } from '../utils/time';
 import type { Task } from './TaskCard';
-import { apiFetch, type EfficiencyAxesResponse } from '../api';
+import { apiFetch } from '../api';
 import {
   ResponsiveContainer,
   AreaChart,
@@ -210,6 +210,43 @@ interface EfficiencyAxisDef {
   favorableDirection: 'lower' | 'higher';
 }
 
+// Backend returns history[] per axis; api.ts EfficiencyAxis adds this field in cluster 4/4.
+interface EfficiencyAxisLocal {
+  current: number | null;
+  baseline: number | null;
+  drift_pct: number | null;
+  history?: Array<{ captured_at: string; value: number | null }>;
+}
+
+interface EfficiencyAxesLocal {
+  axes: Record<string, EfficiencyAxisLocal>;
+  baseline_captured_at: string | null;
+  last_snapshot_at: string | null;
+}
+
+function AxisSparkline({ history, favorableDirection }: {
+  history: Array<{ captured_at: string; value: number | null }>;
+  favorableDirection: 'lower' | 'higher';
+}) {
+  const points = history
+    .filter((h): h is { captured_at: string; value: number } => h.value !== null)
+    .map(h => ({ v: h.value }));
+  if (points.length < 2) return null;
+  const first = points[0].v;
+  const last = points[points.length - 1].v;
+  const improved = favorableDirection === 'lower' ? last <= first : last >= first;
+  const color = improved ? '#10b981' : '#ef4444';
+  return (
+    <div style={{ height: 24 }} className="mt-1">
+      <ResponsiveContainer width="100%" height="100%">
+        <LineChart data={points} margin={{ top: 2, right: 0, left: 0, bottom: 2 }}>
+          <Line dataKey="v" stroke={color} dot={false} strokeWidth={1.5} isAnimationActive={false} />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
 const EFFICIENCY_AXES: EfficiencyAxisDef[] = [
   { key: 'cost_per_merged_pr', label: 'Cost per merged PR', unit: '$', favorableDirection: 'lower' },
   { key: 'vm_cold_start_p50_ms', label: 'VM cold-start p50', unit: 'ms', favorableDirection: 'lower' },
@@ -225,7 +262,7 @@ function getDriftColor(driftPct: number | null, favorableDirection: 'lower' | 'h
 }
 
 function EfficiencyWidget({ projectId }: { projectId: string }) {
-  const [data, setData] = useState<EfficiencyAxesResponse | null>(null);
+  const [data, setData] = useState<EfficiencyAxesLocal | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -277,13 +314,18 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
         const driftArrow = drift_pct === null ? '—' : (drift_pct < 0 ? '↓' : '↑');
         const driftDisplay = drift_pct === null ? '—' : `${driftArrow} ${Math.abs(drift_pct).toFixed(1)}%`;
         return (
-          <div key={axisDef.key} className="flex justify-between items-center py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
-            <span className="text-neutral-400">{axisDef.label}</span>
-            <div className="flex gap-4 items-center text-neutral-300 font-mono">
-              <span>{current !== null ? `${current.toFixed(1)}${axisDef.unit}` : '—'}</span>
-              <span className="text-neutral-500">baseline: {baseline !== null ? `${baseline.toFixed(1)}${axisDef.unit}` : '—'}</span>
-              <span className={`${driftColor} min-w-12 text-right`}>{driftDisplay}</span>
+          <div key={axisDef.key} className="py-1.5 px-3 rounded bg-neutral-800/50 text-xs">
+            <div className="flex justify-between items-center">
+              <span className="text-neutral-400">{axisDef.label}</span>
+              <div className="flex gap-4 items-center text-neutral-300 font-mono">
+                <span>{current !== null ? `${current.toFixed(1)}${axisDef.unit}` : '—'}</span>
+                <span className="text-neutral-500">baseline: {baseline !== null ? `${baseline.toFixed(1)}${axisDef.unit}` : '—'}</span>
+                <span className={`${driftColor} min-w-12 text-right`}>{driftDisplay}</span>
+              </div>
             </div>
+            {axisData.history && axisData.history.length >= 2 && (
+              <AxisSparkline history={axisData.history} favorableDirection={axisDef.favorableDirection} />
+            )}
           </div>
         );
       })}

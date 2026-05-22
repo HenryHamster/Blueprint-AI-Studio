@@ -3,7 +3,7 @@ import { useMemo, useState, useRef, useEffect } from 'react';
 import { Activity, Network, Compass, Microscope, Archive, Plus, MoreHorizontal, Settings, LayoutGrid, LayoutDashboard, MessageSquare } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { AutonomousStatus } from './AutonomousStatus';
-import { SettingsDropdown, type MaxPlanAccount } from './SettingsDropdown';
+import { SettingsDropdown, type MaxPlanAccount, type SectionId } from './SettingsDropdown';
 import type { AuthMode, CategoryRoutingEntry, DeployState, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
 import type { Task } from '../types/task';
 import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, AutoReviewConfig } from '../types/project';
@@ -28,6 +28,7 @@ export interface HeaderBarProps {
   showMessages: boolean;
   onToggleMessages: () => void;
   openMessageCount: number;
+  newSinceLastVisitCount?: number;
   needsAttentionCount?: number;
   onOpenNewTaskModal: () => void;
   onShowDirections: () => void;
@@ -41,6 +42,7 @@ export interface HeaderBarProps {
   showSettings: boolean;
   onToggleSettings: () => void;
   settingsRef: RefObject<HTMLDivElement | null>;
+  settingsInitialSection?: SectionId | null;
   defaultTaskType: UserLaunchableTaskType;
   onUpdateDefaultTaskType: (value: UserLaunchableTaskType) => void;
   notifyOnComplete: boolean;
@@ -194,6 +196,7 @@ export function HeaderBar(props: HeaderBarProps) {
     showSettings,
     onToggleSettings,
     settingsRef,
+    settingsInitialSection,
     defaultTaskType,
     onUpdateDefaultTaskType,
     notifyOnComplete,
@@ -405,6 +408,7 @@ export function HeaderBar(props: HeaderBarProps) {
           showSettings={showSettings}
           onToggleSettings={onToggleSettings}
           settingsRef={settingsRef}
+          initialSection={settingsInitialSection ?? null}
           defaultTaskType={defaultTaskType}
           onUpdateDefaultTaskType={onUpdateDefaultTaskType}
           viewMode={viewMode}
@@ -558,6 +562,11 @@ export function HeaderBar(props: HeaderBarProps) {
                 {props.openMessageCount > 9 ? '9+' : props.openMessageCount}
               </span>
             )}
+            {!showMessages && (props.newSinceLastVisitCount ?? 0) > 0 && (
+              <span className="ml-0.5 bg-amber-500 text-black text-[8px] font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center" title={`${props.newSinceLastVisitCount} new since last visit`}>
+                {(props.newSinceLastVisitCount ?? 0) > 9 ? '9+' : props.newSinceLastVisitCount}
+              </span>
+            )}
           </button>
           {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
           <button
@@ -646,6 +655,11 @@ export function HeaderBar(props: HeaderBarProps) {
                 {props.openMessageCount > 0 && (
                   <span className="ml-auto bg-blue-500 text-white text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
                     {props.openMessageCount > 9 ? '9+' : props.openMessageCount}
+                  </span>
+                )}
+                {!showMessages && (props.newSinceLastVisitCount ?? 0) > 0 && (
+                  <span className="ml-auto bg-amber-500 text-black text-[9px] font-bold px-1.5 py-0.5 rounded-full leading-none">
+                    {(props.newSinceLastVisitCount ?? 0) > 9 ? '9+' : props.newSinceLastVisitCount} new
                   </span>
                 )}
               </button>

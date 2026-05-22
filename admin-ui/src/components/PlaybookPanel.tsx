@@ -162,8 +162,8 @@ export function PlaybookPanel({ selectedProjectId }: PlaybookPanelProps) {
                             <span className="text-xs text-neutral-500">{entry.applicable_types.join(', ')}</span>
                           )}
                         </div>
-                        {/* Content snippet */}
-                        <p className="text-xs text-neutral-400 leading-relaxed line-clamp-2 mb-2">{entry.content}</p>
+                        {/* Content snippet — intentionally clamped to 2 lines for compact layout */}
+                        <p className="text-xs text-neutral-400 leading-relaxed line-clamp-2 mb-2" data-viewport-allow-truncation>{entry.content}</p>
                         {/* Stats row */}
                         <div className="flex items-center gap-4 flex-wrap">
                           <div className="flex items-center gap-1.5">
@@ -178,33 +178,30 @@ export function PlaybookPanel({ selectedProjectId }: PlaybookPanelProps) {
                         </div>
                       </div>
                       {/* Actions */}
-                      <div className="flex items-center gap-1 shrink-0 mt-0.5">
-                        {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+                      <div className="flex items-center gap-1.5 shrink-0 mt-0.5">
                         <button
                           disabled={isPending}
                           onClick={() => doAction(entry.key, 'promote')}
                           title="Promote — increment confirmed count"
-                          className="p-1.5 rounded hover:bg-emerald-900/40 text-neutral-500 hover:text-emerald-400 transition-colors disabled:opacity-40"
+                          className="p-3 rounded hover:bg-emerald-900/40 text-neutral-500 hover:text-emerald-400 transition-colors disabled:opacity-40"
                         >
-                          <ThumbsUp className="w-3.5 h-3.5" />
+                          <ThumbsUp className="w-5 h-5" />
                         </button>
-                        {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                         <button
                           disabled={isPending}
                           onClick={() => doAction(entry.key, 'demote')}
                           title="Demote — mark as stale/ineffective"
-                          className="p-1.5 rounded hover:bg-red-900/40 text-neutral-500 hover:text-red-400 transition-colors disabled:opacity-40"
+                          className="p-3 rounded hover:bg-red-900/40 text-neutral-500 hover:text-red-400 transition-colors disabled:opacity-40"
                         >
-                          <ThumbsDown className="w-3.5 h-3.5" />
+                          <ThumbsDown className="w-5 h-5" />
                         </button>
-                        {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                         <button
                           disabled={isPending}
                           onClick={() => doAction(entry.key, 'archive')}
                           title="Archive — remove from active playbook"
-                          className="p-1.5 rounded hover:bg-neutral-800 text-neutral-500 hover:text-neutral-300 transition-colors disabled:opacity-40"
+                          className="p-3 rounded hover:bg-neutral-800 text-neutral-500 hover:text-neutral-300 transition-colors disabled:opacity-40"
                         >
-                          <Archive className="w-3.5 h-3.5" />
+                          <Archive className="w-5 h-5" />
                         </button>
                       </div>
                     </div>

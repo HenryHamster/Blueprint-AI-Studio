@@ -851,3 +851,510 @@ async def test_process_lifecycle_cpm_unchanged_for_fully_autonomous_direction(
     assert by_id["d-fa-expensive"].get("retirement_consideration_needed") is True
     assert "retirement_consideration_needed" not in by_id["d-fa-cheap-1"]
     assert "retirement_consideration_needed" not in by_id["d-fa-cheap-2"]
+
+
+@pytest.mark.asyncio
+async def test_process_lifecycle_lifetime_burn_pause_via_aggregate(db_session, mocker):
+    """Lifetime burn backstop pauses direction + sets evidence + flags manual-intervention.
+
+    Tests the aggregate-driven slow burn: a direction whose recent rolling window
+    would NOT trip the churn guardrail, but whose lifetime aggregate (trimmed old
+    cycles) carries enough accumulated non-merge volume to trip the lifetime
+    backstop threshold. Asserts the direction is paused with 'Lifetime burn backstop'
+    reason, the stored evidence matches the computed metrics, and the
+    manual-intervention flag is set with its timestamp.
+    """
+    now = datetime.utcnow()
+
+    direction = {
+        "id": "d-lifetime-burn",
+        "text": "Direction with aggregate slow burn",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        # Recent rolling window: 3 cycles, each with 10 completed tasks
+        # and 2 merges = 8 non-merge per cycle, 20% merge rate.
+        # Total window: 24 non-merge, 6 merged, 20% merge rate.
+        # Rule 5 doesn't fire: although 24 >= 15, merge_rate is 20% > 10% minimum.
+        "research_history": [
+            {
+                "timestamp": (now - timedelta(days=3)).isoformat(),
+                "tasks_created": 10,
+                "tasks_completed": 10,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 2,
+            },
+            {
+                "timestamp": (now - timedelta(days=2)).isoformat(),
+                "tasks_created": 10,
+                "tasks_completed": 10,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 2,
+            },
+            {
+                "timestamp": now.isoformat(),
+                "tasks_created": 10,
+                "tasks_completed": 10,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 2,
+            },
+        ],
+        # Trimmed history aggregate: 136 completed, 0 failed, 10 merged
+        # Non-merge in aggregate: 126. Combined with window's 24 = 150 total,
+        # lifetime merge rate = 16/(150+16) ≈ 9.6%, which is below 10% threshold.
+        # This should trip the lifetime backstop (Rule 6).
+        "history_aggregate": {
+            "total_cycles": 10,
+            "total_tasks_created": 136,
+            "total_tasks_completed": 136,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+            "total_prs_merged": 10,
+        },
+    }
+
+    project = Project(
+        name="Lifetime Burn Test",
+        user_id="u-lifetime",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=now,
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    # Direction should be paused with lifetime burn reason
+    assert d["status"] == "paused", (
+        "direction should be auto-paused when lifetime burn threshold exceeded"
+    )
+    assert d.get("auto_paused") is True
+    reason = d.get("paused_reason", "")
+    assert reason.startswith("Lifetime burn backstop:"), (
+        f"paused_reason should start with 'Lifetime burn backstop:', got: {reason!r}"
+    )
+    # Verify evidence is stored and matches computed metrics
+    evidence = d.get("lifetime_burn_pause_evidence", {})
+    assert isinstance(evidence, dict), "lifetime_burn_pause_evidence should be a dict"
+    assert evidence.get("lifetime_merged") == 16, (
+        f"expected lifetime_merged=16, got {evidence.get('lifetime_merged')}"
+    )
+    assert evidence.get("lifetime_non_merge_finished") == 150, (
+        f"expected lifetime_non_merge_finished=150, got {evidence.get('lifetime_non_merge_finished')}"
+    )
+    assert 0.095 < evidence.get("lifetime_merge_rate", 0) < 0.098, (
+        f"expected lifetime_merge_rate ~0.0964, got {evidence.get('lifetime_merge_rate')}"
+    )
+    # Manual-intervention flag should be set
+    assert d.get("needs_manual_intervention") is True, (
+        "direction should be flagged for manual intervention on lifetime burn pause"
+    )
+    assert d.get("needs_manual_intervention_at"), (
+        "needs_manual_intervention_at timestamp should be set"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lifetime_burn_manual_intervention_survives_ttl_window(
+    db_session, mocker
+):
+    """Lifetime-burn manual-intervention flag persists past TTL window.
+
+    A direction paused by the lifetime-burn backstop is flagged for manual
+    intervention (operator must retire or reset). Unlike remediation-stuck
+    scenarios, this flag should NOT be cleared by the TTL safety net after
+    72 hours — the direction remains paused and needs operator action.
+    """
+    now = datetime.utcnow()
+    # Flag was set 75 hours ago (past the 72h TTL)
+    flagged_at = now - timedelta(hours=75)
+
+    direction = {
+        "id": "d-lifetime-burn-ttl",
+        "text": "Lifetime burn direction",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "Lifetime burn backstop: cumulative non-merge tasks exceeded threshold",
+        "paused_at": flagged_at.isoformat(),
+        "needs_manual_intervention": True,
+        "needs_manual_intervention_at": flagged_at.isoformat(),
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        # No remediation_monitor_started_at — lifetime-burn is not a remediation case
+        "lifetime_burn_pause_evidence": {
+            "lifetime_merged": 16,
+            "lifetime_non_merge_finished": 150,
+            "lifetime_merge_rate": 0.0964,
+        },
+        "research_history": [],
+        "history_aggregate": {},
+    }
+
+    project = Project(
+        name="Lifetime Burn TTL Test",
+        user_id="u-lb-ttl",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Process lifecycle with now = 75 hours after the flag was set
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=now,
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    # The lifetime-burn manual-intervention flag should SURVIVE the TTL window
+    assert d.get("needs_manual_intervention") is True, (
+        "lifetime-burn manual-intervention flag should survive past 72h TTL window"
+    )
+    assert d.get("needs_manual_intervention_at") == flagged_at.isoformat(), (
+        "needs_manual_intervention_at should remain unchanged"
+    )
+    assert d["status"] == "paused", "direction should remain paused after TTL expiry"
+
+
+@pytest.mark.asyncio
+async def test_remediation_stuck_manual_intervention_cleared_by_ttl_window(
+    db_session, mocker
+):
+    """Remediation-stuck manual-intervention flag IS cleared by TTL window.
+
+    A direction paused by a code-failure reason with no remediation monitor
+    ever started (i.e., remediation kept failing and never merged) is a
+    'stuck remediation' scenario. The manual-intervention flag should be
+    cleared by the TTL safety net after 72 hours so operators are not
+    perpetually alerted about a direction the system cannot fix.
+    """
+    now = datetime.utcnow()
+    # Flag was set 75 hours ago (past the 72h TTL) but within 48h cooldown window
+    # to prevent auto-recovery from interfering with the test.
+    flagged_at = now - timedelta(hours=30)
+
+    direction = {
+        "id": "d-remediation-stuck-ttl",
+        "text": "Stuck remediation direction",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "High code failure rate",
+        "paused_at": flagged_at.isoformat(),
+        "needs_manual_intervention": True,
+        "needs_manual_intervention_at": (
+            now - timedelta(hours=75)
+        ).isoformat(),  # Set the flag 75h ago
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        # No remediation_monitor_started_at — remediation has not successfully merged
+        "research_history": [
+            {
+                "timestamp": (now - timedelta(days=1)).isoformat(),
+                "tasks_created": 10,
+                "tasks_failed": 9,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            }
+        ],
+    }
+
+    project = Project(
+        name="Remediation Stuck TTL Test",
+        user_id="u-rem-stuck-ttl",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Process lifecycle with now = 75 hours after the flag was set
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=now,
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    # The remediation-stuck manual-intervention flag SHOULD be cleared by TTL
+    assert d.get("needs_manual_intervention") is None, (
+        "remediation-stuck manual-intervention flag should be cleared after 72h TTL"
+    )
+    assert d.get("needs_manual_intervention_at") is None, (
+        "needs_manual_intervention_at should be cleared"
+    )
+    assert d["status"] == "paused", (
+        "direction should remain paused (within 48h recovery window; TTL only clears the flag, not pause state)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_lifecycle_churn_pause_emits_blocker_notification(
+    db_session, mocker
+):
+    """Churn-guardrail pause emits a BLOCKER direction_churn_pause message (not milestone).
+
+    Constructs a direction whose rolling window trips the churn guardrail (high non-merge
+    volume, low merge rate) but does NOT exceed the lifetime-burn threshold. Asserts:
+    - direction transitions to paused with auto_paused=True and a 'Churn guardrail:' reason
+    - churn_pause_evidence is stored with expected windowed counts
+    - a BLOCKER ProjectMessage with event_type='direction_churn_pause' is emitted
+    - needs_manual_intervention is NOT set (churn pauses auto-recover)
+    """
+    from app.models import ProjectMessage, MessageType
+
+    now = datetime.utcnow()
+
+    # 5 recent cycles, each with 10 tasks completed and 0 merges.
+    # Window: 50 non-merge_finished, 0 merged, 0% merge rate.
+    # This trips the churn guardrail (rule 5: non_merge_finished>=15, merge_rate<10%).
+    # Lifetime totals are modest enough to NOT trip the lifetime backstop.
+    direction = {
+        "id": "d-churn-test",
+        "text": "Direction with rolling churn pattern",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        # 5 cycles with 10 tasks each. First cycle has 1 merge so total_merged=1
+        # (bypasses Rule 2 "Unproductive: 0 PRs merged"). Remaining cycles have 0
+        # merges. non_merge_finished = 49, merge_rate = 1/50 = 2% < 10% → Rule 5
+        # (Churn guardrail) fires.
+        "research_history": [
+            {
+                "timestamp": (now - timedelta(days=5)).isoformat(),
+                "tasks_created": 10,
+                "tasks_completed": 10,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 1,  # one merge in first cycle → total_merged=1, bypasses Rule 2
+            },
+            *[
+                {
+                    "timestamp": (now - timedelta(days=i)).isoformat(),
+                    "tasks_created": 10,
+                    "tasks_completed": 10,
+                    "tasks_failed": 0,
+                    "tasks_failed_infra": 0,
+                    "prs_merged": 0,
+                }
+                for i in range(4, 0, -1)
+            ],
+        ],
+        # Small aggregate — not enough lifetime volume to trip backstop
+        "history_aggregate": {
+            "total_cycles": 2,
+            "total_tasks_created": 10,
+            "total_tasks_completed": 10,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+            "total_prs_merged": 2,
+        },
+    }
+
+    project = Project(
+        name="Churn Pause Test",
+        user_id="u-churn",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=now,
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused", "direction should be auto-paused by churn guardrail"
+    assert d.get("auto_paused") is True
+    reason = d.get("paused_reason", "")
+    assert reason.startswith("Churn guardrail:"), (
+        f"paused_reason should start with 'Churn guardrail:', got: {reason!r}"
+    )
+
+    # Churn evidence must be stored
+    evidence = d.get("churn_pause_evidence", {})
+    assert isinstance(evidence, dict), "churn_pause_evidence should be a dict"
+    assert evidence.get("non_merge_finished", 0) >= 15, (
+        f"expected non_merge_finished>=15, got {evidence.get('non_merge_finished')}"
+    )
+    assert evidence.get("merge_rate", 1.0) < 0.10, (
+        f"expected merge_rate<0.10, got {evidence.get('merge_rate')}"
+    )
+
+    # A BLOCKER ProjectMessage with event_type='direction_churn_pause' must be present
+    from sqlmodel import select
+
+    msgs = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.message_type == MessageType.BLOCKER,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    churn_msgs = [
+        m for m in msgs if m.context.get("event_type") == "direction_churn_pause"
+    ]
+    assert len(churn_msgs) == 1, (
+        f"expected exactly 1 direction_churn_pause BLOCKER message, got {len(churn_msgs)}"
+    )
+    msg_ctx = churn_msgs[0].context
+    assert msg_ctx.get("evidence") is not None, (
+        "churn evidence should be in message context"
+    )
+
+    # Churn pauses do NOT require manual intervention (they auto-recover)
+    assert not d.get("needs_manual_intervention"), (
+        "churn pause should NOT set needs_manual_intervention"
+    )
+
+
+def _scaffolding_direction_for_lifecycle(progress_window):
+    return {
+        "id": "d-scaffold-lc",
+        "text": "Outcome-less scaffolding direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [
+            {
+                "tasks_created": 3,
+                "tasks_completed": 3,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 3,
+            }
+            for _ in range(4)
+        ],
+        "history_aggregate": {
+            "total_cycles": 10,
+            "total_prs_merged": 8,
+            "total_tasks_completed": 8,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        },
+        "outcome_progress_history": [{"progress": p} for p in progress_window],
+    }
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_flags_outcome_scaffolding_and_notifies_once(
+    db_session, mocker
+):
+    """Scaffolding direction gets the advisory flag (not paused) and one notification per transition."""
+    notify = mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    direction = _scaffolding_direction_for_lifecycle([5, 5, 5, 5, 5, 5])
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert d["status"] == "active", "advisory flag must NOT pause the direction"
+    assert d.get("outcome_scaffolding_flagged") is True
+    assert d.get("outcome_scaffolding_evidence", {}).get("total_cycles") == 14
+    notify.assert_awaited_once()
+
+    # Second pass while still flagged: no second notification (once per transition).
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    assert project.directions[0].get("outcome_scaffolding_flagged") is True
+    notify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
+    db_session, mocker
+):
+    """Once the progress window shows growth, the advisory flag is cleared."""
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    direction = _scaffolding_direction_for_lifecycle([5, 5, 5, 5, 5, 5])
+    project = await _make_cost_project(db_session, direction)
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    assert project.directions[0].get("outcome_scaffolding_flagged") is True
+
+    # Progress resumes -> window now shows an increase.
+    project.directions[0]["outcome_progress_history"] = [
+        {"progress": p} for p in [5, 5, 5, 5, 5, 7]
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    assert project.directions[0].get("outcome_scaffolding_flagged") is None

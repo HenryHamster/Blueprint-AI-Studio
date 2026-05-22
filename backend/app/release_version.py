@@ -4,24 +4,37 @@ Phase 2 of the automain LTS design (docs/plans/automain-lts-plan-v1.md):
 a "version" is the span of automain between two promotions.  This module
 is the single source of truth for version reads/writes.
 
-The strategic agent drives phase transitions (build → stabilize); the
-qualifier (Phase 3) drives status transitions (open → promoted).
+The strategic agent and operators drive phase transitions (build → stabilize);
+the qualifier (Phase 3) drives status transitions (open → promoted).
 
 Public API:
 
-  open_version(session, project_id, *, version_number, base_sha)
+  open_version(session, project_id, *, version_number, base_sha, phase)
       Insert a new open version row (idempotent via UNIQUE constraint).
 
   current_open_version(session, project_id)
       Return the single ``status="open"`` row for a project, or None.
 
+  ensure_initial_release_version(session, project_id, *, integration_branch, base_sha)
+      Bootstrap version 1 in the ``stabilize`` phase when no version row
+      exists for the project and the integration branch is not "main".
+      Idempotent: no-op if any version row already exists.  Caller must commit.
+
   count_merged_since(session, project_id, since)
       Count tasks whose PR was merged after ``since`` for a project.
 
-  set_version_phase(session, version, phase, *, reasoning)
+  recent_closed_versions(session, project_id, limit=5)
+      Return the most recently closed/promoted versions for a project,
+      newest first.  Used by the operator version-lifecycle panel.
+
+  set_version_phase(version, phase, *, reasoning)
       Update the phase on an open version row (build ↔ stabilize).
-      Stamps ``phase_changed_at`` to now and records the agent's reasoning.
-      Caller must commit.
+      Stamps ``phase_changed_at`` to now and records the caller's reasoning.
+      Caller is responsible for session.add(version) and committing.
+
+  to_phase_block(version)
+      Return a compact dict for embedding the version's phase state in the
+      strategic agent's payload.
 """
 
 from __future__ import annotations
@@ -51,6 +64,7 @@ async def open_version(
     *,
     version_number: int,
     base_sha: str | None = None,
+    phase: str = "build",
 ) -> ReleaseVersion:
     """Insert a new open ``ReleaseVersion`` row for ``project_id``.
 
@@ -61,21 +75,30 @@ async def open_version(
 
     ``base_sha`` is the automain HEAD SHA at the time the version is opened;
     nullable per migration linter rules.
+
+    ``phase`` defaults to ``"build"``; pass ``"stabilize"`` to bootstrap a
+    version over an already-diverged trunk that is ready to qualify.
     """
+    if phase not in _VALID_PHASES:
+        raise ValueError(
+            f"[RELEASE_VERSION] Invalid phase {phase!r}; "
+            f"must be one of {sorted(_VALID_PHASES)}"
+        )
     version = ReleaseVersion(
         project_id=project_id,
         version_number=version_number,
-        phase="build",
+        phase=phase,
         status="open",
         opened_at=_utcnow(),
         base_sha=base_sha,
     )
     session.add(version)
     logger.info(
-        "[RELEASE_VERSION] opened version=%d project=%s sha=%s",
+        "[RELEASE_VERSION] opened version=%d project=%s sha=%s phase=%s",
         version_number,
         project_id,
         base_sha,
+        phase,
     )
     return version
 
@@ -110,6 +133,60 @@ async def current_open_version(
             rows[0].version_number,
         )
     return rows[0]
+
+
+async def ensure_initial_release_version(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    integration_branch: str,
+    base_sha: str | None = None,
+) -> ReleaseVersion | None:
+    """Bootstrap version 1 when no ReleaseVersion row exists for the project.
+
+    Opens the version in the ``stabilize`` phase (not ``build``) because a
+    bootstrap over an already-diverged integration trunk represents accumulated
+    work that is ready to be qualified immediately, not built from scratch.
+    Waiting out the build→stabilize stall gate (~14 days) would delay the
+    first real qualification verdict indefinitely.
+
+    Returns ``None`` (no-op) when:
+    - ``integration_branch == "main"`` — same-branch LTS is degenerate; the
+      qualifier's ``main…HEAD`` diff would be empty.
+    - Any ``ReleaseVersion`` row already exists — the lifecycle has already
+      started (either open, or previously promoted / abandoned).
+
+    Caller is responsible for committing the session.
+    """
+    if integration_branch == "main":
+        return None
+
+    existing_open = await current_open_version(session, project_id)
+    if existing_open is not None:
+        return None
+
+    count_stmt = (
+        select(func.count())
+        .select_from(ReleaseVersion)
+        .where(ReleaseVersion.project_id == project_id)
+    )
+    count = int((await session.execute(count_stmt)).scalar() or 0)
+    if count > 0:
+        return None
+
+    logger.info(
+        "[RELEASE_VERSION] bootstrapping initial version 1 for project=%s branch=%s sha=%s",
+        project_id,
+        integration_branch,
+        base_sha,
+    )
+    return await open_version(
+        session,
+        project_id,
+        version_number=1,
+        base_sha=base_sha,
+        phase="stabilize",
+    )
 
 
 def _pr_merged_predicate(session: AsyncSession) -> ColumnElement[bool]:
@@ -171,6 +248,30 @@ async def count_merged_since(
     return int(result.scalar() or 0)
 
 
+async def recent_closed_versions(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    limit: int = 5,
+) -> list[ReleaseVersion]:
+    """Return the most recently closed (non-open) ``ReleaseVersion`` rows.
+
+    Results are ordered newest-first by ``opened_at``.  Returns at most
+    ``limit`` rows (default 5).  Projects with no version history return an
+    empty list.  Used by the operator version-lifecycle panel to show the
+    confidence trend over recent versions.
+    """
+    stmt = (
+        select(ReleaseVersion)
+        .where(
+            ReleaseVersion.project_id == project_id,
+            ReleaseVersion.status != "open",
+        )
+        .order_by(ReleaseVersion.opened_at.desc())
+        .limit(limit)
+    )
+    return list((await session.execute(stmt)).scalars().all())
+
+
 def to_phase_block(version: ReleaseVersion) -> dict[str, Any]:
     """Return a compact dict for embedding in the strategic agent's payload.
 
@@ -183,6 +284,7 @@ def to_phase_block(version: ReleaseVersion) -> dict[str, Any]:
         "phase_changed_at": version.phase_changed_at.isoformat()
         if version.phase_changed_at
         else None,
+        "phase_reasoning": version.phase_reasoning,
         "last_qualification": version.last_qualification,
     }
 

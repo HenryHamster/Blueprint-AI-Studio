@@ -9198,7 +9198,9 @@ async def test_sr_blind_spots_examples_capped_at_limit(client: AsyncClient, db_s
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Create more tasks than the example cap for a single theme
+    # Create more tasks than the example cap for a single theme. The blind-spot
+    # string must NOT match DISALLOWED_BLIND_SPOT_PATTERNS — intended-skip
+    # phrasings ("did not run the full ... suite") are filtered before themeing.
     for i in range(_BLIND_SPOT_EXAMPLES_PER_THEME + 2):
         db_session.add(
             make_task(
@@ -9210,7 +9212,7 @@ async def test_sr_blind_spots_examples_capped_at_limit(client: AsyncClient, db_s
                         "verdict": "pass",
                         "fixes_applied": False,
                         "check_results": {"correctness": {"passed": True}},
-                        "blind_spots": [f"did not run the full test suite variant {i}"],
+                        "blind_spots": [f"did not verify file path number {i}"],
                     }
                 },
             )
@@ -12072,6 +12074,78 @@ async def test_list_regression_cases_summary_uses_latest_merge_before_recovery(
 
 
 @pytest.mark.asyncio
+async def test_list_regression_cases_summary_per_episode_anchoring_on_re_armed_case(
+    client: AsyncClient, db_session
+):
+    """Re-armed case: second cycle durations are anchored to first cycle's recovery, not first_seen_at.
+
+    A case that trips, gets fixed+recovered, then re-trips and is fixed again should
+    report per-episode metrics.  Without per-episode anchoring the second cycle's
+    time-to-merge would be inflated by the entire case lifetime.
+
+    Timeline:
+      09:00  first_seen_at
+      11:00  cycle-1 fix merged   (2h from episode start → 7200s)
+      12:00  cycle-1 recovered    (1h from merge → 3600s)
+      14:00  cycle-2 fix merged   (2h from cycle-1 recovery → 7200s, NOT 5h from first_seen)
+      15:00  cycle-2 recovered    (1h from merge → 3600s)
+
+    Expected per-episode summary: count=2, median_to_merged=7200s, median_to_recovered=3600s.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate:correctness",
+        status=RegressionCaseStatus.CLOSED,
+        first_seen_at=datetime(2026, 5, 1, 9, 0, 0),
+        fingerprint_to_fix_log=[
+            {
+                "fingerprint": "sr_catch_rate:correctness",
+                "fix_pr_number": 101,
+                "merged_at": "2026-05-01T11:00:00Z",
+            },
+            {
+                "fingerprint": "sr_catch_rate:correctness",
+                "recovered_at": "2026-05-01T12:00:00Z",
+                "post_merge_value": 0.65,
+            },
+            {
+                "fingerprint": "sr_catch_rate:correctness",
+                "fix_pr_number": 202,
+                "merged_at": "2026-05-01T14:00:00Z",
+            },
+            {
+                "fingerprint": "sr_catch_rate:correctness",
+                "recovered_at": "2026-05-01T15:00:00Z",
+                "post_merge_value": 0.72,
+            },
+        ],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases",
+        params={"project_id": str(project.id)},
+    )
+    assert response.status_code == 200
+    summary = response.json()["summary"]["by_regression_class"]
+    assert len(summary) == 1
+    entry = summary[0]
+    assert entry["regression_class"] == "sr_catch_rate:correctness"
+    # Two full fix-recovery cycles → count=2
+    assert entry["count"] == 2
+    # Both cycles took 2h from episode start to merge → median 7200s
+    assert entry["median_time_from_first_seen_to_merged_seconds"] == 7200.0
+    # Both cycles took 1h from merge to recovery → median 3600s
+    assert entry["median_time_from_merged_to_recovered_seconds"] == 3600.0
+
+
+@pytest.mark.asyncio
 async def test_list_regression_cases_summary_includes_time_to_detect(
     client: AsyncClient, db_session
 ):
@@ -14735,6 +14809,129 @@ async def test_cross_layer_compliance_new_additive_fields(
 
 
 # ---------------------------------------------------------------------------
+# GET /regression-cases/first-attempt-compliance-trend
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_first_attempt_compliance_trend_first_attempt_compliant(
+    client: AsyncClient, db_session
+):
+    """First fix touches >=2 canonical layers => first_attempt_compliant incremented."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = _make_cross_layer_case(
+        project.id,
+        "sr_catch_rate",
+        [_cross_layer_entry(layers_targeted=["CI_WORKFLOW", "AGENT_VM"], days_ago=3)],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/first-attempt-compliance-trend",
+        params={"project_id": str(project.id), "num_windows": 6, "window_days": 7},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert "windows" in body
+    assert body["num_windows"] == 6
+    assert body["window_days"] == 7
+    total_fa = sum(w["first_attempt_compliant"] for w in body["windows"])
+    total_fr = sum(w["followup_rescued"] for w in body["windows"])
+    assert total_fa == 1
+    assert total_fr == 0
+    # Rate should be 1.0 for the window containing this case
+    rates = [w["rate"] for w in body["windows"] if w["rate"] is not None]
+    assert any(r == 1.0 for r in rates)
+
+
+@pytest.mark.asyncio
+async def test_first_attempt_compliance_trend_followup_rescued(
+    client: AsyncClient, db_session
+):
+    """First fix has <2 layers but followup spawned+merged => followup_rescued."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    fix_log = [
+        # First fix: only 1 layer (non-compliant)
+        {
+            "fix_pr_number": 1,
+            "merged_at": (now - timedelta(days=3)).isoformat(),
+            "spawn_was_cross_layer": True,
+            "spawn_layers_enumerated": ["CI_WORKFLOW", "AGENT_VM"],
+            "layers_targeted": ["CI_WORKFLOW"],
+        },
+        # Compliance followup marker
+        {
+            "type": "compliance_followup_spawned",
+            "spawned_at": (now - timedelta(days=2)).isoformat(),
+        },
+        # Subsequent fix after followup
+        {
+            "fix_pr_number": 2,
+            "merged_at": (now - timedelta(days=1)).isoformat(),
+            "layers_targeted": ["CI_WORKFLOW", "AGENT_VM"],
+        },
+    ]
+    case = _make_cross_layer_case(project.id, "sr_catch_rate", fix_log)
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/first-attempt-compliance-trend",
+        params={"project_id": str(project.id), "num_windows": 6, "window_days": 7},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    total_fa = sum(w["first_attempt_compliant"] for w in body["windows"])
+    total_fr = sum(w["followup_rescued"] for w in body["windows"])
+    assert total_fa == 0
+    assert total_fr == 1
+
+
+@pytest.mark.asyncio
+async def test_first_attempt_compliance_trend_awaiting_backfill_excluded(
+    client: AsyncClient, db_session
+):
+    """Entry without layers_targeted is awaiting_backfill and excluded from rate."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = _make_cross_layer_case(
+        project.id,
+        "sr_catch_rate",
+        [_cross_layer_entry(layers_targeted=None, days_ago=3)],
+    )
+    db_session.add(case)
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/admin/regression-cases/first-attempt-compliance-trend",
+        params={"project_id": str(project.id), "num_windows": 6, "window_days": 7},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    total_fa = sum(w["first_attempt_compliant"] for w in body["windows"])
+    total_fr = sum(w["followup_rescued"] for w in body["windows"])
+    total_ab = sum(w["awaiting_backfill"] for w in body["windows"])
+    assert total_fa == 0
+    assert total_fr == 0
+    assert total_ab == 1
+    # Rate is None when denominator is 0
+    assert all(w["rate"] is None for w in body["windows"])
+
+
+# ---------------------------------------------------------------------------
 # Viewport-debt coverage_summary tests
 # ---------------------------------------------------------------------------
 
@@ -14848,6 +15045,176 @@ async def test_viewport_debt_coverage_summary_counts_full_set(
     assert len(body["rows"]) == 15
     # untested_components capped at 50
     assert len(cs["untested_components"]) == 50
+
+
+@pytest.mark.asyncio
+async def test_viewport_debt_counts_assertion_type_regressions(
+    client: AsyncClient, db_session
+):
+    """GET /viewport-debt counts regressions with new assertion_type format."""
+    from unittest.mock import patch
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    membership = make_membership(project.id, user_id="test-user-123", role="owner")
+    db_session.add(membership)
+    await db_session.commit()
+
+    fake_rows = [
+        {
+            "component": "admin-ui/src/components/TaskCard.tsx",
+            "eslint_disable_count": 1,
+            "data_viewport_allow_small_target": 0,
+            "data_viewport_allow_overflow": 0,
+            "data_viewport_allow_truncation": 0,
+            "total_opt_outs": 5,
+            "has_viewport_test": True,
+            "regression_case_count": 0,
+            "source_url": None,
+        },
+        {
+            "component": "admin-ui/src/components/MessagesPanel.tsx",
+            "eslint_disable_count": 1,
+            "data_viewport_allow_small_target": 0,
+            "data_viewport_allow_overflow": 0,
+            "data_viewport_allow_truncation": 0,
+            "total_opt_outs": 3,
+            "has_viewport_test": True,
+            "regression_case_count": 0,
+            "source_url": None,
+        },
+    ]
+
+    with patch(
+        "app.routers.admin_digest._scan_viewport_debt_rows",
+        return_value=(
+            fake_rows,
+            [],
+            {"total_components": 2, "untested_count": 0, "untested_components": []},
+        ),
+    ):
+        # Create regression cases in both old and new format
+        case1 = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:TaskCard.tsx@375",  # old format
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=_utcnow(),
+        )
+        case2 = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:TaskCard:text_truncation@375",  # new format
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=_utcnow(),
+        )
+        case3 = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:MessagesPanel:overflow@768",  # new format, different width
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=_utcnow(),
+        )
+        db_session.add(case1)
+        db_session.add(case2)
+        db_session.add(case3)
+        await db_session.commit()
+
+        response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+    assert response.status_code == 200
+    body = response.json()
+    rows = body["rows"]
+
+    # Find TaskCard and MessagesPanel rows
+    task_card_row = next((r for r in rows if "TaskCard" in r["component"]), None)
+    messages_panel_row = next(
+        (r for r in rows if "MessagesPanel" in r["component"]), None
+    )
+
+    assert task_card_row is not None, "TaskCard row not found"
+    assert task_card_row["regression_case_count"] == 2  # old format + new format
+
+    assert messages_panel_row is not None, "MessagesPanel row not found"
+    assert messages_panel_row["regression_case_count"] == 1  # new format
+
+
+@pytest.mark.asyncio
+async def test_viewport_debt_returns_per_assertion_type_breakdown(
+    client: AsyncClient, db_session
+):
+    """GET /viewport-debt includes regression_case_breakdown keyed by assertion type."""
+    from unittest.mock import patch
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    membership = make_membership(project.id, user_id="test-user-123", role="owner")
+    db_session.add(membership)
+    await db_session.commit()
+
+    fake_rows = [
+        {
+            "component": "admin-ui/src/components/TaskCard.tsx",
+            "eslint_disable_count": 0,
+            "data_viewport_allow_small_target": 0,
+            "data_viewport_allow_overflow": 0,
+            "data_viewport_allow_truncation": 0,
+            "total_opt_outs": 1,
+            "has_viewport_test": True,
+            "regression_case_count": 0,
+            "source_url": None,
+        },
+    ]
+
+    with patch(
+        "app.routers.admin_digest._scan_viewport_debt_rows",
+        return_value=(
+            fake_rows,
+            [],
+            {"total_components": 1, "untested_count": 0, "untested_components": []},
+        ),
+    ):
+        # Two overflow cases and one truncation case for TaskCard
+        case1 = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:TaskCard:overflow@375",
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=_utcnow(),
+        )
+        case2 = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:TaskCard:overflow@768",
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=_utcnow(),
+        )
+        case3 = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:TaskCard:truncation@375",
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=_utcnow(),
+        )
+        # Old-format case counts as "unknown" assertion type
+        case4 = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class="viewport_regression:TaskCard.tsx@375",
+            status=RegressionCaseStatus.ACTIVE,
+            first_seen_at=_utcnow(),
+        )
+        db_session.add_all([case1, case2, case3, case4])
+        await db_session.commit()
+
+        response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
+
+    assert response.status_code == 200
+    body = response.json()
+    row = next((r for r in body["rows"] if "TaskCard" in r["component"]), None)
+    assert row is not None, "TaskCard row not found"
+    assert row["regression_case_count"] == 4
+    breakdown = row["regression_case_breakdown"]
+    assert breakdown["overflow"] == 2
+    assert breakdown["truncation"] == 1
+    assert breakdown["unknown"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -15044,6 +15411,7 @@ async def test_evaluate_sr_catch_rate_targets_fires_after_2_windows(db_session):
             "categories": {
                 "correctness": {
                     "current_hit_rate": 0.60,
+                    "current_human_count": 15,
                     "rate_history": [0.62, 0.60],
                     "trend": "decreasing",
                 }
@@ -15071,6 +15439,48 @@ async def test_evaluate_sr_catch_rate_targets_fires_after_2_windows(db_session):
     )
     assert len(alerts) == 1
     assert "0.80" in alerts[0].message or "80%" in alerts[0].message
+    assert "n=15" in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_evaluate_sr_catch_rate_targets_suppressed_on_low_findings(db_session):
+    """Alert is NOT emitted when current_human_count is below the minimum finding floor."""
+    from app.routers.admin_digest import _evaluate_sr_catch_rate_targets
+    from app.models import Alert
+
+    project = make_project()
+    project.sr_catch_rate_targets = {"correctness": 0.80}
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.50,
+                    "current_human_count": 4,  # below _SR_CATCH_RATE_MIN_FINDINGS=10
+                    "rate_history": [0.52, 0.50],
+                    "trend": "decreasing",
+                }
+            }
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _evaluate_sr_catch_rate_targets(db_session, project.id)
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == "SR catch-rate below target: correctness",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
 
 
 @pytest.mark.asyncio
@@ -15331,3 +15741,369 @@ async def test_evaluate_lone_checker_alert_dedup(db_session):
         .all()
     )
     assert len(all_alerts) == 1
+
+
+# ---------------------------------------------------------------------------
+# /api/admin/projects/{project_id}/version-lifecycle
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_version_lifecycle_no_versions(client: AsyncClient, db_session):
+    """Project with no release versions returns null current_version and empty history."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["current_version"] is None
+    assert data["recent_versions"] == []
+
+
+@pytest.mark.asyncio
+async def test_version_lifecycle_with_open_version(client: AsyncClient, db_session):
+    """Open version fields are surfaced including qualification data."""
+    from app.models import ReleaseVersion
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="stabilize",
+        status="open",
+        qualification_attempts=2,
+        last_qualification={
+            "status": "dry_run",
+            "confidence": 0.92,
+            "threshold": 0.90,
+            "sub_scores": {"audit": 0.95, "test_erosion": 0.88, "smoketest": 0.90},
+            "blocker": None,
+            "finalized_at": "2026-01-01T00:00:00",
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    assert response.status_code == 200
+    data = response.json()
+
+    cv = data["current_version"]
+    assert cv is not None
+    assert cv["version_number"] == 3
+    assert cv["phase"] == "stabilize"
+    assert cv["qualification_attempts"] == 2
+    assert cv["merged_task_count"] == 0
+
+    qual = cv["last_qualification"]
+    assert qual["status"] == "dry_run"
+    assert qual["confidence"] == 0.92
+    assert qual["threshold"] == 0.90
+    assert qual["sub_scores"]["audit"] == 0.95
+    assert qual["blocker"] is None
+
+    assert data["recent_versions"] == []
+
+
+@pytest.mark.asyncio
+async def test_version_lifecycle_phase_reasoning_surfaced(
+    client: AsyncClient, db_session
+):
+    """phase_reasoning is included in the current_version response when set."""
+    from app.models import ReleaseVersion
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=5,
+        phase="stabilize",
+        status="open",
+        qualification_attempts=0,
+        phase_reasoning="Moved to stabilize: 8 tasks merged and build confidence above threshold.",
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    assert response.status_code == 200
+    data = response.json()
+
+    cv = data["current_version"]
+    assert cv is not None
+    assert (
+        cv["phase_reasoning"]
+        == "Moved to stabilize: 8 tasks merged and build confidence above threshold."
+    )
+
+
+@pytest.mark.asyncio
+async def test_version_lifecycle_phase_reasoning_null_when_unset(
+    client: AsyncClient, db_session
+):
+    """phase_reasoning is null in the response when no reasoning has been recorded."""
+    from app.models import ReleaseVersion
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=6,
+        phase="build",
+        status="open",
+        qualification_attempts=0,
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    assert response.status_code == 200
+    data = response.json()
+
+    cv = data["current_version"]
+    assert cv is not None
+    assert cv["phase_reasoning"] is None
+
+
+@pytest.mark.asyncio
+async def test_version_lifecycle_history(client: AsyncClient, db_session):
+    """Closed versions appear in recent_versions, open version in current_version."""
+    from app.models import ReleaseVersion
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    closed = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        qualification_attempts=1,
+        last_qualification={"status": "promoted", "confidence": 0.95},
+    )
+    open_v = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="build",
+        status="open",
+        qualification_attempts=0,
+    )
+    db_session.add(closed)
+    db_session.add(open_v)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["current_version"]["version_number"] == 2
+    assert len(data["recent_versions"]) == 1
+    assert data["recent_versions"][0]["version_number"] == 1
+    assert data["recent_versions"][0]["status"] == "promoted"
+    assert data["recent_versions"][0]["last_qualification"]["confidence"] == 0.95
+
+
+@pytest.mark.asyncio
+async def test_version_lifecycle_promotion_fields_present(
+    client: AsyncClient, db_session
+):
+    """promotion_enabled and promotion_readiness are always present in the response."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert isinstance(data["promotion_enabled"], bool)
+    pr = data["promotion_readiness"]
+    assert pr is not None
+    assert "ready" in pr
+    assert "reason" in pr
+    assert "verdicts_evaluated" in pr
+
+
+@pytest.mark.asyncio
+async def test_version_lifecycle_promotion_enabled_true(
+    client: AsyncClient, db_session
+):
+    """When promotion_enabled is True in runtime_config, the endpoint reflects it."""
+    import app.shared_state as _ss
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    original = _ss.runtime_config.get("promotion_enabled", False)
+    try:
+        _ss.runtime_config["promotion_enabled"] = True
+        response = await client.get(
+            f"/api/admin/projects/{project.id}/version-lifecycle"
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["promotion_enabled"] is True
+    finally:
+        _ss.runtime_config["promotion_enabled"] = original
+
+
+@pytest.mark.asyncio
+async def test_version_lifecycle_promotion_readiness_not_ready(
+    client: AsyncClient, db_session
+):
+    """With no dry-run verdicts the readiness summary reports not-ready."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+    assert response.status_code == 200
+    data = response.json()
+
+    pr = data["promotion_readiness"]
+    assert pr["ready"] is False
+    assert pr["verdicts_evaluated"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Memo-pathway exit count in digest
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_digest_memo_pathway_exits_zero_without_project(client: AsyncClient):
+    """Without project_id, memo_pathway_exits is 0."""
+    response = await client.get("/api/admin/digest")
+    assert response.status_code == 200
+    assert response.json()["memo_pathway_exits"] == 0
+
+
+@pytest.mark.asyncio
+async def test_digest_memo_pathway_exits_counts_completed_memo_tasks(
+    client: AsyncClient, db_session
+):
+    """Digest surfaces completed memo tasks count via memo_pathway_exits."""
+    project = make_project()
+    db_session.add(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two completed memo tasks
+    for _ in range(2):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "memo"}],
+            )
+        )
+    # One completed non-memo task — should not count
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+        )
+    )
+    # One in-progress memo task — should not count
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "memo"}],
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["memo_pathway_exits"] == 2
+
+
+@pytest.mark.asyncio
+async def test_digest_latest_cycle_includes_memo_stats(client: AsyncClient, db_session):
+    """When a completed cycle has memo counts in cycle_metadata, they appear in latest_cycle."""
+    from app import strategic_cycle as _sc
+
+    project = make_project()
+    db_session.add(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a completed strategic cycle with memo counts
+    cycle = await _sc.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await _sc.mark_phase1_completed(db_session, cycle.id)
+    await db_session.commit()
+    await _sc.mark_phase2_completed(
+        db_session, cycle.id, memos_available=4, memos_cited=1
+    )
+    await db_session.commit()
+
+    # Wire the cycle into project.vision._strategic_cycle_history so the
+    # digest's legacy-JSONB path can find it.
+    from sqlalchemy.orm.attributes import flag_modified
+
+    await db_session.refresh(cycle)
+    vision = dict(project.vision or {})
+    vision["_strategic_cycle_history"] = [
+        {
+            "cycle_id": cycle.id,
+            "started_at": cycle.phase1_started_at.isoformat()
+            if cycle.phase1_started_at
+            else None,
+            "phase2_completed_at": cycle.phase2_completed_at.isoformat()
+            if cycle.phase2_completed_at
+            else None,
+            "outcome": cycle.outcome,
+            "directions_created": 0,
+            "directions_retired": 0,
+            "vision_updated": False,
+        }
+    ]
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+    lc = data.get("latest_cycle")
+    assert lc is not None
+    assert lc["memos_available"] == 4
+    assert lc["memos_cited"] == 1

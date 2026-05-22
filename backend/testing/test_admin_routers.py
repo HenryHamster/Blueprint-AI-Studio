@@ -17,6 +17,7 @@ from app.models import (
     AllowedUser,
     Project,
     ProjectMember,
+    ReleaseVersion,
     Task,
     TaskStatus,
     Alert,
@@ -390,7 +391,9 @@ class TestGetAllProjects:
 
         resp = await client.get("/api/admin/projects")
         assert resp.status_code == 200
-        ids = [p["id"] for p in resp.json()]
+        data = resp.json()
+        assert "items" in data
+        ids = [p["id"] for p in data["items"]]
         assert str(project.id) in ids
 
     @pytest.mark.asyncio
@@ -407,7 +410,7 @@ class TestGetAllProjects:
 
         resp = await client.get("/api/admin/projects")
         assert resp.status_code == 200
-        ids = [p["id"] for p in resp.json()]
+        ids = [p["id"] for p in resp.json()["items"]]
         assert str(other.id) not in ids
 
     @pytest.mark.asyncio
@@ -417,7 +420,7 @@ class TestGetAllProjects:
 
         resp = await client.get("/api/admin/projects")
         assert resp.status_code == 200
-        assert all("my_role" in p for p in resp.json())
+        assert all("my_role" in p for p in resp.json()["items"])
 
 
 class TestUpdateProject:
@@ -1009,6 +1012,97 @@ class TestMessages:
         )
         assert resp.status_code == 400
 
+    @pytest.mark.asyncio
+    async def test_list_messages_guarantees_high_signal_with_routine_flood(
+        self, client: AsyncClient, db_session
+    ):
+        """BLOCKER messages are always returned even when routine messages fill the paged limit."""
+        from datetime import datetime, timedelta, timezone
+
+        project = await _make_project(db_session)
+        now = datetime.now(timezone.utc)
+
+        # BLOCKER is the OLDEST message: with order_by(created_at.desc()) and limit=3 the
+        # five newer routine rows would evict it entirely unless the guaranteed-query logic
+        # in list_messages explicitly pulls it back in. This ordering is what makes the test
+        # actually exercise the guarantee — a newest BLOCKER would survive on recency alone.
+        blocker = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BLOCKER,
+            from_type="system",
+            content="critical blocker",
+            context={},
+        )
+        blocker.created_at = now - timedelta(hours=10)
+        db_session.add(blocker)
+        for i in range(5):
+            routine = ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.NOTE,
+                from_type="system",
+                content=f"routine {i}",
+                context={"event_type": "pr_merged"},
+            )
+            routine.created_at = now - timedelta(minutes=5 * (5 - i))
+            db_session.add(routine)
+        await db_session.commit()
+
+        # limit=3 would normally cut off the BLOCKER if 5 newer routine messages exist
+        resp = await client.get(
+            f"/api/admin/messages?project_id={project.id}&status=open&limit=3"
+        )
+        assert resp.status_code == 200
+        returned_ids = {m["id"] for m in resp.json()["messages"]}
+        assert str(blocker.id) in returned_ids
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "high_signal_event_type",
+        ["failure_alert", "rollback_recommended", "fix_loop_divergence_regressed"],
+    )
+    async def test_list_messages_guarantees_high_signal_notes_with_routine_flood(
+        self, client: AsyncClient, db_session, high_signal_event_type: str
+    ):
+        """System NOTE alerts classified as high-signal always survive a routine flood."""
+        from datetime import datetime, timedelta, timezone
+
+        project = await _make_project(db_session)
+        now = datetime.now(timezone.utc)
+
+        # High-signal NOTE is the OLDEST message so it would be evicted by paging
+        # alone without the guaranteed-query logic.
+        alert = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content=f"system alert: {high_signal_event_type}",
+            context={"event_type": high_signal_event_type},
+        )
+        alert.created_at = now - timedelta(hours=10)
+        db_session.add(alert)
+        for i in range(5):
+            routine = ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.NOTE,
+                from_type="system",
+                content=f"routine {i}",
+                context={"event_type": "pr_merged"},
+            )
+            routine.created_at = now - timedelta(minutes=5 * (5 - i))
+            db_session.add(routine)
+        await db_session.commit()
+
+        # limit=3 would normally cut off the alert if 5 newer routine messages exist
+        resp = await client.get(
+            f"/api/admin/messages?project_id={project.id}&status=open&limit=3"
+        )
+        assert resp.status_code == 200
+        returned_ids = {m["id"] for m in resp.json()["messages"]}
+        assert str(alert.id) in returned_ids, (
+            f"high-signal NOTE with event_type={high_signal_event_type!r} was evicted "
+            "by routine flood — guaranteed-query logic did not include it"
+        )
+
 
 class TestMessagesLastSeen:
     @pytest.mark.asyncio
@@ -1073,6 +1167,86 @@ class TestMessagesLastSeen:
             json={"project_id": random_pid, "timestamp": 1_700_000_000_000},
         )
         assert put_resp.status_code == 404
+
+
+class TestMessagesSavedViews:
+    @pytest.mark.asyncio
+    async def test_get_saved_views_empty(self, client: AsyncClient, db_session):
+        """Returns empty list when no saved-views record exists for the operator."""
+        project = await _make_project(db_session)
+        resp = await client.get(
+            f"/api/admin/messages/saved-views?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["saved_views"] == []
+
+    @pytest.mark.asyncio
+    async def test_round_trip(self, client: AsyncClient, db_session):
+        """PUT stores saved views; subsequent GET returns the same value."""
+        project = await _make_project(db_session)
+        views = [{"name": "Blockers only", "query": "", "sort": "desc"}]
+
+        put_resp = await client.put(
+            "/api/admin/messages/saved-views",
+            json={"project_id": str(project.id), "saved_views": views},
+        )
+        assert put_resp.status_code == 200
+        assert put_resp.json()["status"] == "ok"
+
+        get_resp = await client.get(
+            f"/api/admin/messages/saved-views?project_id={project.id}"
+        )
+        assert get_resp.status_code == 200
+        assert get_resp.json()["saved_views"] == views
+
+    @pytest.mark.asyncio
+    async def test_update_replaces_views(self, client: AsyncClient, db_session):
+        """A second PUT replaces the previous saved views."""
+        project = await _make_project(db_session)
+        views1 = [{"name": "First view"}]
+        views2 = [{"name": "Second view"}, {"name": "Third view"}]
+
+        await client.put(
+            "/api/admin/messages/saved-views",
+            json={"project_id": str(project.id), "saved_views": views1},
+        )
+        await client.put(
+            "/api/admin/messages/saved-views",
+            json={"project_id": str(project.id), "saved_views": views2},
+        )
+        get_resp = await client.get(
+            f"/api/admin/messages/saved-views?project_id={project.id}"
+        )
+        assert get_resp.json()["saved_views"] == views2
+
+    @pytest.mark.asyncio
+    async def test_no_access_returns_404(self, client: AsyncClient, db_session):
+        """Cannot read or write saved-views for a project the user is not a member of."""
+        random_pid = str(uuid.uuid4())
+        get_resp = await client.get(
+            f"/api/admin/messages/saved-views?project_id={random_pid}"
+        )
+        assert get_resp.status_code == 404
+
+        put_resp = await client.put(
+            "/api/admin/messages/saved-views",
+            json={"project_id": random_pid, "saved_views": []},
+        )
+        assert put_resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_oversize_payload_returns_400(self, client: AsyncClient, db_session):
+        """Payload exceeding 50 KB is rejected with 400."""
+        project = await _make_project(db_session)
+        # Each view is ~1KB; 60 of them easily exceeds 50KB
+        large_views = [{"name": f"view-{i}", "data": "x" * 900} for i in range(60)]
+
+        put_resp = await client.put(
+            "/api/admin/messages/saved-views",
+            json={"project_id": str(project.id), "saved_views": large_views},
+        )
+        assert put_resp.status_code == 400
+        assert "50" in put_resp.json()["error"]["message"]
 
 
 class TestPlaybook:
@@ -1226,6 +1400,37 @@ class TestPlaybook:
         assert resp.status_code == 404
 
     @pytest.mark.asyncio
+    async def test_admin_playbook_delete_writes_tombstone(
+        self, client: AsyncClient, db_session
+    ):
+        """Deleting a playbook entry records a tombstone in playbook_archive and playbook_deleted_keys."""
+        project = await _make_project(db_session)
+        await client.put(
+            f"/api/admin/projects/{project.id}/playbook",
+            json={"key": "tombstone-test", "value": "To be deleted"},
+        )
+
+        resp = await client.delete(
+            f"/api/admin/projects/{project.id}/playbook/tombstone-test"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] is True
+
+        # Verify the tombstone was written to the design_doc
+        await db_session.refresh(project)
+        doc = project.design_doc or {}
+        archive = doc.get("playbook_archive", [])
+        tombstones = [
+            e for e in archive if e.get("_archived_key") == "playbook/tombstone-test"
+        ]
+        assert len(tombstones) == 1
+        assert tombstones[0]["_retirement_reason"] == "operator_deleted"
+        assert "_archived_at" in tombstones[0]
+
+        deleted_keys = doc.get("playbook_deleted_keys", [])
+        assert "playbook/tombstone-test" in deleted_keys
+
+    @pytest.mark.asyncio
     async def test_playbook_seed_creates_default_entries(
         self, client: AsyncClient, db_session
     ):
@@ -1349,6 +1554,37 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_patch_warm_backlog_reuse_enabled(self, client: AsyncClient):
+        """warm_backlog_reuse_enabled accepts booleans, rejects non-booleans,
+        round-trips on GET, and is independent of warm_continuity_enabled."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"warm_backlog_reuse_enabled": True}
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        body = get_resp.json()
+        assert body["warm_backlog_reuse_enabled"] is True
+        # Independently switchable: flipping backlog reuse must not touch the
+        # chain-continuity flag.
+        assert "warm_continuity_enabled" in body
+
+        resp = await client.patch(
+            "/api/admin/settings", json={"warm_backlog_reuse_enabled": False}
+        )
+        assert resp.status_code == 200
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.json()["warm_backlog_reuse_enabled"] is False
+
+        bad = await client.patch(
+            "/api/admin/settings", json={"warm_backlog_reuse_enabled": "true"}
+        )
+        assert bad.status_code == 400
+        bad2 = await client.patch(
+            "/api/admin/settings", json={"warm_backlog_reuse_enabled": 1}
+        )
+        assert bad2.status_code == 400
+
+    @pytest.mark.asyncio
     async def test_release_flags_round_trip_on_get(self, client: AsyncClient):
         """The automain/LTS release-control flags — integration_branch,
         promotion_enabled, smoketest_enabled — are settable via PATCH and
@@ -1367,9 +1603,7 @@ class TestNotificationConfigSettings:
         assert body["promotion_enabled"] is True
         assert body["smoketest_enabled"] is False
         # Restore the default so promotion_enabled does not leak to other tests.
-        await client.patch(
-            "/api/admin/settings", json={"promotion_enabled": False}
-        )
+        await client.patch("/api/admin/settings", json={"promotion_enabled": False})
 
     @pytest.mark.asyncio
     async def test_patch_next_role_poll_timeout_secs(self, client: AsyncClient):
@@ -1960,11 +2194,11 @@ class TestDirectionAutoPauseStats:
 
 
 class TestProjectEndpointsSurfaceProblemModel:
-    """Project endpoints expose problem_model + running_update fields so the
-    admin-ui can render the new strategic views."""
+    """Project detail endpoint exposes problem_model + running_update fields so
+    the admin-ui can render the new strategic views."""
 
     @pytest.mark.asyncio
-    async def test_list_projects_includes_new_fields(
+    async def test_detail_endpoint_includes_jsonb_fields(
         self, client: AsyncClient, db_session
     ):
         project = await _make_project(db_session)
@@ -1975,18 +2209,104 @@ class TestProjectEndpointsSurfaceProblemModel:
         db_session.add(project)
         await db_session.commit()
 
+        resp = await client.get(f"/api/admin/projects/{project.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert isinstance(data, dict)
+        assert data["id"] == str(project.id)
+        assert "problem_model" in data
+        assert data["problem_model"]["intent"]["purpose"] == "Build X."
+        assert "running_update" in data
+        assert data["running_update"].startswith("## Current state")
+        assert "running_update_acknowledged_at" in data
+        assert "self_reflection_log" in data
+        assert "my_role" in data
+
+    @pytest.mark.asyncio
+    async def test_list_excludes_large_jsonb_fields(
+        self, client: AsyncClient, db_session
+    ):
+        """List endpoint omits large JSONB columns for performance."""
+        project = await _make_project(db_session)
+        project.problem_model = {"intent": {"purpose": "Build X."}}
+        project.running_update = "## Current state"
+        db_session.add(project)
+        await db_session.commit()
+
         resp = await client.get("/api/admin/projects")
         assert resp.status_code == 200
         data = resp.json()
-        assert isinstance(data, list)
-        our = next((p for p in data if p["id"] == str(project.id)), None)
+        our = next((p for p in data["items"] if p["id"] == str(project.id)), None)
         assert our is not None
-        assert "problem_model" in our
-        assert our["problem_model"]["intent"]["purpose"] == "Build X."
-        assert "running_update" in our
-        assert our["running_update"].startswith("## Current state")
-        assert "running_update_acknowledged_at" in our
-        assert "self_reflection_log" in our
+        assert "problem_model" not in our
+        assert "running_update" not in our
+        assert "vision" not in our
+        assert "design_doc" not in our
+        assert "self_reflection_log" not in our
+        assert "directions" not in our
+        assert "directions_count" in our
+
+    @pytest.mark.asyncio
+    async def test_detail_endpoint_returns_404_for_other_user(
+        self, client: AsyncClient, db_session
+    ):
+        other = Project(name="Other", user_id="other-owner")
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id="other-owner", role="owner")
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{other.id}")
+        assert resp.status_code == 404
+
+
+class TestGetAllProjectsPagination:
+    """GET /api/admin/projects supports limit/offset pagination."""
+
+    @pytest.mark.asyncio
+    async def test_limit_parameter(self, client: AsyncClient, db_session):
+        for i in range(5):
+            await _make_project(db_session, name=f"Project {i}")
+
+        resp = await client.get("/api/admin/projects?limit=2")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "items" in data
+        assert "has_more" in data
+        assert len(data["items"]) <= 2
+
+    @pytest.mark.asyncio
+    async def test_offset_parameter(self, client: AsyncClient, db_session):
+        for i in range(4):
+            await _make_project(db_session, name=f"Page Project {i}")
+
+        resp_all = await client.get("/api/admin/projects?limit=100")
+        resp_offset = await client.get("/api/admin/projects?limit=100&offset=2")
+        all_ids = [p["id"] for p in resp_all.json()["items"]]
+        offset_ids = [p["id"] for p in resp_offset.json()["items"]]
+        assert offset_ids == all_ids[2:]
+
+    @pytest.mark.asyncio
+    async def test_limit_max_enforced(self, client: AsyncClient, db_session):
+        resp = await client.get("/api/admin/projects?limit=200")
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_has_more_flag(self, client: AsyncClient, db_session):
+        """has_more is True when there are more results beyond the page."""
+        for i in range(3):
+            await _make_project(db_session, name=f"HM Project {i}")
+
+        resp_page = await client.get("/api/admin/projects?limit=2")
+        assert resp_page.status_code == 200
+        data_page = resp_page.json()
+        assert data_page["has_more"] is True
+
+        resp_all = await client.get("/api/admin/projects?limit=100")
+        assert resp_all.json()["has_more"] is False
 
 
 class TestPatchProblemModel:
@@ -2694,3 +3014,254 @@ class TestViewportDebt:
             "https://github.com/acme/repo/blob/main/"
             "admin-ui/src/components/QuickFilterPresets.tsx"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_settings.py — integration_branch validation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestIntegrationBranchValidation:
+    """PATCH /api/admin/settings integration_branch must reject shell metacharacters."""
+
+    @pytest.mark.asyncio
+    async def test_integration_branch_rejects_shell_injection(
+        self, client: AsyncClient
+    ):
+        """integration_branch=main\";id;\" must be rejected with HTTP 400."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"integration_branch": 'main";id;"'}
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_integration_branch_accepts_valid(self, client: AsyncClient):
+        """Valid branch names (e.g. main, feature/foo-bar) must be accepted."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"integration_branch": "main"}
+        )
+        assert resp.status_code == 200
+
+        resp2 = await client.patch(
+            "/api/admin/settings", json={"integration_branch": "feature/foo-bar"}
+        )
+        assert resp2.status_code == 200
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_branch",
+        [
+            'main";id;"',  # double-quote + semicolon
+            "main;id",  # semicolon
+            "branch$HOME",  # dollar
+            "branch`id`",  # backtick
+            "branch|cat",  # pipe
+            "branch&id",  # ampersand
+            "branch(id)",  # parentheses
+            ".hidden",  # leading dot
+            "a/..b",  # dotdot
+            "a/.git/b",  # reserved component
+        ],
+    )
+    async def test_integration_branch_rejects_bad_names(
+        self, client: AsyncClient, bad_branch: str
+    ):
+        resp = await client.patch(
+            "/api/admin/settings", json={"integration_branch": bad_branch}
+        )
+        assert resp.status_code == 400, (
+            f"Expected 400 for branch {bad_branch!r}, got {resp.status_code}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin.py — Set Version Phase
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def _make_open_version(session, project_id, phase="build"):
+    """Create an open ReleaseVersion for the given project."""
+    version = ReleaseVersion(
+        project_id=project_id, version_number=1, phase=phase, status="open"
+    )
+    session.add(version)
+    await session.commit()
+    await session.refresh(version)
+    return version
+
+
+class TestSetVersionPhase:
+    @pytest.mark.asyncio
+    async def test_set_phase_to_stabilize(self, client: AsyncClient, db_session):
+        """Member can advance phase from build to stabilize."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="build")
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "stabilize", "reasoning": "ready for gate"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["phase"] == "stabilize"
+        assert "ready for gate" in data["phase_reasoning"]
+        assert data["phase_changed_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_set_phase_back_to_build(self, client: AsyncClient, db_session):
+        """Member can revert phase from stabilize back to build."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id, phase="stabilize")
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "build"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["phase"] == "build"
+
+    @pytest.mark.asyncio
+    async def test_set_phase_no_open_version_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns 404 when no open release version exists for the project."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "stabilize"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_set_phase_invalid_phase_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """Payload with an unrecognised phase value is rejected by Pydantic."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "qualify"},
+        )
+        assert resp.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_set_phase_non_member_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """User without project membership cannot set the version phase."""
+        other = Project(name="Other", user_id="other-owner")
+        db_session.add(other)
+        await db_session.commit()
+        await db_session.refresh(other)
+        db_session.add(
+            ProjectMember(project_id=other.id, user_id="other-owner", role="owner")
+        )
+        await _make_open_version(db_session, other.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{other.id}/version-phase",
+            json={"phase": "stabilize"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_set_phase_records_operator_reasoning(
+        self, client: AsyncClient, db_session
+    ):
+        """Operator email is prepended to phase_reasoning in the response."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "stabilize", "reasoning": "dry-run calibration"},
+        )
+        assert resp.status_code == 200
+        reasoning = resp.json()["phase_reasoning"]
+        assert "[operator:" in reasoning
+        assert "dry-run calibration" in reasoning
+
+
+class TestResetIterationCap:
+    """POST /api/admin/tasks/{task_id}/reset-iteration-cap — archives FAILED
+    review/fix tasks for the PR. The archive filter pushes pr_number into SQL;
+    on SQLite the naive .as_string() form double-quotes the int and matches
+    nothing, so this test guards against that dialect breakage by asserting
+    matching tasks are actually archived."""
+
+    async def _make_failed(self, db_session, project_id, pr_number, task_type="review"):
+        t = Task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            payloads=[{"type": task_type, "pr_number": pr_number, "branch": "feat/x"}],
+            archived=False,
+        )
+        db_session.add(t)
+        return t
+
+    @pytest.mark.asyncio
+    async def test_archives_only_matching_pr_failed_review_fix_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+
+        parking = Task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "review", "pr_number": 777, "branch": "feat/x"}],
+            context={"review_loop": {"iteration": 5, "pr_number": 777}},
+        )
+        db_session.add(parking)
+
+        # FAILED review/fix tasks on PR #777 — these must be archived.
+        match_review = await self._make_failed(db_session, project.id, 777, "review")
+        match_fix = await self._make_failed(db_session, project.id, 777, "fix")
+        # FAILED on a different PR — must NOT be archived.
+        other_pr = await self._make_failed(db_session, project.id, 888, "review")
+        # FAILED on PR #777 but not a review/fix type — must NOT be archived.
+        wrong_type = await self._make_failed(db_session, project.id, 777, "create")
+        await db_session.commit()
+        for t in (parking, match_review, match_fix, other_pr, wrong_type):
+            await db_session.refresh(t)
+
+        resp = await client.post(f"/api/admin/tasks/{parking.id}/reset-iteration-cap")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # The two FAILED review/fix tasks on PR #777 must be counted — if the
+        # SQL pr_number filter silently matched zero rows (SQLite .as_string()
+        # bug), this would be 0.
+        assert body["archived_count"] == 2
+        assert body["pr_number"] == 777
+        assert body["previous_per_chain_iteration"] == 5
+
+        for t in (match_review, match_fix, other_pr, wrong_type):
+            await db_session.refresh(t)
+        assert match_review.archived is True
+        assert match_fix.archived is True
+        assert other_pr.archived is False
+        assert wrong_type.archived is False
+
+        # Per-chain iteration counter reset to 0 on the parking task.
+        await db_session.refresh(parking)
+        assert parking.context["review_loop"]["iteration"] == 0
+
+    @pytest.mark.asyncio
+    async def test_no_pr_number_in_context_returns_400(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        parking = Task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "review"}],
+            context={"review_loop": {"iteration": 3}},
+        )
+        db_session.add(parking)
+        await db_session.commit()
+        await db_session.refresh(parking)
+
+        resp = await client.post(f"/api/admin/tasks/{parking.id}/reset-iteration-cap")
+        assert resp.status_code == 400

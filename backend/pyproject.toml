@@ -32,12 +32,19 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 "testing/*" = ["DTZ", "BLE", "B"]
 # main.py has many intentional except Exception blocks for background-task error handling
 # B904: FastAPI pattern — raise HTTPException in except block is intentional HTTP conversion
-"app/main.py" = ["BLE001", "B904"]
+# E402: Deferred imports for circular dependency / module load order (lines 113, 202, 2035, 2042, 2174)
+"app/main.py" = ["BLE001", "B904", "E402"]
 # services.py is entirely background workers (cleanup, persist, timeout sweep, orphan
 # recovery). Every except Exception is the intentional "log and continue — never crash
 # the background loop" pattern; narrowing risks missing an exception type and killing
 # the worker, which is strictly worse than logging an unexpected error.
 "app/services.py" = ["BLE001"]
+# lifecycle.py is the FastAPI lifespan that hosts every background service plus the
+# crash-monitor and leader-election loops. BLE001 (broad except) and PERF203
+# (try/except inside a loop) are both the intentional resilient-loop pattern — a
+# periodic worker must survive a transient per-iteration failure, not die — exactly
+# as documented for services.py above.
+"app/lifecycle.py" = ["BLE001", "PERF203"]
 # ci_completion.py is the CI webhook + poll-fallback handler. Its except blocks are the
 # same "log and keep retrying" pattern (DB lookup races, GitHub API blips, merge retries).
 # Crashing here would leave a PR in limbo with no progress.

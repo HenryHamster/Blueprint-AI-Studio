@@ -703,6 +703,64 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
     }
   }
 
+  // Promotion-readiness trend (cross-version aggregation).
+  const promotionReadinessRaw = versionPhase.promotion_readiness;
+  if (promotionReadinessRaw && typeof promotionReadinessRaw === 'object' && !Array.isArray(promotionReadinessRaw)) {
+    const pr = promotionReadinessRaw as Record<string, unknown>;
+    const prReady = pr.ready === true ? 'YES' : 'NO';
+    const prRate = typeof pr.would_promote_rate === 'number' ? pr.would_promote_rate : null;
+    const prStreak = typeof pr.consecutive_clean_passes === 'number' ? pr.consecutive_clean_passes : null;
+    const prEvaluated = typeof pr.verdicts_evaluated === 'number' ? pr.verdicts_evaluated : null;
+    const prReason = typeof pr.reason === 'string' ? pr.reason : null;
+    const prConf = pr.confidence && typeof pr.confidence === 'object' && !Array.isArray(pr.confidence)
+      ? pr.confidence as Record<string, unknown> : null;
+    const prRecurring = pr.recurring_blockers && typeof pr.recurring_blockers === 'object' && !Array.isArray(pr.recurring_blockers)
+      ? pr.recurring_blockers as Record<string, unknown> : null;
+
+    const prBits: string[] = [`ready=${prReady}`];
+    if (prRate !== null) prBits.push(`would_promote_rate=${prRate}`);
+    if (prStreak !== null) prBits.push(`consecutive_clean_passes=${prStreak}`);
+    if (prEvaluated !== null) prBits.push(`verdicts_evaluated=${prEvaluated}`);
+    if (prConf) {
+      const confMean = typeof prConf.mean === 'number' ? prConf.mean : null;
+      const confStdev = typeof prConf.stdev === 'number' ? prConf.stdev : null;
+      const confStable = prConf.stable === true ? 'stable' : (prConf.stable === false ? 'volatile' : null);
+      if (confMean !== null) prBits.push(`confidence_mean=${confMean}`);
+      if (confStdev !== null) prBits.push(`confidence_stdev=${confStdev}`);
+      if (confStable !== null) prBits.push(`confidence=${confStable}`);
+    }
+    parts.push(`Promotion readiness: ${prBits.join(', ')}`);
+    if (prReason) parts.push(`  Readiness reason: ${prReason}`);
+    if (prRecurring && Object.keys(prRecurring).length > 0) {
+      const blockerStr = Object.entries(prRecurring).map(([code, n]) => `${code}x${String(n)}`).join(', ');
+      parts.push(`  Recurring blockers: ${blockerStr}`);
+    }
+  }
+
+  // Recent closed versions (newest-first, up to 3).
+  const recentVersionsRaw = versionPhase.recent_versions;
+  if (Array.isArray(recentVersionsRaw) && recentVersionsRaw.length > 0) {
+    const rvLines: string[] = ['Recent versions (newest-first):'];
+    for (const rv of recentVersionsRaw) {
+      if (!rv || typeof rv !== 'object' || Array.isArray(rv)) continue;
+      const rvRec = rv as Record<string, unknown>;
+      const rvNum = typeof rvRec.version_number === 'number' ? rvRec.version_number : '?';
+      const rvStatus = typeof rvRec.status === 'string' ? rvRec.status : '?';
+      const lq = rvRec.last_qualification;
+      const lqRec = lq && typeof lq === 'object' && !Array.isArray(lq) ? lq as Record<string, unknown> : null;
+      const lqStatus = lqRec && typeof lqRec.status === 'string' ? lqRec.status : null;
+      const lqConf = lqRec && typeof lqRec.confidence === 'number' ? lqRec.confidence : null;
+      const lqBlocker = lqRec && typeof lqRec.blocker === 'string' && lqRec.blocker ? lqRec.blocker : null;
+      const lqBits: string[] = [];
+      if (lqStatus) lqBits.push(`qual=${lqStatus}`);
+      if (lqConf !== null) lqBits.push(`confidence=${lqConf}`);
+      if (lqBlocker) lqBits.push(`blocker=${lqBlocker}`);
+      const lqSuffix = lqBits.length > 0 ? ` [${lqBits.join(', ')}]` : '';
+      rvLines.push(`  - v${rvNum} (${rvStatus})${lqSuffix}`);
+    }
+    if (rvLines.length > 1) parts.push(rvLines.join('\n'));
+  }
+
   parts.push(`
 **Phase meanings:**
 - **build** — pursue the version's feature and improvement work at full pace. The version is actively developing; continue creating and executing directions that advance the intent.
@@ -742,6 +800,90 @@ Only request qualification from the **stabilize** phase — it is ignored in **b
 **Do NOT re-request after a dry-run of the same candidate.** If the "Last qualification" line shows \`status=dry_run\`, the qualifier already ran end-to-end (CI, test-erosion, audit, smoketest) on that candidate commit and recorded the result — a dry-run means the candidate would promote but promotion currently ships dark, so the version stays open in \`stabilize\`. Re-emitting \`qualify_request\` for the SAME candidate re-spawns two agent VMs to re-score an identical, already-evaluated commit; the orchestrator's already-dry-run guard ignores it. Only emit \`qualify_request\` again once new work has merged onto the integration branch since that dry-run — i.e. the candidate commit has actually changed. If nothing has merged since the \`dry_run\` line above, do NOT re-request.`);
 
   return parts.join('\n');
+}
+
+/**
+ * Builds the memo-citations block for the strategic thinker prompt.
+ * Memos are terminal reasoning artifacts spawned from research findings the
+ * packer dropped under budget pressure; the backend surfaces a digest of the
+ * recent ones so the strategic reviewer can cite them by task id. Returns ''
+ * when there are no memos for this cycle window.
+ */
+export function buildMemoCitationsSection(memoCitations: unknown): string {
+  if (!Array.isArray(memoCitations) || memoCitations.length === 0) return '';
+  const lines: string[] = ['\n## Memo Citations (recent terminal reasoning artifacts)'];
+  lines.push(
+    'Memos are short reasoning notes spawned from research findings dropped ' +
+    'under budget pressure in earlier cycles. Each is a completed, terminal ' +
+    'artifact. When a memo informs a gap or direction, cite it by task id ' +
+    '(e.g. "memo <task_id>") so the reasoning thread stays traceable.',
+  );
+  for (const m of memoCitations) {
+    if (!m || typeof m !== 'object') continue;
+    const rec = m as Record<string, unknown>;
+    const taskId = typeof rec.task_id === 'string' && rec.task_id ? rec.task_id : '?';
+    const excerpt = typeof rec.summary_excerpt === 'string' ? rec.summary_excerpt.trim() : '';
+    lines.push(`- memo ${taskId}: ${excerpt || '(no summary)'}`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Builds the efficiency-axes section for the strategic thinker prompt.
+ * Shows per-axis current value, baseline, and drift_pct so the strategic
+ * agent can track whether pipeline efficiency is improving or regressing.
+ * Returns a 'data unavailable' marker (not empty string) when absent so the
+ * agent is never left guessing whether efficiency was intentionally omitted.
+ */
+export function buildEfficiencySnapshotSection(efficiencySnapshot: unknown): string {
+  const AXIS_LABELS: Record<string, string> = {
+    cost_per_merged_pr: 'Cost/merged PR (USD)',
+    vm_cold_start_p50_ms: 'VM cold-start p50 (ms)',
+    vm_reuse_rate: 'VM reuse rate',
+    median_api_calls_per_task: 'Median API calls/task',
+    median_review_iterations: 'Median review iterations',
+  };
+
+  if (!efficiencySnapshot || typeof efficiencySnapshot !== 'object') {
+    return '\n## Pipeline Efficiency Axes\n_data unavailable — no snapshot recorded yet_\n';
+  }
+  const snap = efficiencySnapshot as Record<string, unknown>;
+  const axes = snap.axes && typeof snap.axes === 'object' ? snap.axes as Record<string, unknown> : {};
+  const axisKeys = Object.keys(axes);
+  if (axisKeys.length === 0) {
+    return '\n## Pipeline Efficiency Axes\n_data unavailable — no snapshot recorded yet_\n';
+  }
+
+  const fmt = (v: unknown): string => {
+    if (v === null || v === undefined) return 'n/a';
+    if (typeof v === 'number') return v.toString();
+    if (typeof v === 'string' || typeof v === 'boolean') return String(v);
+    return 'n/a';
+  };
+  const fmtDrift = (v: unknown): string => {
+    if (v === null || v === undefined) return 'n/a';
+    if (typeof v !== 'number') return typeof v === 'string' ? v : 'n/a';
+    const sign = v > 0 ? '+' : '';
+    return `${sign}${v.toFixed(1)}%`;
+  };
+
+  const lines: string[] = ['\n## Pipeline Efficiency Axes'];
+  const lastAt = typeof snap.last_snapshot_at === 'string' ? snap.last_snapshot_at.slice(0, 10) : 'unknown';
+  const baseAt = typeof snap.baseline_captured_at === 'string' ? snap.baseline_captured_at.slice(0, 10) : 'unknown';
+  lines.push(`Baseline: ${baseAt}  |  Last snapshot: ${lastAt}`);
+  lines.push('');
+  lines.push('axis | current | baseline | drift');
+  lines.push('--- | --- | --- | ---');
+  for (const key of axisKeys) {
+    const data = axes[key] as Record<string, unknown> | undefined;
+    if (!data || typeof data !== 'object') continue;
+    const label = AXIS_LABELS[key] ?? key;
+    const cur = fmt(data.current);
+    const base = fmt(data.baseline);
+    const drift = fmtDrift(data.drift_pct);
+    lines.push(`${label} | ${cur} | ${base} | ${drift}`);
+  }
+  return lines.join('\n') + '\n';
 }
 
 // Portfolio-level view computed from per-direction data — surfaces imbalances
@@ -1028,6 +1170,8 @@ export interface ThinkerPromptParams {
   threadSection: string;
   taskId: string;
   versionPhaseSection: string;
+  memoCitationsSection: string;
+  efficiencySnapshotSection: string;
 }
 
 export function buildThinkerPrompt(p: ThinkerPromptParams): string {
@@ -1060,8 +1204,8 @@ ${p.dirHealthSummary}
 ${p.userPausedSection}${p.rejectedProposalsSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
-${p.systemMaturitySection}${p.driftSection}
-${p.recentWorkSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}
+${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}
+${p.recentWorkSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
 You operate on a **problem model** — a structured representation of what the user wants (intent), what the project can do (capabilities), and what's between those (gaps). Directions are *moves* toward specific gaps. Friction is *obstacles* in the way.
@@ -1157,6 +1301,22 @@ If no directions were retired in the last 90 days, write exactly:
 **No eligible retirements this cycle** — and still include this section heading.
 
 The Executor will call \`./strategic set-retirement-critiques\` to persist these. Do not skip this section.
+
+## 3.6. Evidence-progress assessment (long-running active directions, OPTIONAL)
+
+For each ACTIVE direction that is long-running — well past its early cycles (high cumulative cycle count) and especially any direction carrying an \`outcome_scaffolding_flagged\` marker in the direction list — record your read on whether it is genuinely advancing toward its stated \`success_evidence\`:
+
+\`\`\`
+direction_id: d-xxx
+status: advancing | stalled | met
+rationale: 1 sentence — the observable evidence behind this verdict
+\`\`\`
+
+- **advancing** — landing real progress toward \`success_evidence\` (suppresses the advisory scaffolding flag — the agent confirms genuine movement).
+- **met** — \`success_evidence\` is satisfied; the direction is effectively done (suppresses the flag; consider retiring it).
+- **stalled** — still shipping merges but NOT advancing \`success_evidence\` (outcome-less scaffolding; reinforces the flag).
+
+A deterministic detector already flags stalled scaffolding on its own, so this verdict is OPTIONAL precision-tuning — only assess directions you have a genuine read on, and skip the section if none qualify. The Executor persists these via \`./strategic set-evidence-progress\`.
 
 ## 4. Running update document (for the user)
 Write the full refined running_update as markdown to \`/tmp/running_update_${p.taskId}.md\` (also show it as a code block in your analysis for auditability — the file is the authoritative handoff to the Executor). This is the document the user sees as "project current state" — rewrite, don't append. Under 400 words. Follow the section guidance above.
@@ -1604,6 +1764,8 @@ ${hotspotsSection}
       }
     }
 
+    const efficiencySnapshotSection = buildEfficiencySnapshotSection(payload.efficiency_snapshot);
+
     // Build outcome evaluation section
     const outcomeEval = payload.outcome_evaluation as Record<string, unknown> | undefined;
     let outcomeSection = '';
@@ -1916,7 +2078,7 @@ ${hotspotsSection}
     const strategicHelper = `#!/bin/bash
 # Strategic review tool — updates problem_model, running_update, directions,
 # messages via API. Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env.
-OP="\${1:?Usage: strategic set-problem-model|set-running-update|reflect|pending-confirm|set-vision|create-direction|update-direction|retire-direction|create-message|resolve-message|spawn-task|set-retirement-critiques <json-or-file>}"
+OP="\${1:?Usage: strategic set-problem-model|set-running-update|reflect|pending-confirm|set-vision|create-direction|update-direction|retire-direction|create-message|resolve-message|spawn-task|set-retirement-critiques|set-evidence-progress <json-or-file>}"
 shift
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
@@ -1974,6 +2136,7 @@ case "$OP" in
   resolve-message)           _call "resolve_message" ;;
   spawn-task)                _call "spawn_task" ;;
   set-retirement-critiques)  _call "set_retirement_critiques" ;;
+  set-evidence-progress)     _call "set_evidence_progress" ;;
   *) echo "Unknown op: $OP" >&2; exit 1 ;;
 esac
 echo ""
@@ -2247,6 +2410,8 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
       threadSection,
       taskId,
       versionPhaseSection: buildVersionPhaseSection(versionPhase),
+      memoCitationsSection: buildMemoCitationsSection(payload.memo_citations),
+      efficiencySnapshotSection,
     });
 
     const thinkerGateResult = await runThinkerWithGate(
@@ -2319,6 +2484,12 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # If no retirements in last 90 days:
 ./strategic set-retirement-critiques '{"no_eligible_retirements": true}'
 
+# OPTIONAL: Submit evidence-progress verdicts from Section 3.6 for long-running
+# active directions. status ∈ advancing|stalled|met; advancing/met suppress the
+# advisory scaffolding flag, stalled reinforces it. Omit entirely if Section 3.6
+# assessed no directions — it's an optional precision refinement, never required.
+./strategic set-evidence-progress '[{"direction_id":"d-xxx","status":"advancing","rationale":"..."}]'
+
 # Spawn a targeted investigation task (research or plan only) when something
 # from the Recent Work section needs investigation NOW instead of waiting for
 # the next autonomous cycle.
@@ -2370,6 +2541,8 @@ ${analysisText.slice(0, 50_000)}
    - low: opportunistic
 
 4. **Retired-direction critique (REQUIRED).** From Section 3.5, call \`./strategic set-retirement-critiques\` with a JSON array of critique objects. If the Thinker wrote "No eligible retirements", pass \`'{"no_eligible_retirements": true}'\`. Never skip this call.
+
+   *Optional companion:* If the Thinker's Section 3.6 recorded \`evidence_progress\` verdicts for long-running active directions, persist them with \`./strategic set-evidence-progress '[{"direction_id":"d-xxx","status":"advancing|stalled|met","rationale":"..."}]'\`. Skip entirely when Section 3.6 is empty — this is an optional precision refinement, never a required call.
 
 5. **Version phase / qualify siblings (conditional — do this BEFORE step 1's \`set-problem-model\` call).** If the Thinker's analysis includes a \`version_phase_decision\` field (look in Section 6 and throughout the analysis), edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add it as a top-level sibling key, so the file becomes:
    \`{"version_phase_decision": {"phase": "build" or "stabilize", "reasoning": "..."}, ...rest_of_problem_model}\`

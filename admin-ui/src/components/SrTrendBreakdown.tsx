@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { TrendingUp, TrendingDown, Minus, ChevronRight, ChevronDown, AlertTriangle, ArrowDownRight, ArrowUpRight } from 'lucide-react';
+import { TrendingUp, TrendingDown, Minus, ChevronRight, ChevronDown, AlertTriangle, ArrowDownRight, ArrowUpRight, Search, Loader2 } from 'lucide-react';
 
 export interface SrMissExample {
   severity: 'CRITICAL' | 'MAJOR' | 'MINOR';
@@ -21,6 +21,9 @@ export interface SrCategoryTrend {
   sr_alone_hit_rate?: number | null;
   reviewer_save_rate?: number | null;
   trend?: 'increasing' | 'decreasing' | 'stable';
+  /** True when the trend direction is statistically significant (z-test passed).
+   *  False = adequate data but change is within noise; null = insufficient data. */
+  trend_significant?: boolean | null;
   rate_history?: number[];
   /** True when the SR prompt version changed within the rate_history window — attribution breaks here. */
   prompt_version_changed?: boolean | null;
@@ -49,6 +52,10 @@ export interface SrCategoryTrend {
   time_to_miss_detect_sample_count?: number | null;
   /** True when sample_count >= 2 AND p95 > 7 days — SR is effectively the sole checker. */
   time_to_miss_detect_lone_checker?: boolean | null;
+  /** Number of reviewer findings (category-level flags) backing the catch rate in the current window — the true denominator of the rate. */
+  current_finding_count?: number | null;
+  /** Number of reviewer findings in the previous window — used to gate cycle-over-cycle delta confidence. */
+  previous_finding_count?: number | null;
   /** Severity calibration: how often agent severity matched/under-rated/over-rated reviewer severity for the same category. */
   severity_calibration?: {
     under_rated: number;
@@ -135,6 +142,14 @@ export interface SrCoFailurePair {
   lift: number;
 }
 
+export interface SrInvestigationSignal {
+  category: string;
+  current_hit_rate?: number | null;
+  previous_hit_rate?: number | null;
+  sample_size?: number | null;
+  signals: string[];
+}
+
 // eslint-disable-next-line react-refresh/only-export-components
 export const SR_CANONICAL_CATEGORIES: { id: string; label: string }[] = [
   { id: 'correctness', label: 'Correctness' },
@@ -150,6 +165,14 @@ export const SR_CANONICAL_CATEGORIES: { id: string; label: string }[] = [
   { id: 'regression_risk', label: 'Regression Risk' },
   { id: 'cross-system-contract', label: 'Cross-System Contract' },
 ];
+
+export interface ReviewerHallucinationRate {
+  current_rate?: number | null;
+  previous_rate?: number | null;
+  current_sample?: number | null;
+  previous_sample?: number | null;
+  delta?: number | null;
+}
 
 export interface SrTrendData {
   computed_at?: string | null;
@@ -173,6 +196,7 @@ export interface SrTrendData {
   execution_evidence_miss_rates?: Record<string, ExecutionEvidenceMissRate> | null;
   edges_considered_stats?: Record<string, number> | null;
   co_failure_pairs?: SrCoFailurePair[] | null;
+  reviewer_hallucination_rate?: ReviewerHallucinationRate | null;
 }
 
 const SKIP_RATE_AMBER_THRESHOLD = 0.25;
@@ -1072,6 +1096,10 @@ interface SrTrendBreakdownProps {
   srCatchRateTargets?: Record<string, number> | null;
   /** Callback invoked when the user clicks the "configure targets" CTA. Parent is responsible for routing to the settings destination. */
   onConfigureTargets?: () => void;
+  /** Called when operator requests an SR investigation for a category. Returns the spawned task id on success, null on failure. */
+  onSpawnSrInvestigation?: (signal: SrInvestigationSignal) => Promise<string | null>;
+  /** Map from category id → open investigation task id; used to dedup stacking. */
+  activeInvestigationTaskIds?: Record<string, string> | null;
 }
 
 function CategoryRow({
@@ -1080,14 +1108,21 @@ function CategoryRow({
   variant,
   onCategoryClick,
   targetHitRate,
+  onSpawnSrInvestigation,
+  existingInvestigationTaskId,
 }: {
   cat: string;
   c: SrCategoryTrend;
   variant: 'card' | 'inline';
   targetHitRate?: number | null;
   onCategoryClick?: (category: string) => void;
+  onSpawnSrInvestigation?: (signal: SrInvestigationSignal) => Promise<string | null>;
+  existingInvestigationTaskId?: string | null;
 }) {
   const [open, setOpen] = useState(false);
+  const [spawning, setSpawning] = useState(false);
+  const [spawnedTaskId, setSpawnedTaskId] = useState<string | null>(null);
+  const activeTaskId = existingInvestigationTaskId ?? spawnedTaskId;
   const miss = deriveMissRate(c);
   const allIterMiss = c.all_iterations_miss_rate;
   const wmiss = c.weighted_miss_rate;
@@ -1106,7 +1141,12 @@ function CategoryRow({
     const cls = quadrant === 'both_declining' ? 'text-red-400' : 'text-amber-500';
     const pdStr = c.precision_delta != null ? formatDelta(c.precision_delta) : 'N/A';
     const rdStr = c.recall_delta != null ? formatDelta(c.recall_delta) : 'N/A';
-    const tip = `precision ${pdStr} / recall ${rdStr}`;
+    const numericDelta = `precision ${pdStr} / recall ${rdStr}`;
+    const explanation =
+      quadrant === 'conservative_shift' ? 'Self-review is catching fewer real issues while maintaining accuracy (under-flagging). Consider loosening criteria or investigating why issues are missed.'
+      : quadrant === 'noisy_shift' ? 'Self-review is flagging more things reviewers don\'t confirm, indicating over-flagging. Review false-positive patterns or tighten flagging criteria.'
+      : 'Both precision and recall have degraded, indicating the category needs recalibration. Investigate root cause of accuracy loss.';
+    const tip = `${explanation}\n\n${numericDelta}`;
     return <span className={`font-mono text-[9px] ${cls}`} title={tip}>{label}</span>;
   })();
   const examples = c.examples ?? [];
@@ -1135,7 +1175,37 @@ function CategoryRow({
   } : {};
 
   const sparklineTitle = c.prompt_version_changed ? 'prompt version changed mid-window — attribution may differ' : undefined;
-  const sampleTooSmall = isSampleTooSmall(c.current_human_count);
+  // Gate confidence on reviewer finding count (true denominator of the catch rate).
+  // Fall back to current_human_count for backward compat with older backend payloads.
+  const findingCount = c.current_finding_count ?? c.current_human_count;
+  const prevFindingCount = c.previous_finding_count ?? c.previous_human_count;
+  const sampleTooSmall = isSampleTooSmall(findingCount);
+  const deltaLowConfidence = sampleTooSmall || isSampleTooSmall(prevFindingCount);
+
+  const activeSignals: string[] = [
+    ...(c.below_floor ? ['below_floor'] : []),
+    ...(c.reasoning_engagement_rate != null && c.reasoning_engagement_rate < ENGAGEMENT_THINNING_THRESHOLD && (c.reasoning_engagement_total ?? 0) >= ENGAGEMENT_THINNING_MIN_PASSES ? ['thinning'] : []),
+    ...(c.severity_calibration && c.severity_calibration.total >= 5 && c.severity_calibration.under_rated / c.severity_calibration.total >= 0.30 ? ['under_calibration'] : []),
+    ...(c.time_to_miss_detect_lone_checker ? ['lone_checker'] : []),
+  ];
+  const handleSpawn = async () => {
+    if (!onSpawnSrInvestigation || spawning) return;
+    setSpawning(true);
+    try {
+      const id = await onSpawnSrInvestigation({ category: cat, current_hit_rate: c.current_hit_rate, previous_hit_rate: c.previous_hit_rate, sample_size: c.current_human_count, signals: activeSignals });
+      if (id) setSpawnedTaskId(id);
+    } finally { setSpawning(false); }
+  };
+  const investigateButton = onSpawnSrInvestigation && activeSignals.length > 0 && !sampleTooSmall && (
+    activeTaskId ? (
+      <span className="font-mono text-[9px] text-cyan-600 shrink-0 tabular-nums" title={`SR investigation: ${activeTaskId}`}>{activeTaskId.slice(0, 8)}</span>
+    ) : (
+      <button type="button" onClick={handleSpawn} disabled={spawning} title={`Investigate ${cat}: ${activeSignals.join(', ')}`} className="shrink-0 text-neutral-500 hover:text-amber-400 disabled:opacity-40" aria-label={`Spawn SR investigation for ${cat}`}>
+        {spawning ? <Loader2 className="w-3 h-3 animate-spin" /> : <Search className="w-3 h-3" />}
+      </button>
+    )
+  );
+
   if (variant === 'card') {
     const srAlone = c.sr_alone_hit_rate;
     const reviewerSave = c.reviewer_save_rate;
@@ -1147,7 +1217,7 @@ function CategoryRow({
         <span className="text-neutral-300 truncate flex-1" title={cat}>{cat}</span>
         {sampleTooSmall ? (
           <span className="font-mono tabular-nums text-neutral-500">
-            {miss != null ? `${Math.round(miss * 100)}/${c.current_human_count} — too small` : '–'}
+            {miss != null ? `${Math.round(miss * 100)}/${findingCount} — too small` : '–'}
           </span>
         ) : (
           <span className={`font-mono font-bold tabular-nums ${color}`}>
@@ -1159,7 +1229,7 @@ function CategoryRow({
             {`all:${Math.round(allIterMiss * 100)}%`}
           </span>
         )}
-        {delta != null && (
+        {delta != null && !deltaLowConfidence && (
           <span className={`font-mono tabular-nums text-xs ${deltaColor}`} title="cycle-over-cycle change">
             {formatDelta(delta)}
           </span>
@@ -1274,6 +1344,7 @@ function CategoryRow({
               {rowBody}
             </div>
           )}
+          {investigateButton}
         </div>
         {showSplit && (
           <div className="flex items-center gap-2 text-xs text-neutral-500 ml-5 mt-0.5">
@@ -1295,7 +1366,7 @@ function CategoryRow({
       <span className="text-neutral-300">{cat}</span>
       {sampleTooSmall ? (
         <span className="font-mono text-neutral-500">
-          {miss != null ? `${Math.round(miss * 100)}/${c.current_human_count} — too small` : '–'} miss
+          {miss != null ? `${Math.round(miss * 100)}/${findingCount} — too small` : '–'} miss
         </span>
       ) : (
         <span className={`font-mono ${color}`}>
@@ -1307,7 +1378,7 @@ function CategoryRow({
           {`all:${Math.round(allIterMiss * 100)}%`}
         </span>
       )}
-      {delta != null && (
+      {delta != null && !deltaLowConfidence && (
         <span className={`font-mono text-xs ${deltaColor}`} title="cycle-over-cycle change">
           {formatDelta(delta)}
         </span>
@@ -1430,7 +1501,7 @@ function CategoryRow({
   );
 }
 
-export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRateTargets, onConfigureTargets }: SrTrendBreakdownProps) {
+export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRateTargets, onConfigureTargets, onSpawnSrInvestigation, activeInvestigationTaskIds }: SrTrendBreakdownProps) {
   const categories = trends?.categories;
   if (!categories || Object.keys(categories).length === 0) return null;
   const entries = sortedEntries(categories);
@@ -1521,7 +1592,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRate
             <>
               <div className="flex flex-col gap-0.5">
                 {regularEntries.map(([cat, c]) => (
-                  <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} targetHitRate={srCatchRateTargets?.[cat] ?? null} />
+                  <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} targetHitRate={srCatchRateTargets?.[cat] ?? null} onSpawnSrInvestigation={onSpawnSrInvestigation} existingInvestigationTaskId={activeInvestigationTaskIds?.[cat] ?? null} />
                 ))}
               </div>
               {execEntries.length > 0 && (
@@ -1529,7 +1600,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRate
                   <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">Execution Evidence</p>
                   <div className="flex flex-col gap-0.5">
                     {execEntries.map(([cat, c]) => (
-                      <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} targetHitRate={srCatchRateTargets?.[cat] ?? null} />
+                      <CategoryRow key={cat} cat={cat} c={c} variant="card" onCategoryClick={onCategoryClick} targetHitRate={srCatchRateTargets?.[cat] ?? null} onSpawnSrInvestigation={onSpawnSrInvestigation} existingInvestigationTaskId={activeInvestigationTaskIds?.[cat] ?? null} />
                     ))}
                   </div>
                 </div>

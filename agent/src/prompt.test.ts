@@ -4677,6 +4677,12 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — evidence anchors', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('evidence anchor');
   });
 
+  it('requires evidence anchors for PASS on scope-drift category', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('scope-drift');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('evidence anchor');
+  });
+
   it('specifies file:line format as a valid anchor type', async () => {
     const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/file:line|path\/to\/file\.ts:/);
@@ -4687,14 +4693,25 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — evidence anchors', () => {
     expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/code snippet|quoted|backtick/);
   });
 
-  it('mentions that this requirement applies to high-stakes categories only', async () => {
+  it('specifies scope-drift anchor formats (diff stats and file list)', async () => {
     const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
-    expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/high-stakes|four categories/);
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/Trigger A.*diff.*stats|Trigger B.*related_files/);
+  });
+
+  it('mentions that this requirement applies to high-stakes categories', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/high-stakes|five categories/);
   });
 
   it('excludes lower-stakes categories from evidence anchor requirement', async () => {
     const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
-    expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/lower-stakes|style-conventions|documentation/);
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toMatch(/lower-stakes|style-conventions|documentation|performance|architecture/);
+  });
+
+  it('documents scope-drift-specific anchor requirements (Trigger A and B)', async () => {
+    const { CODE_CHANGE_HELPER_GUIDANCE } = await import('./prompt.js');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Trigger A');
+    expect(CODE_CHANGE_HELPER_GUIDANCE).toContain('Trigger B');
   });
 });
 
@@ -4766,7 +4783,178 @@ describe('writeCodeChangeHelpers — regressingCategories edge cases', () => {
     expect(doneScript).toContain('error-handling');
     expect(doneScript).toContain('security');
     expect(doneScript).toContain('regression_risk');
+    expect(doneScript).toContain('scope-drift');
     expect(doneScript).toContain('evidence anchor');
     expect(doneScript).toContain('MISSING_EVIDENCE');
+  });
+
+  it('generates ./done with scope-drift overage gate for large threshold', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'edge-task-4',
+      workBranch: 'blueprint/edge-task-4',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+    expect(doneScript).toContain('scope-drift overage gate');
+    expect(doneScript).toContain('800 lines');
+    expect(doneScript).toContain('15 files');
+    expect(doneScript).toContain('_SCOPE_DRIFT_PASSED');
+  });
+});
+
+// ── writeCodeChangeHelpers — thinning categories gate ─────────────────────────
+describe('writeCodeChangeHelpers — thinning categories gate', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('generates ./done with reasoning gate when only thinning categories are set', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'thin-task-1',
+      workBranch: 'blueprint/thin-task-1',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+      // Only thinning categories (no officially-regressing ones) passed as the union
+      regressingCategories: ['test-coverage'],
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+    expect(doneScript).toContain('REGRESSING_CATS=("test-coverage")');
+    expect(doneScript).toContain('Regressing categories need a reasoning field');
+    expect(doneScript).toContain('exit 1');
+  });
+
+  it('generates ./done without reasoning gate when both regressing and thinning lists are empty', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'thin-task-2',
+      workBranch: 'blueprint/thin-task-2',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+      regressingCategories: [],
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+    expect(doneScript).not.toContain('REGRESSING_CATS=');
+    expect(doneScript).toContain('# No regressing categories for this task type');
+  });
+
+  it('generates ./done with anchor-exception in reasoning gate so short file:line reasoning passes', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'thin-task-3',
+      workBranch: 'blueprint/thin-task-3',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+      regressingCategories: ['correctness'],
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+    // The anchor-detection block must be present inside the reasoning gate
+    expect(doneScript).toContain('_HAS_ANCHOR=0');
+    expect(doneScript).toContain('[a-zA-Z0-9._/-]+[.][a-z]+:[0-9]+');
+    // Short reasoning without anchor still fails
+    expect(doneScript).toContain('MISSING_REASONING');
+    expect(doneScript).toContain('exit 1');
+  });
+
+  it('reasoning gate failure message mentions file:line anchor as valid alternative', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'thin-task-4',
+      workBranch: 'blueprint/thin-task-4',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+      regressingCategories: ['scope-drift'],
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+    expect(doneScript).toContain('file:line anchor');
+  });
+});
+
+// ── writeCodeChangeHelpers — shell injection validation ───────────────────────
+describe('writeCodeChangeHelpers — shell injection validation', () => {
+  const validCfg = {
+    taskId: 'task-abc123',
+    workBranch: 'blueprint/task-abc123',
+    baseBranch: 'main',
+    owner: 'acme-org',
+    repo: 'my-repo',
+    testsOnMainBranch: false,
+  };
+
+  beforeEach(() => {
+    vi.mocked(fs.writeFileSync).mockImplementation(() => {});
+  });
+
+  it('accepts valid cfg fields without throwing', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers(validCfg); }).not.toThrow();
+  });
+
+  it('rejects taskId with shell metacharacters', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers({ ...validCfg, taskId: 'task;rm -rf /' }); }).toThrow(/taskId/);
+  });
+
+  it('rejects taskId with dollar sign', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers({ ...validCfg, taskId: 'task$VAR' }); }).toThrow(/taskId/);
+  });
+
+  it('rejects workBranch with shell metacharacters', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers({ ...validCfg, workBranch: 'branch`whoami`' }); }).toThrow(/workBranch/);
+  });
+
+  it('rejects baseBranch with newline', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers({ ...validCfg, baseBranch: 'main\nevil' }); }).toThrow(/baseBranch/);
+  });
+
+  it('rejects owner with shell metacharacters', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers({ ...validCfg, owner: 'owner$(id)' }); }).toThrow(/owner/);
+  });
+
+  it('rejects repo with shell metacharacters', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers({ ...validCfg, repo: 'repo&&evil' }); }).toThrow(/repo/);
+  });
+
+  it('accepts branch names with slashes and dots', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers({ ...validCfg, workBranch: 'feat/my-feature.v2', baseBranch: 'release/1.0' }); }).not.toThrow();
+  });
+
+  it('accepts owner/repo with dots and hyphens', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => { writeCodeChangeHelpers({ ...validCfg, owner: 'my.org-123', repo: 'my-repo.v2' }); }).not.toThrow();
   });
 });

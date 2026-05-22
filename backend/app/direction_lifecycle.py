@@ -476,6 +476,9 @@ async def _process_direction_lifecycle(
     from app.strategic_completion import (
         _check_direction_health,
         _check_direction_completion,
+        _check_outcome_scaffolding,
+        _compute_churn_metrics,
+        _compute_lifetime_burn_metrics,
     )
 
     directions_modified = False
@@ -555,10 +558,19 @@ async def _process_direction_lifecycle(
     # which only gets set on a successful remediation merge. If remediation keeps
     # failing, the flag (and operator alert) persists forever — clear it here
     # once enough time has passed without a monitor ever starting.
+    #
+    # EXCEPTION: lifetime-burn pauses set needs_manual_intervention but never set
+    # a remediation monitor (they are not code-failure remediation cases). They require
+    # manual operator action (retire or reset) and should persist until resolved,
+    # not expire via this TTL safety net designed for remediation-stuck scenarios.
     for d in project.directions or []:
         if not d.get("needs_manual_intervention"):
             continue
         if d.get("remediation_monitor_started_at"):
+            continue
+        # Skip TTL clear for lifetime-burn pauses — they require manual operator
+        # intervention and should not auto-expire.
+        if (d.get("paused_reason") or "").startswith("Lifetime burn backstop:"):
             continue
         flagged_at = d.get("needs_manual_intervention_at")
         if not flagged_at:
@@ -592,28 +604,10 @@ async def _process_direction_lifecycle(
         ).total_seconds() / 3600
         if hours < recovery_hours:
             continue
-        if _check_direction_health(d) is None:
+        if not d.get("needs_manual_intervention"):
             d["status"] = "active"
             for k in ("auto_paused", "paused_reason", "paused_at"):
                 d.pop(k, None)
-            # Clear stale manual-intervention alert if the last pause's dominant error
-            # fingerprint differs from what we last remediated. A different fingerprint
-            # means the original root cause is gone; the UI alert should reflect that
-            # rather than persisting indefinitely.
-            current_fp = d.get("error_fingerprint")
-            last_rem_fp = d.get("last_remediation_fingerprint")
-            if (
-                d.get("needs_manual_intervention")
-                and current_fp
-                and last_rem_fp
-                and str(current_fp) != str(last_rem_fp)
-            ):
-                d.pop("needs_manual_intervention", None)
-                d.pop("needs_manual_intervention_at", None)
-                logger.info(
-                    f"[AUTONOMOUS] Cleared needs_manual_intervention on {d.get('id')}: "
-                    f"fingerprint changed since remediation"
-                )
             # Start remediation-effectiveness monitoring when recovering a direction whose
             # remediation task merged. Subsequent failures with the same error fingerprint
             # during this window signal the fix did not hold; escalation is triggered below
@@ -625,9 +619,12 @@ async def _process_direction_lifecycle(
             )
             directions_modified = True
         else:
+            # Lifetime-burn backstop pauses require manual operator action (retire or reset)
+            # because the cumulative metric won't drop on its own. Keep the pause active
+            # until the operator reactivates the direction or the TTL fallback clears the flag.
             d["paused_at"] = _utcnow().isoformat()
             logger.info(
-                f"[AUTONOMOUS] Direction {d.get('id')} still unhealthy, extending pause"
+                f"[AUTONOMOUS] Direction {d.get('id')} requires manual intervention, extending pause"
             )
             directions_modified = True
     active_directions = []
@@ -923,6 +920,27 @@ async def _process_direction_lifecycle(
             d.pop(
                 "diagnosis_stall_retry_count", None
             )  # Reset retries for this pause event
+            # Store structured evidence for churn guardrail pauses so the operator
+            # can see the windowed counts (not just the reason string).
+            if pause_reason.startswith("Churn guardrail:"):
+                churn_ev = _compute_churn_metrics(d)
+                if churn_ev:
+                    d["churn_pause_evidence"] = churn_ev
+            # Lifetime burn backstop: store evidence and flag for manual intervention.
+            # The lifetime metric won't drop on its own after auto-recovery, so the
+            # direction would thrash through repeated pause/extend cycles — surface it
+            # for operator decision (retire vs. reset history_aggregate) instead.
+            if pause_reason.startswith("Lifetime burn backstop:"):
+                lb_ev = _compute_lifetime_burn_metrics(d)
+                if lb_ev:
+                    d["lifetime_burn_pause_evidence"] = lb_ev
+                if not d.get("needs_manual_intervention"):
+                    d["needs_manual_intervention"] = True
+                    d["needs_manual_intervention_at"] = _utcnow().isoformat()
+                    logger.warning(
+                        f"[AUTONOMOUS] Direction {did} flagged needs_manual_intervention "
+                        f"(lifetime burn backstop): operator must retire or reset."
+                    )
             # Only code-failure pauses (Rules 3/4) count toward auto-retirement.
             # Infrastructure-driven pauses (saturation, unproductive) shouldn't
             # permanently retire an otherwise healthy direction.
@@ -1044,19 +1062,48 @@ async def _process_direction_lifecycle(
             logger.info(f"[AUTONOMOUS] Auto-paused direction {did}: {pause_reason}")
             auto_paused_any = True
             try:
-                from app.notification_dispatch import post_direction_milestone_message  # noqa: PLC0415
+                if pause_reason.startswith("Lifetime burn backstop:"):
+                    from app.notification_dispatch import (
+                        post_direction_burn_pause_message,
+                    )  # noqa: PLC0415
 
-                await post_direction_milestone_message(
-                    session,
-                    project.id,
-                    direction_text=d.get("text", ""),
-                    milestone="auto-paused",
-                    reason=pause_reason,
-                    direction_id=did,
-                )
+                    await post_direction_burn_pause_message(
+                        session,
+                        project.id,
+                        direction_text=d.get("text", ""),
+                        reason=pause_reason,
+                        direction_id=did,
+                        evidence=d.get("lifetime_burn_pause_evidence"),
+                    )
+                elif pause_reason.startswith("Churn guardrail:"):
+                    from app.notification_dispatch import (
+                        post_direction_churn_pause_message,
+                    )  # noqa: PLC0415
+
+                    await post_direction_churn_pause_message(
+                        session,
+                        project.id,
+                        direction_text=d.get("text", ""),
+                        reason=pause_reason,
+                        direction_id=did,
+                        evidence=d.get("churn_pause_evidence"),
+                    )
+                else:
+                    from app.notification_dispatch import (
+                        post_direction_milestone_message,
+                    )  # noqa: PLC0415
+
+                    await post_direction_milestone_message(
+                        session,
+                        project.id,
+                        direction_text=d.get("text", ""),
+                        milestone="auto-paused",
+                        reason=pause_reason,
+                        direction_id=did,
+                    )
             except Exception as _notify_exc:
                 logger.warning(
-                    f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}"
+                    f"[NOTIFY] Failed to post direction pause notification: {_notify_exc}"
                 )
             try:
                 if _is_code_failure_pause_reason(pause_reason):
@@ -1161,6 +1208,53 @@ async def _process_direction_lifecycle(
                 d.pop("possibly_complete", None)
                 d.pop("completion_suggestion", None)
                 directions_modified = True
+        # Advisory outcome-progress (scaffolding) detection — surfacing only, NEVER
+        # auto-pauses. Flags a long-running healthy-merge direction whose outcome
+        # signal has stalled so the strategic agent / operator can decide to retire,
+        # redirect, or redefine it. Notify once per transition into the flagged state.
+        scaffolding_ev = _check_outcome_scaffolding(d)
+        if scaffolding_ev:
+            if not d.get("outcome_scaffolding_flagged"):
+                d["outcome_scaffolding_flagged"] = True
+                d["outcome_scaffolding_flagged_at"] = _utcnow().isoformat()
+                d["outcome_scaffolding_evidence"] = scaffolding_ev
+                directions_modified = True
+                logger.warning(
+                    f"[AUTONOMOUS] Direction {did} flagged outcome-less scaffolding: "
+                    f"{scaffolding_ev['total_cycles']} cycles, "
+                    f"{scaffolding_ev['lifetime_merged']} merged "
+                    f"(rate {scaffolding_ev['lifetime_merge_rate']:.0%}), "
+                    f"progress stalled {scaffolding_ev['stall_run_cycles']} cycles"
+                )
+                try:
+                    from app.notification_dispatch import (
+                        post_direction_outcome_stalled_message,
+                    )  # noqa: PLC0415
+
+                    await post_direction_outcome_stalled_message(
+                        session,
+                        project.id,
+                        direction_text=d.get("text", ""),
+                        evidence=scaffolding_ev,
+                        direction_id=did,
+                    )
+                except Exception as _notify_exc:
+                    logger.warning(
+                        f"[NOTIFY] Failed to post outcome-stalled message for {did}: "
+                        f"{_notify_exc}"
+                    )
+            else:
+                # Keep the evidence fresh while the flag remains set.
+                d["outcome_scaffolding_evidence"] = scaffolding_ev
+        elif d.get("outcome_scaffolding_flagged"):
+            d.pop("outcome_scaffolding_flagged", None)
+            d.pop("outcome_scaffolding_flagged_at", None)
+            d.pop("outcome_scaffolding_evidence", None)
+            directions_modified = True
+            logger.info(
+                f"[AUTONOMOUS] Cleared outcome-scaffolding flag on {did}: "
+                f"condition no longer holds"
+            )
         active_directions.append(d)
     if auto_paused_any or directions_modified:
         flag_modified(project, "directions")

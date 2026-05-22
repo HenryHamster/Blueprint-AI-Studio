@@ -638,6 +638,13 @@ def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, dict]:
     counts: Dict[tuple, dict] = defaultdict(
         lambda: {
             "miss": 0,
+            # Breakdown by origin (orthogonal to the aggregate miss counter):
+            # reading gap — agent admitted incomplete file coverage
+            "miss_recovery_incomplete": 0,
+            # judgment gap — agent scored category but reviewer disagreed
+            "miss_disagreement": 0,
+            # coverage gap — agent's SR had no entry for the category
+            "miss_coverage_gap": 0,
             "tp": 0,
             "fp": 0,
             "severity": dict.fromkeys(_SEVERITY_LEVELS, 0),
@@ -689,6 +696,13 @@ def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, dict]:
 
         for cat in missed_cats:
             counts[(cat, task_type)]["miss"] += 1
+            origin = (check_results.get(cat) or {}).get("origin")
+            if origin == "reviewer_recovery_after_incomplete_sr":
+                counts[(cat, task_type)]["miss_recovery_incomplete"] += 1
+            elif origin == "reviewer_disagreement":
+                counts[(cat, task_type)]["miss_disagreement"] += 1
+            else:
+                counts[(cat, task_type)]["miss_coverage_gap"] += 1
             matching_finding = next(
                 (
                     f

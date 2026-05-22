@@ -1186,6 +1186,7 @@ def test_retire_ineffective_patterns_retires_low_success_rate():
     doc = {
         "playbook/bad": {
             "content": "bad tip",
+            "source": "auto-generated",
             "followed_count": _RETIRE_MIN_FOLLOWED,
             "confirmed_count": 0,  # 0% success rate — below threshold
         },
@@ -1205,6 +1206,7 @@ def test_retire_ineffective_patterns_keeps_sufficient_success_rate():
     doc = {
         "playbook/good": {
             "content": "good tip",
+            "source": "auto-generated",
             "followed_count": _RETIRE_MIN_FOLLOWED,
             "confirmed_count": _RETIRE_MIN_FOLLOWED,  # 100% — well above threshold
         },
@@ -1220,6 +1222,7 @@ def test_retire_ineffective_patterns_skips_entries_below_min_followed():
     doc = {
         "playbook/new": {
             "content": "new tip",
+            "source": "auto-generated",
             "followed_count": _RETIRE_MIN_FOLLOWED - 1,
             "confirmed_count": 0,  # Would retire if followed enough
         },
@@ -1235,6 +1238,7 @@ def test_retire_ineffective_patterns_retirement_reason_includes_rate():
     doc = {
         "playbook/tip": {
             "content": "x",
+            "source": "auto-generated",
             "followed_count": 10,
             "confirmed_count": 1,  # 10% success rate
         },
@@ -1244,6 +1248,83 @@ def test_retire_ineffective_patterns_retirement_reason_includes_rate():
     assert len(archive) == 1
     reason = archive[0]["_retirement_reason"]
     assert "0.10" in reason
+
+
+def test_retire_ineffective_patterns_skips_operator_curated():
+    """Operator-curated entries (non-auto source) must NOT be retired even if low success rate."""
+    from app.playbook_learning import retire_ineffective_patterns, _RETIRE_MIN_FOLLOWED
+
+    doc = {
+        "playbook/operator-tip": {
+            "content": "operator tip",
+            "source": "operator",
+            "followed_count": _RETIRE_MIN_FOLLOWED,
+            "confirmed_count": 0,
+        },
+        "playbook/review-tip": {
+            "content": "review tip",
+            "source": "review-extracted",
+            "followed_count": _RETIRE_MIN_FOLLOWED,
+            "confirmed_count": 0,
+        },
+    }
+    retired = retire_ineffective_patterns(doc)
+    assert retired == []
+    assert "playbook/operator-tip" in doc
+    assert "playbook/review-tip" in doc
+
+
+def test_retire_ineffective_patterns_skips_no_source():
+    """Entries with no source field must NOT be retired (treated as operator-curated)."""
+    from app.playbook_learning import retire_ineffective_patterns, _RETIRE_MIN_FOLLOWED
+
+    doc = {
+        "playbook/legacy": {
+            "content": "legacy tip",
+            "followed_count": _RETIRE_MIN_FOLLOWED,
+            "confirmed_count": 0,
+        },
+    }
+    retired = retire_ineffective_patterns(doc)
+    assert retired == []
+    assert "playbook/legacy" in doc
+
+
+def test_count_low_success_retired_within_window():
+    from app.playbook_learning import count_low_success_retired_within
+
+    now = _utcnow()
+    doc = {
+        "playbook_archive": [
+            # Within 24h, low_success_rate reason → counted
+            {
+                "_archived_key": "playbook/a",
+                "_archived_at": (now - timedelta(hours=2)).isoformat(),
+                "_retirement_reason": "low_success_rate:0.10",
+            },
+            # Within 24h, but idle reason → NOT counted
+            {
+                "_archived_key": "playbook/b",
+                "_archived_at": (now - timedelta(hours=2)).isoformat(),
+                "_retirement_reason": "idle_auto_entry:30d",
+            },
+            # low_success_rate but older than 24h → NOT counted
+            {
+                "_archived_key": "playbook/c",
+                "_archived_at": (now - timedelta(hours=48)).isoformat(),
+                "_retirement_reason": "low_success_rate:0.05",
+            },
+            # Within 24h, low_success_rate → counted
+            {
+                "_archived_key": "playbook/d",
+                "_archived_at": (now - timedelta(hours=23)).isoformat(),
+                "_retirement_reason": "low_success_rate:0.20",
+            },
+        ],
+    }
+    assert count_low_success_retired_within(doc, hours=24) == 2
+    assert count_low_success_retired_within({}, hours=24) == 0
+    assert count_low_success_retired_within({"playbook_archive": []}, hours=24) == 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3915,7 +3996,7 @@ def _make_sr_task(
 async def test_compute_sr_catch_rate_trends_returns_none_below_sample_size(
     db_session: AsyncSession,
 ):
-    """Returns None when either window has fewer than 5 tasks with both fields."""
+    """Returns None when either window has fewer than _MIN_SR_FINDINGS reviewer findings."""
     from app.playbook_learning import compute_sr_catch_rate_trends
 
     project = await _make_project(db_session)
@@ -3943,6 +4024,90 @@ async def test_compute_sr_catch_rate_trends_returns_none_below_sample_size(
     result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
 
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_exposes_finding_counts(
+    db_session: AsyncSession,
+):
+    """result contains current_finding_count / previous_finding_count (true denominator)
+    and per-category low_confidence_finding_count flag."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[]
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id, age_days=20, human_cats={"test-coverage": 1}, sr_failed_cats=[]
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result["current_finding_count"] == 5
+    assert result["previous_finding_count"] == 5
+    cat = result["categories"]["test-coverage"]
+    assert cat["current_human_count"] == 5
+    # 5 findings == _MIN_SR_FINDINGS, so not low-confidence
+    assert cat["low_confidence_finding_count"] is False
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_low_confidence_suppresses_trend(
+    db_session: AsyncSession,
+):
+    """Categories with fewer than _MIN_SR_FINDINGS findings are flagged low-confidence
+    and their trend is suppressed to 'stable' even when hit rates diverge."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 6 tasks — 5 flag 'correctness', 1 flags 'test-coverage' (low-finding cat)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    t = _make_sr_task(
+        project.id, age_days=2, human_cats={"test-coverage": 1}, sr_failed_cats=[]
+    )
+    db_session.add(t)
+    tasks.append(t)
+    # Previous window: 5 tasks all flag 'correctness' (hit rate differs); 'test-coverage' absent
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    # 'test-coverage' has only 1 finding in current window — low-confidence, trend suppressed
+    tc = result["categories"]["test-coverage"]
+    assert tc["low_confidence_finding_count"] is True
+    assert tc["trend"] == "stable"
+    # 'correctness' has 5 current + 5 previous = enough findings, not low-confidence
+    corr = result["categories"]["correctness"]
+    assert corr["low_confidence_finding_count"] is False
 
 
 @pytest.mark.asyncio
@@ -4165,6 +4330,235 @@ async def test_compute_sr_catch_rate_trends_trend_classification(
 
     assert result is not None
     assert result["categories"]["test-coverage"]["trend"] == "decreasing"
+    assert result["categories"]["test-coverage"]["trend_significant"] is True
+
+
+@pytest.mark.asyncio
+async def test_trend_small_sample_swing_suppressed(db_session: AsyncSession):
+    """n=5 per window with a 1-finding delta (0.2 hit-rate diff) is sampling noise.
+
+    The two-proportion z-test (z≈0.63 < _TREND_Z_MIN=1.28) must suppress the
+    directional label even though delta (0.2) exceeds _TREND_DELTA_THRESHOLD (0.05).
+    trend_significant must be False to distinguish this from 'not enough data'.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 2/5 = 0.4 hit_rate
+    for _ in range(2):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(3):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: 3/5 = 0.6 hit_rate (delta=−0.2, z≈0.63)
+    for _ in range(3):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(2):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["test-coverage"]
+    # delta=−0.2 exceeds the raw threshold but is not statistically significant
+    assert cat["trend"] == "stable"
+    assert cat["trend_significant"] is False
+
+
+@pytest.mark.asyncio
+async def test_trend_large_consistent_shift_reported(db_session: AsyncSession):
+    """Large n with a 0.3 hit-rate drop is statistically significant and reported.
+
+    n=30 per window, delta=−0.3 → z≈2.74 >> _TREND_Z_MIN=1.28; trend='decreasing'.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 12/30 = 0.4 hit_rate
+    for _ in range(12):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(18):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: 21/30 = 0.7 hit_rate (delta=−0.3, significant)
+    for _ in range(21):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(9):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cat = result["categories"]["correctness"]
+    assert cat["trend"] == "decreasing"
+    assert cat["trend_significant"] is True
+
+
+@pytest.mark.asyncio
+async def test_trend_significance_scales_with_sample_size(db_session: AsyncSession):
+    """The same delta (0.2) reports 'stable' at n=5 but 'decreasing' at n=30.
+
+    This validates the significance boundary: a fixed raw threshold is insufficient
+    because the same rate change means very different things at different sample sizes.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    # --- Small n: n=5, delta=0.2 → NOT significant ---
+    project_small = await _make_project(db_session)
+    tasks_small = []
+    for _ in range(2):  # current 2/5 = 0.4
+        t = _make_sr_task(
+            project_small.id,
+            age_days=2,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=["error-handling"],
+        )
+        db_session.add(t)
+        tasks_small.append(t)
+    for _ in range(3):
+        t = _make_sr_task(
+            project_small.id,
+            age_days=2,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks_small.append(t)
+    for _ in range(3):  # previous 3/5 = 0.6
+        t = _make_sr_task(
+            project_small.id,
+            age_days=20,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=["error-handling"],
+        )
+        db_session.add(t)
+        tasks_small.append(t)
+    for _ in range(2):
+        t = _make_sr_task(
+            project_small.id,
+            age_days=20,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks_small.append(t)
+
+    # --- Large n: n=30, delta=0.2 → significant ---
+    project_large = await _make_project(db_session)
+    tasks_large = []
+    for _ in range(12):  # current 12/30 = 0.4
+        t = _make_sr_task(
+            project_large.id,
+            age_days=2,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=["error-handling"],
+        )
+        db_session.add(t)
+        tasks_large.append(t)
+    for _ in range(18):
+        t = _make_sr_task(
+            project_large.id,
+            age_days=2,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks_large.append(t)
+    for _ in range(18):  # previous 18/30 = 0.6
+        t = _make_sr_task(
+            project_large.id,
+            age_days=20,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=["error-handling"],
+        )
+        db_session.add(t)
+        tasks_large.append(t)
+    for _ in range(12):
+        t = _make_sr_task(
+            project_large.id,
+            age_days=20,
+            human_cats={"error-handling": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks_large.append(t)
+
+    await db_session.flush()
+
+    result_small = await compute_sr_catch_rate_trends(
+        project_small.id, db_session, tasks_small
+    )
+    result_large = await compute_sr_catch_rate_trends(
+        project_large.id, db_session, tasks_large
+    )
+
+    assert result_small is not None
+    assert result_large is not None
+    small_cat = result_small["categories"]["error-handling"]
+    large_cat = result_large["categories"]["error-handling"]
+    # Same delta, different sample sizes → different significance outcomes
+    assert small_cat["trend"] == "stable"
+    assert small_cat["trend_significant"] is False
+    assert large_cat["trend"] == "decreasing"
+    assert large_cat["trend_significant"] is True
 
 
 @pytest.mark.asyncio
@@ -4915,6 +5309,225 @@ async def test_compute_sr_catch_rate_trends_by_direction_stores_direction_text(
     assert result is not None
     entry = result["by_direction"][direction_id]
     assert entry.get("direction_text") == "Fix the login regression"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for reviewer_hallucination_rate in compute_sr_catch_rate_trends
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_sr_task_with_rff(
+    project_id,
+    *,
+    age_days: float,
+    total_reviewer_findings: int,
+    filtered_count: int,
+) -> Task:
+    """Build a Task carrying reviewer_findings_filtered in its SR outcome."""
+    ctx: dict = {
+        "_self_review_outcome": {
+            "check_results": {"correctness": {"passed": True}},
+            "reviewer_findings_filtered": {
+                "total_reviewer_findings": total_reviewer_findings,
+                "filtered_count": filtered_count,
+                "sampled_phantom_paths": [],
+            },
+        },
+        "_first_attempt_rejection_categories": {"correctness": 1},
+    }
+    task = Task(
+        project_id=project_id,
+        title="RFF task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_reviewer_hallucination_rate_omitted_below_floor(
+    db_session: AsyncSession,
+):
+    """reviewer_hallucination_rate is absent when total findings < floor (10)."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 5 tasks, each with only 1 total finding → sum=5, below floor of 10
+    for _ in range(5):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=2, total_reviewer_findings=1, filtered_count=0
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=20, total_reviewer_findings=1, filtered_count=0
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    # Neither window meets the floor (5 < 10), so the key should be absent
+    assert "reviewer_hallucination_rate" not in result
+
+
+@pytest.mark.asyncio
+async def test_reviewer_hallucination_rate_correct_computation(
+    db_session: AsyncSession,
+):
+    """reviewer_hallucination_rate current_rate = filtered/total across current window tasks."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 5 tasks, 4 findings each → total=20, filtered=5 → rate=0.25
+    for _ in range(5):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=2, total_reviewer_findings=4, filtered_count=1
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: 5 tasks, 4 findings each → total=20, filtered=0 → rate=0.0
+    for _ in range(5):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=20, total_reviewer_findings=4, filtered_count=0
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    assert "reviewer_hallucination_rate" in result
+    rhr = result["reviewer_hallucination_rate"]
+    assert rhr["current_rate"] == pytest.approx(0.25, abs=0.001)
+    assert rhr["previous_rate"] == pytest.approx(0.0, abs=0.001)
+    assert rhr["current_sample"] == 20
+    assert rhr["previous_sample"] == 20
+    assert rhr["delta"] == pytest.approx(0.25, abs=0.001)
+
+
+@pytest.mark.asyncio
+async def test_reviewer_hallucination_rate_delta_direction(
+    db_session: AsyncSession,
+):
+    """delta is positive when current_rate > previous_rate (worsening)."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: higher hallucination rate (6/20 = 0.3)
+    for _ in range(5):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=2, total_reviewer_findings=4, filtered_count=1
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: lower hallucination rate (2/20 = 0.1)
+    for _ in range(5):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=20, total_reviewer_findings=4, filtered_count=0
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Add 2 more current and 2 more previous with extra filtered
+    t_extra_curr = _make_sr_task_with_rff(
+        project.id, age_days=3, total_reviewer_findings=0, filtered_count=0
+    )
+    t_extra_prev = _make_sr_task_with_rff(
+        project.id, age_days=21, total_reviewer_findings=0, filtered_count=0
+    )
+    db_session.add(t_extra_curr)
+    db_session.add(t_extra_prev)
+    tasks.extend([t_extra_curr, t_extra_prev])
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    if "reviewer_hallucination_rate" in result:
+        rhr = result["reviewer_hallucination_rate"]
+        # delta should be current_rate - previous_rate
+        if rhr["delta"] is not None:
+            assert (
+                abs(rhr["delta"] - (rhr["current_rate"] - rhr["previous_rate"])) < 0.001
+            )
+
+
+@pytest.mark.asyncio
+async def test_reviewer_hallucination_rate_persists_to_design_doc(
+    db_session: AsyncSession,
+):
+    """reviewer_hallucination_rate is persisted in project.design_doc['sr_catch_rate_trends']."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(5):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=2, total_reviewer_findings=4, filtered_count=2
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=20, total_reviewer_findings=4, filtered_count=1
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    assert "reviewer_hallucination_rate" in result
+    doc = project.design_doc or {}
+    stored = doc.get("sr_catch_rate_trends", {})
+    assert "reviewer_hallucination_rate" in stored
+
+
+@pytest.mark.asyncio
+async def test_reviewer_hallucination_rate_tasks_without_field_ignored(
+    db_session: AsyncSession,
+):
+    """Tasks without reviewer_findings_filtered contribute nothing to the rate."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Mix tasks with and without the field; only those with field count
+    for _ in range(3):
+        t = _make_sr_task_with_rff(
+            project.id, age_days=2, total_reviewer_findings=5, filtered_count=1
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # 2 tasks without the field (old-style)
+    for _ in range(2):
+        t = _make_sr_task(
+            project.id, age_days=2, human_cats={"correctness": 1}, sr_failed_cats=[]
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id, age_days=20, human_cats={"correctness": 1}, sr_failed_cats=[]
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    # Previous window has no tasks with reviewer_findings_filtered, so no rate for it.
+    # Current window total = 3*5 = 15 >= 10, so current_rate should be present.
+    if "reviewer_hallucination_rate" in result:
+        rhr = result["reviewer_hallucination_rate"]
+        assert rhr["current_sample"] == 15  # only the 3 tasks with rff contribute
+        assert rhr["previous_rate"] is None  # previous window below floor
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7807,12 +8420,14 @@ async def test_categorize_review_issues_llm_returns_correct_buckets():
 
     import os
 
-    with patch.dict(
-        os.environ,
-        {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_REVIEW_CATEGORIZATION": ""},
+    with (
+        patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_REVIEW_CATEGORIZATION": ""},
+        ),
+        patch("anthropic.AsyncAnthropic", mock_client_cls),
     ):
-        with patch("anthropic.AsyncAnthropic", mock_client_cls):
-            result = await categorize_review_issues_llm(issues)
+        result = await categorize_review_issues_llm(issues)
 
     assert "test-coverage" in result
     assert result["test-coverage"][0]["desc"] == "missing unit tests"
@@ -7832,15 +8447,17 @@ async def test_categorize_review_issues_llm_falls_back_on_api_error():
 
     import os
 
-    with patch.dict(
-        os.environ,
-        {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_REVIEW_CATEGORIZATION": ""},
-    ):
-        with patch(
+    with (
+        patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_REVIEW_CATEGORIZATION": ""},
+        ),
+        patch(
             "anthropic.AsyncAnthropic",
             MagicMock(side_effect=Exception("network error")),
-        ):
-            result = await categorize_review_issues_llm(issues)
+        ),
+    ):
+        result = await categorize_review_issues_llm(issues)
 
     expected = _keyword_from_flat(issues)
     assert result == expected
@@ -11091,7 +11708,7 @@ def _make_latency_task(
     # SR marks all miss_cats as passed=True
     check_results = {cat: {"passed": True, "issue": ""} for cat in miss_cats}
     # human cats contains all miss_cats
-    human_cats = {cat: 1 for cat in miss_cats}
+    human_cats = dict.fromkeys(miss_cats, 1)
     sr_outcome = {
         "check_results": check_results,
         "completed_at": sr_completed_at.isoformat(),
@@ -11914,3 +12531,720 @@ def test_stats_for_tasks_lone_checker_recovery_excluded_from_sr_failed_author():
     # lone_checker_recovery is not an author SR failure, so fp_count must be 0.
     security = cat_stats.get("security", {})
     assert security.get("fp_count", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# miss_mode_breakdown per-category breakdown in compute_sr_catch_rate_trends
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_miss_mode_breakdown(
+    db_session: AsyncSession,
+):
+    """compute_sr_catch_rate_trends attaches miss_mode_breakdown per category with correct counters."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 5 tasks on "correctness" with distinct reviewer origins.
+    # 1 reading_gap, 2 judgment_gap, 2 coverage_gap
+    current_specs = [
+        {"origin": "reviewer_recovery_after_incomplete_sr"},
+        {"origin": "reviewer_disagreement"},
+        {"origin": "reviewer_disagreement"},
+        {"origin": "reviewer"},
+        {"origin": "reviewer"},
+    ]
+    for spec in current_specs:
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            check_result_overrides={"correctness": {"origin": spec["origin"]}},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: 5 tasks (no origin tags)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"]["correctness"]
+    breakdown = cat.get("miss_mode_breakdown")
+    assert breakdown is not None, (
+        "miss_mode_breakdown should be present for reviewer-origin misses"
+    )
+    assert breakdown["reading_gap"] == 1
+    assert breakdown["judgment_gap"] == 2
+    assert breakdown["coverage_gap"] == 2
+    # Both judgment_gap and coverage_gap tied at 2; dominant is one of them
+    assert breakdown["dominant_mode"] in ("judgment_gap", "coverage_gap")
+
+
+@pytest.mark.asyncio
+async def test_below_floor_flag_persisted_to_design_doc(db_session: AsyncSession):
+    """below_floor=True is stored in design_doc categories when a category has
+    been below the floor threshold for >= _FLOOR_MIN_CONSECUTIVE_WINDOWS windows.
+    The dispatcher's _evaluate_sr_below_floor_signal reads this field directly."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _make_project(db_session)
+    # Pre-seed one prior below-floor rate_history entry so two consecutive
+    # below-floor windows are reached after a single compute call.
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": (_utcnow() - timedelta(days=15)).isoformat(),
+            "categories": {
+                "correctness": {"rate_history": [0.3]},
+            },
+        }
+    }
+    flag_modified(project, "design_doc")
+    await db_session.flush()
+
+    tasks = []
+    # Current window: 5 tasks — all SR misses (hit_rate=0.0, below 50% floor).
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],  # SR passes → miss
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: 5 tasks with low hit rate (also below floor).
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    await db_session.flush()
+
+    stored = (project.design_doc or {}).get("sr_catch_rate_trends", {})
+    cat = stored.get("categories", {}).get("correctness", {})
+    assert cat.get("below_floor") is True, (
+        "below_floor must be True after two consecutive below-floor windows; "
+        "dispatcher reads this field from design_doc"
+    )
+    assert cat.get("current_hit_rate") is not None, (
+        "current_hit_rate required by dispatcher"
+    )
+    assert isinstance(cat.get("rate_history"), list) and len(cat["rate_history"]) >= 2
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_false_attestation_no_duplicate_alerts(
+    db_session: AsyncSession,
+):
+    """Calling compute_sr_false_attestation_trends twice with the same elevated
+    categories must not create duplicate Alert rows (defense-in-depth dedup)."""
+    from app.playbook_learning import compute_sr_false_attestation_trends
+
+    project = await _make_project(db_session)
+
+    def _fa_task():
+        """Task where SR claimed tests_executed_cleanly=PASS but CI failed."""
+        t = Task(
+            project_id=project.id,
+            title="false attestation task",
+            payloads=[{"type": "create", "prompt": "p"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {
+                    "check_results": {
+                        "tests_executed_cleanly": {
+                            "passed": True,
+                            "evidence": "exit_code=0",
+                        }
+                    }
+                },
+                "review_loop": {"ci_passed": False},
+            },
+        )
+        t.created_at = _utcnow() - timedelta(days=2)
+        return t
+
+    tasks = [_fa_task() for _ in range(5)]
+    for t in tasks:
+        db_session.add(t)
+    await db_session.flush()
+
+    await compute_sr_false_attestation_trends(project.id, db_session, tasks)
+    await db_session.flush()
+    await compute_sr_false_attestation_trends(project.id, db_session, tasks)
+    await db_session.flush()
+
+    alerts = (
+        (
+            await db_session.execute(
+                _sql_select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title.like("SR false attestation rate elevated%"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, (
+        f"expected exactly 1 false-attestation alert, got {len(alerts)}; "
+        "duplicate-alert dedup guard must be active"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for engagement_thinning flag in compute_sr_catch_rate_trends
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_engagement_thinning_flag_set_when_below_threshold(
+    db_session: AsyncSession,
+):
+    """engagement_thinning=True when rate < threshold and total >= min_passes."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # 10 current-window PASS tasks for correctness: 0 have reasoning → rate = 0.0
+    for _ in range(10):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": ""},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window tasks to establish a history entry
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"].get("correctness")
+    assert cat is not None
+    assert cat["reasoning_engagement_total"] == 10
+    assert cat["reasoning_engagement_rate"] == 0.0  # below 0.5 threshold
+    assert cat["engagement_thinning"] is True
+
+
+@pytest.mark.asyncio
+async def test_engagement_thinning_flag_false_when_insufficient_passes(
+    db_session: AsyncSession,
+):
+    """engagement_thinning=False when total < min_passes (default 10), even if rate is low."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Only 5 PASS tasks (below the default min_passes=10) in current window
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": ""},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous-window tasks to ensure the function can compute trends (non-None result)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"].get("correctness")
+    assert cat is not None
+    assert cat["reasoning_engagement_total"] == 5
+    assert cat["reasoning_engagement_rate"] == 0.0
+    # Too few samples — thinning flag must be False
+    assert cat["engagement_thinning"] is False
+
+
+@pytest.mark.asyncio
+async def test_engagement_thinning_flag_set_for_regressing_category(
+    db_session: AsyncSession,
+):
+    """engagement_thinning=True even for a regressing category (no exclusion)."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 10 hits (SR catches human) + 10 no-reasoning PASS tasks
+    # → category is NOT regressing by miss_rate, but engagement rate = 0.0
+    # Make it regressing by having a decreasing hit rate vs previous window.
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # 10 PASS tasks with no reasoning in current window
+    for _ in range(10):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": ""},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: all hits → current window has lower hit rate → regressing
+    for _ in range(10):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"].get("correctness")
+    assert cat is not None
+    # The category should be regressing (below 0.5 threshold) or have trend decreasing
+    assert cat["reasoning_engagement_total"] == 10
+    assert cat["reasoning_engagement_rate"] == 0.0
+    # thinning flag applies even for regressing categories
+    assert cat["engagement_thinning"] is True
+
+
+@pytest.mark.asyncio
+async def test_engagement_thinning_honors_design_doc_overrides(
+    db_session: AsyncSession,
+):
+    """engagement_thinning respects sr_engagement_threshold / sr_engagement_min_passes from design_doc."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    # Override threshold=0.8, min_passes=5 so that 5 passes at 0.0 rate qualifies.
+    project = await _make_project(
+        db_session,
+        design_doc={
+            "sr_engagement_threshold": 0.8,
+            "sr_engagement_min_passes": 5,
+        },
+    )
+    tasks = []
+    # 5 PASS tasks with no reasoning — rate=0.0, total=5
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],
+            sr_passed_cats_with_reasoning={"correctness": ""},
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous-window tasks to ensure the function can compute trends (non-None result)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    cat = result["categories"].get("correctness")
+    assert cat is not None
+    assert cat["reasoning_engagement_total"] == 5
+    assert cat["reasoning_engagement_rate"] == 0.0
+    # With overrides: threshold=0.8, min_passes=5 → 5 passes at 0.0 qualifies
+    assert cat["engagement_thinning"] is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for anti-resurrection suppression helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_is_auto_playbook_suppressed_archive_within_cooldown():
+    """Entry archived within cooldown window is suppressed."""
+    from app.playbook_learning import _is_auto_playbook_suppressed
+    from app.models import _utcnow
+
+    now_str = _utcnow().isoformat()
+    doc = {
+        "playbook_archive": [
+            {
+                "_archived_key": "playbook/auto-test-pattern",
+                "_archived_at": now_str,
+                "_retirement_reason": "idle_auto_entry:30d",
+            }
+        ]
+    }
+    assert _is_auto_playbook_suppressed(doc, "playbook/auto-test-pattern") is True
+
+
+def test_is_auto_playbook_suppressed_archive_after_cooldown():
+    """Entry archived beyond cooldown window is NOT suppressed."""
+    from app.playbook_learning import (
+        _is_auto_playbook_suppressed,
+        _AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS,
+    )
+    from app.models import _utcnow
+
+    old_str = (
+        _utcnow() - timedelta(days=_AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS + 1)
+    ).isoformat()
+    doc = {
+        "playbook_archive": [
+            {
+                "_archived_key": "playbook/auto-test-pattern",
+                "_archived_at": old_str,
+                "_retirement_reason": "idle_auto_entry:30d",
+            }
+        ]
+    }
+    assert _is_auto_playbook_suppressed(doc, "playbook/auto-test-pattern") is False
+
+
+def test_is_auto_playbook_suppressed_operator_deleted_key():
+    """Key in playbook_deleted_keys is suppressed regardless of archive."""
+    from app.playbook_learning import _is_auto_playbook_suppressed
+
+    doc = {
+        "playbook_deleted_keys": ["playbook/auto-test-pattern"],
+    }
+    assert _is_auto_playbook_suppressed(doc, "playbook/auto-test-pattern") is True
+
+
+def test_is_auto_playbook_suppressed_never_seen():
+    """Key with no archive entry and not in deleted_keys is NOT suppressed."""
+    from app.playbook_learning import _is_auto_playbook_suppressed
+
+    doc: dict = {}
+    assert _is_auto_playbook_suppressed(doc, "playbook/auto-test-pattern") is False
+
+
+def test_get_prior_archive_entry_returns_most_recent():
+    """_get_prior_archive_entry returns the most recent (last) archive entry."""
+    from app.playbook_learning import _get_prior_archive_entry
+
+    doc = {
+        "playbook_archive": [
+            {
+                "_archived_key": "playbook/k",
+                "_archived_at": "2026-01-01T00:00:00",
+                "confirmed_count": 3,
+            },
+            {
+                "_archived_key": "playbook/k",
+                "_archived_at": "2026-02-01T00:00:00",
+                "confirmed_count": 7,
+            },
+            {"_archived_key": "playbook/other", "_archived_at": "2026-03-01T00:00:00"},
+        ]
+    }
+    entry = _get_prior_archive_entry(doc, "playbook/k")
+    assert entry is not None
+    assert entry["confirmed_count"] == 7
+
+
+def test_get_prior_archive_entry_returns_none_when_missing():
+    """_get_prior_archive_entry returns None when no matching archive entry."""
+    from app.playbook_learning import _get_prior_archive_entry
+
+    doc: dict = {"playbook_archive": [{"_archived_key": "playbook/other"}]}
+    assert _get_prior_archive_entry(doc, "playbook/missing") is None
+
+
+def test_first_attempt_skips_suppressed_key():
+    """_maybe_auto_playbook_from_first_attempt skips keys in playbook_deleted_keys."""
+    from app.playbook_learning import (
+        _maybe_auto_playbook_from_first_attempt,
+        _DIRECTION_FIRST_ATTEMPT_KEY,
+        _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD,
+    )
+
+    direction_key = "dir-abc123"
+    dir_slug = direction_key[:8].replace("-", "").replace("_", "")
+    suppressed_key = f"playbook/first-attempt-{dir_slug}-test-coverage"
+
+    doc: dict = {
+        _DIRECTION_FIRST_ATTEMPT_KEY: {
+            direction_key: {
+                "test-coverage": _FIRST_ATTEMPT_PLAYBOOK_THRESHOLD + 2,
+            }
+        },
+        "playbook_deleted_keys": [suppressed_key],
+    }
+    created = _maybe_auto_playbook_from_first_attempt(
+        doc, direction_key, "create", "task-id"
+    )
+    assert created == []
+
+
+@pytest.mark.asyncio
+async def test_auto_playbook_skips_if_archived_within_cooldown(
+    db_session: AsyncSession,
+):
+    """_maybe_auto_playbook does not recreate entry archived within cooldown."""
+    from app.playbook_learning import (
+        _maybe_auto_playbook,
+        _signature_to_key,
+        _extract_failure_signature,
+    )
+    from app.models import _utcnow
+
+    project = await _make_project(db_session)
+    msg = "vm failed to start after provision attempt"
+
+    # Compute the key that would be generated for this failure pattern
+    sig = _extract_failure_signature("PROVISION_FAILURE", msg, "create", "small")
+    key = _signature_to_key(sig)
+    full_key = f"playbook/{key}"
+
+    # Pre-populate archive with a recently-retired entry
+    now_str = _utcnow().isoformat()
+    project.design_doc = {
+        "playbook_archive": [
+            {
+                "_archived_key": full_key,
+                "_archived_at": now_str,
+                "_retirement_reason": "idle_auto_entry:30d",
+                "confirmed_count": 4,
+            }
+        ]
+    }
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.flush()
+
+    # Two prior tasks with pre-set signature
+    expected_sig = sig
+    t1 = Task(
+        project_id=project.id,
+        title="T1",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={"_failure_signature": expected_sig},
+    )
+    t2 = Task(
+        project_id=project.id,
+        title="T2",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={"_failure_signature": expected_sig},
+    )
+    db_session.add(t1)
+    db_session.add(t2)
+    await db_session.flush()
+
+    # Current task — should be suppressed
+    t3 = Task(
+        project_id=project.id,
+        title="T3",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={},
+    )
+    db_session.add(t3)
+    await db_session.flush()
+
+    result = await _maybe_auto_playbook(t3, "PROVISION_FAILURE", msg, db_session)
+    assert result is None, "Entry should be suppressed within cooldown"
+    doc = project.design_doc or {}
+    assert full_key not in doc
+
+
+@pytest.mark.asyncio
+async def test_auto_playbook_skips_if_operator_deleted(db_session: AsyncSession):
+    """_maybe_auto_playbook does not recreate operator-deleted entries."""
+    from app.playbook_learning import (
+        _maybe_auto_playbook,
+        _signature_to_key,
+        _extract_failure_signature,
+    )
+
+    project = await _make_project(db_session)
+    msg = "vm failed to start after provision attempt"
+
+    sig = _extract_failure_signature("PROVISION_FAILURE", msg, "create", "small")
+    key = _signature_to_key(sig)
+    full_key = f"playbook/{key}"
+
+    # Operator deleted this key
+    project.design_doc = {"playbook_deleted_keys": [full_key]}
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.flush()
+
+    expected_sig = sig
+    t1 = Task(
+        project_id=project.id,
+        title="T1",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={"_failure_signature": expected_sig},
+    )
+    t2 = Task(
+        project_id=project.id,
+        title="T2",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={"_failure_signature": expected_sig},
+    )
+    db_session.add(t1)
+    db_session.add(t2)
+    await db_session.flush()
+
+    t3 = Task(
+        project_id=project.id,
+        title="T3",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={},
+    )
+    db_session.add(t3)
+    await db_session.flush()
+
+    result = await _maybe_auto_playbook(t3, "PROVISION_FAILURE", msg, db_session)
+    assert result is None, "Operator-deleted entry should be suppressed"
+    doc = project.design_doc or {}
+    assert full_key not in doc
+
+
+@pytest.mark.asyncio
+async def test_auto_playbook_recreates_after_cooldown_carries_prior_data(
+    db_session: AsyncSession,
+):
+    """_maybe_auto_playbook re-creates entry after cooldown and carries prior confirmed_count."""
+    from app.playbook_learning import (
+        _maybe_auto_playbook,
+        _signature_to_key,
+        _extract_failure_signature,
+        _AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS,
+    )
+    from app.models import _utcnow
+
+    project = await _make_project(db_session)
+    msg = "vm failed to start after provision attempt"
+
+    sig = _extract_failure_signature("PROVISION_FAILURE", msg, "create", "small")
+    key = _signature_to_key(sig)
+    full_key = f"playbook/{key}"
+
+    # Archive entry is OLDER than cooldown → should be recreatable
+    old_str = (
+        _utcnow() - timedelta(days=_AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS + 1)
+    ).isoformat()
+    project.design_doc = {
+        "playbook_archive": [
+            {
+                "_archived_key": full_key,
+                "_archived_at": old_str,
+                "_retirement_reason": "low_success_rate:0.10",
+                "confirmed_count": 6,
+            }
+        ]
+    }
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.flush()
+
+    expected_sig = sig
+    t1 = Task(
+        project_id=project.id,
+        title="T1",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={"_failure_signature": expected_sig},
+    )
+    t2 = Task(
+        project_id=project.id,
+        title="T2",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={"_failure_signature": expected_sig},
+    )
+    db_session.add(t1)
+    db_session.add(t2)
+    await db_session.flush()
+
+    t3 = Task(
+        project_id=project.id,
+        title="T3",
+        payloads=[{"type": "create", "prompt": "x"}],
+        status=TaskStatus.FAILED,
+        latest_status_message=msg,
+        context={},
+    )
+    db_session.add(t3)
+    await db_session.flush()
+
+    result = await _maybe_auto_playbook(t3, "PROVISION_FAILURE", msg, db_session)
+    assert result is not None, "Entry should be recreated after cooldown elapsed"
+    doc = project.design_doc or {}
+    entry = doc.get(full_key)
+    assert entry is not None
+    # Prior confirmed_count carried forward
+    assert entry["confirmed_count"] == 6
+    # Prior retirement reason preserved
+    assert entry.get("prior_retirement_reason") == "low_success_rate:0.10"

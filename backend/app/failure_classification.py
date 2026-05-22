@@ -145,8 +145,9 @@ SCOPE_EMPTY = "SCOPE_EMPTY"
 # separately from crash/OOM regressions. Lowercase to match the literal string
 # the reaper writes into failure_category context.
 AGENT_STALLED = "agent_stalled"
-# Viewport rendering regression — npm run test:viewport reported overflow or
-# touch-target violations (expectNoOverflowAt / expectMinTouchTargetAt).
+# Viewport rendering regression — npm run test:viewport reported overflow,
+# text-truncation, or touch-target violations (expectNoOverflowAt /
+# expectNoTextTruncationAt / expectMinTouchTargetAt).
 # Distinct from CODE_ERROR so the regression dispatcher and operator panels can
 # track mobile-rendering regressions separately from unit-test or build breaks.
 VIEWPORT_REGRESSION = "VIEWPORT_REGRESSION"
@@ -157,11 +158,13 @@ VIEWPORT_REGRESSION = "VIEWPORT_REGRESSION"
 VIEWPORT_COVERAGE_DROP = "viewport_coverage_drop"
 
 
-# Substrings emitted by expectNoOverflowAt() / expectMinTouchTargetAt() in
-# admin-ui/src/test/viewport.ts. Kept narrow so only true viewport-suite
-# failures get this class rather than any test mentioning "viewport".
+# Substrings emitted by expectNoOverflowAt() / expectNoTextTruncationAt() /
+# expectMinTouchTargetAt() in admin-ui/src/test/viewport.ts. Kept narrow so
+# only true viewport-suite failures get this class rather than any test
+# mentioning "viewport".
 _VIEWPORT_PATTERNS: tuple[str, ...] = (
     "expectnooverflowat(",
+    "expectnotexttruncationat(",
     "expectmintouchtargetat(",
 )
 
@@ -171,6 +174,19 @@ _VIEWPORT_PATTERNS: tuple[str, ...] = (
 # than VIEWPORT_REGRESSION or CODE_ERROR.
 _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS: tuple[str, ...] = (
     "viewport_gate_infra_unavailable",
+)
+
+
+# Agent heartbeat substrings (lowercased) emitted by agent/src/index.ts when the
+# agent is in a live-work state — mid-PR-push (sendHeartbeatSync) or mid-tool-call
+# (statusRef.value).  Tasks reaped in these states (OOM, SIGKILL, VM kill) leave
+# the stale heartbeat as latest_status_message; they are infrastructure deaths, not
+# code defects and must NOT fall through to CODE_ERROR.
+# Cross-language contract: must stay in sync with agent/src/index.ts emissions.
+# Verified by TestCrossLanguageClassificationContracts in test_failure_classification.py.
+_AGENT_LIVE_WORK_PATTERNS: tuple[str, ...] = (
+    "creating pull request for blueprint/",  # sendHeartbeatSync() during PR push
+    "using tool: ",  # statusRef.value during tool calls
 )
 
 
@@ -1653,12 +1669,7 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     # "[fatal:" matches agent _crashReport() labels: [FATAL:uncaughtException], [FATAL:unhandledRejection], etc.
     # NOTE: "timed out" and "killed" intentionally omitted — too broad and cause misclassification.
     # Only use specific forms: "execution timed out", "node process killed", "oom killer".
-    # "creating pull request for blueprint/" is the agent's heartbeat during PR push — never an error
-    # message. Tasks that die in this state (OOM, SIGKILL) leave this stale heartbeat as
-    # latest_status_message; they must not create CODE_ERROR fingerprints in the residual store.
-    # "using tool: " is the agent's heartbeat during a Claude Code tool call (Grep, Read, Edit, etc.).
-    # Tasks reaped mid-tool-call (VM kill, network drop, OOM of the Claude subprocess) leave this
-    # as latest_status_message; they are infrastructure deaths, not code defects.
+    # Live-work heartbeats (_AGENT_LIVE_WORK_PATTERNS) route here too — see module-level comment.
     if any(
         kw in combined
         for kw in [
@@ -1682,8 +1693,7 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
             "[fatal:",
             "fatal error",
             "process crashed",
-            "creating pull request for blueprint/",
-            "using tool: ",
+            *_AGENT_LIVE_WORK_PATTERNS,
         ]
     ):
         return "AGENT_TIMEOUT"

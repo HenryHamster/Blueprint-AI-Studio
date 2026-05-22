@@ -4175,10 +4175,17 @@ async function main() {
       lastPrNumber = claimResult.prNumber;
       lastBaseBranch = claimResult.baseBranch;
 
-      // After a successful role completion, decide whether to poll for a
-      // warm next role. process.env.VM_INSTANCE_ID is set by the orchestrator's
-      // startup script and is what the backend keys warm pinning on. Local
-      // dev and tests where it's absent skip the loop and exit normally.
+      // After a successful role completion, poll for a warm next role. This
+      // single unconditional poll loop serves BOTH warm-VM mechanisms: the
+      // PR-chain pin (warm_continuity) and same-project backlog reuse
+      // (warm_backlog_reuse, efficiency direction d-91d8dede). The agent is
+      // agnostic to which is enabled — the backend decides what /next-role
+      // returns (chain pin, backlog claim, exit, or 204). So no agent change
+      // is needed for backlog reuse: the VM already stays alive and polls here
+      // regardless of whether a chain follow-on is pinned. process.env.
+      // VM_INSTANCE_ID is set by the orchestrator startup script and is what
+      // the backend keys warm pinning on; local dev / tests where it's absent
+      // skip the loop and exit normally.
       const vmInstanceId = process.env.VM_INSTANCE_ID;
       if (!vmInstanceId) break;
 

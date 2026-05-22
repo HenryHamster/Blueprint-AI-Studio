@@ -173,6 +173,7 @@ async def _compute_health_overview(
     active_filters = [Task.status.in_(active_statuses), Task.archived.is_(False)]
     if project_id:
         active_filters.append(Task.project_id == project_id)
+    _ACTIVE_TASKS_LIMIT = 5000
     active_result = await session.execute(
         select(Task)
         .where(*active_filters)
@@ -189,8 +190,16 @@ async def _compute_health_overview(
                 Task.depends_on,
             )
         )
+        .limit(_ACTIVE_TASKS_LIMIT)
     )
     active_tasks = active_result.scalars().all()
+    if len(active_tasks) >= _ACTIVE_TASKS_LIMIT:
+        logger.warning(
+            "[HEALTH-OVERVIEW] active-tasks scan hit cap=%d rows — "
+            "stuck-task diagnostics and queue-depth counts are truncated; "
+            "consider filtering by project_id to reduce result size",
+            _ACTIVE_TASKS_LIMIT,
+        )
 
     # Zone health (needed for remediation hints)
     try:
@@ -337,6 +346,34 @@ async def _compute_health_overview(
                 "category": "zone_exhaustion",
             }
         )
+
+    # --- 4b. Warm-VM continuity circuit breaker ---
+    if _shared_state.runtime_config.get("warm_continuity_enabled", False):
+        if _shared_state.is_warm_continuity_suppressed():
+            sup_until = _shared_state.warm_continuity_suppressed_until
+            clears = _shared_state.count_recent_warm_pin_clears(3600)
+            threshold = _shared_state.runtime_config.get(
+                "warm_pin_clear_rate_threshold", 10
+            )
+            cooldown_min = (
+                _shared_state.runtime_config.get(
+                    "warm_continuity_cooldown_seconds", 1800
+                )
+                // 60
+            )
+            sup_str = sup_until.strftime("%H:%M UTC") if sup_until else "unknown"
+            actionable_issues.append(
+                {
+                    "severity": "warning",
+                    "title": "Warm-VM continuity circuit breaker open — falling back to cold provisioning",
+                    "hint": (
+                        f"{clears} pin-clear events in last hour exceeded threshold ({threshold}). "
+                        f"Auto-resumes at {sup_str} (~{cooldown_min} min cooldown)."
+                    ),
+                    "task_ids": [],
+                    "category": "warm_vm_circuit_breaker",
+                }
+            )
 
     # --- 5. External dependency health ---
     failed_deps = external_health.get("failed_deps", [])
@@ -663,6 +700,7 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
                 if hasattr(cur.status, "value")
                 else str(cur.status),
                 "warm_start": bool(timing.get("warm_start", False)),
+                "warm_claim_origin": timing.get("warm_claim_origin"),
                 "prior_role_vm_id": timing.get("prior_role_vm_id"),
                 "setup_secs": timing.get("setup_secs"),
                 "started_at": cur.started_at.isoformat() if cur.started_at else None,
@@ -716,7 +754,22 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         for t in in_progress_tasks
         if (t.context or {}).get("_timing", {}).get("warm_start") is True
     )
+    # Origin attribution: split the warm-start population into backlog-reuse
+    # claims (a VM picked up an unrelated QUEUED task from the same project's
+    # backlog) vs chain-continuity claims (the existing PR-chain follow-on
+    # path, origin "next_role_endpoint" or legacy unset). The two sum to
+    # active_warm_chains so operators can attribute the reuse lift.
+    active_backlog_reuse_claims = sum(
+        1
+        for t in in_progress_tasks
+        if (t.context or {}).get("_timing", {}).get("warm_start") is True
+        and (t.context or {}).get("_timing", {}).get("warm_claim_origin")
+        == "backlog_reuse"
+    )
+    active_chain_continuity_claims = active_warm_chains - active_backlog_reuse_claims
 
+    cb_suppressed = _shared_state.is_warm_continuity_suppressed()
+    suppressed_until = _shared_state.warm_continuity_suppressed_until
     return {
         "active_vms": active_vms_out,
         "warm_pin_metrics": {
@@ -724,9 +777,21 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
             "clears_last_24h": _shared_state.count_recent_warm_pin_clears(86400),
             "active_pinned_queued_total": sum(len(v) for v in pinned_by_vm.values()),
             "active_warm_chains": active_warm_chains,
+            "active_backlog_reuse_claims": active_backlog_reuse_claims,
+            "active_chain_continuity_claims": active_chain_continuity_claims,
+            "circuit_breaker_suppressed": cb_suppressed,
+            "suppressed_until": suppressed_until.isoformat()
+            if suppressed_until
+            else None,
+            "clear_rate_threshold": int(
+                _shared_state.runtime_config.get("warm_pin_clear_rate_threshold", 10)
+            ),
         },
         "warm_continuity_enabled": bool(
             _shared_state.runtime_config.get("warm_continuity_enabled", False)
+        ),
+        "warm_backlog_reuse_enabled": bool(
+            _shared_state.runtime_config.get("warm_backlog_reuse_enabled", False)
         ),
         "next_role_poll_timeout_secs": int(
             _shared_state.runtime_config.get("next_role_poll_timeout_secs", 180)

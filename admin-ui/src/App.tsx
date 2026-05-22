@@ -12,13 +12,15 @@ import { PipelineView } from './components/PipelineView';
 import { ProjectDashboard } from './components/ProjectDashboard';
 import { auth, signInWithGoogle, signOut } from './firebase';
 import { fetchTask, apiFetch, API_BASE_URL, fetchSrMissedRetrospectives } from './api';
-import { SrMissedRetrospective, type SrMissedTask } from './components/SrTrendBreakdown';
+import { countHighSignalMessages, countNewSinceLastVisit, loadLastSeen } from './components/MessagesPanel.utils';
+import { SrMissedRetrospective, type SrMissedTask, type SrInvestigationSignal } from './components/SrTrendBreakdown';
 import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
 import { AlertsBanner } from './components/AlertsBanner';
 import { NewTaskModal } from './components/NewTaskModal';
 import { NewProjectModal } from './components/NewProjectModal';
 import { HeaderBar } from './components/HeaderBar';
+import type { SectionId } from './components/SettingsDropdown';
 import { TaskLaunchFAB } from './components/TaskLaunchFAB';
 import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
@@ -62,6 +64,7 @@ export default function App() {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [drawerWidth, setDrawerWidth] = useState(0);
   const [openMessageCount, setOpenMessageCount] = useState(0);
+  const [newSinceLastVisit, setNewSinceLastVisit] = useState(0);
   const handleMessageCountChange = useCallback((count: number) => setOpenMessageCount(count), []);
   const [sortBy, setSortBy] = useState<SortBy>(() => {
     try {
@@ -91,6 +94,7 @@ export default function App() {
   useEffect(() => {
     if (showMessages) {
       setOpenMessageCount(0);
+      setNewSinceLastVisit(0);
     }
   }, [showMessages]);
   useEffect(() => {
@@ -103,14 +107,18 @@ export default function App() {
         const res = await apiFetch(`${API_BASE_URL}/api/admin/messages?${params}`);
         if (!res.ok || cancelled) return;
         const data = await res.json();
-        const msgs: { from_type?: string }[] = data.messages ?? [];
-        if (!cancelled) setOpenMessageCount(msgs.filter(m => (m.from_type || '').toLowerCase() !== 'user').length);
+        const msgs: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown>; created_at?: string | null }> = data.messages ?? [];
+        if (!cancelled) {
+          setOpenMessageCount(countHighSignalMessages(msgs));
+          const lastSeenTs = loadLastSeen(s.user?.email, pid);
+          setNewSinceLastVisit(countNewSinceLastVisit(msgs, lastSeenTs));
+        }
       } catch { /* ignore */ }
     }
     fetchCount();
     const interval = setInterval(fetchCount, 30_000);
     return () => { cancelled = true; clearInterval(interval); };
-  }, [selectedProjectId, showMessages]);
+  }, [selectedProjectId, showMessages, s.user?.email]);
 
   useEffect(() => {
     function handleSearchShortcut(e: KeyboardEvent) {
@@ -172,6 +180,59 @@ export default function App() {
       .catch(() => {})
       .finally(() => setSrMissedLoading(false));
   }, [showSrMissed, selectedProjectId]);
+
+  // Open operator-spawned SR investigations, keyed by category — used to dedup spawning.
+  const [srInvestigationTaskIds, setSrInvestigationTaskIds] = useState<Record<string, string>>({});
+  useEffect(() => {
+    if (!selectedProjectId) { setSrInvestigationTaskIds({}); return; }
+    const pid = selectedProjectId;
+    let cancelled = false;
+    async function fetchIds() {
+      try {
+        const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(pid)}/sr-investigation-task-ids`);
+        if (!res.ok || cancelled) return;
+        const data = (await res.json()) as { task_ids?: Record<string, string> };
+        if (!cancelled) setSrInvestigationTaskIds(data.task_ids ?? {});
+      } catch { /* ignore */ }
+    }
+    fetchIds();
+    const interval = setInterval(fetchIds, 30_000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [selectedProjectId]);
+
+  const handleSpawnSrInvestigation = useCallback(async (signal: SrInvestigationSignal): Promise<string | null> => {
+    if (!selectedProjectId) return null;
+    try {
+      const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-investigation`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(signal),
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as { task_id: string; created: boolean };
+      setSrInvestigationTaskIds(prev => ({ ...prev, [signal.category]: data.task_id }));
+      return data.task_id;
+    } catch {
+      return null;
+    }
+  }, [selectedProjectId]);
+
+  const [settingsInitialSection, setSettingsInitialSection] = useState<SectionId | null>(null);
+
+  const handleConfigureTargets = useCallback(() => {
+    setSettingsInitialSection('build-config');
+    s.handleToggleSettings();
+    setTimeout(() => {
+      const element = document.getElementById('sr-catch-rate-targets');
+      element?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 100);
+  }, [s]);
+
+  // Clear the deep-link section once Settings closes, so a subsequent plain
+  // Settings open is not forced back to the build-config tab.
+  useEffect(() => {
+    if (!s.showSettings) setSettingsInitialSection(null);
+  }, [s.showSettings]);
 
   const zoneHealthAlerts = useMemo(() => {
     if (!s.zoneHealth) return [];
@@ -360,6 +421,7 @@ export default function App() {
         showMessages={s.showMessages}
         onToggleMessages={() => s.setShowMessages(prev => !prev)}
         openMessageCount={openMessageCount}
+        newSinceLastVisitCount={newSinceLastVisit}
         needsAttentionCount={s.needsAttentionCount}
         onOpenNewTaskModal={s.openNewTaskModal}
         onShowDirections={() => s.setShowDirections(true)}
@@ -372,6 +434,7 @@ export default function App() {
         showSettings={s.showSettings}
         onToggleSettings={s.handleToggleSettings}
         settingsRef={s.settingsRef}
+        settingsInitialSection={settingsInitialSection}
         maxRetries={s.maxRetries}
         maxAutonomousTasksPerHour={s.maxAutonomousTasksPerHour}
         requireApprovalGates={s.requireApprovalGates}
@@ -553,6 +616,8 @@ export default function App() {
         }}
         onViewTask={handleViewTask}
         projectId={s.selectedProjectId ?? undefined}
+        onSpawnSrInvestigation={s.selectedProjectId ? handleSpawnSrInvestigation : undefined}
+        activeInvestigationTaskIds={srInvestigationTaskIds}
       />
 
       {!s.showArchive && !s.showUserManagement && (
@@ -723,7 +788,7 @@ export default function App() {
 
           {s.viewMode === 'home' ? (
             <>
-              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onCategoryClick={(cat) => { setSrMissedCategory(cat); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} /></ErrorBoundary>
+              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onCategoryClick={(cat) => { setSrMissedCategory(cat); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onConfigureTargets={handleConfigureTargets} /></ErrorBoundary>
               <PlaybookPanel selectedProjectId={s.selectedProjectId} />
               {s.selectedProjectId && (
                 <div ref={srMissedRef} className="shrink-0 mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">

@@ -20,6 +20,16 @@ vi.mock('../api', () => ({
     if (url.includes('escalation-outcomes')) {
       return new Response(JSON.stringify({ lookback_days: 30, by_reason: {} }), { status: 200 });
     }
+    if (url.includes('first-attempt-compliance-trend')) {
+      return new Response(JSON.stringify({
+        windows: Array.from({ length: 6 }, (_, i) => ({
+          window_start: new Date(Date.now() - (6 - i) * 7 * 86400_000).toISOString(),
+          window_end: new Date(Date.now() - (5 - i) * 7 * 86400_000).toISOString(),
+          first_attempt_compliant: 0, followup_rescued: 0, awaiting_backfill: 0, rate: null,
+        })),
+        num_windows: 6, window_days: 7, generated_at: new Date().toISOString(),
+      }), { status: 200 });
+    }
     return new Response(JSON.stringify({ cases: [] }), { status: 200 });
   }),
   fetchCrossLayerCompliance: vi.fn(async () => ({

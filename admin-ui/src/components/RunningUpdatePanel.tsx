@@ -80,7 +80,7 @@ export default function RunningUpdatePanel({
           type="button"
           onClick={handleAcknowledge}
           disabled={!hasContent || acknowledging}
-          className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border border-emerald-600/40 bg-emerald-600/10 text-emerald-300 hover:bg-emerald-600/20 disabled:opacity-40 disabled:cursor-not-allowed transition"
+          className="shrink-0 inline-flex items-center gap-1.5 px-3 py-3 min-h-11 text-xs font-medium rounded-md border border-emerald-600/40 bg-emerald-600/10 text-emerald-300 hover:bg-emerald-600/20 disabled:opacity-40 disabled:cursor-not-allowed transition"
         >
           <Check size={12} />
           {acknowledging ? 'Acknowledging…' : 'Acknowledge'}

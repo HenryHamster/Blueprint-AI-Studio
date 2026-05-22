@@ -924,6 +924,7 @@ async def test_return_structure_has_all_required_keys():
         "direction_first_attempt_feedback",
         "medium_scope_measurement",
         "auto_playbook_idle_retired_24h",
+        "auto_playbook_low_success_retired_24h",
         "sr_regression_risk_test_signal_trends",
         "sr_false_attestation_trends",
     }

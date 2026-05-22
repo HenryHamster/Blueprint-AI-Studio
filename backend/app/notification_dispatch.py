@@ -55,6 +55,22 @@ _PERMANENT_FAILURE_CODES: frozenset[int] = frozenset({401, 403, 404})
 # Retry delays in seconds: attempt 1 → 30s, attempt 2 → 120s, attempt 3 → 600s
 _RETRY_DELAYS: tuple[int, ...] = (30, 120, 600)
 
+# System-emitted NOTE event types classified as high_signal in event_type_snapshot.json.
+# These must always survive paging regardless of routine message volume (see
+# admin_notifications.list_messages guaranteed-query logic). Escalation types
+# (auto_fix_escalated, residual_fix_escalated, etc.) are already safe because they emit
+# as BLOCKER messages — not NOTE — so they don't belong here.
+# Source of truth: backend/testing/event_type_snapshot.json (classification=high_signal).
+HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        "failure_alert",  # post_failure_alert_message
+        "rollback_recommended",  # post_rollback_recommendation_message
+        "fix_loop_divergence_regressed",  # post_fix_loop_divergence_regression_message
+        "direction_outcome_stalled",  # post_direction_outcome_stalled_message
+        "promotion_readiness_reached",  # post_version_promotion_readiness_message
+    }
+)
+
 
 @dataclasses.dataclass
 class _RetryEntry:
@@ -1290,6 +1306,198 @@ async def post_remediation_escalation_message(
     return msg
 
 
+async def post_direction_burn_pause_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_text: str,
+    reason: str,
+    direction_id: Optional[str] = None,
+    evidence: Optional[dict[str, Any]] = None,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a BLOCKER-severity message when a direction is auto-paused for manual intervention.
+
+    Distinct from the routine direction_milestone event — this fires as BLOCKER so it
+    surfaces in the high-signal feed. Includes burn evidence (counts + merge rate) so
+    the operator sees the numbers without drilling into direction details.
+    """
+    ev = evidence or {}
+    ev_parts: list[str] = []
+    if "lifetime_non_merge_finished" in ev:
+        ev_parts.append(f"non-merging={ev['lifetime_non_merge_finished']}")
+    if "lifetime_merged" in ev:
+        ev_parts.append(f"merged={ev['lifetime_merged']}")
+    if "lifetime_merge_rate" in ev:
+        rate = ev["lifetime_merge_rate"]
+        ev_parts.append(
+            f"merge_rate={rate:.0%}"
+            if isinstance(rate, float)
+            else f"merge_rate={rate}"
+        )
+    ev_str = f" ({', '.join(ev_parts)})" if ev_parts else ""
+    summary = (
+        f"Direction auto-paused — manual intervention required: "
+        f"'{direction_text[:80]}'{ev_str} — {reason}"
+    )
+    ctx: dict[str, Any] = {
+        "event_type": "direction_burn_pause",
+        "direction_text": direction_text[:120],
+        "reason": reason,
+        "direction_id": direction_id,
+        "manual_intervention_required": True,
+    }
+    if evidence:
+        ctx["evidence"] = evidence
+    msg = ProjectMessage(
+        project_id=project_id,
+        message_type=MessageType.BLOCKER,
+        from_type="system",
+        from_task_id=task_id,
+        content=summary,
+        context=ctx,
+    )
+    session.add(msg)
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "DIRECTION_BURN_PAUSE",
+            {
+                "direction_text": direction_text[:120],
+                "reason": reason,
+                "direction_id": direction_id,
+                "evidence": evidence or {},
+                "severity": "blocker",
+                "manual_intervention_required": True,
+                "summary": summary,
+            },
+        )
+    )
+    return msg
+
+
+async def post_direction_churn_pause_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_text: str,
+    reason: str,
+    direction_id: Optional[str] = None,
+    evidence: Optional[dict[str, Any]] = None,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a BLOCKER-severity message when a direction is auto-paused by the churn guardrail.
+
+    Unlike the lifetime-burn pause, churn pauses auto-recover after a cooldown period and
+    do NOT require manual operator intervention. Still surfaced as BLOCKER so it reaches
+    the high-signal feed rather than being digested as routine ops noise.
+    """
+    ev = evidence or {}
+    ev_parts: list[str] = []
+    if "non_merge_finished" in ev:
+        ev_parts.append(f"non-merging={ev['non_merge_finished']}")
+    if "merged" in ev:
+        ev_parts.append(f"merged={ev['merged']}")
+    if "merge_rate" in ev:
+        rate = ev["merge_rate"]
+        ev_parts.append(
+            f"merge_rate={rate:.0%}"
+            if isinstance(rate, float)
+            else f"merge_rate={rate}"
+        )
+    if "window_cycles" in ev:
+        ev_parts.append(f"window={ev['window_cycles']} cycles")
+    ev_str = f" ({', '.join(ev_parts)})" if ev_parts else ""
+    summary = (
+        f"Direction auto-paused by churn guardrail — will auto-recover after cooldown: "
+        f"'{direction_text[:80]}'{ev_str} — {reason}"
+    )
+    ctx: dict[str, Any] = {
+        "event_type": "direction_churn_pause",
+        "direction_text": direction_text[:120],
+        "reason": reason,
+        "direction_id": direction_id,
+    }
+    if evidence:
+        ctx["evidence"] = evidence
+    msg = ProjectMessage(
+        project_id=project_id,
+        message_type=MessageType.BLOCKER,
+        from_type="system",
+        from_task_id=task_id,
+        content=summary,
+        context=ctx,
+    )
+    session.add(msg)
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "DIRECTION_CHURN_PAUSE",
+            {
+                "direction_text": direction_text[:120],
+                "reason": reason,
+                "direction_id": direction_id,
+                "evidence": evidence or {},
+                "severity": "blocker",
+                "summary": summary,
+            },
+        )
+    )
+    return msg
+
+
+async def post_direction_outcome_stalled_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_text: str,
+    evidence: Optional[dict[str, Any]] = None,
+    direction_id: Optional[str] = None,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a HIGH-SIGNAL NOTE when a direction is flagged as outcome-less scaffolding.
+
+    Advisory signal — NOT a pause: the direction keeps merging PRs at a healthy
+    rate but its outcome-progress signal has been flat for a sustained run of
+    cycles and it has never met its success_evidence. Emitted once per transition
+    into the flagged state (the caller dedups via the direction's
+    outcome_scaffolding_flagged flag), mirroring the direction burn-pause /
+    milestone one-shot pattern. High-signal NOTE so it survives routine paging.
+    """
+    ev = evidence or {}
+    parts: list[str] = []
+    if "total_cycles" in ev:
+        parts.append(f"cycles={ev['total_cycles']}")
+    if "lifetime_merged" in ev:
+        parts.append(f"merged={ev['lifetime_merged']}")
+    if "lifetime_merge_rate" in ev:
+        rate = ev["lifetime_merge_rate"]
+        parts.append(
+            f"merge_rate={rate:.0%}"
+            if isinstance(rate, float)
+            else f"merge_rate={rate}"
+        )
+    if "stall_run_cycles" in ev:
+        parts.append(f"no_progress_for={ev['stall_run_cycles']} cycles")
+    ev_str = f" ({', '.join(parts)})" if parts else ""
+    summary = (
+        f"Direction shipping merges without outcome progress: "
+        f"'{direction_text[:80]}'{ev_str} — review whether to retire, redirect, "
+        f"or redefine its success_evidence."
+    )
+    context: dict[str, Any] = {
+        "direction_text": direction_text[:120],
+        "direction_id": direction_id,
+    }
+    if evidence:
+        context["evidence"] = evidence
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="direction_outcome_stalled",
+        summary=summary,
+        context=context,
+        task_id=task_id,
+    )
+
+
 async def post_issue_implementation_spawned_message(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -1377,6 +1585,225 @@ async def post_feedback_acknowledgment(
         context={"reply_to": str(original_msg_id), "resolution": resolution},
         task_id=task_id,
     )
+
+
+async def post_version_calcification_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    version_number: int,
+    version_id: str,
+    qualification_attempts: int,
+    blocker: str,
+    blocker_label: str,
+    age_days: int,
+) -> ProjectMessage:
+    """Post a calcification alert when a release version is repeatedly stuck.
+
+    Called when a version in the stabilize phase has accumulated enough
+    hard-blocker failures to be considered calcifying (promotion is stalled).
+    Also fires RELEASE_VERSION_CALCIFYING external webhook so operators can
+    route the alert to their incident channel.
+
+    Does NOT commit — the caller owns the transaction.
+    """
+    summary = (
+        f"v{version_number} is calcifying — {qualification_attempts} "
+        f"qualification attempt(s) blocked by {blocker_label} over "
+        f"{age_days} day(s). Resolve the blocker to restore promotion."
+    )
+    msg = await post_event_message(
+        session,
+        project_id,
+        event_type="release_calcifying",
+        summary=summary,
+        context={
+            "version_number": version_number,
+            "version_id": version_id,
+            "qualification_attempts": qualification_attempts,
+            "blocker": blocker,
+            "age_days": age_days,
+        },
+    )
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "RELEASE_VERSION_CALCIFYING",
+            {
+                "version_number": version_number,
+                "version_id": version_id,
+                "qualification_attempts": qualification_attempts,
+                "blocker": blocker,
+                "age_days": age_days,
+                "summary": summary,
+            },
+        )
+    )
+    return msg
+
+
+async def post_version_build_stalled_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    version_number: int,
+    version_id: str,
+    age_days: int,
+    tasks_merged: int,
+) -> ProjectMessage:
+    """Post a build-stall alert when a release version sits too long in build.
+
+    Called when an open version has been in the ``build`` phase well past a
+    healthy window without advancing to ``stabilize`` (``build → stabilize`` is
+    agent-driven and has no automatic cadence, so a version can accumulate
+    merged tasks in build indefinitely without ever reaching qualify/promote).
+    Also fires the RELEASE_VERSION_BUILD_STALLED external webhook so operators
+    can route the alert to their incident channel.
+
+    Does NOT commit — the caller owns the transaction.
+    """
+    summary = (
+        f"v{version_number} has been building for {age_days} day(s) with "
+        f"{tasks_merged} merged task(s) and has not advanced to stabilize. "
+        f"Consider moving it to the stabilize phase to drive it toward "
+        f"qualification."
+    )
+    msg = await post_event_message(
+        session,
+        project_id,
+        event_type="release_build_stalled",
+        summary=summary,
+        context={
+            "version_number": version_number,
+            "version_id": version_id,
+            "age_days": age_days,
+            "tasks_merged": tasks_merged,
+        },
+    )
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "RELEASE_VERSION_BUILD_STALLED",
+            {
+                "version_number": version_number,
+                "version_id": version_id,
+                "age_days": age_days,
+                "tasks_merged": tasks_merged,
+                "summary": summary,
+            },
+        )
+    )
+    return msg
+
+
+async def post_version_stabilize_stalled_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    version_number: int,
+    version_id: str,
+    age_days: int,
+    tasks_merged: int,
+) -> ProjectMessage:
+    """Post a stabilize-stall alert when a release version sits too long in stabilize.
+
+    Called when an open version has been in the ``stabilize`` phase well past a
+    healthy window without making qualification progress (stabilize→qualify is
+    agent-driven and has no automatic cadence, so a version can sit in stabilize
+    indefinitely without ever reaching qualify/promote).  Also fires the
+    RELEASE_VERSION_STABILIZE_STALLED external webhook so operators can route
+    the alert to their incident channel.
+
+    Does NOT commit — the caller owns the transaction.
+    """
+    summary = (
+        f"v{version_number} has been in the stabilize phase for {age_days} day(s) "
+        f"with {tasks_merged} merged task(s) and has not been qualified. "
+        f"Consider requesting qualification now or addressing what is preventing "
+        f"readiness."
+    )
+    msg = await post_event_message(
+        session,
+        project_id,
+        event_type="release_stabilize_stalled",
+        summary=summary,
+        context={
+            "version_number": version_number,
+            "version_id": version_id,
+            "age_days": age_days,
+            "tasks_merged": tasks_merged,
+        },
+    )
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "RELEASE_VERSION_STABILIZE_STALLED",
+            {
+                "version_number": version_number,
+                "version_id": version_id,
+                "age_days": age_days,
+                "tasks_merged": tasks_merged,
+                "summary": summary,
+            },
+        )
+    )
+    return msg
+
+
+async def post_version_promotion_readiness_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    version_number: int,
+    version_id: str,
+    verdicts_evaluated: int,
+    would_promote_rate: float,
+    consecutive_clean_passes: int,
+    reason: str,
+) -> ProjectMessage:
+    """Notify operator when the dry-run track record first reaches promotion-readiness.
+
+    Fires once per not-ready→ready transition while promotion is disabled.
+    Enable promotion_enabled in settings to act on this signal.
+    Does NOT commit — the caller owns the transaction.
+    """
+    summary = (
+        f"v{version_number} qualifier track record supports autonomous promotion: "
+        f"{consecutive_clean_passes} consecutive clean passes, "
+        f"{would_promote_rate:.0%} would-promote rate "
+        f"({verdicts_evaluated} dry-run verdict(s)). "
+        f"Enable promotion in settings to unlock automain→main autonomy."
+    )
+    msg = await post_event_message(
+        session,
+        project_id,
+        event_type="promotion_readiness_reached",
+        summary=summary,
+        context={
+            "version_number": version_number,
+            "version_id": version_id,
+            "verdicts_evaluated": verdicts_evaluated,
+            "would_promote_rate": would_promote_rate,
+            "consecutive_clean_passes": consecutive_clean_passes,
+            "reason": reason,
+        },
+    )
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "PROMOTION_READINESS_REACHED",
+            {
+                "version_number": version_number,
+                "version_id": version_id,
+                "verdicts_evaluated": verdicts_evaluated,
+                "would_promote_rate": would_promote_rate,
+                "consecutive_clean_passes": consecutive_clean_passes,
+                "reason": reason,
+                "summary": summary,
+            },
+        )
+    )
+    return msg
 
 
 async def post_fix_loop_divergence_regression_message(

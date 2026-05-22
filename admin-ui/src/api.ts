@@ -687,10 +687,16 @@ export async function onboardProject(
   return res.json();
 }
 
+export interface EfficiencyHistoryPoint {
+  captured_at: string | null;
+  value: number | null;
+}
+
 export interface EfficiencyAxis {
   current: number | null;
   baseline: number | null;
   drift_pct: number | null;
+  history: EfficiencyHistoryPoint[];
 }
 
 export interface EfficiencyAxesResponse {
@@ -702,5 +708,132 @@ export interface EfficiencyAxesResponse {
 export async function fetchEfficiencyAxes(projectId: string): Promise<EfficiencyAxesResponse> {
   const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/efficiency-axes`);
   if (!res.ok) throw new Error(`Failed to fetch efficiency axes: ${res.status}`);
+  return res.json();
+}
+
+export interface VersionQualificationSubScores {
+  audit: number;
+  test_erosion: number;
+  smoketest: number;
+}
+
+export type QualificationStatus =
+  | 'not_promoted'
+  | 'dry_run'
+  | 'already_dry_run'
+  | 'promoted'
+  | 'promotion_failed'
+  | 'error'
+  | 'sha_error';
+
+export interface VersionQualification {
+  status: QualificationStatus | null;
+  confidence: number | null;
+  threshold: number | null;
+  sub_scores: VersionQualificationSubScores | null;
+  blocker: string | null;
+  finalized_at: string | null;
+}
+
+export interface CurrentVersion {
+  version_number: number;
+  phase: string;
+  phase_changed_at: string | null;
+  phase_reasoning: string | null;
+  opened_at: string;
+  qualification_attempts: number;
+  merged_task_count: number;
+  last_qualification: VersionQualification | null;
+}
+
+export interface RecentVersion {
+  version_number: number;
+  status: string;
+  opened_at: string;
+  promoted_at: string | null;
+  qualification_attempts: number;
+  last_qualification: VersionQualification | null;
+}
+
+export interface PromotionReadinessConfidence {
+  mean: number;
+  stdev: number;
+  min: number;
+  max: number;
+  stable: boolean;
+}
+
+export interface PromotionReadiness {
+  ready: boolean;
+  reason: string;
+  verdicts_evaluated: number;
+  would_promote_count: number;
+  would_promote_rate: number;
+  consecutive_clean_passes: number;
+  confidence: PromotionReadinessConfidence;
+  recurring_blockers: Record<string, number>;
+  blocker_counts: Record<string, number>;
+  thresholds: Record<string, number>;
+}
+
+export interface VersionLifecycleResponse {
+  current_version: CurrentVersion | null;
+  recent_versions: RecentVersion[];
+  promotion_enabled?: boolean;
+  promotion_readiness?: PromotionReadiness | null;
+}
+
+export async function fetchVersionLifecycle(projectId: string): Promise<VersionLifecycleResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-lifecycle`);
+  if (!res.ok) throw new Error(`Failed to fetch version lifecycle: ${res.status}`);
+  return res.json();
+}
+
+export interface SetVersionPhaseResponse {
+  version_number: number;
+  phase: string;
+  phase_changed_at: string | null;
+  phase_reasoning: string | null;
+}
+
+export async function setVersionPhase(
+  projectId: string,
+  phase: 'build' | 'stabilize',
+  reasoning?: string,
+): Promise<SetVersionPhaseResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-phase`, {
+    method: 'POST',
+    body: JSON.stringify({ phase, reasoning: reasoning ?? '' }),
+  });
+  if (!res.ok) throw new Error(`Failed to set version phase: ${res.status}`);
+  return res.json();
+}
+
+export type QualifyTriggerStatus =
+  | 'wrong_phase'
+  | 'already_pending'
+  | 'project_not_found'
+  | 'no_credentials'
+  | 'sha_error'
+  | 'version_not_found'
+  | 'already_dry_run'
+  | 'spawn_failed'
+  | 'not_promoted'
+  | 'dry_run'
+  | 'promoted'
+  | 'promotion_failed'
+  | 'error';
+
+export interface QualifyTriggerResponse {
+  status: QualifyTriggerStatus;
+  error?: string | null;
+  conflict?: boolean | null;
+}
+
+export async function triggerQualify(projectId: string): Promise<QualifyTriggerResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/qualify`, {
+    method: 'POST',
+  });
+  if (!res.ok) throw new Error(`Failed to trigger qualify: ${res.status}`);
   return res.json();
 }

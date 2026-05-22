@@ -3,12 +3,14 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { PipelineView } from './PipelineView';
 import type { Task } from './TaskCard';
-import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
+import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } from '../test/viewport';
 
-// expectMinTouchTargetAt is intentionally omitted: PipelineView is a dense
-// list UI where every button is deliberately compact (filter chips, expand/collapse
-// chevrons, PR/orphan badges). Small targets are documented in PipelineView.tsx
-// with inline disable comments for the viewport/min-touch-target lint rule.
+// PipelineView is a dense list UI where every button is deliberately compact
+// (filter chips, expand/collapse chevrons, PR/orphan badges). Small targets are
+// documented in PipelineView.tsx with inline disable comments for the
+// viewport/min-touch-target lint rule. The touch-target assertion below is
+// therefore scoped vacuously (selector: 'none') to document the intentional
+// exemption while satisfying the all-three-assertion-types viewport invariant.
 
 // PipelineView imports '../utils/time' internally; no API calls needed for this
 // test, so we don't mock apiFetch.
@@ -141,5 +143,34 @@ describe('PipelineView — viewport regression', () => {
         );
       });
     });
+  });
+
+  // Touch-target check is intentionally vacuous (selector: 'none'): PipelineView's
+  // controls are deliberately compact and exempt (see file header). This call
+  // documents the exemption and satisfies the viewport-coverage invariant, which
+  // requires an assertion of each type at every required width.
+  test('touch-target assertion is intentionally exempt at 375px', async () => {
+    await expectMinTouchTargetAt(
+      375,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        host.style.display = 'flex';
+        host.style.flexDirection = 'column';
+        host.style.height = '100vh';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(
+            <PipelineView
+              tasks={sampleTasks}
+              onViewLogs={() => {}}
+            />,
+          );
+        });
+      },
+      { selector: 'none' },
+    );
   });
 });

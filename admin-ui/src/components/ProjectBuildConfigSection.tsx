@@ -72,8 +72,8 @@ export function ProjectBuildConfigSection({
     if (!projectId) { setSrTargets({}); return; }
     apiFetch('/api/admin/projects')
       .then(r => r.json())
-      .then((projects: { id: string; sr_catch_rate_targets?: Record<string, number> }[]) => {
-        const p = projects.find(p => p.id === projectId);
+      .then((resp: { items: { id: string; sr_catch_rate_targets?: Record<string, number> }[] }) => {
+        const p = (resp.items ?? []).find(p => p.id === projectId);
         setSrTargets(p?.sr_catch_rate_targets ?? {});
       })
       .catch(() => {});
@@ -346,7 +346,7 @@ export function ProjectBuildConfigSection({
 
       {/* SR Catch-Rate Targets */}
       {hasConfig && projectId && (
-        <div>
+        <div id="sr-catch-rate-targets">
           <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">Self-Review Catch-Rate Targets</h3>
           <p className="text-[11px] text-neutral-600 mb-3">
             Set a minimum hit-rate (%) per SR category. An alert fires when a category stays below target for ≥2 consecutive windows. Leave blank for no target.

@@ -81,15 +81,52 @@ async def get_directions(
     current_user: dict = Depends(get_current_user),
 ):
     from app.shared_state import get_direction_hold_info as _get_direction_hold_info  # noqa: PLC0415
+    from app.shared_state import runtime_config as _runtime_config  # noqa: PLC0415
     from app.direction_metrics import _compute_direction_quality_score  # noqa: PLC0415
+    from app.strategic_completion import (
+        _compute_churn_metrics,
+        _compute_lifetime_burn_metrics,
+    )  # noqa: PLC0415
 
     project = await _get_user_project(project_id, current_user["user_id"], session)
     directions = project.directions or []
+    churn_threshold = int(
+        _runtime_config.get("direction_churn_non_merge_threshold", 15) or 15
+    )
+    churn_min_rate = float(
+        _runtime_config.get("direction_churn_min_merge_rate", 0.10) or 0.10
+    )
+    lifetime_threshold = int(
+        _runtime_config.get("direction_lifetime_non_merge_threshold", 150) or 150
+    )
+    lifetime_min_rate = float(
+        _runtime_config.get("direction_lifetime_min_merge_rate", 0.10) or 0.10
+    )
     enriched = []
     for d in directions:
         hold_info = _get_direction_hold_info(d.get("id", ""))
         held_at = hold_info["held_at"]
         held_until = hold_info["held_until"]
+        raw_churn = _compute_churn_metrics(d)
+        churn_metrics = (
+            {
+                **raw_churn,
+                "threshold": churn_threshold,
+                "min_merge_rate": churn_min_rate,
+            }
+            if raw_churn is not None
+            else None
+        )
+        raw_lifetime = _compute_lifetime_burn_metrics(d)
+        lifetime_burn_metrics = (
+            {
+                **raw_lifetime,
+                "threshold": lifetime_threshold,
+                "min_merge_rate": lifetime_min_rate,
+            }
+            if raw_lifetime is not None
+            else None
+        )
         enriched.append(
             {
                 **d,
@@ -103,6 +140,8 @@ async def get_directions(
                 "held_until": held_until.isoformat()
                 if isinstance(held_until, datetime)
                 else None,
+                "churn_metrics": churn_metrics,
+                "lifetime_burn_metrics": lifetime_burn_metrics,
             }
         )
     return {

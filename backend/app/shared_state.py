@@ -261,6 +261,33 @@ runtime_config: Dict = {
     "autonomous_direction_cooldown_minutes": 240,
     "productive_direction_cooldown_minutes": 45,
     "direction_auto_recovery_hours": 48,
+    # Non-merge churn guardrail (Rule 5 in _check_direction_health).
+    # window_cycles: how many recent research cycles to evaluate (rolling window).
+    # non_merge_threshold: minimum non-merging finished tasks to trigger the guardrail.
+    # min_merge_rate: merge rate below this AND above threshold triggers the pause.
+    # Conservative defaults prevent pausing productive high-throughput directions.
+    "direction_churn_window_cycles": 5,
+    "direction_churn_non_merge_threshold": 15,
+    "direction_churn_min_merge_rate": 0.10,
+    # Lifetime/cumulative burn backstop — catches slow-burn directions that stay
+    # just under the rolling-window threshold every window but accumulate hundreds
+    # of non-merging tasks over their lifetime. Thresholds are intentionally high
+    # (order-of-hundreds) so healthy high-throughput directions are never paused.
+    "direction_lifetime_non_merge_threshold": 150,
+    "direction_lifetime_min_merge_rate": 0.10,
+    # Outcome-progress (scaffolding) detector — ADVISORY, never auto-pauses.
+    # Surfaces long-running directions that keep merging PRs at a healthy rate but
+    # never advance their stated success_evidence (the "outcome-less scaffolding"
+    # pattern). min_cycles honors the "caught within ~12 cycles" goal; merge_floor +
+    # min_merge_rate exclude churn/burn directions (handled by the churn/lifetime
+    # backstops); stall_run is the consecutive run of no-progress cycles required so
+    # a single low-progress cycle cannot trip the flag; history_max caps the bounded
+    # per-direction snapshot list stored on direction.outcome_progress_history.
+    "direction_outcome_progress_min_cycles": 12,
+    "direction_outcome_progress_merge_floor": 8,
+    "direction_outcome_progress_min_merge_rate": 0.5,
+    "direction_outcome_progress_stall_run": 6,
+    "direction_outcome_progress_history_max": 20,
     "strategic_research_frequency": 6,  # Every Nth research cycle is a strategic vision review
     "architecture_review_frequency": 3,  # Every Nth strategic cycle includes architecture (design doc) review
     "max_active_directions": 10,
@@ -363,9 +390,22 @@ runtime_config: Dict = {
     # warm_target_vm_id`) and the orchestrator's provisioning loop skips
     # cold-provisioning a fresh VM as long as the target VM has heartbeated
     # within the last 90s. The agent on that VM picks the task up via
-    # /api/agent/next-role. Defaults to False — feature ships dark and is
-    # only enabled per-deployment via runtime_config_json.
-    "warm_continuity_enabled": False,
+    # /api/agent/next-role. Guarded by is_warm_continuity_suppressed() circuit
+    # breaker which auto-disables warm pinning when pin-clear rate is elevated.
+    "warm_continuity_enabled": True,
+    # Circuit-breaker thresholds for warm-pin continuity. When pin-clear events
+    # in the last hour exceed warm_pin_clear_rate_threshold, warm pinning is
+    # auto-suppressed for warm_continuity_cooldown_seconds before resuming.
+    "warm_pin_clear_rate_threshold": 10,
+    "warm_continuity_cooldown_seconds": 1800,
+    # Phase 2 backlog reuse (efficiency direction d-91d8dede): when True, an
+    # agent VM that just went idle (its task reached a terminal state with no
+    # chain follow-on) may claim the next eligible QUEUED task from the SAME
+    # project's general backlog via /api/agent/next-role and run it warm —
+    # not only a PR-chain-pinned follow-on. Independently switchable from
+    # warm_continuity_enabled so it can be enabled, observed, and rolled back
+    # on its own. Defaults to False — feature ships dark.
+    "warm_backlog_reuse_enabled": False,
     # Maximum seconds the agent waits in /api/agent/next-role polling before
     # falling through to the normal exit path. Bounded by the warm-handoff
     # window and the typical role transition cadence; tunable down for
@@ -625,6 +665,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "warm_continuity_enabled",
                         bool(config_json["warm_continuity_enabled"]),
                     )
+                if "warm_backlog_reuse_enabled" in config_json:
+                    _set(
+                        "warm_backlog_reuse_enabled",
+                        bool(config_json["warm_backlog_reuse_enabled"]),
+                    )
                 for int_key in (
                     "max_provision_retries",
                     "max_rollup_retries",
@@ -640,9 +685,20 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "evaluating_fail_hours",
                     "max_total_research_per_project",
                     "next_role_poll_timeout_secs",
+                    "direction_churn_window_cycles",
+                    "direction_churn_non_merge_threshold",
+                    "direction_lifetime_non_merge_threshold",
+                    "warm_pin_clear_rate_threshold",
+                    "warm_continuity_cooldown_seconds",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))
+                for float_key in (
+                    "direction_churn_min_merge_rate",
+                    "direction_lifetime_min_merge_rate",
+                ):
+                    if float_key in config_json:
+                        _set(float_key, float(config_json[float_key]))
                 if "reserved_slots_for_types" in config_json:
                     _set(
                         "reserved_slots_for_types",
@@ -1017,6 +1073,79 @@ def count_recent_warm_pin_clears(window_seconds: int = 3600) -> int:
     """Distinct clear-out events in the trailing window."""
     cutoff = _utcnow() - timedelta(seconds=window_seconds)
     return sum(1 for ts, _, _ in warm_pin_clear_events if ts >= cutoff)
+
+
+# Auto-suppression deadline set by is_warm_continuity_suppressed() when the
+# pin-clear rate exceeds warm_pin_clear_rate_threshold. None means not suppressed.
+warm_continuity_suppressed_until: datetime | None = None
+
+
+def is_warm_continuity_suppressed() -> bool:
+    """True iff warm continuity is auto-suppressed by the pin-clear circuit breaker.
+
+    Checks the recent pin-clear rate against the configured threshold. When the
+    rate exceeds the threshold, sets a suppression window so callers fall back to
+    cold provisioning until the cooldown expires and the rate normalises.
+    """
+    global warm_continuity_suppressed_until
+    now = _utcnow()
+    if (
+        warm_continuity_suppressed_until is not None
+        and now < warm_continuity_suppressed_until
+    ):
+        return True
+    threshold = runtime_config.get("warm_pin_clear_rate_threshold", 10)
+    recent_clears = count_recent_warm_pin_clears(3600)
+    if recent_clears >= threshold:
+        cooldown = runtime_config.get("warm_continuity_cooldown_seconds", 1800)
+        warm_continuity_suppressed_until = now + timedelta(seconds=cooldown)
+        logger.warning(
+            f"[WARM_CONTINUITY] Circuit breaker tripped: {recent_clears} pin-clear events "
+            f"in last hour (threshold {threshold}). Suppressed until "
+            f"{warm_continuity_suppressed_until.isoformat()}."
+        )
+        return True
+    warm_continuity_suppressed_until = None
+    return False
+
+
+# --- Warm backlog-reuse first-refusal (efficiency direction d-91d8dede) ---
+# project_id (str) -> first-refusal deadline (naive UTC). While a project has
+# an unexpired entry, the orchestrator's cold-dispatch loop holds off
+# cold-provisioning eligible backlog tasks for that project so an idle warm VM
+# polling /api/agent/next-role gets first claim. Set/refreshed on each idle-VM
+# poll (and when a COMPLETED task's teardown is deferred). The atomic
+# SKIP-LOCKED claim in /next-role still guarantees no double-provision if both
+# race — this only biases the race toward reuse. Bounded: entries are short
+# (WARM_BACKLOG_FIRST_REFUSAL_SECS) and pruned by sweep_stale_in_memory_state.
+WARM_BACKLOG_FIRST_REFUSAL_SECS = 20
+warm_backlog_first_refusal: Dict[str, datetime] = {}
+
+
+def register_backlog_first_refusal(
+    project_id: str, window_seconds: int = WARM_BACKLOG_FIRST_REFUSAL_SECS
+) -> None:
+    """Mark project_id as having an idle warm VM that wants backlog work.
+
+    Sets the first-refusal deadline to now + window_seconds. Called from the
+    /next-role poll path so the orchestrator holds off cold-provisioning the
+    project's eligible backlog while a warm VM is actively polling.
+    """
+    if not project_id:
+        return
+    warm_backlog_first_refusal[str(project_id)] = _utcnow() + timedelta(
+        seconds=window_seconds
+    )
+
+
+def is_backlog_first_refusal_active(project_id: str) -> bool:
+    """True iff project_id has an unexpired backlog first-refusal window."""
+    if not project_id:
+        return False
+    deadline = warm_backlog_first_refusal.get(str(project_id))
+    if deadline is None:
+        return False
+    return _utcnow() <= deadline
 
 
 # --- Background Tasks (populated by lifespan, used by admin restart endpoint) ---
@@ -1519,6 +1648,14 @@ def sweep_stale_in_memory_state() -> Dict[str, int]:
     while warm_pin_clear_events and warm_pin_clear_events[0][0] < warm_clear_cutoff:
         warm_pin_clear_events.popleft()
         pruned["warm_pin_clear_events"] += 1
+
+    # Backlog first-refusal: entries are short-lived (≈20s); drop anything
+    # already expired so the map can't grow on a long-lived instance.
+    pruned["warm_backlog_first_refusal"] = 0
+    for pid, deadline in list(warm_backlog_first_refusal.items()):
+        if deadline < now:
+            del warm_backlog_first_refusal[pid]
+            pruned["warm_backlog_first_refusal"] += 1
 
     return pruned
 

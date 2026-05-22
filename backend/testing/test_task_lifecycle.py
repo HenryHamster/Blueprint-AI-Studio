@@ -3959,9 +3959,7 @@ async def test_ci_auto_remediation_followup_uses_integration_branch(tl_db):
 
     assert spawned is True
     result = await session.execute(
-        select(Task).where(
-            Task.project_id == project.id, Task.id != task.id
-        )
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
     )
     followup = result.scalars().one()
     assert followup.created_by == "ORCHESTRATOR"
@@ -3996,9 +3994,7 @@ async def test_ci_auto_remediation_followup_defaults_to_main(tl_db):
 
     assert spawned is True
     result = await session.execute(
-        select(Task).where(
-            Task.project_id == project.id, Task.id != task.id
-        )
+        select(Task).where(Task.project_id == project.id, Task.id != task.id)
     )
     followup = result.scalars().one()
     assert followup.first_payload.get("base_branch") == "main"
@@ -4026,4 +4022,190 @@ def test_no_hardcoded_main_base_branch_in_task_lifecycle():
     assert not offenders, (
         "task_lifecycle.py spawn payloads hardcode base_branch='main' "
         "instead of routing through integration_branch:\n" + "\n".join(offenders)
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _close_loop_regression_case_on_merge — synchronous layer classification
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_close_loop_merge_populates_layers_targeted_synchronously(tl_db, mocker):
+    """layers_targeted is classified at merge time, not deferred to async backfill."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.task_lifecycle import _close_loop_regression_case_on_merge
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="test-token"),
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[{"filename": "agent/src/handlers/standard.ts"}]),
+    )
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    project.github_owner = "owner"
+    project.github_repo = "repo"
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={
+            "regression_class": "agent_verb_scope",
+            "cross_layer": True,
+            "cross_layer_layers": ["AGENT_VERB", "BASELINE_GATE"],
+        },
+    )
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="agent_verb_scope",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=1,
+        hit_count=1,
+        last_remediation_task_id=task.id,
+    )
+    session.add(case)
+    await session.commit()
+    await session.refresh(case)
+
+    await _close_loop_regression_case_on_merge(task, 42, session)
+    await session.commit()
+    await session.refresh(case)
+
+    assert case.status == RegressionCaseStatus.MERGED
+    log = case.fingerprint_to_fix_log or []
+    assert log, "fix-log should have an entry"
+    entry = log[-1]
+    assert entry.get("fix_pr_number") == 42
+    # agent/src/handlers/standard.ts maps to AGENT_VERB in the path classifier
+    assert "layers_targeted" in entry, "layers_targeted must be set synchronously"
+    assert "AGENT_VERB" in entry["layers_targeted"]
+
+
+@pytest.mark.asyncio
+async def test_close_loop_merge_persists_recommended_unmodifiable_layers(tl_db, mocker):
+    """recommended_unmodifiable_layers from task context is written to the fix-log entry."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.task_lifecycle import _close_loop_regression_case_on_merge
+
+    # Layer classification not needed for this test — suppress GitHub calls
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value=None),
+    )
+
+    session, _ = tl_db
+    project = await _make_project(session)
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={
+            "regression_class": "ci_workflow_gap",
+            "cross_layer": True,
+            "cross_layer_layers": ["CI_WORKFLOW", "AGENT_VERB"],
+            "recommended_unmodifiable_layers": ["CI_WORKFLOW"],
+        },
+    )
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="ci_workflow_gap",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=1,
+        hit_count=1,
+        last_remediation_task_id=task.id,
+    )
+    session.add(case)
+    await session.commit()
+    await session.refresh(case)
+
+    await _close_loop_regression_case_on_merge(task, 99, session)
+    await session.commit()
+    await session.refresh(case)
+
+    log = case.fingerprint_to_fix_log or []
+    assert log
+    entry = log[-1]
+    assert entry.get("fix_pr_number") == 99
+    assert entry.get("recommended_unmodifiable_layers") == ["CI_WORKFLOW"]
+
+
+@pytest.mark.asyncio
+async def test_close_loop_merge_compliant_with_one_targeted_plus_one_unmodifiable(
+    tl_db, mocker
+):
+    """Union of layers_targeted + recommended_unmodifiable_layers >= 2 is compliant.
+
+    A fix that patches AGENT_VERB and documents CI_WORKFLOW as unmodifiable should
+    not trigger a compliance re-spawn, since |{AGENT_VERB, CI_WORKFLOW}| == 2.
+    """
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.regression_layer_classifier import ALL_LAYERS
+    from app.task_lifecycle import _close_loop_regression_case_on_merge
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[{"filename": "agent/src/handlers/code-change.ts"}]),
+    )
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    project.github_owner = "owner"
+    project.github_repo = "repo"
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={
+            "regression_class": "cross_layer_mandate",
+            "cross_layer": True,
+            "cross_layer_layers": ["CI_WORKFLOW", "AGENT_VERB"],
+            "recommended_unmodifiable_layers": ["CI_WORKFLOW"],
+        },
+    )
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="cross_layer_mandate",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=1,
+        hit_count=1,
+        last_remediation_task_id=task.id,
+    )
+    session.add(case)
+    await session.commit()
+    await session.refresh(case)
+
+    await _close_loop_regression_case_on_merge(task, 77, session)
+    await session.commit()
+    await session.refresh(case)
+
+    log = case.fingerprint_to_fix_log or []
+    assert log
+    entry = log[-1]
+    targeted = set(entry.get("layers_targeted") or []) & ALL_LAYERS
+    recommended = set(entry.get("recommended_unmodifiable_layers") or []) & ALL_LAYERS
+    effective = targeted | recommended
+    assert len(effective) >= 2, (
+        f"Effective layer count {len(effective)} < 2: "
+        f"targeted={sorted(targeted)}, recommended={sorted(recommended)}; "
+        "this fix would incorrectly trigger a compliance re-spawn"
     )

@@ -1,5 +1,9 @@
 """Tests for regression_layer_classifier.classify_layers()."""
 
+from pathlib import Path
+
+import pytest
+
 from app.regression_layer_classifier import (
     ALL_LAYERS,
     LAYER_AGENT_VERB,
@@ -741,3 +745,68 @@ class TestComputeRecoveryLayerMismatch:
         result = compute_recovery_layer_mismatch(fix_log, symptoms, evaluated_at=_TS)
         assert result is not None
         assert result["fix_layers"] == sorted(result["fix_layers"])
+
+
+# ---------------------------------------------------------------------------
+# Contract / drift guard: viewport helper names must match their source of truth
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).parents[2]
+_VIEWPORT_TS = _REPO_ROOT / "admin-ui" / "src" / "test" / "viewport.ts"
+
+
+class TestViewportClassifierSourceContract:
+    """Drift guard: viewport helper names that _VIEWPORT_PATTERNS and
+    _BASELINE_GATE_PATTERNS in regression_layer_classifier.py depend on
+    must still be defined in admin-ui/src/test/viewport.ts.
+
+    If a helper is renamed in TypeScript, this test fails at change-time
+    with a message telling the developer to update the matching side.
+    """
+
+    @staticmethod
+    def _src() -> str:
+        if not _VIEWPORT_TS.exists():
+            pytest.skip(
+                f"{_VIEWPORT_TS} not available in this environment — the "
+                "backend test image ships no admin-ui/ (build context is "
+                "./backend) and CI mounts none. This viewport drift guard runs "
+                "wherever the full repo tree is checked out (local dev, agent "
+                "VM workspace)."
+            )
+        return _VIEWPORT_TS.read_text(encoding="utf-8").lower()
+
+    def test_expect_no_overflow_at_in_viewport_ts(self):
+        """_VIEWPORT_PATTERNS regex 'expectNoOverflowAt' must exist in viewport.ts.
+
+        Also matched (case-insensitively) by the _BASELINE_GATE_PATTERNS combined
+        regex expect(?:NoOverflow|MinTouchTarget)At.  Renaming the helper silently
+        stops viewport failures from routing to LAYER_VIEWPORT.
+        """
+        src = self._src()
+        assert "expectnooverflowat(" in src, (
+            "admin-ui/src/test/viewport.ts no longer defines 'expectNoOverflowAt'; "
+            "update the matching pattern in _VIEWPORT_PATTERNS (and _BASELINE_GATE_PATTERNS) "
+            "in regression_layer_classifier.py, or restore the function name in viewport.ts."
+        )
+
+    def test_expect_min_touch_target_at_in_viewport_ts(self):
+        """_VIEWPORT_PATTERNS regex 'expectMinTouchTargetAt' must exist in viewport.ts.
+
+        Also matched by the _BASELINE_GATE_PATTERNS combined regex.
+        """
+        src = self._src()
+        assert "expectmintouchtargetat(" in src, (
+            "admin-ui/src/test/viewport.ts no longer defines 'expectMinTouchTargetAt'; "
+            "update the matching pattern in _VIEWPORT_PATTERNS (and _BASELINE_GATE_PATTERNS) "
+            "in regression_layer_classifier.py, or restore the function name in viewport.ts."
+        )
+
+    def test_expect_no_text_truncation_at_in_viewport_ts(self):
+        """_VIEWPORT_PATTERNS regex 'expectNoTextTruncationAt' must exist in viewport.ts."""
+        src = self._src()
+        assert "expectnotexttruncationat(" in src, (
+            "admin-ui/src/test/viewport.ts no longer defines 'expectNoTextTruncationAt'; "
+            "update the matching pattern in _VIEWPORT_PATTERNS in "
+            "regression_layer_classifier.py, or restore the function name in viewport.ts."
+        )

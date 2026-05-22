@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
 import { CheckCircle, Minus, Shield } from 'lucide-react';
 import { apiFetch, fetchCrossLayerCompliance, type CrossLayerComplianceResponse } from '../api';
-import { EscalationOutcomePanel } from './PipelineRegressionsPanel';
+import { EscalationOutcomePanel, FirstAttemptComplianceTrendPanel } from './PipelineRegressionsPanel';
 import { timeAgo, formatDurationSec, parseTimestamp, formatTimeToDetect, formatTimeToInvestigate } from '../utils/time';
+import { parseViewportSubkey } from '../utils/viewportRegression';
 import { LayersAffectedBadges, UntargetedLayersBadge, type LayerSummary } from './LayersAffectedBadges';
 import { PhaseChip } from './regressionPhaseChips';
 
@@ -31,20 +32,6 @@ const ASSERTION_TYPE_CHIPS: Record<string, string> = {
   text_truncation: 'bg-amber-900/60 text-amber-300 border-amber-700/50',
   touch_target: 'bg-blue-900/60 text-blue-300 border-blue-700/50',
 };
-
-function parseViewportSubkey(subkey: string): { component: string; assertionType?: string; width?: string } {
-  const colonIdx = subkey.indexOf(':');
-  if (colonIdx === -1) {
-    const atIdx = subkey.indexOf('@');
-    return atIdx === -1 ? { component: subkey } : { component: subkey.slice(0, atIdx), width: subkey.slice(atIdx + 1) };
-  }
-  const component = subkey.slice(0, colonIdx);
-  const rest = subkey.slice(colonIdx + 1);
-  const atIdx = rest.indexOf('@');
-  return atIdx === -1
-    ? { component, assertionType: rest }
-    : { component, assertionType: rest.slice(0, atIdx), width: rest.slice(atIdx + 1) };
-}
 
 function RegressionClassLabel({ cls }: { cls: string }) {
   const colon = cls.indexOf(':');
@@ -419,6 +406,7 @@ export function RecentlyResolvedRegressionsPanel({ projectId }: Props) {
         </div>
       )}
       <div className="mt-4">
+        <FirstAttemptComplianceTrendPanel projectId={projectId} />
         <EscalationOutcomePanel projectId={projectId} />
       </div>
     </section>

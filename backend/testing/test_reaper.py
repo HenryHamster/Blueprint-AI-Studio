@@ -29,6 +29,7 @@ from app.models import (
     ArtifactType,
     Project,
     ReleaseVersion,
+    StrategicCycle,
     Task,
     TaskStatus,
 )
@@ -1505,6 +1506,90 @@ async def test_step4_diagnostic_summarizes_failure_categories(
     assert "CODE_ERROR" in msg
     assert "AGENT_TIMEOUT" in msg
     assert "1 cancelled" in msg
+
+
+@pytest.mark.asyncio
+async def test_step4_rescues_parent_after_step3_rollup_expires_session(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Step 4 rescues an all-children-failed parent even when Step 3's rollup
+    helper expired every loaded ORM instance mid-sweep.
+
+    Regression: Step 3/4 once iterated the live ``evaluating_parents`` batch and
+    read ``parent.id`` / ``child.status`` off it. ``_check_and_trigger_rollup``
+    can commit or roll back (inner DB error), expiring every instance — the next
+    read fired a sync lazy-load that crashed the reaper cycle on a dead socket
+    (prod 2026-05-21, reaper.py:2385/2420). The fix snapshots ids/statuses and
+    re-fetches via ``session.get``. (The crash itself needs an unhealthy
+    connection — not reproducible on in-memory SQLite — so this locks the
+    snapshot+re-fetch contract and exercises the post-expiry code paths.)
+    """
+
+    def _expire_session(_child, session):
+        # Mirror the documented "_check_and_trigger_rollup may commit or roll
+        # back" behaviour — both expire every loaded ORM instance.
+        session.expire_all()
+
+    rollup_mock = mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup",
+        new_callable=AsyncMock,
+        side_effect=_expire_session,
+    )
+    requeue_mock = mocker.patch(
+        "app.task_lifecycle._requeue_parent_task", new_callable=AsyncMock
+    )
+
+    project = await _make_project(reaper_db)
+
+    # Parent A: has a COMPLETED child → Step 3 invokes the rollup helper, which
+    # expires the reaper's session.
+    parent_a = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(parent_a)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent_a)
+    reaper_db.add(
+        Task(
+            project_id=project.id,
+            parent_task_id=parent_a.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+        )
+    )
+
+    # Parent B: all children FAILED → Step 4 must still rescue it after the
+    # session was expired by parent A's Step 3 rollup.
+    parent_b = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.EVALUATING,
+        updated_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    reaper_db.add(parent_b)
+    await reaper_db.commit()
+    await reaper_db.refresh(parent_b)
+    for _ in range(2):
+        reaper_db.add(
+            Task(
+                project_id=project.id,
+                parent_task_id=parent_b.id,
+                payloads=[{"type": "create"}],
+                status=TaskStatus.FAILED,
+                context={"failure_category": "CODE_ERROR"},
+            )
+        )
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    assert rollup_mock.await_count >= 1
+    requeued_ids = {call.args[0].id for call in requeue_mock.await_args_list}
+    assert parent_b.id in requeued_ids
+    assert parent_a.id not in requeued_ids
 
 
 @pytest.mark.asyncio
@@ -3809,9 +3894,7 @@ async def test_step9_sweep_times_out_qualification_with_unparseable_started_at(
             "Step 9 timeout must force-finalize a pending qualification with "
             "an unparseable started_at — falling back to updated_at"
         )
-        assert (
-            version.last_qualification.get("blocker") == "qualification_timeout"
-        )
+        assert version.last_qualification.get("blocker") == "qualification_timeout"
         assert version.phase == "stabilize"
         assert version.status == "open"
     finally:
@@ -3819,3 +3902,259 @@ async def test_step9_sweep_times_out_qualification_with_unparseable_started_at(
             shared_state.runtime_config.pop("promotion_enabled", None)
         else:
             shared_state.runtime_config["promotion_enabled"] = _original_promotion
+
+
+# ── Step 9: calcification alerting ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_step9_calcification_alert_fires_for_repeated_hard_blockers(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """A version stuck in stabilize with >= _MIN_CALCIFICATION_ATTEMPTS hard-blocker
+    failures gets a calcification alert posted by the reaper's Step 9 sweep."""
+    from app import release_qualifier as _rq
+    from app.models import Alert as _Alert
+
+    project = await _make_project(reaper_db)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        qualification_attempts=_rq._MIN_CALCIFICATION_ATTEMPTS,
+        last_qualification={
+            "status": "not_promoted",
+            "blocker": "ci_not_green",
+            "candidate_sha": "abc" * 13 + "a",
+        },
+    )
+    reaper_db.add(version)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(version)
+
+    alerts = (
+        (
+            await reaper_db.execute(
+                _select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "calcifying" in alerts[0].title
+    assert "ci_not_green" in alerts[0].title
+
+
+@pytest.mark.asyncio
+async def test_step9_calcification_alert_not_fired_for_dry_run_hold(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """A version whose last qualification is a dry_run (passed but promotion
+    disabled) must NOT trigger a calcification alert — that is healthy operation."""
+    from app import release_qualifier as _rq
+    from app.models import Alert as _Alert
+
+    project = await _make_project(reaper_db)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        qualification_attempts=_rq._MIN_CALCIFICATION_ATTEMPTS + 5,
+        last_qualification={
+            "status": "dry_run",
+            "would_promote": True,
+            "confidence": 0.95,
+            "blocker": None,
+        },
+    )
+    reaper_db.add(version)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    alerts = (
+        (
+            await reaper_db.execute(
+                _select(_Alert).where(_Alert.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+# ── Step 7: stalled-cycle reaper + linked task reconciliation ────────────────
+
+
+def _make_cycle_id() -> str:
+    return str(_uuid_mod.uuid4())
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_cycle_cancels_linked_phase1_task(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Phase1 task IN_PROGRESS with stale heartbeat → task FAILED, cycle STALLED_PHASE1."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase1",
+        payloads=[{"type": "design_doc_update", "scope": "medium"}],
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=datetime.utcnow() - timedelta(hours=1),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase1_running",
+        phase1_task_id=task.id,
+        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+
+    assert task.status == TaskStatus.FAILED, (
+        "stale linked task must be force-terminated"
+    )
+    assert "stalled-cycle reaper" in (task.latest_status_message or "")
+    assert cycle.outcome == "stalled_phase1"
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_cycle_cancels_linked_phase2_task(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Phase2 task IN_PROGRESS with stale heartbeat → task FAILED, cycle STALLED_PHASE2."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase2",
+        payloads=[{"type": "strategic_review", "scope": "medium"}],
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=datetime.utcnow() - timedelta(hours=1),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        phase2_task_id=task.id,
+        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
+        phase2_started_at=datetime.utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+
+    assert task.status == TaskStatus.FAILED, (
+        "stale linked task must be force-terminated"
+    )
+    assert "stalled-cycle reaper" in (task.latest_status_message or "")
+    assert cycle.outcome == "stalled_phase2"
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_cycle_live_task_not_declared_stalled(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Cycle >3h but linked task has a fresh heartbeat — cycle must NOT be declared stalled."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-live",
+        payloads=[{"type": "design_doc_update", "scope": "medium"}],
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=datetime.utcnow() - timedelta(seconds=30),
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase1_running",
+        phase1_task_id=task.id,
+        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+
+    assert task.status == TaskStatus.IN_PROGRESS, "live task must not be terminated"
+    assert cycle.outcome == "phase1_running", (
+        "slow-but-live cycle must not be declared stalled"
+    )
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_cycle_already_terminal_task_untouched(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Linked task already FAILED — cycle is declared stalled without re-mutating the task."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-already-failed",
+        payloads=[{"type": "design_doc_update", "scope": "medium"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="crashed earlier",
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase1_running",
+        phase1_task_id=task.id,
+        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+
+    assert task.status == TaskStatus.FAILED, "already-terminal task must not be mutated"
+    assert task.latest_status_message == "crashed earlier", (
+        "task message must not be overwritten"
+    )
+    assert cycle.outcome == "stalled_phase1", "cycle must be declared stalled"

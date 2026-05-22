@@ -2,7 +2,7 @@ import { afterEach, describe, test } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { SearchFilterBar } from './SearchFilterBar';
-import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 import { FILTER_TASK_TYPE_OPTIONS } from '../taskCapabilities';
 
 describe('SearchFilterBar — viewport regression', () => {
@@ -137,6 +137,34 @@ describe('SearchFilterBar — viewport regression', () => {
 
   test('renders without horizontal overflow at 768px (md: breakpoint — input transitions to w-64)', async () => {
     await expectNoOverflowAt(768, async () => {
+      host = document.createElement('div');
+      host.style.padding = '16px';
+      host.style.display = 'flex';
+      host.style.gap = '0.5rem';
+      host.style.flexWrap = 'wrap';
+      host.style.alignItems = 'center';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <SearchFilterBar
+            searchQuery="test query"
+            onSearchChange={() => {}}
+            taskTypeFilter={['create', 'fix']}
+            onTypeFilterChange={() => {}}
+            dateRange="24h"
+            onDateRangeChange={() => {}}
+            blockedFilter={true}
+            onBlockedFilterChange={() => {}}
+          />,
+        );
+      });
+    });
+  });
+
+  test('text labels do not truncate silently at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => {
       host = document.createElement('div');
       host.style.padding = '16px';
       host.style.display = 'flex';

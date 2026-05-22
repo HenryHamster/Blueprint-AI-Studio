@@ -10,10 +10,10 @@ with module-level defaults, then persists partial updates back into
 import uuid
 import logging
 from typing import Dict, Any
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import func, case
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,33 +39,52 @@ async def cost_summary(
     days: int = Query(7, ge=1, le=365),
     current_user: dict = Depends(require_admin),
 ):
-    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
-    tasks = (
-        (await session.execute(select(Task).where(Task.created_at >= cutoff)))
-        .scalars()
-        .all()
-    )
-
     # e2-standard-2 pricing: ~$0.067/hr on-demand, ~$0.020/hr spot
     ON_DEMAND_RATE = 0.067 / 3600  # per second
     SPOT_RATE = 0.020 / 3600
 
-    by_type = defaultdict(
-        lambda: {"count": 0, "total_seconds": 0, "estimated_cost": 0.0}
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+    duration_seconds = func.extract(
+        "epoch", Task.vm_stopped_at - Task.vm_provisioned_at
     )
-    for t in tasks:
-        if t.vm_provisioned_at and t.vm_stopped_at:
-            seconds = (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
-            rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-            task_type = t.first_payload.get("type", "unknown")
-            by_type[task_type]["count"] += 1
-            by_type[task_type]["total_seconds"] += seconds
-            by_type[task_type]["estimated_cost"] += seconds * rate
+    rate_expr = case((Task.vm_spot, SPOT_RATE), else_=ON_DEMAND_RATE)
+
+    rows = (
+        await session.execute(
+            select(
+                Task.provider,
+                Task.vm_spot,
+                func.count().label("count"),
+                func.sum(duration_seconds).label("total_seconds"),
+                func.sum(duration_seconds * rate_expr).label("estimated_cost"),
+            )
+            .where(
+                Task.created_at >= cutoff,
+                Task.vm_provisioned_at.is_not(None),
+                Task.vm_stopped_at.is_not(None),
+            )
+            .group_by(Task.provider, Task.vm_spot)
+        )
+    ).all()
+
+    by_type: Dict[str, Any] = {}
+    total_cost = 0.0
+    for row in rows:
+        key = f"{row.provider or 'unknown'}:{'spot' if row.vm_spot else 'on-demand'}"
+        estimated_cost = float(row.estimated_cost or 0.0)
+        by_type[key] = {
+            "count": row.count,
+            "total_seconds": float(row.total_seconds or 0.0),
+            "estimated_cost": estimated_cost,
+            "provider": row.provider,
+            "spot": row.vm_spot,
+        }
+        total_cost += estimated_cost
 
     return {
         "period_days": days,
-        "by_task_type": dict(by_type),
-        "total_estimated_cost": sum(v["estimated_cost"] for v in by_type.values()),
+        "by_task_type": by_type,
+        "total_estimated_cost": total_cost,
     }
 
 

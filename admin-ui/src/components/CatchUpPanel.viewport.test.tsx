@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { CatchUpPanel } from './CatchUpPanel';
-import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
+import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } from '../test/viewport';
 import { apiFetch } from '../api';
 
 // Mock the api module so CatchUpPanel doesn't try to fetch real data.
@@ -68,15 +68,13 @@ vi.mock('../api', async () => {
           ],
           direction_progress: [
             {
-              id: 'd-001',
-              text: 'Improve admin UI mobile responsiveness',
+              direction_id: 'd-001',
+              direction_text: 'Improve admin UI mobile responsiveness',
               priority: 'high',
-              findings: 5,
-              latest_status: 'in-progress',
-              matching_tasks: 3,
-              task_completion_rate: 0.67,
-              current_effort_points: 8,
-              target_effort_points: 13,
+              cycles_in_window: 3,
+              tasks_created: 8,
+              prs_merged: 5,
+              possibly_saturated: false,
             },
           ],
           active_tasks: [],
@@ -137,8 +135,12 @@ describe('CatchUpPanel — viewport regression', () => {
                 title: 'fix(backend): handle edge case where pipeline_regression_dispatcher emits duplicate escalation_reason labels on retry loops',
                 reason: 'failed',
                 error_snippet: 'AssertionError: Expected labels to be unique but found [\'escalated_cross_layer\', \'escalated_cross_layer\'] — dedup guard not applied in dispatch_single_signal',
-                pr_url: null,
+                pr_url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/4923',
                 failure_class: 'TEST_FAILURE',
+                scope: 'small',
+                direction_text: 'Improve test infrastructure and coverage for edge cases',
+                merge_retries_saved: 3,
+                waiting_hours: 2,
               },
             ],
             recent_failures: [
@@ -172,15 +174,13 @@ describe('CatchUpPanel — viewport regression', () => {
             ],
             direction_progress: [
               {
-                id: 'd-001',
-                text: 'Improve admin UI mobile responsiveness across all operator-facing panels including kanban board, task detail drawer, and metrics dashboard',
+                direction_id: 'd-001',
+                direction_text: 'Improve admin UI mobile responsiveness across all operator-facing panels including kanban board, task detail drawer, and metrics dashboard',
                 priority: 'high',
-                findings: 12,
-                latest_status: 'in-progress',
-                matching_tasks: 7,
-                task_completion_rate: 0.57,
-                current_effort_points: 16,
-                target_effort_points: 28,
+                cycles_in_window: 6,
+                tasks_created: 14,
+                prs_merged: 8,
+                possibly_saturated: false,
               },
             ],
             active_tasks: [],
@@ -248,5 +248,34 @@ describe('CatchUpPanel — viewport regression', () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 50));
       });
     });
+  });
+
+  test('primary triage actions (Approve/Retry buttons) meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <CatchUpPanel
+            selectedProjectId="project-123"
+            lastVisitTimestamp={Date.now() - 24 * 60 * 60 * 1000}
+            refreshInterval={60000}
+            onSelectTask={() => {}}
+            onOpenActivityFeed={() => {}}
+            needsAttentionCount={2}
+            onApprove={() => {}}
+            onRetry={() => {}}
+            onBulkApprove={() => {}}
+            onBulkRetry={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    }, { selector: 'button:is(.bg-emerald-500\\/10, .bg-blue-500\\/10)', waitMs: 50 });
   });
 });

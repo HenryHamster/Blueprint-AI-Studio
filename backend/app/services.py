@@ -1386,30 +1386,39 @@ async def _check_evaluating_timeouts():
                 .all()
             )
 
-            # Phase B4 (H-P2): batch-fetch children for all evaluating parents
-            # in a single ``IN (...)`` query. The previous code fired one query
-            # per parent inside the loop (lines ~1345 and ~1396), an N+1 pattern.
-            # Children are loaded with full columns because per-child mutations
-            # below (status, latest_status_message, vm_instance_id) need to flow
-            # through the session.
-            _eval_children_by_parent: Dict[uuid.UUID, list] = {}
+            # Phase B4 (H-P2): batch the child lookup for all evaluating parents
+            # into one ``IN (...)`` query instead of one-per-parent (N+1).
+            #
+            # Only a plain (id, status) snapshot is kept — NOT live ORM rows.
+            # This loop commits per task, and a commit/rollback inside
+            # _check_and_trigger_rollup expires every loaded instance; a later
+            # iteration reading ``child.status`` off a stale batch fires a sync
+            # lazy-load that crashes the cycle on an unhealthy connection (prod
+            # 2026-05-21, services.py:1868). The hot all-terminal check below
+            # reads the snapshot; the rare branches that mutate children
+            # re-fetch them fresh.
+            _eval_child_status_by_parent: Dict[uuid.UUID, list[tuple]] = {}
             if evaluating_tasks:
                 _eval_parent_ids = [t.id for t in evaluating_tasks]
-                _eval_all_children = (
+                _eval_child_rows = (
                     (
                         await session.execute(
-                            select(Task).where(
-                                Task.parent_task_id.in_(_eval_parent_ids)
+                            select(Task)
+                            .options(
+                                load_only(
+                                    Task.id, Task.parent_task_id, Task.status
+                                )
                             )
+                            .where(Task.parent_task_id.in_(_eval_parent_ids))
                         )
                     )
                     .scalars()
                     .all()
                 )
-                for _ec in _eval_all_children:
-                    _eval_children_by_parent.setdefault(_ec.parent_task_id, []).append(
-                        _ec
-                    )
+                for _ec in _eval_child_rows:
+                    _eval_child_status_by_parent.setdefault(
+                        _ec.parent_task_id, []
+                    ).append((_ec.id, _ec.status))
 
             for task in evaluating_tasks:
                 ctx = task.context or {}
@@ -1807,7 +1816,20 @@ async def _check_evaluating_timeouts():
                         task_type=task.first_payload.get("type", ""),
                     )
                     session.add(task)
-                    children = _eval_children_by_parent.get(task.id, [])
+                    # Re-fetch children fresh — the batch holds only a plain
+                    # status snapshot, and this branch reads + mutates the live
+                    # rows (cancel, latest_status_message, vm_instance_id).
+                    children = (
+                        (
+                            await session.execute(
+                                select(Task).where(
+                                    Task.parent_task_id == task.id
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
                     from app.main import _ensure_vm_deleted
                     from app.max_plan_pool import release_max_plan_account
 
@@ -1861,11 +1883,13 @@ async def _check_evaluating_timeouts():
 
                 elapsed = (now - evaluating_since).total_seconds()
 
-                # Children fetched in the batched IN query at the top of the loop.
-                children = _eval_children_by_parent.get(task.id, [])
+                # Child statuses snapshotted at batch-fetch time (plain tuples).
+                # Reading live ORM children here would fire a sync lazy-load if an
+                # earlier iteration's commit/rollback expired the shared batch.
+                child_status_snap = _eval_child_status_by_parent.get(task.id, [])
 
-                all_children_terminal = bool(children) and all(
-                    c.status in TERMINAL for c in children
+                all_children_terminal = bool(child_status_snap) and all(
+                    c_status in TERMINAL for _, c_status in child_status_snap
                 )
 
                 # Recovery for missed rollup: all children done but parent still EVALUATING
@@ -1874,8 +1898,12 @@ async def _check_evaluating_timeouts():
                         f"[EVAL TIMEOUT] Task {str(task.id)[:8]} has all children terminal "
                         f"but is still EVALUATING — triggering missed rollup"
                     )
-                    # Use any terminal child to trigger rollup
-                    await _check_and_trigger_rollup(children[0], session)
+                    # Re-fetch a terminal child fresh to trigger rollup.
+                    trigger_child = await session.get(
+                        Task, child_status_snap[0][0]
+                    )
+                    if trigger_child is not None:
+                        await _check_and_trigger_rollup(trigger_child, session)
                     await session.commit()
                     continue
 
@@ -1985,6 +2013,19 @@ async def _check_evaluating_timeouts():
                         task_type=task.first_payload.get("type", ""),
                     )
                     session.add(task)
+
+                    # Re-fetch children fresh — the batch holds only a plain
+                    # status snapshot, and the cascade-cancel + PR-close below
+                    # read and mutate the live rows.
+                    children = (
+                        (
+                            await session.execute(
+                                select(Task).where(Task.parent_task_id == task.id)
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
 
                     # Cascade-cancel non-terminal children
                     from app.main import _ensure_vm_deleted

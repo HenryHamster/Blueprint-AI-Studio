@@ -107,6 +107,8 @@ async def db_session():
                 "residualremediationcase",
                 "systemmaturity",
                 "messageslastseen",
+                "messagesnoiseprefs",
+                "messagessavedviews",
                 # Drift time-series (project_id not a FK constraint, safe to delete standalone)
                 "directiondriftsnapshot",
                 # Base tables

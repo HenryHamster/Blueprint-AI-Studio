@@ -11,6 +11,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query, HTTPException
+from pydantic import BaseModel, Field as _Field
 from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -37,10 +38,13 @@ from app.models import (
     ResidualRemediationCaseStatus,
     RegressionRemediationCase,
     RegressionCaseStatus,
+    ReleaseVersion,
     StrategicCycle,
     Alert,
     AlertSeverity,
     CLOSE_REASON_RECOVERED_UNATTENDED,
+    CYCLE_META_MEMOS_AVAILABLE,
+    CYCLE_META_MEMOS_CITED,
 )
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
@@ -50,6 +54,7 @@ from app.direction_metrics import _compute_direction_quality_score
 from app.direction_outcomes import synthesize_prompt_quality_patterns
 from app.retry_budget import failure_class_history_classes
 from app import strategic_cycle as _strategic_cycle
+from app import release_version as _release_version
 from app.strategic_analysis import _compute_prediction_calibration
 from app.playbook_learning import (
     _MIN_DIRECTION_SR_SAMPLE,
@@ -84,6 +89,9 @@ _REGRESSION_STALL_THRESHOLD_HOURS = (
 _SIGNAL_STALENESS_TITLE_PREFIX = "Signal staleness: "
 _SR_CATCH_RATE_TARGET_ALERT_PREFIX = "SR catch-rate below target: "
 _SR_CATCH_RATE_TARGET_MIN_WINDOWS = 2
+_SR_CATCH_RATE_MIN_FINDINGS = (
+    10  # minimum reviewer findings to treat a rate as reliable
+)
 _LONE_CHECKER_ALERT_TITLE = "SR lone-checker blind spot: ≥2 categories uncorroborated"
 _LONE_CHECKER_MIN_CATEGORIES = 2
 
@@ -139,6 +147,11 @@ async def _evaluate_sr_catch_rate_targets(
                 existing.dismissed_at = _utcnow()
                 await session.commit()
             continue
+        # Gate on finding count (true denominator) not task count to avoid spurious
+        # alerts when the window clears the task-count bar but rests on a handful of findings.
+        current_human_count = cat_data.get("current_human_count") or 0
+        if current_human_count < _SR_CATCH_RATE_MIN_FINDINGS:
+            continue
         rate_history = cat_data.get("rate_history") or []
         if len(rate_history) < _SR_CATCH_RATE_TARGET_MIN_WINDOWS:
             continue
@@ -153,7 +166,8 @@ async def _evaluate_sr_catch_rate_targets(
         message = (
             f"Self-review catch-rate for '{cat}' has been below the configured target "
             f"({target_float:.0%}) for the last {_SR_CATCH_RATE_TARGET_MIN_WINDOWS} "
-            f"measurement windows. Current: {curr_str}. Trend: {trend}. "
+            f"measurement windows. Current: {curr_str} (n={current_human_count} reviewer findings). "
+            f"Trend: {trend}. "
             f"Review the SR Trend Breakdown in the admin dashboard."
         )
         session.add(
@@ -404,6 +418,8 @@ def _compute_sr_prediction_accuracy(
         return None
     total_human = total_overlap = total_missed = total_false = total_sr_failed = 0
     w_caught = w_missed = 0.0
+    self_flagged_task_count = 0
+    tasks_with_rejections = 0
     for t in tasks_with_both:
         ctx = t.context or {}
         check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
@@ -414,6 +430,10 @@ def _compute_sr_prediction_accuracy(
         total_missed += len(human_cats - sr_failed)
         total_false += len(sr_failed - human_cats)
         total_sr_failed += len(sr_failed)
+        if human_cats:
+            tasks_with_rejections += 1
+            if human_cats & sr_failed:
+                self_flagged_task_count += 1
         rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
         cat_weights: Dict[str, int] = {}
         cached_entry = ctx.get("_first_attempt_categorized_issues")
@@ -448,6 +468,13 @@ def _compute_sr_prediction_accuracy(
         "weighted_hit_rate": round(w_caught / total_w, 3) if total_w > 0 else None,
         "weighted_miss_rate": round(w_missed / total_w, 3) if total_w > 0 else None,
         "sample_size": len(tasks_with_both),
+        # Tasks where SR already flagged the issue but the agent submitted without fixing it.
+        "self_flagged_shipped_unfixed_task_count": self_flagged_task_count,
+        "self_flagged_shipped_unfixed_task_rate": round(
+            self_flagged_task_count / tasks_with_rejections, 3
+        )
+        if tasks_with_rejections > 0
+        else None,
     }
 
 
@@ -1266,8 +1293,13 @@ def _compute_regression_case_summary(
 ) -> Dict[str, Any]:
     by_class: Dict[str, Dict[str, List[float]]] = {}
     for case in rows:
+        if not case.first_seen_at:
+            continue
+        # episode_start advances to each cycle's recovered_at so re-armed cases
+        # report per-episode durations rather than lifetime spans.
+        episode_start = _to_naive_utc(case.first_seen_at)
         latest_merged_at = None
-        merged_at = recovered_at = None
+        bucket_written = False
         for entry in case.fingerprint_to_fix_log or []:
             if entry.get("merged_at"):
                 latest_merged_at = _to_naive_utc(
@@ -1276,30 +1308,31 @@ def _compute_regression_case_summary(
                     )
                 )
             if entry.get("recovered_at") and latest_merged_at is not None:
-                merged_at = latest_merged_at
-                recovered_at = _to_naive_utc(
+                recovered_dt = _to_naive_utc(
                     datetime.fromisoformat(
                         str(entry["recovered_at"]).replace("Z", "+00:00")
                     )
                 )
-        if case.first_seen_at and merged_at and recovered_at:
-            bucket = by_class.setdefault(
-                case.regression_class,
-                {"to_merged": [], "to_recovered": [], "to_detect": []},
-            )
-            bucket["to_merged"].append(
+                bucket = by_class.setdefault(
+                    case.regression_class,
+                    {"to_merged": [], "to_recovered": [], "to_detect": []},
+                )
+                bucket["to_merged"].append(
+                    (latest_merged_at - episode_start).total_seconds()
+                )
+                bucket["to_recovered"].append(
+                    (recovered_dt - latest_merged_at).total_seconds()
+                )
+                episode_start = recovered_dt
+                latest_merged_at = None
+                bucket_written = True
+        if bucket_written and case.signal_first_crossed_at:
+            by_class[case.regression_class]["to_detect"].append(
                 (
-                    _to_naive_utc(merged_at) - _to_naive_utc(case.first_seen_at)
+                    _to_naive_utc(case.first_seen_at)
+                    - _to_naive_utc(case.signal_first_crossed_at)
                 ).total_seconds()
             )
-            bucket["to_recovered"].append((recovered_at - merged_at).total_seconds())
-            if case.signal_first_crossed_at:
-                bucket["to_detect"].append(
-                    (
-                        _to_naive_utc(case.first_seen_at)
-                        - _to_naive_utc(case.signal_first_crossed_at)
-                    ).total_seconds()
-                )
     layer_coverage_by_class = _compute_layer_coverage_by_class(rows)
     all_rows_list = list(all_rows) if all_rows is not None else rows
     symptom_layers_by_class = _compute_symptom_layers_by_class(all_rows_list)
@@ -1476,11 +1509,27 @@ async def compute_pipeline_health_summary(
         except (ValueError, TypeError):
             return False
 
-    # Query tasks from extended 48h window to compute both current and previous period
+    # Query tasks from extended 48h window to compute both current and previous period.
+    # Status is filtered in SQL to avoid loading IN_PROGRESS/QUEUED tasks; timestamp
+    # window is post-filtered in Python via _derive_completed_at (uses status_log).
     tasks_result = await session.execute(
-        select(Task).where(
+        select(Task)
+        .where(
             Task.project_id == project_id,
             Task.created_at >= prev_window_start,
+            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.project_id,
+                Task.status,
+                Task.created_at,
+                Task.context,
+                Task.latest_status_message,
+                Task.payloads,
+                Task.status_log,
+            )
         )
     )
     all_tasks = tasks_result.scalars().all()
@@ -2223,10 +2272,17 @@ async def compute_pipeline_health_summary(
     # over-retirement of auto-generated entries whose last_referenced_at
     # crossed the idle threshold (see playbook_learning.retire_idle_auto_entries).
     auto_playbook_idle_retired_24h: Optional[int] = None
+    auto_playbook_low_success_retired_24h: Optional[int] = None
     if project and project.design_doc:
-        from app.playbook_learning import count_idle_auto_retired_within  # noqa: PLC0415
+        from app.playbook_learning import (  # noqa: PLC0415
+            count_idle_auto_retired_within,
+            count_low_success_retired_within,
+        )
 
         auto_playbook_idle_retired_24h = count_idle_auto_retired_within(
+            project.design_doc, hours=24
+        )
+        auto_playbook_low_success_retired_24h = count_low_success_retired_within(
             project.design_doc, hours=24
         )
 
@@ -2312,6 +2368,7 @@ async def compute_pipeline_health_summary(
         "direction_first_attempt_feedback": direction_first_attempt_feedback,
         "medium_scope_measurement": medium_scope_measurement,
         "auto_playbook_idle_retired_24h": auto_playbook_idle_retired_24h,
+        "auto_playbook_low_success_retired_24h": auto_playbook_low_success_retired_24h,
     }
 
 
@@ -3373,6 +3430,43 @@ async def get_cross_layer_compliance(
     return compute_cross_layer_compliance(rows, cutoff)
 
 
+@router.get("/regression-cases/first-attempt-compliance-trend")
+async def get_first_attempt_compliance_trend(
+    project_id: uuid.UUID = Query(..., description="Project to query (required)"),
+    num_windows: int = Query(6, ge=1, le=12, description="Number of rolling windows"),
+    window_days: int = Query(
+        7, ge=1, le=30, description="Width of each window in days"
+    ),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """First-attempt cross-layer compliance trend over rolling weekly windows.
+
+    Distinguishes whether the original meta-investigation produced a >=2-layer
+    defense (first_attempt_compliant) vs. only the corrective compliance-followup
+    did (followup_rescued). Cases awaiting layers_targeted backfill are excluded
+    from the rate denominator and reported in awaiting_backfill.
+    """
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        compute_first_attempt_compliance_trend,
+    )
+
+    rows = (
+        (
+            await session.execute(
+                select(RegressionRemediationCase).where(
+                    RegressionRemediationCase.project_id == project_id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return compute_first_attempt_compliance_trend(
+        list(rows), num_windows=num_windows, window_days=window_days
+    )
+
+
 @router.get("/regression-class-kpis")
 async def get_regression_class_kpis(
     project_id: uuid.UUID = Query(..., description="Project to query (required)"),
@@ -3418,6 +3512,8 @@ async def get_regression_class_kpis(
         if case.time_to_detect_sec is not None:
             b["mttd"].append(case.time_to_detect_sec)
         if case.fingerprint_to_fix_log and first:
+            ep_start = first
+            latest_merged_ep: Optional[datetime] = None
             for entry in case.fingerprint_to_fix_log:
                 if entry.get("merged_at"):
                     try:
@@ -3426,7 +3522,18 @@ async def get_regression_class_kpis(
                                 str(entry["merged_at"]).replace("Z", "+00:00")
                             )
                         )
-                        b["mttr"].append((merged - first).total_seconds())
+                        b["mttr"].append((merged - ep_start).total_seconds())
+                        latest_merged_ep = merged
+                    except (ValueError, TypeError):
+                        pass
+                if entry.get("recovered_at") and latest_merged_ep is not None:
+                    try:
+                        ep_start = _to_naive_utc(
+                            datetime.fromisoformat(
+                                str(entry["recovered_at"]).replace("Z", "+00:00")
+                            )
+                        )
+                        latest_merged_ep = None
                     except (ValueError, TypeError):
                         pass
 
@@ -5735,8 +5842,12 @@ async def _compute_digest(
     edges_trend: Optional[Dict[str, Any]] = None
     self_review_prediction_accuracy_trends: Optional[Dict[str, Any]] = None
     sr_regression_risk_test_signal_trends: Optional[Dict[str, Any]] = None
+    memo_pathway_exits: int = 0
     if project_id:
         _proj = await session.get(Project, project_id)
+        memo_pathway_exits = await _strategic_cycle.count_memo_exits(
+            session, project_id
+        )
         if _proj:
             _sr_trends = (_proj.design_doc or {}).get("sr_catch_rate_trends") or {}
             if _sr_trends:
@@ -5766,6 +5877,17 @@ async def _compute_digest(
                     "vision_updated": last.get("vision_updated", False),
                     "summary_text": last.get("summary_text"),
                 }
+                _cycle_id = last.get("cycle_id")
+                if _cycle_id:
+                    _sc_row = await session.get(StrategicCycle, _cycle_id)
+                    if _sc_row is not None:
+                        _ms = _sc_row.memo_stats()
+                        latest_cycle[CYCLE_META_MEMOS_AVAILABLE] = _ms[
+                            CYCLE_META_MEMOS_AVAILABLE
+                        ]
+                        latest_cycle[CYCLE_META_MEMOS_CITED] = _ms[
+                            CYCLE_META_MEMOS_CITED
+                        ]
             _sc_history = await _strategic_cycle.recent_for_agent_context(
                 session,
                 project_id,
@@ -6013,9 +6135,13 @@ async def _compute_digest(
     remediations_merged = sum(1 for t in _rem_tasks if t.status == TaskStatus.COMPLETED)
     remediations_failed = sum(1 for t in _rem_tasks if t.status == TaskStatus.FAILED)
 
-    _held_projects_q = select(Project)
+    _held_projects_q = select(Project).options(
+        load_only(Project.id, Project.directions)
+    )
     if project_id:
         _held_projects_q = _held_projects_q.where(Project.id == project_id)
+    else:
+        _held_projects_q = _held_projects_q.where(Project.directions.isnot(None))
     _held_projects = (await session.execute(_held_projects_q)).scalars().all()
     fixes_held = 0
     _window_iso = window_start.isoformat()
@@ -6726,6 +6852,7 @@ async def _compute_digest(
         "trend": trend,
         "trend_history": trend_history,
         "latest_cycle": latest_cycle,
+        "memo_pathway_exits": memo_pathway_exits,
         "scope_conversion_rates": scope_conversion_rates or None,
         "prev_scope_conversion_rates": prev_scope_conversion_rates or None,
         "pipeline_acceptance_rate": pipeline_acceptance_rate,
@@ -8794,19 +8921,27 @@ async def get_regression_mtta(
             tti = c.time_to_investigate_sec
             if tti is not None and tti >= 0:
                 investigate_s.append(float(tti))
+            # inv_anchor advances to recovered_dt after each cycle so
+            # re-armed cases report per-episode investigate→merge durations.
+            inv_anchor: Optional[datetime] = c.investigate_spawned_at
+            latest_merged_fix: Optional[datetime] = None
             for entry in c.fingerprint_to_fix_log or []:
                 if not isinstance(entry, dict):
                     continue
                 merged_dt = _parse_dt(entry.get("merged_at"))
                 recovered_dt = _parse_dt(entry.get("recovered_at"))
-                if merged_dt and c.investigate_spawned_at:
-                    d = (merged_dt - c.investigate_spawned_at).total_seconds()
+                if merged_dt and inv_anchor:
+                    d = (merged_dt - inv_anchor).total_seconds()
                     if d >= 0:
                         inv_to_merge_s.append(d)
+                    latest_merged_fix = merged_dt
                 if merged_dt and recovered_dt:
                     d2 = (recovered_dt - merged_dt).total_seconds()
                     if d2 >= 0:
                         merge_to_rec_s.append(d2)
+                if recovered_dt and latest_merged_fix is not None and not merged_dt:
+                    inv_anchor = recovered_dt
+                    latest_merged_fix = None
 
             if c.status != RegressionCaseStatus.CLOSED:
                 anchor = (
@@ -8975,6 +9110,7 @@ def _scan_viewport_debt_rows() -> tuple[
                         "total_opt_outs": 0,
                         "has_viewport_test": False,
                         "regression_case_count": 0,
+                        "regression_case_breakdown": {},
                         "source_url": None,
                     }
                 )
@@ -8990,6 +9126,7 @@ def _scan_viewport_debt_rows() -> tuple[
                 "total_opt_outs": total,
                 "has_viewport_test": vp_test,
                 "regression_case_count": 0,
+                "regression_case_breakdown": {},
                 "source_url": None,
             }
         )
@@ -9030,11 +9167,17 @@ async def get_viewport_debt(
     # Shallow-copy cached rows: the scan result is a process-wide cache and
     # we annotate per-project below. Without the copy, concurrent requests
     # for different projects would race on regression_case_count / source_url.
-    top_rows, top_untested, coverage_summary = _scan_viewport_debt_rows()
+    top_rows, top_untested, coverage_summary = await asyncio.to_thread(
+        _scan_viewport_debt_rows
+    )
     rows = [dict(r) for r in top_rows]
     untested_rows = [dict(r) for r in top_untested]
 
     if rows or untested_rows:
+        from app.regression_layer_classifier import (  # noqa: PLC0415
+            parse_viewport_regression_class,
+        )
+
         cutoff = datetime.utcnow() - timedelta(days=30)
         stmt = select(RegressionRemediationCase).where(
             RegressionRemediationCase.project_id == project_id,
@@ -9045,14 +9188,20 @@ async def get_viewport_debt(
         )
         vp_cases = (await session.execute(stmt)).scalars().all()
 
-        # Map component stem → case count
+        # Map component stem → case count and per-assertion-type breakdown
         case_counts: Dict[str, int] = {}
+        case_breakdown: Dict[str, Dict[str, int]] = {}
         for c in vp_cases:
-            cls = c.regression_class  # e.g. "viewport_regression:MessagesPanel.tsx@375"
-            # Extract component name between ":" and "@"
-            inner = cls[len("viewport_regression:") :]
-            comp = inner.split("@")[0]  # e.g. "MessagesPanel.tsx"
-            case_counts[comp] = case_counts.get(comp, 0) + 1
+            parsed = parse_viewport_regression_class(c.regression_class)
+            comp = parsed.get("component")
+            if comp:
+                # Normalize component name to .tsx extension for consistent lookup
+                if not comp.endswith(".tsx"):
+                    comp = f"{comp}.tsx"
+                case_counts[comp] = case_counts.get(comp, 0) + 1
+                atype = parsed.get("assertion_type") or "unknown"
+                bd = case_breakdown.setdefault(comp, {})
+                bd[atype] = bd.get(atype, 0) + 1
 
         project = await session.get(Project, project_id)
         gh_owner = project.github_owner if project else None
@@ -9061,6 +9210,7 @@ async def get_viewport_debt(
         for row in (*rows, *untested_rows):
             stem_tsx = _Path(row["component"]).name  # e.g. "MessagesPanel.tsx"
             row["regression_case_count"] = case_counts.get(stem_tsx, 0)
+            row["regression_case_breakdown"] = case_breakdown.get(stem_tsx, {})
             if gh_owner and gh_repo:
                 row["source_url"] = (
                     f"https://github.com/{gh_owner}/{gh_repo}/blob/main/{row['component']}"
@@ -9080,20 +9230,26 @@ async def get_efficiency_axes(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    """Return per-axis current/baseline/drift for the project's efficiency baseline.
+    """Return per-axis current/baseline/drift/history for the project's efficiency baseline.
 
     Reads ``project.design_doc["efficiency_baseline"]`` (populated weekly by
     the ``_efficiency_snapshot_service``) and returns each of the five
     foundational axes — ``cost_per_merged_pr``, ``vm_cold_start_p50_ms``,
     ``vm_reuse_rate``, ``median_api_calls_per_task``,
     ``median_review_iterations`` — with the latest snapshot value, the
-    immutable baseline value, and percentage drift from baseline.
+    immutable baseline value, percentage drift from baseline, and a
+    time-series of up to 26 weekly snapshots for trend rendering.
 
     Response shape::
 
         {
           "axes": {
-            "<axis>": {"current": float|None, "baseline": float|None, "drift_pct": float|None},
+            "<axis>": {
+              "current": float|None,
+              "baseline": float|None,
+              "drift_pct": float|None,
+              "history": [{"captured_at": iso8601, "value": float|None}, ...]
+            },
             ...
           },
           "baseline_captured_at": iso8601|None,
@@ -9101,6 +9257,7 @@ async def get_efficiency_axes(
         }
 
     ``drift_pct`` is None whenever either side is missing or baseline is 0.
+    ``history`` is ordered oldest-first; before any snapshot fires it is ``[]``.
     Before the first snapshot fires, all axis values are None and both
     timestamps are None.
     """
@@ -9268,4 +9425,300 @@ async def get_canonical_regression_layers(
             }
             for layer in LAYER_DISPLAY_ORDER
         ]
+    }
+
+
+_SR_INVESTIGATION_ACTIVE_STATUSES = (
+    TaskStatus.QUEUED,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.EVALUATING,
+)
+_SR_INVESTIGATION_SPAWNED_BY = "operator_sr_investigation"
+
+
+class SpawnSrInvestigationRequest(BaseModel):
+    category: str = _Field(..., min_length=1, max_length=100)
+    current_hit_rate: float | None = None
+    previous_hit_rate: float | None = None
+    sample_size: int | None = None
+    signals: list[str] = _Field(default_factory=list)
+
+
+@router.post("/projects/{project_id}/sr-investigation")
+async def spawn_sr_investigation(
+    project_id: uuid.UUID,
+    req: SpawnSrInvestigationRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Spawn an operator-triggered SR investigation task for a category.
+
+    Deduplicates: if an open investigation for the same category already exists,
+    returns the existing task id without creating a new one.
+    Requires at least member role on the project — this spawns a billable
+    agent task, consistent with request_fresh_reviewer and other task-spawning
+    admin endpoints.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    dedup_stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status.in_(_SR_INVESTIGATION_ACTIVE_STATUSES),
+            Task.context["spawned_by"].as_string() == _SR_INVESTIGATION_SPAWNED_BY,
+            Task.context["sr_category"].as_string() == req.category,
+        )
+        .options(load_only(Task.id, Task.status))
+        .limit(1)
+    )
+    existing = (await session.execute(dedup_stmt)).scalars().first()
+    if existing:
+        return {"task_id": str(existing.id), "created": False}
+
+    signals_str = ", ".join(req.signals) if req.signals else "no specific signal"
+    rate_info = ""
+    if req.current_hit_rate is not None:
+        rate_info = f" (current hit-rate: {req.current_hit_rate:.0%}"
+        if req.previous_hit_rate is not None:
+            rate_info += f", previous: {req.previous_hit_rate:.0%}"
+        rate_info += f", n={req.sample_size or '?'})"
+
+    prompt = (
+        f"Operator-requested SR investigation for category '{req.category}'{rate_info}.\n"
+        f"Signals that tripped: {signals_str}.\n\n"
+        f"Investigate why the self-review catch-rate for this category has regressed. "
+        f"Identify root causes (e.g. prompt gaps, task patterns, reviewer hallucinations) "
+        f"and propose concrete fixes."
+    )
+
+    new_task = Task(
+        project_id=project_id,
+        title=f"Investigate SR catch-rate: {req.category}"[:200],
+        description=f"Operator-triggered SR investigation for category '{req.category}'"[
+            :500
+        ],
+        payloads=[
+            {
+                "type": "investigate",
+                "prompt": prompt,
+                "base_branch": _runtime_config.get("integration_branch", "main"),
+                "effort": "low",
+            }
+        ],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="USER",
+        launched_by_user_id=current_user["user_id"],
+        context={
+            "spawned_by": _SR_INVESTIGATION_SPAWNED_BY,
+            "sr_category": req.category,
+            "signals": req.signals,
+            "current_hit_rate": req.current_hit_rate,
+            "previous_hit_rate": req.previous_hit_rate,
+            "sample_size": req.sample_size,
+        },
+    )
+    session.add(new_task)
+    await session.commit()
+    await session.refresh(new_task)
+
+    return {"task_id": str(new_task.id), "created": True}
+
+
+@router.get("/projects/{project_id}/sr-investigation-task-ids")
+async def get_sr_investigation_task_ids(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return a map of category → task_id for open operator-spawned SR investigations.
+
+    Used by the UI to deduplicate investigation spawning and surface existing task ids
+    inline on category cards.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+
+    stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status.in_(_SR_INVESTIGATION_ACTIVE_STATUSES),
+            Task.context["spawned_by"].as_string() == _SR_INVESTIGATION_SPAWNED_BY,
+        )
+        .options(load_only(Task.id, Task.context))
+    )
+    tasks = (await session.execute(stmt)).scalars().all()
+
+    task_ids: Dict[str, str] = {}
+    for t in tasks:
+        cat = (t.context or {}).get("sr_category")
+        if cat:
+            task_ids[str(cat)] = str(t.id)
+
+    return {"task_ids": task_ids}
+
+
+# ---------------------------------------------------------------------------
+# /projects/{project_id}/version-lifecycle
+# ---------------------------------------------------------------------------
+
+
+def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract operator-facing fields from a last_qualification record."""
+    return {
+        "status": qual.get("status"),
+        "confidence": qual.get("confidence"),
+        "threshold": qual.get("threshold"),
+        "sub_scores": qual.get("sub_scores"),
+        "blocker": qual.get("blocker"),
+        "finalized_at": qual.get("finalized_at"),
+    }
+
+
+@router.get("/projects/{project_id}/version-lifecycle")
+async def get_version_lifecycle(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return the release version lifecycle state for a project.
+
+    Exposes the current open version (phase, qualification verdicts, merged-task
+    count) and a short history of recent closed versions for calibration.
+    Projects with no version lifecycle return ``null`` for ``current_version``
+    and an empty ``recent_versions`` list.
+    """
+    from app.release_version import count_merged_since  # noqa: PLC0415
+    from app.release_qualifier import compute_promotion_readiness  # noqa: PLC0415
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+
+    open_row = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "open",
+                )
+                .order_by(ReleaseVersion.opened_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    current_version_out: Optional[Dict[str, Any]] = None
+    if open_row is not None:
+        merged_count = await count_merged_since(session, project_id, open_row.opened_at)
+        qual = open_row.last_qualification or {}
+        current_version_out = {
+            "version_number": open_row.version_number,
+            "phase": open_row.phase,
+            "phase_changed_at": open_row.phase_changed_at.isoformat()
+            if open_row.phase_changed_at
+            else None,
+            "phase_reasoning": open_row.phase_reasoning,
+            "opened_at": open_row.opened_at.isoformat(),
+            "qualification_attempts": open_row.qualification_attempts,
+            "merged_task_count": merged_count,
+            "last_qualification": _format_qualification(qual) if qual else None,
+        }
+
+    history_rows = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status != "open",
+                )
+                .order_by(ReleaseVersion.opened_at.desc())
+                .limit(5)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    promotion_readiness = await compute_promotion_readiness(session, project_id)
+
+    return {
+        "current_version": current_version_out,
+        "recent_versions": [
+            {
+                "version_number": v.version_number,
+                "status": v.status,
+                "opened_at": v.opened_at.isoformat(),
+                "promoted_at": v.promoted_at.isoformat() if v.promoted_at else None,
+                "qualification_attempts": v.qualification_attempts,
+                "last_qualification": _format_qualification(v.last_qualification)
+                if v.last_qualification
+                else None,
+            }
+            for v in history_rows
+        ],
+        "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
+        "promotion_readiness": promotion_readiness,
+    }
+
+
+class _SetVersionPhaseBody(BaseModel):
+    phase: str = _Field(..., pattern=r"^(build|stabilize)$")
+    reasoning: str = _Field(default="", max_length=500)
+
+
+@router.post("/projects/{project_id}/version-phase")
+async def set_version_phase(
+    project_id: uuid.UUID,
+    payload: _SetVersionPhaseBody,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Set the phase of the open release version for a project.
+
+    Member+ role required.  Returns 404 when there is no open version.
+    Combined with POST /qualify this gives the operator a direct lever to
+    advance a version to stabilize and trigger the release gate end-to-end,
+    producing a dry-run QualificationVerdict without waiting for the strategic
+    agent's conservative stall threshold (~14 days).
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    open_ver = await _release_version.current_open_version(session, project_id)
+    if open_ver is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No open release version found for this project.",
+        )
+
+    operator_id = current_user.get("email") or current_user["user_id"]
+    full_reasoning = (
+        f"[operator:{operator_id}] {payload.reasoning}".strip()
+        if payload.reasoning
+        else f"[operator:{operator_id}]"
+    )
+    _release_version.set_version_phase(
+        open_ver, payload.phase, reasoning=full_reasoning
+    )
+    session.add(open_ver)
+    await session.commit()
+    await session.refresh(open_ver)
+    return {
+        "version_number": open_ver.version_number,
+        "phase": open_ver.phase,
+        "phase_changed_at": open_ver.phase_changed_at.isoformat()
+        if open_ver.phase_changed_at
+        else None,
+        "phase_reasoning": open_ver.phase_reasoning,
     }

@@ -392,7 +392,7 @@ async def get_dispatcher_cycle_records(
     On an empty table, returns ``[]`` — never raises — so the health
     endpoint can render 'no data' on cold start.
     """
-    from app.models import DispatcherCycleRecord  # noqa: PLC0415
+    from app.models import DispatcherCycleRecord
 
     stmt = select(DispatcherCycleRecord)
     if project_id is not None:
@@ -428,7 +428,7 @@ def compute_mtti_p50_sec(cases: list) -> float | None:
     ``operator_acknowledged_at`` are set.  Returns ``None`` when no acked
     cases are present in the input.  Uses ``statistics.median`` — no numpy.
     """
-    import statistics  # noqa: PLC0415
+    import statistics
 
     deltas = [
         (c.operator_acknowledged_at - c.needs_manual_intervention_at).total_seconds()
@@ -446,8 +446,8 @@ async def _prune_old_dispatcher_cycle_records(session: AsyncSession) -> int:
     a prune error cannot mask a successful spawn commit.  Returns the count
     of rows deleted (0 when nothing matches).
     """
-    from sqlalchemy import delete as sql_delete  # noqa: PLC0415
-    from app.models import DispatcherCycleRecord  # noqa: PLC0415
+    from sqlalchemy import delete as sql_delete
+    from app.models import DispatcherCycleRecord
 
     cutoff = _utcnow() - _DISPATCHER_CYCLE_TTL
     try:
@@ -1179,6 +1179,118 @@ def compute_escalation_outcome_breakdown(
     }
 
 
+def compute_first_attempt_compliance_trend(
+    cases: list[RegressionRemediationCase],
+    *,
+    num_windows: int = 6,
+    window_days: int = 7,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Per-window first-attempt cross-layer compliance rate.
+
+    For each cross-layer-mandated case (first fix-log entry with
+    spawn_was_cross_layer=True), classifies the outcome of that first attempt:
+
+    - ``first_attempt_compliant``: layers_targeted present and >=2 distinct
+      canonical layers (including recommended_unmodifiable_layers).
+    - ``followup_rescued``: first fix had <2 canonical layers AND a
+      compliance_followup_spawned marker with a subsequent merged fix exists.
+    - ``awaiting_backfill``: layers_targeted absent, or non-compliant without a
+      merged followup yet; excluded from the rate denominator.
+
+    Cases are bucketed by merged_at of the first cross-layer fix entry into
+    ``num_windows`` rolling ``window_days``-wide windows ending at ``now``
+    (oldest window first). ``rate`` = first_attempt_compliant /
+    (first_attempt_compliant + followup_rescued), or None when denominator is 0.
+    """
+    if now is None:
+        now = _utcnow()
+    canonical = set(LAYER_DISPLAY_ORDER)
+
+    # Build window boundaries oldest-first
+    windows: list[dict[str, Any]] = []
+    for i in range(num_windows - 1, -1, -1):
+        w_end = now - timedelta(days=i * window_days)
+        w_start = w_end - timedelta(days=window_days)
+        windows.append(
+            {
+                "_w_start": w_start,
+                "_w_end": w_end,
+                "window_start": w_start.isoformat(),
+                "window_end": w_end.isoformat(),
+                "first_attempt_compliant": 0,
+                "followup_rescued": 0,
+                "awaiting_backfill": 0,
+            }
+        )
+
+    for case in cases:
+        raw_log = case.fingerprint_to_fix_log or []
+        if not isinstance(raw_log, list):
+            continue
+
+        # Find the first fix entry carrying the cross-layer mandate
+        first_entry: dict[str, Any] | None = None
+        for entry in raw_log:
+            if (
+                isinstance(entry, dict)
+                and entry.get("fix_pr_number") is not None
+                and entry.get("spawn_was_cross_layer")
+            ):
+                first_entry = entry
+                break
+        if first_entry is None:
+            continue
+
+        merged_at = _parse_dispatcher_dt(first_entry.get("merged_at"))
+        if merged_at is None:
+            continue
+
+        bucket: dict[str, Any] | None = None
+        for w in windows:
+            if w["_w_start"] <= merged_at < w["_w_end"]:
+                bucket = w
+                break
+        if bucket is None:
+            continue
+
+        if "layers_targeted" not in first_entry:
+            bucket["awaiting_backfill"] += 1
+            continue
+
+        layers = set(first_entry.get("layers_targeted") or []) & canonical
+        unmodifiable = (
+            set(first_entry.get("recommended_unmodifiable_layers") or []) & canonical
+        )
+        if len(layers | unmodifiable) >= 2:
+            bucket["first_attempt_compliant"] += 1
+        elif _compliance_followup_fix_idx(raw_log) >= 0:
+            bucket["followup_rescued"] += 1
+        else:
+            bucket["awaiting_backfill"] += 1
+
+    result_windows = []
+    for w in windows:
+        denom = w["first_attempt_compliant"] + w["followup_rescued"]
+        result_windows.append(
+            {
+                "window_start": w["window_start"],
+                "window_end": w["window_end"],
+                "first_attempt_compliant": w["first_attempt_compliant"],
+                "followup_rescued": w["followup_rescued"],
+                "awaiting_backfill": w["awaiting_backfill"],
+                "rate": w["first_attempt_compliant"] / denom if denom > 0 else None,
+            }
+        )
+
+    return {
+        "windows": result_windows,
+        "num_windows": num_windows,
+        "window_days": window_days,
+        "generated_at": now.isoformat(),
+    }
+
+
 def compute_avg_prevention_rate_7d(
     cases: list[RegressionRemediationCase],
     now: datetime | None = None,
@@ -1396,7 +1508,7 @@ def compute_class_layer_defense_counts(
     canonical order (including layers with zero fixes) so the UI renders a
     stable six-row table.
     """
-    counts: dict[str, int] = {layer: 0 for layer in LAYER_DISPLAY_ORDER}
+    counts: dict[str, int] = dict.fromkeys(LAYER_DISPLAY_ORDER, 0)
     for entry in fix_logs or []:
         if not isinstance(entry, dict):
             continue
@@ -1645,7 +1757,11 @@ def _signal_higher_is_better(regression_class: str) -> bool:
         "sr_catch_rate:"
     ):
         return True
-    if regression_class == "pipeline_success_rate":
+    if regression_class in (
+        "pipeline_success_rate",
+        "sr_catch_rate_below_floor",
+        "sr_pass_engagement_thinning",
+    ):
         return True
     return False
 
@@ -2207,7 +2323,7 @@ async def _collect_viewport_failures(
         r"expect(?:NoOverflow|NoTextTruncation|MinTouchTarget)At\((\d+)\)",
         re.IGNORECASE,
     )
-    _component_re = re.compile(r"(\w+)\.viewport\.test\.tsx", re.IGNORECASE)
+    _component_re = re.compile(r"([\w-]+)\.viewport\.test\.tsx", re.IGNORECASE)
 
     grouped: dict[tuple[str, str], dict[str, Any]] = {}
     for task in rows:
@@ -2659,6 +2775,23 @@ _AWAITING_BACKFILL_AGE_THRESHOLD = timedelta(days=3)
 _AWAITING_BACKFILL_WINDOW = timedelta(days=30)
 _AWAITING_BACKFILL_ALERT_TITLE = "Cross-layer awaiting_backfill backlog stuck"
 
+# Second-stage escalation for observation-only alerts that stay open past SLA.
+# When an alert with one of the monitored titles has been open continuously for
+# longer than the threshold, the dispatcher opens a RegressionRemediationCase and
+# spawns one investigate task so the autonomous loop can remediate the root cause.
+# Reuses case dedup (unique regression_class per project) so a single escalation
+# is opened per stuck alert regardless of how many dispatcher cycles fire.
+_OBSERVATION_ALERT_SLA_HOURS_DEFAULT = 72
+# Per-title overrides — key is the alert title, value is SLA hours. Falls back
+# to _OBSERVATION_ALERT_SLA_HOURS_DEFAULT when a title is not listed here.
+_OBSERVATION_ALERT_SLA_HOURS: dict[str, int] = {}
+# Titles of observation-only alerts that are eligible for second-stage escalation.
+# admin_digest alert titles are imported lazily inside the function to avoid cycles.
+_OBSERVATION_ONLY_ALERT_TITLES = [
+    _PATH_CLASSIFIER_COVERAGE_ALERT_TITLE,
+    _AWAITING_BACKFILL_ALERT_TITLE,
+]
+
 
 def _classify_layers_from_paths(paths: list[str]) -> list[str]:
     """Map a list of changed file paths to canonical infrastructure-layer tags.
@@ -2681,7 +2814,7 @@ def _classify_layers_from_paths(paths: list[str]) -> list[str]:
         ``backend/app/source_ref_validation.py``, ``check`` script,
         ``backend/app/fix_loop_telemetry.py`` → BASELINE_GATE
     """
-    from app.regression_layer_classifier import (  # noqa: PLC0415
+    from app.regression_layer_classifier import (
         LAYER_AGENT_VERB,
         LAYER_AGENT_VM,
         LAYER_BASELINE_GATE,
@@ -2780,10 +2913,10 @@ async def _backfill_layers_targeted_once(
     rest of the dispatcher tick. GitHub auth / API failures are logged and
     skipped — never raised — so a transient outage never breaks recovery.
     """
-    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+    from sqlalchemy.orm.attributes import flag_modified
 
-    from app.github import get_pr_files, get_repo_installation_token  # noqa: PLC0415
-    from app.models import Project  # noqa: PLC0415
+    from app.github import get_pr_files, get_repo_installation_token
+    from app.models import Project
 
     project = await session.get(Project, project_id)
     if project is None or not project.github_owner or not project.github_repo:
@@ -3146,6 +3279,158 @@ async def _evaluate_awaiting_backfill_alert(
     await session.commit()
 
 
+async def _escalate_stale_observation_alerts(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> int:
+    """Second-stage escalation for observation-only alerts open past SLA.
+
+    For each WARNING alert whose title appears in ``_OBSERVATION_ONLY_ALERT_TITLES``
+    (or is imported from admin_digest) and which has been open continuously for
+    longer than ``_OBSERVATION_ALERT_SLA_HOURS_DEFAULT`` (or its per-title override),
+    the dispatcher opens a RegressionRemediationCase and spawns one investigate task.
+    Uses case dedup via a stable ``regression_class`` derived from the alert title so
+    exactly one escalation is opened per stuck alert. Records ``source_alert_id`` in
+    ``signal_snapshot_at_spawn`` so downstream consumers can dismiss the alert when the
+    case closes. Returns the number of new investigate tasks spawned.
+    """
+    from app.routers.admin_digest import (  # noqa: PLC0415
+        _LONE_CHECKER_ALERT_TITLE,
+    )
+
+    monitored_titles = set(_OBSERVATION_ONLY_ALERT_TITLES) | {_LONE_CHECKER_ALERT_TITLE}
+    now = _utcnow()
+
+    open_alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.task_id.is_(None),
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title.in_(list(monitored_titles)),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    spawned = 0
+    for alert in open_alerts:
+        sla_hours = _OBSERVATION_ALERT_SLA_HOURS.get(
+            alert.title, _OBSERVATION_ALERT_SLA_HOURS_DEFAULT
+        )
+        elapsed = now - alert.created_at
+        if elapsed < timedelta(hours=sla_hours):
+            continue
+
+        regression_class = f"observation_alert_sla:{alert.title}"[:512]
+        existing_case = (
+            (
+                await session.execute(
+                    select(RegressionRemediationCase).where(
+                        RegressionRemediationCase.project_id == project_id,
+                        RegressionRemediationCase.regression_class == regression_class,
+                        RegressionRemediationCase.status.in_(
+                            [
+                                RegressionCaseStatus.ACTIVE,
+                                RegressionCaseStatus.REMEDIATING,
+                                RegressionCaseStatus.MERGED,
+                                RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
+                            ]
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if existing_case is not None:
+            continue
+
+        elapsed_hours = elapsed.total_seconds() / 3600
+        prompt = (
+            f"Observation-only alert '{alert.title}' has been open for "
+            f"{elapsed_hours:.1f}h (SLA: {sla_hours}h) without operator remediation.\n\n"
+            f"Alert message:\n{alert.message}\n\n"
+            f"Diagnose the root cause and ship a fix so this alert clears. "
+            f"Do NOT simply dismiss the alert — resolve the underlying condition."
+        )
+        payload = validate_internal_payload(
+            {
+                "type": "investigate",
+                "prompt": prompt,
+                "base_branch": _runtime_config.get("integration_branch", "main"),
+                "effort": "low",
+            },
+            "pipeline_regression_dispatcher:observation_alert_sla_escalation",
+        )
+        context: dict[str, Any] = {
+            "spawned_by": "pipeline_regression_dispatcher_observation_sla",
+            "regression_class": regression_class,
+            "signal_name": "observation_alert_sla",
+            "source_alert_id": str(alert.id),
+            "alert_title": alert.title,
+            "elapsed_hours": round(elapsed_hours, 1),
+        }
+        new_task = Task(
+            project_id=project_id,
+            title=f"Investigate stuck alert: {alert.title}"[:200],
+            description=(
+                f"Observation-only alert open {elapsed_hours:.1f}h past "
+                f"{sla_hours}h SLA — autonomous escalation."
+            )[:500],
+            payloads=[payload],
+            context=context,
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        session.add(new_task)
+        await session.flush()
+
+        signal_snapshot: dict[str, Any] = {
+            "signal_name": "observation_alert_sla",
+            "source_alert_id": str(alert.id),
+            "alert_title": alert.title,
+            "elapsed_hours": round(elapsed_hours, 1),
+            "sla_hours": sla_hours,
+            "captured_at": now.isoformat(),
+        }
+        session.add(
+            RegressionRemediationCase(
+                project_id=project_id,
+                regression_class=regression_class,
+                status=RegressionCaseStatus.ACTIVE,
+                signal_snapshot_at_spawn=signal_snapshot,
+                last_remediation_task_id=new_task.id,
+                last_seen_at=now,
+                hit_count=1,
+                signal_first_crossed_at=alert.created_at,
+                signal_first_seen_at=alert.created_at,
+                investigate_spawned_at=now,
+            )
+        )
+        session.add(
+            Alert(
+                project_id=project_id,
+                severity=AlertSeverity.INFO,
+                title=f"Escalating stuck observation alert: {alert.title}"[:200],
+                message=(
+                    f"Alert '{alert.title}' open {elapsed_hours:.1f}h. "
+                    f"Spawned investigate task {new_task.id}."
+                )[:1000],
+            )
+        )
+        spawned += 1
+
+    if spawned:
+        await session.commit()
+    return spawned
+
+
 async def _get_remediation_case(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -3447,7 +3732,7 @@ async def _maybe_spawn(
     # contains observations on >=2 distinct layers within the 48h window. The
     # regression_class itself is unchanged so the existing 6h cooldown still
     # applies and a cross-layer escalation occupies exactly one spawn slot.
-    from app.regression_layer_classifier import classify_layers  # noqa: PLC0415
+    from app.regression_layer_classifier import classify_layers
 
     obs_failure_class, obs_message, obs_stage = _derive_observation_for_layer_classify(
         signal_name=signal_name,
@@ -3459,7 +3744,7 @@ async def _maybe_spawn(
     obs_fingerprint = ""
     if obs_message:
         try:
-            from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
+            from app.anomaly_detection import _error_fingerprint
 
             obs_fingerprint = _error_fingerprint(obs_message, obs_stage or None)
         except Exception:  # noqa: BLE001
@@ -3985,6 +4270,266 @@ async def _evaluate_sr_catch_rate_direction_signals(
     return _spawned
 
 
+async def _evaluate_sr_below_floor_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    project_design_doc: dict | None,
+    spawn_budget_left: int,
+) -> int:
+    """Trip when any SR category sits below the floor for min-windows consecutively."""
+    if spawn_budget_left <= 0:
+        return 0
+    from app.playbook_learning import (
+        _SR_FLOOR_THRESHOLD,
+        _FLOOR_MIN_CONSECUTIVE_WINDOWS,
+    )
+
+    categories = ((project_design_doc or {}).get("sr_catch_rate_trends") or {}).get(
+        "categories"
+    ) or {}
+    if not isinstance(categories, dict):
+        return 0
+
+    floor_threshold = float(
+        (project_design_doc or {}).get("sr_floor_threshold") or _SR_FLOOR_THRESHOLD
+    )
+    floor_min_windows = int(
+        (project_design_doc or {}).get("sr_floor_min_windows")
+        or _FLOOR_MIN_CONSECUTIVE_WINDOWS
+    )
+
+    tripped: list[tuple[str, dict]] = []
+    for cat, data in sorted(categories.items()):
+        if not isinstance(data, dict):
+            continue
+        if not data.get("below_floor"):
+            continue
+        rate = data.get("current_hit_rate")
+        history = data.get("rate_history") or []
+        if rate is None or len(history) < floor_min_windows:
+            continue
+        tripped.append((cat, data))
+
+    if not tripped:
+        return 0
+
+    cats_label = ", ".join(cat for cat, _ in tripped)
+    lines = [
+        "Pipeline quality signal: SR catch-rate sustained below floor "
+        "(sub-signal=below_floor / class=sr_catch_rate_below_floor).",
+        f"Categories stuck below {floor_threshold:.0%} floor for "
+        f"{floor_min_windows}+ consecutive windows: {cats_label}.",
+        "",
+        "Sub-signal: below_floor — the hit-rate is chronically low (not just declining).",
+        "The category has been stuck at a low catch-rate without getting worse, so the "
+        "delta-trend signal has not fired. Investigate why the baseline is low and what "
+        "structural changes to the self-review prompt or process could lift it.",
+        "",
+    ]
+    for cat, data in tripped:
+        rate = data.get("current_hit_rate")
+        history = data.get("rate_history") or []
+        rate_str = f"{rate:.0%}" if rate is not None else "N/A"
+        hist_str = ", ".join(f"{r:.0%}" for r in history[-floor_min_windows:])
+        lines.append(
+            f"  • {cat}: current={rate_str}, last {floor_min_windows} windows: [{hist_str}]"
+        )
+    lines.append("")
+    lines.append(
+        "FIRST: triage whether this signal actually represents a regression. "
+        "Set `verdict` to 'not_a_regression' when the low rate is intentional or "
+        "the sample is too small. Otherwise produce the structured diagnosis JSON."
+    )
+    prompt = "\n".join(lines)
+
+    _rep_cat, rep_data = tripped[0]
+    spawn = await _maybe_spawn(
+        session,
+        project_id,
+        signal_name="sr_catch_rate_below_floor",
+        regression_class="sr_catch_rate_below_floor",
+        prior_rate=floor_threshold,
+        current_rate=rep_data.get("current_hit_rate"),
+        sample_size=int(rep_data.get("current_human_count") or 0),
+        magnitude=round(floor_threshold - (rep_data.get("current_hit_rate") or 0), 3),
+        title_hint=f"SR catch-rate below floor ({cats_label})",
+        prompt_override=prompt,
+        extra_context_fields={"categories": [cat for cat, _ in tripped]},
+    )
+    return 1 if spawn is not None else 0
+
+
+async def _evaluate_sr_pass_engagement_thinning_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    project_design_doc: dict | None,
+    spawn_budget_left: int,
+) -> int:
+    """Trip when PASS reasoning engagement drops below threshold for a category."""
+    if spawn_budget_left <= 0:
+        return 0
+    from app.playbook_learning import (
+        _SR_ENGAGEMENT_THRESHOLD,
+        _SR_ENGAGEMENT_MIN_PASSES,
+    )
+
+    categories = ((project_design_doc or {}).get("sr_catch_rate_trends") or {}).get(
+        "categories"
+    ) or {}
+    if not isinstance(categories, dict):
+        return 0
+
+    eng_threshold = float(
+        (project_design_doc or {}).get("sr_engagement_threshold")
+        or _SR_ENGAGEMENT_THRESHOLD
+    )
+    eng_min_passes = int(
+        (project_design_doc or {}).get("sr_engagement_min_passes")
+        or _SR_ENGAGEMENT_MIN_PASSES
+    )
+
+    thinning: list[tuple[str, dict]] = []
+    for cat, data in sorted(categories.items()):
+        if not isinstance(data, dict):
+            continue
+        rate = data.get("reasoning_engagement_rate")
+        total = data.get("reasoning_engagement_total") or 0
+        if rate is None or total < eng_min_passes:
+            continue
+        if rate < eng_threshold:
+            thinning.append((cat, data))
+
+    if not thinning:
+        return 0
+
+    cats_label = ", ".join(cat for cat, _ in thinning)
+    lines = [
+        "Pipeline quality signal: SR PASS reasoning engagement thinning "
+        "(sub-signal=pass_engagement_thinning / class=sr_pass_engagement_thinning).",
+        f"Categories with PASS engagement below {eng_threshold:.0%}: {cats_label}.",
+        "",
+        "Sub-signal: pass_engagement_thinning — the agent is rubber-stamping PASS "
+        "verdicts without substantive reasoning. This is an early indicator that "
+        "precedes catch-rate regressions.",
+        "",
+    ]
+    for cat, data in thinning:
+        rate = data.get("reasoning_engagement_rate")
+        total = data.get("reasoning_engagement_total") or 0
+        rate_str = f"{rate:.0%}" if rate is not None else "N/A"
+        lines.append(f"  • {cat}: engagement={rate_str} (n={total} PASS verdicts)")
+    lines.append("")
+    lines.append(
+        "Investigate why PASS reasoning is thin for these categories. "
+        "Check the self-review prompt wording — does it make it too easy to "
+        "skip substantive reasoning for PASS verdicts? Produce the structured "
+        "diagnosis JSON ({summary, root_cause, recommended_fix, severity, "
+        "confidence, affected_files, verdict, verdict_reason})."
+    )
+    prompt = "\n".join(lines)
+
+    _rep_cat, rep_data = thinning[0]
+    rep_rate = rep_data.get("reasoning_engagement_rate") or 0.0
+    rep_total = int(rep_data.get("reasoning_engagement_total") or 0)
+    spawn = await _maybe_spawn(
+        session,
+        project_id,
+        signal_name="sr_pass_engagement_thinning",
+        regression_class="sr_pass_engagement_thinning",
+        prior_rate=eng_threshold,
+        current_rate=rep_rate,
+        sample_size=rep_total,
+        magnitude=round(eng_threshold - rep_rate, 3),
+        title_hint=f"SR PASS engagement thinning ({cats_label})",
+        prompt_override=prompt,
+        extra_context_fields={"categories": [cat for cat, _ in thinning]},
+    )
+    return 1 if spawn is not None else 0
+
+
+async def _evaluate_sr_false_attestation_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    project_design_doc: dict | None,
+    spawn_budget_left: int,
+) -> int:
+    """Trip when SR false-attestation rate exceeds threshold for any category."""
+    if spawn_budget_left <= 0:
+        return 0
+    from app.playbook_learning import _FALSE_ATTESTATION_RATE_THRESHOLD
+
+    per_category = (
+        (project_design_doc or {}).get("sr_false_attestation_trends") or {}
+    ).get("per_category") or {}
+    if not isinstance(per_category, dict):
+        return 0
+
+    elevated: list[tuple[str, dict]] = []
+    for cat, data in sorted(per_category.items()):
+        if not isinstance(data, dict):
+            continue
+        rate = data.get("false_attestation_rate")
+        if rate is not None and rate > _FALSE_ATTESTATION_RATE_THRESHOLD:
+            elevated.append((cat, data))
+
+    if not elevated:
+        return 0
+
+    cats_label = ", ".join(cat for cat, _ in elevated)
+    lines = [
+        "Pipeline quality signal: SR false attestation elevated "
+        "(sub-signal=sr_false_attestation / class=sr_false_attestation).",
+        f"Categories where SR claimed passed but CI recorded failure: {cats_label}.",
+        "",
+        "Sub-signal: sr_false_attestation — SR claimed tests_executed_cleanly, "
+        "lint_executed_cleanly, or typecheck_executed_cleanly passed but CI "
+        "recorded ci_passed=False for the same task. This indicates the agent "
+        "is attesting to clean execution without actually running the checks.",
+        "",
+    ]
+    for cat, data in elevated:
+        rate = data.get("false_attestation_rate")
+        n = data.get("false_attested", 0)
+        total = (data.get("ci_confirmed") or 0) + n
+        rate_str = f"{rate:.0%}" if rate is not None else "N/A"
+        prev_rate = data.get("previous_false_attestation_rate")
+        prev_str = f"{prev_rate:.0%}" if prev_rate is not None else "N/A"
+        lines.append(
+            f"  • {cat}: false_attestation_rate={rate_str} ({n}/{total}), "
+            f"prior window={prev_str}"
+        )
+    lines.append("")
+    lines.append(
+        "Investigate why the agent is attesting to clean execution without "
+        "running the checks. Check whether the self-review prompt adequately "
+        "enforces that execution evidence must come from an actual run on the "
+        "current VM. Produce the structured diagnosis JSON ({summary, root_cause, "
+        "recommended_fix, severity, confidence, affected_files, verdict, verdict_reason})."
+    )
+    prompt = "\n".join(lines)
+
+    _rep_cat, rep_data = elevated[0]
+    rep_rate = rep_data.get("false_attestation_rate") or 0.0
+    prev_rate = rep_data.get("previous_false_attestation_rate") or 0.0
+    rep_total = int(
+        (rep_data.get("false_attested") or 0) + (rep_data.get("ci_confirmed") or 0)
+    )
+    spawn = await _maybe_spawn(
+        session,
+        project_id,
+        signal_name="sr_false_attestation",
+        regression_class="sr_false_attestation",
+        prior_rate=prev_rate,
+        current_rate=rep_rate,
+        sample_size=rep_total,
+        magnitude=round(rep_rate - prev_rate, 3),
+        title_hint=f"SR false attestation elevated ({cats_label})",
+        prompt_override=prompt,
+        extra_context_fields={"categories": [cat for cat, _ in elevated]},
+    )
+    return 1 if spawn is not None else 0
+
+
 async def _evaluate_fix_loop_divergence_signal(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -4130,14 +4675,8 @@ async def _evaluate_viewport_regression_signal(
                     session, project_id, regression_class
                 )
                 if case is not None:
-                    setattr(
-                        case, "introducing_pr_number", trip.get("introducing_pr_number")
-                    )
-                    setattr(
-                        case,
-                        "introducing_commit_sha",
-                        trip.get("introducing_commit_sha"),
-                    )
+                    case.introducing_pr_number = trip.get("introducing_pr_number")
+                    case.introducing_commit_sha = trip.get("introducing_commit_sha")
                     session.add(case)
     return spawned
 
@@ -4224,7 +4763,7 @@ async def update_viewport_coverage_snapshot_from_diff(
     Called by the PR-merge hook (rollup_management) each time a PR merges.
     Skips silently when the project has no admin-ui directory in the diff.
     """
-    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+    from sqlalchemy.orm.attributes import flag_modified
 
     if "admin-ui/" not in diff_text:
         return
@@ -4983,6 +5522,7 @@ def _classify_cycle_compliance(row: dict) -> str:
 
     Labels:
       - ``compliant``         — mandate True AND >=2 distinct canonical layers targeted
+                                (recommended_unmodifiable_layers count toward the total)
       - ``non-compliant``     — mandate True AND layers_targeted recorded but <2 canonical layers
       - ``awaiting-backfill`` — mandate True AND layers_targeted not yet present (do NOT accuse)
       - ``not-mandated``      — mandate False or absent
@@ -4995,7 +5535,12 @@ def _classify_cycle_compliance(row: dict) -> str:
     distinct_canonical = {
         layer for layer in (row.get("layers_targeted") or []) if layer in canonical
     }
-    if len(distinct_canonical) >= 2:
+    distinct_unmodifiable = {
+        layer
+        for layer in (row.get("recommended_unmodifiable_layers") or [])
+        if layer in canonical
+    }
+    if len(distinct_canonical | distinct_unmodifiable) >= 2:
         return "compliant"
     return "non-compliant"
 
@@ -5168,6 +5713,10 @@ async def _evaluate_recurring_class_signal(
             {
                 "cycle": i + 1,
                 "layers_targeted": e.get("layers_targeted") or [],
+                "recommended_unmodifiable_layers": e.get(
+                    "recommended_unmodifiable_layers"
+                )
+                or [],
                 "merged_at": e.get("merged_at") or "unknown",
                 "spawn_was_cross_layer": bool(e.get("spawn_was_cross_layer")),
                 "layers_targeted_present": "layers_targeted" in e,
@@ -5312,6 +5861,7 @@ def _format_strategic_stall_prompt(
     stall_hours: int,
     recent_task_count: int,
     failed_strategic: list[Task],
+    payload_bloat_skip: dict | None = None,
 ) -> str:
     lines = [
         "Pipeline regression detected (strategic_cycle_stall).",
@@ -5324,20 +5874,46 @@ def _format_strategic_stall_prompt(
         "missed signal patterns, and direction drift.",
         "",
     ]
-    if failed_strategic:
-        lines.append("Recent FAILED strategic tasks in this window:")
-        for t in failed_strategic:
-            ptype = (t.first_payload or {}).get("type", "unknown")
-            lines.append(f"  - {ptype} task {t.id} FAILED")
-        lines.append("")
+    if payload_bloat_skip:
+        skipped_at = payload_bloat_skip.get("skipped_at", "unknown")
+        size = payload_bloat_skip.get("size", 0)
+        top = payload_bloat_skip.get("top_contributors", [])
+        top_str = (
+            ", ".join(f"{c['key']}={c['size']}B" for c in top[:3]) if top else "unknown"
+        )
+        lines += [
+            "ROOT CAUSE IDENTIFIED: strategic spawn was skipped because the assembled",
+            f"strategic payload exceeded the 256 KB size budget (last skip: {skipped_at},",
+            f"size: {size} bytes, top contributors: {top_str}).",
+            "",
+            "No strategic task was ever created — so there is no stuck or failed strategic",
+            "task to find. The true cause is an over-budget strategic context (design_doc,",
+            "problem_model, or vision) that must be compacted before strategic spawns resume.",
+            "",
+            "Investigate: which strategic context field(s) are driving the payload over budget?",
+            "  - Identify the largest fields listed above in top_contributors",
+            "  - Check design_doc and problem_model for redundant, verbose, or stale content",
+            "  - Propose targeted compaction: trim or summarize oversized sections",
+            "  - Do NOT look for stuck/failed strategic tasks — none exist",
+            "",
+        ]
+    else:
+        if failed_strategic:
+            lines.append("Recent FAILED strategic tasks in this window:")
+            for t in failed_strategic:
+                ptype = (t.first_payload or {}).get("type", "unknown")
+                lines.append(f"  - {ptype} task {t.id} FAILED")
+            lines.append("")
+        lines += [
+            "Investigate: why has the strategic engine not completed a cycle? Look for:",
+            "  - strategic_review or design_doc_update tasks stuck in QUEUED/IN_PROGRESS",
+            "  - repeated FAILED outcomes on strategic tasks",
+            "  - orchestrator scheduling not spawning strategic tasks",
+            "  - research slot exhaustion (max_total_research_per_project cap) blocking spawns",
+            "  - recent deploy changes that may correlate with the stall onset",
+            "",
+        ]
     lines += [
-        "Investigate: why has the strategic engine not completed a cycle? Look for:",
-        "  - strategic_review or design_doc_update tasks stuck in QUEUED/IN_PROGRESS",
-        "  - repeated FAILED outcomes on strategic tasks",
-        "  - orchestrator scheduling not spawning strategic tasks",
-        "  - research slot exhaustion (max_total_research_per_project cap) blocking spawns",
-        "  - recent deploy changes that may correlate with the stall onset",
-        "",
         "\nDiagnose the underlying root cause of this regression and produce "
         "the structured diagnosis JSON report ({summary, root_cause, "
         "recommended_fix, severity, confidence, affected_files}). "
@@ -5351,6 +5927,7 @@ async def _evaluate_strategic_cycle_stall_signal(
     session: AsyncSession,
     project_id: uuid.UUID,
     spawn_budget_left: int,
+    project_vision: dict | None = None,
 ) -> int:
     """Trip strategic_cycle_stall when no strategic task completed in stall window.
 
@@ -5420,6 +5997,7 @@ async def _evaluate_strategic_cycle_stall_signal(
         if (t.first_payload or {}).get("type") in _STRATEGIC_TASK_TYPES
         and t.status == TaskStatus.FAILED
     ]
+    payload_bloat_skip = (project_vision or {}).get("_strategic_payload_bloat_skip")
     spawn = await _maybe_spawn(
         session,
         project_id,
@@ -5434,6 +6012,7 @@ async def _evaluate_strategic_cycle_stall_signal(
             stall_hours=_STRATEGIC_CYCLE_STALL_HOURS,
             recent_task_count=len(recent_tasks),
             failed_strategic=failed_strategic,
+            payload_bloat_skip=payload_bloat_skip,
         ),
     )
     return 1 if spawn is not None else 0
@@ -5612,6 +6191,19 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "[REGRESSION_DISPATCHER] compliance-followup raised for project=%s: %s",
+            project_id,
+            exc,
+        )
+
+    # Second-stage escalation: promote observation-only alerts that have been
+    # open past SLA into RegressionRemediationCases with investigate tasks so
+    # the autonomous loop can remediate the underlying condition.
+    try:
+        await _escalate_stale_observation_alerts(session, project_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[REGRESSION_DISPATCHER] observation-alert SLA escalation raised "
+            "for project=%s: %s",
             project_id,
             exc,
         )
@@ -5948,7 +6540,7 @@ async def _persist_recovery_cycle_record(
     confirmed_closed: int,
 ) -> None:
     """Persist a recovery cycle record with marginal/confirmed recovery counts."""
-    from app.models import DispatcherCycleRecord  # noqa: PLC0415
+    from app.models import DispatcherCycleRecord
 
     try:
         session.add(
@@ -6537,8 +7129,16 @@ async def _run_compliance_followup_once(
         .all()
     )
 
+    max_spawns = int(
+        _runtime_config.get("regression_compliance_followup_max_spawns", 3) or 3
+    )
+
     spawned = 0
     for case in rows:
+        followup_count = getattr(case, "compliance_followup_count", 0) or 0
+        if followup_count >= max_spawns:
+            continue
+
         last_at = getattr(case, "compliance_followup_spawned_at", None)
         if last_at is not None:
             if last_at.tzinfo is not None:
@@ -6629,6 +7229,7 @@ async def _run_compliance_followup_once(
             )
         )
         case.compliance_followup_spawned_at = now
+        case.compliance_followup_count = followup_count + 1
         case.fingerprint_to_fix_log = list(case.fingerprint_to_fix_log or []) + [
             {
                 "type": "compliance_followup_spawned",
@@ -7040,6 +7641,7 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
     _ledger_cache_init: dict = {}
     _ledger_token = _cycle_layer_ledger_var.set(_ledger_cache_init)
     _spawned = 0
+    _se_count = 0
     try:
         # Force a full SELECT rather than session.get(): a caller that left a
         # partial Project (e.g. via ``load_only(Project.id)``) in the session
@@ -7116,95 +7718,135 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
             project.design_doc,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_sr_false_positive_signal(
             session,
             project_id,
             project.design_doc,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_sr_catch_rate_direction_signals(
             session,
             project_id,
             project.design_doc,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_fix_loop_divergence_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_fix_loop_divergence_fingerprint_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_pipeline_success_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_anomaly_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_sr_blind_spot_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_layer_concentration_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_cross_case_fingerprint_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_recurring_class_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_strategic_cycle_stall_signal(
             session,
             project_id,
             spawn_budget - _spawned,
+            project.vision,
         )
+        _se_count += 1
         _spawned += await _evaluate_telemetry_staleness_signal(
             session,
             project_id,
             project.design_doc,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_viewport_regression_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_viewport_coverage_drop_signal(
             session,
             project_id,
             project.design_doc,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_reviewer_sla_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_agent_vm_resource_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
         _spawned += await _evaluate_low_prevention_rate_signal(
             session,
             project_id,
             spawn_budget - _spawned,
         )
+        _se_count += 1
+        _spawned += await _evaluate_sr_below_floor_signal(
+            session,
+            project_id,
+            project.design_doc,
+            spawn_budget - _spawned,
+        )
+        _se_count += 1
+        _spawned += await _evaluate_sr_pass_engagement_thinning_signal(
+            session,
+            project_id,
+            project.design_doc,
+            spawn_budget - _spawned,
+        )
+        _se_count += 1
+        _spawned += await _evaluate_sr_false_attestation_signal(
+            session,
+            project_id,
+            project.design_doc,
+            spawn_budget - _spawned,
+        )
+        _se_count += 1
 
         if _spawned or stale_alerts_created:
             await session.commit()
@@ -7219,7 +7861,7 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
         # ``finally``-block semantics: the record is written even when
         # run_once short-circuits early (deploy-monitoring defer, project not
         # found, exception inside an evaluator).
-        from app.models import DispatcherCycleRecord  # noqa: PLC0415
+        from app.models import DispatcherCycleRecord
 
         try:
             session.add(
@@ -7227,7 +7869,7 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
                     project_id=project_id,
                     cycle_started_at=cycle_started_at,
                     cycle_finished_at=_utcnow(),
-                    signals_evaluated=0,
+                    signals_evaluated=_se_count,
                     signals_tripped=_st_counter[0],
                     spawns_emitted=_spawned,
                     rejections_by_reason=dict(_rj),
@@ -7261,8 +7903,8 @@ async def get_regression_mtta_data(
     p50 distribution.  Active cases whose p50 has been exceeded carry a negative
     ETA (overdue indicator).
     """
-    from collections import defaultdict  # noqa: PLC0415
-    from datetime import datetime  # noqa: PLC0415
+    from collections import defaultdict
+    from datetime import datetime
 
     cutoff = _utcnow() - timedelta(days=window_days)
     where: list[Any] = [RegressionRemediationCase.first_seen_at >= cutoff]
@@ -7312,19 +7954,29 @@ async def get_regression_mtta_data(
                 detect_s.append(ttd)
             if (tti := c.time_to_investigate_sec) is not None and tti >= 0:
                 invest_s.append(float(tti))
+            # ep_investigate_start tracks the per-episode investigation anchor.
+            # Starts at the lifetime investigate_spawned_at; advances to each
+            # cycle's recovered_at so re-armed cases report per-episode durations
+            # rather than inflated lifetime spans (mirrors the approach in
+            # admin_digest._compute_regression_case_summary).
+            ep_investigate_start = c.investigate_spawned_at
             for entry in c.fingerprint_to_fix_log or []:
                 if not isinstance(entry, dict):
                     continue
                 merged_dt = _parse_dt(entry.get("merged_at"))
                 recovered_dt = _parse_dt(entry.get("recovered_at"))
-                if merged_dt and c.investigate_spawned_at:
-                    d = (merged_dt - c.investigate_spawned_at).total_seconds()
+                if merged_dt and ep_investigate_start:
+                    d = (merged_dt - ep_investigate_start).total_seconds()
                     if d >= 0:
                         itom_s.append(d)
                 if merged_dt and recovered_dt:
                     d2 = (recovered_dt - merged_dt).total_seconds()
                     if d2 >= 0:
                         mtor_s.append(d2)
+                # Advance anchor so the next episode is measured from when
+                # the previous cycle resolved, not the case's original spawn.
+                if recovered_dt is not None:
+                    ep_investigate_start = recovered_dt
 
             if c.status == RegressionCaseStatus.CLOSED:
                 continue
@@ -7332,9 +7984,12 @@ async def get_regression_mtta_data(
                 c.signal_first_crossed_at or c.signal_first_seen_at or c.first_seen_at
             )
             live_elapsed = round((now - anchor).total_seconds()) if anchor else None
+            # ep_investigate_start now reflects the latest episode's anchor
+            # (last recovered_at, or the original investigate_spawned_at when
+            # there have been no recoveries yet).
             live_inv = (
-                round((now - c.investigate_spawned_at).total_seconds())
-                if c.investigate_spawned_at
+                round((now - ep_investigate_start).total_seconds())
+                if ep_investigate_start
                 else None
             )
             rec_check_in: int | None = None
@@ -7444,7 +8099,7 @@ async def get_sr_persistent_blind_spot_hint(
     consecutive 7-day windows.  Returns None when no persistent categories
     exist (i.e. below-threshold or insufficient sample size).
     """
-    from app.sr_blind_spots import compute_persistent_sr_blind_spot_hint  # noqa: PLC0415
+    from app.sr_blind_spots import compute_persistent_sr_blind_spot_hint
 
     now = _utcnow()
     tasks = (

@@ -69,13 +69,22 @@ async def _load_recent_tasks(
     *,
     window_days: int = _AXIS_WINDOW_DAYS,
 ) -> list[Task]:
-    """Load tasks for the project that completed/failed within the window."""
+    """Load tasks for the project that reached a terminal state in the window.
+
+    Includes CANCELLED alongside COMPLETED/FAILED so VM cost incurred by
+    cancelled tasks (which now record ``vm_stopped_at`` on cancel) is counted
+    in ``cost_per_merged_pr``. The merged-PR denominator still only counts
+    COMPLETED tasks with ``pr_merged``, so cancelled tasks add cost without
+    inflating the merge count.
+    """
     cutoff = _utcnow() - timedelta(days=window_days)
     stmt = (
         select(Task)
         .where(
             Task.project_id == project_id,
-            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+            Task.status.in_(
+                [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+            ),
             Task.updated_at >= cutoff,
         )
         .options(
@@ -119,15 +128,23 @@ def _compute_vm_cold_start_p50_ms(tasks: list[Task]) -> Optional[float]:
 
 
 def _compute_vm_reuse_rate(tasks: list[Task]) -> Optional[float]:
-    """warm_count / (warm_count + cold_count). None when no VMs were observed."""
+    """warm / participating. None when no VMs participated.
+
+    Reads ``context['_timing']['warm_start']`` — the same source the
+    ``/pipeline-efficiency`` endpoint uses. The ``vm_warm_start`` column is
+    only ever written ``False`` at cold-provision time; warm-claim and
+    next-role telemetry land in ``context['_timing']``, so reading the column
+    pinned this axis at 0%. A task participates when it has a non-empty
+    ``_timing`` dict OR a recorded ``vm_provisioned_at``.
+    """
     warm = 0
-    cold = 0
+    total = 0
     for t in tasks:
-        if t.vm_warm_start is True:
-            warm += 1
-        elif t.vm_warm_start is False and t.vm_provisioned_at is not None:
-            cold += 1
-    total = warm + cold
+        timing = (t.context or {}).get("_timing") or {}
+        if timing or t.vm_provisioned_at is not None:
+            total += 1
+            if timing.get("warm_start") is True:
+                warm += 1
     if not total:
         return None
     return round(warm / total, 4)
@@ -154,6 +171,11 @@ def _compute_median_review_iterations(tasks: list[Task]) -> Optional[float]:
             n = loop.get("iteration")
             if isinstance(n, int) and n >= 0:
                 iters.append(n)
+        elif ctx.get("pr_merged"):
+            # Review was skipped (e.g. auto-approved small diff) — counts as 0 iterations.
+            # Excluding these tasks inflates the median whenever the pipeline gets more
+            # efficient by skipping review, inverting the signal.
+            iters.append(0)
     if not iters:
         return None
     return round(float(statistics.median(iters)), 2)
@@ -195,6 +217,27 @@ async def write_snapshot(
 
     if not container.get("baseline"):
         container["baseline"] = dict(snapshot)
+    else:
+        baseline = dict(container["baseline"])
+        # One-time migration: baselines captured before the heartbeat-beacon fix
+        # (schema_version 0) stored vm_cold_start_p50_ms from the first boot
+        # beacon rather than true dispatch-to-claim latency. Clear it so the
+        # next snapshot re-seeds with accurate data.
+        if not baseline.get("_schema_version"):
+            baseline[AXIS_VM_COLD_START_P50_MS] = None
+            baseline["_schema_version"] = 1
+        # One-time migration: baselines captured before review-skipped tasks
+        # counted as 0 iterations (schema_version 1) excluded auto-approved
+        # tasks, biasing the median upward. Clear and re-seed.
+        if baseline.get("_schema_version") == 1:
+            baseline[AXIS_MEDIAN_REVIEW_ITERATIONS] = None
+            baseline["_schema_version"] = 2
+        # Re-seed any individual axes that were cleared (e.g. by the migration
+        # above) once a valid current value is available.
+        for axis in ALL_AXES:
+            if baseline.get(axis) is None and snapshot.get(axis) is not None:
+                baseline[axis] = snapshot[axis]
+        container["baseline"] = baseline
 
     snapshots = list(container.get("snapshots") or [])
     snapshots.append(snapshot)
@@ -237,7 +280,7 @@ async def read_baseline_with_drift(
     snapshots = container.get("snapshots") or []
     latest = snapshots[-1] if snapshots else {}
 
-    axes: Dict[str, Dict[str, Optional[float]]] = {}
+    axes: Dict[str, Dict[str, Any]] = {}
     for axis in ALL_AXES:
         cur = latest.get(axis)
         base = baseline.get(axis)
@@ -252,10 +295,15 @@ async def read_baseline_with_drift(
             drift_pct = None
         else:
             drift_pct = round(((cur - base) / base) * 100.0, 2)
+        history = [
+            {"captured_at": snap.get("captured_at"), "value": snap.get(axis)}
+            for snap in snapshots
+        ]
         axes[axis] = {
             "current": cur,
             "baseline": base,
             "drift_pct": drift_pct,
+            "history": history,
         }
 
     return {

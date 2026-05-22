@@ -3,6 +3,52 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import MetricsDashboard from './MetricsDashboard';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
+import type { Task } from '../types/task';
+
+const now = Date.now();
+const POPULATED_TASKS: Task[] = [
+  {
+    id: 'task-done-1',
+    title: 'feat: add mobile-responsive grid layout to MetricsDashboard operator page',
+    description: 'Refactor the MetricsDashboard grid to use Tailwind responsive breakpoints.',
+    status: 'COMPLETED',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 3_200_000).toISOString(),
+    started_at: new Date(now - 3_000_000).toISOString(),
+  },
+  {
+    id: 'task-done-2',
+    title: 'fix: vm-reuse-rate widget overflows at 375px',
+    description: 'Clamp the VM reuse rate widget width so it does not exceed the viewport.',
+    status: 'COMPLETED',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 2_400_000).toISOString(),
+    started_at: new Date(now - 2_200_000).toISOString(),
+  },
+  {
+    id: 'task-fail-1',
+    title: 'fix: cost-per-merged-pr chart clips labels at mobile widths',
+    description: 'Ensure X-axis labels in the cost chart do not clip below the chart boundary.',
+    status: 'FAILED',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 1_800_000).toISOString(),
+    started_at: new Date(now - 1_600_000).toISOString(),
+    failure_class: 'CODE_ERROR',
+  },
+  {
+    id: 'task-active-1',
+    title: 'perf: batch efficiency snapshot queries to reduce API call count',
+    description: 'Combine the three separate efficiency snapshot fetches into one batched request.',
+    status: 'IN_PROGRESS',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 900_000).toISOString(),
+    started_at: new Date(now - 800_000).toISOString(),
+  },
+];
 
 vi.mock('recharts', () => ({
   ResponsiveContainer: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
@@ -23,10 +69,25 @@ vi.mock('../api', () => ({
     ok: true,
     json: async () => ({
       axes: {
-        cost_per_merged_pr: { current: 45.2, baseline: 50.0, drift_pct: -9.6 },
-        vm_cold_start_p50_ms: { current: 3200, baseline: 3500, drift_pct: -8.6 },
-        vm_reuse_rate: { current: 72, baseline: 68, drift_pct: 5.9 },
-        median_api_calls_per_task: { current: 12, baseline: 15, drift_pct: -20.0 },
+        cost_per_merged_pr: {
+          current: 45.2, baseline: 50.0, drift_pct: -9.6,
+          history: [
+            { captured_at: '2026-03-01T00:00:00Z', value: 54.0 },
+            { captured_at: '2026-03-08T00:00:00Z', value: 51.0 },
+            { captured_at: '2026-04-01T00:00:00Z', value: 50.0 },
+            { captured_at: '2026-05-01T00:00:00Z', value: 45.2 },
+          ],
+        },
+        vm_cold_start_p50_ms: {
+          current: 3200, baseline: 3500, drift_pct: -8.6,
+          history: [
+            { captured_at: '2026-03-01T00:00:00Z', value: 3600 },
+            { captured_at: '2026-04-01T00:00:00Z', value: 3500 },
+            { captured_at: '2026-05-01T00:00:00Z', value: 3200 },
+          ],
+        },
+        vm_reuse_rate: { current: 72, baseline: 68, drift_pct: 5.9, history: [] },
+        median_api_calls_per_task: { current: 12, baseline: 15, drift_pct: -20.0, history: [{ captured_at: '2026-05-01T00:00:00Z', value: 12 }] },
         median_review_iterations: { current: 2.1, baseline: 2.5, drift_pct: -16.0 },
       },
       baseline_captured_at: '2026-05-01T00:00:00Z',
@@ -71,7 +132,7 @@ describe('MetricsDashboard — viewport regression', () => {
             cumulativeCost={0}
             cumulativeVmHours={0}
             maxConcurrentVMs={4}
-            tasks={[]}
+            tasks={POPULATED_TASKS}
             metricsWindow="1h"
             onWindowChange={() => {}}
           />,
@@ -94,7 +155,7 @@ describe('MetricsDashboard — viewport regression', () => {
             cumulativeCost={12.34}
             cumulativeVmHours={5.67}
             maxConcurrentVMs={4}
-            tasks={[]}
+            tasks={POPULATED_TASKS}
             metricsWindow="1h"
             onWindowChange={() => {}}
           />,
@@ -117,7 +178,7 @@ describe('MetricsDashboard — viewport regression', () => {
             cumulativeCost={0}
             cumulativeVmHours={0}
             maxConcurrentVMs={4}
-            tasks={[]}
+            tasks={POPULATED_TASKS}
             metricsWindow="1h"
             onWindowChange={() => {}}
           />,
@@ -140,7 +201,7 @@ describe('MetricsDashboard — viewport regression', () => {
             cumulativeCost={0}
             cumulativeVmHours={0}
             maxConcurrentVMs={4}
-            tasks={[]}
+            tasks={POPULATED_TASKS}
             metricsWindow="1h"
             onWindowChange={() => {}}
             projectId="test-project-id"

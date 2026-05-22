@@ -2,7 +2,64 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { DashboardHome } from './DashboardHome';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } from '../test/viewport';
+import type { Task } from '../types/task';
+
+const now = Date.now();
+// 'task-abc' matches the task_id in the mocked /digest recent_completions payload.
+const POPULATED_TASKS: Task[] = [
+  {
+    id: 'task-abc',
+    title: 'feat: add mobile-responsive grid layout to DashboardHome operator page',
+    description: 'Refactor the DashboardHome grid to use Tailwind responsive breakpoints.',
+    status: 'COMPLETED',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 3_600_000).toISOString(),
+    started_at: new Date(now - 3_500_000).toISOString(),
+  },
+  {
+    id: 'task-fail-1',
+    title: 'fix: digest failure-group pill overflows at 375px',
+    description: 'Ensure failure class pills wrap rather than overflow at mobile widths.',
+    status: 'FAILED',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 2_700_000).toISOString(),
+    started_at: new Date(now - 2_600_000).toISOString(),
+    failure_class: 'CODE_ERROR',
+  },
+  {
+    id: 'task-fail-2',
+    title: 'fix: direction progress card clips title text at 375px',
+    description: 'Apply text-wrap and min-w-0 to prevent direction title clipping.',
+    status: 'FAILED',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 1_900_000).toISOString(),
+    started_at: new Date(now - 1_800_000).toISOString(),
+    failure_class: 'AGENT_TIMEOUT',
+  },
+  {
+    id: 'task-active-1',
+    title: 'perf: reduce digest fetch latency by caching direction_progress',
+    description: 'Cache the direction_progress field in Redis to reduce p95 digest latency.',
+    status: 'IN_PROGRESS',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 1_000_000).toISOString(),
+    started_at: new Date(now - 900_000).toISOString(),
+  },
+  {
+    id: 'task-queued-1',
+    title: 'create: add pipeline conversion rate trend sparkline to DashboardHome',
+    description: 'Render a 30-day sparkline next to the conversion rate metric.',
+    status: 'QUEUED',
+    created_by: 'agent',
+    requires_approval: false,
+    created_at: new Date(now - 300_000).toISOString(),
+  },
+];
 
 // DashboardHome (and its sub-components) transitively import apiFetch from
 // '../api', which pulls in Firebase. Mock the module so the test does not
@@ -65,6 +122,32 @@ vi.mock('../api', () => ({
         { status: 200 },
       );
     }
+    if (url.includes('/version-lifecycle')) {
+      return new Response(
+        JSON.stringify({
+          current_version: {
+            version_number: 42,
+            phase: 'stabilize',
+            phase_changed_at: '2026-05-20T12:00:00Z',
+            opened_at: '2026-05-15T00:00:00Z',
+            qualification_attempts: 2,
+            merged_task_count: 15,
+            last_qualification: {
+              status: 'dry_run',
+              confidence: 0.78,
+              threshold: 0.80,
+              sub_scores: { audit: 0.85, test_erosion: 0.70, smoketest: 0.90 },
+              blocker: null,
+              finalized_at: '2026-05-20T11:00:00Z',
+            },
+          },
+          recent_versions: [
+            { version_number: 41, status: 'promoted', opened_at: '2026-05-10T00:00:00Z', promoted_at: '2026-05-15T00:00:00Z', qualification_attempts: 1, last_qualification: { status: 'promoted', confidence: 0.85, threshold: 0.80, sub_scores: null, blocker: null, finalized_at: null } },
+          ],
+        }),
+        { status: 200 },
+      );
+    }
     // All other endpoints return 404 so sub-components see their `if (!res.ok)`
     // / `if (!data)` early-exits and render their idle/empty states. Returning
     // `{}` with 200 instead causes widgets that destructure specific shapes
@@ -97,6 +180,13 @@ vi.mock('../api', () => ({
     by_class: {},
   })),
   onboardProject: vi.fn(async () => ({})),
+  setVersionPhase: vi.fn(async () => ({
+    version_number: 42,
+    phase: 'stabilize',
+    phase_changed_at: '2026-05-20T12:00:00Z',
+    phase_reasoning: '[operator:test] operator advance',
+  })),
+  triggerQualify: vi.fn(async () => ({ status: 'dry_run' })),
   CANONICAL_LAYER_NAMES: ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS', 'VIEWPORT'] as const,
   fetchCanonicalRegressionLayers: vi.fn(async () => ({ layers: [] })),
 }));
@@ -131,13 +221,35 @@ describe('DashboardHome — viewport regression', () => {
       await act(async () => {
         r.render(
           <DashboardHome
-            tasks={[]}
+            tasks={POPULATED_TASKS}
             selectedProjectId={null}
             onViewTask={() => {}}
           />,
         );
       });
       // Allow async state updates (mock fetches resolve) to settle.
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    });
+  });
+
+  test('version lifecycle panel renders without overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DashboardHome
+            tasks={POPULATED_TASKS}
+            selectedProjectId="proj-abc"
+            onViewTask={() => {}}
+          />,
+        );
+      });
       await act(async () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 50));
       });
@@ -154,7 +266,7 @@ describe('DashboardHome — viewport regression', () => {
       await act(async () => {
         r.render(
           <DashboardHome
-            tasks={[]}
+            tasks={POPULATED_TASKS}
             selectedProjectId={null}
             onViewTask={() => {}}
           />,
@@ -164,5 +276,49 @@ describe('DashboardHome — viewport regression', () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 50));
       });
     });
+  });
+
+  test('operator-facing text is not silently clipped at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DashboardHome
+            tasks={POPULATED_TASKS}
+            selectedProjectId={null}
+            onViewTask={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    });
+  });
+
+  test('interactive controls meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DashboardHome
+            tasks={POPULATED_TASKS}
+            selectedProjectId={null}
+            onViewTask={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    }, { selector: 'button, a[href]' });
   });
 });

@@ -150,6 +150,28 @@ describe('RemediationFunnelSection — viewport regression', () => {
       await act(async () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 80));
       });
+      // Verify the "By failure class" section and its cards are rendered.
+      // At 375px the stacked-card layout (md:hidden) is active; the desktop
+      // nine-column grid (hidden md:block) is hidden by Tailwind breakpoint.
+      const text = host!.textContent ?? '';
+      if (!text.includes('By failure class')) {
+        throw new Error('"By failure class" section not found at 375px');
+      }
+      if (!text.includes('CODE_ERROR')) {
+        throw new Error('CODE_ERROR class card not rendered at 375px');
+      }
+      if (!text.includes('AGENT_TIMEOUT')) {
+        throw new Error('AGENT_TIMEOUT class card not rendered at 375px');
+      }
+      // The class breakdown now uses responsive card layout at mobile widths —
+      // it no longer carries data-viewport-allow-overflow. Only the horizontal
+      // stage-flow arrows section should retain the opt-out (exactly one).
+      const escapeHatches = host!.querySelectorAll('[data-viewport-allow-overflow]');
+      if (escapeHatches.length > 1) {
+        throw new Error(
+          `data-viewport-allow-overflow: expected 1 (funnel stage flow), found ${escapeHatches.length} — class breakdown should use responsive layout at 375px instead`,
+        );
+      }
     });
   });
 

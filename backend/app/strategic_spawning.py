@@ -158,6 +158,72 @@ async def _build_system_maturity_payload(
     return out
 
 
+_EFFICIENCY_SNAPSHOT_HISTORY_TAIL = 3
+
+
+def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
+    """Trim efficiency_snapshot for inclusion in strategic-agent payloads.
+
+    Strips full history arrays down to a 3-point tail per axis so the agent
+    can read a trend without dragging months of weekly history through the
+    payload budget.
+    """
+    if not snapshot:
+        return {}
+    axes = snapshot.get("axes") or {}
+    trimmed_axes: dict = {}
+    for axis, data in axes.items():
+        if not isinstance(data, dict):
+            trimmed_axes[axis] = data
+            continue
+        history = data.get("history") or []
+        trimmed_axes[axis] = {
+            "current": data.get("current"),
+            "baseline": data.get("baseline"),
+            "drift_pct": data.get("drift_pct"),
+            "history_tail": history[-_EFFICIENCY_SNAPSHOT_HISTORY_TAIL:],
+        }
+    return {
+        "axes": trimmed_axes,
+        "baseline_captured_at": snapshot.get("baseline_captured_at"),
+        "last_snapshot_at": snapshot.get("last_snapshot_at"),
+    }
+
+
+_VERSION_PHASE_RECENT_VERSIONS_CAP = 3
+
+
+def _summarize_version_phase(block: dict) -> dict:
+    """Trim version_phase for inclusion under budget pressure.
+
+    Drops ``thresholds`` from ``promotion_readiness`` (verbose config), trims
+    ``confidence`` to {mean, stdev, stable}, and caps ``recent_versions`` to
+    the 3 most recent entries so the agent sees the trend without dragging full
+    verdict history through the payload.
+    """
+    if not block:
+        return {}
+    out = dict(block)
+    pr = block.get("promotion_readiness")
+    if isinstance(pr, dict):
+        conf = pr.get("confidence") or {}
+        out["promotion_readiness"] = {
+            k: v
+            for k, v in pr.items()
+            if k not in {"thresholds", "blocker_counts", "confidence"}
+        }
+        if isinstance(conf, dict):
+            out["promotion_readiness"]["confidence"] = {
+                "mean": conf.get("mean"),
+                "stdev": conf.get("stdev"),
+                "stable": conf.get("stable"),
+            }
+    rv = block.get("recent_versions")
+    if isinstance(rv, list):
+        out["recent_versions"] = rv[:_VERSION_PHASE_RECENT_VERSIONS_CAP]
+    return out
+
+
 def _summarize_drift_signals(drift: dict) -> dict:
     """Return a payload-friendly subset of drift_detection.compute_direction_drift.
 
@@ -372,7 +438,16 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "retired_directions_summary": {"priority": "low"},
     # LTS version/phase context — present only on self-repo projects. High priority
     # so it survives budget pressure (the agent needs it for phase-transition decisions).
-    "version_phase": {"priority": "high"},
+    "version_phase": {"priority": "high", "summarize": _summarize_version_phase},
+    # Citable memo digest — supplementary context, dropped first under budget pressure.
+    "memo_citations": {"priority": "low"},
+    # Per-axis efficiency axes with drift vs baseline. Medium priority so it
+    # survives typical payload pressure; the summarize_fn trims history tails
+    # so it degrades gracefully before being dropped entirely.
+    "efficiency_snapshot": {
+        "priority": "medium",
+        "summarize": _summarize_efficiency_snapshot,
+    },
 }
 
 
@@ -1299,6 +1374,27 @@ async def _spawn_strategic_review(
         ctx = d.get("research_context")
         if ctx:
             stat_entry["research_context"] = ctx[:3000]
+        # Surface the direction's stated outcome goal so the strategic agent's
+        # per-cycle review is grounded in success_evidence/retirement_condition,
+        # not just merge/cost metrics. Mirror the write-side cap from main.py.
+        _DIR_FIELD_MAX = 500
+        dir_context = d.get("context") or {}
+        _success_evidence = str(dir_context.get("success_evidence") or "").strip()
+        if _success_evidence:
+            stat_entry["success_evidence"] = _success_evidence[:_DIR_FIELD_MAX]
+        _retirement_condition = str(
+            dir_context.get("retirement_condition") or ""
+        ).strip()
+        if _retirement_condition:
+            stat_entry["retirement_condition"] = _retirement_condition[:_DIR_FIELD_MAX]
+        # Advisory outcome-less-scaffolding flag: surfaces a long-running direction
+        # that keeps merging PRs but never advances its success_evidence, so the
+        # strategic agent sees it as a first-class signal (not just merge/cost metrics).
+        if d.get("outcome_scaffolding_flagged"):
+            stat_entry["outcome_scaffolding_flagged"] = True
+            _osc_ev = d.get("outcome_scaffolding_evidence")
+            if _osc_ev:
+                stat_entry["outcome_scaffolding_evidence"] = _osc_ev
         _rfe = d.get("recent_findings_evidence") or []
         if _rfe:
             from app.research_context import filter_direction_evidence
@@ -1430,6 +1526,7 @@ async def _spawn_strategic_review(
         _build_outcome_evaluation,
         _build_retired_directions_summary,
         _compute_prediction_calibration,
+        _build_retired_approaches_block,
     )
 
     # Audit W2: cycle history is in the StrategicCycle table; pre-fetch once
@@ -1469,9 +1566,42 @@ async def _spawn_strategic_review(
     _version_phase_block: dict | None = None
     if project.is_self_repo:
         try:
-            from app.release_version import count_merged_since, current_open_version, to_phase_block
+            from app.release_version import (
+                count_merged_since,
+                current_open_version,
+                ensure_initial_release_version,
+                recent_closed_versions,
+                to_phase_block,
+            )
 
             _open_version = await current_open_version(session, project.id)
+            if _open_version is None:
+                # No open version: attempt bootstrap if the integration branch
+                # is a real trunk distinct from "main" (i.e. the LTS split is
+                # active). Try to resolve the integration-branch HEAD SHA so the
+                # qualifier's diff is meaningful; fall back to None on any error.
+                _integration_branch = _runtime_config.get("integration_branch", "main")
+                _bootstrap_sha: str | None = None
+                try:
+                    from app import github as _github
+                    from app.release_qualifier import _resolve_github_with_session
+
+                    _resolved = await _resolve_github_with_session(session, project)
+                    if _resolved is not None:
+                        _gh_token, _gh_owner, _gh_repo = _resolved
+                        _bootstrap_sha = await _github.get_branch_sha(
+                            _gh_token, _gh_owner, _gh_repo, _integration_branch
+                        )
+                except Exception:
+                    logger.exception(
+                        "[STRATEGIC] could not resolve integration branch SHA for bootstrap"
+                    )
+                _open_version = await ensure_initial_release_version(
+                    session,
+                    project.id,
+                    integration_branch=_integration_branch,
+                    base_sha=_bootstrap_sha,
+                )
             if _open_version is not None:
                 _tasks_merged = await count_merged_since(
                     session, project.id, _open_version.opened_at
@@ -1480,10 +1610,68 @@ async def _spawn_strategic_review(
                     **to_phase_block(_open_version),
                     "tasks_merged_this_version": _tasks_merged,
                 }
+            # Enrich with cross-version promotion-readiness trend.  Best-effort:
+            # absent when no QualificationVerdict rows exist yet.
+            try:
+                from app.release_qualifier import compute_promotion_readiness
+
+                _readiness = await compute_promotion_readiness(session, project.id)
+                if _readiness.get("verdicts_evaluated", 0) > 0:
+                    if _version_phase_block is None:
+                        _version_phase_block = {}
+                    _version_phase_block["promotion_readiness"] = _readiness
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] promotion_readiness fetch failed; continuing"
+                )
+            try:
+                _closed = await recent_closed_versions(
+                    session, project.id, limit=_VERSION_PHASE_RECENT_VERSIONS_CAP
+                )
+                if _closed:
+                    if _version_phase_block is None:
+                        _version_phase_block = {}
+                    _version_phase_block["recent_versions"] = [
+                        {
+                            "version_number": v.version_number,
+                            "status": v.status,
+                            "phase": v.phase,
+                            "last_qualification": v.last_qualification,
+                        }
+                        for v in _closed
+                    ]
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] recent_closed_versions fetch failed; continuing"
+                )
         except Exception:
-            logger.exception(
-                "[STRATEGIC] version_phase block build failed; continuing"
-            )
+            logger.exception("[STRATEGIC] version_phase block build failed; continuing")
+    # Citable memo digest: terminal reasoning artifacts spawned from dropped
+    # research findings since the previous cycle. Surfaced so the reviewer can
+    # cite memos by task_id. Low priority in the pack schema — dropped first
+    # under budget pressure.
+    try:
+        memo_citations = await strategic_cycle.query_recent_memo_citations(
+            session, project.id
+        )
+    except Exception:
+        logger.exception("[STRATEGIC] memo citation fetch failed; continuing")
+        memo_citations = []
+    # Efficiency axes + drift vs baseline. Best-effort: absent when no snapshot
+    # data has been written yet (cold-start projects). The summarize_fn trims
+    # history tails before the packer drops it entirely under budget pressure.
+    _efficiency_snapshot: dict | None = None
+    try:
+        from app.efficiency_snapshot import read_baseline_with_drift
+
+        _raw_snapshot = await read_baseline_with_drift(session, project.id)
+        axes = (_raw_snapshot or {}).get("axes") or {}
+        if any(
+            v.get("current") is not None for v in axes.values() if isinstance(v, dict)
+        ):
+            _efficiency_snapshot = _summarize_efficiency_snapshot(_raw_snapshot)
+    except Exception:
+        logger.exception("[STRATEGIC] efficiency snapshot fetch failed; continuing")
     # Stabilize phase directive — when the open version is in stabilize, bias the
     # strategic agent's work-mix toward audit/cleanup/hardening so the version
     # converges toward qualification rather than accumulating net-new feature work.
@@ -1497,6 +1685,125 @@ async def _spawn_strategic_review(
         prompt_suffix = (
             f"{prompt_suffix}\n{_stabilize_hint}" if prompt_suffix else _stabilize_hint
         )
+        # Stabilize-stall directive — when the version has been in stabilize too
+        # long without progress toward qualification (zero attempts or only soft
+        # near-misses), explicitly prompt the agent to emit qualify_request or
+        # resolve whatever is blocking readiness.  Skips a dry-run hold (passing
+        # candidate waiting for promotion_enabled) and hard-blocker stalls (covered
+        # by the calcification alert).  Best-effort — never block the payload build.
+        try:
+            from app.release_qualifier import (
+                _STABILIZE_STALL_AGE_DAYS,
+                _STABILIZE_STALL_MERGED_TASKS,
+            )
+            from app.release_version import count_merged_since
+
+            _stab_qual = _open_version.last_qualification or {}
+            _stab_qual_status = _stab_qual.get("status")
+            _stab_is_healthy = _stab_qual_status == "dry_run" or (
+                _stab_qual_status == "not_promoted" and _stab_qual.get("blocker")
+            )
+            if not _stab_is_healthy:
+                _stab_ref = _open_version.phase_changed_at or _open_version.opened_at
+                _stab_age_days = (
+                    max(0, (_utcnow() - _stab_ref).days) if _stab_ref else 0
+                )
+                # Stabilize-phase-scoped merged-task count, mirroring the
+                # qualifier backstop _check_version_stabilize_stall (which counts
+                # count_merged_since(..., phase_changed_at or opened_at)).  Using
+                # the version-lifetime count from _version_phase_block here would
+                # include build-phase merges and misreport the stall in prompt
+                # text on the common age-triggered path.
+                _stab_merged = (
+                    await count_merged_since(session, project.id, _stab_ref)
+                    if _stab_ref
+                    else 0
+                )
+                if (
+                    _stab_age_days >= _STABILIZE_STALL_AGE_DAYS
+                    or _stab_merged >= _STABILIZE_STALL_MERGED_TASKS
+                ):
+                    _stab_stall_hint = (
+                        f"Version phase: STABILIZE — STALLED. "
+                        f"v{_open_version.version_number} has been in the stabilize "
+                        f"phase for {_stab_age_days} day(s) with {_stab_merged} merged "
+                        f"task(s) without making progress toward qualification. "
+                        f"stabilize→qualify is agent-driven — consider emitting a "
+                        f"qualify_request now, or identifying and resolving whatever "
+                        f"is preventing qualification readiness."
+                    )
+                    prompt_suffix = (
+                        f"{prompt_suffix}\n{_stab_stall_hint}"
+                        if prompt_suffix
+                        else _stab_stall_hint
+                    )
+                    if _version_phase_block is not None:
+                        _version_phase_block["stabilize_stall"] = {
+                            "age_days": _stab_age_days,
+                            "tasks_merged": _stab_merged,
+                        }
+        except Exception:
+            logger.exception(
+                "[STRATEGIC] stabilize-stall hint build failed; continuing"
+            )
+    # Build-stall directive — when the open version is in build and has stalled
+    # past the same threshold the qualifier backstop uses, explicitly tell the
+    # strategic agent the version has been building for N days / M merged tasks
+    # without advancing and should consider stabilizing it.  build→stabilize is
+    # agent-driven with no cadence, so this nudge is the only thing prompting
+    # the agent to move a parked version forward.  Best-effort — never block the
+    # payload build.
+    elif _open_version is not None and _open_version.phase == "build":
+        try:
+            from app.release_qualifier import _is_build_stalled
+            from app.release_version import count_merged_since
+
+            _build_ref = _open_version.phase_changed_at or _open_version.opened_at
+            _build_age_days = max(0, (_utcnow() - _build_ref).days) if _build_ref else 0
+            # Build-phase-scoped merged-task count, mirroring the qualifier
+            # backstop _check_version_build_stall (which counts
+            # count_merged_since(..., phase_changed_at or opened_at)).  Using
+            # the version-lifetime count from _version_phase_block here would
+            # include earlier build-phase and stabilize-phase merges and
+            # misreport the stall for a version re-entering build from stabilize.
+            _build_merged = (
+                await count_merged_since(session, project.id, _build_ref)
+                if _build_ref
+                else 0
+            )
+            if _is_build_stalled(_build_age_days, _build_merged):
+                _build_stall_hint = (
+                    f"Version phase: BUILD — STALLED. v{_open_version.version_number} "
+                    f"has been in the build phase for {_build_age_days} day(s) with "
+                    f"{_build_merged} merged task(s) without advancing to stabilize. "
+                    f"build→stabilize is agent-driven and has no automatic cadence — "
+                    f"consider emitting a version_phase_decision to move it to "
+                    f"'stabilize' so it can progress toward qualification and "
+                    f"promotion."
+                )
+                prompt_suffix = (
+                    f"{prompt_suffix}\n{_build_stall_hint}"
+                    if prompt_suffix
+                    else _build_stall_hint
+                )
+                if _version_phase_block is not None:
+                    _version_phase_block["build_stall"] = {
+                        "age_days": _build_age_days,
+                        "tasks_merged": _build_merged,
+                    }
+        except Exception:
+            logger.exception("[STRATEGIC] build-stall hint build failed; continuing")
+    # Inject explicit list of failed approaches from retired directions so the
+    # agent has a clear "do not re-propose" block in the prompt.
+    _retired_summary = _build_retired_directions_summary(project)
+    if _retired_summary:
+        _approaches_block = _build_retired_approaches_block(_retired_summary)
+        if _approaches_block:
+            prompt_suffix = (
+                f"{prompt_suffix}\n{_approaches_block}"
+                if prompt_suffix
+                else _approaches_block
+            )
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",
@@ -1552,9 +1859,8 @@ async def _spawn_strategic_review(
                 else {}
             ),
             **({"drift_signals": drift_summary} if drift_summary else {}),
-            **(
-                {"version_phase": _version_phase_block} if _version_phase_block else {}
-            ),
+            **({"version_phase": _version_phase_block} if _version_phase_block else {}),
+            **({"memo_citations": memo_citations} if memo_citations else {}),
             **(
                 {"past_retirement_critiques": _past_critiques}
                 if (_past_critiques := _build_past_retirement_critiques(cycle_history))
@@ -1562,7 +1868,12 @@ async def _spawn_strategic_review(
             ),
             **(
                 {"retired_directions_summary": _retired_summary}
-                if (_retired_summary := _build_retired_directions_summary(project))
+                if _retired_summary
+                else {}
+            ),
+            **(
+                {"efficiency_snapshot": _efficiency_snapshot}
+                if _efficiency_snapshot
                 else {}
             ),
             "base_branch": _runtime_config.get("integration_branch", "main"),

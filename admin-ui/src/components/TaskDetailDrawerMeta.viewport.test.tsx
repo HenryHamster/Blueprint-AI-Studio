@@ -21,14 +21,43 @@ vi.mock('../api', () => ({
 }));
 
 const richTask: Task = {
-  id: 'task-1',
-  title: 'Test Task with Self-Review',
+  id: 'task-550e8400e29b41d4a716446655440000',
+  title: 'Test Task with Self-Review and Long Identifiers',
   description: 'A test description',
   status: 'COMPLETED',
   task_type: 'create',
   created_at: '2024-01-01T00:00:00Z',
   created_by: 'USER',
   requires_approval: false,
+  parent_task_id: 'task-550e8400e29b41d4a716446655440001',
+  project_id: '550e8400-e29b-41d4-a716-446655440000',
+  vm_instance_id: 'blueprint-agent-c99e9c2f7a9e8b1c2d3e4f5a6b7c8d9e-0123',
+  branch: 'feature/add-comprehensive-error-handling-to-data-pipeline',
+  repo_url: 'https://github.com/HenryHamster/BlueprintAIStudio',
+  pr_url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/4829',
+  commit_hash: '550e8400e29b41d4a716446655440000abcdef12',
+  child_task_ids: ['task-550e8400e29b41d4a716446655440002', 'task-550e8400e29b41d4a716446655440003'],
+  artifacts: [
+    {
+      artifact_type: 'PULL_REQUEST',
+      pr_url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/4829',
+      iteration: 1,
+    },
+    {
+      artifact_type: 'GIT_COMMIT',
+      commit_hash: '550e8400e29b41d4a716446655440000abcdef12',
+      repo_url: 'https://github.com/HenryHamster/BlueprintAIStudio',
+      iteration: 1,
+    },
+  ],
+  payloads: [
+    {
+      type: 'create',
+      branch: 'feature/add-comprehensive-error-handling-to-data-pipeline-processing',
+      base_branch: 'main',
+      pr_number: 4829,
+    },
+  ],
   context: {
     _self_review_outcome: {
       verdict: 'fail',

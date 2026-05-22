@@ -37,12 +37,12 @@ const categoryRouting: Record<string, CategoryRoutingEntry> = {
   research: { providers: ['anthropic'], effort: 'low' },
 };
 
-// Per-task-overrides table renders a non-wrapping `flex items-center gap-3`
-// row per entry whose intrinsic width (code + providers + effort + remove)
-// exceeds 375px even with two providers — a known dense-table layout issue
-// tracked separately. Leaving empty here so this test exercises the category
-// + selection-mode + default layout that DOES need to fit at mobile widths.
-const taskTypeRouting: Record<string, TaskTypeRoutingEntry> = {};
+// Per-task-overrides table with at least one entry to ensure the row layout
+// (task-type label, providers checklist, effort selector, remove button)
+// wraps cleanly at 375px without overflow.
+const taskTypeRouting: Record<string, TaskTypeRoutingEntry> = {
+  'code-change': { providers: ['anthropic', 'openai'], effort: 'high' },
+};
 
 describe('ProviderCategoriesPanel — viewport regression', () => {
   let root: Root | null = null;

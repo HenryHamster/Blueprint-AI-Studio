@@ -427,9 +427,57 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
         return (
         <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 mb-2">
           <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1.5">By failure class</div>
-          <div className="overflow-x-auto -mx-1 px-1" data-viewport-allow-overflow>
-          {/* eslint-disable-next-line viewport/no-fixed-width -- intentional scrollable breakdown table on mobile; overflow contained by parent overflow-x-auto */}
-          <div className="space-y-1 min-w-[480px]">
+          {/* Mobile: stacked cards, one per failure class */}
+          <div className="md:hidden space-y-2">
+            {classKeys.map(cls => {
+              const s = funnel.investigations_spawned_by_class?.[cls] ?? 0;
+              const c = funnel.investigations_completed_by_class?.[cls] ?? 0;
+              const r = funnel.remediations_spawned_by_class?.[cls] ?? 0;
+              const m = funnel.merged_remediations_by_trigger_class?.[cls] ?? 0;
+              const f = funnel.failed_remediations_by_class?.[cls] ?? 0;
+              const cumM = funnel.cumulative_merged_by_trigger_class?.[cls] ?? 0;
+              const complRate = s > 0 ? pct(c, s) : null;
+              const mergeRate = r > 0 ? pct(m, r) : null;
+              const rateColor = (v: number) => v >= 60 ? 'text-emerald-400' : v >= 30 ? 'text-amber-400' : 'text-red-400';
+              const isBottleneck = cls === bottleneckCls;
+              return (
+                <div
+                  key={cls}
+                  className={`rounded border border-neutral-800/50 p-2 ${isBottleneck ? 'border-l-2 border-red-500/60 bg-red-500/5' : ''}`}
+                  title={isBottleneck ? 'Lowest merge rate among classes with ≥2 remediations (bottleneck)' : undefined}
+                >
+                  <div className="flex items-center justify-between mb-1.5">
+                    <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded border ${classBadge(cls)}`}>{cls}</span>
+                    {isBottleneck && <span className="text-[9px] text-red-400 font-semibold">bottleneck</span>}
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-2 gap-y-0.5 text-[11px]">
+                    <span className="text-neutral-600">Spawned</span>
+                    <span className="font-mono text-neutral-300 text-right">{s}</span>
+                    <span className="text-neutral-600">Completed</span>
+                    <span className="font-mono text-neutral-300 text-right">{c}</span>
+                    <span className="text-neutral-600">Compl%</span>
+                    <span className={`font-mono text-right ${complRate == null ? 'text-neutral-600' : rateColor(complRate)}`}>
+                      {complRate == null ? '—' : `${complRate}%`}
+                    </span>
+                    <span className="text-neutral-600">Remediated</span>
+                    <span className="font-mono text-neutral-300 text-right">{r}</span>
+                    <span className="text-neutral-600">Merged</span>
+                    <span className="font-mono text-emerald-400 text-right">{m}</span>
+                    <span className="text-neutral-600">Failed</span>
+                    <span className="font-mono text-red-400 text-right">{f}</span>
+                    <span className="text-neutral-600">Merge%</span>
+                    <span className={`font-mono text-right ${mergeRate == null ? 'text-neutral-600' : rateColor(mergeRate)}`}>
+                      {mergeRate == null ? '—' : `${mergeRate}%`}
+                    </span>
+                    <span className="text-neutral-600">All-time</span>
+                    <span className="font-mono text-neutral-400 text-right" title="Cumulative all-time merged">{cumM}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {/* Desktop: table grid layout */}
+          <div className="hidden md:block space-y-1">
             <div className="grid grid-cols-[minmax(110px,1fr)_repeat(8,minmax(44px,1fr))] gap-2 text-[9px] uppercase tracking-wide text-neutral-600">
               <span>Class</span>
               <span className="text-right">Spawned</span>
@@ -476,7 +524,6 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                 </div>
               );
             })}
-          </div>
           </div>
         </div>
         );

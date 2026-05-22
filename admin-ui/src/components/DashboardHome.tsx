@@ -11,7 +11,7 @@ import {
   Search,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { apiFetch, fetchSrUnhandledEdgesRetrospectives, type PromptFingerprintAnalyticsResponse, type SrUnhandledEdgesTask } from '../api';
+import { apiFetch, fetchSrUnhandledEdgesRetrospectives, setVersionPhase, triggerQualify, type PromptFingerprintAnalyticsResponse, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
@@ -31,7 +31,7 @@ import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
-import { SrTrendBreakdown, SrMissedRetrospective, SrReviewerDisagreementsPanel, SrUnhandledEdgesRetrospective, EdgesTrendBreakdown, DirectionSrBreakdownPanel, type SrTrendData, type SrMissedTask, type SrReviewerDisagreementsData, type EdgesTrend, type DirectionSrEntry } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
+import { SrTrendBreakdown, SrMissedRetrospective, SrReviewerDisagreementsPanel, SrUnhandledEdgesRetrospective, EdgesTrendBreakdown, DirectionSrBreakdownPanel, type SrTrendData, type SrMissedTask, type SrReviewerDisagreementsData, type EdgesTrend, type DirectionSrEntry, type SrInvestigationSignal } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
 import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import { ManualInterventionPanel, AutoRecoveredPanel, AnomalyTrackerPanel } from './PipelineRegressionsPanel';
 import { RecentlyResolvedRegressionsPanel } from './RecentlyResolvedRegressionsPanel';
@@ -239,6 +239,8 @@ interface DigestData {
     miss_rate?: number | null;
     false_alarm_rate?: number | null;
     sample_size?: number | null;
+    self_flagged_shipped_unfixed_task_count?: number | null;
+    self_flagged_shipped_unfixed_task_rate?: number | null;
   } | null;
   self_review_prediction_accuracy_trends?: SrTrendWithFixIterations | null;
   sr_regression_risk_test_signal_trends?: {
@@ -305,7 +307,7 @@ interface DigestData {
 }
 
 interface SrFixIterationBucket { hit_rate?: number | null; miss_rate?: number | null; sample_count?: number | null; }
-type SrTrendWithFixIterations = SrTrendData & { by_fix_iteration?: Record<string, SrFixIterationBucket> | null; fix_iteration_breakdown?: Record<string, SrFixIterationBucket> | null; iteration_breakdown?: Record<string, SrFixIterationBucket> | null; };
+type SrTrendWithFixIterations = SrTrendData & { by_fix_iteration?: Record<string, SrFixIterationBucket> | null; fix_iteration_breakdown?: Record<string, SrFixIterationBucket> | null; iteration_breakdown?: Record<string, SrFixIterationBucket> | null; overall_hit_rate?: number | null; previous_overall_hit_rate?: number | null; };
 
 // Per-direction SR catch-rate breakdown (endpoint: GET /projects/{id}/direction-sr-breakdown)
 // DirectionSrEntry is re-exported from SrTrendBreakdown (canonical model)
@@ -405,6 +407,199 @@ interface SparkPoint {
   failed: number;
 }
 
+// ---------- Version Lifecycle Panel ----------
+
+const QUAL_VERDICT_COLOR: Record<string, string> = {
+  pending: 'text-blue-400',
+  promoted: 'text-emerald-400',
+  dry_run: 'text-blue-400',
+  already_dry_run: 'text-blue-400',
+  not_promoted: 'text-amber-400',
+  promotion_failed: 'text-red-400',
+  error: 'text-red-400',
+  sha_error: 'text-red-400',
+};
+
+function QualSummary({ q }: { q: VersionQualification | null }) {
+  if (!q || q.confidence == null) return <span className="text-neutral-500 text-[10px]">—</span>;
+  const conf = `${Math.round(q.confidence * 100)}%`;
+  const thr = q.threshold != null ? `/${Math.round(q.threshold * 100)}%` : '';
+  const status = q.status ?? 'unknown';
+  return (
+    <span className={`font-mono text-[10px] ${QUAL_VERDICT_COLOR[status] ?? 'text-neutral-400'}`}>
+      {conf}{thr} {status.replace(/_/g, '-')}
+    </span>
+  );
+}
+
+function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadiness | null | undefined }) {
+  if (!readiness) return null;
+  const { ready, reason, verdicts_evaluated, would_promote_rate, consecutive_clean_passes, recurring_blockers } = readiness;
+  const hasBlockers = Object.keys(recurring_blockers ?? {}).length > 0;
+  return (
+    <div className="mt-1 pt-1 border-t border-neutral-700/50 space-y-0.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${ready ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-amber-500/10 border-amber-500/30 text-amber-400'}`}>
+          {ready ? 'ready to promote' : 'not ready'}
+        </span>
+        {verdicts_evaluated > 0 && (
+          <span className="text-[10px] text-neutral-500">{verdicts_evaluated} dry-run{verdicts_evaluated !== 1 ? 's' : ''}</span>
+        )}
+        {verdicts_evaluated > 0 && (
+          <span className="text-[10px] text-neutral-500">{Math.round(would_promote_rate * 100)}% pass rate</span>
+        )}
+        {consecutive_clean_passes > 0 && (
+          <span className="text-[10px] text-neutral-500">{consecutive_clean_passes} clean streak</span>
+        )}
+      </div>
+      {!ready && reason && (
+        <p className="text-[10px] text-neutral-400 line-clamp-2">{reason}</p>
+      )}
+      {hasBlockers && (
+        <p className="text-[10px] text-red-400 truncate">
+          recurring: {Object.entries(recurring_blockers).map(([k, n]) => `${k}×${n}`).join(', ')}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: VersionLifecycleResponse | null; loading: boolean; projectId: string | null; onRefresh: () => void }) {
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [actionMsg, setActionMsg] = useState<string | null>(null);
+
+  if (loading || !data || (!data.current_version && data.recent_versions.length === 0)) return null;
+  const cv = data.current_version;
+  const recent = data.recent_versions;
+  const promotionEnabled = data.promotion_enabled ?? false;
+  const readiness = data.promotion_readiness;
+
+  const handleSetPhase = async (phase: 'build' | 'stabilize') => {
+    if (!projectId) return;
+    setActionLoading('phase');
+    setActionMsg(null);
+    try {
+      await setVersionPhase(projectId, phase, 'operator advance');
+      setActionMsg(`Phase → ${phase}`);
+      onRefresh();
+    } catch {
+      setActionMsg('Request failed');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleQualify = async () => {
+    if (!projectId) return;
+    setActionLoading('qualify');
+    setActionMsg(null);
+    try {
+      const result = await triggerQualify(projectId);
+      setActionMsg(`qualify: ${result.status ?? 'done'}`);
+      onRefresh();
+    } catch {
+      setActionMsg('Request failed');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  return (
+    <section data-testid="version-lifecycle-panel">
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Version Lifecycle</h2>
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 text-xs">
+        <div className="flex flex-wrap items-center gap-2">
+          {data.promotion_enabled !== undefined && (
+            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${promotionEnabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`}>
+              {promotionEnabled ? 'LIVE' : 'DRY-RUN'}
+            </span>
+          )}
+        </div>
+        {cv && (
+          <div className="space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-bold text-neutral-200">v{cv.version_number}</span>
+              <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${cv.phase === 'stabilize' ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 'bg-blue-500/10 border-blue-500/30 text-blue-400'}`}>{cv.phase}</span>
+              {cv.phase_changed_at && <span className="text-[10px] text-neutral-500">{timeAgo(cv.phase_changed_at)}</span>}
+              <span className="text-[10px] text-neutral-500">{cv.merged_task_count} tasks merged</span>
+              {cv.qualification_attempts > 0 && <span className="text-[10px] text-neutral-500">{cv.qualification_attempts} qual{cv.qualification_attempts !== 1 ? 's' : ''}</span>}
+            </div>
+            {cv.phase_reasoning && (
+              <p className="text-[10px] text-neutral-400 italic truncate" title={cv.phase_reasoning}>{cv.phase_reasoning}</p>
+            )}
+            {cv.last_qualification && (
+              <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
+                <QualSummary q={cv.last_qualification} />
+                {cv.last_qualification.sub_scores && (
+                  <div className="flex flex-wrap gap-x-2 text-[10px] text-neutral-500">
+                    <span>audit {Math.round(cv.last_qualification.sub_scores.audit * 100)}%</span>
+                    <span>erosion {Math.round(cv.last_qualification.sub_scores.test_erosion * 100)}%</span>
+                    <span>smoke {Math.round(cv.last_qualification.sub_scores.smoketest * 100)}%</span>
+                  </div>
+                )}
+                {cv.last_qualification.blocker && (
+                  <p className="text-[10px] text-red-400 truncate">{cv.last_qualification.blocker}</p>
+                )}
+              </div>
+            )}
+            {projectId && (
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                {cv.phase === 'build' ? (
+                  // eslint-disable-next-line viewport/min-touch-target
+                  <button
+                    onClick={() => handleSetPhase('stabilize')}
+                    disabled={actionLoading !== null}
+                    className="text-[10px] px-2 py-0.5 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {actionLoading === 'phase' ? '…' : '→ stabilize'}
+                  </button>
+                ) : (
+                  // eslint-disable-next-line viewport/min-touch-target
+                  <button
+                    onClick={() => handleSetPhase('build')}
+                    disabled={actionLoading !== null}
+                    className="text-[10px] px-2 py-0.5 rounded border border-blue-500/40 text-blue-400 hover:bg-blue-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {actionLoading === 'phase' ? '…' : '→ build'}
+                  </button>
+                )}
+                {cv.phase === 'stabilize' && (
+                  // eslint-disable-next-line viewport/min-touch-target
+                  <button
+                    onClick={handleQualify}
+                    disabled={actionLoading !== null}
+                    className="text-[10px] px-2 py-0.5 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {actionLoading === 'qualify' ? '…' : 'Run Qualify'}
+                  </button>
+                )}
+                {actionMsg && (
+                  <span className="text-[10px] text-neutral-400 italic">{actionMsg}</span>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+        {readiness !== undefined && <PromotionReadinessSummary readiness={readiness} />}
+        {recent.length > 0 && (
+          <div>
+            <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">History</p>
+            <div className="space-y-0.5">
+              {recent.slice(0, 4).map(v => (
+                <div key={v.version_number} className="flex flex-wrap items-center gap-2 text-[10px]">
+                  <span className="text-neutral-400 font-mono w-8">v{v.version_number}</span>
+                  <span className="text-neutral-500">{v.status}</span>
+                  <QualSummary q={v.last_qualification} />
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
 // ---------- Pipeline Efficiency Panel ----------
 
 function EffDelta({ delta, lowerIsBetter }: { delta: number | null | undefined; lowerIsBetter: boolean }) {
@@ -453,6 +648,7 @@ export interface DashboardHomeProps {
   onViewTask: (task: Task) => void;
   onDirectionClick?: (directionId: string) => void;
   onCategoryClick?: (category: string) => void;
+  onConfigureTargets?: () => void;
 }
 
 // ---------- helpers ----------
@@ -506,9 +702,8 @@ function FailureClassPill({ group, sparkData, cost }: { group: FailureGroup; spa
 
   return (
     <div ref={ref} className="relative">
-      {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
       <button
-        className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${colorClass} cursor-pointer`}
+        className={`inline-flex items-center justify-center gap-1.5 text-[10px] font-semibold px-3 py-2 rounded border min-h-11 ${colorClass} cursor-pointer`}
         onClick={() => setOpen(v => !v)}
         title={`${group.label}: ${group.count} failure${group.count !== 1 ? 's' : ''}`}
       >
@@ -695,7 +890,7 @@ const WINDOW_OPTIONS = [
   { label: '7d', value: 168 },
 ];
 
-export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick }: DashboardHomeProps) {
+export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick, onConfigureTargets }: DashboardHomeProps) {
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
@@ -705,6 +900,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const [accountHealth, setAccountHealth] = useState<AccountHealthEntry[] | null>(null);
   const [systemMaturity, setSystemMaturity] = useState<SystemMaturityRow[] | null>(null);
   const [taskDurationStats, setTaskDurationStats] = useState<TaskDurationStats | null>(null);
+  const [versionLifecycle, setVersionLifecycle] = useState<VersionLifecycleResponse | null>(null);
   const [blindSpots, setBlindSpots] = useState<BlindSpotsData | null>(null);
   const [srRecentMisses, setSrRecentMisses] = useState<SrMissedTask[] | null>(null);
   const [srRecentMissesTotal, setSrRecentMissesTotal] = useState<number>(0);
@@ -712,6 +908,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const [srReviewerDisagreements, setSrReviewerDisagreements] = useState<SrReviewerDisagreementsData | null>(null);
   const [directionSrBreakdown, setDirectionSrBreakdown] = useState<DirectionSrBreakdownData | null>(null);
   const [fingerprintAnalytics, setFingerprintAnalytics] = useState<PromptFingerprintAnalyticsResponse | null>(null);
+  const [srInvestigationTaskIds, setSrInvestigationTaskIds] = useState<Record<string, string>>({});
   const [srTrendDrilldownOpen, setSrTrendDrilldownOpen] = useState(false);
   const [srTrendDrilldownRows, setSrTrendDrilldownRows] = useState<{ task_id: string; title: string; missed_categories: string[]; sr_verdict: string | null }[]>([]);
   const [srTrendDrilldownLoading, setSrTrendDrilldownLoading] = useState(false);
@@ -755,9 +952,25 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   }, []);
 
   const handleConfigureTargets = useCallback(() => {
-    // Parent (App.tsx) is responsible for implementing the navigation to settings
-    // For now, this is a no-op callback that can be enhanced to navigate or show a modal
-  }, []);
+    onConfigureTargets?.();
+  }, [onConfigureTargets]);
+
+  const handleSpawnSrInvestigation = useCallback(async (signal: SrInvestigationSignal): Promise<string | null> => {
+    if (!selectedProjectId) return null;
+    try {
+      const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-investigation`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(signal),
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as { task_id: string; created: boolean };
+      setSrInvestigationTaskIds(prev => ({ ...prev, [signal.category]: data.task_id }));
+      return data.task_id;
+    } catch {
+      return null;
+    }
+  }, [selectedProjectId]);
 
   // Fetch data
   const fetchData = useCallback(async () => {
@@ -881,6 +1094,21 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             if (res.ok) setFingerprintAnalytics(await res.json());
           } catch { /* silent */ }
         })(),
+        (async () => {
+          try {
+            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/version-lifecycle`);
+            if (res.ok) setVersionLifecycle(await res.json());
+          } catch { /* silent */ }
+        })(),
+        (async () => {
+          try {
+            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-investigation-task-ids`);
+            if (res.ok) {
+              const data = (await res.json()) as { task_ids?: Record<string, string> };
+              setSrInvestigationTaskIds(data.task_ids ?? {});
+            }
+          } catch { /* silent */ }
+        })(),
       );
     }
 
@@ -905,6 +1133,14 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       : !digestOk;
     setLastFetchError(allFailed);
   }, [selectedProjectId, windowHours]);
+
+  const refreshVersionLifecycle = useCallback(async () => {
+    if (!selectedProjectId) return;
+    try {
+      const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/version-lifecycle`);
+      if (res.ok) setVersionLifecycle(await res.json());
+    } catch { /* silent */ }
+  }, [selectedProjectId]);
 
   const fetchSrTrendDrilldown = useCallback(async (categories: string[]) => {
     if (!selectedProjectId || categories.length === 0) return;
@@ -1010,6 +1246,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       {/* Viewport Debt */}
       {selectedProjectId && <ViewportDebtPanel projectId={selectedProjectId} />}
 
+      {/* Version Lifecycle */}
+      {selectedProjectId && <VersionLifecyclePanel data={versionLifecycle} loading={loading} projectId={selectedProjectId} onRefresh={refreshVersionLifecycle} />}
+
       {/* Pipeline Efficiency */}
       <PipelineEfficiencyPanel projectId={selectedProjectId} />
 
@@ -1034,7 +1273,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
               <ConversionRateCard rate={digest?.pipeline_conversion_rate} loading={loading} />
               <AcceptanceRateCard rate={digest?.pipeline_acceptance_rate} loading={loading} />
               <CostCard totalCost={digest?.total_estimated_cost_usd} trendHistory={digest?.trend_history} loading={loading} />
-              <SrCatchRateCard rate={digest?.self_review_prediction_accuracy?.prediction_hit_rate} trends={digest?.self_review_prediction_accuracy_trends} sampleSize={digest?.self_review_prediction_accuracy?.sample_size} loading={loading} onScrollToReviewQuality={handleScrollToReviewQuality} />
+              <SrCatchRateCard rate={digest?.self_review_prediction_accuracy?.prediction_hit_rate} trends={digest?.self_review_prediction_accuracy_trends} loading={loading} onScrollToReviewQuality={handleScrollToReviewQuality} />
             </div>
           </section>
 
@@ -1103,13 +1342,12 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           {/* Section 1d4: Fix-Loop Convergence */}
           {!loading && (
             <div>
-              <div className="flex justify-end gap-0.5 mb-1">
+              <div className="flex justify-end gap-1 mb-1">
                 {([7, 14, 30] as const).map(d => (
-                  // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                   <button
                     key={d}
                     onClick={() => setFixLoopTrendDays(d)}
-                    className={`text-[10px] px-2 py-0.5 rounded transition-colors ${fixLoopTrendDays === d ? 'bg-neutral-700 text-neutral-200' : 'text-neutral-500 hover:text-neutral-300'}`}
+                    className={`text-[10px] px-3 py-2 rounded transition-colors min-h-11 min-w-11 ${fixLoopTrendDays === d ? 'bg-neutral-700 text-neutral-200' : 'text-neutral-500 hover:text-neutral-300'}`}
                   >
                     {d}d
                   </button>
@@ -1267,6 +1505,32 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
                     )}
                   </div>
                 )}
+                {(() => {
+                  const spa = digest?.self_review_prediction_accuracy;
+                  const rate = spa?.self_flagged_shipped_unfixed_task_rate ?? null;
+                  const taskCount = spa?.self_flagged_shipped_unfixed_task_count;
+                  if (rate == null && taskCount == null) return null;
+                  const color = rate == null ? 'text-neutral-300' : rate <= 0.2 ? 'text-emerald-400' : rate <= 0.4 ? 'text-amber-400' : 'text-red-400';
+                  const tooltip = [
+                    'SR Unfixed Flags: tasks where SR already failed a category but the agent submitted without fixing it and a reviewer confirmed the same category.',
+                    taskCount != null ? `${taskCount} tasks with at least one self-flagged unresolved category` : null,
+                  ].filter(Boolean).join('\n');
+                  return (
+                    <div
+                      className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]"
+                      title={tooltip}
+                      data-testid="sr-self-flagged-unresolved-tile"
+                    >
+                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Unfixed Flags</p>
+                      <p className={`text-xl font-bold font-mono ${color}`}>
+                        {rate != null ? `${Math.round(rate * 100)}%` : '--'}
+                      </p>
+                      <p className="text-[9px] text-neutral-600 mt-0.5">
+                        {taskCount != null ? `${taskCount} tasks` : ''}
+                      </p>
+                    </div>
+                  );
+                })()}
                 {digest?.sr_regression_risk_test_signal_trends?.current?.miss_by_test_signal_rate != null && (() => {
                   const rrts = digest.sr_regression_risk_test_signal_trends!;
                   const missRate = rrts.current!.miss_by_test_signal_rate!;
@@ -1316,6 +1580,45 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
                         {Math.round(rate * 100)}%
                       </p>
                       <p className="text-[9px] text-neutral-600 mt-0.5">n={skip.sample_size}</p>
+                    </div>
+                  );
+                })()}
+                {digest?.self_review_prediction_accuracy_trends?.reviewer_hallucination_rate != null && (() => {
+                  const hall = digest.self_review_prediction_accuracy_trends.reviewer_hallucination_rate!;
+                  const curr = hall.current_rate;
+                  const prev = hall.previous_rate;
+                  const sample = hall.current_sample ?? 0;
+                  const hasSample = sample >= 5;
+                  const color = !hasSample ? 'text-neutral-500' : curr == null ? 'text-neutral-500' : curr <= 0.05 ? 'text-emerald-400' : curr <= 0.15 ? 'text-amber-400' : 'text-red-400';
+                  const tooltip = [
+                    'Reviewer hallucination rate: share of fresh-reviewer findings that reference non-existent files/lines',
+                    hasSample ? `Current: ${Math.round((curr ?? 0) * 100)}% (n=${sample})` : `Insufficient sample (n=${sample})`,
+                    prev != null ? `Previous: ${Math.round(prev * 100)}%` : null,
+                    hall.delta != null ? `Δ vs previous cycle: ${hall.delta >= 0 ? '+' : ''}${Math.round(hall.delta * 100)}pp` : null,
+                  ].filter(Boolean).join('\n');
+                  return (
+                    <div
+                      className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[140px]"
+                      title={tooltip}
+                      data-testid="reviewer-hallucination-rate-tile"
+                    >
+                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">Reviewer Hallucination</p>
+                      {hasSample && curr != null ? (
+                        <>
+                          <p className={`text-xl font-bold font-mono ${color}`}>
+                            {Math.round(curr * 100)}%
+                          </p>
+                          {prev != null && hall.delta != null && (
+                            <p className={`text-[9px] mt-0.5 ${hall.delta > 0.005 ? 'text-red-400' : hall.delta < -0.005 ? 'text-emerald-400' : 'text-neutral-600'}`}>
+                              {hall.delta >= 0 ? '+' : ''}
+                              {Math.round(hall.delta * 100)}pp
+                            </p>
+                          )}
+                          <p className="text-[9px] text-neutral-600 mt-0.5">n={sample}</p>
+                        </>
+                      ) : (
+                        <p className="text-[9px] text-neutral-500 mt-2">insufficient sample</p>
+                      )}
                     </div>
                   );
                 })()}
@@ -1396,6 +1699,8 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
                   onCategoryClick={handleCategoryClick}
                   srCatchRateTargets={srCatchRateTargets}
                   onConfigureTargets={handleConfigureTargets}
+                  onSpawnSrInvestigation={selectedProjectId ? handleSpawnSrInvestigation : undefined}
+                  activeInvestigationTaskIds={srInvestigationTaskIds}
                 />
                 <FixIterationBreakdown trends={digest?.self_review_prediction_accuracy_trends} />
                 <EdgesTrendBreakdown trend={digest?.edges_trend} />
@@ -1930,7 +2235,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
                           </div>
                         </div>
                         {ev.pr_url && isSafeUrl(ev.pr_url) && (
-                          <a href={ev.pr_url} target="_blank" rel="noopener noreferrer" className="text-neutral-500 hover:text-neutral-300 shrink-0">
+                          <a href={ev.pr_url} target="_blank" rel="noopener noreferrer" className="text-neutral-500 hover:text-neutral-300 shrink-0" data-viewport-allow-small-target title="View PR on GitHub">
                             <ExternalLink className="w-3.5 h-3.5" />
                           </a>
                         )}
@@ -2354,50 +2659,53 @@ function CostCard({ totalCost, trendHistory, loading }: {
   );
 }
 
-function SrCatchRateCard({ rate, trends, sampleSize, loading, onScrollToReviewQuality }: {
+const MIN_SR_CATCH_FINDINGS = 5;
+
+function deriveReviewerFindingCount(trends: SrTrendWithFixIterations | null | undefined): number {
+  const categories = trends?.categories;
+  if (!categories) return 0;
+  return Object.values(categories).reduce((sum, cat) => sum + (cat.current_human_count ?? 0), 0);
+}
+
+function SrCatchRateCard({ rate, trends, loading, onScrollToReviewQuality }: {
   rate?: number | null;
   trends?: SrTrendWithFixIterations | null;
-  sampleSize?: number | null;
   loading: boolean;
   onScrollToReviewQuality?: () => void;
 }) {
   if (loading) return <Skeleton className="h-20" />;
-  if (rate == null || sampleSize == null || (sampleSize ?? 0) < 5) {
+  const reviewerFindingCount = deriveReviewerFindingCount(trends);
+  if (rate == null || reviewerFindingCount < MIN_SR_CATCH_FINDINGS) {
     return (
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4 cursor-pointer hover:border-neutral-700/80 transition-colors" onClick={onScrollToReviewQuality}>
         <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">SR Catch Rate</p>
         <p className="text-2xl font-bold font-mono text-neutral-500">too small</p>
-        <p className="text-[10px] text-neutral-600 mt-1">n={sampleSize ?? 0}</p>
+        <p className="text-[10px] text-neutral-600 mt-1">n={reviewerFindingCount} findings</p>
       </div>
     );
   }
 
-  const cats = trends?.categories || {};
-  const categoryDeltas = Object.values(cats)
-    .map(c => {
-      const curr = c.current_hit_rate ?? 0;
-      const prev = c.previous_hit_rate ?? 0;
-      return curr - prev;
-    })
-    .filter(d => d !== 0 || Object.keys(cats).length > 0);
-  const avgDelta = categoryDeltas.length > 0 ? categoryDeltas.reduce((a, b) => a + b, 0) / categoryDeltas.length : 0;
+  const overallPrevRate = trends?.previous_overall_hit_rate ?? null;
+  const delta = overallPrevRate != null ? rate - overallPrevRate : null;
 
   const pct = Math.round(rate * 100);
   const color = rate >= 0.7 ? 'text-emerald-400' : rate >= 0.4 ? 'text-amber-400' : 'text-red-400';
-  const deltaPp = Math.round(avgDelta * 100);
-  const deltaColor = avgDelta > 0.01 ? 'text-emerald-500' : avgDelta < -0.01 ? 'text-red-500' : 'text-neutral-500';
-  const deltaIcon = avgDelta > 0.01 ? '↑' : avgDelta < -0.01 ? '↓' : '→';
+  const deltaPp = delta != null ? Math.round(delta * 100) : 0;
+  const deltaColor = delta != null && delta > 0.01 ? 'text-emerald-500' : delta != null && delta < -0.01 ? 'text-red-500' : 'text-neutral-500';
+  const deltaIcon = delta != null && delta > 0.01 ? '↑' : delta != null && delta < -0.01 ? '↓' : '→';
 
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4 cursor-pointer hover:border-neutral-700/80 transition-colors" onClick={onScrollToReviewQuality}>
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">SR Catch Rate</p>
       <div className="flex items-center gap-2">
         <p className={`text-2xl font-bold font-mono ${color}`}>{pct}%</p>
-        <span className={`text-sm font-semibold ${deltaColor}`}>
-          {deltaIcon} {deltaPp >= 0 ? '+' : ''}{deltaPp}pp
-        </span>
+        {delta != null && (
+          <span className={`text-sm font-semibold ${deltaColor}`}>
+            {deltaIcon} {deltaPp >= 0 ? '+' : ''}{deltaPp}pp
+          </span>
+        )}
       </div>
-      <p className="text-[10px] text-neutral-600 mt-1">n={sampleSize}</p>
+      <p className="text-[10px] text-neutral-600 mt-1">n={reviewerFindingCount} findings</p>
     </div>
   );
 }

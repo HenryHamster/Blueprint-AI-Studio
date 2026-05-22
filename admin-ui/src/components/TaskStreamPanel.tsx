@@ -64,7 +64,7 @@ export default function TaskStreamPanel({ trackedTaskIds, trackedLogs, tasks, on
 
   return (
     <div className={`fixed bottom-0 z-40 flex flex-col bg-neutral-950 border-l border-t border-neutral-800 shadow-2xl transition-all ${collapsed ? 'h-10' : 'h-[420px]'}`}
-      style={{ width: 400, right: offsetRight ?? 0 }}>
+      style={{ width: 'min(400px, 100vw)', right: offsetRight ?? 0 }}>
       {/* Header */}
       <div className="flex items-center justify-between px-3 py-2 border-b border-neutral-800 shrink-0 bg-neutral-900/80">
         <div className="flex items-center gap-2 text-xs text-neutral-300">
