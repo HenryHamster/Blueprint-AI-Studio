@@ -870,7 +870,7 @@ async def admin_playbook_set(
             playbook_total = _playbook_size_bytes(doc)
             raise HTTPException(
                 status_code=400,
-                detail=f"Playbook too large ({playbook_total} bytes, max 30KB total) and no entries are evictable",
+                detail=f"Playbook too large ({playbook_total} bytes, max {_PLAYBOOK_CAPACITY_BYTES} bytes total) and no entries are evictable",
             )
 
     doc[playbook_key] = new_entry
