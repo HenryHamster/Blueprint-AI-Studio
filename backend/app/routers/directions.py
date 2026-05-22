@@ -519,16 +519,17 @@ async def update_direction(
             status_code=400,
             detail=f"retirement_condition must be a string of at most {DIRECTION_CONTEXT_FIELD_MAX} characters",
         )
-    _VALID_RECOMMENDED_MODES = {"audit", "fundamentals", "ship", "pause"}
-    if (
-        "recommended_mode" in payload
-        and payload["recommended_mode"] is not None
-        and payload["recommended_mode"] not in _VALID_RECOMMENDED_MODES
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail=f"recommended_mode must be one of: {sorted(_VALID_RECOMMENDED_MODES)}",
-        )
+    from app.strategic_completion import (  # noqa: PLC0415
+        _VALID_RECOMMENDED_MODES,
+        _normalize_recommended_mode,
+    )
+
+    if "recommended_mode" in payload and payload["recommended_mode"] is not None:
+        if _normalize_recommended_mode(payload["recommended_mode"]) is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"recommended_mode must be one of: {sorted(_VALID_RECOMMENDED_MODES)}",
+            )
     if "system_id" in payload and payload["system_id"] is not None:
         if not isinstance(payload["system_id"], str) or len(payload["system_id"]) > 100:
             raise HTTPException(
@@ -648,7 +649,7 @@ async def update_direction(
                     d.pop("recommended_mode", None)
                     d.pop(RECOMMENDED_MODE_META_KEY, None)
                 else:
-                    mode = payload["recommended_mode"].strip().lower()
+                    mode = _normalize_recommended_mode(payload["recommended_mode"])
                     d["recommended_mode"] = mode
                     d[RECOMMENDED_MODE_META_KEY] = {
                         "mode": mode,

@@ -317,6 +317,102 @@ async def test_update_direction_rejects_invalid_cost_budget(
 
 
 @pytest.mark.asyncio
+async def test_update_direction_rejects_invalid_recommended_mode(
+    client: AsyncClient, mocker
+):
+    """PATCH rejects a recommended_mode outside the documented set."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"recommended_mode": "turbo"},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_direction_normalizes_recommended_mode(
+    client: AsyncClient, mocker
+):
+    """PATCH normalizes mixed-case/whitespace recommended_mode before storing."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"recommended_mode": "  Ship "},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["direction"]["recommended_mode"] == "ship"
+
+
+@pytest.mark.asyncio
+async def test_update_direction_recommended_mode_set_and_clear(
+    client: AsyncClient, mocker
+):
+    """PATCH sets recommended_mode and clears it (with meta) when set to null."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"recommended_mode": "audit"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["direction"]["recommended_mode"] == "audit"
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"recommended_mode": None},
+    )
+    assert resp.status_code == 200
+    body = resp.json()["direction"]
+    assert "recommended_mode" not in body
+    assert "recommended_mode_meta" not in body
+
+
+@pytest.mark.asyncio
+async def test_update_direction_rejects_invalid_system_id(client: AsyncClient, mocker):
+    """PATCH rejects non-string and over-length system_id."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"system_id": 123},
+    )
+    assert resp.status_code == 400
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"system_id": "x" * 101},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_direction_system_id_set_and_clear(client: AsyncClient, mocker):
+    """PATCH sets system_id and clears it when set to null."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"system_id": "sys-alpha"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["direction"]["system_id"] == "sys-alpha"
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"system_id": None},
+    )
+    assert resp.status_code == 200
+    assert "system_id" not in resp.json()["direction"]
+
+
+@pytest.mark.asyncio
 async def test_update_direction_priority(client: AsyncClient, mocker):
     """PATCH updates direction priority."""
     project_id = await _deploy_project(client, mocker)
