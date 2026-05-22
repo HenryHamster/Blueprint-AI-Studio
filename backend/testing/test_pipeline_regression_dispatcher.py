@@ -15499,3 +15499,206 @@ async def test_fix_loop_divergence_non_fingerprint_does_not_trip_with_stable_rat
 
     spawned = await run_once(db_session, project.id)
     assert spawned == 0
+
+
+# ---------------------------------------------------------------------------
+# Recovery coverage — every spawnable regression_class shape must be
+# re-evaluatable by the recovery path so a merged fix can auto-close.
+# ---------------------------------------------------------------------------
+
+
+def _design_doc_for_recovery_coverage() -> dict:
+    """Design-doc that lets every telemetry-snapshot recovery branch evaluate."""
+    now = _utcnow()
+    return {
+        "sr_catch_rate_trends": {
+            "signal_last_computed_at": now.isoformat(),
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.80,
+                    "previous_hit_rate": 0.80,
+                    "current_human_count": 12,
+                    "trend": "stable",
+                    "false_positive_rate": 0.50,
+                    "previous_fp_rate": 0.50,
+                    "below_floor": False,
+                    "rate_history": [0.80, 0.80],
+                    "reasoning_engagement_rate": 0.95,
+                    "reasoning_engagement_total": 20,
+                },
+            },
+            "by_direction": {
+                "dir-coverage-test": {
+                    "categories": {
+                        "correctness": {
+                            "hit_rate": 0.80,
+                            "sample_count": 5,
+                            "miss_rate": 0.20,
+                        }
+                    }
+                }
+            },
+        },
+        "sr_false_attestation_trends": {
+            "per_category": {
+                "correctness": {
+                    "false_attestation_rate": 0.02,
+                    "previous_false_attestation_rate": 0.02,
+                    "false_attested": 1,
+                    "ci_confirmed": 49,
+                }
+            }
+        },
+        "viewport_coverage_snapshot": {
+            "assertion_count_before": 10,
+            "assertion_count_after": 10,
+            "new_escape_hatch_count": 0,
+            "removed_component_files": [],
+            "merged_pr": 1,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_recovery_covers_every_spawnable_regression_class(db_session):
+    """Every shape in SPAWNABLE_REGRESSION_CLASS_SHAPES is recoverable.
+
+    Enumerates the canonical declaration and asserts ``_current_signal_value_for_class``
+    returns a non-None state dict (with the full contract) for a representative
+    instance of every shape. If someone later adds a new spawnable class without
+    a recovery branch — or lists it in the registry without an evaluator/inline
+    branch — this test fails because recovery returns None for that shape.
+    """
+    from app.playbook_learning import _MIN_SR_SAMPLE
+    from app.pipeline_regression_dispatcher import (
+        SPAWNABLE_REGRESSION_CLASS_SHAPES,
+        _PIPELINE_SUCCESS_MIN_SAMPLE,
+        _current_signal_value_for_class,
+        match_spawnable_shape,
+    )
+
+    now = _utcnow()
+    project = make_project(design_doc=_design_doc_for_recovery_coverage())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # fix_loop_divergence:lint — needs >= _MIN_SR_SAMPLE tasks in BOTH the
+    # current (0-7d) and previous (7-14d) windows.
+    for _ in range(_MIN_SR_SAMPLE):
+        db_session.add(
+            _make_fix_loop_divergence_task(
+                project.id,
+                error_tail="lint drift",
+                related_files=["backend/app/x.py"],
+                loop="lint",
+                created_at=now - timedelta(days=3),
+            )
+        )
+        db_session.add(
+            _make_fix_loop_divergence_task(
+                project.id,
+                error_tail="lint drift",
+                related_files=["backend/app/x.py"],
+                loop="lint",
+                created_at=now - timedelta(days=10),
+            )
+        )
+    # sr_blind_spot:correctness — needs reviewer-disagreement denom >= floor.
+    for _ in range(_MIN_SR_SAMPLE):
+        db_session.add(
+            _make_sr_blind_spot_task(
+                project.id,
+                category="correctness",
+                miss=True,
+                created_at=now - timedelta(days=3),
+            )
+        )
+    # pipeline_success_rate — needs >= _PIPELINE_SUCCESS_MIN_SAMPLE terminal
+    # tasks updated within the 24h window.
+    for _ in range(_PIPELINE_SUCCESS_MIN_SAMPLE + 2):
+        db_session.add(make_task(project_id=project.id, status=TaskStatus.COMPLETED))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    contract_keys = {
+        "signal_name",
+        "prior_rate",
+        "current_rate",
+        "sample_size",
+        "magnitude",
+        "tripped",
+        "extras",
+    }
+
+    assert SPAWNABLE_REGRESSION_CLASS_SHAPES, "registry must not be empty"
+    for shape in SPAWNABLE_REGRESSION_CLASS_SHAPES:
+        state = await _current_signal_value_for_class(
+            db_session,
+            project.id,
+            shape.example,
+            project.design_doc,
+        )
+        assert state is not None, (
+            f"recovery returned None for spawnable shape {shape.example!r} "
+            f"(signal={shape.signal_name}) — every spawnable class needs a "
+            f"recovery branch so its merged fix can auto-close"
+        )
+        missing = contract_keys - set(state.keys())
+        assert not missing, f"{shape.example!r} missing contract keys: {missing}"
+        assert isinstance(state["tripped"], bool)
+        assert isinstance(state["extras"], list)
+        # The canonical matcher recognizes the example as the declared shape.
+        assert match_spawnable_shape(shape.example) is not None
+
+
+@pytest.mark.asyncio
+async def test_recovery_unknown_class_returns_none(db_session):
+    """A class that is not a spawnable shape is not recoverable (returns None)."""
+    from app.pipeline_regression_dispatcher import (
+        _current_signal_value_for_class,
+        match_spawnable_shape,
+    )
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    state = await _current_signal_value_for_class(
+        db_session, project.id, "not_a_real_regression_class", project.design_doc
+    )
+    assert state is None
+    assert match_spawnable_shape("not_a_real_regression_class") is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_dynamic_shapes_return_healthy_with_no_data(db_session):
+    """Dynamic-signal recovery branches return non-None tripped=False on empty state.
+
+    This is the property that lets a merged fix auto-close: when the activity /
+    case / alert that tripped the signal is gone, recovery reads healthy rather
+    than None (which the recovery scan would skip, stranding the case).
+    """
+    from app.pipeline_regression_dispatcher import (
+        SPAWNABLE_REGRESSION_CLASS_SHAPES,
+        _current_signal_value_for_class,
+    )
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    dynamic_shapes = [
+        s for s in SPAWNABLE_REGRESSION_CLASS_SHAPES if s.evaluator is not None
+    ]
+    assert dynamic_shapes, "expected dynamic shapes with evaluators"
+    for shape in dynamic_shapes:
+        state = await _current_signal_value_for_class(
+            db_session, project.id, shape.example, project.design_doc
+        )
+        assert state is not None, shape.example
+        assert state["tripped"] is False, (
+            f"{shape.example!r} should read healthy with no underlying activity"
+        )
