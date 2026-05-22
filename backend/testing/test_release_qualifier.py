@@ -2164,6 +2164,49 @@ async def test_promote_success_opens_next_version(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_promote_success_snapshots_current_focus_as_next_goal(db_session, mocker):
+    """The next version (N+1) opened by a successful promotion snapshots the
+    project's current_focus into its ``goal``.
+
+    Regression: ``_record_promotion_success`` referenced an undefined ``project``
+    when reading current_focus, so the NameError was always swallowed and every
+    promotion opened v(N+1) with goal=None instead of the real focus.
+    """
+    project, version = await _make_project_and_version(db_session)
+    focus = "Promote v1 and stabilize the qualifier loop."
+    project.problem_model = {"intent": {"current_focus": focus}}
+    db_session.add(project)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 7, "html_url": "http://pr/7"}),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+
+    result = await rq.promote(
+        db_session, version, "1234" * 10, composite={"confidence": 0.95}
+    )
+    await db_session.commit()
+
+    assert result["status"] == "promoted"
+    next_version = await rv.current_open_version(db_session, project.id)
+    assert next_version is not None
+    assert next_version.version_number == 2
+    assert next_version.goal == focus
+
+
+@pytest.mark.asyncio
 async def test_promote_empty_diff_is_noop_success(db_session, mocker):
     """An empty diff (release branch == main) is a degenerate but valid success
     — create_pull_request returns {empty_diff: True}; the version still

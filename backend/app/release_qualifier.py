@@ -3439,6 +3439,16 @@ async def _relock_version_for_promotion_write(
         NOT re-SELECT; it just confirms the row still exists and returns the
         live, already-locked instance for the caller to mutate.
     """
+    # Snapshot the PK up front.  In the lock_released=True branch the
+    # ``session.expire(version)`` below expires EVERY attribute on the instance
+    # (including ``id``); reading ``version.id`` after that point triggers a
+    # sync lazy-load, which under the async session raises MissingGreenlet
+    # ("greenlet_spawn has not been called").  The reaper-sweep finalize path
+    # hit this on every cycle — a passing-but-merge-conflicted promotion could
+    # never record its verdict, so the version stuck at status="pending" and the
+    # sweep crash-looped.  Holding the id in a local avoids the reload entirely.
+    version_id = version.id
+
     if not lock_released:
         # The row is still locked by this transaction; the live instance is
         # authoritative.  A bare existence check (no expire — would drop
@@ -3446,7 +3456,7 @@ async def _relock_version_for_promotion_write(
         still_exists = (
             await session.execute(
                 select(release_version.ReleaseVersion.id).where(
-                    release_version.ReleaseVersion.id == version.id
+                    release_version.ReleaseVersion.id == version_id
                 )
             )
         ).first()
@@ -3454,7 +3464,7 @@ async def _relock_version_for_promotion_write(
             logger.warning(
                 "[RELEASE_QUALIFIER] promote: version row %s vanished before "
                 "the final state write — skipping",
-                version.id,
+                version_id,
             )
             return None
         return version
@@ -3465,7 +3475,7 @@ async def _relock_version_for_promotion_write(
         (
             await session.execute(
                 select(release_version.ReleaseVersion)
-                .where(release_version.ReleaseVersion.id == version.id)
+                .where(release_version.ReleaseVersion.id == version_id)
                 .with_for_update()
                 .execution_options(populate_existing=True)
             )
@@ -3477,7 +3487,7 @@ async def _relock_version_for_promotion_write(
         logger.warning(
             "[RELEASE_QUALIFIER] promote: version row %s vanished before the "
             "final state write — skipping",
-            version.id,
+            version_id,
         )
     return relocked
 
@@ -4312,11 +4322,31 @@ async def _record_promotion_success(
 
     # Open the next version (build phase) — base_sha is the freshly-promoted SHA
     # (the real main HEAD after the merge, not the now-superseded candidate).
+    # goal snapshots the project's current focus (see release_version.open_version).
+    _next_goal: str | None = None
+    try:
+        from app.problem_model import parse_problem_model
+
+        # _record_promotion_success has no `project` in scope — fetch it.  (Bug:
+        # the prior code referenced an undefined `project`, so the NameError was
+        # always swallowed here and every promotion opened v(N+1) with goal=None
+        # instead of snapshotting current_focus.)
+        _project = await session.get(Project, version.project_id)
+        if _project is not None:
+            _next_goal = (
+                parse_problem_model(_project.problem_model).intent.current_focus
+                or None
+            )
+    except Exception:
+        logger.exception(
+            "[RELEASE_QUALIFIER] could not read current_focus for next version goal"
+        )
     next_version = await release_version.open_version(
         session,
         version.project_id,
         version_number=version.version_number + 1,
         base_sha=effective_sha,
+        goal=_next_goal,
     )
     logger.info(
         "[RELEASE_QUALIFIER] v%d promoted (sha=%s%s); opened v%d",

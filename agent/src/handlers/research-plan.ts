@@ -634,6 +634,8 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
   const phaseChangedAt = typeof versionPhase.phase_changed_at === 'string' ? versionPhase.phase_changed_at : null;
   const tasksMergedThisVersion = typeof versionPhase.tasks_merged_this_version === 'number'
     ? versionPhase.tasks_merged_this_version : null;
+  const goal = typeof versionPhase.goal === 'string' && versionPhase.goal.trim()
+    ? versionPhase.goal.trim() : null;
   // The backend always sends last_qualification as an object (the structured
   // qualification record: {status, candidate_sha, confidence, blocker, ...}) or
   // null — never a string. Render a compact summary line so the agent can see
@@ -658,6 +660,9 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
   const parts: string[] = [];
   parts.push(`\n## Version Phase`);
   parts.push(`Current: **v${versionNumber} — ${phase.toUpperCase()}**`);
+  if (goal) {
+    parts.push(`Goal: ${goal}`);
+  }
 
   if (phaseChangedAt) {
     parts.push(`Phase entered: ${phaseChangedAt}`);
@@ -767,7 +772,7 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
 - **stabilize** — shift the work-mix toward audit, cleanup, and hardening. The version is approaching a release-qualifiable state; prioritize directions that reduce risk, fix known issues, and improve test coverage over net-new feature work. New feature directions should be deferred to the next version unless they directly unblock stabilization.
 
 **Your judgment on phase:**
-Assess whether the current phase still fits the project's state. You are not bound to a schedule or a fixed rule — phase transitions are YOUR call, based on what you observe.
+Assess whether the current phase still fits the project's state. When a **Goal** is shown above, treat it as what this version is *for* — weigh phase and qualification decisions against whether that goal is substantially met. You are not bound to a schedule or a fixed rule — phase transitions are YOUR call, based on what you observe.
 
 - Flip from **build → stabilize** when: enough feature work has landed that further additions would outpace the project's ability to qualify them, or when there are enough known issues, technical debt, or stability concerns that they should be addressed before continuing to build.
 - Flip from **stabilize → build** when: the version has been sufficiently hardened, qualification criteria look achievable, and continued stabilization work has diminishing returns.

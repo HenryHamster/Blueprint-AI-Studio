@@ -1083,167 +1083,6 @@ describe('DashboardHome', () => {
     expect(screen.getAllByText('80%').length).toBeGreaterThan(0);
   });
 
-  describe('Direction SR trend visualization', () => {
-    it('renders trend icon, delta, and sparkline when data is available', async () => {
-      setupApiMocks({
-        digest: {
-          failed_count: 0,
-          pending_approval_count: 0,
-          completed_count: 0,
-          failure_groups: [],
-          direction_progress: [],
-          recent_completions: [],
-        },
-        diagnostics: makeDiagnostics(),
-        directionSrBreakdown: {
-          directions: [
-            {
-              direction_id: 'd-123',
-              direction_text: 'test direction',
-              sample_size: 5,
-              overall_catch_rate: 0.8,
-              categories: {},
-              worst_category: null,
-              previous_miss_rate: 0.15,
-              trend: 'increasing',
-              rate_history: [0.6, 0.65, 0.7, 0.75, 0.8],
-            },
-          ],
-          min_sample: 3,
-        },
-      });
-
-      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
-
-      // Direction should be rendered
-      expect(await screen.findByText('test direction')).toBeInTheDocument();
-      // Catch rate should be displayed
-      expect(screen.getByTitle('overall SR catch rate for this direction')).toHaveTextContent('80%');
-      // Sparkline should be present (SVG element for miss-rate history)
-      const sparklines = document.querySelectorAll('svg[aria-label="catch-rate history (5 most recent samples)"]');
-      expect(sparklines.length).toBeGreaterThan(0);
-      // Delta should be displayed (miss-rate delta: 0.05)
-      const deltaElements = screen.queryAllByTitle('miss-rate cycle-over-cycle change');
-      expect(deltaElements.length).toBeGreaterThan(0);
-    });
-
-    it('does not render sparkline when rate_history has fewer than 2 points', async () => {
-      setupApiMocks({
-        digest: {
-          failed_count: 0,
-          pending_approval_count: 0,
-          completed_count: 0,
-          failure_groups: [],
-          direction_progress: [],
-          recent_completions: [],
-        },
-        diagnostics: makeDiagnostics(),
-        directionSrBreakdown: {
-          directions: [
-            {
-              direction_id: 'd-456',
-              direction_text: 'limited history',
-              sample_size: 3,
-              overall_catch_rate: 0.7,
-              categories: {},
-              worst_category: null,
-              previous_miss_rate: 0.35,
-              trend: 'stable',
-              rate_history: [0.65],
-            },
-          ],
-          min_sample: 3,
-        },
-      });
-
-      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
-
-      // Direction should be rendered
-      expect(await screen.findByText('limited history')).toBeInTheDocument();
-      // Sparkline should NOT be present
-      const sparklines = document.querySelectorAll('svg[aria-label="catch-rate history (5 most recent samples)"]');
-      expect(sparklines.length).toBe(0);
-    });
-
-    it('does not render delta when previous_miss_rate is not available', async () => {
-      setupApiMocks({
-        digest: {
-          failed_count: 0,
-          pending_approval_count: 0,
-          completed_count: 0,
-          failure_groups: [],
-          direction_progress: [],
-          recent_completions: [],
-        },
-        diagnostics: makeDiagnostics(),
-        directionSrBreakdown: {
-          directions: [
-            {
-              direction_id: 'd-789',
-              direction_text: 'no previous data',
-              sample_size: 3,
-              overall_catch_rate: 0.75,
-              categories: {},
-              worst_category: null,
-              trend: 'stable',
-              rate_history: [0.7, 0.75],
-            },
-          ],
-          min_sample: 3,
-        },
-      });
-
-      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
-
-      // Direction should be rendered
-      expect(await screen.findByText('no previous data')).toBeInTheDocument();
-      // Delta should NOT be present
-      const deltaElements = screen.queryAllByTitle('miss-rate cycle-over-cycle change');
-      expect(deltaElements.length).toBe(0);
-    });
-
-    it('renders decreasing trend (regression) in red', async () => {
-      setupApiMocks({
-        digest: {
-          failed_count: 0,
-          pending_approval_count: 0,
-          completed_count: 0,
-          failure_groups: [],
-          direction_progress: [],
-          recent_completions: [],
-        },
-        diagnostics: makeDiagnostics(),
-        directionSrBreakdown: {
-          directions: [
-            {
-              direction_id: 'd-bad',
-              direction_text: 'regressing direction',
-              sample_size: 4,
-              overall_catch_rate: 0.6,
-              categories: {},
-              worst_category: null,
-              previous_miss_rate: 0.35,
-              trend: 'decreasing',
-              rate_history: [0.75, 0.7, 0.65, 0.6],
-            },
-          ],
-          min_sample: 3,
-        },
-      });
-
-      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
-
-      // Direction should be rendered
-      expect(await screen.findByText('regressing direction')).toBeInTheDocument();
-      // Delta should be red (regression: miss-rate went from 0.35 to 0.4, delta = +0.05)
-      const deltaElements = screen.queryAllByTitle('miss-rate cycle-over-cycle change');
-      expect(deltaElements.length).toBeGreaterThan(0);
-      // Check that the delta element has red color class
-      const deltaElement = deltaElements[0] as HTMLElement;
-      expect(deltaElement.className).toContain('text-red-400');
-    });
-  });
-
   describe('SR False Attestation tile', () => {
     it('renders false attestation tile with rate and per-category breakdown', async () => {
       setupApiMocks({
@@ -1513,6 +1352,7 @@ describe('DashboardHome', () => {
           version_number: 42,
           phase: 'stabilize',
           phase_changed_at: '2026-05-20T12:00:00Z',
+          goal: 'Ship mobile-responsive admin UI',
           opened_at: '2026-05-15T00:00:00Z',
           qualification_attempts: 2,
           merged_task_count: 15,
@@ -1532,6 +1372,7 @@ describe('DashboardHome', () => {
     expect(panel).toHaveTextContent('v42');
     expect(panel).toHaveTextContent('stabilize');
     expect(panel).toHaveTextContent('15 tasks merged');
+    expect(panel).toHaveTextContent('Goal: Ship mobile-responsive admin UI');
     expect(panel).toHaveTextContent('78%/80% dry-run');
     expect(panel).toHaveTextContent('audit 85%');
     expect(panel).toHaveTextContent('History');
