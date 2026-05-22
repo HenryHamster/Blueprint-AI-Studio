@@ -2219,8 +2219,17 @@ async def _handle_security_audit_completion(
                 exc_info=True,
             )
 
-    task.status = TaskStatus.EVALUATING
-    task.latest_status_message = f"{len(child_tasks)} critical/high fixed, {len(informational)} medium/low surfaced as PR comment"
+    if child_tasks:
+        task.status = TaskStatus.EVALUATING
+        task.latest_status_message = f"{len(child_tasks)} critical/high fixed, {len(informational)} medium/low surfaced as PR comment"
+    else:
+        # No critical/high fix tasks spawned. Like the perf handler below, a
+        # security_audit opens no PR of its own, so a childless EVALUATING task
+        # has no lifecycle path to COMPLETED (no rollup trigger; reaper Step 4
+        # skips childless parents) and would hang forever, pinning any parent.
+        # Mark it terminal directly.
+        task.status = TaskStatus.COMPLETED
+        task.latest_status_message = f"Security audit complete: no critical/high findings; {len(informational)} medium/low surfaced as PR comment"
     session.add(task)
     await session.commit()
 
@@ -2354,11 +2363,26 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
         except Exception as e:
             logger.warning(f"[PERF] Failed to post PR comment: {e}", exc_info=True)
 
-    task.status = TaskStatus.EVALUATING
-    task.latest_status_message = (
-        f"{len(child_tasks)} high-severity fix task(s) spawned, "
-        f"{len(informational)} medium/low finding(s) surfaced as PR comment"
-    )
+    if child_tasks:
+        task.status = TaskStatus.EVALUATING
+        task.latest_status_message = (
+            f"{len(child_tasks)} high-severity fix task(s) spawned, "
+            f"{len(informational)} medium/low finding(s) surfaced as PR comment"
+        )
+    else:
+        # No high-severity fix tasks spawned. A perf task opens no PR of its
+        # own, so with zero children there is no COMPLETED child to trigger
+        # _check_and_trigger_rollup and no children for the reaper's EVALUATING
+        # sweep to act on (reaper Step 4 ``if not children_snap: continue``).
+        # An EVALUATING perf task here would hang forever — and pin its
+        # research/strategic parent in EVALUATING too. Mark it terminal
+        # directly, the same workaround the memo handler documents for its
+        # childless, PR-less case.
+        task.status = TaskStatus.COMPLETED
+        task.latest_status_message = (
+            "Perf audit complete: no high-severity findings; "
+            f"{len(informational)} medium/low finding(s) surfaced as PR comment"
+        )
     session.add(task)
 
     await broadcast_to_project(

@@ -1,0 +1,150 @@
+"""Tests for the security-audit task completion handler.
+
+A security_audit task spawns a ``create`` child fix-task per critical/high
+finding and surfaces medium/low findings as a PR comment. It opens NO PR of
+its own.
+
+Regression focus (same class as test_perf_completion): a security_audit with
+zero spawned children must NOT be left in EVALUATING — it opens no PR, so a
+childless EVALUATING task has no lifecycle path to COMPLETED and would hang
+forever, pinning any parent. The common "no critical/high" case is guarded by
+an early return; the narrow hole is critical/high findings that all lack a
+usable fix_prompt — that path now also resolves to COMPLETED.
+"""
+
+import json
+import uuid
+from unittest.mock import AsyncMock
+
+import pytest
+from sqlmodel import select
+
+from app.models import Task, TaskStatus
+from app.task_completion import _handle_security_audit_completion
+from testing.factories import make_project, make_task
+
+
+@pytest.fixture
+def _quiet_audit_io(mocker):
+    mocker.patch(
+        "app.task_completion.broadcast_to_project", new=AsyncMock(return_value=None)
+    )
+    mocker.patch(
+        "app.task_completion._maybe_release_safeguard_gate",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.task_completion.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.task_completion.get_open_pull_requests",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.task_completion.create_pr_comment", new=AsyncMock(return_value=None)
+    )
+
+
+async def _make_audit_task(db_session):
+    project = make_project(name="SecAuditProj")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="security_audit: scan repo",
+        status=TaskStatus.COMPLETED,  # agent reported done; handler decides final state
+        payloads=[{"type": "security_audit", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+async def _children_of(db_session, task):
+    return (
+        (await db_session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+
+
+@pytest.mark.asyncio
+async def test_audit_no_critical_high_stays_completed(db_session, _quiet_audit_io):
+    """Findings exist but none critical/high → early return, no children,
+    incoming terminal status preserved (not flipped to EVALUATING)."""
+    task = await _make_audit_task(db_session)
+    findings = [
+        {
+            "severity": "medium",
+            "title": "Verbose error in response",
+            "description": "Leaks stack info.",
+            "fix_prompt": "Return a generic error.",
+            "file_path": "app/x.py",
+            "line_number": 10,
+        },
+    ]
+
+    await _handle_security_audit_completion(task, json.dumps(findings), db_session)
+
+    assert await _children_of(db_session, task) == []
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_audit_actionable_without_fix_prompt_marks_completed(
+    db_session, _quiet_audit_io
+):
+    """Critical/high findings exist but all lack a usable fix_prompt/description
+    → zero children spawned → must resolve to COMPLETED, not hang EVALUATING."""
+    task = await _make_audit_task(db_session)
+    findings = [
+        {
+            "severity": "critical",
+            "title": "SQL injection",
+            "description": "",  # no description
+            "fix_prompt": "",  # no fix prompt → child is skipped
+            "file_path": "app/db.py",
+            "line_number": 42,
+        },
+    ]
+
+    await _handle_security_audit_completion(task, json.dumps(findings), db_session)
+
+    assert await _children_of(db_session, task) == []
+    await db_session.refresh(task)
+    # The regression: childless, PR-less audit MUST be terminal.
+    assert task.status == TaskStatus.COMPLETED
+    assert "no critical/high findings" in (task.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_audit_critical_finding_spawns_child_and_evaluates(
+    db_session, _quiet_audit_io
+):
+    """A fixable critical finding → spawns a child fix task and parks the
+    parent in EVALUATING to await rollup."""
+    task = await _make_audit_task(db_session)
+    findings = [
+        {
+            "severity": "high",
+            "title": "Missing auth check on admin route",
+            "description": "Endpoint lacks @require_role.",
+            "fix_prompt": "Add @require_role('admin') to the endpoint.",
+            "file_path": "app/routers/admin.py",
+            "line_number": 7,
+        },
+    ]
+
+    await _handle_security_audit_completion(task, json.dumps(findings), db_session)
+
+    children = await _children_of(db_session, task)
+    assert len(children) == 1
+    assert children[0].parent_task_id == task.id
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
