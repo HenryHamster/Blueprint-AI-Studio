@@ -290,6 +290,12 @@ const ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL || 'http://localhost:8080'
 let AGENT_TOKEN = process.env.AGENT_SECRET_TOKEN || '';
 const VM_INSTANCE_ID = process.env.VM_INSTANCE_ID || 'local';
 export const WORKSPACE = process.env.AGENT_WORKSPACE || '/tmp/workspace';
+// Root of the git object cache pre-baked into the agent VM image (see
+// infra/packer/agent.pkr.hcl). A bare mirror lives at
+// <root>/<owner>/<repo>.git; setupWorkspace passes it via
+// `git clone --reference-if-able` so cold VMs reuse pre-fetched objects
+// instead of re-downloading the full target repo every task.
+export const GIT_REFERENCE_CACHE_ROOT = process.env.GIT_REFERENCE_CACHE_ROOT || '/opt/agent-cache/git';
 
 // Populated at startup by fetchVmImageIdentity(); stays null in local dev /
 // tests where the GCP metadata service is unreachable so vm-heartbeat sends
@@ -1586,8 +1592,19 @@ export async function setupWorkspace(
   sendHeartbeatSync(taskId, `Cloning ${owner}/${repo}...`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  const cloneArgs = ['clone', '--depth', '100', '--branch', baseBranch];
+  // Reuse the pre-baked git object cache when the image seeded a mirror for
+  // this repo. `--reference-if-able` borrows objects from the local mirror and
+  // silently falls back to a normal fetch if the path is missing or invalid,
+  // so this is safe for repos the image never cached.
+  const referenceRepo = `${GIT_REFERENCE_CACHE_ROOT}/${owner}/${repo}.git`;
+  if (fs.existsSync(referenceRepo)) {
+    cloneArgs.push('--reference-if-able', referenceRepo);
+    sendLog(ws, `Using pre-baked git object cache at ${referenceRepo}\n`);
+  }
+  cloneArgs.push(cloneUrl, WORKSPACE);
   try {
-    await cloneWithRetry(['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE]);
+    await cloneWithRetry(cloneArgs);
   } catch (e) {
     const err = e instanceof Error ? e : new Error(String(e));
     (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'clone_failed';
