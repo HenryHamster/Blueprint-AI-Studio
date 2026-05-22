@@ -203,6 +203,30 @@ _DISPATCHER_ZERO_SPAWN_STREAK_K = 10  # ≈10 min of suppressed spawns
 _STALENESS_ALERT_TITLE_PREFIX = "Dispatcher cycle staleness:"
 _ZERO_SPAWN_ALERT_TITLE_PREFIX = "Dispatcher zero-spawn streak:"
 _CROSS_LAYER_BACKFILL_ALERT_TITLE_PREFIX = "Cross-layer backfill lag:"
+_EVALUATOR_FAILURE_ALERT_TITLE_PREFIX = "Evaluator failure:"
+_ALL_EVALUATOR_NAMES: tuple[str, ...] = (
+    "sr_catch_rate_signal",
+    "sr_false_positive_signal",
+    "sr_catch_rate_direction_signals",
+    "fix_loop_divergence_signal",
+    "fix_loop_divergence_fingerprint_signal",
+    "pipeline_success_signal",
+    "anomaly_signal",
+    "sr_blind_spot_signal",
+    "layer_concentration_signal",
+    "cross_case_fingerprint_signal",
+    "recurring_class_signal",
+    "strategic_cycle_stall_signal",
+    "telemetry_staleness_signal",
+    "viewport_regression_signal",
+    "viewport_coverage_drop_signal",
+    "reviewer_sla_signal",
+    "agent_vm_resource_signal",
+    "low_prevention_rate_signal",
+    "sr_below_floor_signal",
+    "sr_pass_engagement_thinning_signal",
+    "sr_false_attestation_signal",
+)
 
 _ACTIVE_INVESTIGATE_STATUSES = (
     TaskStatus.QUEUED,
@@ -7589,90 +7613,101 @@ async def run_watchdog_once(session: AsyncSession, project_id: uuid.UUID) -> int
         )
 
         for case in rows:
-            updated = case.updated_at
-            if updated.tzinfo is not None:
-                updated = updated.replace(tzinfo=None)
+            try:
+                updated = case.updated_at
+                if updated.tzinfo is not None:
+                    updated = updated.replace(tzinfo=None)
 
-            if case.status == RegressionCaseStatus.ACTIVE:
-                threshold = _WATCHDOG_ACTIVE_STALE_THRESHOLD
-                reason = "ACTIVE case stale — investigation may have finished with low confidence and no remediation was spawned"
-                escalation_reason = ESCALATION_REASON_STALE_ACTIVE
-            else:  # MERGED
-                threshold = _WATCHDOG_MERGED_STALE_THRESHOLD
-                reason = (
-                    "MERGED case stale — recovery scan did not auto-close it "
-                    "within the staleness window. The underlying signal is most "
-                    "likely still tripped while the case is in re-arm cooldown, "
-                    "or a transient evaluation error skipped the case on recent "
-                    "recovery ticks."
-                )
-                escalation_reason = ESCALATION_REASON_STALE_MERGED
-
-            if now < updated + threshold:
-                continue
-
-            # ACTIVE-stale auto-escalation: if the original investigation child is
-            # still running and we have not yet auto-escalated this case, give the
-            # autonomous loop ONE more attempt — spawn a meta-investigate task
-            # focused on the remediation BLOCKER (merge conflicts, reviewer/CI
-            # disagreement, leader-death cascade) and let the 24h window restart
-            # from the auto-escalation moment. `auto_escalation_count` is the
-            # cooldown gate (capped at 1 — the next stale tick goes straight to
-            # NMI). We scope the meta task with `signal_name=auto_escalation_meta_investigate`
-            # so the existing _last_spawn_for_class cooldown — keyed on
-            # (spawned_by, regression_class) — does not block the meta-investigate;
-            # `_in_flight_for_class` likewise dedups on regression_class, but here
-            # we deliberately want a peer task running alongside the original
-            # investigation, so we bypass _maybe_spawn entirely and emit the
-            # task/history/alert inline.
-            if (
-                case.status == RegressionCaseStatus.ACTIVE
-                and (case.auto_escalation_count or 0) == 0
-            ):
-                child_alive = await _has_active_remediation_child(session, case)
-                if child_alive:
-                    meta_task = await _spawn_auto_escalation_meta_investigate(
-                        session, project_id, case
+                if case.status == RegressionCaseStatus.ACTIVE:
+                    threshold = _WATCHDOG_ACTIVE_STALE_THRESHOLD
+                    reason = "ACTIVE case stale — investigation may have finished with low confidence and no remediation was spawned"
+                    escalation_reason = ESCALATION_REASON_STALE_ACTIVE
+                else:  # MERGED
+                    threshold = _WATCHDOG_MERGED_STALE_THRESHOLD
+                    reason = (
+                        "MERGED case stale — recovery scan did not auto-close it "
+                        "within the staleness window. The underlying signal is most "
+                        "likely still tripped while the case is in re-arm cooldown, "
+                        "or a transient evaluation error skipped the case on recent "
+                        "recovery ticks."
                     )
-                    case.auto_escalation_count = (case.auto_escalation_count or 0) + 1
-                    case.last_remediation_task_id = meta_task.id
-                    case.updated_at = now
-                    session.add(case)
-                    logger.info(
-                        "[REGRESSION_WATCHDOG] auto-escalate project=%s class=%s "
-                        "meta_task=%s (one-shot, count=1)",
-                        project_id,
-                        case.regression_class,
-                        meta_task.id,
-                    )
-                    mutated += 1
+                    escalation_reason = ESCALATION_REASON_STALE_MERGED
+
+                if now < updated + threshold:
                     continue
 
-            logger.warning(
-                "[REGRESSION_WATCHDOG] stale-%s project=%s class=%s updated_at=%s "
-                "threshold_hours=%s — escalating to NEEDS_MANUAL_INTERVENTION",
-                case.status,
-                project_id,
-                case.regression_class,
-                updated.isoformat(),
-                threshold.total_seconds() / 3600,
-            )
-            case.status = RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
-            case.needs_manual_intervention_at = now
-            case.escalation_reason = escalation_reason
-            session.add(case)
-            session.add(
-                Alert(
-                    project_id=project_id,
-                    severity=AlertSeverity.WARNING,
-                    title=f"Regression case stalled: {case.regression_class}"[:200],
-                    message=(
-                        f"{reason}. Case last updated {updated.isoformat()}; "
-                        f"staleness threshold {threshold}. Manual review required."
-                    )[:1000],
+                # ACTIVE-stale auto-escalation: if the original investigation child is
+                # still running and we have not yet auto-escalated this case, give the
+                # autonomous loop ONE more attempt — spawn a meta-investigate task
+                # focused on the remediation BLOCKER (merge conflicts, reviewer/CI
+                # disagreement, leader-death cascade) and let the 24h window restart
+                # from the auto-escalation moment. `auto_escalation_count` is the
+                # cooldown gate (capped at 1 — the next stale tick goes straight to
+                # NMI). We scope the meta task with `signal_name=auto_escalation_meta_investigate`
+                # so the existing _last_spawn_for_class cooldown — keyed on
+                # (spawned_by, regression_class) — does not block the meta-investigate;
+                # `_in_flight_for_class` likewise dedups on regression_class, but here
+                # we deliberately want a peer task running alongside the original
+                # investigation, so we bypass _maybe_spawn entirely and emit the
+                # task/history/alert inline.
+                if (
+                    case.status == RegressionCaseStatus.ACTIVE
+                    and (case.auto_escalation_count or 0) == 0
+                ):
+                    child_alive = await _has_active_remediation_child(session, case)
+                    if child_alive:
+                        meta_task = await _spawn_auto_escalation_meta_investigate(
+                            session, project_id, case
+                        )
+                        case.auto_escalation_count = (
+                            case.auto_escalation_count or 0
+                        ) + 1
+                        case.last_remediation_task_id = meta_task.id
+                        case.updated_at = now
+                        session.add(case)
+                        logger.info(
+                            "[REGRESSION_WATCHDOG] auto-escalate project=%s class=%s "
+                            "meta_task=%s (one-shot, count=1)",
+                            project_id,
+                            case.regression_class,
+                            meta_task.id,
+                        )
+                        mutated += 1
+                        continue
+
+                logger.warning(
+                    "[REGRESSION_WATCHDOG] stale-%s project=%s class=%s updated_at=%s "
+                    "threshold_hours=%s — escalating to NEEDS_MANUAL_INTERVENTION",
+                    case.status,
+                    project_id,
+                    case.regression_class,
+                    updated.isoformat(),
+                    threshold.total_seconds() / 3600,
                 )
-            )
-            mutated += 1
+                case.status = RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
+                case.needs_manual_intervention_at = now
+                case.escalation_reason = escalation_reason
+                session.add(case)
+                session.add(
+                    Alert(
+                        project_id=project_id,
+                        severity=AlertSeverity.WARNING,
+                        title=f"Regression case stalled: {case.regression_class}"[:200],
+                        message=(
+                            f"{reason}. Case last updated {updated.isoformat()}; "
+                            f"staleness threshold {threshold}. Manual review required."
+                        )[:1000],
+                    )
+                )
+                mutated += 1
+            except Exception as _case_exc:  # noqa: BLE001
+                logger.warning(
+                    "[REGRESSION_WATCHDOG] error processing case project=%s class=%s: %s",
+                    project_id,
+                    getattr(case, "regression_class", "<unknown>"),
+                    _case_exc,
+                )
+                continue
 
         if mutated:
             await session.commit()
@@ -8582,6 +8617,7 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
     _ledger_token = _cycle_layer_ledger_var.set(_ledger_cache_init)
     _spawned = 0
     _se_count = 0
+    _failed_evaluator_names: list[str] = []
     try:
         # Force a full SELECT rather than session.get(): a caller that left a
         # partial Project (e.g. via ``load_only(Project.id)``) in the session
@@ -8652,141 +8688,348 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
         # Cap 2: per-cycle system-wide concurrency budget.
         spawn_budget = min(project_remaining, _REGRESSION_DISPATCHER_SYSTEM_CAP)
 
-        _spawned += await _evaluate_sr_catch_rate_signal(
-            session,
-            project_id,
-            project.design_doc,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_sr_false_positive_signal(
-            session,
-            project_id,
-            project.design_doc,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_sr_catch_rate_direction_signals(
-            session,
-            project_id,
-            project.design_doc,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_fix_loop_divergence_signal(
-            session,
-            project_id,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_fix_loop_divergence_fingerprint_signal(
-            session,
-            project_id,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_pipeline_success_signal(
-            session,
-            project_id,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_anomaly_signal(
-            session,
-            project_id,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_sr_blind_spot_signal(
-            session,
-            project_id,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_layer_concentration_signal(
-            session,
-            project_id,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_cross_case_fingerprint_signal(
-            session,
-            project_id,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_recurring_class_signal(
-            session,
-            project_id,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_strategic_cycle_stall_signal(
-            session,
-            project_id,
-            spawn_budget - _spawned,
-            project.vision,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_telemetry_staleness_signal(
-            session,
-            project_id,
-            project.design_doc,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_viewport_regression_signal(
-            session,
-            project_id,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_viewport_coverage_drop_signal(
-            session,
-            project_id,
-            project.design_doc,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_reviewer_sla_signal(
-            session,
-            project_id,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_agent_vm_resource_signal(
-            session,
-            project_id,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_low_prevention_rate_signal(
-            session,
-            project_id,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_sr_below_floor_signal(
-            session,
-            project_id,
-            project.design_doc,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_sr_pass_engagement_thinning_signal(
-            session,
-            project_id,
-            project.design_doc,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
-        _spawned += await _evaluate_sr_false_attestation_signal(
-            session,
-            project_id,
-            project.design_doc,
-            spawn_budget - _spawned,
-        )
-        _se_count += 1
+        try:
+            _spawned += await _evaluate_sr_catch_rate_signal(
+                session,
+                project_id,
+                project.design_doc,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("sr_catch_rate_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "sr_catch_rate_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_sr_false_positive_signal(
+                session,
+                project_id,
+                project.design_doc,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("sr_false_positive_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "sr_false_positive_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_sr_catch_rate_direction_signals(
+                session,
+                project_id,
+                project.design_doc,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("sr_catch_rate_direction_signals")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "sr_catch_rate_direction_signals",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_fix_loop_divergence_signal(
+                session,
+                project_id,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("fix_loop_divergence_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "fix_loop_divergence_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_fix_loop_divergence_fingerprint_signal(
+                session,
+                project_id,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("fix_loop_divergence_fingerprint_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "fix_loop_divergence_fingerprint_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_pipeline_success_signal(
+                session,
+                project_id,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("pipeline_success_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "pipeline_success_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_anomaly_signal(
+                session,
+                project_id,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("anomaly_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "anomaly_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_sr_blind_spot_signal(
+                session,
+                project_id,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("sr_blind_spot_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "sr_blind_spot_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_layer_concentration_signal(
+                session,
+                project_id,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("layer_concentration_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "layer_concentration_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_cross_case_fingerprint_signal(
+                session,
+                project_id,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("cross_case_fingerprint_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "cross_case_fingerprint_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_recurring_class_signal(
+                session,
+                project_id,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("recurring_class_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "recurring_class_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_strategic_cycle_stall_signal(
+                session,
+                project_id,
+                spawn_budget - _spawned,
+                project.vision,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("strategic_cycle_stall_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "strategic_cycle_stall_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_telemetry_staleness_signal(
+                session,
+                project_id,
+                project.design_doc,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("telemetry_staleness_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "telemetry_staleness_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_viewport_regression_signal(
+                session,
+                project_id,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("viewport_regression_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "viewport_regression_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_viewport_coverage_drop_signal(
+                session,
+                project_id,
+                project.design_doc,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("viewport_coverage_drop_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "viewport_coverage_drop_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_reviewer_sla_signal(
+                session,
+                project_id,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("reviewer_sla_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "reviewer_sla_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_agent_vm_resource_signal(
+                session,
+                project_id,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("agent_vm_resource_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "agent_vm_resource_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_low_prevention_rate_signal(
+                session,
+                project_id,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("low_prevention_rate_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "low_prevention_rate_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_sr_below_floor_signal(
+                session,
+                project_id,
+                project.design_doc,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("sr_below_floor_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "sr_below_floor_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_sr_pass_engagement_thinning_signal(
+                session,
+                project_id,
+                project.design_doc,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("sr_pass_engagement_thinning_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "sr_pass_engagement_thinning_signal",
+                project_id,
+                _exc,
+            )
+        try:
+            _spawned += await _evaluate_sr_false_attestation_signal(
+                session,
+                project_id,
+                project.design_doc,
+                spawn_budget - _spawned,
+            )
+            _se_count += 1
+        except Exception as _exc:  # noqa: BLE001
+            _failed_evaluator_names.append("sr_false_attestation_signal")
+            logger.warning(
+                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                "sr_false_attestation_signal",
+                project_id,
+                _exc,
+            )
+
+        # Surface / resolve per-evaluator failure alerts so operators can see
+        # which signals are partially blind.  Uses the same deduped-alert
+        # pattern as _run_signal_staleness_watchdog.
+        _failed_set = set(_failed_evaluator_names)
+        for _ev_name in _ALL_EVALUATOR_NAMES:
+            _ev_title = f"{_EVALUATOR_FAILURE_ALERT_TITLE_PREFIX} {_ev_name}"
+            if _ev_name in _failed_set:
+                await _ensure_watchdog_alert_open(
+                    session,
+                    project_id,
+                    _ev_title,
+                    _ev_title,
+                    f"Evaluator {_ev_name!r} raised for project {project_id}; remaining evaluators still ran.",
+                    AlertSeverity.WARNING,
+                )
+            else:
+                await _resolve_watchdog_alert(session, project_id, _ev_title)
 
         if _spawned or stale_alerts_created:
             await session.commit()

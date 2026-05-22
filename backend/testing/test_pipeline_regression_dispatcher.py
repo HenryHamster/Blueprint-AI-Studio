@@ -9211,7 +9211,7 @@ async def test_regression_mtta_data_eta_recovery_per_case(db_session):
             ).isoformat(),
         },
     ]
-    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+    from sqlalchemy.orm.attributes import flag_modified
 
     flag_modified(case_b, "fingerprint_to_fix_log")
     await db_session.commit()
@@ -10588,7 +10588,7 @@ def _make_viewport_task(
     status_message: str,
     title: str = "Test Task",
     updated_at_offset_hours: int = 1,
-) -> "Task":
+) -> Task:
     """Create a FAILED Task whose status_message triggers VIEWPORT_REGRESSION classification."""
     now = _utcnow()
     task = make_task(
@@ -14144,7 +14144,7 @@ async def test_recurring_class_trips_when_class_spans_2_layers_across_3_cycles(
 
     # Recurring-class meta-spawns get a dedicated escalation_reason so
     # operators can distinguish them from generic cross-layer escalations.
-    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+    from app.pipeline_regression_dispatcher import (
         ESCALATION_REASON_RECURRING_CLASS_META,
     )
 
@@ -14383,7 +14383,7 @@ async def test_recurring_class_prompt_annotates_non_compliant_cycle(db_session):
     # Single-layer fix's targeted layer is named in the guidance.
     assert "CI_WORKFLOW" in prompt
     # At least one canonical layer untargeted across the full history is named.
-    from app.regression_layer_classifier import LAYER_DISPLAY_ORDER  # noqa: PLC0415
+    from app.regression_layer_classifier import LAYER_DISPLAY_ORDER
 
     # CI_WORKFLOW + AGENT_VM are targeted; the remaining canonical layers are untargeted.
     expected_untargeted = [
@@ -15702,3 +15702,192 @@ async def test_recovery_dynamic_shapes_return_healthy_with_no_data(db_session):
         assert state["tripped"] is False, (
             f"{shape.example!r} should read healthy with no underlying activity"
         )
+
+
+# ---------------------------------------------------------------------------
+# Evaluator fault isolation tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_evaluator_failure_does_not_abort_remaining_evaluators(
+    db_session, mocker
+):
+    """When one evaluator raises, the remaining evaluators still run.
+
+    Patches _evaluate_sr_catch_rate_signal to raise and
+    _evaluate_fix_loop_divergence_signal to return 1 (a synthetic spawn).
+    run_once must complete without raising and return 1 (the surviving spawn).
+    """
+    from app.pipeline_regression_dispatcher import _ALL_EVALUATOR_NAMES
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.pipeline_regression_dispatcher._evaluate_sr_catch_rate_signal",
+        side_effect=RuntimeError("simulated evaluator error"),
+    )
+
+    # Return 1 spawn so we can verify this evaluator ran despite the earlier failure.
+    async def _fake_fix_loop(session, project_id, budget):
+        return 1
+
+    mocker.patch(
+        "app.pipeline_regression_dispatcher._evaluate_fix_loop_divergence_signal",
+        side_effect=_fake_fix_loop,
+    )
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1, "surviving evaluator spawn should propagate"
+
+    # Cycle record should show signals_evaluated == 20, not 21.
+    records = await get_dispatcher_cycle_records(db_session, project_id=str(project.id))
+    assert records, "cycle record should be written"
+    latest = records[-1]
+    expected_evaluated = len(_ALL_EVALUATOR_NAMES) - 1  # one evaluator failed
+    assert latest["signals_evaluated"] == expected_evaluated, (
+        f"failed evaluator should not count; got {latest['signals_evaluated']}, expected {expected_evaluated}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_evaluator_opens_watchdog_alert(db_session, mocker):
+    """A failing evaluator opens a WARNING Alert deduped by evaluator name."""
+    from app.models import Alert
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.pipeline_regression_dispatcher._evaluate_sr_catch_rate_signal",
+        side_effect=RuntimeError("boom"),
+    )
+
+    await run_once(db_session, project.id)
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == "Evaluator failure: sr_catch_rate_signal",
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "exactly one open evaluator-failure alert expected"
+
+
+@pytest.mark.asyncio
+async def test_recovered_evaluator_resolves_alert(db_session, mocker):
+    """When a previously-failing evaluator succeeds, its alert is auto-resolved."""
+    from app.models import Alert, AlertSeverity
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    # Pre-plant an open evaluator-failure alert.
+    preexisting = Alert(
+        project_id=None,  # will be set after project is committed
+        severity=AlertSeverity.WARNING,
+        title="Evaluator failure: sr_catch_rate_signal",
+        message="planted for test",
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    preexisting.project_id = project.id
+    db_session.add(preexisting)
+    await db_session.commit()
+
+    # No mock — all evaluators run normally (no tripped signals on empty project).
+    await run_once(db_session, project.id)
+
+    # Alert should now be dismissed (resolved).
+    await db_session.refresh(preexisting)
+    assert preexisting.dismissed_at is not None, (
+        "open evaluator-failure alert should be auto-resolved when evaluator succeeds"
+    )
+
+
+@pytest.mark.asyncio
+async def test_watchdog_case_error_does_not_abort_other_cases(db_session, mocker):
+    """A per-case exception in run_watchdog_once does not prevent other cases from being escalated."""
+    from app.models import (
+        Alert,
+        RegressionCaseStatus,
+        RegressionRemediationCase,
+    )
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two stale ACTIVE cases; both are old enough to be escalated.
+    stale_time = _utcnow() - timedelta(hours=30)
+    case1 = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="class_a",
+        status=RegressionCaseStatus.ACTIVE,
+        hit_count=1,
+        fingerprint_to_fix_log=[],
+        updated_at=stale_time,
+    )
+    case2 = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="class_b",
+        status=RegressionCaseStatus.ACTIVE,
+        hit_count=1,
+        fingerprint_to_fix_log=[],
+        updated_at=stale_time,
+    )
+    db_session.add(case1)
+    db_session.add(case2)
+    await db_session.commit()
+    await db_session.refresh(case1)
+    await db_session.refresh(case2)
+
+    # Make _has_active_remediation_child raise for the first case and return
+    # False for the second so the code reaches the NMI escalation path.
+    call_n = {"n": 0}
+
+    async def _mock_has_child(session, case):
+        call_n["n"] += 1
+        if call_n["n"] == 1:
+            raise RuntimeError("simulated DB error on case1")
+        return False
+
+    mocker.patch(
+        "app.pipeline_regression_dispatcher._has_active_remediation_child",
+        side_effect=_mock_has_child,
+    )
+
+    mutated = await run_watchdog_once(db_session, project.id)
+    assert mutated >= 1, "at least case2 should have been escalated"
+
+    await db_session.refresh(case2)
+    assert case2.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION, (
+        "case2 must be escalated even though case1 raised"
+    )
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title.like("Regression case stalled: class_b%"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) >= 1, "Alert for case2 escalation should exist"
