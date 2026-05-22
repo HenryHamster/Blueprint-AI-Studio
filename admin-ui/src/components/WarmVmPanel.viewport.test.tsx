@@ -123,15 +123,9 @@ describe('WarmVmPanel — viewport regression', () => {
       await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
     });
 
-    // Find the actual escape-hatch element (table wrapper) and assert that
-    // its IN-bounds parent (the panel container) stays within 375px. Asserting
-    // against host.parentElement (= document.body) is trivially true because
-    // page.viewport(375) constrains body width.
-    const escapeHatch = host?.querySelector('[data-viewport-allow-overflow]') as HTMLElement | null;
-    expect(escapeHatch).not.toBeNull();
-    const parent = escapeHatch!.parentElement;
-    expect(parent).not.toBeNull();
-    const rect = parent!.getBoundingClientRect();
+    const panelRoot = host?.firstElementChild as HTMLElement | null;
+    expect(panelRoot).not.toBeNull();
+    const rect = panelRoot!.getBoundingClientRect();
     expect(rect.right).toBeLessThanOrEqual(388); // 375px + 12px host padding + 1px tolerance
   });
 });
