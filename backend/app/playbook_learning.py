@@ -3896,11 +3896,16 @@ async def compute_sr_catch_rate_trends(
         # Stamp a heartbeat so the staleness watchdog knows the job ran but had
         # insufficient reviewer-rejection findings (low-data / idle state), not
         # that the computation broke.  Mirrors sr_blind_spots heartbeat pattern.
+        # data_sufficient=False distinguishes this from a real refresh so the
+        # watchdog and UI can tell when the displayed trend is actually current.
         _project = await session.get(Project, project_id)
         if _project is not None:
             _doc = dict(_project.design_doc or {})
             _trends = dict(_doc.get("sr_catch_rate_trends") or {})
             _trends["signal_last_computed_at"] = now.isoformat()
+            _trends["data_sufficient"] = False
+            # last_sufficient_computed_at is preserved (not overwritten) so
+            # callers can tell when data was last actually sufficient.
             _doc["sr_catch_rate_trends"] = _trends
             _project.design_doc = _doc
             flag_modified(_project, "design_doc")
@@ -4475,6 +4480,8 @@ async def compute_sr_catch_rate_trends(
     result: dict[str, Any] = {
         "computed_at": now.isoformat(),
         "signal_last_computed_at": now.isoformat(),
+        "last_sufficient_computed_at": now.isoformat(),
+        "data_sufficient": True,
         "bucket_mode": "cycle" if use_cycle_mode else "calendar",
         "current_cycle_id": current_cycle_id,
         "previous_cycle_id": previous_cycle_id,

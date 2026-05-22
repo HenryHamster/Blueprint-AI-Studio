@@ -125,6 +125,8 @@ def stamp_sr_blind_spot_computed_at(
 def stamp_sr_catch_rate_computed_at(
     doc: dict,
     now: datetime | None = None,
+    *,
+    data_sufficient: bool | None = None,
 ) -> None:
     """Write the current UTC timestamp into *doc* under the sr_catch_rate_trends
     heartbeat key consumed by the pipeline staleness watchdog.
@@ -133,9 +135,22 @@ def stamp_sr_catch_rate_computed_at(
     compute_sr_catch_rate_trends, success or no-result alike, so the watchdog
     can distinguish idle/low-data from genuinely broken.  Pass *now* in tests
     to fix the clock.
+
+    When *data_sufficient* is provided it is written into the trends dict so
+    callers can distinguish 'job ran but had no data' (False) from 'trend
+    refreshed with real data' (True).  When True, ``last_sufficient_computed_at``
+    is also stamped so the staleness watchdog and UI can tell when the displayed
+    trend is actually current (a frozen trend continues advancing
+    ``signal_last_computed_at`` but ``last_sufficient_computed_at`` stays at the
+    last real computation).
     """
+    ts = (now or datetime.utcnow()).isoformat()
     trends = dict(doc.get("sr_catch_rate_trends") or {})
-    trends["signal_last_computed_at"] = (now or datetime.utcnow()).isoformat()
+    trends["signal_last_computed_at"] = ts
+    if data_sufficient is not None:
+        trends["data_sufficient"] = data_sufficient
+        if data_sufficient:
+            trends["last_sufficient_computed_at"] = ts
     doc["sr_catch_rate_trends"] = trends
 
 

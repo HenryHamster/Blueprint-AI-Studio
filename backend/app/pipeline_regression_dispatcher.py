@@ -333,7 +333,8 @@ async def _run_signal_staleness_watchdog(
     specs: list[tuple[str, Any, timedelta]] = [
         (
             "sr_catch_rate",
-            (doc.get("sr_catch_rate_trends") or {}).get("signal_last_computed_at"),
+            (doc.get("sr_catch_rate_trends") or {}).get("last_sufficient_computed_at")
+            or (doc.get("sr_catch_rate_trends") or {}).get("signal_last_computed_at"),
             _SIGNAL_STALENESS_WINDOWS["sr_catch_rate"],
         ),
         (
@@ -1904,13 +1905,15 @@ async def _current_signal_value_for_class(
         sample_size = int(raw_sample) if raw_sample is not None else _MIN_SR_SAMPLE
         if raw_sample is not None and sample_size < _MIN_SR_SAMPLE:
             return None
+        trend_sig = data.get("trend_significant")
         return {
             "signal_name": "sr_catch_rate",
             "prior_rate": prior,
             "current_rate": curr,
             "sample_size": sample_size,
             "magnitude": round(prior - curr, 3),
-            "tripped": (prior - curr) >= _TREND_DELTA_THRESHOLD,
+            "tripped": (prior - curr) >= _TREND_DELTA_THRESHOLD
+            and trend_sig is not False,
             "extras": [f"Self-review catch-rate for category '{cat}' is regressing."],
         }
 
@@ -6701,7 +6704,10 @@ def _get_staleness_raw_ts(
 ) -> tuple[Any, timedelta]:
     """Return (raw_timestamp_str, freshness_threshold) for a staleness-monitored signal."""
     if signal_name == "sr_catch_rate":
-        raw = (doc.get("sr_catch_rate_trends") or {}).get("signal_last_computed_at")
+        _sr_trends = doc.get("sr_catch_rate_trends") or {}
+        raw = _sr_trends.get("last_sufficient_computed_at") or _sr_trends.get(
+            "signal_last_computed_at"
+        )
     elif signal_name == "fix_loop_divergence":
         raw = doc.get("fix_loop_divergence_signal_last_computed_at") or doc.get(
             "fix_loop_divergence_detected_at"

@@ -959,3 +959,55 @@ def test_stamp_sr_catch_rate_computed_at_initialises_missing_trends():
     assert "sr_catch_rate_trends" in doc
     assert doc["sr_catch_rate_trends"]["signal_last_computed_at"] == fixed.isoformat()
     assert doc["other_key"] == "value"
+
+
+def test_stamp_sr_catch_rate_computed_at_data_sufficient_true():
+    """data_sufficient=True stamps both data_sufficient and last_sufficient_computed_at."""
+    fixed = datetime(2026, 4, 1, 10, 0, 0)
+    doc: dict = {}
+    stamp_sr_catch_rate_computed_at(doc, now=fixed, data_sufficient=True)
+    trends = doc["sr_catch_rate_trends"]
+    assert trends["signal_last_computed_at"] == fixed.isoformat()
+    assert trends["data_sufficient"] is True
+    assert trends["last_sufficient_computed_at"] == fixed.isoformat()
+
+
+def test_stamp_sr_catch_rate_computed_at_data_sufficient_false():
+    """data_sufficient=False stamps data_sufficient but does NOT stamp last_sufficient_computed_at."""
+    fixed = datetime(2026, 4, 1, 10, 0, 0)
+    doc: dict = {}
+    stamp_sr_catch_rate_computed_at(doc, now=fixed, data_sufficient=False)
+    trends = doc["sr_catch_rate_trends"]
+    assert trends["signal_last_computed_at"] == fixed.isoformat()
+    assert trends["data_sufficient"] is False
+    assert "last_sufficient_computed_at" not in trends
+
+
+def test_stamp_sr_catch_rate_computed_at_data_sufficient_false_preserves_existing():
+    """data_sufficient=False preserves an existing last_sufficient_computed_at (frozen trend detection)."""
+    fixed_old = datetime(2026, 3, 1, 0, 0, 0)
+    fixed_new = datetime(2026, 4, 1, 10, 0, 0)
+    doc: dict = {
+        "sr_catch_rate_trends": {
+            "signal_last_computed_at": fixed_old.isoformat(),
+            "last_sufficient_computed_at": fixed_old.isoformat(),
+            "data_sufficient": True,
+        }
+    }
+    stamp_sr_catch_rate_computed_at(doc, now=fixed_new, data_sufficient=False)
+    trends = doc["sr_catch_rate_trends"]
+    assert trends["signal_last_computed_at"] == fixed_new.isoformat()
+    assert trends["data_sufficient"] is False
+    # last_sufficient_computed_at must stay at the old value — not overwritten
+    assert trends["last_sufficient_computed_at"] == fixed_old.isoformat()
+
+
+def test_stamp_sr_catch_rate_computed_at_no_data_sufficient_omits_fields():
+    """Default call (no data_sufficient) does not write data_sufficient or last_sufficient_computed_at."""
+    fixed = datetime(2026, 4, 1, 10, 0, 0)
+    doc: dict = {}
+    stamp_sr_catch_rate_computed_at(doc, now=fixed)
+    trends = doc["sr_catch_rate_trends"]
+    assert trends["signal_last_computed_at"] == fixed.isoformat()
+    assert "data_sufficient" not in trends
+    assert "last_sufficient_computed_at" not in trends

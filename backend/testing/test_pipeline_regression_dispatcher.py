@@ -44,21 +44,25 @@ def _design_doc_with_sr_regression(
     category: str = "correctness",
     prior: float = 0.80,
     current: float = 0.50,
+    trend_significant: bool | None = True,
 ) -> dict:
     """Synthesize a sr_catch_rate_trends snapshot the dispatcher will trip on.
 
     The dispatcher reads ``project.design_doc["sr_catch_rate_trends"]["categories"]``
-    and trips when current_hit_rate dropped vs previous_hit_rate by ≥ 5pp.
+    and trips when current_hit_rate dropped vs previous_hit_rate by ≥ 5pp AND
+    trend_significant is not False (i.e. True or None for backward compat).
     """
+    cat_data: dict = {
+        "current_hit_rate": current,
+        "previous_hit_rate": prior,
+        "current_human_count": 12,
+        "trend": "decreasing",
+        "trend_significant": trend_significant,
+    }
     return {
         "sr_catch_rate_trends": {
             "categories": {
-                category: {
-                    "current_hit_rate": current,
-                    "previous_hit_rate": prior,
-                    "current_human_count": 12,
-                    "trend": "decreasing",
-                },
+                category: cat_data,
             },
         },
     }
@@ -130,6 +134,27 @@ async def test_payload_shape_and_context(db_session):
     assert ctx["current_rate"] == 0.50
     assert ctx["sample_size"] >= 5
     assert "dispatcher_cooldown_until_iso" in ctx
+
+
+@pytest.mark.asyncio
+async def test_sr_catch_rate_insignificant_trend_not_spawned(db_session):
+    """A category with trend_significant=False must not spawn even when raw delta ≥ 5pp."""
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness",
+            prior=0.80,
+            current=0.60,
+            trend_significant=False,
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0, (
+        "Dispatcher must not spawn for a statistically-insignificant catch-rate delta"
+    )
 
 
 @pytest.mark.asyncio
@@ -8026,6 +8051,52 @@ async def test_telemetry_stale_computed_at_alone_does_not_trigger(db_session):
         if (t.context or {}).get("regression_class") == "telemetry_stale:sr_catch_rate"
     ]
     assert len(stale_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_telemetry_stale_fires_on_stale_last_sufficient_even_with_fresh_heartbeat(
+    db_session,
+):
+    """data_sufficient=False with fresh signal_last_computed_at but stale last_sufficient_computed_at triggers staleness.
+
+    When compute_sr_catch_rate_trends runs but can't produce a real result
+    (insufficient findings), it stamps signal_last_computed_at as a heartbeat
+    while preserving the older last_sufficient_computed_at.  The dispatcher must
+    key staleness on last_sufficient_computed_at so a frozen trend is detected
+    even though the heartbeat looks fresh.
+    """
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    stale_sufficient = (now - timedelta(hours=60)).isoformat()
+    fresh_heartbeat = (now - timedelta(hours=1)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {
+                "signal_last_computed_at": fresh_heartbeat,
+                "last_sufficient_computed_at": stale_sufficient,
+                "data_sufficient": False,
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned >= 1
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    stale_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class") == "telemetry_stale:sr_catch_rate"
+    ]
+    assert len(stale_tasks) == 1
 
 
 # ---------------------------------------------------------------------------

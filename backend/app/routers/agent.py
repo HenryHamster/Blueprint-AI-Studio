@@ -1549,10 +1549,40 @@ async def claim_task(
             try:
                 from app.playbook_learning import compute_sr_catch_rate_trends
 
+                # Dedicated larger fetch for SR catch-rate: the metric needs
+                # two comparison buckets (current vs. previous cycle or 14-day
+                # window), each with ≥_MIN_SR_FINDINGS reviewer-rejection findings.
+                # The 50-row high_iter_rows cap is insufficient — under normal
+                # throughput all 50 rows fall in the "current" bucket, leaving
+                # "previous" empty. Load only the columns _stats_for_tasks reads
+                # (context, created_at, strategic_cycle_id) to keep memory bounded.
+                _sr_stmt = (
+                    select(Task)
+                    .options(
+                        load_only(
+                            Task.id,
+                            Task.context,
+                            Task.created_at,
+                            Task.project_id,
+                            Task.strategic_cycle_id,
+                        )
+                    )
+                    .where(
+                        Task.project_id == task.project_id,
+                        Task.status.in_([TaskStatus.FAILED, TaskStatus.COMPLETED]),
+                    )
+                    .order_by(Task.created_at.desc())
+                    .limit(200)
+                )
+                _sr_rows = (await session.execute(_sr_stmt)).scalars().all()
+                logger.debug(
+                    "[SR_CATCH_RATE] fetched %d tasks for catch-rate window",
+                    len(_sr_rows),
+                )
                 await compute_sr_catch_rate_trends(
                     project_id=task.project_id,
                     session=session,
-                    all_tasks=list(high_iter_rows),
+                    all_tasks=list(_sr_rows),
                 )
             except Exception:
                 logger.exception(

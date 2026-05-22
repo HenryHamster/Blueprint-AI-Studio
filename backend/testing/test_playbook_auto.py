@@ -4214,6 +4214,150 @@ async def test_compute_sr_catch_rate_trends_stamps_heartbeat_on_success(
 
 
 @pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_data_sufficient_false_on_low_sample(
+    db_session: AsyncSession,
+):
+    """data_sufficient=False is stored when returning None (insufficient findings).
+    last_sufficient_computed_at must NOT be set/overwritten so callers can tell
+    when data was last actually sufficient."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for i in range(4):  # 4 findings — below _MIN_SR_FINDINGS=5
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(4):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is None
+    stored = (project.design_doc or {}).get("sr_catch_rate_trends", {})
+    assert stored.get("data_sufficient") is False, (
+        "data_sufficient must be False when findings are insufficient"
+    )
+    assert "last_sufficient_computed_at" not in stored, (
+        "last_sufficient_computed_at must not be set when no successful computation occurred"
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_data_sufficient_true_on_success(
+    db_session: AsyncSession,
+):
+    """data_sufficient=True and last_sufficient_computed_at are stored on a real computation."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(5):  # 5 findings per window — meets _MIN_SR_FINDINGS=5
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    assert result.get("data_sufficient") is True, (
+        "data_sufficient must be True on a successful computation"
+    )
+    assert "last_sufficient_computed_at" in result, (
+        "last_sufficient_computed_at must be set on a successful computation"
+    )
+    stored = (project.design_doc or {}).get("sr_catch_rate_trends", {})
+    assert stored.get("data_sufficient") is True
+    assert "last_sufficient_computed_at" in stored
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_data_sufficient_preserves_last_sufficient_on_low(
+    db_session: AsyncSession,
+):
+    """After a successful run, a subsequent low-data run preserves last_sufficient_computed_at."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+
+    # First run with sufficient data
+    tasks_ok = []
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks_ok.append(t)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks_ok.append(t)
+    await db_session.flush()
+
+    result1 = await compute_sr_catch_rate_trends(project.id, db_session, tasks_ok)
+    assert result1 is not None
+    stored1 = (project.design_doc or {}).get("sr_catch_rate_trends", {})
+    last_sufficient = stored1["last_sufficient_computed_at"]
+
+    # Second run with insufficient data — should preserve last_sufficient_computed_at
+    tasks_low = []
+    for _ in range(4):  # below threshold
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"test-coverage": 1},
+            sr_failed_cats=["test-coverage"],
+        )
+        db_session.add(t)
+        tasks_low.append(t)
+    await db_session.flush()
+
+    result2 = await compute_sr_catch_rate_trends(project.id, db_session, tasks_low)
+    assert result2 is None
+    stored2 = (project.design_doc or {}).get("sr_catch_rate_trends", {})
+    assert stored2.get("data_sufficient") is False
+    assert stored2.get("last_sufficient_computed_at") == last_sufficient, (
+        "last_sufficient_computed_at must be preserved (not cleared) after a low-data run"
+    )
+
+
+@pytest.mark.asyncio
 async def test_compute_sr_catch_rate_trends_exposes_finding_counts(
     db_session: AsyncSession,
 ):
