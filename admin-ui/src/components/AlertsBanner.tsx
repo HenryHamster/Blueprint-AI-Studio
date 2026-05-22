@@ -324,10 +324,9 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, regr
         );
       })}
       {hiddenCount > 0 && (
-        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
         <button
           onClick={() => setExpanded(true)}
-          className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors text-center py-1"
+          className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors flex items-center justify-center min-h-[44px] sm:min-h-0"
         >
           +{hiddenCount} more alert{hiddenCount > 1 ? 's' : ''}
         </button>
