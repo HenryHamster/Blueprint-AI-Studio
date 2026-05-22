@@ -1,58 +1,15 @@
 import { describe, it, expect } from 'vitest';
-import fs from 'fs';
-import path from 'path';
+import {
+  checkRequiredComponentAssertions,
+  checkAllComponentsHaveTests,
+  check375pxOverflow,
+  checkBackendPatterns,
+  checkEscapeHatchBudget,
+} from './viewport-checks.js';
 
 describe('viewport test coverage invariant', () => {
   it('fails CI when a required component is missing all three viewport assertions at required widths', () => {
-    const requiredPath = path.join(__dirname, 'viewport-required.json');
-    const { requiredWidths, components } = JSON.parse(fs.readFileSync(requiredPath, 'utf-8')) as {
-      requiredWidths: number[];
-      components: string[];
-    };
-
-    const componentsDir = path.join(__dirname, '../components');
-    const missing: string[] = [];
-
-    // Assertion types that must be present at each required width.
-    // A single expectFullViewportAt call counts as all three.
-    const assertionTypes = ['overflow', 'text_truncation', 'touch_target'];
-
-    for (const component of components) {
-      const testFile = path.join(componentsDir, `${component}.viewport.test.tsx`);
-      if (!fs.existsSync(testFile)) {
-        for (const width of requiredWidths) {
-          for (const type of assertionTypes) {
-            missing.push(`${component} — no viewport test file (needs ${type} at ${width}px)`);
-          }
-        }
-        continue;
-      }
-      const content = fs.readFileSync(testFile, 'utf-8');
-      for (const width of requiredWidths) {
-        // Check if expectFullViewportAt(width) is present — it counts as all three
-        const hasFullViewport = new RegExp(`expectFullViewportAt\\s*\\(\\s*${width}[^\\d]`).test(content);
-
-        if (hasFullViewport) {
-          // Single expectFullViewportAt call satisfies all three assertion types
-          continue;
-        }
-
-        // Otherwise, check for each assertion type individually
-        const overflowRegex = new RegExp(`expectNoOverflowAt\\s*\\(\\s*${width}[^\\d]`);
-        const truncationRegex = new RegExp(`expectNoTextTruncationAt\\s*\\(\\s*${width}[^\\d]`);
-        const touchRegex = new RegExp(`expectMinTouchTargetAt\\s*\\(\\s*${width}[^\\d]`);
-
-        if (!overflowRegex.test(content)) {
-          missing.push(`${component} — missing overflow assertion at ${width}px in ${component}.viewport.test.tsx`);
-        }
-        if (!truncationRegex.test(content)) {
-          missing.push(`${component} — missing text_truncation assertion at ${width}px in ${component}.viewport.test.tsx`);
-        }
-        if (!touchRegex.test(content)) {
-          missing.push(`${component} — missing touch_target assertion at ${width}px in ${component}.viewport.test.tsx`);
-        }
-      }
-    }
+    const missing = checkRequiredComponentAssertions();
 
     const errorMessage =
       missing.length > 0
@@ -74,47 +31,7 @@ Required widths come from admin-ui/src/test/viewport-required.json.
   });
 
   it('fails CI when a new operator component lacks a *.viewport.test.tsx file', () => {
-    const componentsDir = path.join(__dirname, '../components');
-    const files = fs.readdirSync(componentsDir);
-
-    // All .tsx component files (exclude test files)
-    const components = files
-      .filter(f => f.endsWith('.tsx') && !f.endsWith('.test.tsx') && !f.endsWith('.viewport.test.tsx'))
-      .map(f => f.replace('.tsx', ''))
-      .sort();
-
-    // All .viewport.test.tsx files
-    const viewportTests = files
-      .filter(f => f.endsWith('.viewport.test.tsx'))
-      .map(f => f.replace('.viewport.test.tsx', ''))
-      .sort();
-
-    // Allowlist: components that are exempt from the viewport-test invariant.
-    // Each entry is a utility/internal component that is never rendered standalone
-    // on an operator page — overflow is handled by the parent that composes it.
-    const exemptFromViewportTest = new Set([
-      // Internal decorator component for error isolation; not operator-facing.
-      'ErrorBoundary',
-      // Pure presentation: renders markdown blocks, used in help/documentation
-      // panels where overflow is already handled by parent scroll container.
-      'MarkdownContent',
-      // Utility component: renders chip columns in KanbanBoard's table; layout
-      // controlled entirely by parent, not rendering standalone in operator pages.
-      'ColumnsPicker',
-      // Toast notifications: positioned fixed/absolutely, exempt from viewport
-      // flow overflow checks; positioned via Tailwind fixed positioning.
-      'Toasts',
-      // Internal mapper: generates DOM from regression data array; not used
-      // standalone on operator pages, used within parent containers that handle layout.
-      'catchupRows',
-      // Internal mapper: generates chip DOM from phase data; not standalone,
-      // layout controlled by parent container.
-      'regressionPhaseChips',
-    ]);
-
-    const missingTests = components
-      .filter(c => !viewportTests.includes(c) && !exemptFromViewportTest.has(c))
-      .sort();
+    const missingTests = checkAllComponentsHaveTests();
 
     const errorMessage =
       missingTests.length > 0
@@ -125,7 +42,7 @@ Add a viewport test file for each (or add to the exemption list with justificati
 ${missingTests.map(c => `  admin-ui/src/components/${c}.viewport.test.tsx`).join('\n')}
 
 If a component should be exempt from viewport testing, add it to the
-exemptFromViewportTest Set in this file with a code comment justifying why.
+exemptFromViewportTest Set in admin-ui/src/test/viewport-checks.js with a code comment justifying why.
         `.trim()
         : '';
 
@@ -133,45 +50,7 @@ exemptFromViewportTest Set in this file with a code comment justifying why.
   });
 
   it('fails CI when an operator component lacks a 375px overflow assertion', () => {
-    const componentsDir = path.join(__dirname, '../components');
-    const files = fs.readdirSync(componentsDir);
-
-    // All .tsx component files (exclude test files)
-    const components = files
-      .filter(f => f.endsWith('.tsx') && !f.endsWith('.test.tsx') && !f.endsWith('.viewport.test.tsx'))
-      .map(f => f.replace('.tsx', ''))
-      .sort();
-
-    // Exempt components (same list as above)
-    const exemptFromViewportTest = new Set([
-      'ErrorBoundary',
-      'MarkdownContent',
-      'ColumnsPicker',
-      'Toasts',
-      'catchupRows',
-      'regressionPhaseChips',
-    ]);
-
-    const missing: string[] = [];
-
-    for (const component of components) {
-      if (exemptFromViewportTest.has(component)) {
-        continue;
-      }
-
-      const testFile = path.join(componentsDir, `${component}.viewport.test.tsx`);
-      if (!fs.existsSync(testFile)) {
-        continue; // Already caught by the previous test
-      }
-
-      const content = fs.readFileSync(testFile, 'utf-8');
-      // Check if the test file asserts overflow at 375px
-      const hasOverflowAssertion = new RegExp(`expectNoOverflowAt\\s*\\(\\s*375[^\\d]|expectFullViewportAt\\s*\\(\\s*375[^\\d]`).test(content);
-
-      if (!hasOverflowAssertion) {
-        missing.push(`${component} — missing 375px overflow assertion in ${component}.viewport.test.tsx`);
-      }
-    }
+    const missing = check375pxOverflow();
 
     const errorMessage =
       missing.length > 0
@@ -198,20 +77,7 @@ ${missing.map(m => `  ${m}`).join('\n')}
     // Cross-language contract: kept in sync with _VIEWPORT_PATTERNS in
     // backend/app/failure_classification.py.  Verified by
     // TestCrossLanguageClassificationContracts in backend/testing/test_failure_classification.py.
-    const backendSrc = fs.readFileSync(
-      path.join(__dirname, '../../../backend/app/failure_classification.py'),
-      'utf-8',
-    ).toLowerCase();
-
-    // Each pattern is the lowercase function-call prefix emitted by that helper
-    // in its thrown Error message (e.g. `expectNoOverflowAt(375) ...`).
-    const patterns: string[] = [
-      'expectnooverflowat(',
-      'expectnotexttruncationat(',
-      'expectmintouchtargetat(',
-    ];
-
-    const missing = patterns.filter(p => !backendSrc.includes(p));
+    const missing = checkBackendPatterns();
 
     const errorMessage =
       missing.length > 0
@@ -229,43 +95,7 @@ ${missing.map(p => `  "${p}"`).join('\n')}
   });
 
   it('fails CI when escape-hatch debt exceeds the per-component or total budget', () => {
-    const budgetPath = path.join(__dirname, 'viewport-escape-hatch-budget.json');
-    const { total: totalBudget, perComponent } = JSON.parse(fs.readFileSync(budgetPath, 'utf-8')) as {
-      total: number;
-      perComponent: Record<string, number>;
-    };
-
-    const componentsDir = path.join(__dirname, '../components');
-    const files = fs.readdirSync(componentsDir).filter(
-      f => f.endsWith('.tsx') && !f.endsWith('.test.tsx') && !f.endsWith('.viewport.test.tsx')
-    );
-
-    // Matches all three escape-hatch data attributes and eslint-disable viewport/* comments.
-    const escapeHatchPattern =
-      /data-viewport-allow-overflow|data-viewport-allow-truncation|data-viewport-allow-small-target|eslint-disable[^\n]*viewport/g;
-
-    const violations: string[] = [];
-    let grandTotal = 0;
-
-    for (const file of files) {
-      const component = file.replace('.tsx', '');
-      const content = fs.readFileSync(path.join(componentsDir, file), 'utf-8');
-      const count = (content.match(escapeHatchPattern) ?? []).length;
-      grandTotal += count;
-
-      const budget = perComponent[component];
-      if (budget !== undefined && count > budget) {
-        violations.push(
-          `  ${component}: ${count} escape hatches (budget: ${budget}, over by ${count - budget})`
-        );
-      }
-    }
-
-    if (grandTotal > totalBudget) {
-      violations.push(
-        `  [total]: ${grandTotal} escape hatches (budget: ${totalBudget}, over by ${grandTotal - totalBudget})`
-      );
-    }
+    const violations = checkEscapeHatchBudget();
 
     const errorMessage =
       violations.length > 0

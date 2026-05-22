@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi, expect } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { MessagesPanel } from './MessagesPanel';
-import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt, stressStrings } from '../test/viewport';
 
 // React patches the input `value` setter on its prototype to track controlled-input
 // state. Assigning `input.value = 'x'` then dispatching an event won't trigger React's
@@ -489,5 +489,74 @@ describe('MessagesPanel — viewport regression', () => {
     }
 
     localStorage.removeItem(`messages_panel_last_seen:anonymous:project-123`);
+  });
+
+  test('stress fixture — realistic message data does not overflow at 375px', async () => {
+    const now = new Date();
+    const yesterday = new Date(now.getTime() - 86400000);
+
+    const msgs = [
+      // Long-content BLOCKER from agent with task ID and context badges
+      makeMsg({
+        id: 'stress-blocker-1',
+        message_type: 'BLOCKER',
+        from_type: 'agent',
+        from_task_id: 'task-abc12345-xyz',
+        content: stressStrings.title,
+        context: { severity: 'high', task_type: 'create', event_type: 'failure_alert' },
+        status: 'open',
+        created_at: yesterday.toISOString(),
+      }),
+      // BUG_REPORT with long error snippet and annotation badge
+      makeMsg({
+        id: 'stress-bug-1',
+        message_type: 'BUG_REPORT',
+        from_type: 'system',
+        content: stressStrings.errorSnippet,
+        context: { severity: 'medium', annotation_type: 'issue', task_type: 'fix' },
+        status: 'open',
+        created_at: now.toISOString(),
+      }),
+      // FEEDBACK from user with reply context (tests reply-preview row)
+      makeMsg({
+        id: 'stress-feedback-1',
+        message_type: 'FEEDBACK',
+        from_type: 'user',
+        content: stressStrings.directionText,
+        context: { reply_preview: stressStrings.shortTitle },
+        status: 'open',
+        created_at: now.toISOString(),
+      }),
+      // NOTE from strategic with cycle_summary badge
+      makeMsg({
+        id: 'stress-note-1',
+        message_type: 'NOTE',
+        from_type: 'strategic',
+        content: 'Cycle summary: 6/10 tasks merged, 4 failed, 3 pending approval. Mobile responsiveness work is progressing.',
+        context: { event_type: 'cycle_summary', severity: 'low' },
+        status: 'open',
+        created_at: yesterday.toISOString(),
+      }),
+      // QUESTION from agent with medium severity
+      makeMsg({
+        id: 'stress-question-1',
+        message_type: 'QUESTION',
+        from_type: 'agent',
+        from_task_id: 'task-def67890-uvw',
+        content: stressStrings.shortTitle,
+        context: { severity: 'medium' },
+        status: 'open',
+        created_at: now.toISOString(),
+      }),
+    ];
+
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderPanel(r, msgs);
+    }, { waitMs: 50 });
   });
 });

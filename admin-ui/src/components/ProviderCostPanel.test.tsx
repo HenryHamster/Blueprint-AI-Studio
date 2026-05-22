@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, act } from '@testing-library/react';
+import { render, screen, act, within } from '@testing-library/react';
 import { ProviderCostPanel } from './ProviderCostPanel';
 
 const { apiFetchMock } = vi.hoisted(() => ({
@@ -8,6 +8,16 @@ const { apiFetchMock } = vi.hoisted(() => ({
 
 vi.mock('../api', () => ({
   apiFetch: (path: string, init?: RequestInit) => apiFetchMock(path, init),
+}));
+
+// ProviderCostPanel also calls useEfficiencySnapshot, which issues its own
+// apiFetch on a separate poll interval. Stub it so apiFetch call-count
+// assertions reflect only the provider-cost-summary endpoint.
+vi.mock('../hooks/useEfficiencySnapshot', () => ({
+  useEfficiencySnapshot: () => null,
+  fmtEffSecs: () => '—',
+  fmtEffRate: () => '—',
+  fmtEffIter: () => '—',
 }));
 
 function jsonResponse(data: unknown): Response {
@@ -57,11 +67,15 @@ describe('ProviderCostPanel', () => {
     render(<ProviderCostPanel selectedProjectId="proj-abc" windowHours={24} />);
 
     expect(await screen.findByText('Provider Cost & Success')).toBeInTheDocument();
-    expect(screen.getByText('Primary')).toBeInTheDocument();
-    expect(screen.getByText('openai')).toBeInTheDocument();
-    expect(screen.getByText('83%')).toBeInTheDocument();
-    expect(screen.getByText('$21.50')).toBeInTheDocument();
-    expect(screen.getByText('$5.38')).toBeInTheDocument();
+    // The panel renders both a mobile card layout (sm:hidden) and a desktop
+    // table layout (hidden sm:table); jsdom applies no CSS so both are present.
+    // Scope queries to the desktop table to avoid duplicate-text matches.
+    const table = within(screen.getByRole('table'));
+    expect(table.getByText('Primary')).toBeInTheDocument();
+    expect(table.getByText('openai')).toBeInTheDocument();
+    expect(table.getByText('83%')).toBeInTheDocument();
+    expect(table.getByText('$21.50')).toBeInTheDocument();
+    expect(table.getByText('$5.38')).toBeInTheDocument();
     expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/provider-cost-summary?hours=24&project_id=proj-abc', undefined);
   });
 

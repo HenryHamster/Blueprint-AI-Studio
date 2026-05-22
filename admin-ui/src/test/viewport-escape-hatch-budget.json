@@ -1,10 +1,10 @@
 {
   "_doc": "Loose upper bounds on viewport escape-hatch debt. Read by viewport-coverage.test.ts. Per the project guardrail philosophy: never ratchet down — only bump when work justifies it. Seeded above current counts so a single justified opt-out passes without a bump; a cluster of new opt-outs requires a visible, reviewable budget increase in the same PR. Bump 'total' alongside any per-component increase.",
-  "total": 225,
+  "total": 219,
   "perComponent": {
     "DirectionCard": 28,
     "DirectionsPanel": 19,
-    "SettingsDropdown": 15,
+    "SettingsDropdown": 10,
     "RemediationFunnelSection": 13,
     "CatchUpPanel": 12,
     "ResearchBrowser": 11,
@@ -49,7 +49,7 @@
     "TimelineView": 4,
     "TaskLaunchFAB": 4,
     "TaskFixLoopPanel": 4,
-    "ProviderCostPanel": 4,
+    "ProviderCostPanel": 3,
     "PlaybookPanel": 4,
     "PRMonitorSection": 4,
     "NewTaskModal": 4,

@@ -3,6 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { DashboardHome } from './DashboardHome';
 import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } from '../test/viewport';
+import { apiFetch } from '../api';
 import type { Task } from '../types/task';
 
 const now = Date.now();
@@ -320,5 +321,70 @@ describe('DashboardHome — viewport regression', () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 50));
       });
     }, { selector: 'button, a[href]' });
+  });
+
+  test('direction portfolio cards with realistic data do not overflow at 375px', async () => {
+    vi.mocked(apiFetch).mockImplementationOnce(async (url: string) => {
+      if (url.includes('/digest')) {
+        return new Response(JSON.stringify({
+          failed_count: 3,
+          pending_approval_count: 2,
+          direction_progress: [
+            {
+              direction_id: 'd-001',
+              direction_text: 'Improve admin UI mobile responsiveness across all operator-facing panels including kanban board, task detail drawer, and metrics dashboard',
+              priority: 'high',
+              cycles_in_window: 6,
+              tasks_created: 14,
+              prs_merged: 8,
+              possibly_saturated: false,
+              estimated_cost_usd: 42.50,
+              conversion_rate: 0.57,
+              first_attempt_success_rate: 0.43,
+            },
+            {
+              direction_id: 'd-002',
+              direction_text: 'Enforce all viewport-coverage invariants in the test:viewport gate and add escape-hatch debt ceiling guardrail',
+              priority: 'medium',
+              cycles_in_window: 3,
+              tasks_created: 7,
+              prs_merged: 3,
+              possibly_saturated: true,
+              auto_paused: true,
+              paused_reason: 'Saturation detected: merge rate below viable threshold for 3 consecutive cycles',
+              estimated_cost_usd: 18.20,
+              conversion_rate: 0.43,
+            },
+          ],
+          recent_completions: [],
+          failure_groups: [{ failure_class: 'CODE_ERROR', label: 'Code Error', count: 3, tasks: [] }],
+          success_rate: 0.75,
+          trend: 'stable',
+          trend_history: [],
+          completed_count: 10,
+        }), { status: 200 });
+      }
+      return new Response('not found', { status: 404 });
+    });
+
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DashboardHome
+            tasks={POPULATED_TASKS}
+            selectedProjectId={null}
+            onViewTask={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    });
   });
 });

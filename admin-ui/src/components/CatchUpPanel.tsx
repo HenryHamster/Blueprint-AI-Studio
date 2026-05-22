@@ -1221,7 +1221,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                             onClick={() => onSelectTask({ id: item.task_id })}
                             onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: item.task_id }); } }}
                           >
-                            <span className="flex-1 truncate text-neutral-300">{item.title}</span>
+                            <span className="min-w-0 flex-1 truncate text-neutral-300">{item.title}</span>
                             {item.direction_text && (
                               <span
                                 className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40 truncate max-w-[12rem]"
@@ -1375,7 +1375,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                               const entry = dismissed[item.task_id];
                               return (
                                 <div key={item.task_id} className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/50 px-2 py-1.5 rounded opacity-50">
-                                  <span className="flex-1 truncate text-neutral-400">{item.title}</span>
+                                  <span className="min-w-0 flex-1 truncate text-neutral-400">{item.title}</span>
                                   {entry?.type === 'snooze' && (
                                     <span className="shrink-0 text-[9px] font-mono text-neutral-500">
                                       {formatSnoozeRemaining((entry as { type: 'snooze'; until: number }).until)}
@@ -1420,11 +1420,11 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                           key={t.task_id}
                           role="button"
                           tabIndex={0}
-                          className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
+                          className="flex flex-wrap items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
                           onClick={() => onSelectTask({ id: t.task_id })}
                           onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: t.task_id }); } }}
                         >
-                          <span className="flex-1 truncate text-neutral-400">{t.title}</span>
+                          <span className="min-w-0 flex-1 truncate text-neutral-400">{t.title}</span>
                           {t.direction_text && (
                             <span
                               className="shrink-0 inline-flex items-center gap-0.5 text-[9px] px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40 max-w-[180px] truncate"

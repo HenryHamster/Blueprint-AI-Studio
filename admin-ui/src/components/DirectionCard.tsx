@@ -632,7 +632,7 @@ function DirectionCardImpl({
                     ) : (
                       <p className="text-[10px] text-red-400/80 leading-relaxed mt-0.5">
                         Auto-remediation escalated after {d.remediation_attempts ?? 0} failed attempt{(d.remediation_attempts ?? 0) !== 1 ? 's' : ''}.
-                        {d.diagnosis_summary && <span className="block mt-0.5 text-neutral-400 italic">{d.diagnosis_summary}</span>}
+                        {d.diagnosis_summary && <span className="block mt-0.5 text-neutral-400 italic break-all">{d.diagnosis_summary}</span>}
                       </p>
                     )}
                   </div>
@@ -646,7 +646,7 @@ function DirectionCardImpl({
                     </div>
                   )}
                   {d.diagnosis_summary && !d.diagnosis_in_progress && (
-                    <p className="text-[10px] text-neutral-400 leading-relaxed">
+                    <p className="text-[10px] text-neutral-400 leading-relaxed break-all">
                       <span className="text-neutral-500 font-medium">Diagnosis: </span>
                       {d.diagnosis_summary}
                       {d.diagnosis_completed_at && (

@@ -413,6 +413,16 @@ describe('EscalationOutcomePanel — viewport regression', () => {
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
     });
   });
+  test('mobile cards render all buckets without text truncation at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => { root?.render(<EscalationOutcomePanel projectId="project-123" />); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    }, { waitMs: 50 });
+  });
   test('does not render when all merged_count are zero', async () => {
     const { apiFetch } = await import('../api');
     vi.mocked(apiFetch).mockResolvedValueOnce(
@@ -448,6 +458,16 @@ describe('FirstAttemptComplianceTrendPanel — viewport regression', () => {
       await act(async () => { root?.render(<FirstAttemptComplianceTrendPanel projectId="project-123" />); });
       await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
     });
+  });
+  test('mobile cards render window labels without text truncation at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => { root?.render(<FirstAttemptComplianceTrendPanel projectId="project-123" />); });
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
+    }, { waitMs: 50 });
   });
   test('does not render when all windows are empty', async () => {
     const { apiFetch } = await import('../api');
