@@ -576,6 +576,209 @@ async def _resolve_github_with_session(
 
 
 # ---------------------------------------------------------------------------
+# Qualifier-scoped CI resolution — the real-green-build gate.
+#
+# The qualifier must NOT treat the CI dimension as green unless a real,
+# completed, green build exists for the exact candidate commit.  Two project
+# realities make a naive check unreliable:
+#
+#   * CI (.github/workflows/ci.yml) runs only on ``pull_request`` events —
+#     there is no push trigger.  A freshly-merged ``automain`` HEAD commit
+#     therefore carries NO check-runs of its own; the check-runs that actually
+#     verified the change live on the head commit of the PR that introduced it.
+#   * the shared ``github.get_check_runs`` helper fails OPEN on an empty
+#     check-runs list (so the orchestrator's CI-wait does not hang on no-CI
+#     repos).  Inheriting that here would let a candidate score CI-green purely
+#     from the ABSENCE of any signal.
+#
+# This resolver scopes a stricter interpretation to the qualifier only — it
+# passes ``treat_missing_as_success=False`` so an empty check-runs list is
+# distinguishable, and resolves CI through the candidate's PR head when the
+# candidate carries no checks of its own.  The shared helper's global
+# fail-open behaviour is unchanged for every other caller.
+# ---------------------------------------------------------------------------
+
+# CI resolution states for a qualifier candidate commit.
+_CI_GREEN = "green"  # a real completed, all-passing build exists
+_CI_RED = "red"  # a completed build with at least one failure
+_CI_PENDING = "pending"  # checks in progress, or no check-runs found anywhere
+_CI_NO_CHECKS = "no_checks"  # the commit itself carries no check-runs
+
+
+def _classify_check_runs(result: dict[str, Any] | None) -> str:
+    """Map a strict ``get_check_runs`` result to a qualifier CI state."""
+    if not isinstance(result, dict):
+        return _CI_PENDING
+    status = result.get("status")
+    if status == "no_checks":
+        return _CI_NO_CHECKS
+    if status == "completed":
+        conclusion = result.get("conclusion")
+        if conclusion == "success":
+            return _CI_GREEN
+        if conclusion == "failure":
+            return _CI_RED
+        return _CI_PENDING
+    return _CI_PENDING
+
+
+async def _resolve_candidate_ci(
+    token: str,
+    owner: str,
+    repo: str,
+    candidate_sha: str,
+    *,
+    project_id: str | None = None,
+) -> dict[str, Any]:
+    """Resolve the *real* CI verdict for a release-qualifier candidate commit.
+
+    Resolution order:
+      1. Inspect check-runs on ``candidate_sha`` itself, in strict mode (an
+         empty list is NOT a pass).  A completed green/red build here is
+         authoritative — return it.  Checks still in progress → pending.
+      2. When the candidate carries no check-runs of its own, look up the PR(s)
+         that introduced it (``commits/{sha}/pulls``) and evaluate check-runs
+         on the PR head commit — that is where ``pull_request``-triggered CI
+         actually ran.
+
+    Returns ``{"state": str, "ci_green": bool, "resolved_sha": str | None,
+    "detail": str}`` — ``ci_green`` is True ONLY for the ``green`` state.
+    Never raises: any GitHub I/O failure degrades to the ``pending`` state.
+    """
+    if not candidate_sha:
+        return {
+            "state": _CI_PENDING,
+            "ci_green": False,
+            "resolved_sha": None,
+            "detail": "no candidate sha",
+        }
+
+    # --- Step 1: check-runs on the candidate commit itself -----------------
+    try:
+        direct = await github.get_check_runs_cached(
+            token,
+            owner,
+            repo,
+            candidate_sha,
+            project_id=project_id,
+            treat_missing_as_success=False,
+        )
+    except Exception as exc:  # noqa: BLE001 — CI fetch failure → not-green/pending
+        logger.warning(
+            "[RELEASE_QUALIFIER] CI check-runs fetch failed for %s/%s@%s: %s",
+            owner,
+            repo,
+            candidate_sha[:8],
+            exc,
+        )
+        return {
+            "state": _CI_PENDING,
+            "ci_green": False,
+            "resolved_sha": candidate_sha,
+            "detail": f"candidate check-runs fetch failed: {exc}",
+        }
+
+    direct_state = _classify_check_runs(direct)
+    if direct_state in (_CI_GREEN, _CI_RED):
+        return {
+            "state": direct_state,
+            "ci_green": direct_state == _CI_GREEN,
+            "resolved_sha": candidate_sha,
+            "detail": f"candidate commit check-runs: {direct_state}",
+        }
+    if direct_state == _CI_PENDING:
+        return {
+            "state": _CI_PENDING,
+            "ci_green": False,
+            "resolved_sha": candidate_sha,
+            "detail": "check-runs in progress on the candidate commit",
+        }
+
+    # --- Step 2: resolve through the PR that introduced the candidate ------
+    # direct_state == _CI_NO_CHECKS: the candidate has no check-runs of its own.
+    try:
+        prs = await github.list_pull_requests_for_commit(
+            token, owner, repo, candidate_sha, project_id=project_id
+        )
+    except Exception as exc:  # noqa: BLE001 — PR lookup failure → not-green/pending
+        logger.warning(
+            "[RELEASE_QUALIFIER] PR-for-commit lookup failed for %s/%s@%s: %s",
+            owner,
+            repo,
+            candidate_sha[:8],
+            exc,
+        )
+        return {
+            "state": _CI_PENDING,
+            "ci_green": False,
+            "resolved_sha": None,
+            "detail": f"pr-for-commit lookup failed: {exc}",
+        }
+
+    # Prefer merged PRs; fall back to every associated PR when none carry merged_at.
+    merged_prs = [pr for pr in prs if isinstance(pr, dict) and pr.get("merged_at")]
+    use_prs = merged_prs or [pr for pr in prs if isinstance(pr, dict)]
+    head_shas: list[str] = []
+    for pr in use_prs:
+        head = pr.get("head")
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        if head_sha and head_sha != candidate_sha and head_sha not in head_shas:
+            head_shas.append(head_sha)
+
+    if not head_shas:
+        return {
+            "state": _CI_PENDING,
+            "ci_green": False,
+            "resolved_sha": None,
+            "detail": "no check-runs on candidate and no PR head with CI",
+        }
+
+    for head_sha in head_shas:
+        try:
+            pr_checks = await github.get_check_runs_cached(
+                token,
+                owner,
+                repo,
+                head_sha,
+                project_id=project_id,
+                treat_missing_as_success=False,
+            )
+        except Exception as exc:  # noqa: BLE001 — keep trying remaining PR heads
+            logger.warning(
+                "[RELEASE_QUALIFIER] CI check-runs fetch failed for PR head "
+                "%s/%s@%s: %s",
+                owner,
+                repo,
+                head_sha[:8],
+                exc,
+            )
+            continue
+        pr_state = _classify_check_runs(pr_checks)
+        if pr_state == _CI_RED:
+            return {
+                "state": _CI_RED,
+                "ci_green": False,
+                "resolved_sha": head_sha,
+                "detail": "PR head check-runs failed",
+            }
+        if pr_state == _CI_GREEN:
+            return {
+                "state": _CI_GREEN,
+                "ci_green": True,
+                "resolved_sha": head_sha,
+                "detail": "PR head check-runs passed",
+            }
+        # pending / no_checks on this PR head — keep looking.
+
+    return {
+        "state": _CI_PENDING,
+        "ci_green": False,
+        "resolved_sha": None,
+        "detail": "PR head check-runs still pending / absent",
+    }
+
+
+# ---------------------------------------------------------------------------
 # run_qualification — the coordinator (phase 1: spawn).
 # ---------------------------------------------------------------------------
 
@@ -733,21 +936,20 @@ async def run_qualification(
         await _increment_qualification_attempts(session, version.id)
         return {"status": "sha_error"}
 
-    # 3. CI check on the candidate SHA (cheap, orchestrator-side).  Also done
-    #    before the row lock — it is read-only external I/O.
-    ci_green = False
-    try:
-        ci_result = await github.get_check_runs_cached(
-            token, owner, repo, candidate_sha, project_id=str(project_id)
-        )
-        ci_green = ci_result.get("conclusion") == "success"
-    except Exception as exc:  # noqa: BLE001 — CI fetch failure ⇒ treat as not-green
-        logger.warning(
-            "[RELEASE_QUALIFIER] CI check failed for %s@%s: %s",
-            repo,
-            candidate_sha[:8],
-            exc,
-        )
+    # 3. CI check on the candidate SHA (cheap, orchestrator-side).  Done before
+    #    the row lock — it is read-only external I/O.  This resolves CI through
+    #    the candidate's PR head when the candidate carries no check-runs of its
+    #    own (CI runs only on pull_request events), and never fails green purely
+    #    from the absence of a signal.  ``ci_green`` recorded here is only a
+    #    spawn-time snapshot — _finalize_qualification RE-RESOLVES CI and
+    #    applies it as the composite hard blocker, so a candidate whose checks
+    #    are merely pending now is not frozen not-green forever.
+    #    _resolve_candidate_ci never raises.
+    ci_resolution = await _resolve_candidate_ci(
+        token, owner, repo, candidate_sha, project_id=str(project_id)
+    )
+    ci_green = ci_resolution["ci_green"]
+    ci_state = ci_resolution["state"]
 
     # 4. Take the ReleaseVersion row lock (audit C3).  The strategic
     #    qualify_request path and the admin POST /qualify endpoint can both
@@ -885,6 +1087,7 @@ async def run_qualification(
             "detail": str(exc)[:300],
             "candidate_sha": candidate_sha,
             "ci_green": ci_green,
+            "ci_state": ci_state,
             "started_at": started_at,
         }
         # Read-modify-write is safe here (unlike the no_credentials / sha_error
@@ -907,6 +1110,7 @@ async def run_qualification(
         "status": "pending",
         "candidate_sha": candidate_sha,
         "ci_green": ci_green,
+        "ci_state": ci_state,
         "smoketest_enabled": smoketest_enabled,
         "started_at": started_at,
         "audit_task_id": audit_task_id,
@@ -938,6 +1142,7 @@ async def run_qualification(
         "status": "spawned",
         "candidate_sha": candidate_sha,
         "ci_green": ci_green,
+        "ci_state": ci_state,
         "smoketest_enabled": smoketest_enabled,
         "audit_task_id": audit_task_id,
         "smoketest_task_id": smoketest_task_id,
@@ -1526,6 +1731,72 @@ async def _handle_infra_failure(
     }
 
 
+async def _resolve_ci_at_finalize(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+) -> bool:
+    """Re-resolve the candidate commit's CI verdict at finalize time.
+
+    ``run_qualification`` snapshots ``ci_green`` once, at spawn.  Reusing that
+    frozen boolean at finalize is a livelock: if the candidate's checks were
+    merely in progress when qualification started, ``ci_green`` was recorded
+    False, finalize would keep blocking on it, the version returns to stabilize
+    and the SAME commit is re-qualified and re-blocked indefinitely.  So
+    finalize re-evaluates CI here against the candidate commit rather than
+    trusting the spawn-time value — once the build completes green this
+    re-resolution lets the CI dimension pass, while a still-pending build
+    simply stays not-green WITHOUT a permanent dead-end.
+
+    Returns True ONLY when a real completed green build exists for the
+    candidate.  Any credential-resolution or GitHub I/O failure degrades
+    gracefully to False (not-green) for THIS finalize attempt — it never
+    crashes the finalize.
+    """
+    if not candidate_sha:
+        return False
+    try:
+        project = await session.get(Project, version.project_id)
+        if project is None:
+            logger.warning(
+                "[RELEASE_QUALIFIER] finalize CI re-resolution: project %s for "
+                "version v%d not found — treating CI as not-green",
+                version.project_id,
+                version.version_number,
+            )
+            return False
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            logger.warning(
+                "[RELEASE_QUALIFIER] finalize CI re-resolution: no GitHub "
+                "credentials for version v%d — treating CI as not-green",
+                version.version_number,
+            )
+            return False
+        token, owner, repo = resolved
+        ci_resolution = await _resolve_candidate_ci(
+            token, owner, repo, candidate_sha, project_id=str(version.project_id)
+        )
+        logger.info(
+            "[RELEASE_QUALIFIER] finalize CI re-resolution for v%d candidate "
+            "%s: state=%s ci_green=%s (%s)",
+            version.version_number,
+            candidate_sha[:8],
+            ci_resolution["state"],
+            ci_resolution["ci_green"],
+            ci_resolution["detail"],
+        )
+        return bool(ci_resolution["ci_green"])
+    except Exception as exc:  # noqa: BLE001 — finalize CI failure → not-green
+        logger.warning(
+            "[RELEASE_QUALIFIER] finalize CI re-resolution failed for version "
+            "v%d (treating CI as not-green for this attempt): %s",
+            version.version_number,
+            exc,
+        )
+        return False
+
+
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -1537,7 +1808,9 @@ async def _finalize_qualification(
     smoketest subsystem was enabled for this run (audit H3) — for ``version``
     have reached a terminal state.
 
-    Reads the RELEASE_AUDIT_REPORT and (when the smoketest subsystem was
+    Re-resolves CI for the candidate commit (``_resolve_ci_at_finalize``)
+    rather than trusting the boolean frozen at spawn, reads the
+    RELEASE_AUDIT_REPORT and (when the smoketest subsystem was
     enabled) SMOKETEST_RESULT artifacts, computes the composite, then:
       * promote == True  and promotion_enabled ⇒ ``promote()``.
       * promote == True  but promotion_enabled is False ⇒ dry-run: log the
@@ -1558,7 +1831,6 @@ async def _finalize_qualification(
     """
     qual = dict(version.last_qualification or {})
     candidate_sha = qual.get("candidate_sha")
-    ci_green = bool(qual.get("ci_green"))
     audit_task_id = qual.get("audit_task_id")
     smoketest_task_id = qual.get("smoketest_task_id")
     # Audit H3: whether the qualifying run had the smoketest subsystem enabled.
@@ -1567,6 +1839,15 @@ async def _finalize_qualification(
     # must match the children that actually ran.  Legacy records that predate
     # the flag default to True (the old always-spawn behaviour).
     smoketest_enabled = bool(qual.get("smoketest_enabled", True))
+
+    # Re-resolve CI for the candidate commit NOW rather than reusing the
+    # boolean frozen at spawn — a candidate whose checks were merely pending
+    # when run_qualification ran recorded ci_green=False, and trusting that
+    # stale value would re-block the same commit forever.  Re-resolution lets a
+    # now-completed green build pass and keeps a still-pending build not-green
+    # without a permanent dead-end.  Graceful: a credential / GitHub failure
+    # degrades to not-green for this attempt (never crashes the finalize).
+    ci_green = await _resolve_ci_at_finalize(session, version, candidate_sha)
 
     policy = _load_policy()
 

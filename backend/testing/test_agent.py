@@ -10313,6 +10313,15 @@ async def test_qualifier_smoketest_finalize_sees_own_artifact_via_endpoint(
     mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
     mocker.patch("app.main.fire_and_forget_vm_delete", return_value=None)
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # Finalize re-resolves CI for the candidate commit rather than trusting the
+    # spawn-time ci_green snapshot; with no GitHub credentials in this test that
+    # resolution degrades to not-green and would hard-block on ci_not_green.
+    # This test's subject is smoketest-artifact visibility (CI is assumed green,
+    # as the stored qualification records), so pin the re-resolution to green.
+    mocker.patch(
+        "app.release_qualifier._resolve_ci_at_finalize",
+        new=AsyncMock(return_value=True),
+    )
     # promotion_enabled defaults False (dark) — a confident candidate dry-runs.
 
     project = Project(

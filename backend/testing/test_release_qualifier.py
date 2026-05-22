@@ -732,6 +732,166 @@ class TestScoreSmoketest:
 
 
 # ===========================================================================
+# _classify_check_runs — CI state mapping
+# ===========================================================================
+
+
+class TestClassifyCheckRuns:
+    def test_none_is_pending(self):
+        assert rq._classify_check_runs(None) == rq._CI_PENDING
+
+    def test_non_dict_is_pending(self):
+        assert rq._classify_check_runs("bad") == rq._CI_PENDING  # type: ignore[arg-type]
+
+    def test_no_checks_status(self):
+        assert rq._classify_check_runs({"status": "no_checks"}) == rq._CI_NO_CHECKS
+
+    def test_completed_success_is_green(self):
+        assert (
+            rq._classify_check_runs({"status": "completed", "conclusion": "success"})
+            == rq._CI_GREEN
+        )
+
+    def test_completed_failure_is_red(self):
+        assert (
+            rq._classify_check_runs({"status": "completed", "conclusion": "failure"})
+            == rq._CI_RED
+        )
+
+    def test_completed_neutral_conclusion_is_pending(self):
+        assert (
+            rq._classify_check_runs({"status": "completed", "conclusion": "neutral"})
+            == rq._CI_PENDING
+        )
+
+    def test_in_progress_is_pending(self):
+        assert rq._classify_check_runs({"status": "in_progress"}) == rq._CI_PENDING
+
+
+# ===========================================================================
+# _resolve_candidate_ci — qualifier-scoped strict CI resolver
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_ci_no_sha_returns_pending(mocker):
+    """Missing candidate SHA → pending state without any API call."""
+    result = await rq._resolve_candidate_ci("tok", "owner", "repo", "")
+    assert result["ci_green"] is False
+    assert result["state"] == rq._CI_PENDING
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_ci_direct_green(mocker):
+    """Candidate commit carries a completed green build → ci_green=True."""
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={"status": "completed", "conclusion": "success", "details": []}
+        ),
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit", new=AsyncMock(return_value=[])
+    )
+    result = await rq._resolve_candidate_ci("tok", "owner", "repo", "abc123")
+    assert result["ci_green"] is True
+    assert result["state"] == rq._CI_GREEN
+    assert result["resolved_sha"] == "abc123"
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_ci_direct_red(mocker):
+    """Candidate commit carries a completed failing build → ci_green=False."""
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={"status": "completed", "conclusion": "failure", "details": []}
+        ),
+    )
+    result = await rq._resolve_candidate_ci("tok", "owner", "repo", "abc123")
+    assert result["ci_green"] is False
+    assert result["state"] == rq._CI_RED
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_ci_direct_pending(mocker):
+    """Candidate commit has in-progress checks → ci_green=False (pending)."""
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={"status": "in_progress", "conclusion": None, "details": []}
+        ),
+    )
+    result = await rq._resolve_candidate_ci("tok", "owner", "repo", "abc123")
+    assert result["ci_green"] is False
+    assert result["state"] == rq._CI_PENDING
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_ci_no_checks_resolves_via_pr_head(mocker):
+    """Candidate has no check-runs; CI ran on the PR head commit — resolves green."""
+    pr_head_sha = "pr_head_deadbeef"
+    call_count = {"n": 0}
+
+    async def _check_runs_side_effect(token, owner, repo, sha, **kwargs):
+        call_count["n"] += 1
+        if sha == "candidate000":
+            return {"status": "no_checks", "conclusion": None, "details": []}
+        # PR head commit
+        return {"status": "completed", "conclusion": "success", "details": []}
+
+    mocker.patch(
+        "app.github.get_check_runs_cached", side_effect=_check_runs_side_effect
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(
+            return_value=[
+                {
+                    "number": 42,
+                    "merged_at": "2026-01-01T00:00:00Z",
+                    "head": {"sha": pr_head_sha},
+                },
+            ]
+        ),
+    )
+    result = await rq._resolve_candidate_ci("tok", "owner", "repo", "candidate000")
+    assert result["ci_green"] is True
+    assert result["state"] == rq._CI_GREEN
+    assert result["resolved_sha"] == pr_head_sha
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_ci_no_checks_no_prs_returns_pending(mocker):
+    """Candidate has no check-runs and no associated PRs → pending (not-green)."""
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={"status": "no_checks", "conclusion": None, "details": []}
+        ),
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(return_value=[]),
+    )
+    result = await rq._resolve_candidate_ci("tok", "owner", "repo", "candidate111")
+    assert result["ci_green"] is False
+    assert result["state"] == rq._CI_PENDING
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_ci_check_runs_fetch_error_returns_pending(mocker):
+    """Any exception from get_check_runs_cached → pending (never raises)."""
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(side_effect=RuntimeError("transient network error")),
+    )
+    result = await rq._resolve_candidate_ci("tok", "owner", "repo", "candidate222")
+    assert result["ci_green"] is False
+    assert result["state"] == rq._CI_PENDING
+
+
+# ===========================================================================
 # Shared fixtures for the DB-backed coordinator tests
 # ===========================================================================
 
@@ -845,6 +1005,45 @@ def _patch_promote_github_defaults(mocker, *, already_on_main: bool = False):
     return is_ancestor_mock, delete_branch_mock, pr_state_mock
 
 
+@pytest.fixture(autouse=True)
+def _qualifier_ci_resolves_green(mocker):
+    """Default the qualifier's CI resolution to a real completed green build.
+
+    Both ``run_qualification`` and ``_finalize_qualification`` resolve CI for
+    the candidate commit through ``_resolve_candidate_ci``, which calls the
+    GitHub check-runs + PR-for-commit + installation-token helpers.  The
+    overwhelming majority of coordinator tests exercise guards, scoring,
+    promote paths or notifications where CI is incidental and the candidate is
+    assumed green.
+
+    This autouse fixture patches those GitHub helpers so ``_resolve_candidate_ci``
+    runs for real and resolves GREEN by default — the candidate commit reports
+    a completed, all-passing build.  Tests that exercise the CI gate itself
+    re-patch ``get_check_runs_cached`` / ``list_pull_requests_for_commit`` in
+    the test body; the later patch wins.  Pure-function tests (compute_composite
+    etc.) never reach these helpers, so the patches are harmless there.
+    """
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "success",
+                "details": [],
+                "failed_logs": "",
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(return_value=[]),
+    )
+
+
 # ===========================================================================
 # run_qualification — phase 1: guards + snapshot + spawn
 # ===========================================================================
@@ -876,7 +1075,7 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
     )
     mocker.patch(
         "app.github.get_check_runs_cached",
-        new=AsyncMock(return_value={"conclusion": "success"}),
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
     )
 
     result = await rq.run_qualification(db_session, project.id, version)
@@ -2180,9 +2379,16 @@ async def test_promote_project_not_found_records_failure(db_session, mocker):
 
 @pytest.mark.asyncio
 async def test_finalize_project_not_found_breaks_pending_loop(db_session, mocker):
-    """End-to-end: when _finalize_qualification reaches promote() and the
-    project is gone, last_qualification must NOT be left 'pending' — a later
-    finalize would otherwise re-loop forever."""
+    """End-to-end: when _finalize_qualification cannot load the Project row,
+    last_qualification must NOT be left 'pending' — a later finalize would
+    otherwise re-loop forever.
+
+    _finalize_qualification re-resolves CI before scoring; that re-resolution
+    needs the Project row to resolve credentials.  With the project gone CI
+    cannot be re-resolved, so it degrades to not-green (graceful — never
+    crashes), the composite hard-blocks on ci_not_green, and the version is
+    finalized as not_promoted.  The pending loop is still broken: the record
+    reaches a terminal status rather than staying 'pending'."""
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
@@ -2207,8 +2413,8 @@ async def test_finalize_project_not_found_breaks_pending_loop(db_session, mocker
         },
     )
 
-    # _finalize_qualification resolves credentials via session.get(Project) and
-    # then promote() does too.  Make every Project lookup return None.
+    # Make every Project lookup return None — simulates the project deleted
+    # between qualification spawn and finalize.
     real_get = db_session.get
 
     async def _fake_get(model, ident, *args, **kwargs):
@@ -2221,12 +2427,14 @@ async def test_finalize_project_not_found_breaks_pending_loop(db_session, mocker
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    assert result["status"] == "promotion_failed"
-    assert result["error"] == "project_not_found"
+    # _resolve_ci_at_finalize degrades to not-green when the project is gone,
+    # so the composite hard-blocks on ci_not_green — not promotion_failed.
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "ci_not_green"
 
     await db_session.refresh(version)
     # The pending loop is broken — status is terminal.
-    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["status"] == "not_promoted"
     assert version.last_qualification["status"] != "pending"
 
 

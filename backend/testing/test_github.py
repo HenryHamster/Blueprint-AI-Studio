@@ -2489,3 +2489,102 @@ async def test_post_merge_summary_comment_returns_false_on_error(mocker):
     result = await post_merge_summary_comment("token", "owner", "repo", 42)
 
     assert result is False
+
+
+# ---------------------------------------------------------------------------
+# list_pull_requests_for_commit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_pull_requests_for_commit_success(mocker):
+    """200 response with a list of PR dicts is returned as-is."""
+    from app.github import list_pull_requests_for_commit
+
+    prs = [
+        {
+            "number": 42,
+            "state": "closed",
+            "merged_at": "2026-01-01T00:00:00Z",
+            "head": {"sha": "abc"},
+        },
+    ]
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, prs),
+    )
+
+    result = await list_pull_requests_for_commit("tok", "owner", "repo", "deadbeef123")
+
+    assert result == prs
+
+
+@pytest.mark.asyncio
+async def test_list_pull_requests_for_commit_non_200_returns_empty(mocker):
+    """Non-200 response (e.g. 404) returns [] without raising."""
+    from app.github import list_pull_requests_for_commit
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(404, {"message": "Not Found"}, text="Not Found"),
+    )
+
+    result = await list_pull_requests_for_commit("tok", "owner", "repo", "deadbeef123")
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_list_pull_requests_for_commit_non_list_body_returns_empty(mocker):
+    """A 200 response whose body is not a list (e.g. a dict error) returns []."""
+    from app.github import list_pull_requests_for_commit
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, {"message": "unexpected"}),
+    )
+
+    result = await list_pull_requests_for_commit("tok", "owner", "repo", "deadbeef123")
+
+    assert result == []
+
+
+# ---------------------------------------------------------------------------
+# get_check_runs: treat_missing_as_success=False (strict mode)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_check_runs_strict_mode_empty_returns_no_checks(mocker):
+    """With treat_missing_as_success=False an empty check-runs list returns
+    status='no_checks' so callers can distinguish 'no CI' from 'CI passed'."""
+    from app.github import get_check_runs
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, {"check_runs": []}),
+    )
+
+    result = await get_check_runs(
+        "tok", "owner", "repo", "sha123", treat_missing_as_success=False
+    )
+
+    assert result["status"] == "no_checks"
+    assert result["conclusion"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_check_runs_default_mode_empty_returns_success(mocker):
+    """Default (treat_missing_as_success=True): empty check-runs → status='completed',
+    conclusion='success' to preserve the fail-open behaviour for all existing callers."""
+    from app.github import get_check_runs
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, {"check_runs": []}),
+    )
+
+    result = await get_check_runs("tok", "owner", "repo", "sha123")
+
+    assert result["status"] == "completed"
+    assert result["conclusion"] == "success"
