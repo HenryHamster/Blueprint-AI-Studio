@@ -348,6 +348,60 @@ async def test_eligibility_skips_other_vm_pin(db_session):
 
 
 @pytest.mark.asyncio
+async def test_in_progress_scan_computed_once_when_reused(db_session, mocker):
+    """A caller pairing the eligibility gate with the claim can compute the
+    project's IN_PROGRESS file set once and pass it to both, so the file-conflict
+    scan runs a single time instead of once per call."""
+    import app.warm_backlog_reuse as wbr
+
+    project = await _make_project(db_session, name="Scan Reuse")
+    vm_id = "agent-vm-scan"
+    # One IN_PROGRESS task (file-conflict source) + one clean candidate.
+    await _make_backlog_task(
+        db_session,
+        project.id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"related_files": ["src/app.py"]},
+    )
+    clean = await _make_backlog_task(
+        db_session, project.id, context={"related_files": ["docs/readme.md"]}
+    )
+
+    # Compute the IN_PROGRESS file set once, then reuse it across both calls.
+    in_progress_files = await wbr._project_in_progress_files(db_session, project.id)
+    spy = mocker.spy(wbr, "_project_in_progress_files")
+
+    assert (
+        await has_eligible_backlog_task(
+            db_session, project.id, vm_id, in_progress_files=in_progress_files
+        )
+        is True
+    )
+    picked = await select_backlog_reuse_candidate(
+        db_session, project.id, vm_id, in_progress_files=in_progress_files
+    )
+    assert picked is not None and picked.id == clean.id
+    # Neither call re-scanned IN_PROGRESS — the precomputed set was reused.
+    assert spy.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_in_progress_scan_runs_when_not_provided(db_session, mocker):
+    """When no precomputed set is passed, the scan still runs (lazy default),
+    preserving the standalone behavior of each helper."""
+    import app.warm_backlog_reuse as wbr
+
+    project = await _make_project(db_session, name="Scan Lazy")
+    vm_id = "agent-vm-lazy"
+    await _make_backlog_task(
+        db_session, project.id, context={"related_files": ["docs/readme.md"]}
+    )
+    spy = mocker.spy(wbr, "_project_in_progress_files")
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is True
+    assert spy.call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_backlog_reused_task_lifts_efficiency_axes(
     client: AsyncClient, db_session, mocker
 ):
