@@ -380,6 +380,48 @@ def _summarize_conversation_thread(thread: list) -> list:
     return thread[-_CONVERSATION_THREAD_KEEP_WHEN_TRIMMED:]
 
 
+_MEMO_CITATIONS_KEEP = 5
+_MEMO_EXCERPT_MAX_CHARS = 400
+
+
+def _summarize_memo_citations(memos: list) -> list:
+    """Trim memo citations for inclusion in strategic-agent payloads.
+
+    Keeps the most recent N memos (by task_id) and caps excerpt length
+    so the digest survives under budget pressure rather than vanishing
+    entirely. The strategic reviewer can cite memos by task_id; shorter
+    excerpts still preserve citability.
+    """
+    if not isinstance(memos, list):
+        return memos
+    if len(memos) <= _MEMO_CITATIONS_KEEP:
+        # No trimming needed for list size, but still cap excerpts
+        return [
+            {
+                **m,
+                "summary_excerpt": (m.get("summary_excerpt") or "")[
+                    :_MEMO_EXCERPT_MAX_CHARS
+                ]
+                if isinstance(m, dict)
+                else m,
+            }
+            for m in memos
+        ]
+    # Cap to most recent memos and trim excerpts
+    trimmed = memos[:_MEMO_CITATIONS_KEEP]
+    return [
+        {
+            **m,
+            "summary_excerpt": (m.get("summary_excerpt") or "")[
+                :_MEMO_EXCERPT_MAX_CHARS
+            ]
+            if isinstance(m, dict)
+            else m,
+        }
+        for m in trimmed
+    ]
+
+
 # Schemas for pack_under_budget. Each key declares its priority tier and an
 # optional summarize_fn. Critical = always shipped (raises if can't fit).
 # High = shipped unless budget exhausted by summarized criticals + earlier
@@ -439,8 +481,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # LTS version/phase context — present only on self-repo projects. High priority
     # so it survives budget pressure (the agent needs it for phase-transition decisions).
     "version_phase": {"priority": "high", "summarize": _summarize_version_phase},
-    # Citable memo digest — supplementary context, dropped first under budget pressure.
-    "memo_citations": {"priority": "low"},
+    # Citable memo digest — terminal reasoning artifacts spawned from dropped research
+    # findings. Medium priority so it survives typical payload pressure; the summarize_fn
+    # trims memos and excerpts so it degrades gracefully (fewer memos / shorter text)
+    # rather than vanishing entirely. The strategic reviewer must see memos to cite them.
+    "memo_citations": {"priority": "medium", "summarize": _summarize_memo_citations},
     # Per-axis efficiency axes with drift vs baseline. Medium priority so it
     # survives typical payload pressure; the summarize_fn trims history tails
     # so it degrades gracefully before being dropped entirely.

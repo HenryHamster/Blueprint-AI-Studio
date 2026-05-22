@@ -806,8 +806,9 @@ Only request qualification from the **stabilize** phase — it is ignored in **b
  * Builds the memo-citations block for the strategic thinker prompt.
  * Memos are terminal reasoning artifacts spawned from research findings the
  * packer dropped under budget pressure; the backend surfaces a digest of the
- * recent ones so the strategic reviewer can cite them by task id. Returns ''
- * when there are no memos for this cycle window.
+ * recent ones so the strategic reviewer can cite them by short handle. Each memo
+ * is assigned a stable short handle (M0, M1, M2, ...) alongside its real task_id
+ * for traceability. Returns '' when there are no memos for this cycle window.
  */
 export function buildMemoCitationsSection(memoCitations: unknown): string {
   if (!Array.isArray(memoCitations) || memoCitations.length === 0) return '';
@@ -815,17 +816,56 @@ export function buildMemoCitationsSection(memoCitations: unknown): string {
   lines.push(
     'Memos are short reasoning notes spawned from research findings dropped ' +
     'under budget pressure in earlier cycles. Each is a completed, terminal ' +
-    'artifact. When a memo informs a gap or direction, cite it by task id ' +
-    '(e.g. "memo <task_id>") so the reasoning thread stays traceable.',
+    'artifact. When a memo informs a gap or direction, cite it by its short handle ' +
+    '(e.g. "memo M0", "memo M1") — the handle is easy to reproduce and maps reliably ' +
+    'back to the full task_id for traceability.',
   );
-  for (const m of memoCitations) {
+  for (let i = 0; i < memoCitations.length; i++) {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+    const m = memoCitations[i];
     if (!m || typeof m !== 'object') continue;
     const rec = m as Record<string, unknown>;
     const taskId = typeof rec.task_id === 'string' && rec.task_id ? rec.task_id : '?';
     const excerpt = typeof rec.summary_excerpt === 'string' ? rec.summary_excerpt.trim() : '';
-    lines.push(`- memo ${taskId}: ${excerpt || '(no summary)'}`);
+    const handle = `M${i}`;
+    lines.push(`- ${handle} (task_id: ${taskId}): ${excerpt || '(no summary)'}`);
   }
   return lines.join('\n');
+}
+
+/**
+ * Resolves memo handle references (e.g., "M0", "M1") back to their real task_ids.
+ * Scans analysisText for handle patterns and returns the corresponding task_ids
+ * in the order they appear. Handles are format like M0, M1, M2, etc.
+ * Used to make memo citation capture robust to UUID reproduction fragility.
+ */
+export function resolveMemoHandles(
+  analysisText: string,
+  memoCitations: Array<Record<string, unknown> | null | undefined>
+): string[] {
+  if (memoCitations.length === 0) return [];
+  const matches: Array<{ taskId: string; position: number }> = [];
+
+  for (let i = 0; i < memoCitations.length; i++) {
+    const m = memoCitations[i];
+    if (!m || typeof m !== 'object') continue;
+    const taskId = m.task_id;
+    if (typeof taskId !== 'string' || !taskId) continue;
+
+    // Look for the handle pattern M{i} (e.g., M0, M1, M2...). The word
+    // boundaries keep "M01" from matching handle "M0" and also cover
+    // phrase contexts like "memo M0" and "(M0)".
+    const handlePattern = new RegExp(`\\bM${i}\\b`);
+    const match = handlePattern.exec(analysisText);
+    if (match) {
+      matches.push({ taskId, position: match.index });
+    }
+  }
+
+  // Contract (see docstring): return task_ids in the order their handles
+  // appear in analysisText, sorted by first-match position.
+  matches.sort((a, b) => a.position - b.position);
+  return matches.map((entry) => entry.taskId);
 }
 
 /**
@@ -2420,18 +2460,16 @@ point of self-repo. Just do it and tell the user in whats_changed.` : '';
     if (!thinkerGateResult.ok) return;
     const analysisText = thinkerGateResult.analysisText;
 
-    // Scan thinker analysis for cited memo IDs and persist them via the API.
+    // Scan thinker analysis for cited memo handles and persist them via the API.
     // The completion handler reads task.context["_strategic_cited_memo_ids"] to
     // count memos_cited — scanning the analysis text (where memos were shown
-    // to the agent) is reliable; the previous fallback scanned the status message
-    // (a mechanical template) which can never contain a memo task id.
+    // to the agent) is reliable. Memos are cited by short handles (M0, M1, M2)
+    // rather than task UUIDs, which are fragile for LLMs to reproduce exactly.
     const memoCitations = Array.isArray(payload.memo_citations)
       ? payload.memo_citations as Array<Record<string, unknown>>
       : [];
     if (memoCitations.length > 0) {
-      const citedMemoIds = memoCitations
-        .filter(m => typeof m.task_id === 'string' && m.task_id && analysisText.includes(m.task_id))
-        .map(m => m.task_id as string);
+      const citedMemoIds = resolveMemoHandles(analysisText, memoCitations);
       try {
         await apiPost('/api/agent/strategic', {
           task_id: taskId,
