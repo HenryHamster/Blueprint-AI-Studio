@@ -1455,33 +1455,42 @@ async def list_pull_requests_for_commit(
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    response = await _github_request(
-        "GET",
-        f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}/pulls",
-        headers,
-        project_id=project_id,
+    all_prs: list[dict] = []
+    url: str | None = (
+        f"https://api.github.com/repos/{owner}/{repo}/commits/{sha}/pulls?per_page=100"
     )
-    if response.status_code != 200:
-        logger.warning(
-            "[GITHUB] list_pull_requests_for_commit: %s/%s commit %s returned %s",
-            owner,
-            repo,
-            sha[:8] if sha else sha,
-            response.status_code,
+    while url:
+        response = await _github_request(
+            "GET",
+            url,
+            headers,
+            project_id=project_id,
         )
-        return []
-    try:
-        data = response.json()
-    except (ValueError, TypeError):
-        logger.warning(
-            "[GITHUB] list_pull_requests_for_commit: unparseable body for "
-            "%s/%s commit %s",
-            owner,
-            repo,
-            sha[:8] if sha else sha,
-        )
-        return []
-    return data if isinstance(data, list) else []
+        if response.status_code != 200:
+            logger.warning(
+                "[GITHUB] list_pull_requests_for_commit: %s/%s commit %s returned %s",
+                owner,
+                repo,
+                sha[:8] if sha else sha,
+                response.status_code,
+            )
+            return []
+        try:
+            page = response.json()
+        except (ValueError, TypeError):
+            logger.warning(
+                "[GITHUB] list_pull_requests_for_commit: unparseable body for "
+                "%s/%s commit %s",
+                owner,
+                repo,
+                sha[:8] if sha else sha,
+            )
+            return []
+        if not isinstance(page, list):
+            return []
+        all_prs.extend(page)
+        url = response.links.get("next", {}).get("url")
+    return all_prs
 
 
 async def is_ancestor_of(

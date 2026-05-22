@@ -950,6 +950,117 @@ async def test_rate_limit_requeue_blacklists_account_and_skips_budget(
     )
 
 
+@pytest.mark.asyncio
+async def test_reaper_account_cooldown_silent_death_free_requeue(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Silent death (no rate-limit keywords) with account in cooldown → RATE_LIMIT free requeue.
+
+    Regression guard for the account-state correlation path through the REAPER.
+    The existing test triggers on a log keyword; this one drives classification
+    purely via account state so a future change to keyword detection can't mask
+    a broken correlation path.
+    """
+    disable_mock = mocker.patch(
+        "app.max_plan_pool.disable_account_model", new_callable=AsyncMock
+    )
+    mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
+    # Stub account-state correlation to return True — isolates the REAPER free-requeue
+    # path from the account-pool internals (those are tested in test_failure_classification.py).
+    mocker.patch(
+        "app.failure_classification._account_was_rate_limited", return_value=True
+    )
+
+    account_id = "acct-rl-silent"
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "model": "sonnet"}],
+        vm_instance_id="vm-rl-silent",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={
+            "max_plan_account_id": account_id,
+            # No rate-limit keywords in last_error — correlation driven purely by account state.
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    ctx = t.context or {}
+    assert t.status == TaskStatus.QUEUED, "account-correlated RL must requeue"
+    assert t.attempt_count == 1, "account-correlated RL must not burn attempt budget"
+    assert account_id in (ctx.get("blacklisted_accounts") or [])
+    assert "max_plan_account_id" not in ctx
+    disable_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reaper_account_cooldown_uses_failure_instant_not_sweep_time(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """at_time=last_heartbeat is passed so edge-of-cooldown failures are caught.
+
+    Scenario: account was disabled before the task's last_heartbeat but the
+    cooldown has since expired by sweep time. The reaper must pass
+    at_time=task.last_heartbeat so classify_failure evaluates the account
+    state at the failure instant, not at the (later) sweep instant.
+
+    The side_effect returns True only when at_time is not None (i.e., when the
+    reaper correctly passes at_time=last_heartbeat). If the reaper passed
+    at_time=None instead, the side_effect returns False and the task would be
+    classified AGENT_TIMEOUT — burning a retry attempt.
+    """
+    disable_mock = mocker.patch(
+        "app.max_plan_pool.disable_account_model", new_callable=AsyncMock
+    )
+    mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
+
+    def _rl_only_at_heartbeat(task, at_time=None):
+        # Simulate cooldown active at failure instant (at_time set) but expired now.
+        return at_time is not None
+
+    mocker.patch(
+        "app.failure_classification._account_was_rate_limited",
+        side_effect=_rl_only_at_heartbeat,
+    )
+
+    account_id = "acct-rl-edge"
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "model": "sonnet"}],
+        vm_instance_id="vm-rl-edge",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=20),
+        context={
+            "max_plan_account_id": account_id,
+            # No rate-limit keywords — correlation via account state at failure instant only.
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    ctx = t.context or {}
+    assert t.status == TaskStatus.QUEUED, (
+        "failure at tail of rate-limit window must still classify RATE_LIMIT "
+        "(at_time=last_heartbeat fix)"
+    )
+    assert t.attempt_count == 1, (
+        "must not burn attempt budget (at_time=last_heartbeat plumbing)"
+    )
+    assert account_id in (ctx.get("blacklisted_accounts") or [])
+    disable_mock.assert_awaited_once()
+
+
 # ── Non-provision failure classification & retry delay selection ─────────
 
 

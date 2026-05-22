@@ -1215,7 +1215,12 @@ async def reaper_service():
                         )
                     )
                     is_rate_limited = (
-                        classify_failure(task, logs=combined_logs) == "RATE_LIMIT"
+                        classify_failure(
+                            task,
+                            logs=combined_logs,
+                            at_time=task.last_heartbeat,
+                        )
+                        == "RATE_LIMIT"
                     )
 
                     # ── EXTERNAL I/O BLOCK (no row lock held) ─────────────────
@@ -1655,7 +1660,9 @@ async def reaper_service():
                         # left no error context (pure heartbeat timeout), fall back to
                         # AGENT_TIMEOUT rather than the default CODE_ERROR — a silent death
                         # is not a code defect.
-                        reap_failure_class = classify_failure(task, logs=combined_logs)
+                        reap_failure_class = classify_failure(
+                            task, logs=combined_logs, at_time=task.last_heartbeat
+                        )
                         if (
                             reap_failure_class == "CODE_ERROR"
                             and not combined_logs.strip()

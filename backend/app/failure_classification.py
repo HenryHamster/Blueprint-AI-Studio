@@ -525,13 +525,17 @@ def _persist_rate_limit_signal_context(task: "Task", signal) -> None:
         logger.exception("[FAILURE_CLASS] Failed to persist rate_limit_* keys")
 
 
-def _account_was_rate_limited(task: "Task") -> bool:
+def _account_was_rate_limited(task: "Task", at_time: "datetime | None" = None) -> bool:
     """Return True if the task's assigned account was in rate-limit cooldown.
 
     Reads the in-memory pool state (_account_by_id). Returns False when the
     account is unresolvable (pool empty, standalone test path, no account
     assigned) so callers degrade to today's text-only classification.
     Never raises — any exception returns False.
+
+    at_time: reference timestamp for the cooldown check. Pass task.last_heartbeat
+    (the failure instant) so a reaper lag between failure and sweep cannot cause
+    a rate-limited silent death to miss the correlation. Defaults to _utcnow().
     """
     try:
         from app.max_plan_pool import (
@@ -549,10 +553,9 @@ def _account_was_rate_limited(task: "Task") -> bool:
         dm = acct.get("disabled_models") or {}
         if not dm:
             return False
-        # Use naive UTC (_utcnow) to match max_plan_pool's stored 'at' datetimes,
-        # which are naive (set via _utcnow at write time). An aware now here would
-        # raise TypeError on the subtraction below and silently no-op the feature.
-        now = _utcnow()
+        # Use naive UTC to match max_plan_pool's stored 'at' datetimes (naive via
+        # _utcnow at write time). An aware datetime here would raise TypeError.
+        now = at_time if at_time is not None else _utcnow()
         for info in dm.values():
             at_dt = info.get("at")
             if at_dt is None:
@@ -1412,10 +1415,10 @@ def get_account_failure_class_counts(
 
 
 def classify_failure_with_confidence(
-    task: "Task", logs: str | None = None
+    task: "Task", logs: str | None = None, at_time: "datetime | None" = None
 ) -> FailureClassification:
     """Classify a failure and return a cheap rule-derived confidence score."""
-    failure_class = _classify_failure_class(task, logs)
+    failure_class = _classify_failure_class(task, logs, at_time=at_time)
     agent_category = (task.context or {}).get("failure_category")
     combined = (
         (task.latest_status_message or "").lower() + " " + (logs or "").lower()
@@ -1475,7 +1478,9 @@ def classify_failure_with_confidence(
     return FailureClassification(failure_class=failure_class, confidence=0.7)
 
 
-def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
+def _classify_failure_class(
+    task: "Task", logs: str | None = None, at_time: "datetime | None" = None
+) -> str:
     """Classify a task failure for deployment monitoring.
     Returns: CODE_ERROR, PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API,
     RATE_LIMIT, SCOPE_OVERFLOW, MIGRATION_ERROR, BLOCKED_PRECONDITION."""
@@ -1513,7 +1518,7 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
                     return VIEWPORT_REGRESSION
                 if (
                     agent_lower in _ALL_GENERIC_CODE_ERROR_LABELS
-                    and _account_was_rate_limited(task)
+                    and _account_was_rate_limited(task, at_time=at_time)
                 ):
                     return RATE_LIMIT
             return mapped
@@ -1529,8 +1534,11 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     combined = status_msg + " " + logs_lower
 
     # Empty/whitespace-only combined log — agent crashed or never communicated.
-    # Classify as AGENT_TIMEOUT (infra) rather than falling through to CODE_ERROR.
+    # Check account state FIRST: a silent death during a rate-limit cooldown
+    # should classify as RATE_LIMIT, not AGENT_TIMEOUT, so no retry attempt is burned.
     if not combined.strip():
+        if _account_was_rate_limited(task, at_time=at_time):
+            return RATE_LIMIT
         return AGENT_TIMEOUT
 
     # Migration-specific failures — alembic chain/head errors, missing migration
@@ -1791,7 +1799,7 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     # assigned account was in rate-limit cooldown. Generic failures (no keywords,
     # no structured signal) during a multi-hour block are most likely throttling-
     # induced; classifying as RATE_LIMIT avoids burning a retry attempt.
-    if _account_was_rate_limited(task):
+    if _account_was_rate_limited(task, at_time=at_time):
         return RATE_LIMIT
 
     # Default: code error — record fingerprint for residual-pattern analysis.
@@ -1802,9 +1810,11 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     return "CODE_ERROR"
 
 
-def classify_failure(task: "Task", logs: str | None = None) -> str:
+def classify_failure(
+    task: "Task", logs: str | None = None, at_time: "datetime | None" = None
+) -> str:
     """Backward-compatible shim that returns only the failure class string."""
-    return classify_failure_with_confidence(task, logs).failure_class
+    return classify_failure_with_confidence(task, logs, at_time=at_time).failure_class
 
 
 # ---------------------------------------------------------------------------

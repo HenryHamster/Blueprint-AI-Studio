@@ -733,6 +733,12 @@ async def _resolve_candidate_ci(
             "detail": "no check-runs on candidate and no PR head with CI",
         }
 
+    # Exhaustive RED-preferring sweep: inspect every PR head before deciding.
+    # A red on ANY head must win over a green on another head regardless of the
+    # order GitHub returns them — return green only when at least one head is
+    # green AND no associated head is red.
+    first_red_sha: str | None = None
+    first_green_sha: str | None = None
     for head_sha in head_shas:
         try:
             pr_checks = await github.get_check_runs_cached(
@@ -754,22 +760,26 @@ async def _resolve_candidate_ci(
             )
             continue
         pr_state = _classify_check_runs(pr_checks)
-        if pr_state == _CI_RED:
-            return {
-                "state": _CI_RED,
-                "ci_green": False,
-                "resolved_sha": head_sha,
-                "detail": "PR head check-runs failed",
-            }
-        if pr_state == _CI_GREEN:
-            return {
-                "state": _CI_GREEN,
-                "ci_green": True,
-                "resolved_sha": head_sha,
-                "detail": "PR head check-runs passed",
-            }
-        # pending / no_checks on this PR head — keep looking.
+        if pr_state == _CI_RED and first_red_sha is None:
+            first_red_sha = head_sha
+        elif pr_state == _CI_GREEN and first_green_sha is None:
+            first_green_sha = head_sha
+        # pending / no_checks — keep inspecting remaining heads.
 
+    if first_red_sha is not None:
+        return {
+            "state": _CI_RED,
+            "ci_green": False,
+            "resolved_sha": first_red_sha,
+            "detail": "PR head check-runs failed",
+        }
+    if first_green_sha is not None:
+        return {
+            "state": _CI_GREEN,
+            "ci_green": True,
+            "resolved_sha": first_green_sha,
+            "detail": "PR head check-runs passed",
+        }
     return {
         "state": _CI_PENDING,
         "ci_green": False,

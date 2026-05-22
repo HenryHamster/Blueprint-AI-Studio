@@ -2684,6 +2684,57 @@ async def test_list_pull_requests_for_commit_non_list_body_returns_empty(mocker)
     assert result == []
 
 
+@pytest.mark.asyncio
+async def test_list_pull_requests_for_commit_paginates_all_pages(mocker):
+    """list_pull_requests_for_commit must follow Link: rel=next headers and
+    return all PRs across all pages.  A PR on page 2 whose head carries the
+    failing CI check must not be silently dropped."""
+    from app.github import list_pull_requests_for_commit
+
+    page1 = [
+        {
+            "number": 1,
+            "state": "closed",
+            "merged_at": "2026-01-01T00:00:00Z",
+            "head": {"sha": "sha_green_pr"},
+        }
+    ]
+    page2 = [
+        {
+            "number": 2,
+            "state": "closed",
+            "merged_at": "2026-01-02T00:00:00Z",
+            "head": {"sha": "sha_red_pr"},
+        }
+    ]
+
+    call_count = 0
+
+    def _mock_request(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return MockResponse(
+                200,
+                page1,
+                links={
+                    "next": {
+                        "url": "https://api.github.com/repos/owner/repo/commits/sha/pulls?per_page=100&page=2"
+                    }
+                },
+            )
+        return MockResponse(200, page2)
+
+    mocker.patch("httpx.AsyncClient.request", side_effect=_mock_request)
+
+    result = await list_pull_requests_for_commit("tok", "owner", "repo", "sha_multi")
+
+    assert len(result) == 2
+    assert result[0]["number"] == 1
+    assert result[1]["number"] == 2
+    assert call_count == 2
+
+
 # ---------------------------------------------------------------------------
 # get_check_runs: treat_missing_as_success=False (strict mode)
 # ---------------------------------------------------------------------------

@@ -891,6 +891,112 @@ async def test_resolve_candidate_ci_check_runs_fetch_error_returns_pending(mocke
     assert result["state"] == rq._CI_PENDING
 
 
+@pytest.mark.asyncio
+async def test_resolve_candidate_ci_no_checks_pr_head_red_returns_red(mocker):
+    """Candidate has no check-runs; CI ran on the PR head and is RED → ci_green=False."""
+    pr_head_sha = "pr_head_red0001"
+
+    async def _check_runs_side_effect(token, owner, repo, sha, **kwargs):
+        if sha == "candidate_red":
+            return {"status": "no_checks", "conclusion": None, "details": []}
+        return {"status": "completed", "conclusion": "failure", "details": []}
+
+    mocker.patch(
+        "app.github.get_check_runs_cached", side_effect=_check_runs_side_effect
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(
+            return_value=[
+                {
+                    "number": 7,
+                    "merged_at": "2026-01-01T00:00:00Z",
+                    "head": {"sha": pr_head_sha},
+                }
+            ]
+        ),
+    )
+    result = await rq._resolve_candidate_ci("tok", "owner", "repo", "candidate_red")
+    assert result["ci_green"] is False
+    assert result["state"] == rq._CI_RED
+    assert result["resolved_sha"] == pr_head_sha
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_ci_no_checks_pr_head_pending_returns_pending(mocker):
+    """Candidate has no check-runs; PR head CI still in progress → pending (not-green)."""
+    pr_head_sha = "pr_head_pending01"
+
+    async def _check_runs_side_effect(token, owner, repo, sha, **kwargs):
+        if sha == "candidate_pend":
+            return {"status": "no_checks", "conclusion": None, "details": []}
+        return {"status": "in_progress", "conclusion": None, "details": []}
+
+    mocker.patch(
+        "app.github.get_check_runs_cached", side_effect=_check_runs_side_effect
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(
+            return_value=[
+                {
+                    "number": 8,
+                    "merged_at": "2026-01-01T00:00:00Z",
+                    "head": {"sha": pr_head_sha},
+                }
+            ]
+        ),
+    )
+    result = await rq._resolve_candidate_ci("tok", "owner", "repo", "candidate_pend")
+    assert result["ci_green"] is False
+    assert result["state"] == rq._CI_PENDING
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_ci_red_beats_green_across_multiple_pr_heads(mocker):
+    """With multiple PR heads, a red result on any head must win over a green on
+    another head — regardless of which order GitHub returns them.  The resolver
+    is exhaustive: it inspects all PR heads and returns red if any is red."""
+    green_sha = "pr_head_green01"
+    red_sha = "pr_head_red0002"
+
+    async def _check_runs_side_effect(token, owner, repo, sha, **kwargs):
+        if sha == "candidate_multi":
+            return {"status": "no_checks", "conclusion": None, "details": []}
+        if sha == green_sha:
+            return {"status": "completed", "conclusion": "success", "details": []}
+        if sha == red_sha:
+            return {"status": "completed", "conclusion": "failure", "details": []}
+        return {"status": "no_checks", "conclusion": None, "details": []}
+
+    mocker.patch(
+        "app.github.get_check_runs_cached", side_effect=_check_runs_side_effect
+    )
+    # Green head is listed FIRST — the resolver must not short-circuit on it.
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(
+            return_value=[
+                {
+                    "number": 10,
+                    "merged_at": "2026-01-01T00:00:00Z",
+                    "head": {"sha": green_sha},
+                },
+                {
+                    "number": 11,
+                    "merged_at": "2026-01-02T00:00:00Z",
+                    "head": {"sha": red_sha},
+                },
+            ]
+        ),
+    )
+    result = await rq._resolve_candidate_ci("tok", "owner", "repo", "candidate_multi")
+    # Red must win despite being listed after the green PR.
+    assert result["ci_green"] is False
+    assert result["state"] == rq._CI_RED
+    assert result["resolved_sha"] == red_sha
+
+
 # ===========================================================================
 # Shared fixtures for the DB-backed coordinator tests
 # ===========================================================================
