@@ -1596,11 +1596,25 @@ async def _spawn_strategic_review(
                     logger.exception(
                         "[STRATEGIC] could not resolve integration branch SHA for bootstrap"
                     )
+                # Snapshot the project's current focus as the version's goal.
+                _bootstrap_goal: str | None = None
+                try:
+                    from app.problem_model import parse_problem_model
+
+                    _bootstrap_goal = (
+                        parse_problem_model(project.problem_model).intent.current_focus
+                        or None
+                    )
+                except Exception:
+                    logger.exception(
+                        "[STRATEGIC] could not read current_focus for version goal"
+                    )
                 _open_version = await ensure_initial_release_version(
                     session,
                     project.id,
                     integration_branch=_integration_branch,
                     base_sha=_bootstrap_sha,
+                    goal=_bootstrap_goal,
                 )
             if _open_version is not None:
                 _tasks_merged = await count_merged_since(

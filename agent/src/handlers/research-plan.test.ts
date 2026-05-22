@@ -1222,6 +1222,22 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toContain('hardening');
   });
 
+  it('renders the version goal when present', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'build',
+      goal: 'Make the admin UI mobile-responsive',
+    });
+    expect(result).toContain('Goal: Make the admin UI mobile-responsive');
+  });
+
+  it('omits the Goal line when goal is absent or empty', () => {
+    const absent = buildVersionPhaseSection({ version_number: 4, phase: 'build' });
+    expect(absent).not.toContain('Goal:');
+    const blank = buildVersionPhaseSection({ version_number: 4, phase: 'build', goal: '   ' });
+    expect(blank).not.toContain('Goal:');
+  });
+
   it('instructs agent to emit version_phase_decision when flipping', () => {
     const result = buildVersionPhaseSection({ version_number: 1, phase: 'build' });
     expect(result).toContain('version_phase_decision');

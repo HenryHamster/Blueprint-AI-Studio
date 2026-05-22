@@ -9,13 +9,13 @@ the qualifier (Phase 3) drives status transitions (open → promoted).
 
 Public API:
 
-  open_version(session, project_id, *, version_number, base_sha, phase)
+  open_version(session, project_id, *, version_number, base_sha, phase, goal)
       Insert a new open version row (idempotent via UNIQUE constraint).
 
   current_open_version(session, project_id)
       Return the single ``status="open"`` row for a project, or None.
 
-  ensure_initial_release_version(session, project_id, *, integration_branch, base_sha)
+  ensure_initial_release_version(session, project_id, *, integration_branch, base_sha, goal)
       Bootstrap version 1 in the ``stabilize`` phase when no version row
       exists for the project and the integration branch is not "main".
       Idempotent: no-op if any version row already exists.  Caller must commit.
@@ -57,6 +57,10 @@ logger = logging.getLogger(__name__)
 _VALID_PHASES = frozenset({"build", "stabilize"})
 _PHASE_REASONING_MAX = 500
 
+# Cap on the persisted version ``goal`` — a snapshot of intent.current_focus,
+# which is meant to be a concise statement.  Mirrors _PHASE_REASONING_MAX.
+_GOAL_MAX = 500
+
 
 async def open_version(
     session: AsyncSession,
@@ -65,6 +69,7 @@ async def open_version(
     version_number: int,
     base_sha: str | None = None,
     phase: str = "build",
+    goal: str | None = None,
 ) -> ReleaseVersion:
     """Insert a new open ``ReleaseVersion`` row for ``project_id``.
 
@@ -78,6 +83,11 @@ async def open_version(
 
     ``phase`` defaults to ``"build"``; pass ``"stabilize"`` to bootstrap a
     version over an already-diverged trunk that is ready to qualify.
+
+    ``goal`` is a point-in-time snapshot of ``ProblemModel.intent.current_focus``
+    — what this version is *for*.  Stored verbatim (truncated to ``_GOAL_MAX``)
+    and frozen for the version's lifetime; ``None`` when the project has no
+    current focus.
     """
     if phase not in _VALID_PHASES:
         raise ValueError(
@@ -91,6 +101,7 @@ async def open_version(
         status="open",
         opened_at=_utcnow(),
         base_sha=base_sha,
+        goal=goal[:_GOAL_MAX] if goal else None,
     )
     session.add(version)
     logger.info(
@@ -141,6 +152,7 @@ async def ensure_initial_release_version(
     *,
     integration_branch: str,
     base_sha: str | None = None,
+    goal: str | None = None,
 ) -> ReleaseVersion | None:
     """Bootstrap version 1 when no ReleaseVersion row exists for the project.
 
@@ -155,6 +167,9 @@ async def ensure_initial_release_version(
       qualifier's ``main…HEAD`` diff would be empty.
     - Any ``ReleaseVersion`` row already exists — the lifecycle has already
       started (either open, or previously promoted / abandoned).
+
+    ``goal`` snapshots ``ProblemModel.intent.current_focus`` onto the new
+    version (see :func:`open_version`).
 
     Caller is responsible for committing the session.
     """
@@ -186,6 +201,7 @@ async def ensure_initial_release_version(
         version_number=1,
         base_sha=base_sha,
         phase="stabilize",
+        goal=goal,
     )
 
 
@@ -281,6 +297,7 @@ def to_phase_block(version: ReleaseVersion) -> dict[str, Any]:
     return {
         "version_number": version.version_number,
         "phase": version.phase,
+        "goal": version.goal,
         "phase_changed_at": version.phase_changed_at.isoformat()
         if version.phase_changed_at
         else None,

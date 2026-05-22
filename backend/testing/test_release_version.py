@@ -259,6 +259,44 @@ async def test_open_version_inserts_open_build_row(db_session):
 
 
 @pytest.mark.asyncio
+async def test_open_version_stores_goal(db_session):
+    """open_version persists the goal snapshot when provided."""
+    project = await _make_project(db_session)
+    version = await rv.open_version(
+        db_session,
+        project.id,
+        version_number=1,
+        goal="Ship the mobile-responsive admin UI",
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.goal == "Ship the mobile-responsive admin UI"
+
+
+@pytest.mark.asyncio
+async def test_open_version_goal_defaults_to_none(db_session):
+    """open_version leaves goal as None when not provided."""
+    project = await _make_project(db_session)
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.goal is None
+
+
+@pytest.mark.asyncio
+async def test_open_version_truncates_long_goal(db_session):
+    """A goal longer than _GOAL_MAX is truncated to the cap."""
+    project = await _make_project(db_session)
+    version = await rv.open_version(
+        db_session, project.id, version_number=1, goal="g" * 5000
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.goal is not None
+    assert len(version.goal) == rv._GOAL_MAX
+
+
+@pytest.mark.asyncio
 async def test_current_open_version_returns_none_when_absent(db_session):
     """No open version → None."""
     project = await _make_project(db_session)
@@ -406,18 +444,20 @@ def test_to_phase_block_shape():
         opened_at=_utcnow(),
         phase_changed_at=_utcnow(),
         phase_reasoning="ready to qualify",
+        goal="Ship the mobile-responsive admin UI",
         last_qualification={"status": "pending"},
     )
     block = rv.to_phase_block(version)
     assert block["version_number"] == 3
     assert block["phase"] == "stabilize"
+    assert block["goal"] == "Ship the mobile-responsive admin UI"
     assert block["phase_changed_at"] is not None
     assert block["phase_reasoning"] == "ready to qualify"
     assert block["last_qualification"] == {"status": "pending"}
 
 
 def test_to_phase_block_phase_reasoning_none_when_absent():
-    """A version with no phase_reasoning yields None for that key."""
+    """A version with no phase_reasoning / goal yields None for those keys."""
     version = ReleaseVersion(
         version_number=1,
         phase="build",
@@ -426,6 +466,7 @@ def test_to_phase_block_phase_reasoning_none_when_absent():
     )
     block = rv.to_phase_block(version)
     assert block["phase_reasoning"] is None
+    assert block["goal"] is None
 
 
 def test_to_phase_block_handles_none_phase_changed_at():
@@ -558,6 +599,23 @@ async def test_ensure_initial_release_version_creates_stabilize_version(db_sessi
     assert version.phase == "stabilize"
     assert version.status == "open"
     assert version.base_sha == "deadbeef"
+
+
+@pytest.mark.asyncio
+async def test_ensure_initial_release_version_snapshots_goal(db_session):
+    """The goal passed to the bootstrap is persisted on version 1."""
+    project = await _make_project(db_session)
+    version = await rv.ensure_initial_release_version(
+        db_session,
+        project.id,
+        integration_branch="automain",
+        base_sha="deadbeef",
+        goal="Bootstrap the LTS release line",
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version is not None
+    assert version.goal == "Bootstrap the LTS release line"
 
 
 @pytest.mark.asyncio

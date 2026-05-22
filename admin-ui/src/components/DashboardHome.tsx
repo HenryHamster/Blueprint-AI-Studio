@@ -524,6 +524,11 @@ function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: 
               <span className="text-[10px] text-neutral-500">{cv.merged_task_count} tasks merged</span>
               {cv.qualification_attempts > 0 && <span className="text-[10px] text-neutral-500">{cv.qualification_attempts} qual{cv.qualification_attempts !== 1 ? 's' : ''}</span>}
             </div>
+            {cv.goal && (
+              <p className="text-[11px] text-neutral-300" title={cv.goal}>
+                <span className="text-neutral-500">Goal: </span>{cv.goal}
+              </p>
+            )}
             {cv.phase_reasoning && (
               <p className="text-[10px] text-neutral-400 italic truncate" title={cv.phase_reasoning}>{cv.phase_reasoning}</p>
             )}
