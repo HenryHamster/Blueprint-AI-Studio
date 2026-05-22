@@ -1919,7 +1919,7 @@ async def reaper_service():
                                 _reap_failure_class = (
                                     "PROVISION_FAILURE"
                                     if is_provision_failure
-                                    else classify_failure(task, logs=combined_logs)
+                                    else reap_failure_class
                                 )
                                 _fingerprint = _error_fingerprint(reap_reason)
                                 # Audit W1: previous_error_fingerprint is a column.

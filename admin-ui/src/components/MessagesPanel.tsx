@@ -568,7 +568,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
   const otherHighSignal = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type !== 'BLOCKER') : highSignalOpen;
 
   // Failing routine groups auto-promoted above the routine ops section
-  const { promotedGroups, remainingRoutineRows, autoExpandedKeys } = useMemo(() => {
+  const { promotedGroups, remainingRoutineRows, autoExpandedKeys, visibleRoutineCount, mutedRoutineCount } = useMemo(() => {
     const rows = collapseStaleRoutineRows(groupRoutineMessages(routineOpen));
     const promoted = rows.filter(
       (r): r is RoutineRow<ProjectMessage> & { kind: 'group' } =>
@@ -585,10 +585,19 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
         .filter((r): r is RoutineRow<ProjectMessage> & { kind: 'group' } => r.kind === 'group' && r.msgs.length > 0)
         .map(r => r.key)
     );
+    // Calculate shown vs muted routine message counts when mute is active
+    let visible = routineOpen.length;
+    let muted = 0;
+    if (muteActive && promoted.length > 0) {
+      visible = promoted.reduce((sum, row) => sum + row.msgs.length, 0);
+      muted = routineOpen.length - visible;
+    }
     return {
       promotedGroups: promoted,
       remainingRoutineRows: remaining,
       autoExpandedKeys: searchQuery.trim() ? withMatches : new Set<string>(),
+      visibleRoutineCount: visible,
+      mutedRoutineCount: muted,
     };
   }, [routineOpen, eventPrefs, muteActive, searchQuery]);
 
@@ -1926,7 +1935,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                     className="flex-1 flex items-center gap-2 px-4 py-2.5 text-left"
                   >
                     <ChevronDown className={`w-3.5 h-3.5 text-neutral-600 shrink-0 transition-transform ${routineExpanded ? 'rotate-180' : ''}`} />
-                    <span className="text-xs text-neutral-500 font-medium shrink-0">{routineOpen.length} routine ops</span>
+                    <span className="text-xs text-neutral-500 font-medium shrink-0">
+                      {visibleRoutineCount} routine ops
+                      {mutedRoutineCount > 0 && <span className="text-neutral-600 ml-1">({mutedRoutineCount} muted)</span>}
+                    </span>
                     <span className="text-[11px] text-neutral-600 truncate">{routineSummary(routineOpen)}</span>
                   </button>
                   <div className="relative shrink-0 px-2">

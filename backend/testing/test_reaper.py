@@ -1061,6 +1061,44 @@ async def test_reaper_account_cooldown_uses_failure_instant_not_sweep_time(
     disable_mock.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_reaper_enrichment_block_records_failure_class_from_initial_classification(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Regression guard: the enrichment block that writes _previous_failure_class
+    reuses reap_failure_class (computed at line 1663 with at_time=last_heartbeat)
+    rather than calling classify_failure a second time after last_heartbeat is
+    cleared to None.
+
+    Before the fix, a re-call without at_time could diverge from reap_failure_class
+    for edge-of-cooldown failures. Verified here for the AGENT_TIMEOUT case:
+    the enrichment block must write 'AGENT_TIMEOUT', not another class.
+    """
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "model": "sonnet"}],
+        vm_instance_id="vm-enrich-at",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=20),
+        # No last_error, no rate-limit keywords → AGENT_TIMEOUT
+        context={},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    ctx = t.context or {}
+    assert t.status == TaskStatus.QUEUED
+    assert ctx.get("_previous_failure_class") == "AGENT_TIMEOUT", (
+        "enrichment block must write the same class as reap_failure_class "
+        "(AGENT_TIMEOUT for heartbeat timeout with empty logs)"
+    )
+
+
 # ── Non-provision failure classification & retry delay selection ─────────
 
 

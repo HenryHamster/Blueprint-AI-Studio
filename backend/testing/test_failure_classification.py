@@ -2437,3 +2437,79 @@ class TestPoolWideRateLimitCorrelation:
             pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
         )
         assert _pool_was_rate_limited(at_time=datetime.now(tz=timezone.utc)) is True
+
+
+class TestAtTimeFailureInstantCorrelation:
+    """Verifies that classify_failure respects at_time so a rate-limit window
+    that has already expired by sweep time is still detected at failure time."""
+
+    def _make_rl_account(self, account_id: str, *, in_cooldown: bool):
+        """Return a fake pool entry whose cooldown state matches in_cooldown."""
+        if in_cooldown:
+            from datetime import datetime, timedelta
+
+            return {
+                "id": account_id,
+                "disabled_models": {
+                    "claude-sonnet-4-6": {
+                        "at": datetime.utcnow() - timedelta(minutes=2),
+                        "kind": "rate_limit",
+                        "hits": 1,
+                    }
+                },
+            }
+        return {"id": account_id, "disabled_models": {}}
+
+    def test_account_rate_limited_at_failure_time_not_sweep_time(self, monkeypatch):
+        """A generic failure classified at the failure instant (at_time=failure_time)
+        is RATE_LIMIT; the same failure classified at sweep time (after cooldown
+        expires) falls back to CODE_ERROR.
+
+        This locks in the fix that threads at_time through to the account-state
+        correlation helpers so a short cooldown that expired before the reaper
+        sweep still protects the retry budget.
+        """
+        from datetime import datetime, timedelta
+        import app.max_plan_pool as pool_mod
+
+        account_id = "acct-at-time-test"
+
+        # Account was rate-limited; cooldown active at failure_time, expired by sweep_time.
+        def _account_corr(task, at_time=None):
+            # Simulate cooldown active only when at_time is provided (failure instant).
+            # When at_time is None (sweep time), the cooldown has already cleared.
+            return at_time is not None
+
+        monkeypatch.setattr(
+            pool_mod,
+            "_account_by_id",
+            {account_id: self._make_rl_account(account_id, in_cooldown=True)},
+        )
+        monkeypatch.setattr(
+            "app.failure_classification._account_was_rate_limited",
+            _account_corr,
+        )
+        # Pool-wide check must be disabled so only the account-level at_time
+        # correlation drives the result — isolates the variable under test.
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+
+        task = _task(
+            "",
+            ctx={
+                "failure_category": "claude_code_failed",
+                "llm_account_id": account_id,
+            },
+        )
+
+        # With at_time=failure_time (non-None), cooldown is detected → RATE_LIMIT.
+        failure_time = datetime.utcnow() - timedelta(minutes=5)
+        assert classify_failure(task, at_time=failure_time) == RATE_LIMIT, (
+            "failure at failure_time must be RATE_LIMIT (cooldown active then)"
+        )
+
+        # With at_time=None (sweep time), cooldown has expired → CODE_ERROR.
+        assert classify_failure(task, at_time=None) == CODE_ERROR, (
+            "failure re-classified at sweep time must be CODE_ERROR (cooldown expired)"
+        )

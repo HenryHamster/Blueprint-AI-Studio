@@ -916,7 +916,11 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
 
         # Capture before cancellation — cancellation overwrites both
         child_extra_logs = (child.context or {}).get("last_error", "")
-        failure_class = classify_failure(child, logs=child_extra_logs or None)
+        failure_class = classify_failure(
+            child,
+            logs=child_extra_logs or None,
+            at_time=child.vm_stopped_at or child.last_heartbeat,
+        )
         original_status_message = child.latest_status_message
 
         # BLOCKED_PRECONDITION: agent surfaced a "BLOCKER:" message and paused

@@ -11402,3 +11402,86 @@ async def test_generic_failure_with_healthy_account_burns_retry(
     assert task.attempt_count == 1, (
         f"attempt_count must be 1 after CODE_ERROR retry burn, got {task.attempt_count}"
     )
+
+
+@pytest.mark.asyncio
+async def test_requeue_parent_task_uses_vm_stopped_at_for_rate_limit_correlation(
+    db_session, mocker
+):
+    """_requeue_parent_task passes child.vm_stopped_at as at_time so a pool
+    rate-limit window that expired before the requeue sweep is still detected.
+
+    Scenario: child died during a pool rate-limit block; vm_stopped_at records
+    the death instant. By the time the parent is re-evaluated, the cooldown has
+    cleared. Without the at_time fix, classify_failure would check the pool at
+    sweep time (no cooldown) and return CODE_ERROR — reducing the parent's
+    requeue budget. With the fix, at_time=vm_stopped_at is passed, the cooldown
+    is detected, and the child's failure class is RATE_LIMIT (INFRA — budget
+    not reduced).
+
+    Verification: _account_was_rate_limited side_effect returns True only when
+    at_time is not None. If the call site omits at_time, the side_effect returns
+    False → CODE_ERROR → budget reduction in compute_effective_max_requeues.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    def _rl_only_at_failure_time(task, at_time=None):
+        # Return True (rate-limited) only when a failure instant was provided.
+        return at_time is not None
+
+    mocker.patch(
+        "app.failure_classification._account_was_rate_limited",
+        side_effect=_rl_only_at_failure_time,
+    )
+
+    project = Project(name="Requeue atTime Test", user_id="test-user-requeue-attime")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "investigate X"}],
+        vm_instance_id=None,
+        status=TaskStatus.EVALUATING,
+        attempt_count=0,
+        context={},
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    # Child died at vm_stopped_at — no rate-limit keywords in the error.
+    child = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do part of X"}],
+        vm_instance_id="vm-child-rl",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        attempt_count=1,
+        latest_status_message="Process exited with code 1",
+        vm_stopped_at=datetime.utcnow() - timedelta(minutes=30),
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=31),
+        context={"failure_category": "claude_code_failed"},
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    from app.task_lifecycle import _requeue_parent_task
+
+    await _requeue_parent_task(parent, db_session)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    # Parent should be re-queued for evaluation (EVALUATING), not failed.
+    assert parent.status == TaskStatus.EVALUATING, (
+        "parent must remain EVALUATING after rate-limit-correlated requeue "
+        f"(got {parent.status}); at_time plumbing may be broken"
+    )
+    # Requeue count must not exceed budget (RATE_LIMIT is INFRA — no reduction).
+    parent_ctx = parent.context or {}
+    assert parent_ctx.get("_requeue_count", 0) <= 1, (
+        "parent requeue count must be ≤1 after first requeue"
+    )
