@@ -17,6 +17,7 @@ accepted as a fallback so in-flight tasks from before the gate split still merge
 """
 
 import asyncio
+import contextlib
 import logging
 import re
 import uuid
@@ -474,6 +475,43 @@ async def _attempt_merge_with_retry_and_escalation(
             except Exception as e:
                 logger.warning(
                     f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True
+                )
+        # Promotion carrier task: the automain→main promotion PR just merged via
+        # the normal CI pipeline. Run the release-version bookkeeping (mark the
+        # version promoted, open the next one, tag). Gated on is_promotion so
+        # this is a no-op for every ordinary rollup/feature PR.
+        _promo_ctx = task.context or {}
+        if _promo_ctx.get("is_promotion") and _promo_ctx.get("release_version_id"):
+            try:
+                from app import release_qualifier
+                from app.github import get_branch_sha
+
+                _merged_sha = None
+                try:
+                    _merged_sha = await get_branch_sha(gh_token, owner, repo, "main")
+                except Exception:  # merge landed; SHA read is best-effort
+                    logger.warning(
+                        "[CI] promotion PR #%s merged but could not resolve main "
+                        "HEAD — bookkeeping will degrade to candidate_sha",
+                        ci_pr_number,
+                    )
+                await release_qualifier.finalize_promotion_landed(
+                    session,
+                    _promo_ctx["release_version_id"],
+                    token=gh_token,
+                    owner=owner,
+                    repo=repo,
+                    merged_sha=_merged_sha,
+                    pr_url=_promo_ctx.get("promotion_pr_url", ""),
+                )
+            except Exception as _promo_exc:
+                logger.error(
+                    "[CI] finalize_promotion_landed failed for promotion PR "
+                    "#%s (version %s): %r",
+                    ci_pr_number,
+                    _promo_ctx.get("release_version_id"),
+                    _promo_exc,
+                    exc_info=True,
                 )
         logger.info(f"[CI] PR #{ci_pr_number} merged ({source})")
         return True
@@ -1175,8 +1213,6 @@ async def handle_ci_completion(
     from app.main import _maybe_create_failure_alert
     from app.broadcast import broadcast_to_project
 
-    ci_marked_failed = False
-
     # Serialize concurrent callers (webhook + poller) by locking the task row.
     # skip_locked: if another handler already holds the lock, exit — it will
     # handle the CI result.
@@ -1195,6 +1231,13 @@ async def handle_ci_completion(
         )
         return False
     task = locked_task
+
+    # Identity snapshot: a rollback inside the failure-class helpers further
+    # below can expire ``task`` (a rollback defers every attr even with
+    # expire_on_commit=False), so the final broadcast must not re-read it.
+    # id/project_id are immutable — capture them now while ``task`` is fresh.
+    _bcast_task_id = str(task.id)
+    _bcast_project_id = str(task.project_id) if task.project_id else ""
 
     # Re-check: task may have been completed by the concurrent handler that held the lock
     if task.status != TaskStatus.EVALUATING:
@@ -1246,6 +1289,44 @@ async def handle_ci_completion(
             task, gh_token, owner, repo, session, source=source
         )
     else:
+        # Promotion carrier task: a red/failed CI on the automain→main promotion
+        # candidate is a quality signal about the *version*, not a PR to "fix".
+        # Revert the version to stabilize (so the next strategic cycle works the
+        # blocker) and mark the carrier FAILED — do NOT spawn a fix task.
+        # Gated on is_promotion so ordinary PRs keep the normal fix-spawn path.
+        _promo_ctx_fail = task.context or {}
+        if _promo_ctx_fail.get("is_promotion") and _promo_ctx_fail.get(
+            "release_version_id"
+        ):
+            from app import release_qualifier
+
+            await release_qualifier.revert_promotion_after_ci_failure(
+                session,
+                _promo_ctx_fail["release_version_id"],
+                reason=f"promotion PR #{ci_pr_number} CI failed",
+                red_build=True,
+            )
+            task.status = TaskStatus.FAILED
+            task.latest_status_message = (
+                f"Promotion PR #{ci_pr_number} CI failed — version returned to "
+                f"stabilize (no fix task spawned)"
+            )
+            from app.failure_classification import persist_failure_category
+
+            persist_failure_category(task, "CODE_ERROR")
+            session.add(task)
+            await session.commit()
+            await broadcast_to_project(
+                str(task.project_id),
+                "task_updated",
+                {"task_id": str(task.id), "status": task.status},
+            )
+            logger.warning(
+                f"[CI] Promotion PR #{ci_pr_number} CI failed — reverted version "
+                f"to stabilize ({source})"
+            )
+            return True
+
         # CI failed — spawn fix task
         # Phase F3 (H5): push pr_number filter into SQL via cast(..., Integer)
         # so ``ix_task_payloads_pr_number`` (alembic 0057) is usable on
@@ -1389,54 +1470,78 @@ async def handle_ci_completion(
                 f"[CI] PR #{ci_pr_number} CI failed, spawned fix → {fix_task.id} ({source})"
             )
         else:
-            task.status = TaskStatus.FAILED
-            ci_marked_failed = True
-            task.latest_status_message = (
+            _ci_fail_msg = (
                 f"CI failed on PR #{ci_pr_number}, fix not spawned (pipeline limit)"
             )
+            task.status = TaskStatus.FAILED
+            task.latest_status_message = _ci_fail_msg
             logger.error(
                 f"[CI] PR #{ci_pr_number} CI failed, fix spawn returned None ({source})"
             )
-            from app.failure_classification import (
-                classify_failure,
-                persist_failure_category,
+            # Persist the terminal FAILED transition NOW, on a known-healthy
+            # session, before the best-effort failure accounting below. Of the
+            # accounting helpers only ``_maybe_create_failure_alert`` touches
+            # the DB; an inner error there poisons the transaction, so a
+            # deferred commit would raise PendingRollbackError and strand the
+            # task in EVALUATING. Committing first makes FAILED durable.
+            session.add(task)
+            await session.commit()
+            await broadcast_to_project(
+                _bcast_project_id,
+                "task_updated",
+                {"task_id": _bcast_task_id, "status": TaskStatus.FAILED},
             )
-            from app.routers.agent_status import record_task_result
-            from app.shared_state import record_direction_result
 
-            _fc = classify_failure(task)
-            persist_failure_category(task, _fc)
-            record_task_result(
-                success=False,
-                failure_class=_fc,
-                task_id=str(task.id),
-                task_type=task.first_payload.get("type", ""),
-            )
-            _direction_id = str((task.context or {}).get("direction_id") or "")
-            if _direction_id:
-                record_direction_result(
-                    _direction_id,
+            # Best-effort failure accounting (classification, deploy-monitor
+            # signal, direction streak, alert). Isolated so a DB error here
+            # cannot undo the FAILED status already committed above.
+            try:
+                from app.failure_classification import (
+                    classify_failure,
+                    persist_failure_category,
+                )
+                from app.routers.agent_status import record_task_result
+                from app.shared_state import record_direction_result
+
+                _fc = classify_failure(task)
+                persist_failure_category(task, _fc)
+                record_task_result(
                     success=False,
                     failure_class=_fc,
-                    project_id=str(task.project_id) if task.project_id else "",
+                    task_id=_bcast_task_id,
+                    task_type=task.first_payload.get("type", ""),
                 )
+                _direction_id = str((task.context or {}).get("direction_id") or "")
+                if _direction_id:
+                    record_direction_result(
+                        _direction_id,
+                        success=False,
+                        failure_class=_fc,
+                        project_id=_bcast_project_id,
+                    )
+                await _maybe_create_failure_alert(task, session, _ci_fail_msg)
+                session.add(task)
+                await session.commit()
+            except Exception as acct_exc:
+                logger.warning(
+                    "[CI] failure accounting errored for task %s (%s) — FAILED "
+                    "status already persisted",
+                    _bcast_task_id,
+                    acct_exc,
+                    exc_info=True,
+                )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
+            return True
 
-    # Tracked via local rather than ``task.status`` re-read: the failure-class
-    # block above invokes session-touching helpers that can leave ``task`` in
-    # an expired state (rollback after inner DB error → all attrs deferred,
-    # next read fires a sync lazy-load that crashes under async + bad conn).
-    # Production 2026-05-08: ci_completion.py:1421 cascade.
-    if ci_marked_failed:
-        await _maybe_create_failure_alert(
-            task,
-            session,
-            f"CI failed on PR #{ci_pr_number}, fix not spawned (pipeline limit)",
-        )
+    # Reached only by the fix-spawned branch above — the fix-not-spawned
+    # branch commits and returns inline. ``task`` is not expired on this
+    # path (no session-poisoning failure accounting runs here).
     session.add(task)
     await session.commit()
     await broadcast_to_project(
-        str(task.project_id),
+        _bcast_project_id,
         "task_updated",
-        {"task_id": str(task.id), "status": task.status},
+        {"task_id": _bcast_task_id, "status": task.status},
     )
     return True

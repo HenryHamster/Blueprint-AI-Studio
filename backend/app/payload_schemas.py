@@ -273,6 +273,18 @@ class ReleaseAuditPayload(_SystemPopulated):
     prompt: str | None = None
 
 
+class PromotionMergePayload(_SystemPopulated):
+    """Payload for the synthetic promotion-merge carrier task.
+
+    The task is never dispatched to an agent — it sits in EVALUATING with a
+    ``review_loop`` so the orchestrator's CI-poll loop merges the
+    automain→main promotion PR via the normal CI-aware pipeline. ``pr_number``
+    identifies the promotion PR; ``branch`` is the release-v{N} head.
+    """
+
+    pr_number: int | None = None
+
+
 class QAPayload(_SystemPopulated):
     pass
 
@@ -342,6 +354,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.perf: PerfPayload,
     TaskType.self_audit: SelfAuditPayload,
     TaskType.release_audit: ReleaseAuditPayload,
+    TaskType.promotion_merge: PromotionMergePayload,
     TaskType.memo: MemoPayload,
 }
 

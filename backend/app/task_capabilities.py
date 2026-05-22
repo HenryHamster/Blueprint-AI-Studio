@@ -33,6 +33,7 @@ class TaskType(str, Enum):
     investigate = "investigate"
     self_audit = "self_audit"
     release_audit = "release_audit"
+    promotion_merge = "promotion_merge"
     memo = "memo"
 
 
@@ -188,6 +189,20 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         "Release Audit",
         "read_only",
         description="Audit the main...automain diff for the release qualifier.",
+    ),
+    TaskCapability(
+        TaskType.promotion_merge,
+        "Promotion Merge",
+        "read_only",
+        user_launchable=False,
+        provider_configurable=False,
+        filter_visible=False,
+        description=(
+            "Synthetic, never-dispatched carrier task: holds the automain→main "
+            "promotion PR while the orchestrator's CI-poll loop + "
+            "handle_ci_completion merge it (review pre-approved by the "
+            "release_audit). No agent VM is ever provisioned for it."
+        ),
     ),
     TaskCapability(
         TaskType.memo,

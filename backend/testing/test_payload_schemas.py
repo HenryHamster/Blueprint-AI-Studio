@@ -55,11 +55,12 @@ EXPECTED_TYPES = {
     "investigate",
     "self_audit",
     "release_audit",
+    "promotion_merge",
     "memo",
 }
 
 
-def test_task_type_enum_has_all_20_types():
+def test_task_type_enum_has_all_21_types():
     values = {t.value for t in TaskType}
     assert values == EXPECTED_TYPES
 
@@ -75,10 +76,10 @@ def test_model_for_type_covers_all_task_types():
     assert set(_MODEL_FOR_TYPE.keys()) == set(TaskType)
 
 
-def test_model_for_type_count_is_20():
+def test_model_for_type_count_is_21():
     from app.payload_schemas import _MODEL_FOR_TYPE
 
-    assert len(_MODEL_FOR_TYPE) == 20
+    assert len(_MODEL_FOR_TYPE) == 21
 
 
 # ---------------------------------------------------------------------------

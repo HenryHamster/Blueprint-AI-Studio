@@ -273,6 +273,14 @@ async def _qualification_in_flight(
     be spawning).
     """
     qual = version.last_qualification or {}
+    if qual.get("status") == "promoting":
+        # A promotion PR is enrolled in the CI-merge pipeline (awaiting CI then
+        # merge).  Treat as in flight so a re-emitted qualify_request / reaper
+        # sweep does not spawn a duplicate qualification or a second promotion
+        # PR while the merge is pending.  The terminal transition is
+        # finalize_promotion_landed (→ promoted) or
+        # revert_promotion_after_ci_failure (→ stabilize).
+        return True
     if qual.get("status") != "pending":
         return False
 
@@ -2579,6 +2587,86 @@ async def _check_version_promotion_readiness(
     return True
 
 
+async def _check_promoting_carrier_health(
+    session: AsyncSession, version: release_version.ReleaseVersion
+) -> bool:
+    """Safety net for a version stuck in the ``"promoting"`` state.
+
+    The normal terminal transitions are ``finalize_promotion_landed`` (the
+    promotion PR merged) and ``revert_promotion_after_ci_failure`` (CI failed,
+    via ``handle_ci_completion``).  But the carrier task can also die on a path
+    that bypasses ``handle_ci_completion`` — e.g. the orchestrator marks it
+    FAILED when the PR is deleted.  Without this check the version would stay
+    ``"promoting"`` forever and ``_qualification_in_flight`` would block every
+    future qualification.
+
+    - carrier missing / FAILED / CANCELLED ⇒ revert the version to stabilize.
+    - carrier COMPLETED but version still ``"promoting"`` ⇒ the PR merged but
+      bookkeeping did not commit; retry ``finalize_promotion_landed``
+      (idempotent) rather than revert (main already advanced).
+
+    Returns True if it wrote a change (so the caller commits).
+    """
+    if version.status != "open":
+        return False
+    qual = version.last_qualification or {}
+    if qual.get("status") != "promoting":
+        return False
+    task_id_raw = qual.get("promotion_task_id")
+    if not task_id_raw:
+        return False
+    try:
+        carrier = await session.get(Task, uuid.UUID(str(task_id_raw)))
+    except (ValueError, AttributeError):
+        return False
+
+    if carrier is None:
+        await revert_promotion_after_ci_failure(
+            session, version.id, reason="promotion carrier task missing"
+        )
+        return True
+
+    if carrier.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
+        await revert_promotion_after_ci_failure(
+            session,
+            version.id,
+            reason=f"promotion carrier {carrier.status.value} without a merge",
+        )
+        return True
+
+    if carrier.status == TaskStatus.COMPLETED:
+        # PR merged but finalize_promotion_landed never committed — retry it.
+        project = await session.get(Project, version.project_id)
+        token = owner = repo = merged_sha = None
+        resolved = (
+            await _resolve_github_with_session(session, project) if project else None
+        )
+        if resolved:
+            token, owner, repo = resolved
+            try:
+                merged_sha = await github.get_branch_sha(token, owner, repo, "main")
+            except Exception:  # noqa: BLE001 — best-effort; finalize degrades to candidate
+                merged_sha = None
+        logger.warning(
+            "[RELEASE_QUALIFIER] v%d carrier %s COMPLETED but version still "
+            "'promoting' — retrying promotion bookkeeping",
+            version.version_number,
+            carrier.id,
+        )
+        await finalize_promotion_landed(
+            session,
+            version.id,
+            token=token,
+            owner=owner,
+            repo=repo,
+            merged_sha=merged_sha,
+            pr_url=qual.get("pr_url", ""),
+        )
+        return True
+
+    return False
+
+
 async def sweep_stuck_qualifications(
     session: AsyncSession,
     *,
@@ -2695,6 +2783,9 @@ async def sweep_stuck_qualifications(
                 alerted = (
                     await _check_version_promotion_readiness(alert_session, v)
                     or alerted
+                )
+                alerted = (
+                    await _check_promoting_carrier_health(alert_session, v) or alerted
                 )
                 if alerted:
                     await alert_session.commit()
@@ -3316,150 +3407,335 @@ async def promote(
             lock_released=True,
         )
 
-    # 2. Merge the PR — merge_method="merge" preserves integration history.
-    #    merge_pull_request does NOT raise on 405/409; it returns merged=False.
-    try:
-        merge_result = await github.merge_pull_request(
-            token,
-            owner,
-            repo,
-            pr_number,
-            merge_method="merge",
-            project_id=str(version.project_id),
-        )
-    except Exception as exc:  # noqa: BLE001 — a 5xx raises HTTPException; treat as failure
-        logger.warning(
-            "[RELEASE_QUALIFIER] merge raised for promotion PR #%s (v%d): %s",
-            pr_number,
-            version.version_number,
-            exc,
-        )
-        return await _record_promotion_failure(
-            session,
-            version,
-            base_record,
-            "merge_error",
-            detail=str(exc)[:300],
-            pr_url=pr_url,
-            lock_released=True,
-        )
-
-    if not merge_result.get("merged"):
-        # Concern 3 — disambiguate a merged=False result.  merge_pull_request
-        # collapses TWO different outcomes onto {"merged": False}: a genuine
-        # merge block (failing checks / required reviews / conflict) AND an
-        # already-merged PR (GitHub's merge endpoint returns 405 once a PR is
-        # already merged).  Recording an already-merged PR as merge_blocked
-        # would permanently diverge the DB from GitHub.
-        #
-        # _promotion_pr_landed asks the PR resource itself for its
-        # authoritative ``merged`` boolean — which flips synchronously on a
-        # merge and is NOT subject to the compare API's eventual-consistency
-        # lag that could make a genuinely-successful promotion look like a
-        # merge_blocked failure right after the merge.  It falls back to the
-        # ancestry check only when the PR state is indeterminate.
-        if await _promotion_pr_landed(
-            token, owner, repo, pr_number, candidate_sha, version
-        ):
-            logger.info(
-                "[RELEASE_QUALIFIER] promote: PR #%s for v%d returned "
-                "merged=False but the PR is in fact merged — recording success "
-                "(idempotent retry / eventual-consistency-safe)",
-                pr_number,
-                version.version_number,
-            )
-            await _delete_release_branch_best_effort(
-                token, owner, repo, release_branch, version
-            )
-            merged_sha_retry: str | None = None
-            try:
-                merged_sha_retry = await github.get_branch_sha(
-                    token, owner, repo, "main"
-                )
-            except Exception:  # noqa: BLE001 — best-effort; degrade to candidate
-                logger.warning(
-                    "[RELEASE_QUALIFIER] promote: could not re-resolve main "
-                    "HEAD after detecting an already-merged PR #%s for v%d — "
-                    "recording candidate_sha",
-                    pr_number,
-                    version.version_number,
-                )
-            return await _record_promotion_success(
-                session,
-                version,
-                candidate_sha,
-                base_record,
-                pr_url,
-                token=token,
-                owner=owner,
-                repo=repo,
-                promoted_sha=merged_sha_retry or candidate_sha,
-                already_landed=True,
-            )
-        # A genuine non-merge (checks/reviews block, real conflict).  This is a
-        # FAILED promotion — do NOT retry blindly.  Branch protection is the
-        # real gate; the version goes back to stabilize.
-        msg = merge_result.get("message", "merge not completed")
-        logger.warning(
-            "[RELEASE_QUALIFIER] promotion PR #%s for v%d did not merge: %s",
-            pr_number,
-            version.version_number,
-            msg,
-        )
-        return await _record_promotion_failure(
-            session,
-            version,
-            base_record,
-            "merge_blocked",
-            detail=str(msg)[:300],
-            pr_url=pr_url,
-            conflict=bool(merge_result.get("conflict")),
-            lock_released=True,
-        )
-
-    # 3. Success — resolve the REAL merged commit.  merge_method="merge"
-    #    creates a NEW merge commit on main; candidate_sha is only one of its
-    #    parents, not main HEAD.  github.merge_pull_request does not return the
-    #    merge SHA, so re-resolve main HEAD — that commit IS the merge result.
-    #    A resolution failure here is non-fatal: the merge already landed, so
-    #    degrade to candidate_sha (a known parent) rather than fail a
-    #    successful promotion.
-    merged_sha: str | None = None
-    try:
-        merged_sha = await github.get_branch_sha(token, owner, repo, "main")
-    except Exception as exc:  # noqa: BLE001 — merge already succeeded; SHA read is best-effort
-        logger.warning(
-            "[RELEASE_QUALIFIER] promote: merged PR #%s for v%d but could not "
-            "resolve the new main HEAD (%s) — recording candidate_sha instead",
-            pr_number,
-            version.version_number,
-            exc,
-        )
-
-    # 4. Best-effort: delete the release branch now that the merge has landed
-    #    (audit R4-H2 — release-v{N} branches must not accumulate forever).
-    await _delete_release_branch_best_effort(
-        token, owner, repo, release_branch, version
-    )
-
-    logger.info(
-        "[RELEASE_QUALIFIER] v%d promoted: automain → main merged via PR #%s "
-        "(merge commit=%s)",
-        version.version_number,
-        pr_number,
-        (merged_sha or candidate_sha)[:8],
-    )
-    return await _record_promotion_success(
+    # 2. Enroll the promotion PR into the existing CI-aware merge pipeline
+    #    instead of merging inline.  promote() runs inside the agent
+    #    status-report request path (maybe_finalize_qualification →
+    #    _process_post_commit, agent_status.py:955), so it MUST NOT block on the
+    #    promotion PR's CI.  main's ruleset requires CI/{Agent,Backend,Frontend};
+    #    opening the release-v{N} → main PR triggers a FRESH run of those checks,
+    #    and merging while they're pending is a "Repository rule violations" 422
+    #    that the old inline-merge code recorded as a hard promotion failure — so
+    #    a perfectly promotable version bounced back to stabilize purely on CI
+    #    timing (the "CI sub-gate" in v1's goal).
+    #
+    #    Instead, hand the PR to the orchestrator's CI-poll loop +
+    #    handle_ci_completion — the same battle-tested machinery that merges
+    #    every rollup PR (waits for CI, retries, escalates).  A synthetic
+    #    promotion-merge task enrolled with review_loop{ci_waiting,
+    #    review_approved} is polled until CI is green, then merged.
+    #    review_approved is pre-set because the release_audit IS the review.  On
+    #    that merge, handle_ci_completion calls finalize_promotion_landed (below)
+    #    to do the version bookkeeping; on CI failure it calls
+    #    revert_promotion_after_ci_failure instead of spawning a fix task.
+    return await _record_promotion_enrolled(
         session,
         version,
         candidate_sha,
         base_record,
-        pr_url,
+        pr_url=pr_url,
+        pr_number=pr_number,
+        release_branch=release_branch,
+    )
+
+
+async def _spawn_promotion_task(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    version_id: uuid.UUID,
+    pr_number: int,
+    pr_url: str,
+    release_branch: str,
+    candidate_sha: str,
+) -> Task:
+    """Create the synthetic, never-dispatched carrier task for a promotion PR.
+
+    The task sits in EVALUATING (no VM is ever provisioned) carrying a
+    ``review_loop`` so the orchestrator's CI-poll loop merges the PR through the
+    normal CI-aware pipeline (the same path every rollup PR rides).
+    ``review_approved`` is pre-set True — the ``release_audit`` already served as
+    the review.  ``is_promotion`` + ``release_version_id`` let
+    ``handle_ci_completion`` route the merge / CI-failure to
+    ``finalize_promotion_landed`` / ``revert_promotion_after_ci_failure``.
+    """
+    payload: dict[str, Any] = {
+        "type": "promotion_merge",
+        "branch": release_branch,
+        "base_branch": "main",
+        "pr_number": pr_number,
+    }
+    payload = validate_internal_payload(payload, "release_qualifier:promotion_merge")
+    now_iso = _utcnow().isoformat()
+    task = Task(
+        project_id=project_id,
+        title=f"Promotion: {release_branch} → main (PR #{pr_number})",
+        description=(
+            f"Carry the automain→main promotion PR #{pr_number} through the "
+            f"CI-aware merge pipeline (review pre-approved by the release audit)."
+        ),
+        payloads=[payload],
+        vm_instance_id=None,  # never dispatched — EVALUATING-only carrier
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        context={
+            "is_promotion": True,
+            "release_version_id": str(version_id),
+            "candidate_sha": candidate_sha,
+            "promotion_pr_url": pr_url,
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": pr_number,
+                "branch": release_branch,
+                "base_branch": "main",
+                "review_approved": True,
+                "ci_wait_started": now_iso,
+            },
+        },
+    )
+    session.add(task)
+    await session.flush()
+    session.add(
+        TaskHistory(
+            task_id=task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "RELEASE_QUALIFIER",
+                "task_type": "promotion_merge",
+                "pr_number": pr_number,
+                "release_version_id": str(version_id),
+            },
+        )
+    )
+    return task
+
+
+async def _record_promotion_enrolled(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str,
+    base_record: dict[str, Any],
+    *,
+    pr_url: str,
+    pr_number: int,
+    release_branch: str,
+) -> dict[str, Any]:
+    """Record that the promotion PR was enrolled into the CI-merge pipeline.
+
+    Re-locks the version (``promote()`` released the row lock for its GitHub
+    I/O), re-checks ``status == "open"`` (a concurrent finalize may have already
+    promoted), spawns the carrier task, and stamps
+    ``last_qualification.status = "promoting"``.  The "promoting" state stops
+    ``run_qualification`` / the reaper from re-spawning a duplicate qualification
+    while the merge is in flight (see ``_qualification_in_flight``).
+    """
+    locked = await _relock_version_for_promotion_write(
+        session, version, lock_released=True
+    )
+    if locked is None:
+        return {"status": "promotion_failed", "error": "version_vanished"}
+    version = locked
+    if version.status != "open":
+        # A concurrent finalize already advanced this version — nothing to do.
+        return {"status": "already_promoted"}
+    if (version.last_qualification or {}).get("status") == "promoting":
+        # A genuinely-overlapping finalize already enrolled this version's
+        # promotion PR.  promote() releases the row lock for its branch/PR
+        # GitHub I/O, so two callers can both pass the "pending" guard and reach
+        # here; the FOR UPDATE re-lock above serializes them, and the loser sees
+        # the winner's committed "promoting" record and bails — exactly one
+        # carrier task is ever enrolled.
+        return {"status": "already_enrolled"}
+
+    try:
+        promo_task = await _spawn_promotion_task(
+            session,
+            version.project_id,
+            version_id=version.id,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            release_branch=release_branch,
+            candidate_sha=candidate_sha,
+        )
+    except Exception as exc:  # noqa: BLE001 — enroll failure must not crash finalize
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to enroll promotion PR #%s for v%d: %s",
+            pr_number,
+            version.version_number,
+            exc,
+            exc_info=True,
+        )
+        return await _record_promotion_failure(
+            session,
+            version,
+            base_record,
+            "enroll_failed",
+            detail=str(exc)[:300],
+            pr_url=pr_url,
+            lock_released=False,  # already re-locked above; row held by this txn
+        )
+
+    record = {
+        **base_record,
+        "status": "promoting",
+        "candidate_sha": candidate_sha,
+        "pr_number": pr_number,
+        "pr_url": pr_url,
+        "promotion_task_id": str(promo_task.id),
+        "enrolled_at": _utcnow().isoformat(),
+    }
+    version.last_qualification = record
+    flag_modified(version, "last_qualification")
+    session.add(version)
+    logger.info(
+        "[RELEASE_QUALIFIER] v%d promotion PR #%s enrolled in the CI-merge "
+        "pipeline (carrier task %s) — awaiting CI, then merge",
+        version.version_number,
+        pr_number,
+        promo_task.id,
+    )
+    return {
+        "status": "promoting",
+        "pr_number": pr_number,
+        "promotion_task_id": str(promo_task.id),
+    }
+
+
+async def finalize_promotion_landed(
+    session: AsyncSession,
+    version_id: uuid.UUID | str,
+    *,
+    token: str | None,
+    owner: str | None,
+    repo: str | None,
+    merged_sha: str | None,
+    pr_url: str = "",
+) -> dict[str, Any]:
+    """Version bookkeeping after the promotion PR merges.
+
+    Called from ``handle_ci_completion`` when the carrier task's PR merges.
+    Loads + ``FOR UPDATE``-locks the version, then delegates to
+    ``_record_promotion_success`` (mark promoted, stamp SHAs, open v(N+1), tag).
+    Idempotent: a version no longer ``"open"`` is treated as already-handled
+    (a concurrent merge sweep or crash-retry).
+    """
+    try:
+        vid = uuid.UUID(str(version_id))
+    except (ValueError, AttributeError):
+        logger.warning(
+            "[RELEASE_QUALIFIER] finalize_promotion_landed: bad version_id %r",
+            version_id,
+        )
+        return {"status": "error", "error": "bad_version_id"}
+
+    locked = (
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == vid)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if locked is None:
+        return {"status": "error", "error": "version_not_found"}
+    if locked.status != "open":
+        return {"status": "already_finalized", "version_status": locked.status}
+
+    base_record = dict(locked.last_qualification or {})
+    candidate_sha = base_record.get("candidate_sha") or merged_sha or ""
+    release_branch = f"release-v{locked.version_number}"
+    result = await _record_promotion_success(
+        session,
+        locked,
+        candidate_sha,
+        base_record,
+        pr_url or base_record.get("pr_url", ""),
         token=token,
         owner=owner,
         repo=repo,
         promoted_sha=merged_sha or candidate_sha,
+        lock_released=False,  # we hold the FOR UPDATE lock taken just above
     )
+    # Best-effort: delete the release-v{N} branch now that the merge has landed
+    # (audit R4-H2 — release branches must not accumulate).  The carrier-driven
+    # merge via handle_ci_completion does not clean it up, so do it here.
+    if token and owner and repo and result.get("status") == "promoted":
+        await _delete_release_branch_best_effort(
+            token, owner, repo, release_branch, locked
+        )
+    return result
+
+
+async def revert_promotion_after_ci_failure(
+    session: AsyncSession,
+    version_id: uuid.UUID | str,
+    *,
+    reason: str,
+    red_build: bool = False,
+) -> dict[str, Any]:
+    """Send a ``"promoting"`` version back to stabilize after the promotion PR's
+    CI failed or the PR could not merge.
+
+    Called from ``handle_ci_completion`` (CI-failure branch) INSTEAD of spawning
+    a fix task — a red promotion candidate is a quality signal about the version,
+    not a PR to "fix".  ``red_build`` records ``ci_not_green`` vs the softer
+    ``ci_unresolved`` (so the readiness signal isn't polluted, mirroring the
+    candidate-CI vocabulary).  Idempotent: only acts on a version still
+    ``status == "open"`` whose ``last_qualification.status == "promoting"``.
+    """
+    try:
+        vid = uuid.UUID(str(version_id))
+    except (ValueError, AttributeError):
+        return {"status": "error", "error": "bad_version_id"}
+    locked = (
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == vid)
+                .with_for_update()
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if locked is None:
+        return {"status": "error", "error": "version_not_found"}
+    if (
+        locked.status != "open"
+        or (locked.last_qualification or {}).get("status") != "promoting"
+    ):
+        return {"status": "noop", "version_status": locked.status}
+    base_record = dict(locked.last_qualification or {})
+    record = {
+        **base_record,
+        "status": "not_promoted",
+        "blocker": "ci_not_green" if red_build else "ci_unresolved",
+        "promotion_revert_reason": reason[:300],
+        "finalized_at": _utcnow().isoformat(),
+    }
+    locked.last_qualification = record
+    flag_modified(locked, "last_qualification")
+    release_version.set_version_phase(locked, "stabilize", reasoning=reason[:300])
+    session.add(locked)
+    await _notify_operator(
+        session,
+        locked,
+        "release_promotion_failed",
+        (
+            f"v{locked.version_number} promotion merge failed — {reason}. "
+            f"Returned to stabilize; the next strategic cycle works the blocker."
+        ),
+        extra={"error": "merge_blocked", "blocker": record["blocker"]},
+    )
+    logger.warning(
+        "[RELEASE_QUALIFIER] v%d promotion reverted to stabilize (%s): %s",
+        locked.version_number,
+        record["blocker"],
+        reason,
+    )
+    return {"status": "reverted", "blocker": record["blocker"]}
 
 
 async def _delete_release_branch_best_effort(
