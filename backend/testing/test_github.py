@@ -444,6 +444,141 @@ async def test_get_check_runs_log_fetch_timeout(mocker):
 
 
 @pytest.mark.asyncio
+async def test_get_check_runs_paginates_all_pages_failing_run_on_later_page(mocker):
+    """
+    get_check_runs() must fetch all pages of check-runs, not just the first page
+    (GitHub's default page size is 30). A failing run on page 2 must be caught
+    and aggregated correctly so the qualifier's CI gate doesn't false-green.
+    """
+    from app.github import get_check_runs
+
+    # Page 1: 30 passing runs
+    page_1_runs = [
+        {
+            "id": i,
+            "name": f"test-{i}",
+            "status": "completed",
+            "conclusion": "success",
+        }
+        for i in range(30)
+    ]
+    page_1 = {"check_runs": page_1_runs}
+
+    # Page 2: 15 runs, one of which fails
+    page_2_runs = [
+        {
+            "id": 30 + i,
+            "name": f"test-{30 + i}",
+            "status": "completed",
+            "conclusion": "failure" if i == 7 else "success",
+        }
+        for i in range(15)
+    ]
+    page_2 = {"check_runs": page_2_runs}
+
+    call_count = 0
+
+    async def mock_request(method, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First page of check-runs
+            return MockResponse(
+                200,
+                page_1,
+                links={
+                    "next": {
+                        "url": "https://api.github.com/repos/owner/repo/commits/sha/check-runs?per_page=100&page=2"
+                    }
+                },
+            )
+        elif call_count == 2:
+            # Second page of check-runs (has a failing run)
+            return MockResponse(200, page_2, links={})
+        else:
+            return MockResponse(200, page_1)
+
+    mocker.patch("httpx.AsyncClient.request", side_effect=mock_request)
+
+    result = await get_check_runs("token", "owner", "repo", "sha")
+
+    # Must see 45 total runs (30 + 15)
+    assert len(result["details"]) == 45
+    # Aggregate conclusion must be "failure" because page 2 has a failing run
+    assert result["conclusion"] == "failure"
+    assert result["status"] == "completed"
+    # Must have made at least 2 calls to fetch both pages
+    assert call_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_get_check_runs_paginates_all_pages_pending_run_on_later_page(mocker):
+    """
+    get_check_runs() must fetch all pages and correctly handle pending runs.
+    A pending/in_progress run on page 2 must be caught so the aggregate status
+    reflects that CI is still running, not completed.
+    """
+    from app.github import get_check_runs
+
+    # Page 1: 25 completed passing runs
+    page_1_runs = [
+        {
+            "id": i,
+            "name": f"test-{i}",
+            "status": "completed",
+            "conclusion": "success",
+        }
+        for i in range(25)
+    ]
+    page_1 = {"check_runs": page_1_runs}
+
+    # Page 2: 10 runs, one of which is still in_progress
+    page_2_runs = [
+        {
+            "id": 25 + i,
+            "name": f"test-{25 + i}",
+            "status": "in_progress" if i == 3 else "completed",
+            "conclusion": "success" if i != 3 else None,
+        }
+        for i in range(10)
+    ]
+    page_2 = {"check_runs": page_2_runs}
+
+    call_count = 0
+
+    async def mock_request(method, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First page: all passing
+            return MockResponse(
+                200,
+                page_1,
+                links={
+                    "next": {
+                        "url": "https://api.github.com/repos/owner/repo/commits/sha/check-runs?per_page=100&page=2"
+                    }
+                },
+            )
+        elif call_count == 2:
+            # Second page: has a pending run
+            return MockResponse(200, page_2, links={})
+        else:
+            return MockResponse(200, page_1)
+
+    mocker.patch("httpx.AsyncClient.request", side_effect=mock_request)
+
+    result = await get_check_runs("token", "owner", "repo", "sha")
+
+    # Must see 35 total runs (25 + 10)
+    assert len(result["details"]) == 35
+    # Aggregate status must be "in_progress" because page 2 has a pending run
+    assert result["status"] == "in_progress"
+    # Conclusion is "success" because all concluded checks pass (pending check not concluded yet)
+    assert result["conclusion"] == "success"
+
+
+@pytest.mark.asyncio
 async def test_merge_pull_request_rate_limit_retries_then_propagates(mocker):
     """
     A 429 rate-limit response should be retried (respecting Retry-After),

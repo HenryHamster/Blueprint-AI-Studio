@@ -4178,7 +4178,11 @@ async def test_promote_genuine_merge_block_still_fails(db_session, mocker):
     mocker.patch(
         "app.github.merge_pull_request",
         new=AsyncMock(
-            return_value={"merged": False, "message": "required checks pending"}
+            return_value={
+                "merged": False,
+                "conflict": True,
+                "message": "merge conflict",
+            }
         ),
     )
     mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=True))
@@ -4915,7 +4919,11 @@ async def test_promote_merged_false_and_pr_state_not_merged_is_failure(
     mocker.patch(
         "app.github.merge_pull_request",
         new=AsyncMock(
-            return_value={"merged": False, "message": "required checks pending"}
+            return_value={
+                "merged": False,
+                "conflict": True,
+                "message": "merge conflict",
+            }
         ),
     )
     mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=True))
@@ -4925,7 +4933,7 @@ async def test_promote_merged_false_and_pr_state_not_merged_is_failure(
     )
     await db_session.commit()
 
-    # A genuine merge block — recorded as a failure, not papered over.
+    # A genuine merge block (conflict=True) — recorded as a failure, not papered over.
     assert result["status"] == "promotion_failed"
     assert result["error"] == "merge_blocked"
     pr_state_mock.assert_awaited()
@@ -5082,6 +5090,67 @@ async def test_maybe_finalize_takes_no_caller_session(db_session, mocker):
     assert result["status"] == "dry_run"
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "dry_run"
+
+
+# ===========================================================================
+# Round 8 — promote(): pending-CI block → enable auto-merge, no failure verdict
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_promote_pending_ci_enables_auto_merge_no_failure(db_session, mocker):
+    """When merge_pull_request returns merged=False with no conflict flag
+    (GitHub 405 — required checks still pending), promote() must NOT record a
+    failure verdict.  Instead it enables GitHub auto-merge so the PR merges
+    automatically once the checks pass.  last_qualification stays "pending"
+    so the reaper can confirm success when auto-merge lands."""
+    _project, version = await _make_project_and_version(db_session)
+    candidate = "p3nd1ng0" * 5
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    # PR not yet merged (pending CI, not a conflict).
+    mocker.patch(
+        "app.github.get_pull_request_merge_state",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 99, "html_url": "http://pr/99"}),
+    )
+    # 405-style: not merged, no conflict flag — pending required checks.
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(
+            return_value={"merged": False, "message": "required checks pending"}
+        ),
+    )
+    am_mock = mocker.patch(
+        "app.github.enable_auto_merge",
+        new=AsyncMock(return_value={"enabled": True, "message": "auto-merge enabled"}),
+    )
+    mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=True))
+
+    result = await rq.promote(
+        db_session, version, candidate, composite={"confidence": 0.9}
+    )
+    await db_session.commit()
+
+    # Pending CI → auto-merge enabled, NOT a promotion failure.
+    assert result["status"] == "pending_auto_merge"
+    assert result["auto_merge_enabled"] is True
+    am_mock.assert_awaited_once()
+
+    # No failure recorded — last_qualification is unchanged (None or pending).
+    await db_session.refresh(version)
+    lq = version.last_qualification or {}
+    assert lq.get("status") != "promotion_failed"
+    assert "error" not in lq
 
 
 @pytest.mark.asyncio
@@ -5620,7 +5689,7 @@ async def test_record_promotion_failure_does_not_overwrite_promoted_version(
             )
         )
         await db_session.commit()
-        return {"merged": False, "message": "required checks pending"}
+        return {"merged": False, "conflict": True, "message": "merge conflict"}
 
     mocker.patch(
         "app.github.merge_pull_request",
@@ -5685,7 +5754,11 @@ async def test_record_promotion_failure_still_records_on_open_version(
     mocker.patch(
         "app.github.merge_pull_request",
         new=AsyncMock(
-            return_value={"merged": False, "message": "required checks pending"}
+            return_value={
+                "merged": False,
+                "conflict": True,
+                "message": "merge conflict",
+            }
         ),
     )
     mocker.patch("app.github.delete_branch", new=AsyncMock(return_value=True))
@@ -5699,7 +5772,7 @@ async def test_record_promotion_failure_still_records_on_open_version(
     )
     await db_session.commit()
 
-    # The version was open — a real merge block is recorded as a failure.
+    # The version was open — a real merge conflict is recorded as a failure.
     assert result["status"] == "promotion_failed"
     assert result["error"] == "merge_blocked"
 

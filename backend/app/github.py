@@ -2293,23 +2293,31 @@ async def get_check_runs(
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    response = await _github_request(
-        "GET",
-        f"https://api.github.com/repos/{owner}/{repo}/commits/{ref}/check-runs",
-        headers,
-        project_id=project_id,
-    )
-    if response.status_code != 200:
-        logger.error(f"Failed to get check runs for {ref}: {response.text}")
-        return {
-            "status": "pending",
-            "conclusion": None,
-            "details": [],
-            "failed_logs": "",
-        }
 
-    data = response.json()
-    check_runs = data.get("check_runs", [])
+    check_runs = []
+    url = f"https://api.github.com/repos/{owner}/{repo}/commits/{ref}/check-runs?per_page=100"
+
+    while url:
+        response = await _github_request(
+            "GET",
+            url,
+            headers,
+            project_id=project_id,
+        )
+        if response.status_code != 200:
+            logger.error(f"Failed to get check runs for {ref}: {response.text}")
+            return {
+                "status": "pending",
+                "conclusion": None,
+                "details": [],
+                "failed_logs": "",
+            }
+
+        data = response.json()
+        check_runs.extend(data.get("check_runs", []))
+
+        # Follow pagination link to next page
+        url = response.links.get("next", {}).get("url")
 
     if not check_runs:
         if not treat_missing_as_success:

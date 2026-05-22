@@ -3892,26 +3892,63 @@ async def promote(
                 promoted_sha=merged_sha_retry or candidate_sha,
                 already_landed=True,
             )
-        # A genuine non-merge (checks/reviews block, real conflict).  This is a
-        # FAILED promotion — do NOT retry blindly.  Branch protection is the
-        # real gate; the version goes back to stabilize.
+        # Distinguish a real merge conflict (GitHub 409 → conflict=True) from
+        # pending required checks (GitHub 405 → conflict=False/None).  A real
+        # conflict cannot self-heal and must fail immediately; a pending-CI
+        # block WILL clear once checks pass, so arrange for GitHub to complete
+        # the merge automatically rather than recording a spurious failure.
+        if merge_result.get("conflict"):
+            msg = merge_result.get("message", "merge not completed")
+            logger.warning(
+                "[RELEASE_QUALIFIER] promotion PR #%s for v%d did not merge "
+                "(real conflict): %s",
+                pr_number,
+                version.version_number,
+                msg,
+            )
+            return await _record_promotion_failure(
+                session,
+                version,
+                base_record,
+                "merge_blocked",
+                detail=str(msg)[:300],
+                pr_url=pr_url,
+                conflict=True,
+                lock_released=True,
+            )
+
+        # CI still pending (GitHub 405, no conflict) — arrange for GitHub to
+        # complete the merge once required checks pass.  Don't record a failure
+        # verdict; last_qualification stays "pending" so the reaper re-checks
+        # and _candidate_already_on_main records idempotent success when the
+        # auto-merge lands.
         msg = merge_result.get("message", "merge not completed")
-        logger.warning(
-            "[RELEASE_QUALIFIER] promotion PR #%s for v%d did not merge: %s",
+        try:
+            am_result = await github.enable_auto_merge(
+                token,
+                owner,
+                repo,
+                pr_number,
+                merge_method="MERGE",
+                project_id=str(version.project_id),
+            )
+        except Exception as exc:  # noqa: BLE001
+            am_result = {"enabled": False, "message": str(exc)[:200]}
+        logger.info(
+            "[RELEASE_QUALIFIER] promote: PR #%s for v%d pending CI — "
+            "auto-merge %s (%s). Qualification stays pending; reaper confirms "
+            "when auto-merge lands.",
             pr_number,
             version.version_number,
-            msg,
+            "enabled" if am_result.get("enabled") else "not confirmed",
+            am_result.get("message", ""),
         )
-        return await _record_promotion_failure(
-            session,
-            version,
-            base_record,
-            "merge_blocked",
-            detail=str(msg)[:300],
-            pr_url=pr_url,
-            conflict=bool(merge_result.get("conflict")),
-            lock_released=True,
-        )
+        return {
+            "status": "pending_auto_merge",
+            "pr_number": pr_number,
+            "pr_url": pr_url,
+            "auto_merge_enabled": bool(am_result.get("enabled")),
+        }
 
     # 3. Success — resolve the REAL merged commit.  merge_method="merge"
     #    creates a NEW merge commit on main; candidate_sha is only one of its
