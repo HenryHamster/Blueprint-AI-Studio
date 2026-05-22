@@ -2588,3 +2588,62 @@ async def test_get_check_runs_default_mode_empty_returns_success(mocker):
 
     assert result["status"] == "completed"
     assert result["conclusion"] == "success"
+
+
+# ── get_files_changed_between_refs ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_files_changed_between_refs_returns_changed_files(mocker):
+    """Returns filenames from the compare API when it succeeds."""
+    from app.github import get_files_changed_between_refs
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(
+            200,
+            {
+                "files": [
+                    {"filename": "backend/app/foo.py"},
+                    {"filename": "backend/app/bar.py"},
+                ]
+            },
+        ),
+    )
+
+    result = await get_files_changed_between_refs(
+        "tok", "owner", "repo", "base-ref", "head-ref"
+    )
+    assert result == ["backend/app/foo.py", "backend/app/bar.py"]
+
+
+@pytest.mark.asyncio
+async def test_get_files_changed_between_refs_returns_empty_when_identical(mocker):
+    """Returns an empty list when the compare API reports no changed files."""
+    from app.github import get_files_changed_between_refs
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, {"files": []}),
+    )
+
+    result = await get_files_changed_between_refs(
+        "tok", "owner", "repo", "automain", "automain"
+    )
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_get_files_changed_between_refs_returns_none_on_api_error(mocker):
+    """Returns None on a non-200 API response so callers can treat it as indeterminate."""
+    from app.github import get_files_changed_between_refs
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(404, {}),
+    )
+
+    result = await get_files_changed_between_refs(
+        "tok", "owner", "repo", "missing-ref", "head"
+    )
+    assert result is None

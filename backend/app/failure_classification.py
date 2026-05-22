@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from app.time_utils import _utcnow
+
 if TYPE_CHECKING:
     from app.models import Task
 
@@ -476,6 +478,18 @@ _GENERIC_AGENT_CODE_LABELS: frozenset[str] = frozenset(
     }
 )
 
+# Wider set of generic failure labels where account-state correlation applies.
+# These produce no specific failure signal (no test/lint/pr error), so a
+# rate-limited account is a plausible cause that the text scan can't see.
+_ALL_GENERIC_CODE_ERROR_LABELS: frozenset[str] = frozenset(
+    {
+        "claude_code_failed",
+        "fatal",
+        "incomplete",
+        "agent_self_failed",
+    }
+)
+
 
 def _persist_rate_limit_signal_context(task: "Task", signal) -> None:
     """Persist rate-limit signal metadata onto task.context.
@@ -509,6 +523,45 @@ def _persist_rate_limit_signal_context(task: "Task", signal) -> None:
         task.context = ctx
     except Exception:
         logger.exception("[FAILURE_CLASS] Failed to persist rate_limit_* keys")
+
+
+def _account_was_rate_limited(task: "Task") -> bool:
+    """Return True if the task's assigned account was in rate-limit cooldown.
+
+    Reads the in-memory pool state (_account_by_id). Returns False when the
+    account is unresolvable (pool empty, standalone test path, no account
+    assigned) so callers degrade to today's text-only classification.
+    Never raises — any exception returns False.
+    """
+    try:
+        from app.max_plan_pool import (
+            _account_by_id,
+            _cooldown_seconds_for_info,
+            get_task_llm_account_id,
+        )
+
+        account_id = get_task_llm_account_id(task)
+        if not account_id:
+            return False
+        acct = _account_by_id.get(str(account_id))
+        if not acct:
+            return False
+        dm = acct.get("disabled_models") or {}
+        if not dm:
+            return False
+        # Use naive UTC (_utcnow) to match max_plan_pool's stored 'at' datetimes,
+        # which are naive (set via _utcnow at write time). An aware now here would
+        # raise TypeError on the subtraction below and silently no-op the feature.
+        now = _utcnow()
+        for info in dm.values():
+            at_dt = info.get("at")
+            if at_dt is None:
+                continue
+            if (now - at_dt).total_seconds() < _cooldown_seconds_for_info(info):
+                return True
+        return False
+    except Exception:
+        return False
 
 
 def _text_provider_failure_override(task: "Task", combined: str) -> str | None:
@@ -637,6 +690,9 @@ def normalize_agent_failure_category(raw: str | None, task: "Task") -> str:
             override = _text_provider_failure_override(task, combined)
             if override:
                 return override
+        if mapped == CODE_ERROR and label_lower in _ALL_GENERIC_CODE_ERROR_LABELS:
+            if _account_was_rate_limited(task):
+                return RATE_LIMIT
         return mapped
     if label in INFRA_CLASSES or label == CODE_ERROR:
         return label
@@ -1455,6 +1511,11 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
                         return override
                 if any(kw in combined for kw in _VIEWPORT_PATTERNS):
                     return VIEWPORT_REGRESSION
+                if (
+                    agent_lower in _ALL_GENERIC_CODE_ERROR_LABELS
+                    and _account_was_rate_limited(task)
+                ):
+                    return RATE_LIMIT
             return mapped
         if agent_category in INFRA_CLASSES or agent_category == CODE_ERROR:
             return agent_category
@@ -1725,6 +1786,13 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     # fallthrough so it doesn't dissolve into residual fingerprints.
     if any(kw in combined for kw in _VIEWPORT_PATTERNS):
         return VIEWPORT_REGRESSION
+
+    # Account-state correlation: before defaulting to CODE_ERROR, check if the
+    # assigned account was in rate-limit cooldown. Generic failures (no keywords,
+    # no structured signal) during a multi-hour block are most likely throttling-
+    # induced; classifying as RATE_LIMIT avoids burning a retry attempt.
+    if _account_was_rate_limited(task):
+        return RATE_LIMIT
 
     # Default: code error — record fingerprint for residual-pattern analysis.
     # Pass `logs` so the fingerprint keys on the actual error signature

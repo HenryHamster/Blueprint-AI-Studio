@@ -1561,7 +1561,19 @@ async def _record_qualification_verdict(
     before and the surrounding qualification/promotion is unaffected.
     """
     try:
-        sub_scores = base_record.get("sub_scores")
+        sub_scores = base_record.get("sub_scores") or {}
+        if not isinstance(sub_scores, dict):
+            sub_scores = {}
+        # Embed CI resolution provenance in sub_scores.
+        ci_resolution = base_record.get("ci_resolution")
+        if isinstance(ci_resolution, dict):
+            sub_scores = dict(sub_scores)  # make a copy to avoid mutating base_record
+            sub_scores["ci_resolution"] = {
+                "state": ci_resolution.get("state"),
+                "resolved_sha": ci_resolution.get("resolved_sha"),
+                "detail": ci_resolution.get("detail"),
+            }
+
         confidence = base_record.get("confidence")
         threshold = base_record.get("threshold")
         verdict = QualificationVerdict(
@@ -1574,7 +1586,7 @@ async def _record_qualification_verdict(
                 and not isinstance(confidence, bool)
                 else 0.0
             ),
-            sub_scores=sub_scores if isinstance(sub_scores, dict) else None,
+            sub_scores=sub_scores if sub_scores else None,
             blocker=base_record.get("blocker"),
             would_promote=bool(would_promote),
             promotion_enabled=bool(promotion_enabled),
@@ -1735,7 +1747,7 @@ async def _resolve_ci_at_finalize(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
     candidate_sha: str | None,
-) -> bool:
+) -> tuple[bool, dict[str, Any]]:
     """Re-resolve the candidate commit's CI verdict at finalize time.
 
     ``run_qualification`` snapshots ``ci_green`` once, at spawn.  Reusing that
@@ -1748,13 +1760,19 @@ async def _resolve_ci_at_finalize(
     re-resolution lets the CI dimension pass, while a still-pending build
     simply stays not-green WITHOUT a permanent dead-end.
 
-    Returns True ONLY when a real completed green build exists for the
-    candidate.  Any credential-resolution or GitHub I/O failure degrades
-    gracefully to False (not-green) for THIS finalize attempt — it never
-    crashes the finalize.
+    Returns (ci_green, ci_resolution) where ci_green is True ONLY when a real
+    completed green build exists for the candidate, and ci_resolution contains
+    the full provenance (state, resolved_sha, detail).  Any credential-resolution
+    or GitHub I/O failure degrades gracefully to (False, degenerate_resolution)
+    for THIS finalize attempt — it never crashes the finalize.
     """
+    degenerate_resolution = {
+        "state": _CI_PENDING,
+        "resolved_sha": None,
+        "detail": "unresolved",
+    }
     if not candidate_sha:
-        return False
+        return False, degenerate_resolution
     try:
         project = await session.get(Project, version.project_id)
         if project is None:
@@ -1764,7 +1782,7 @@ async def _resolve_ci_at_finalize(
                 version.project_id,
                 version.version_number,
             )
-            return False
+            return False, degenerate_resolution
         resolved = await _resolve_github_with_session(session, project)
         if resolved is None:
             logger.warning(
@@ -1772,7 +1790,7 @@ async def _resolve_ci_at_finalize(
                 "credentials for version v%d — treating CI as not-green",
                 version.version_number,
             )
-            return False
+            return False, degenerate_resolution
         token, owner, repo = resolved
         ci_resolution = await _resolve_candidate_ci(
             token, owner, repo, candidate_sha, project_id=str(version.project_id)
@@ -1786,7 +1804,13 @@ async def _resolve_ci_at_finalize(
             ci_resolution["ci_green"],
             ci_resolution["detail"],
         )
-        return bool(ci_resolution["ci_green"])
+        # Extract only the provenance fields, excluding ci_green boolean.
+        resolution_provenance = {
+            "state": ci_resolution.get("state"),
+            "resolved_sha": ci_resolution.get("resolved_sha"),
+            "detail": ci_resolution.get("detail"),
+        }
+        return bool(ci_resolution["ci_green"]), resolution_provenance
     except Exception as exc:  # noqa: BLE001 — finalize CI failure → not-green
         logger.warning(
             "[RELEASE_QUALIFIER] finalize CI re-resolution failed for version "
@@ -1794,7 +1818,7 @@ async def _resolve_ci_at_finalize(
             version.version_number,
             exc,
         )
-        return False
+        return False, degenerate_resolution
 
 
 async def _finalize_qualification(
@@ -1847,7 +1871,9 @@ async def _finalize_qualification(
     # now-completed green build pass and keeps a still-pending build not-green
     # without a permanent dead-end.  Graceful: a credential / GitHub failure
     # degrades to not-green for this attempt (never crashes the finalize).
-    ci_green = await _resolve_ci_at_finalize(session, version, candidate_sha)
+    ci_green, ci_resolution = await _resolve_ci_at_finalize(
+        session, version, candidate_sha
+    )
 
     policy = _load_policy()
 
@@ -1953,6 +1979,7 @@ async def _finalize_qualification(
     base_record: dict[str, Any] = {
         "candidate_sha": candidate_sha,
         "ci_green": ci_green,
+        "ci_resolution": ci_resolution,
         "smoketest_enabled": smoketest_enabled,
         "confidence": composite["confidence"],
         "sub_scores": composite["sub_scores"],

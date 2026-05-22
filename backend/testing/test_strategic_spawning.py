@@ -26,6 +26,7 @@ from app.strategic_spawning import (
     _spawn_design_doc_update,
     _spawn_strategic_review,
     _build_shipped_changes_manifest,
+    _build_recent_interventions,
 )
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
@@ -3747,3 +3748,117 @@ async def test_outcome_evaluation_handles_empty_strings(db_session):
     assert outcome is not None
     assert "success_evidence" not in outcome
     assert "retirement_condition" not in outcome
+
+
+# ── on_automain flag in _build_recent_interventions ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_on_automain_true_for_root_task(db_session):
+    """Root tasks (no parent) always report on_automain=True."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Direct fix",
+        description="No parent",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["on_automain"] is True
+
+
+@pytest.mark.asyncio
+async def test_on_automain_true_when_rollup_merged(db_session):
+    """Child task reports on_automain=True when its rollup parent's pr_merged=True."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        title="Rollup parent",
+        description="rollup",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "rollup_pr_number": 42},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    child = Task(
+        project_id=project.id,
+        title="Child fix",
+        description="child",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        parent_task_id=parent.id,
+        context={"pr_merged": True},
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    by_title = {m["pr_title"]: m for m in merges}
+    assert by_title["Child fix"]["on_automain"] is True
+    assert by_title["Rollup parent"]["on_automain"] is True
+
+
+@pytest.mark.asyncio
+async def test_on_automain_false_when_rollup_not_merged(db_session):
+    """Child task reports on_automain=False when its rollup parent is not yet merged."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        title="Unmerged rollup",
+        description="rollup",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        context={"rollup_pr_number": 99},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    child = Task(
+        project_id=project.id,
+        title="Staged fix",
+        description="child merged into staging only",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        parent_task_id=parent.id,
+        context={"pr_merged": True},
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["pr_title"] == "Staged fix"
+    assert merges[0]["on_automain"] is False

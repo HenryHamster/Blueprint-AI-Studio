@@ -782,6 +782,31 @@ async def _build_recent_interventions(
         reverse=True,
     )
 
+    # Rollup-aware automain landing check.
+    # A task with pr_merged=True may not be on automain yet when it was merged
+    # into a rollup staging branch but the rollup PR itself hasn't been merged.
+    # Root tasks (no parent) merged directly → always on automain.
+    # Child tasks → on automain iff their rollup parent's pr_merged is True.
+    # We fetch parent contexts in one query so the per-direction loop below
+    # can reuse the same map without extra round-trips.
+    _all_parent_ids: set[uuid.UUID] = {
+        t.parent_task_id for t in merged_tasks if t.parent_task_id is not None
+    }
+    _parent_pr_merged: dict[uuid.UUID, bool] = {}
+    if _all_parent_ids:
+        _parents_result = await session.execute(
+            select(Task)
+            .where(Task.id.in_(_all_parent_ids))
+            .options(load_only(Task.id, Task.context, Task.status_log))
+        )
+        for _p in _parents_result.scalars().all():
+            _parent_pr_merged[_p.id] = bool((_p.context or {}).get("pr_merged", False))
+
+    def _on_automain(task: Task) -> bool:
+        if task.parent_task_id is None:
+            return True
+        return _parent_pr_merged.get(task.parent_task_id, False)
+
     # For rollups: look up child titles so the agent sees what actually
     # shipped instead of "Rollup of 4 subtasks" + a title.
     merged_parent_ids = {str(t.id) for t in merged_tasks[:limit]}
@@ -834,6 +859,7 @@ async def _build_recent_interventions(
                 "merged_at": merged_at.isoformat() if merged_at else None,
                 "hours_ago": hours_ago,
                 "body": body,
+                "on_automain": _on_automain(t),
             }
         )
 
@@ -856,10 +882,12 @@ async def _build_recent_interventions(
         }
         if _strategic_cutoff:
             entry["since_last_strategic"] = _window_counts(d_tasks, _strategic_cutoff)
-        # Titles of things that shipped since last strategic (or last 24h as fallback)
+        # Titles of things that shipped since last strategic (or last 24h as fallback).
+        # Each entry is a dict so the agent can distinguish automain-landed from
+        # staging-only merges (on_automain=False means rollup not yet merged).
         recent_cutoff = _strategic_cutoff or _24h_ago
-        recent_merges = [
-            (t.title or "")[:160]
+        recent_merges_dicts = [
+            {"title": (t.title or "")[:160], "on_automain": _on_automain(t)}
             for t in d_tasks
             if t.status == TaskStatus.COMPLETED
             and (t.context or {}).get("pr_merged")
@@ -870,8 +898,8 @@ async def _build_recent_interventions(
             )
             >= recent_cutoff
         ]
-        if recent_merges:
-            entry["recent_merged_titles"] = recent_merges[:10]
+        if recent_merges_dicts:
+            entry["recent_merged_titles"] = recent_merges_dicts[:10]
         per_direction_delta.append(entry)
 
     # Active-by-scope: tasks currently in flight per scope. Surfaced so the

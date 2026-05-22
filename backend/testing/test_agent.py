@@ -10322,7 +10322,16 @@ async def test_qualifier_smoketest_finalize_sees_own_artifact_via_endpoint(
     # as the stored qualification records), so pin the re-resolution to green.
     mocker.patch(
         "app.release_qualifier._resolve_ci_at_finalize",
-        new=AsyncMock(return_value=True),
+        new=AsyncMock(
+            return_value=(
+                True,
+                {
+                    "state": "green",
+                    "resolved_sha": "deadbeef",
+                    "detail": "pinned-green",
+                },
+            )
+        ),
     )
     # promotion_enabled defaults False (dark) — a confident candidate dry-runs.
 
@@ -11207,3 +11216,150 @@ async def test_viewport_failure_screenshot_download_url_storage_failure(
         },
     )
     assert resp.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# Account-state-correlated RATE_LIMIT requeue tests (cluster 2/4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_generic_failure_with_rate_limited_account_requeues_free(
+    client: AsyncClient, db_session, mocker
+):
+    """Account-state-correlated RATE_LIMIT: a generic failure (no rate-limit keywords
+    in logs) while the assigned account is in cooldown should be classified RATE_LIMIT
+    and requeued without burning attempt_count.
+    """
+    from app.time_utils import _utcnow
+    import app.max_plan_pool as pool_mod
+
+    account_id = "aaaaaaaa-0001-4000-a000-000000000001"
+    # Account disabled 5 minutes ago (hits=1 → 30-min cooldown → still cooling).
+    # Use naive _utcnow() to match the production data shape: max_plan_pool stores
+    # disabled_models[...]['at'] as a NAIVE datetime, so the fixture must too —
+    # otherwise the test passes against an aware value the live pool never produces.
+    at = _utcnow() - timedelta(minutes=5)
+    fake_pool = {
+        account_id: {
+            "id": account_id,
+            "name": "test-account-rl-corr",
+            "active_tasks": 1,
+            "disabled_models": {
+                "claude-sonnet-4-6": {
+                    "at": at,
+                    "hits": 1,
+                    "kind": "rate_limit",
+                }
+            },
+        }
+    }
+    mocker.patch.object(pool_mod, "_account_by_id", fake_pool)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="RL Account Corr Test", user_id="test-user-rl-corr-001")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test task"}],
+        vm_instance_id="agent-vm-rl-corr-001",
+        status=TaskStatus.IN_PROGRESS,
+        context={"llm_account_id": account_id, "llm_model": "claude-sonnet-4-6"},
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    token = create_agent_token(task_id_str, "agent-vm-rl-corr-001")
+    # Generic failure — no rate-limit keywords; classification must fall through
+    # to account-state correlation (_account_was_rate_limited) to return RATE_LIMIT.
+    payload = {
+        "task_id": task_id_str,
+        "status": "FAILED",
+        "failure_category": "claude_code_failed",
+        "logs": "Process exited with code 1",
+    }
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED, (
+        f"Account-state-correlated RATE_LIMIT should requeue to QUEUED, got {task.status}"
+    )
+    # attempt_count must NOT be incremented — free requeue, not a retry burn
+    assert task.attempt_count == 0, (
+        f"attempt_count must stay 0 on free RATE_LIMIT requeue, got {task.attempt_count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_generic_failure_with_healthy_account_burns_retry(
+    client: AsyncClient, db_session, mocker
+):
+    """Without account-state correlation: a generic failure with a healthy account
+    classifies as CODE_ERROR and burns an attempt_count retry slot.
+    """
+    import app.max_plan_pool as pool_mod
+
+    account_id = "aaaaaaaa-0001-4000-a000-000000000002"
+    fake_pool = {
+        account_id: {
+            "id": account_id,
+            "name": "test-account-healthy-corr",
+            "active_tasks": 1,
+            "disabled_models": {},  # no disabled models — account is healthy
+        }
+    }
+    mocker.patch.object(pool_mod, "_account_by_id", fake_pool)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(
+        name="Healthy Account Corr Test", user_id="test-user-healthy-corr-001"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test task"}],
+        vm_instance_id="agent-vm-healthy-corr-001",
+        status=TaskStatus.IN_PROGRESS,
+        context={"llm_account_id": account_id, "llm_model": "claude-sonnet-4-6"},
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    token = create_agent_token(task_id_str, "agent-vm-healthy-corr-001")
+    payload = {
+        "task_id": task_id_str,
+        "status": "FAILED",
+        "failure_category": "claude_code_failed",
+        "logs": "Process exited with code 1",
+    }
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    # CODE_ERROR with retries remaining → task is retried (QUEUED), not permanently failed
+    assert task.status == TaskStatus.QUEUED, (
+        f"CODE_ERROR with retries remaining should retry to QUEUED, got {task.status}"
+    )
+    # attempt_count MUST be incremented — CODE_ERROR burns a retry slot
+    assert task.attempt_count == 1, (
+        f"attempt_count must be 1 after CODE_ERROR retry burn, got {task.attempt_count}"
+    )

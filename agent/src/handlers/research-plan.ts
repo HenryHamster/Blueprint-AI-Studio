@@ -1971,9 +1971,16 @@ ${hotspotsSection}
             if (sinceLast) parts.push(`since_last_strategic: ${fmt(sinceLast)}`);
             parts.push(`last_24h: ${fmt(last24h)}`, `last_3d: ${fmt(last3d)}`);
             lines.push(`  ${parts.join(', ')}`);
-            const recentTitles = Array.isArray(d.recent_merged_titles) ? d.recent_merged_titles as string[] : [];
+            const recentTitles = Array.isArray(d.recent_merged_titles) ? d.recent_merged_titles : [];
             if (recentTitles.length > 0) {
-              lines.push(`  Recently shipped: ${recentTitles.map(t => `"${t}"`).join('; ')}`);
+              const formatted = recentTitles.map((t: unknown) => {
+                if (typeof t === 'string') return `"${t}"`;
+                const entry = t as Record<string, unknown>;
+                const titleStr = strVal(entry.title ?? '', '?');
+                const autoSuffix = entry.on_automain === false ? ' [NOT on automain]' : '';
+                return `"${titleStr}"${autoSuffix}`;
+              });
+              lines.push(`  Recently shipped: ${formatted.join('; ')}`);
             }
           }
         }
@@ -1986,7 +1993,10 @@ ${hotspotsSection}
             const hoursAgo = typeof m.hours_ago === 'number' ? `${m.hours_ago}h ago` : '?';
             const dirText = strVal(m.direction_text, '').slice(0, 80);
             const dirTag = dirText ? ` [direction: ${dirText}]` : ' [no direction]';
-            lines.push(`  - ${title} ${pr} (${hoursAgo})${dirTag}`);
+            // on_automain=false means the task PR was merged into a rollup staging
+            // branch but the rollup itself has not yet landed on automain.
+            const autoTag = m.on_automain === false ? ' [staged, NOT on automain]' : '';
+            lines.push(`  - ${title} ${pr} (${hoursAgo})${dirTag}${autoTag}`);
             const body = strVal(m.body, '').trim();
             if (body) {
               const indented = body.split('\n').map(l => `    ${l}`).join('\n');

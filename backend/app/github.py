@@ -1556,6 +1556,63 @@ async def is_ancestor_of(
     return compare_status in ("identical", "ahead")
 
 
+async def get_files_changed_between_refs(
+    token: str,
+    owner: str,
+    repo: str,
+    base_ref: str,
+    head_ref: str,
+    project_id: str | None = None,
+) -> list[str] | None:
+    """Return filenames that differ between ``base_ref`` and ``head_ref``.
+
+    Uses ``GET /repos/{owner}/{repo}/compare/{base}...{head}`` and extracts
+    the ``files[].filename`` list.  This is the content-aware landing check
+    for the rollup-squash case: when a task's original commit SHA is not an
+    ancestor of automain (because rollup re-applied the content under a new
+    squashed commit), comparing the two branch tips answers "are these files
+    still different?" — if the fix's target files are NOT in the diff, the
+    fix landed.
+
+    Returns ``None`` on API error so callers can treat indeterminate results
+    as such rather than silently assuming "not changed" or "changed".
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = await _github_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/compare/{base_ref}...{head_ref}",
+        headers,
+        project_id=project_id,
+    )
+    if response.status_code != 200:
+        logger.warning(
+            "[GITHUB] get_files_changed_between_refs: compare %s...%s for %s/%s "
+            "returned %s — cannot determine changed files",
+            base_ref,
+            head_ref,
+            owner,
+            repo,
+            response.status_code,
+        )
+        return None
+    try:
+        files = response.json().get("files", [])
+        return [f["filename"] for f in files if "filename" in f]
+    except (ValueError, TypeError, KeyError) as exc:
+        logger.warning(
+            "[GITHUB] get_files_changed_between_refs: unparseable compare response "
+            "for %s/%s: %s",
+            owner,
+            repo,
+            exc,
+        )
+        return None
+
+
 async def create_pull_request(
     token: str,
     owner: str,

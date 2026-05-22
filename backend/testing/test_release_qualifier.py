@@ -7126,6 +7126,123 @@ async def test_verdict_recording_failure_does_not_propagate(db_session, mocker):
     assert rows == []
 
 
+@pytest.mark.asyncio
+async def test_finalize_records_ci_resolution_provenance_in_verdict(db_session, mocker):
+    """CI resolution provenance (state, resolved_sha, detail) is persisted in
+    the QualificationVerdict sub_scores as ci_resolution for both green and
+    non-green paths."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Mock CI resolution to return explicit provenance: green via PR head.
+    async def mock_resolve_ci(*args, **kwargs):
+        return (
+            True,
+            {
+                "state": rq._CI_GREEN,
+                "resolved_sha": "0123456789abcdef0123456789abcdef01234567",
+                "detail": "PR head check-runs passed",
+            },
+        )
+
+    mocker.patch.object(rq, "_resolve_ci_at_finalize", side_effect=mock_resolve_ci)
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+
+    rows = await _verdict_rows(db_session, project.id)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.sub_scores is not None
+    assert "ci_resolution" in row.sub_scores
+    ci_res = row.sub_scores["ci_resolution"]
+    assert ci_res["state"] == rq._CI_GREEN
+    assert ci_res["resolved_sha"] == "0123456789abcdef0123456789abcdef01234567"
+    assert ci_res["detail"] == "PR head check-runs passed"
+
+
+@pytest.mark.asyncio
+async def test_finalize_records_ci_resolution_on_not_promoted(db_session, mocker):
+    """CI resolution provenance is also recorded when a verdict is not promoted,
+    including degenerate states like pending."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.5,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Mock CI resolution to return pending state (no checks found).
+    async def mock_resolve_ci(*args, **kwargs):
+        return (
+            False,
+            {
+                "state": rq._CI_PENDING,
+                "resolved_sha": None,
+                "detail": "no check-runs on candidate and no PR head with CI",
+            },
+        )
+
+    mocker.patch.object(rq, "_resolve_ci_at_finalize", side_effect=mock_resolve_ci)
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+
+    rows = await _verdict_rows(db_session, project.id)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.sub_scores is not None
+    assert "ci_resolution" in row.sub_scores
+    ci_res = row.sub_scores["ci_resolution"]
+    assert ci_res["state"] == rq._CI_PENDING
+    assert ci_res["resolved_sha"] is None
+    assert ci_res["detail"] == "no check-runs on candidate and no PR head with CI"
+
+
 # ===========================================================================
 # compute_promotion_readiness — the calibration aggregation (Phase 4)
 # ===========================================================================

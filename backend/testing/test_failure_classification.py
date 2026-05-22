@@ -2175,3 +2175,108 @@ class TestCrossLanguageClassificationContracts:
             "update _VIEWPORT_PATTERNS in failure_classification.py to match "
             "the new function name, or update viewport.ts to keep the same name."
         )
+
+
+class TestAccountStateRateLimitCorrelation:
+    """Generic failures during account rate-limit cooldowns classify as RATE_LIMIT."""
+
+    def _make_rl_account(self, account_id: str, in_cooldown: bool) -> dict:
+        from datetime import timedelta
+
+        from app.time_utils import _utcnow
+
+        if in_cooldown:
+            at = _utcnow() - timedelta(minutes=5)
+            return {
+                "enabled": True,
+                "disabled_models": {
+                    "claude-opus-4-5": {
+                        "at": at,
+                        "hits": 1,
+                        "kind": "rate_limit",
+                    }
+                },
+            }
+        return {"enabled": True, "disabled_models": {}}
+
+    def test_incomplete_with_rate_limited_account_classifies_rate_limit(
+        self, monkeypatch
+    ):
+        account_id = "acct-rl-test-1"
+        fake_pool = {account_id: self._make_rl_account(account_id, in_cooldown=True)}
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
+
+        task = _task(
+            "", ctx={"failure_category": "incomplete", "llm_account_id": account_id}
+        )
+        assert classify_failure(task) == RATE_LIMIT
+
+    def test_incomplete_with_healthy_account_stays_code_error(self, monkeypatch):
+        account_id = "acct-healthy-1"
+        fake_pool = {account_id: self._make_rl_account(account_id, in_cooldown=False)}
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
+
+        task = _task(
+            "", ctx={"failure_category": "incomplete", "llm_account_id": account_id}
+        )
+        assert classify_failure(task) == CODE_ERROR
+
+    def test_default_fallback_with_rate_limited_account_classifies_rate_limit(
+        self, monkeypatch
+    ):
+        account_id = "acct-rl-test-2"
+        fake_pool = {account_id: self._make_rl_account(account_id, in_cooldown=True)}
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
+
+        # No failure_category in context, no rate-limit keywords — generic failure
+        task = _task(
+            "failed to read investigation report", ctx={"llm_account_id": account_id}
+        )
+        assert classify_failure(task) == RATE_LIMIT
+
+    def test_default_fallback_with_no_account_stays_code_error(self, monkeypatch):
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+
+        task = _task("failed to read investigation report")
+        assert classify_failure(task) == CODE_ERROR
+
+    def test_specific_failure_not_overridden(self, monkeypatch):
+        """test_failed / lint_failed with rate-limited account stays CODE_ERROR — specific failures are authoritative."""
+        account_id = "acct-rl-test-3"
+        fake_pool = {account_id: self._make_rl_account(account_id, in_cooldown=True)}
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
+
+        task = _task(
+            "", ctx={"failure_category": "test_failed", "llm_account_id": account_id}
+        )
+        assert classify_failure(task) == CODE_ERROR
+
+    def test_normalize_incomplete_with_rate_limited_account(self, monkeypatch):
+        account_id = "acct-rl-norm-1"
+        fake_pool = {account_id: self._make_rl_account(account_id, in_cooldown=True)}
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
+
+        task = _task("", ctx={"llm_account_id": account_id})
+        assert normalize_agent_failure_category("incomplete", task) == RATE_LIMIT
+
+    def test_normalize_incomplete_with_healthy_account(self, monkeypatch):
+        account_id = "acct-healthy-2"
+        fake_pool = {account_id: self._make_rl_account(account_id, in_cooldown=False)}
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
+
+        task = _task("", ctx={"llm_account_id": account_id})
+        assert normalize_agent_failure_category("incomplete", task) == CODE_ERROR

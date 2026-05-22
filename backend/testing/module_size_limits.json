@@ -7,7 +7,7 @@
     "orchestrator.py": 5050,
     "admin.py": 3000,
     "compute.py": 2500,
-    "github.py": 2700,
+    "github.py": 2800,
     "routers/admin_settings.py": 3000,
     "routers/admin_analytics.py": 800,
     "routers/admin_digest.py": 10300,

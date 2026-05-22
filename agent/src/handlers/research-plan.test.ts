@@ -2216,3 +2216,56 @@ describe('handlePlan / handleResearch prompt determinism', () => {
     expect(prompt1).toBe(prompt2);
   });
 });
+
+describe('buildThinkerPrompt on_automain annotation', () => {
+  const base: ThinkerPromptParams = {
+    contextPrefix: '',
+    projectName: 'Test',
+    clockHeader: '',
+    isSelfRepo: false,
+    userStateLine: '',
+    packerMetaSection: '',
+    strategicContext: '',
+    problemModelSection: '## Your current understanding (problem_model)\n_(empty)_',
+    reflectionSection: '## What you previously said was hard\n_(no prior)_',
+    selfImprovementBlock: '',
+    runningUpdateSection: '## Running update (living document — rewrite, don\'t append)\n_(empty)_',
+    designDocJson: '',
+    visionJson: '',
+    outcomeSection: '',
+    previousDecisionOutcomes: '',
+    pastRetirementCritiquesSection: '',
+    retiredDirectionsSummarySection: '',
+    dirSummaryText: 'No active directions.',
+    dirHealthSummary: 'Active: 0/10 slots.',
+    userPausedSection: '',
+    rejectedProposalsSection: '',
+    portfolioCompositionText: 'No active directions — portfolio is empty.',
+    systemMaturitySection: '',
+    driftSection: '',
+    recentWorkSection: '',
+    feedbackSection: '',
+    threadSection: '',
+    taskId: 'test-task',
+    versionPhaseSection: '',
+    memoCitationsSection: '',
+    efficiencySnapshotSection: '',
+  };
+
+  it('passes recentWorkSection with staged-not-on-automain annotation through to output', () => {
+    const section =
+      '\n# Recent Work & Rolling Outcomes\n' +
+      '  - Fix qualifier CI gate #5147 (2.1h ago) [direction: release] [staged, NOT on automain]\n';
+    const prompt = buildThinkerPrompt({ ...base, recentWorkSection: section });
+    expect(prompt).toContain('[staged, NOT on automain]');
+  });
+
+  it('does not annotate when on_automain is true (no annotation tag)', () => {
+    const section =
+      '\n# Recent Work & Rolling Outcomes\n' +
+      '  - Normal landed fix #5100 (3h ago) [direction: release]\n';
+    const prompt = buildThinkerPrompt({ ...base, recentWorkSection: section });
+    expect(prompt).not.toContain('[staged, NOT on automain]');
+    expect(prompt).toContain('Normal landed fix');
+  });
+});
