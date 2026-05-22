@@ -45,6 +45,7 @@ import {
   type MuteWindow,
   countHighSignalMessages,
   countNewSinceLastVisit,
+  fetchBackendLastSeen,
 } from './MessagesPanel.utils';
 
 vi.mock('../api', () => ({
@@ -1171,6 +1172,46 @@ describe('countHighSignalMessages — high-signal NOTE flood survival', () => {
   });
 });
 
+// ── countHighSignalMessages — pref-aware ─────────────────────────────────────
+
+describe('countHighSignalMessages — pref-aware counting', () => {
+  const makeNote = (et: string, status = 'open') => ({
+    message_type: 'NOTE' as const,
+    from_type: 'system',
+    status,
+    context: { event_type: et },
+  });
+
+  test('muted event type is excluded from count when prefs provided', () => {
+    const messages = [makeNote('failure_alert'), makeNote('rollback_recommended')];
+    const prefs: Record<string, import('./MessagesPanel.utils').EventPref> = { failure_alert: 'mute' };
+    expect(countHighSignalMessages(messages, prefs)).toBe(1);
+  });
+
+  test('surfaced routine event type is included when prefs provided', () => {
+    const messages = [makeNote('pr_merged')];
+    const prefs: Record<string, import('./MessagesPanel.utils').EventPref> = { pr_merged: 'surfaced' };
+    expect(countHighSignalMessages(messages, prefs)).toBe(1);
+  });
+
+  test('active temp mute excludes event type from count', () => {
+    const messages = [makeNote('failure_alert')];
+    const tempMutes: import('./MessagesPanel.utils').TemporaryMutes = { failure_alert: Date.now() + 60000 };
+    expect(countHighSignalMessages(messages, {}, tempMutes)).toBe(0);
+  });
+
+  test('expired temp mute does not exclude event type', () => {
+    const messages = [makeNote('failure_alert')];
+    const tempMutes: import('./MessagesPanel.utils').TemporaryMutes = { failure_alert: Date.now() - 1 };
+    expect(countHighSignalMessages(messages, {}, tempMutes)).toBe(1);
+  });
+
+  test('zero-arg call (no prefs) is unchanged — existing callers unbroken', () => {
+    const messages = [makeNote('failure_alert'), makeNote('pr_merged')];
+    expect(countHighSignalMessages(messages)).toBe(1);
+  });
+});
+
 // ── countNewSinceLastVisit ────────────────────────────────────────────────────
 
 describe('countNewSinceLastVisit', () => {
@@ -1235,5 +1276,96 @@ describe('countNewSinceLastVisit', () => {
       makeMsg({ event_type: 'failure_alert', status: 'resolved', created_at: tsNew }), // resolved
     ];
     expect(countNewSinceLastVisit(msgs, base)).toBe(1);
+  });
+});
+
+// ── countNewSinceLastVisit — pref-aware ───────────────────────────────────────
+
+describe('countNewSinceLastVisit — pref-aware counting', () => {
+  const base = Date.now();
+  const tsNew = new Date(base + 10000).toISOString();
+
+  const makeMsg = (et: string, messageType = 'NOTE', fromType = 'system') => ({
+    message_type: messageType,
+    from_type: fromType,
+    status: 'open',
+    context: { event_type: et },
+    created_at: tsNew,
+  });
+
+  test('muted event type is excluded from new count when prefs provided', () => {
+    const msgs = [makeMsg('failure_alert')];
+    const prefs: Record<string, import('./MessagesPanel.utils').EventPref> = { failure_alert: 'mute' };
+    expect(countNewSinceLastVisit(msgs, base, prefs)).toBe(0);
+  });
+
+  test('surfaced routine event type is included in new count when prefs provided', () => {
+    const msgs = [makeMsg('pr_merged')];
+    const prefs: Record<string, import('./MessagesPanel.utils').EventPref> = { pr_merged: 'surfaced' };
+    expect(countNewSinceLastVisit(msgs, base, prefs)).toBe(1);
+  });
+
+  test('active temp mute excludes event type from new count', () => {
+    const msgs = [makeMsg('failure_alert')];
+    const tempMutes: import('./MessagesPanel.utils').TemporaryMutes = { failure_alert: Date.now() + 60000 };
+    expect(countNewSinceLastVisit(msgs, base, {}, tempMutes)).toBe(0);
+  });
+
+  test('zero-arg prefs call is unchanged — existing callers unbroken', () => {
+    const msgs = [makeMsg('failure_alert')];
+    expect(countNewSinceLastVisit(msgs, base)).toBe(1);
+  });
+});
+
+// ── fetchBackendLastSeen ──────────────────────────────────────────────────────
+
+describe('fetchBackendLastSeen', () => {
+  beforeEach(() => { vi.resetAllMocks(); });
+
+  test('returns parsed timestamp on successful response', async () => {
+    const ts = 1700000000000;
+    vi.mocked(apiFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ last_seen_at: ts }),
+    } as Response);
+    const result = await fetchBackendLastSeen('project-uuid');
+    expect(result).toBe(ts);
+  });
+
+  test('returns null when last_seen_at is zero', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ last_seen_at: 0 }),
+    } as Response);
+    expect(await fetchBackendLastSeen('project-uuid')).toBeNull();
+  });
+
+  test('returns null when last_seen_at is absent', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({}),
+    } as Response);
+    expect(await fetchBackendLastSeen('project-uuid')).toBeNull();
+  });
+
+  test('returns null on non-ok response', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({ ok: false } as Response);
+    expect(await fetchBackendLastSeen('project-uuid')).toBeNull();
+  });
+
+  test('returns null on network error', async () => {
+    vi.mocked(apiFetch).mockRejectedValue(new Error('network'));
+    expect(await fetchBackendLastSeen('project-uuid')).toBeNull();
+  });
+
+  test('URL includes encoded project_id', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({
+      ok: true,
+      json: async () => ({ last_seen_at: 1 }),
+    } as Response);
+    await fetchBackendLastSeen('proj/with spaces');
+    expect(vi.mocked(apiFetch)).toHaveBeenCalledWith(
+      expect.stringContaining('proj%2Fwith%20spaces'),
+    );
   });
 });

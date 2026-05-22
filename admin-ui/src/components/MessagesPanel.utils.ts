@@ -593,25 +593,34 @@ export function isEventTypeTemporarilyMuted(eventType: string | undefined, tempM
 
 // Count high-signal open messages (genuine operator attention items, excluding routine ops chatter).
 // High-signal includes: user messages, FEEDBACK/BLOCKER/BUG_REPORT types, and critical escalation NOTEs.
-// This computation is used consistently whether the messages panel is open or closed.
-export function countHighSignalMessages(messages: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown> }>): number {
+// When prefs/tempMutes are provided, effectiveSignal() is used so muted types are excluded and
+// surfaced types are included — this computation is used consistently whether the panel is open or closed.
+export function countHighSignalMessages(
+  messages: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown> }>,
+  prefs?: Record<string, EventPref>,
+  tempMutes?: TemporaryMutes,
+): number {
   return messages.filter(m =>
-    m.status === 'open' && classifySignalLevel(m) === 'high'
+    m.status === 'open' && (prefs ? effectiveSignal(m, prefs, tempMutes) : classifySignalLevel(m)) === 'high'
   ).length;
 }
 
 // Count high-signal open messages that arrived after the operator's last panel visit.
 // Returns 0 when lastSeenTs is null (new operator with no baseline yet) so we never
 // mislabel all messages as new. Only counts messages with a valid created_at timestamp
-// that is strictly newer than lastSeenTs.
+// that is strictly newer than lastSeenTs. When prefs/tempMutes are provided, respects
+// operator mute/surface preferences identically to countHighSignalMessages.
 export function countNewSinceLastVisit(
   messages: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown>; created_at?: string | null }>,
   lastSeenTs: number | null,
+  prefs?: Record<string, EventPref>,
+  tempMutes?: TemporaryMutes,
 ): number {
   if (lastSeenTs === null) return 0;
   return messages.filter(m => {
     if (m.status !== 'open') return false;
-    if (classifySignalLevel(m) !== 'high') return false;
+    const signal = prefs ? effectiveSignal(m, prefs, tempMutes) : classifySignalLevel(m);
+    if (signal !== 'high') return false;
     if (!m.created_at) return false;
     const ts = new Date(m.created_at.endsWith('Z') || m.created_at.includes('+') ? m.created_at : m.created_at + 'Z').getTime();
     return !isNaN(ts) && ts > lastSeenTs;
@@ -842,4 +851,20 @@ export function resolveServerMuteWindow(
 ): MuteWindow | null {
   if (serverWin === undefined) return localWin;
   return serverWin;
+}
+
+// ── Server-side last-seen (per-operator, per-project) ────────────────────────
+// Fetches the operator's cross-device last-seen timestamp from the backend.
+// Returns null on any error (non-ok response, network failure). The caller
+// should resolve this with the local localStorage value via resolveLastSeen.
+export async function fetchBackendLastSeen(projectId: string): Promise<number | null> {
+  try {
+    const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/last-seen?project_id=${encodeURIComponent(projectId)}`);
+    if (!res.ok) return null;
+    const data = await res.json() as { last_seen_at?: number | null };
+    const val = data.last_seen_at;
+    return typeof val === 'number' && val > 0 ? val : null;
+  } catch {
+    return null;
+  }
 }

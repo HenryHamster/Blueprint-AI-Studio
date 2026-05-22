@@ -485,11 +485,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
       ).length
     : 0;
 
-  // Badge/tab-title count. Uses countHighSignalMessages (prefs-independent) so the value
-  // matches the closed-panel App.tsx badge and the fetch callback at line 806 — the count
-  // must not jump when the operator opens the panel. Operator mute/surface prefs only
-  // affect in-panel grouping (highSignalOpen/routineOpen), not the global badge.
-  const highSignalCount = countHighSignalMessages(messages);
+  // Badge/tab-title count. Passes eventPrefs/tempMutes so muted types are excluded and
+  // surfaced types are included — matching App.tsx's closed-panel count exactly so the
+  // badge does not jump when the operator opens the panel.
+  const highSignalCount = countHighSignalMessages(messages, eventPrefs, tempMutes);
 
   // Count new messages by type for the summary card (respecting mute prefs and criticalOnly)
   const newMessageCounts = useMemo(() => dividerTime
@@ -869,7 +868,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
         if (prev.length === msgs.length && prev.every((m, i) => m.id === msgs[i].id && m.status === msgs[i].status)) return prev;
         return msgs;
       });
-      onMessageCountChange?.(countHighSignalMessages(msgs));
+      onMessageCountChange?.(countHighSignalMessages(msgs, eventPrefsRef.current, tempMutesRef.current));
       // Fetch webhook delivery stats (non-critical — errors are silently ignored)
       try {
         const statsRes = await apiFetch(`${API_BASE_URL}/api/admin/notification-dispatch/stats?project_id=${selectedProjectId}`);
