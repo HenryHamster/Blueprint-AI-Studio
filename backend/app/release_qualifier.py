@@ -87,6 +87,7 @@ from app.models import (
 )
 from app.notification_dispatch import (
     post_event_message,
+    post_version_auto_merge_stall_message,
     post_version_build_stalled_message,
     post_version_calcification_message,
     post_version_ci_unresolved_stall_message,
@@ -242,6 +243,11 @@ _BUILD_STALL_MERGED_TASKS = 40
 # progressing stabilize phase.  EITHER trigger fires the alert.
 _STABILIZE_STALL_AGE_DAYS = 14
 _STABILIZE_STALL_MERGED_TASKS = 40
+
+# How long a promotion PR may await auto-merge before the stall alert fires.
+# main's required checks can legitimately take a while (queue, slow suites),
+# but 4 hours is generous; a genuinely-stuck PR should be visible by then.
+_AUTO_MERGE_STALL_SECONDS = 4 * 3600
 
 
 def _is_build_stalled(age_days: int, merged_count: int) -> bool:
@@ -2472,6 +2478,14 @@ async def _finalize_locked_version(
     # --- Path 1: age-bound qualification timeout (reaper sweep only) --------
     # Checked first and child-state-independent (audit H2).
     if timeout_now is not None:
+        # Skip the qualification timeout when the version is already awaiting a
+        # promotion auto-merge.  Qualification completed and passed; the pending
+        # clock now belongs to the promotion PR on main CI, not to qualifier
+        # children.  The timeout backstop is only for qualifier children that
+        # never reach a terminal state.  The auto-merge stall check (separate
+        # lifecycle alert) handles the case where the PR is genuinely stuck.
+        if qual.get("promotion_pending"):
+            return None
         started_at = _parse_started_at(qual)
         timeout_clock = started_at
         if timeout_clock is None:
@@ -3116,6 +3130,111 @@ async def _check_version_stabilize_stall(
     return True
 
 
+async def _check_version_auto_merge_stall(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Alert when a promotion PR awaiting auto-merge has been pending too long.
+
+    A version enters the promotion-pending state when ``promote()`` successfully
+    opened a release-vN → main PR and enabled auto-merge, but main's required CI
+    checks had not yet passed.  That is a healthy transient — the PR will merge
+    once CI completes.  But if the PR never merges (auto-merge not enabled,
+    a required check went red, or a required check never reports) the version
+    sits with ``last_qualification.status == "pending"`` indefinitely with no
+    visible alert.
+
+    This check fires once per auto-merge attempt after ``_AUTO_MERGE_STALL_SECONDS``
+    have elapsed without the PR merging.  Dedup anchor: ``alerted_at`` is stored
+    inside ``last_qualification["promotion_pending"]`` to avoid repeated alerts on
+    the same stall without requiring a schema migration.
+
+    Messaging is best-effort — failure never breaks the sweep.
+    Does NOT commit — caller commits on True return.
+    """
+    if version.status != "open":
+        return False
+
+    qual = version.last_qualification or {}
+    if qual.get("status") != "pending":
+        return False
+
+    pending = qual.get("promotion_pending")
+    if not pending:
+        return False
+
+    if pending.get("alerted_at"):
+        return False  # already alerted for this auto-merge attempt
+
+    enabled_at_str = pending.get("enabled_at")
+    if not enabled_at_str:
+        return False
+
+    try:
+        enabled_at = datetime.fromisoformat(enabled_at_str)
+    except (ValueError, TypeError):
+        return False
+
+    age_seconds = (_utcnow() - enabled_at).total_seconds()
+    if age_seconds < _AUTO_MERGE_STALL_SECONDS:
+        return False
+
+    pr_number = pending.get("pr_number")
+    pr_url = pending.get("pr_url") or ""
+    auto_merge_enabled = bool(pending.get("auto_merge_enabled"))
+    age_hours = int(age_seconds // 3600)
+
+    session.add(
+        Alert(
+            project_id=version.project_id,
+            severity=AlertSeverity.WARNING,
+            title=(f"Release v{version.version_number} promotion auto-merge stalled"),
+            message=(
+                f"Release v{version.version_number} passed qualification but "
+                f"promotion PR #{pr_number} has not merged after {age_hours}h "
+                f"(auto-merge "
+                f"{'enabled' if auto_merge_enabled else 'NOT confirmed enabled'}"
+                f"). Check the PR: {pr_url}"
+            ),
+        )
+    )
+    try:
+        await post_version_auto_merge_stall_message(
+            session,
+            version.project_id,
+            version_number=version.version_number,
+            version_id=str(version.id),
+            pr_number=pr_number,
+            pr_url=pr_url,
+            auto_merge_enabled=auto_merge_enabled,
+            age_hours=age_hours,
+        )
+    except Exception as exc:  # noqa: BLE001 — messaging must never break the sweep
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to post auto-merge-stall message for v%d "
+            "(non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+
+    # Record dedup anchor inside the qualification JSON — no schema migration needed.
+    new_qual = dict(qual)
+    new_qual["promotion_pending"] = dict(pending)
+    new_qual["promotion_pending"]["alerted_at"] = _utcnow().isoformat()
+    version.last_qualification = new_qual
+    session.add(version)
+
+    logger.warning(
+        "[RELEASE_QUALIFIER] auto-merge stall alert for v%d: PR #%s pending %dh "
+        "(auto-merge %s)",
+        version.version_number,
+        pr_number,
+        age_hours,
+        "enabled" if auto_merge_enabled else "NOT confirmed enabled",
+    )
+    return True
+
+
 async def _check_version_promotion_readiness(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -3189,6 +3308,161 @@ async def _check_version_promotion_readiness(
         readiness["verdicts_evaluated"],
     )
     return True
+
+
+async def _reconcile_if_promotion_failed_landed(
+    version_id: uuid.UUID,
+    *,
+    session_factory=None,
+) -> bool:
+    """Reconcile an open version whose promotion-failure candidate is already on main.
+
+    A version whose ``last_qualification.status == "promotion_failed"`` is kept
+    ``open`` so the next strategic cycle can retry.  But if the blocked PR later
+    lands (operator manually merges it, a previously-stalled auto-merge fires, a
+    transient CI block clears), nothing calls the idempotency check again — the
+    version stays ``open`` with a stale failure verdict, the next version is never
+    opened, and the release lifecycle wedges.
+
+    This helper fills that gap.  It is called from ``sweep_stuck_qualifications``
+    for every ``open`` version whose ``last_qualification.status`` is
+    ``"promotion_failed"`` and that has a ``candidate_sha``.  For each such version
+    it runs the same idempotency check ``promote()`` uses and, if the candidate is
+    reachable from ``main``, records the promotion as successful via
+    ``_record_promotion_success`` — which also opens the next version.
+
+    Lock + session pattern mirrors ``_finalize_in_dedicated_session``: a dedicated
+    session takes ``FOR UPDATE`` on the version row, releases the lock via an
+    intermediate commit BEFORE any GitHub I/O, then re-acquires it (inside
+    ``_record_promotion_success``) for the final write.
+
+    Returns ``True`` when the version was reconciled (promoted), ``False``
+    otherwise (candidate not on main, GitHub error, wrong status, etc.).
+    """
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            # Lock the version row — same serialization point as _finalize_locked_version.
+            version: release_version.ReleaseVersion | None = (
+                (
+                    await session.execute(
+                        select(release_version.ReleaseVersion)
+                        .where(release_version.ReleaseVersion.id == version_id)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if version is None:
+                return False
+            if version.status != "open":
+                return False
+            qual = version.last_qualification or {}
+            if qual.get("status") != "promotion_failed":
+                return False
+            candidate_sha: str | None = qual.get("candidate_sha")
+            if not candidate_sha:
+                return False
+
+            base_record = dict(qual)
+            project = await session.get(Project, version.project_id)
+            if project is None:
+                return False
+
+            # Release the row lock before any GitHub I/O (mirrors promote()).
+            try:
+                await session.commit()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reconcile: failed to release row lock "
+                    "for v%d before GitHub I/O — skipping",
+                    version.version_number,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "[RELEASE_QUALIFIER] reconcile: rollback failed for v%d "
+                        "after commit error",
+                        version.version_number,
+                    )
+                return False
+
+            # Resolve credentials (unlocked — same as promote()).
+            resolved = await _resolve_github_with_session(session, project)
+            if resolved is None:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile: no GitHub credentials for "
+                    "v%d — skipping reconcile",
+                    version.version_number,
+                )
+                return False
+            token, owner, repo = resolved
+
+            # Idempotency check — is the candidate already on main?
+            if not await _candidate_already_on_main(
+                token, owner, repo, candidate_sha, version
+            ):
+                return False
+
+            logger.info(
+                "[RELEASE_QUALIFIER] reconcile: candidate %s for v%d is on "
+                "main despite promotion_failed record — reconciling as promoted",
+                candidate_sha[:8],
+                version.version_number,
+            )
+
+            # Resolve the real main HEAD SHA so promoted_sha points at the merge
+            # commit, not the candidate (which may be a parent of the merge commit).
+            promoted_sha: str | None = None
+            try:
+                promoted_sha = await github.get_branch_sha(
+                    token,
+                    owner,
+                    repo,
+                    "main",
+                    project_id=str(version.project_id),
+                )
+            except Exception as exc:  # noqa: BLE001 — fallback to candidate_sha
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile: could not resolve main HEAD "
+                    "SHA for v%d (%s) — using candidate_sha as promoted_sha",
+                    version.version_number,
+                    exc,
+                )
+
+            result = await _record_promotion_success(
+                session,
+                version,
+                candidate_sha,
+                base_record,
+                pr_url=_idempotent_pr_url(base_record),
+                token=token,
+                owner=owner,
+                repo=repo,
+                promoted_sha=promoted_sha,
+                already_landed=True,
+                lock_released=True,
+            )
+            await session.commit()
+            return result.get("status") == "promoted" and not result.get(
+                "already_promoted"
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] reconcile: unexpected error for version %s",
+                version_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reconcile: rollback failed for version %s "
+                    "after unexpected error",
+                    version_id,
+                )
+            return False
 
 
 async def sweep_stuck_qualifications(
@@ -3285,6 +3559,34 @@ async def sweep_stuck_qualifications(
             finalized,
         )
 
+    # Reconcile open versions whose promotion-failure candidate is already on
+    # main.  A promotion_failed version is kept open so the next strategic cycle
+    # can retry, but if the blocked PR later lands out-of-band (operator merge,
+    # a stalled auto-merge fires, a transient CI block clears) nothing calls the
+    # idempotency check again.  This loop fills that gap: for each open version
+    # with last_qualification.status=="promotion_failed" it checks whether the
+    # candidate is now reachable from main and, if so, records the promotion as
+    # successful and opens the next version.
+    for version_id in version_ids:
+        try:
+            reconciled = await _reconcile_if_promotion_failed_landed(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: reconcile check failed for version %s",
+                version_id,
+            )
+            continue
+        if reconciled:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep reconciled version %s "
+                "(promotion_failed candidate landed on main)",
+                version_id,
+            )
+
     # Lifecycle-stall checks: alert when an open version is stuck at either end
     # of the lifecycle — calcifying in stabilize (repeated hard-blocker
     # failures) or stalled in build (sitting too long without advancing).  The
@@ -3311,6 +3613,9 @@ async def sweep_stuck_qualifications(
                 alerted = (
                     await _check_version_promotion_readiness(alert_session, v)
                     or alerted
+                )
+                alerted = (
+                    await _check_version_auto_merge_stall(alert_session, v) or alerted
                 )
                 if alerted:
                     await alert_session.commit()
@@ -4054,20 +4359,39 @@ async def promote(
             )
         except Exception as exc:  # noqa: BLE001
             am_result = {"enabled": False, "message": str(exc)[:200]}
+        auto_merge_enabled = bool(am_result.get("enabled"))
         logger.info(
             "[RELEASE_QUALIFIER] promote: PR #%s for v%d pending CI — "
             "auto-merge %s (%s). Qualification stays pending; reaper confirms "
             "when auto-merge lands.",
             pr_number,
             version.version_number,
-            "enabled" if am_result.get("enabled") else "not confirmed",
+            "enabled" if auto_merge_enabled else "not confirmed",
             am_result.get("message", ""),
         )
+        # Durably record the promotion sub-state so the reaper's qualification-
+        # timeout backstop can distinguish this version (qualification PASSED,
+        # waiting on the promotion PR's CI) from a version whose qualifier
+        # children never terminated.  Re-lock the version row first because the
+        # intermediate commit above released the lock.
+        locked = await _relock_version_for_promotion_write(
+            session, version, lock_released=True
+        )
+        if locked is not None and locked.status == "open":
+            q = dict(locked.last_qualification or {})
+            q["promotion_pending"] = {
+                "pr_number": pr_number,
+                "pr_url": pr_url,
+                "auto_merge_enabled": auto_merge_enabled,
+                "enabled_at": _utcnow().isoformat(),
+            }
+            locked.last_qualification = q
+            session.add(locked)
         return {
             "status": "pending_auto_merge",
             "pr_number": pr_number,
             "pr_url": pr_url,
-            "auto_merge_enabled": bool(am_result.get("enabled")),
+            "auto_merge_enabled": auto_merge_enabled,
         }
 
     # 3. Success — resolve the REAL merged commit.  merge_method="merge"

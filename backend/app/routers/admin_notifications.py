@@ -138,6 +138,7 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
         "release_build_stalled",
         "release_stabilize_stalled",
         "release_ci_unresolved_stall",
+        "release_auto_merge_stalled",
     }
 )
 

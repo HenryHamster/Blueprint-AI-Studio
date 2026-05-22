@@ -5368,11 +5368,19 @@ async def test_promote_pending_ci_enables_auto_merge_no_failure(db_session, mock
     assert result["auto_merge_enabled"] is True
     am_mock.assert_awaited_once()
 
-    # No failure recorded — last_qualification is unchanged (None or pending).
+    # No failure recorded — status is not promotion_failed.
     await db_session.refresh(version)
     lq = version.last_qualification or {}
     assert lq.get("status") != "promotion_failed"
     assert "error" not in lq
+
+    # Durable promotion_pending sub-state is now written so the reaper can
+    # distinguish this version (qualification PASSED) from a hung qualifier child.
+    pending = lq.get("promotion_pending") or {}
+    assert pending.get("pr_number") == 99
+    assert pending.get("pr_url") == "http://pr/99"
+    assert pending.get("auto_merge_enabled") is True
+    assert "enabled_at" in pending
 
 
 @pytest.mark.asyncio
@@ -8279,3 +8287,361 @@ async def test_ci_unresolved_stall_distinct_from_calcification_alert(db_session)
 
     assert calc_fired2 is False
     assert ci_stall_fired2 is True
+
+
+# ===========================================================================
+# pending-auto-merge: timeout bypass and stall alert
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_sweep_skips_timeout_for_version_awaiting_auto_merge(db_session):
+    """Audit H2 exemption: the qualification-timeout backstop must NOT
+    misclassify a version that is already awaiting promotion auto-merge.
+    Qualification completed and passed; the pending clock runs on the
+    promotion PR's CI, not on qualifier children."""
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+
+    # Stamp a very old started_at that would normally trigger the timeout,
+    # but include a promotion_pending sub-state indicating qualification passed.
+    old_started = (
+        _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
+    ).isoformat()
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+        started_at=old_started,
+    )
+    # Inject the promotion_pending sub-state directly (simulating what promote()
+    # writes after enabling auto-merge).
+    version.last_qualification = {
+        **version.last_qualification,
+        "promotion_pending": {
+            "pr_number": 42,
+            "pr_url": "http://github.com/pr/42",
+            "auto_merge_enabled": True,
+            "enabled_at": _utcnow().isoformat(),
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    # Sweep did NOT force-finalize this version (count=0) — it is not a
+    # hung-qualifier-child timeout; it is awaiting the promotion PR.
+    assert count == 0
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert "blocker" not in version.last_qualification
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_stall_alert_fires_when_stuck(db_session):
+    """_check_version_auto_merge_stall fires once and records a dedup anchor
+    when a promotion_pending sub-state has been waiting past the stall threshold.
+    """
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+    from sqlmodel import select as _select
+
+    project, version = await _make_project_and_version(db_session)
+
+    # Seed a pending qualification with an old auto-merge enabled_at.
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+    old_enabled = (
+        _utcnow() - timedelta(seconds=rq._AUTO_MERGE_STALL_SECONDS + 600)
+    ).isoformat()
+    version.last_qualification = {
+        **version.last_qualification,
+        "promotion_pending": {
+            "pr_number": 77,
+            "pr_url": "http://github.com/pr/77",
+            "auto_merge_enabled": True,
+            "enabled_at": old_enabled,
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    fired = await rq._check_version_auto_merge_stall(db_session, version)
+    await db_session.commit()
+
+    assert fired is True
+
+    # An Alert was created.
+    alerts = (
+        (await db_session.execute(_select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "auto-merge" in alerts[0].title.lower()
+
+    # Dedup anchor is set — a second call returns False.
+    await db_session.refresh(version)
+    assert version.last_qualification["promotion_pending"].get("alerted_at") is not None
+    fired_again = await rq._check_version_auto_merge_stall(db_session, version)
+    assert fired_again is False
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_stall_does_not_fire_before_threshold(db_session):
+    """_check_version_auto_merge_stall does NOT fire when auto-merge was enabled
+    recently (under the stall threshold)."""
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+    # enabled_at is recent — under the stall threshold.
+    version.last_qualification = {
+        **version.last_qualification,
+        "promotion_pending": {
+            "pr_number": 55,
+            "pr_url": "http://github.com/pr/55",
+            "auto_merge_enabled": True,
+            "enabled_at": _utcnow().isoformat(),
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    fired = await rq._check_version_auto_merge_stall(db_session, version)
+    assert fired is False
+
+
+# ===========================================================================
+# sweep reconcile — promotion_failed candidate already on main
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_candidate_on_main_reconciled(db_session, mocker):
+    """An open version with last_qualification.status='promotion_failed' whose
+    candidate_sha is already reachable from main is reconciled to 'promoted' by
+    the sweep, and the next version is opened (count=1)."""
+    from app.models import ReleaseVersion as _RV
+
+    project, version = await _make_project_and_version(db_session)
+
+    candidate_sha = "reconcile" * 4 + "1234"  # 40 chars
+    main_head_sha = "mainhead" * 5  # 40 chars
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": candidate_sha,
+        "error": "merge_blocked",
+        "conflict": True,
+        "confidence": 0.95,
+        "sub_scores": {},
+        "pr_url": "https://github.com/acme/widget/pull/42",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Candidate IS on main now (operator merged it out-of-band).
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=main_head_sha),
+    )
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value=None))
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # Sweep counted this as a finalization.
+    assert count == 1
+
+    # Version is now promoted.
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.last_qualification["status"] == "promoted"
+    assert version.last_qualification["already_landed"] is True
+    assert version.promoted_sha == main_head_sha
+
+    # Next version was opened.
+    next_versions = (
+        (
+            await db_session.execute(
+                select(_RV).where(
+                    _RV.project_id == project.id,
+                    _RV.version_number == 2,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(next_versions) == 1
+    assert next_versions[0].status == "open"
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_candidate_not_on_main_skipped(db_session, mocker):
+    """An open version with last_qualification.status='promotion_failed' whose
+    candidate_sha is NOT on main is left untouched by the sweep (count=0)."""
+    project, version = await _make_project_and_version(db_session)
+
+    candidate_sha = "notlanded" * 4 + "abcd"  # 40 chars
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": candidate_sha,
+        "error": "merge_blocked",
+        "conflict": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    # Candidate is NOT on main yet.
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=False),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 0
+
+    # Version untouched — still open with promotion_failed record.
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "promotion_failed"
+
+
+@pytest.mark.asyncio
+async def test_promotion_failed_reconcile_idempotent(db_session, mocker):
+    """Calling sweep twice on a version that was reconciled on the first call
+    does NOT double-promote or open a duplicate next version (count=0 on the
+    second call)."""
+    from app.models import ReleaseVersion as _RV
+
+    project, version = await _make_project_and_version(db_session)
+
+    candidate_sha = "idemptest" * 4 + "12ab"  # 40 chars
+    main_head_sha = "mainhead" * 5  # 40 chars
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": candidate_sha,
+        "error": "merge_blocked",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=main_head_sha),
+    )
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value=None))
+
+    first_count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+    assert first_count == 1
+
+    # Second sweep — version is now promoted (not open), reconcile is a no-op.
+    second_count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+    assert second_count == 0
+
+    # Exactly one next version was opened.
+    next_versions = (
+        (
+            await db_session.execute(
+                select(_RV).where(
+                    _RV.project_id == project.id,
+                    _RV.version_number == 2,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(next_versions) == 1
+
+
+@pytest.mark.asyncio
+async def test_non_promotion_failed_status_not_reconciled(db_session, mocker):
+    """A version with last_qualification.status='not_promoted' is NOT touched by
+    the reconcile loop — only 'promotion_failed' versions are candidates."""
+    project, version = await _make_project_and_version(db_session)
+
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": "aabbcc" * 6 + "aabb",
+        "blocker": "ci_not_green",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # is_ancestor_of would return True if called, but it should NOT be called.
+    is_ancestor_mock = mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 0
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "not_promoted"
+    # The ancestry check must NOT have been invoked for a non-promotion_failed version.
+    is_ancestor_mock.assert_not_called()
