@@ -9680,6 +9680,7 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
         "confidence": qual.get("confidence"),
         "threshold": qual.get("threshold"),
         "sub_scores": qual.get("sub_scores"),
+        "ci_resolution": qual.get("ci_resolution"),
         "blocker": qual.get("blocker"),
         "finalized_at": qual.get("finalized_at"),
     }

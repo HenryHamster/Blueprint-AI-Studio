@@ -15849,6 +15849,11 @@ async def test_version_lifecycle_with_open_version(client: AsyncClient, db_sessi
             "confidence": 0.92,
             "threshold": 0.90,
             "sub_scores": {"audit": 0.95, "test_erosion": 0.88, "smoketest": 0.90},
+            "ci_resolution": {
+                "state": "green",
+                "resolved_sha": "abc1234567",
+                "detail": "candidate commit check-runs: green",
+            },
             "blocker": None,
             "finalized_at": "2026-01-01T00:00:00",
         },
@@ -15872,6 +15877,8 @@ async def test_version_lifecycle_with_open_version(client: AsyncClient, db_sessi
     assert qual["confidence"] == 0.92
     assert qual["threshold"] == 0.90
     assert qual["sub_scores"]["audit"] == 0.95
+    assert qual["ci_resolution"]["state"] == "green"
+    assert qual["ci_resolution"]["resolved_sha"] == "abc1234567"
     assert qual["blocker"] is None
 
     assert data["recent_versions"] == []

@@ -3754,8 +3754,12 @@ async def test_outcome_evaluation_handles_empty_strings(db_session):
 
 
 @pytest.mark.asyncio
-async def test_on_automain_true_for_root_task(db_session):
-    """Root tasks (no parent) always report on_automain=True."""
+async def test_on_automain_false_for_root_task_when_unverified(db_session):
+    """Root tasks (no parent) report on_automain=False when ancestry cannot be verified.
+
+    When GitHub credentials are unavailable the ancestry check is skipped and the
+    task is NOT assumed to have landed on the integration branch (fail-closed).
+    """
     project = _make_project(vision={"purpose": "test"})
     db_session.add(project)
     await db_session.commit()
@@ -3777,7 +3781,7 @@ async def test_on_automain_true_for_root_task(db_session):
     result = await _build_recent_interventions(project, db_session)
     merges = result["merges"]
     assert len(merges) == 1
-    assert merges[0]["on_automain"] is True
+    assert merges[0]["on_automain"] is False
 
 
 @pytest.mark.asyncio
@@ -3818,8 +3822,11 @@ async def test_on_automain_true_when_rollup_merged(db_session):
     result = await _build_recent_interventions(project, db_session)
     merges = result["merges"]
     by_title = {m["pr_title"]: m for m in merges}
+    # Child is on automain via the parent's pr_merged DB flag (fail-open for child
+    # tasks is intentional — the flag is a DB-recorded rollup-merge event).
     assert by_title["Child fix"]["on_automain"] is True
-    assert by_title["Rollup parent"]["on_automain"] is True
+    # Rollup parent is a root task with no credentials → ancestry unverifiable → False.
+    assert by_title["Rollup parent"]["on_automain"] is False
 
 
 @pytest.mark.asyncio
@@ -4147,3 +4154,93 @@ async def test_on_automain_child_false_when_parent_rollup_pr_not_ancestor(
     by_title = {m["pr_title"]: m for m in result["merges"]}
     assert by_title["Stranded rollup child"]["on_automain"] is False
     assert by_title["Stranded rollup parent"]["on_automain"] is False
+
+
+@pytest.mark.asyncio
+async def test_on_automain_false_for_root_task_no_pr_number(db_session, mocker):
+    """Root task with no pr_number reports on_automain=False even with credentials.
+
+    When credentials resolve but the task has no pr_number or rollup_pr_number in
+    its context, no ancestry check can run for it.  The task must NOT be assumed
+    landed (fail-closed), so on_automain must be False.
+    """
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="No-PR root fix",
+        description="merged but no pr_number",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        # pr_merged=True but no pr_number/rollup_pr_number → ancestry check skipped
+        context={"pr_merged": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["pr_title"] == "No-PR root fix"
+    # No pr_number → ancestry check skipped → unverifiable → fail-closed = False
+    assert merges[0]["on_automain"] is False
+
+
+@pytest.mark.asyncio
+async def test_on_automain_false_for_root_task_ancestry_api_exception(
+    db_session, mocker
+):
+    """Root task reports on_automain=False when the ancestry API call raises an exception.
+
+    An exception during the ancestry check leaves the task absent from
+    _automain_verified.  The fallback must NOT assume landed (fail-closed).
+    """
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="API-error root fix",
+        description="ancestry API raises",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 777},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={"merge_commit_sha": "abc123", "head": {"sha": "head-sha"}}
+        ),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(side_effect=RuntimeError("GitHub API unreachable")),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["pr_title"] == "API-error root fix"
+    # API exception → task absent from _automain_verified → fail-closed = False
+    assert merges[0]["on_automain"] is False

@@ -11,7 +11,7 @@ import {
   Search,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { apiFetch, fetchQualificationVerdicts, fetchSrUnhandledEdgesRetrospectives, setVersionPhase, triggerQualify, type PromptFingerprintAnalyticsResponse, type QualificationVerdictRecord, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
+import { apiFetch, fetchQualificationVerdicts, fetchSrUnhandledEdgesRetrospectives, setVersionPhase, triggerQualify, type CiResolution, type PromptFingerprintAnalyticsResponse, type QualificationVerdictRecord, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
@@ -436,6 +436,22 @@ function QualSummary({ q }: { q: VersionQualification | null }) {
   );
 }
 
+const CI_STATE_STYLE: Record<string, string> = {
+  green: 'text-emerald-400',
+  red: 'text-red-400',
+  pending: 'text-amber-400',
+  no_checks: 'text-neutral-500',
+};
+
+function CiBadge({ ci }: { ci: CiResolution }) {
+  const color = CI_STATE_STYLE[ci.state] ?? 'text-neutral-500';
+  return (
+    <span className={`font-mono text-[9px] ${color}`} title={ci.detail}>
+      ci:{ci.state}{ci.resolved_sha ? ` @${ci.resolved_sha.slice(0, 7)}` : ''}
+    </span>
+  );
+}
+
 function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadiness | null | undefined }) {
   if (!readiness) return null;
   const { ready, reason, verdicts_evaluated, would_promote_rate, consecutive_clean_passes, recurring_blockers } = readiness;
@@ -539,11 +555,18 @@ function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: 
             {cv.last_qualification && (
               <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
                 <QualSummary q={cv.last_qualification} />
-                {cv.last_qualification.sub_scores && (
-                  <div className="flex flex-wrap gap-x-2 text-[10px] text-neutral-500">
-                    <span>audit {Math.round(cv.last_qualification.sub_scores.audit * 100)}%</span>
-                    <span>erosion {Math.round(cv.last_qualification.sub_scores.test_erosion * 100)}%</span>
-                    <span>smoke {Math.round(cv.last_qualification.sub_scores.smoketest * 100)}%</span>
+                {(cv.last_qualification.sub_scores || cv.last_qualification.ci_resolution) && (
+                  <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-neutral-500">
+                    {cv.last_qualification.sub_scores && (
+                      <>
+                        <span>audit {Math.round(cv.last_qualification.sub_scores.audit * 100)}%</span>
+                        <span>erosion {Math.round(cv.last_qualification.sub_scores.test_erosion * 100)}%</span>
+                        <span>smoke {Math.round(cv.last_qualification.sub_scores.smoketest * 100)}%</span>
+                      </>
+                    )}
+                    {cv.last_qualification.ci_resolution && (
+                      <CiBadge ci={cv.last_qualification.ci_resolution} />
+                    )}
                   </div>
                 )}
                 {cv.last_qualification.blocker && (
@@ -600,6 +623,7 @@ function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: 
                   <span className={QUAL_VERDICT_COLOR[v.terminal_status ?? ''] ?? 'text-neutral-400'}>{v.terminal_status?.replace(/_/g, '-') ?? '?'}</span>
                   {v.promotion_enabled && <span className="text-[9px] font-mono text-emerald-600">LIVE</span>}
                   {v.sub_scores && <span className="text-neutral-600 font-mono text-[9px]">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)} s:{Math.round(v.sub_scores.smoketest * 100)}</span>}
+                  {v.sub_scores?.ci_resolution && <CiBadge ci={v.sub_scores.ci_resolution} />}
                   {v.blocker && <span className="text-red-400 truncate max-w-[120px]" title={v.blocker}>{v.blocker}</span>}
                   <span className="text-neutral-700 font-mono">{v.candidate_sha.slice(0, 7)}</span>
                   {v.finalized_at && <span className="text-neutral-600">{timeAgo(v.finalized_at)}</span>}

@@ -711,10 +711,17 @@ export async function fetchEfficiencyAxes(projectId: string): Promise<Efficiency
   return res.json();
 }
 
+export interface CiResolution {
+  state: 'green' | 'red' | 'pending' | 'no_checks';
+  resolved_sha: string | null;
+  detail: string;
+}
+
 export interface VersionQualificationSubScores {
   audit: number;
   test_erosion: number;
   smoketest: number;
+  ci_resolution?: CiResolution | null;
 }
 
 export type QualificationStatus =
@@ -731,6 +738,7 @@ export interface VersionQualification {
   confidence: number | null;
   threshold: number | null;
   sub_scores: VersionQualificationSubScores | null;
+  ci_resolution: CiResolution | null;
   blocker: string | null;
   finalized_at: string | null;
 }

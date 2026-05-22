@@ -5,8 +5,9 @@ import { DashboardHome } from './DashboardHome';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 
-const { apiFetchMock, capturedProps } = vi.hoisted(() => ({
+const { apiFetchMock, fetchQualificationVerdictsMock, capturedProps } = vi.hoisted(() => ({
   apiFetchMock: vi.fn(),
+  fetchQualificationVerdictsMock: vi.fn().mockResolvedValue({ verdicts: [], total: 0 }),
   capturedProps: {
     prMonitor: null as Record<string, unknown> | null,
     remediationFunnel: null as Record<string, unknown> | null,
@@ -18,6 +19,10 @@ const { apiFetchMock, capturedProps } = vi.hoisted(() => ({
 
 vi.mock('../api', () => ({
   apiFetch: (path: string, init?: RequestInit) => apiFetchMock(path, init),
+  fetchQualificationVerdicts: (projectId: string, limit?: number) => fetchQualificationVerdictsMock(projectId, limit),
+  fetchSrUnhandledEdgesRetrospectives: vi.fn().mockResolvedValue({ tasks: [] }),
+  setVersionPhase: vi.fn(),
+  triggerQualify: vi.fn(),
 }));
 
 vi.mock('./RecentErrorsWidget', () => ({
@@ -169,6 +174,8 @@ function setupApiMocks({
 describe('DashboardHome', () => {
   beforeEach(() => {
     apiFetchMock.mockReset();
+    fetchQualificationVerdictsMock.mockReset();
+    fetchQualificationVerdictsMock.mockResolvedValue({ verdicts: [], total: 0 });
   });
 
   afterEach(() => {
@@ -1530,6 +1537,150 @@ describe('DashboardHome', () => {
     expect(panel).toHaveTextContent('History');
     expect(panel).toHaveTextContent('v41');
     expect(panel).toHaveTextContent('promoted');
+  });
+
+  it('shows green CI badge and resolved SHA in verdict history', async () => {
+    apiFetchMock.mockImplementation((url: string) => {
+      if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse({ failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] }));
+      if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+      if (url.includes('/version-lifecycle')) return Promise.resolve(jsonResponse({
+        current_version: {
+          version_number: 43,
+          phase: 'stabilize',
+          phase_changed_at: '2026-05-22T00:00:00Z',
+          opened_at: '2026-05-20T00:00:00Z',
+          qualification_attempts: 1,
+          merged_task_count: 5,
+          last_qualification: { status: 'dry_run', confidence: 0.91, threshold: 0.90, sub_scores: { audit: 0.95, test_erosion: 0.88, smoketest: 0.92 }, ci_resolution: { state: 'green', resolved_sha: 'abc1234567', detail: 'CI ran on abc1234' }, blocker: null, finalized_at: null },
+        },
+        recent_versions: [],
+      }));
+      return Promise.resolve(notFoundResponse());
+    });
+    fetchQualificationVerdictsMock.mockResolvedValue({
+      verdicts: [{
+        id: 'v1',
+        release_version_id: 'rv1',
+        candidate_sha: 'abc1234567890',
+        confidence: 0.91,
+        sub_scores: { audit: 0.95, test_erosion: 0.88, smoketest: 0.92, ci_resolution: { state: 'green', resolved_sha: 'abc1234567', detail: 'CI ran on abc1234' } },
+        blocker: null,
+        would_promote: true,
+        promotion_enabled: true,
+        terminal_status: 'dry_run',
+        threshold: 0.90,
+        started_at: '2026-05-22T00:00:00Z',
+        finalized_at: '2026-05-22T01:00:00Z',
+        created_at: '2026-05-22T00:00:00Z',
+      }],
+      total: 1,
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    const panel = await screen.findByTestId('version-lifecycle-panel');
+    // Current-version sub-scores CI badge
+    expect(panel).toHaveTextContent('ci:green');
+    expect(panel).toHaveTextContent('@abc1234');
+    // Verdict history CI badge
+    const history = panel.querySelector('[data-testid="verdict-history"]');
+    expect(history).not.toBeNull();
+    expect(history).toHaveTextContent('ci:green');
+    expect(history).toHaveTextContent('@abc1234');
+  });
+
+  it('shows red CI badge in verdict history for failed CI resolution', async () => {
+    apiFetchMock.mockImplementation((url: string) => {
+      if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse({ failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] }));
+      if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+      if (url.includes('/version-lifecycle')) return Promise.resolve(jsonResponse({
+        current_version: {
+          version_number: 44,
+          phase: 'stabilize',
+          phase_changed_at: '2026-05-22T00:00:00Z',
+          opened_at: '2026-05-20T00:00:00Z',
+          qualification_attempts: 1,
+          merged_task_count: 3,
+          last_qualification: { status: 'not_promoted', confidence: 0.50, threshold: 0.90, sub_scores: null, blocker: 'ci_failed', finalized_at: null },
+        },
+        recent_versions: [],
+      }));
+      return Promise.resolve(notFoundResponse());
+    });
+    fetchQualificationVerdictsMock.mockResolvedValue({
+      verdicts: [{
+        id: 'v2',
+        release_version_id: 'rv2',
+        candidate_sha: 'def9876543210',
+        confidence: 0.50,
+        sub_scores: { audit: 0.80, test_erosion: 0.75, smoketest: 0.85, ci_resolution: { state: 'red', resolved_sha: 'def987654', detail: 'CI failed on def9876' } },
+        blocker: 'ci_failed',
+        would_promote: false,
+        promotion_enabled: false,
+        terminal_status: 'not_promoted',
+        threshold: 0.90,
+        started_at: '2026-05-22T00:00:00Z',
+        finalized_at: '2026-05-22T01:00:00Z',
+        created_at: '2026-05-22T00:00:00Z',
+      }],
+      total: 1,
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    const panel = await screen.findByTestId('version-lifecycle-panel');
+    const history = panel.querySelector('[data-testid="verdict-history"]');
+    expect(history).not.toBeNull();
+    expect(history).toHaveTextContent('ci:red');
+    expect(history).toHaveTextContent('@def9876');
+  });
+
+  it('renders pending CI badge without crashing when resolved_sha is null', async () => {
+    apiFetchMock.mockImplementation((url: string) => {
+      if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse({ failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] }));
+      if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+      if (url.includes('/version-lifecycle')) return Promise.resolve(jsonResponse({
+        current_version: {
+          version_number: 45,
+          phase: 'stabilize',
+          phase_changed_at: '2026-05-22T00:00:00Z',
+          opened_at: '2026-05-20T00:00:00Z',
+          qualification_attempts: 1,
+          merged_task_count: 2,
+          last_qualification: { status: 'not_promoted', confidence: 0.60, threshold: 0.90, sub_scores: { audit: 0.90, test_erosion: 0.80, smoketest: 0.85 }, ci_resolution: { state: 'pending', resolved_sha: null, detail: 'no candidate sha' }, blocker: null, finalized_at: null },
+        },
+        recent_versions: [],
+      }));
+      return Promise.resolve(notFoundResponse());
+    });
+    fetchQualificationVerdictsMock.mockResolvedValue({
+      verdicts: [{
+        id: 'v3',
+        release_version_id: 'rv3',
+        candidate_sha: 'aaa1112223330',
+        confidence: 0.60,
+        sub_scores: { audit: 0.90, test_erosion: 0.80, smoketest: 0.85, ci_resolution: { state: 'pending', resolved_sha: null, detail: 'check-runs in progress' } },
+        blocker: null,
+        would_promote: false,
+        promotion_enabled: false,
+        terminal_status: 'not_promoted',
+        threshold: 0.90,
+        started_at: '2026-05-22T00:00:00Z',
+        finalized_at: '2026-05-22T01:00:00Z',
+        created_at: '2026-05-22T00:00:00Z',
+      }],
+      total: 1,
+    });
+
+    render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+
+    const panel = await screen.findByTestId('version-lifecycle-panel');
+    expect(panel).toHaveTextContent('ci:pending');
+    const history = panel.querySelector('[data-testid="verdict-history"]');
+    expect(history).not.toBeNull();
+    expect(history).toHaveTextContent('ci:pending');
+    // null resolved_sha must not render an "@" sha segment for the CI badge
+    expect(panel).not.toHaveTextContent('ci:pending @');
   });
 
   it('does not render version lifecycle panel when project has no lifecycle data', async () => {

@@ -785,7 +785,8 @@ async def _build_recent_interventions(
     # Rollup-aware automain landing check.
     # A task with pr_merged=True may not be on automain yet when it was merged
     # into a rollup staging branch but the rollup PR itself hasn't been merged.
-    # Root tasks (no parent) merged directly → always on automain.
+    # Root tasks (no parent): on automain only when git-ancestry confirms it; unverifiable
+    # cases report False (fail-closed).
     # Child tasks → on automain iff their rollup parent's pr_merged is True.
     # We fetch parent contexts in one query so the per-direction loop below
     # can reuse the same map without extra round-trips.
@@ -812,8 +813,8 @@ async def _build_recent_interventions(
     # confirm the commit is reachable from the integration branch (e.g. the
     # PR may have landed on a rollup staging branch that itself never merged).
     # We attempt a best-effort ancestry check using the existing github
-    # primitives; if credentials are unavailable or an API call fails, we
-    # fall back to the flag heuristic so a GitHub outage cannot break the feed.
+    # primitives.  When credentials are unavailable or an API call fails the
+    # fallback is fail-closed (False), NOT fail-open — see _on_automain below.
     _gh_token_ss: str | None = None
     _gh_owner_ss: str | None = None
     _gh_repo_ss: str | None = None
@@ -904,10 +905,12 @@ async def _build_recent_interventions(
         if task.id in _automain_verified:
             return _automain_verified[task.id]
         # Fallback: flag heuristic (when credentials unavailable or PR has no number).
-        # Root tasks merged directly are assumed on automain; child tasks depend on
-        # whether their rollup parent's PR was merged.
+        # Root tasks with unverifiable ancestry report False (fail-closed) — we cannot
+        # confirm the commit is reachable from the integration branch, so we must not
+        # assume it landed.  Child tasks depend on whether their rollup parent's PR was
+        # merged (DB-recorded flag), which already defaults to False.
         if task.parent_task_id is None:
-            return True
+            return False
         return _parent_pr_merged.get(task.parent_task_id, False)
 
     # For rollups: look up child titles so the agent sees what actually
