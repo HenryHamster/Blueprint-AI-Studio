@@ -1503,6 +1503,72 @@ async def post_direction_outcome_stalled_message(
     )
 
 
+async def post_direction_outcome_scaffolding_escalation_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_text: str,
+    flagged_cycles: int,
+    evidence: Optional[dict[str, Any]] = None,
+    direction_id: Optional[str] = None,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a BLOCKER-severity message when outcome-less scaffolding persists past the escalation threshold.
+
+    Fires once when outcome_scaffolding_flagged_cycles crosses escalation_cycles,
+    signalling that the agent/operator has had multiple cycles to act and hasn't.
+    Mirrored after post_direction_burn_pause_message — BLOCKER so it surfaces in
+    the operator alert feed.
+    """
+    ev = evidence or {}
+    parts: list[str] = []
+    if "total_cycles" in ev:
+        parts.append(f"cycles={ev['total_cycles']}")
+    if "lifetime_merged" in ev:
+        parts.append(f"merged={ev['lifetime_merged']}")
+    if "stall_run_cycles" in ev:
+        parts.append(f"no_progress_for={ev['stall_run_cycles']} cycles")
+    parts.append(f"flagged_for={flagged_cycles} cycles")
+    ev_str = f" ({', '.join(parts)})" if parts else ""
+    summary = (
+        f"Direction outcome-scaffolding flag unresolved after {flagged_cycles} cycles: "
+        f"'{direction_text[:80]}'{ev_str} — manual retirement or success_evidence update required."
+    )
+    ctx: dict[str, Any] = {
+        "event_type": "direction_outcome_scaffolding_escalation",
+        "direction_text": direction_text[:120],
+        "direction_id": direction_id,
+        "flagged_cycles": flagged_cycles,
+        "manual_intervention_required": True,
+    }
+    if evidence:
+        ctx["evidence"] = evidence
+    msg = ProjectMessage(
+        project_id=project_id,
+        message_type=MessageType.BLOCKER,
+        from_type="system",
+        from_task_id=task_id,
+        content=summary,
+        context=ctx,
+    )
+    session.add(msg)
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "DIRECTION_OUTCOME_SCAFFOLDING_ESCALATION",
+            {
+                "direction_text": direction_text[:120],
+                "direction_id": direction_id,
+                "flagged_cycles": flagged_cycles,
+                "evidence": evidence or {},
+                "severity": "blocker",
+                "manual_intervention_required": True,
+                "summary": summary,
+            },
+        )
+    )
+    return msg
+
+
 async def post_issue_implementation_spawned_message(
     session: AsyncSession,
     project_id: uuid.UUID,

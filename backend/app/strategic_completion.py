@@ -1008,8 +1008,10 @@ def _check_direction_completion(direction: dict) -> str | None:
 # with a HEALTHY merge rate that keeps shipping refactor/scaffolding PRs while
 # never advancing its stated success_evidence. Such a direction scores high on
 # quality_score and looks 'stable' on merge-rate trend, so it can burn dozens of
-# cycles unnoticed. This is SURFACING-only — it sets an advisory flag for the
-# strategic agent / operator and never auto-pauses (no 7th pause rule).
+# cycles unnoticed. The flag drives a persistence-pressure ladder (in
+# direction_lifecycle): it never adds a 7th auto-PAUSE rule, but escalates over
+# consecutive flagged cycles — surfacing to the strategic agent / operator and,
+# if the flag persists to max_flagged_cycles, auto-RETIRING the direction.
 
 _OUTCOME_PROGRESS_HISTORY_HARD_CAP = 20
 
@@ -1043,6 +1045,8 @@ def _outcome_progress_config() -> dict:
             "direction_outcome_progress_history_max",
             _OUTCOME_PROGRESS_HISTORY_HARD_CAP,
         ),
+        "escalation_cycles": _int("direction_outcome_progress_escalation_cycles", 3),
+        "max_flagged_cycles": _int("direction_outcome_progress_max_flagged_cycles", 6),
     }
 
 

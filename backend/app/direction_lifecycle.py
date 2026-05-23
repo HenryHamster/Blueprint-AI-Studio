@@ -479,6 +479,7 @@ async def _process_direction_lifecycle(
         _check_outcome_scaffolding,
         _compute_churn_metrics,
         _compute_lifetime_burn_metrics,
+        _outcome_progress_config,
     )
 
     directions_modified = False
@@ -1214,10 +1215,14 @@ async def _process_direction_lifecycle(
                 d.pop("possibly_complete", None)
                 d.pop("completion_suggestion", None)
                 directions_modified = True
-        # Advisory outcome-progress (scaffolding) detection — surfacing only, NEVER
-        # auto-pauses. Flags a long-running healthy-merge direction whose outcome
-        # signal has stalled so the strategic agent / operator can decide to retire,
-        # redirect, or redefine it. Notify once per transition into the flagged state.
+        # Outcome-progress (scaffolding) detection — persistence-pressure ladder.
+        # Flags a long-running healthy-merge direction whose outcome signal has
+        # stalled. The flag never triggers the 6 auto-PAUSE rules above; instead it
+        # escalates over consecutive flagged cycles: notify on entry, escalation
+        # notification at escalation_cycles, and auto-RETIRE at max_flagged_cycles
+        # (an advancing/met evidence_progress verdict suppresses the counter). This
+        # surfaces outcome-less scaffolding to the strategic agent / operator and,
+        # if it persists, frees the slot. Notify once per transition into flagged.
         scaffolding_ev = _check_outcome_scaffolding(d)
         if scaffolding_ev:
             if not d.get("outcome_scaffolding_flagged"):
@@ -1296,10 +1301,93 @@ async def _process_direction_lifecycle(
             else:
                 # Keep the evidence fresh while the flag remains set.
                 d["outcome_scaffolding_evidence"] = scaffolding_ev
+                # Persistence-pressure ladder: increment each cycle the flag holds.
+                _scaffolding_cfg = _outcome_progress_config()
+                _esc_threshold = _scaffolding_cfg["escalation_cycles"]
+                _retire_threshold = _scaffolding_cfg["max_flagged_cycles"]
+                # An advancing/met evidence_progress verdict suppresses the counter
+                # increment for this pass — the agent confirmed real progress.
+                _ep = d.get("evidence_progress")
+                _ep_suppresses = isinstance(_ep, dict) and _ep.get("status") in (
+                    "advancing",
+                    "met",
+                )
+                if not _ep_suppresses:
+                    _flag_cycles = d.get("outcome_scaffolding_flagged_cycles", 0) + 1
+                    d["outcome_scaffolding_flagged_cycles"] = _flag_cycles
+                    directions_modified = True
+                    if _flag_cycles >= _retire_threshold:
+                        # Auto-retire — mirroring the code_failure_pause_count ladder.
+                        d["status"] = "completed"
+                        d["auto_completed"] = True
+                        d["auto_completed_reason"] = (
+                            f"Auto-retired: outcome-less scaffolding flag unresolved "
+                            f"for {_flag_cycles} consecutive cycles. Direction kept "
+                            f"shipping merges but never advanced its success_evidence."
+                        )
+                        d["completed_at"] = _utcnow().isoformat()
+                        logger.info(
+                            f"[AUTONOMOUS] Auto-retired direction {did} after "
+                            f"{_flag_cycles} scaffolding-flagged cycles: {d.get('text', '')[:60]}"
+                        )
+                        from app.models import Alert, AlertSeverity  # noqa: PLC0415
+
+                        _sc_alert = Alert(
+                            project_id=project.id,
+                            severity=AlertSeverity.INFO,
+                            title="Direction auto-retired (outcome scaffolding)",
+                            message=(
+                                f"Direction '{d.get('text', '')[:80]}' was auto-retired after "
+                                f"{_flag_cycles} cycles with outcome-less scaffolding flag unresolved. "
+                                f"Slot freed for strategic agent to create a replacement."
+                            ),
+                        )
+                        session.add(_sc_alert)
+                        try:
+                            from app.notification_dispatch import (  # noqa: PLC0415
+                                post_direction_milestone_message,
+                            )
+
+                            await post_direction_milestone_message(
+                                session,
+                                project.id,
+                                direction_text=d.get("text", ""),
+                                milestone="auto-retired-scaffolding",
+                                reason=d["auto_completed_reason"],
+                                direction_id=did,
+                            )
+                        except Exception as _sc_notify_exc:
+                            logger.warning(
+                                f"[NOTIFY] Failed to post scaffolding auto-retire milestone: {_sc_notify_exc}"
+                            )
+                        # Retired direction is terminal — skip the append so the
+                        # downstream greedy selection cannot spawn a cycle on it
+                        # this tick (mirrors the auto-pause `continue` at L1202).
+                        continue
+                    elif _flag_cycles == _esc_threshold:
+                        # Escalation notification at mid-threshold.
+                        try:
+                            from app.notification_dispatch import (  # noqa: PLC0415
+                                post_direction_outcome_scaffolding_escalation_message,
+                            )
+
+                            await post_direction_outcome_scaffolding_escalation_message(
+                                session,
+                                project.id,
+                                direction_text=d.get("text", ""),
+                                flagged_cycles=_flag_cycles,
+                                evidence=scaffolding_ev,
+                                direction_id=did,
+                            )
+                        except Exception as _esc_notify_exc:
+                            logger.warning(
+                                f"[NOTIFY] Failed to post scaffolding escalation for {did}: {_esc_notify_exc}"
+                            )
         elif d.get("outcome_scaffolding_flagged"):
             d.pop("outcome_scaffolding_flagged", None)
             d.pop("outcome_scaffolding_flagged_at", None)
             d.pop("outcome_scaffolding_evidence", None)
+            d.pop("outcome_scaffolding_flagged_cycles", None)
             directions_modified = True
             logger.info(
                 f"[AUTONOMOUS] Cleared outcome-scaffolding flag on {did}: "
