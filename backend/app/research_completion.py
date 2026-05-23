@@ -74,6 +74,7 @@ from app.shared_state import (
     runtime_config as _runtime_config,
     DEFAULT_TASK_SCOPE,
     scope_to_effort,
+    get_project_integration_branch as _get_project_integration_branch,
 )
 from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/callers
     _SCOPE_ORDER,
@@ -1124,7 +1125,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             p for p in parent_tasks_rows if p.status in _non_terminal_statuses
         ]
         if _non_terminal_parents:
-            _integration_branch_rc = _runtime_config.get("integration_branch", "main")
+            _integration_branch_rc = _get_project_integration_branch(project_obj)
             _gh_creds_rc: tuple | None = None
             try:
                 from app.release_qualifier import (

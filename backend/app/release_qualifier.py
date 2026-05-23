@@ -119,7 +119,10 @@ from app.release_scoring import (
     _score_smoketest,
     compute_composite,
 )
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import (
+    runtime_config as _runtime_config,
+    get_project_integration_branch as _get_project_integration_branch,
+)
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -136,14 +139,21 @@ logger = logging.getLogger(__name__)
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "promotion_policy.yaml"
 
 
-def _lts_branch_names() -> tuple[str, str]:
-    """Return (integration_branch, promotion_target) from runtime_config.
+def _lts_branch_names(project=None) -> tuple[str, str]:
+    """Return (integration_branch, promotion_target).
 
     integration_branch — the trunk the pipeline builds ON (default "automain").
     promotion_target   — the LTS/deploy branch promotions land on (default "main").
     LTS model is considered active when these two differ.
+
+    When ``project`` is provided, integration_branch is resolved per-project via
+    ``get_project_integration_branch``; otherwise falls back to runtime_config.
     """
-    integration = str(_runtime_config.get("integration_branch", "automain"))
+    if project is not None:
+        integration = _get_project_integration_branch(project)
+    else:
+        # DEPRECATED: global runtime_config fallback — remove after per-project column stable
+        integration = str(_runtime_config.get("integration_branch", "automain"))
     promotion = str(_runtime_config.get("promotion_target", "main"))
     return integration, promotion
 
@@ -4215,8 +4225,8 @@ async def promote(
     Returns a result dict.
     """
     base_record = dict(base_record or {})
-    _integration_branch, promotion_target = _lts_branch_names()
     project = await session.get(Project, version.project_id)
+    _integration_branch, promotion_target = _lts_branch_names(project)
     if project is None:
         logger.warning(
             "[RELEASE_QUALIFIER] promote: project %s not found",
