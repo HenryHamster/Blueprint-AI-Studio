@@ -314,6 +314,11 @@ _SIGNAL_STALENESS_WINDOWS = {
 # staleness window to catch frozen-in-place metrics before 48h passes.
 _SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW = timedelta(hours=24)
 
+# Frozen-but-fresh sub-window: the signal heartbeat (signal_last_computed_at) must
+# be newer than this for the metric to count as "computing" when its
+# last_sufficient_computed_at has gone stale past the sufficiency window above.
+_SR_CATCH_RATE_FROZEN_SIGNAL_FRESH_WINDOW = timedelta(hours=6)
+
 # Per-project last cycle timestamp (monotonic). Updated in run_once finally
 # block even when run_once raises. Used by the staleness watchdog alarm.
 # An absent entry means no cycle has ever completed for this process boot.
@@ -430,7 +435,7 @@ async def _run_signal_staleness_watchdog(
         if (
             signal_at is not None
             and sufficient_at is not None
-            and (now - signal_at) <= timedelta(hours=6)  # Signal is fresh
+            and (now - signal_at) <= _SR_CATCH_RATE_FROZEN_SIGNAL_FRESH_WINDOW  # fresh
             and (now - sufficient_at) > _SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW
         ):
             title = "Signal frozen: sr_catch_rate"
@@ -1802,7 +1807,7 @@ async def _current_signal_value_for_class(
             now = _utcnow()
             if signal_at is None or sufficient_at is None:
                 return None
-            is_fresh = (now - signal_at) <= timedelta(hours=6)
+            is_fresh = (now - signal_at) <= _SR_CATCH_RATE_FROZEN_SIGNAL_FRESH_WINDOW
             is_frozen = (now - sufficient_at) > _SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW
             age = now - sufficient_at
             return {
@@ -6115,7 +6120,7 @@ async def _evaluate_telemetry_staleness_signal(
             if (
                 signal_at is not None
                 and sufficient_at is not None
-                and (now - signal_at) <= timedelta(hours=6)
+                and (now - signal_at) <= _SR_CATCH_RATE_FROZEN_SIGNAL_FRESH_WINDOW
                 and (now - sufficient_at) > _SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW
             ):
                 source_module = "playbook_learning.compute_sr_catch_rate_trends"

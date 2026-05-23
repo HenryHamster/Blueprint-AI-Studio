@@ -44,6 +44,8 @@ export interface SrCategoryTrend {
   precision_delta?: number | null;
   /** Cycle-over-cycle change in recall (hit_rate). */
   recall_delta?: number | null;
+  /** Backend-computed flag: reasoning engagement below threshold. Prefers backend calculation when present. */
+  engagement_thinning?: boolean | null;
   /** Median seconds between SR completion and reviewer rejection for misses in this category. */
   time_to_miss_detect_p50_sec?: number | null;
   /** 95th-percentile seconds between SR completion and reviewer rejection for misses. */
@@ -296,6 +298,10 @@ function isBelowFloor(c: SrCategoryTrend, floorHitRate = FLOOR_HIT_RATE, minWind
   const history = c.rate_history;
   if (!history || history.length < minWindows) return false;
   return history.slice(-minWindows).every(r => r < floorHitRate);
+}
+
+function isEngagementThinning(c: SrCategoryTrend, thinningThreshold = ENGAGEMENT_THINNING_THRESHOLD, minPasses = ENGAGEMENT_THINNING_MIN_PASSES): boolean {
+  return c.reasoning_engagement_rate != null && c.reasoning_engagement_rate < thinningThreshold && (c.reasoning_engagement_total ?? 0) >= minPasses;
 }
 
 // SR `trend` `decreasing` = hit-rate falling = miss-rate rising = regression (red).
@@ -1196,9 +1202,10 @@ function CategoryRow({
   const sampleTooSmall = isSampleTooSmall(findingCount);
   const deltaLowConfidence = sampleTooSmall || isSampleTooSmall(prevFindingCount);
 
+  const thinning = c.engagement_thinning != null ? c.engagement_thinning : isEngagementThinning(c);
   const activeSignals: string[] = [
     ...(c.below_floor ? ['below_floor'] : []),
-    ...(c.reasoning_engagement_rate != null && c.reasoning_engagement_rate < ENGAGEMENT_THINNING_THRESHOLD && (c.reasoning_engagement_total ?? 0) >= ENGAGEMENT_THINNING_MIN_PASSES ? ['thinning'] : []),
+    ...(thinning ? ['thinning'] : []),
     ...(c.severity_calibration && c.severity_calibration.total >= 5 && c.severity_calibration.under_rated / c.severity_calibration.total >= 0.30 ? ['under_calibration'] : []),
     ...(c.time_to_miss_detect_lone_checker ? ['lone_checker'] : []),
   ];
@@ -1267,11 +1274,11 @@ function CategoryRow({
           </span>
         )}
         {c.reasoning_engagement_rate != null && (c.reasoning_engagement_total ?? 0) > 0 && (() => {
-          const thinning = c.reasoning_engagement_rate < ENGAGEMENT_THINNING_THRESHOLD && (c.reasoning_engagement_total ?? 0) >= ENGAGEMENT_THINNING_MIN_PASSES;
+          const displayThinning = c.engagement_thinning != null ? c.engagement_thinning : isEngagementThinning(c);
           return (
             <span
-              className={`font-mono tabular-nums ${thinning ? 'text-amber-400' : 'text-cyan-500'}`}
-              title={thinning
+              className={`font-mono tabular-nums ${displayThinning ? 'text-amber-400' : 'text-cyan-500'}`}
+              title={displayThinning
                 ? `Reasoning thinning: only ${c.reasoning_engagement_with}/${c.reasoning_engagement_total} PASS verdicts include substantial reasoning — may regress soon`
                 : `Reasoning engagement: ${c.reasoning_engagement_with}/${c.reasoning_engagement_total} PASS verdicts with substantial reasoning`}
             >
@@ -1416,11 +1423,11 @@ function CategoryRow({
         </span>
       )}
       {c.reasoning_engagement_rate != null && (c.reasoning_engagement_total ?? 0) > 0 && (() => {
-        const thinning = c.reasoning_engagement_rate < ENGAGEMENT_THINNING_THRESHOLD && (c.reasoning_engagement_total ?? 0) >= ENGAGEMENT_THINNING_MIN_PASSES;
+        const displayThinning = c.engagement_thinning != null ? c.engagement_thinning : isEngagementThinning(c);
         return (
           <span
-            className={`font-mono ${thinning ? 'text-amber-400' : 'text-cyan-500'}`}
-            title={thinning
+            className={`font-mono ${displayThinning ? 'text-amber-400' : 'text-cyan-500'}`}
+            title={displayThinning
               ? `Reasoning thinning: only ${c.reasoning_engagement_with}/${c.reasoning_engagement_total} PASS verdicts include substantial reasoning — may regress soon`
               : `Reasoning engagement: ${c.reasoning_engagement_with}/${c.reasoning_engagement_total} PASS verdicts with substantial reasoning`}
           >

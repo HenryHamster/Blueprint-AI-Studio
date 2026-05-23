@@ -8173,3 +8173,88 @@ async def list_qualification_verdicts(
         ],
         "total": len(rows),
     }
+
+
+@router.get("/projects/{project_id}/sr_catch_rate/health")
+async def get_sr_catch_rate_health(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Summarize the persisted SR catch-rate snapshot for ops/audit/CI.
+
+    READ-ONLY: reads ``project.design_doc['sr_catch_rate_trends']`` (written
+    asynchronously by ``compute_sr_catch_rate_trends``) and never recomputes.
+    The derived ``status`` mirrors the dispatcher staleness watchdog's branch
+    semantics and thresholds so this endpoint and the alert system agree.
+    Viewer+ role required.
+    """
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+
+    # Function-local import to avoid a circular import with the dispatcher.
+    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+        _SIGNAL_STALENESS_WINDOWS,
+        _SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW,
+        _SR_CATCH_RATE_FROZEN_SIGNAL_FRESH_WINDOW,
+    )
+    from app.dispatcher_formatters import _parse_iso_timestamp  # noqa: PLC0415
+
+    now = _utcnow()
+    general_window = _SIGNAL_STALENESS_WINDOWS["sr_catch_rate"]
+    trends: Dict[str, Any] = (project.design_doc or {}).get(
+        "sr_catch_rate_trends"
+    ) or {}
+
+    signal_raw = trends.get("signal_last_computed_at")
+    sufficient_raw = trends.get("last_sufficient_computed_at")
+    signal_at = _parse_iso_timestamp(signal_raw)
+    sufficient_at = _parse_iso_timestamp(sufficient_raw)
+    data_sufficient = bool(trends.get("data_sufficient"))
+
+    def _age_hours(dt: Optional[datetime]) -> Optional[float]:
+        return round((now - dt).total_seconds() / 3600, 2) if dt is not None else None
+
+    if not trends:
+        status = "missing"
+    elif signal_raw and not sufficient_raw:
+        status = "never_sufficient"
+    elif (
+        signal_at is not None
+        and sufficient_at is not None
+        and (now - signal_at) <= _SR_CATCH_RATE_FROZEN_SIGNAL_FRESH_WINDOW
+        and (now - sufficient_at) > _SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW
+    ):
+        status = "frozen"
+    elif sufficient_at is not None and (now - sufficient_at) > general_window:
+        status = "stale"
+    elif not data_sufficient:
+        status = "low_data"
+    else:
+        status = "healthy"
+
+    categories = trends.get("categories") or {}
+    categories_with_hit_rate = sum(
+        1
+        for c in categories.values()
+        if isinstance(c, dict) and c.get("current_hit_rate") is not None
+    )
+
+    return {
+        "status": status,
+        "data_sufficient": data_sufficient,
+        "last_sufficient_computed_at": sufficient_raw,
+        "last_sufficient_age_hours": _age_hours(sufficient_at),
+        "signal_last_computed_at": signal_raw,
+        "signal_age_hours": _age_hours(signal_at),
+        "category_count": len(categories),
+        "categories_with_hit_rate": categories_with_hit_rate,
+        "overall_hit_rate": trends.get("overall_hit_rate"),
+        "previous_overall_hit_rate": trends.get("previous_overall_hit_rate"),
+        "overall_trend_verdict": trends.get("overall_trend_verdict"),
+        "overall_trend_significant": trends.get("overall_trend_significant"),
+        "bucket_mode": trends.get("bucket_mode"),
+        "prompt_version_changed": bool(trends.get("prompt_version_changed")),
+        "mixed_prompt_versions": bool(trends.get("mixed_prompt_versions")),
+    }

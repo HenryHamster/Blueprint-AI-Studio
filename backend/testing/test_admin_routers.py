@@ -3747,3 +3747,151 @@ class TestGetAllTasksHistory:
         quiet_hist = by_id[str(quiet.id)]["history"]
         assert len(quiet_hist) == 8
         assert [h["details"]["i"] for h in quiet_hist] == list(range(7, -1, -1))
+
+
+class TestSrCatchRateHealth:
+    """GET /api/admin/projects/{project_id}/sr_catch_rate/health status matrix."""
+
+    async def _setup(self, db_session, trends):
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.design_doc = (
+            {"sr_catch_rate_trends": trends} if trends is not None else {}
+        )
+        flag_modified(project, "design_doc")
+        db_session.add(project)
+        await db_session.commit()
+        return project
+
+    @staticmethod
+    def _iso(hours_ago):
+        from datetime import datetime, timedelta
+
+        return (datetime.utcnow() - timedelta(hours=hours_ago)).isoformat()
+
+    @pytest.mark.asyncio
+    async def test_healthy(self, client: AsyncClient, db_session):
+        project = await self._setup(
+            db_session,
+            {
+                "signal_last_computed_at": self._iso(1),
+                "last_sufficient_computed_at": self._iso(1),
+                "data_sufficient": True,
+                "bucket_mode": "cycle",
+                "overall_hit_rate": 0.75,
+                "previous_overall_hit_rate": 0.7,
+                "overall_trend_verdict": "stable",
+                "overall_trend_significant": None,
+                "categories": {
+                    "correctness": {"current_hit_rate": 0.8},
+                    "security": {"current_hit_rate": None},
+                },
+            },
+        )
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/sr_catch_rate/health"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "healthy"
+        assert data["data_sufficient"] is True
+        assert data["bucket_mode"] == "cycle"
+        assert data["overall_hit_rate"] == 0.75
+        assert data["category_count"] == 2
+        assert data["categories_with_hit_rate"] == 1
+        assert 0.9 <= data["last_sufficient_age_hours"] <= 1.2
+        assert 0.9 <= data["signal_age_hours"] <= 1.2
+
+    @pytest.mark.asyncio
+    async def test_never_sufficient(self, client: AsyncClient, db_session):
+        project = await self._setup(
+            db_session,
+            {
+                "signal_last_computed_at": self._iso(1),
+                "data_sufficient": False,
+            },
+        )
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/sr_catch_rate/health"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "never_sufficient"
+        assert data["data_sufficient"] is False
+        assert data["last_sufficient_computed_at"] is None
+        assert data["last_sufficient_age_hours"] is None
+        assert 0.9 <= data["signal_age_hours"] <= 1.2
+
+    @pytest.mark.asyncio
+    async def test_frozen(self, client: AsyncClient, db_session):
+        # Signal fresh (< 6h) but real data stale (> 24h) => frozen-but-fresh.
+        project = await self._setup(
+            db_session,
+            {
+                "signal_last_computed_at": self._iso(2),
+                "last_sufficient_computed_at": self._iso(30),
+                "data_sufficient": False,
+            },
+        )
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/sr_catch_rate/health"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "frozen"
+        assert data["signal_age_hours"] < 6
+        assert data["last_sufficient_age_hours"] > 24
+
+    @pytest.mark.asyncio
+    async def test_stale(self, client: AsyncClient, db_session):
+        # Both timestamps older than the 48h general window; signal not fresh
+        # so the frozen branch does not apply.
+        project = await self._setup(
+            db_session,
+            {
+                "signal_last_computed_at": self._iso(50),
+                "last_sufficient_computed_at": self._iso(50),
+                "data_sufficient": True,
+            },
+        )
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/sr_catch_rate/health"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "stale"
+        assert data["last_sufficient_age_hours"] > 48
+
+    @pytest.mark.asyncio
+    async def test_low_data(self, client: AsyncClient, db_session):
+        # Recent on both clocks but not data-sufficient and not frozen/stale.
+        project = await self._setup(
+            db_session,
+            {
+                "signal_last_computed_at": self._iso(1),
+                "last_sufficient_computed_at": self._iso(2),
+                "data_sufficient": False,
+            },
+        )
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/sr_catch_rate/health"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "low_data"
+        assert data["data_sufficient"] is False
+
+    @pytest.mark.asyncio
+    async def test_missing(self, client: AsyncClient, db_session):
+        project = await self._setup(db_session, None)
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/sr_catch_rate/health"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "missing"
+        assert data["data_sufficient"] is False
+        assert data["category_count"] == 0
+        assert data["last_sufficient_age_hours"] is None
+        assert data["signal_age_hours"] is None
