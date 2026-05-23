@@ -2317,7 +2317,7 @@ echo ""
     const selfReflectionEntries = Array.isArray(payload.self_reflection_log)
       ? payload.self_reflection_log as Array<Record<string, unknown>>
       : [];
-    const isSelfRepo = payload.is_self_repo === true;
+    const isSelfRepo = payload.enable_self_improvement === true;
 
     const renderRunningUpdateDoc = (doc: string): string => {
       if (!doc.trim()) {

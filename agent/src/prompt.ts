@@ -515,6 +515,11 @@ interface CodeChangeHelperConfig {
    *  When set, ./done validates that each has a non-trivial `reasoning` field
    *  in check_results before posting COMPLETED. */
   regressingCategories?: string[];
+  /** Resolved project build configuration. When it carries per-directory
+   *  commands, the generated ./check runs those instead of the hardcoded
+   *  Blueprint admin-ui/agent/backend blocks (the self-repo fallback used
+   *  only when no build_config is present). */
+  buildConfig?: BuildConfig;
 }
 
 /** Write ./check, ./pr, ./done, ./fail, ./blocked to WORKSPACE. Idempotent. */
@@ -534,7 +539,7 @@ function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
   // Runs the corresponding lint/build commands plus the admin-ui browser-mode
   // viewport suite. Optional `./check test` also runs the Docker backend test
   // suite when backend/ was touched and tests-on-main is enabled.
-  const script = `#!/bin/bash
+  const header = `#!/bin/bash
 # ./check — run lint/build (and optionally tests) for changed paths.
 # Usage:
 #   ./check         # lint+build only — fast, run before each iteration
@@ -605,7 +610,8 @@ run() {
     FAILED+=("$label")
   fi
 }
-
+`;
+  const blueprintStackBlocks = `
 if admin_ui_runtime_touched; then
   ( cd admin-ui && [ -d node_modules ] || npm ci ) >/tmp/check_npm_ci.log 2>&1 || {
     echo "[check] admin-ui npm ci FAILED — see /tmp/check_npm_ci.log"
@@ -847,7 +853,14 @@ if touches backend/; then
     run "backend pytest" bash -c 'bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200'
   fi
 fi
-
+`;
+  // When the project supplies a build_config with directories, generate
+  // per-directory check blocks from it. Otherwise fall back to the hardcoded
+  // Blueprint blocks above (self-repo behavior is byte-for-byte unchanged).
+  const stackBlocks = cfg.buildConfig?.directories?.length
+    ? buildConfigDrivenStackBlocks(cfg.buildConfig)
+    : blueprintStackBlocks;
+  const footer = `
 if [ \${#FAILED[@]} -eq 0 ]; then
   echo ""
   echo "[check] PASS — all checks green"
@@ -858,7 +871,48 @@ else
   exit 1
 fi
 `;
+  const script = header + stackBlocks + footer;
   fs.writeFileSync(`${WORKSPACE}/check`, script, { mode: 0o755 });
+}
+
+/** Generate config-driven per-directory ./check blocks from a project's
+ *  build_config. Mirrors the per-directory loop in runProjectLintChecks
+ *  (index.ts): for each configured directory whose files changed, run its
+ *  install/lint/build commands; test_cmd runs only under `./check test`
+ *  (WITH_TESTS). env_vars are exported so all commands inherit them.
+ *
+ *  All interpolated values (paths, commands, env names/values) are validated
+ *  by validateCfgShellSafety against a conservative allowlist that rejects
+ *  shell metacharacters (including single quotes), so emitting them as
+ *  single-quoted bash literals here is injection-safe — see CLAUDE.md on
+ *  generating one language from another. */
+function buildConfigDrivenStackBlocks(buildConfig: BuildConfig): string {
+  const dirs = buildConfig.directories ?? [];
+  const envLines = Object.entries(buildConfig.env_vars ?? {}).map(
+    ([k, v]) => `export ${k}='${v}'`,
+  );
+  const sections: string[] = [];
+  for (const dir of dirs) {
+    const dirPrefix = dir.path.replace(/\/$/, '');
+    const inner: string[] = [];
+    if (dir.install_cmd) inner.push(`  run "${dirPrefix} install" bash -c 'cd "${dirPrefix}" && ${dir.install_cmd}'`);
+    if (dir.lint_cmd) inner.push(`  run "${dirPrefix} lint" bash -c 'cd "${dirPrefix}" && ${dir.lint_cmd}'`);
+    if (dir.build_cmd) inner.push(`  run "${dirPrefix} build" bash -c 'cd "${dirPrefix}" && ${dir.build_cmd}'`);
+    if (dir.test_cmd) {
+      inner.push(`  if [ "$WITH_TESTS" = "1" ]; then`);
+      inner.push(`    run "${dirPrefix} test" bash -c 'cd "${dirPrefix}" && ${dir.test_cmd}'`);
+      inner.push(`  fi`);
+    }
+    if (inner.length === 0) continue;
+    sections.push(`if touches "${dirPrefix}/"; then\n${inner.join('\n')}\nfi`);
+  }
+  const comment = `
+# Config-driven checks: project supplied a build_config, so run its
+# per-directory install/lint/build commands (tests under \`./check test\`)
+# for changed directories. Mirrors runProjectLintChecks in index.ts.`;
+  const envBlock = envLines.length ? `\n${envLines.join('\n')}` : '';
+  const body = sections.length ? `\n${sections.join('\n\n')}` : '';
+  return `${comment}${envBlock}${body}\n`;
 }
 
 // Load the canonical sr-pr-section.js renderer from disk and base64-encode
@@ -885,6 +939,11 @@ function loadSrSectionScriptB64(): string {
 const BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
 const OWNER_REPO_RE = /^[A-Za-z0-9._-]+$/;
 const TASK_ID_RE = /^[A-Za-z0-9-]+$/;
+// build_config paths/commands/env values are emitted as single-quoted bash
+// literals; this allowlist rejects single quotes and every shell metacharacter
+// ($ ` ; & | < > ( ) newline ...), so no value can break out of its quoting.
+const SHELL_CMD_RE = /^[A-Za-z0-9 _./@:=,+-]+$/;
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 function validateCfgShellSafety(cfg: CodeChangeHelperConfig): void {
   if (!TASK_ID_RE.test(cfg.taskId)) {
@@ -901,6 +960,38 @@ function validateCfgShellSafety(cfg: CodeChangeHelperConfig): void {
   }
   if (!OWNER_REPO_RE.test(cfg.repo)) {
     throw new Error(`repo contains unsafe characters for shell interpolation: ${cfg.repo}`);
+  }
+  validateBuildConfigShellSafety(cfg.buildConfig);
+}
+
+/** Validate every build_config value that gets interpolated into the generated
+ *  ./check bash. Throws on any shell metacharacter so the config-driven blocks
+ *  stay injection-safe (see CLAUDE.md on generating one language from another). */
+function validateBuildConfigShellSafety(buildConfig: BuildConfig | undefined): void {
+  if (!buildConfig) return;
+  for (const dir of buildConfig.directories ?? []) {
+    if (!SHELL_CMD_RE.test(dir.path)) {
+      throw new Error(`build_config directory path contains unsafe characters for shell interpolation: ${dir.path}`);
+    }
+    const cmds: Array<[string, string | undefined]> = [
+      ['install_cmd', dir.install_cmd],
+      ['lint_cmd', dir.lint_cmd],
+      ['build_cmd', dir.build_cmd],
+      ['test_cmd', dir.test_cmd],
+    ];
+    for (const [field, val] of cmds) {
+      if (val !== undefined && val !== '' && !SHELL_CMD_RE.test(val)) {
+        throw new Error(`build_config ${field} for ${dir.path} contains unsafe characters for shell interpolation: ${val}`);
+      }
+    }
+  }
+  for (const [k, v] of Object.entries(buildConfig.env_vars ?? {})) {
+    if (!ENV_NAME_RE.test(k)) {
+      throw new Error(`build_config env_var name contains unsafe characters for shell interpolation: ${k}`);
+    }
+    if (!SHELL_CMD_RE.test(v)) {
+      throw new Error(`build_config env_var value for ${k} contains unsafe characters for shell interpolation: ${v}`);
+    }
   }
 }
 

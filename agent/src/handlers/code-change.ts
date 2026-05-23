@@ -4,6 +4,7 @@ import {
   sanitize, sendLog, runClaudeCode, persistAndPostStatus, git,
   rotateOAuthCredentialsIfChanged,
 } from '../index.js';
+import type { BuildConfig } from '../index.js';
 import { writeCodeChangeHelpers, SELF_REVIEW_PROMPT_VERSION } from '../prompt.js';
 
 // ── Code-change task runner ─────────────────────────────────────────────────
@@ -66,6 +67,10 @@ export interface CodeChangeTaskOpts {
    *  Forwarded to writeCodeChangeHelpers so ./done enforces a non-trivial
    *  `reasoning` field in check_results for each regressing category. */
   regressingCategories?: string[];
+  /** Resolved project build configuration. Forwarded to writeCodeChangeHelpers
+   *  so the generated ./check runs the project's configured per-directory
+   *  commands instead of the hardcoded Blueprint blocks. */
+  buildConfig?: BuildConfig;
   /** When true, this task was auto-decomposed from a larger finding into a
    *  cluster sibling. Combined with relatedFiles + siblingTasks, enables the
    *  SCOPE_EMPTY pre-flight guard (see runCodeChangeTask). */
@@ -272,6 +277,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     existingPrNumber: opts.existingPrNumber,
     testsOnMainBranch: opts.testsOnMainBranch,
     regressingCategories: opts.regressingCategories,
+    buildConfig: opts.buildConfig,
   });
 
   // 2. Run Claude with the full task prompt. Claude is responsible for

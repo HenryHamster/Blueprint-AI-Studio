@@ -692,8 +692,17 @@ function preinstallNodeDeps(
       if (d.type === 'node') targets.push(d.path.replace(/\/$/, ''));
     }
   } else {
-    // Blueprint self-repo fallback: every node directory the reviewer might touch.
-    for (const candidate of ['admin-ui', 'agent', '']) {
+    // Generic fallback: scan root and top-level directories for package.json,
+    // mirroring the detectTestRunners pattern in index.ts.
+    const candidates: string[] = [''];  // '' = workspace root
+    try {
+      for (const entry of fs.readdirSync(workspace, { withFileTypes: true })) {
+        if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules') {
+          candidates.push(entry.name);
+        }
+      }
+    } catch { /* best-effort: directory listing failed */ }
+    for (const candidate of candidates) {
       const checkPath = candidate ? `${workspace}/${candidate}` : workspace;
       if (fs.existsSync(`${checkPath}/package.json`)) {
         targets.push(candidate);
@@ -724,11 +733,11 @@ function preinstallNodeDeps(
 function buildTypeCheckInstructions(buildConfig?: BuildConfig): string {
   if (!buildConfig || !buildConfig.directories || buildConfig.directories.length === 0) {
     return `**Build & Type Safety (MUST run these — do not skip):**
-- For frontend changes (admin-ui/): run \`cd admin-ui && npm ci && npm run build\` — report any errors
-- For agent changes (agent/): run \`cd agent && npm ci && npx tsc --noEmit\` — report any type errors
-- For backend changes (backend/): run \`cd backend && python -m py_compile app/main.py\` or check imports
-- Only run the build commands listed above. The repo root may have its own \`npm run build\`, but it is NOT a required gate — do not invent additional build invocations.
-- For ANY code changes: run the relevant build command above and include results in your verdict. A build failure is an automatic REQUEST_CHANGES — but FIRST verify your workspace is fully installed: a missing-package error like "cannot resolve <foo>" is almost always a stale workspace, not a real defect. Re-run with the install step prefix above before flagging.`;
+- For TypeScript/JavaScript changes: find the package root for each changed file (the nearest parent directory with a package.json), then run \`npm ci && npm run build\` (or \`npx tsc --noEmit\` for TypeScript-only packages) — report any errors
+- For Python changes: run \`python -m ruff check <changed_files>\` or \`python -m py_compile <changed_files>\` to verify syntax/style — report any errors
+- For Go changes: run \`go build ./...\` — report any errors; for Rust: run \`cargo check\`
+- Only run checks for the subsystems touched by the changed files. Do not invent additional build invocations.
+- For ANY code changes: run the relevant command above and include results in your verdict. A build failure is an automatic REQUEST_CHANGES — but FIRST verify your workspace is fully installed: a missing-package error like "cannot resolve <foo>" is almost always a stale workspace, not a real defect. Re-run with the install step prefix above before flagging.`;
   }
   const checks = buildConfig.directories
     .filter(d => d.build_cmd || d.lint_cmd)
@@ -1499,6 +1508,7 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
     effort,
     disallowedTools: disallowedToolsFix,
     noChangesMessage: 'No file changes after review-fix iteration.',
+    buildConfig: fixBuildConfig,
   });
 
   // Fresh reviewer pass: read-only second session to catch issues the fix

@@ -4957,4 +4957,190 @@ describe('writeCodeChangeHelpers — shell injection validation', () => {
     const { writeCodeChangeHelpers } = await import('./prompt.js');
     expect(() => { writeCodeChangeHelpers({ ...validCfg, owner: 'my.org-123', repo: 'my-repo.v2' }); }).not.toThrow();
   });
+
+  it('rejects build_config command with shell metacharacters', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => {
+      writeCodeChangeHelpers({
+        ...validCfg,
+        buildConfig: { directories: [{ path: 'svc', type: 'node', build_cmd: 'npm run build; rm -rf /' }] },
+      });
+    }).toThrow(/build_cmd/);
+  });
+
+  it('rejects build_config env_var value with command substitution', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => {
+      writeCodeChangeHelpers({
+        ...validCfg,
+        buildConfig: { directories: [{ path: 'svc', type: 'node' }], env_vars: { API: '$(whoami)' } },
+      });
+    }).toThrow(/env_var value/);
+  });
+
+  it('rejects build_config env_var name with shell metacharacters', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => {
+      writeCodeChangeHelpers({
+        ...validCfg,
+        buildConfig: { directories: [{ path: 'svc', type: 'node' }], env_vars: { 'A;B': 'x' } },
+      });
+    }).toThrow(/env_var name/);
+  });
+
+  it('rejects build_config directory path with shell metacharacters', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => {
+      writeCodeChangeHelpers({
+        ...validCfg,
+        buildConfig: { directories: [{ path: 'svc`whoami`', type: 'node', build_cmd: 'npm run build' }] },
+      });
+    }).toThrow(/directory path/);
+  });
+
+  it('accepts build_config with typical install/lint/build/test commands', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => {
+      writeCodeChangeHelpers({
+        ...validCfg,
+        buildConfig: {
+          directories: [{
+            path: 'service/api',
+            type: 'python',
+            install_cmd: 'pip install -e .',
+            lint_cmd: 'python3 -m ruff check --select E,F,W --ignore E501',
+            build_cmd: 'python3 -m build',
+            test_cmd: 'pytest -q',
+          }],
+          env_vars: { API_URL: 'http://localhost:8080', NODE_ENV: 'ci' },
+        },
+      });
+    }).not.toThrow();
+  });
+});
+
+// ── writeCheckHelper — config-driven (build_config) path ──────────────────────
+describe('writeCheckHelper — config-driven build_config path', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  const buildConfig = {
+    directories: [
+      {
+        path: 'service/api',
+        type: 'python',
+        install_cmd: 'pip install -e .',
+        lint_cmd: 'python3 -m ruff check',
+        build_cmd: 'python3 -m build',
+        test_cmd: 'pytest -q',
+      },
+      {
+        path: 'web/',
+        type: 'node',
+        install_cmd: 'npm ci',
+        lint_cmd: 'npm run lint',
+        build_cmd: 'npm run build',
+      },
+    ],
+    env_vars: { API_URL: 'http://localhost:8080', NODE_ENV: 'ci' },
+  };
+
+  const baseCfg = {
+    taskId: 'task-cfg-1',
+    workBranch: 'blueprint/task-cfg-1',
+    baseBranch: 'main',
+    owner: 'acme',
+    repo: 'other-repo',
+    testsOnMainBranch: true,
+  };
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('generates per-directory blocks from buildConfig and omits hardcoded Blueprint blocks', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({ ...baseCfg, buildConfig });
+
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+    // Configured directories + commands are present.
+    expect(checkScript).toContain('if touches "service/api/"; then');
+    expect(checkScript).toContain(`run "service/api install" bash -c 'cd "service/api" && pip install -e .'`);
+    expect(checkScript).toContain(`run "service/api lint" bash -c 'cd "service/api" && python3 -m ruff check'`);
+    expect(checkScript).toContain(`run "service/api build" bash -c 'cd "service/api" && python3 -m build'`);
+    // Trailing slash in the configured path is normalized.
+    expect(checkScript).toContain('if touches "web/"; then');
+    expect(checkScript).toContain(`run "web build" bash -c 'cd "web" && npm run build'`);
+    // The hardcoded Blueprint stack blocks must NOT run on the config-driven
+    // path (the `admin_ui_runtime_touched` helper is still defined in the
+    // shared header, but it must not be invoked, and no hardcoded stack
+    // commands should appear).
+    expect(checkScript).not.toContain('if admin_ui_runtime_touched; then');
+    expect(checkScript).not.toContain('run "agent tsc"');
+    expect(checkScript).not.toContain('backend ruff (changed)');
+    expect(checkScript).not.toContain('npm run test:viewport');
+  });
+
+  it('falls back to hardcoded Blueprint blocks when buildConfig is undefined', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({ ...baseCfg });
+
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+    expect(checkScript).toContain('admin_ui_runtime_touched');
+    expect(checkScript).toContain('run "agent tsc"');
+    expect(checkScript).toContain('backend ruff (changed)');
+    expect(checkScript).toContain('npm run test:viewport');
+    // And the config-driven marker is absent.
+    expect(checkScript).not.toContain('Config-driven checks');
+  });
+
+  it('falls back to hardcoded blocks when buildConfig has empty directories', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({ ...baseCfg, buildConfig: { directories: [] } });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toContain('admin_ui_runtime_touched');
+    expect(checkScript).not.toContain('Config-driven checks');
+  });
+
+  it('gates configured test_cmd on ./check test (WITH_TESTS)', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({ ...baseCfg, buildConfig });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    // test_cmd is wrapped in a WITH_TESTS guard.
+    expect(checkScript).toContain('if [ "$WITH_TESTS" = "1" ]; then');
+    expect(checkScript).toContain(`run "service/api test" bash -c 'cd "service/api" && pytest -q'`);
+    // The directory with no test_cmd produces no test run line.
+    expect(checkScript).not.toContain('web test');
+  });
+
+  it('exports env_vars from buildConfig in the generated ./check', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({ ...baseCfg, buildConfig });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toContain(`export API_URL='http://localhost:8080'`);
+    expect(checkScript).toContain(`export NODE_ENV='ci'`);
+  });
+
+  it('generated config-driven ./check passes `bash -n` syntax check', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({ ...baseCfg, buildConfig });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/check_cfg_smoke_${process.pid}_${Date.now()}.sh`;
+    realFs.writeFileSync(tmp, checkScript);
+    try {
+      realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+    } finally {
+      try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  });
 });

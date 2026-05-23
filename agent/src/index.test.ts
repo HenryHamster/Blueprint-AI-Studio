@@ -470,21 +470,27 @@ describe('runProjectLintChecks', () => {
     expect(viewportCall).toBeDefined();
   });
 
-  it('falls back to hardcoded agent checks when buildConfig is undefined and agent/ touched', () => {
+  it('runs tsc for TypeScript changes when buildConfig is absent (generic detection via file extension)', () => {
     runProjectLintChecks(['agent/src/index.ts'], null, undefined);
     expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
       'npx', ['tsc', '--noEmit'], expect.any(Object),
     );
   });
 
-  it('is_self_repo triggers fallback: resolveBuildConfig returns undefined for is_self_repo=true', () => {
-    // When is_self_repo=true, resolveBuildConfig returns undefined, so the
-    // hardcoded fallback runs even if build_config data is present.
-    // Simulate: call runProjectLintChecks with undefined (what resolveBuildConfig returns)
+  it('runs tsc for TypeScript changes in a non-Blueprint directory when buildConfig is absent', () => {
+    runProjectLintChecks(['lib/utils.ts'], null, undefined);
+    expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
+      'npx', ['tsc', '--noEmit'], expect.objectContaining({ cwd: expect.stringContaining('/lib') as unknown as string }),
+    );
+  });
+
+  it('skips all checks when buildConfig is absent and no detectable language tooling is found', () => {
+    // resolveBuildConfig returns undefined when skip_build_config=true or when
+    // build_config is absent/empty. Either case causes runProjectLintChecks to
+    // fall back to generic language detection. With existsSync mocked false,
+    // no .py files are found on disk, so ruff is skipped.
     runProjectLintChecks(['backend/app/main.py'], null, undefined);
-    // Should use hardcoded ruff check (via execFileSync for the try/catch ruff path)
-    // We just verify it doesn't throw and execFileSync was called for something
-    expect(typeof runProjectLintChecks).toBe('function');
+    expect(vi.mocked(execFileSync)).not.toHaveBeenCalled();
   });
 });
 

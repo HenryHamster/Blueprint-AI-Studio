@@ -1059,6 +1059,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     noChangesMessage,
     analysisContext,
     regressingCategories: reasoningGateCats.length > 0 ? reasoningGateCats : undefined,
+    buildConfig,
   });
 
   // Fresh reviewer pass: read-only second session to catch what the implementing

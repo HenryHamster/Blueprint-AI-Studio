@@ -1875,10 +1875,36 @@ export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | nul
     return;
   }
 
-  // Fallback: hardcoded Blueprint project structure
+  // Generic fallback: detect language/tooling from changed file extensions,
+  // mirroring detectTestRunners which detects generically before falling back
+  // to Blueprint-specific subdirectory names.
+
+  // Admin-ui: Blueprint-specific frontend with Playwright viewport + custom env vars
   const touchesFrontend = changedPaths.some(p => p.startsWith('admin-ui/'));
-  const touchesAgent = changedPaths.some(p => p.startsWith('agent/'));
-  const touchesBackend = changedPaths.some(p => p.startsWith('backend/'));
+
+  // TypeScript directories: any top-level dir with .ts/.tsx changes (admin-ui handled separately)
+  const tsDirs = new Set<string>();
+  for (const p of changedPaths) {
+    if (p.endsWith('.ts') || p.endsWith('.tsx')) {
+      const dir = p.split('/')[0];
+      if (dir && !dir.includes('.')) tsDirs.add(dir);
+    }
+  }
+  tsDirs.delete('admin-ui');
+
+  // Python files per directory: scope ruff to changed .py files that still exist on disk
+  // (deletions are skipped; repo-wide ruff is enforced in CI on main)
+  const pyFilesByDir = new Map<string, string[]>();
+  for (const p of changedPaths) {
+    if (!p.endsWith('.py')) continue;
+    const dir = p.split('/')[0];
+    if (!dir || dir.includes('.')) continue;
+    if (!fs.existsSync(`${WORKSPACE}/${p}`)) continue;
+    const list = pyFilesByDir.get(dir) ?? [];
+    list.push(p);
+    pyFilesByDir.set(dir, list);
+  }
+
   if (touchesFrontend) {
     const adminUiEnv = {
       ...process.env,
@@ -1913,50 +1939,39 @@ export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | nul
     execFileSync('npm', ['run', 'build'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_BUILD_TIMEOUT, env: adminUiEnv });
     sendLog(ws, 'Frontend checks passed.\n');
   }
-  if (touchesAgent) {
-    sendLog(ws, 'Running agent type check...\n');
-    sendHeartbeatSync(taskId, 'npm ci (agent)...');
-    execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: AGENT_NPM_TIMEOUT });
-    sendHeartbeatSync(taskId, 'tsc --noEmit (agent)...');
-    execFileSync('npx', ['tsc', '--noEmit'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: AGENT_TSC_TIMEOUT });
-    sendLog(ws, 'Agent type check passed.\n');
+  for (const dir of tsDirs) {
+    sendLog(ws, `Running TypeScript checks in ${dir}...\n`);
+    sendHeartbeatSync(taskId, `npm ci (${dir})...`);
+    execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/${dir}`, encoding: 'utf-8', timeout: AGENT_NPM_TIMEOUT });
+    sendHeartbeatSync(taskId, `tsc --noEmit (${dir})...`);
+    execFileSync('npx', ['tsc', '--noEmit'], { cwd: `${WORKSPACE}/${dir}`, encoding: 'utf-8', timeout: AGENT_TSC_TIMEOUT });
+    sendLog(ws, `TypeScript checks passed in ${dir}.\n`);
   }
-  if (touchesBackend) {
-    // Scope ruff to changed *.py files. Repo-wide ruff is enforced in CI on
-    // main; on PRs the pre-existing baseline is not actionable for fix tasks
-    // and would block unrelated work. Filter to files that still exist so
-    // deletions don't ENOENT.
-    const backendPy = changedPaths.filter(p =>
-      p.startsWith('backend/') && p.endsWith('.py') && fs.existsSync(`${WORKSPACE}/${p}`),
-    );
-    if (backendPy.length === 0) {
-      sendLog(ws, 'No backend/*.py files changed, skipping backend ruff.\n');
-    } else {
-      sendLog(ws, `Running backend ruff lint on ${backendPy.length} changed file(s)...\n`);
-      try {
-        const lintOut = execFileSync('python3', ['-m', 'ruff', 'check', '--select', 'E,F,W', '--ignore', 'E501', ...backendPy], { cwd: WORKSPACE, encoding: 'utf-8', timeout: RUFF_TIMEOUT });
-        sendLog(ws, lintOut || 'Backend ruff lint passed.\n');
-      } catch (err: unknown) {
-        const errCode = (err as NodeJS.ErrnoException).code;
-        const errMsg = err instanceof Error ? err.message : String(err);
-        if (errCode === 'ENOENT' || errMsg.includes('No module named ruff')) {
-          sendLog(ws, 'ruff not installed, skipping backend lint.\n');
-        } else {
-          throw err;
-        }
+  for (const [dir, pyFiles] of pyFilesByDir) {
+    sendLog(ws, `Running ruff lint on ${pyFiles.length} changed .py file(s) in ${dir}...\n`);
+    try {
+      const lintOut = execFileSync('python3', ['-m', 'ruff', 'check', '--select', 'E,F,W', '--ignore', 'E501', ...pyFiles], { cwd: WORKSPACE, encoding: 'utf-8', timeout: RUFF_TIMEOUT });
+      sendLog(ws, lintOut || 'Ruff lint passed.\n');
+    } catch (err: unknown) {
+      const errCode = (err as NodeJS.ErrnoException).code;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errCode === 'ENOENT' || errMsg.includes('No module named ruff')) {
+        sendLog(ws, 'ruff not installed, skipping lint.\n');
+      } else {
+        throw err;
       }
-      sendLog(ws, 'Running backend ruff format check on changed files...\n');
-      try {
-        const fmtOut = execFileSync('python3', ['-m', 'ruff', 'format', '--check', ...backendPy], { cwd: WORKSPACE, encoding: 'utf-8', timeout: RUFF_TIMEOUT });
-        sendLog(ws, fmtOut || 'Backend ruff format check passed.\n');
-      } catch (err: unknown) {
-        const errCode = (err as NodeJS.ErrnoException).code;
-        const errMsg = err instanceof Error ? err.message : String(err);
-        if (errCode === 'ENOENT' || errMsg.includes('No module named ruff')) {
-          sendLog(ws, 'ruff not installed, skipping backend format check.\n');
-        } else {
-          throw err;
-        }
+    }
+    sendLog(ws, `Running ruff format check on changed .py files in ${dir}...\n`);
+    try {
+      const fmtOut = execFileSync('python3', ['-m', 'ruff', 'format', '--check', ...pyFiles], { cwd: WORKSPACE, encoding: 'utf-8', timeout: RUFF_TIMEOUT });
+      sendLog(ws, fmtOut || 'Ruff format check passed.\n');
+    } catch (err: unknown) {
+      const errCode = (err as NodeJS.ErrnoException).code;
+      const errMsg = err instanceof Error ? err.message : String(err);
+      if (errCode === 'ENOENT' || errMsg.includes('No module named ruff')) {
+        sendLog(ws, 'ruff not installed, skipping format check.\n');
+      } else {
+        throw err;
       }
     }
   }
