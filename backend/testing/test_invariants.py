@@ -1752,3 +1752,78 @@ class TestReviewerDisagreementSeverityInvariants:
         )
         assert isinstance(item["severity_breakdown"], dict)
         assert item["max_severity"] == "CRITICAL"
+
+
+# ── Design-Doc Lock Invariant ─────────────────────────────────────────────────
+
+
+class TestDesignDocLockInvariant:
+    """Tripwire: every project.design_doc assignment outside the canonical
+    helper (with_design_doc_locked in task_locking.py) must be explicitly
+    allowlisted. New files not in the allowlist will fail this test.
+
+    To migrate a site: route it through with_design_doc_locked() and remove
+    the file from ALLOWLISTED_FILES when no direct assignments remain.
+    """
+
+    def test_no_new_unlocked_design_doc_writes(self):
+        import glob as globmod
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+
+        # Prefer rg for speed; fall back to pure-Python walk when not installed.
+        matched_files: set[str] = set()
+        try:
+            result = subprocess.run(
+                ["rg", "--files-with-matches", r"project\.design_doc\s*=", app_dir],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 2:
+                pytest.skip(f"rg error: {result.stderr.strip()}")
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line:
+                    matched_files.add(os.path.relpath(line, app_dir))
+        except FileNotFoundError:
+            # rg not on PATH — scan with Python re
+            pattern = re.compile(r"project\.design_doc\s*=")
+            for py_file in globmod.glob(
+                os.path.join(app_dir, "**", "*.py"), recursive=True
+            ):
+                with open(py_file) as fh:
+                    if pattern.search(fh.read()):
+                        matched_files.add(os.path.relpath(py_file, app_dir))
+
+        # Files allowlisted because they hold a project row lock at the call site
+        # (lock_project_or_429 / project_lock / lock_project_for_strategic_transition)
+        # or contain the canonical helper itself (task_locking.py).
+        # Remove an entry here when all its direct assignments have been migrated
+        # to with_design_doc_locked().
+        ALLOWLISTED_FILES = {
+            "task_locking.py",  # canonical helper — the one intentional assignment
+            "auto_remediation.py",
+            "direction_outcomes.py",
+            "efficiency_snapshot.py",
+            "main.py",
+            "notification_dispatch.py",
+            "playbook_learning.py",
+            "research_completion.py",
+            "research_direction_state.py",
+            "shared_state.py",
+            "task_completion.py",
+            os.path.join("routers", "admin_notifications.py"),
+            os.path.join("routers", "admin_onboard.py"),
+            os.path.join("routers", "admin_project_config.py"),
+            os.path.join("routers", "admin_projects.py"),
+            os.path.join("routers", "agent_status.py"),
+        }
+
+        unlocked = matched_files - ALLOWLISTED_FILES
+        assert not unlocked, (
+            "New direct project.design_doc = assignments found outside the allowlist:\n"
+            + "".join(f"  {f}\n" for f in sorted(unlocked))
+            + "\nRoute new design_doc writes through with_design_doc_locked() "
+            "(task_locking.py) or add the file to ALLOWLISTED_FILES in "
+            "testing/test_invariants.py if it already holds a project row lock."
+        )
