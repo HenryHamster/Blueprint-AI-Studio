@@ -3476,7 +3476,14 @@ class TestHandleInvestigationCompletion:
         result = await db_session.execute(
             _select(_Task).where(_Task.parent_task_id == task.id)
         )
-        assert result.scalars().all() == []
+        children = result.scalars().all()
+        # Memo task is spawned for the unactionable structural outcome
+        assert len(children) == 1
+        memo = children[0]
+        assert memo.first_payload["type"] == "memo"
+        assert memo.first_payload["reasoning_kind"] == "investigation_unactionable"
+        assert memo.context["investigation_outcome"] == "structural"
+        assert memo.context["memo_source_task_id"] == str(task.id)
 
         d = project.directions[0]
         notes = d.get("notes") or []
@@ -3602,7 +3609,11 @@ class TestHandleInvestigationCompletion:
             .scalars()
             .all()
         )
-        assert siblings == []
+        # Cap exceeded → no followup spawned → memo is spawned for low_confidence outcome
+        assert len(siblings) == 1
+        memo = siblings[0]
+        assert memo.first_payload["type"] == "memo"
+        assert memo.context["investigation_outcome"] == "low_confidence"
         d = project.directions[0]
         assert d["followup_investigation_attempts_by_fingerprint"] == {"fp-low": recent}
         assert "diagnosis_in_progress" not in d
@@ -3897,7 +3908,9 @@ class TestHandleInvestigationCompletion:
         assert case.false_positive_reason and "design_doc" in case.false_positive_reason
         assert task.status == TaskStatus.COMPLETED
 
-        # No remediation was spawned — only the original investigate task remains.
+        # No remediation was spawned. A reasoning memo documenting the
+        # false-positive determination is spawned alongside the original
+        # investigate task, so two tasks remain — the original plus the memo.
         all_tasks = (
             (
                 await db_session.execute(
@@ -3907,8 +3920,18 @@ class TestHandleInvestigationCompletion:
             .scalars()
             .all()
         )
-        assert len(all_tasks) == 1
-        assert all_tasks[0].id == task.id
+        assert {t.id for t in all_tasks} >= {task.id}
+        spawned = [t for t in all_tasks if t.id != task.id]
+        assert all((t.first_payload or {}).get("type") == "memo" for t in spawned), (
+            "non-investigate spawned tasks must be memos, not remediations"
+        )
+        assert [
+            t
+            for t in spawned
+            if (t.context or {}).get("memo_reasoning_kind")
+            == "regression_false_positive"
+        ], "a regression false-positive memo should be spawned"
+        assert len(all_tasks) == 2
 
     @pytest.mark.asyncio
     async def test_not_a_regression_verdict_ignored_for_direction_investigations(
@@ -3953,6 +3976,260 @@ class TestHandleInvestigationCompletion:
         # Verdict is recorded on the report payload regardless of spawn path.
         assert isinstance(task.plan_output, dict)
         assert task.plan_output.get("verdict") == "not_a_regression"
+
+    # ── memo spawn on terminal (unactionable) outcomes ───────────────────────
+
+    @pytest.mark.asyncio
+    async def test_memo_spawned_for_structural_outcome(self, db_session, mocker):
+        """Structural diagnosis → memo child with reasoning_kind=investigation_unactionable."""
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id, context={"direction_id": "dir-invest-1"}
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        structural_report = self._report(
+            root_cause="The direction scope is too broad — conflates two concerns.",
+            recommended_fix="Split into two narrower directions.",
+        )
+        await _handle_investigation_completion(
+            task, self._payload(structural_report), db_session
+        )
+        await db_session.commit()
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1
+        memo = children[0]
+        assert memo.first_payload["type"] == "memo"
+        assert memo.first_payload["reasoning_kind"] == "investigation_unactionable"
+        assert memo.context["investigation_outcome"] == "structural"
+        assert memo.context["memo_source_task_id"] == str(task.id)
+        assert memo.context["memo_reasoning_kind"] == "investigation_unactionable"
+        assert memo.context["direction_id"] == "dir-invest-1"
+        assert memo.status == TaskStatus.QUEUED
+        assert memo.created_by == "ORCHESTRATOR"
+
+    @pytest.mark.asyncio
+    async def test_memo_spawned_for_no_actionable_fix_outcome(self, db_session, mocker):
+        """No recommended_fix → memo child, no remediation task."""
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id, context={"direction_id": "dir-invest-1"}
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_completion(
+            task,
+            self._payload(self._report(recommended_fix="", confidence="high")),
+            db_session,
+        )
+        await db_session.commit()
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1
+        memo = children[0]
+        assert memo.first_payload["reasoning_kind"] == "investigation_unactionable"
+        assert memo.context["investigation_outcome"] == "no_actionable_fix"
+        # No remediation create-child
+        assert memo.first_payload["type"] == "memo"
+
+    @pytest.mark.asyncio
+    async def test_memo_spawned_for_low_confidence_outcome(self, db_session, mocker):
+        """Low confidence with capped followup → memo child."""
+        from app.time_utils import _utcnow
+
+        recent = [_utcnow().isoformat(), _utcnow().isoformat()]
+        project = await self._setup(
+            db_session,
+            mocker,
+            direction_overrides={
+                "error_fingerprint": "fp-lc",
+                "followup_investigation_attempts_by_fingerprint": {
+                    "fp-lc": list(recent)
+                },
+            },
+        )
+        task = make_task(
+            project_id=project.id,
+            context={"direction_id": "dir-invest-1", "diagnosis_fingerprint": "fp-lc"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_completion(
+            task, self._payload(self._report(confidence="low")), db_session
+        )
+        await db_session.commit()
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1
+        memo = children[0]
+        assert memo.first_payload["reasoning_kind"] == "investigation_unactionable"
+        assert memo.context["investigation_outcome"] == "low_confidence"
+
+    @pytest.mark.asyncio
+    async def test_no_memo_when_remediation_spawned(self, db_session, mocker):
+        """High-confidence actionable report → remediation only, no memo."""
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id, context={"direction_id": "dir-invest-1"}
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_completion(
+            task, self._payload(self._report()), db_session
+        )
+        await db_session.commit()
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1
+        assert children[0].first_payload["type"] == "create"
+
+    @pytest.mark.asyncio
+    async def test_memo_dedup_skips_duplicate_for_same_investigation(
+        self, db_session, mocker
+    ):
+        """Second call for the same investigation task does not spawn a second memo."""
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id, context={"direction_id": "dir-invest-1"}
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        structural_report = self._report(
+            root_cause="The direction scope is too broad.",
+            recommended_fix="Narrow the scope.",
+        )
+        # First call
+        await _handle_investigation_completion(
+            task, self._payload(structural_report), db_session
+        )
+        await db_session.commit()
+        # Second call (simulates accidental re-processing)
+        await _handle_investigation_completion(
+            task, self._payload(structural_report), db_session
+        )
+        await db_session.commit()
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+
+        memos = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.project_id == project.id,
+                        _Task.parent_task_id == task.id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        memo_tasks = [
+            m
+            for m in memos
+            if (m.context or {}).get("memo_reasoning_kind")
+            == "investigation_unactionable"
+        ]
+        assert len(memo_tasks) == 1, (
+            "dedup should prevent a second memo for the same investigation"
+        )
+
+    @pytest.mark.asyncio
+    async def test_memo_spawned_for_no_direction_outcome(self, db_session, mocker):
+        """High-confidence actionable report with no direction context → memo with no_direction outcome."""
+        mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # No direction_id in context → direction=None, spawn_remediation=True but
+        # no direction-anchored / crash / dispatcher path fires → spawned_child=None.
+        task = make_task(project_id=project.id, context={})
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_completion(
+            task, self._payload(self._report()), db_session
+        )
+        await db_session.commit()
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1
+        memo = children[0]
+        assert memo.first_payload["type"] == "memo"
+        assert memo.first_payload["reasoning_kind"] == "investigation_unactionable"
+        assert memo.context["investigation_outcome"] == "no_direction"
+        assert memo.context["memo_source_task_id"] == str(task.id)
+        assert memo.status == TaskStatus.QUEUED
+        assert memo.created_by == "ORCHESTRATOR"
 
 
 # ── _clear_direction_diagnosis_flag ─────────────────────────────────────────

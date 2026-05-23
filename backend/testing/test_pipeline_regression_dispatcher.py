@@ -14140,6 +14140,245 @@ async def test_false_positive_with_null_until_does_not_suppress(db_session):
 
 
 @pytest.mark.asyncio
+async def test_false_positive_verdict_spawns_memo_task(db_session):
+    """When investigate task concludes verdict=not_a_regression, a memo task is spawned."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.task_completion import _mark_regression_case_false_positive
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a case row to link the investigation task to
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        hit_count=1,
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    # Create an investigation task with regression_class context
+    inv_task = Task(
+        project_id=project.id,
+        title="Investigate regression",
+        payloads=[{"type": "investigate", "prompt": "Test investigation prompt"}],
+        context={
+            "regression_class": "sr_catch_rate",
+            "spawned_by": "pipeline_regression_dispatcher",
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(inv_task)
+    await db_session.commit()
+    await db_session.refresh(inv_task)
+
+    # Call _mark_regression_case_false_positive which should spawn the memo
+    await _mark_regression_case_false_positive(
+        task=inv_task,
+        verdict_reason="This is intentional behavior; not a real regression.",
+        session=db_session,
+    )
+    await db_session.commit()
+
+    # Verify memo task was spawned with correct fields
+    memo_tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["memo_reasoning_kind"].as_string()
+                    == "regression_false_positive",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(memo_tasks) == 1, "Expected exactly one memo task"
+    memo = memo_tasks[0]
+    assert memo.context.get("memo_regression_class") == "sr_catch_rate"
+    assert memo.context.get("memo_case_id") == str(case.id)
+    assert memo.context.get("memo_source_task_id") == str(inv_task.id)
+
+    # Verify memo payload has the reasoning
+    memo_payload = memo.first_payload
+    assert memo_payload.get("type") == "memo"
+    assert memo_payload.get("reasoning_kind") == "regression_false_positive"
+    assert memo_payload.get("regression_class") == "sr_catch_rate"
+    assert "intentional" in memo_payload.get("verdict_reason", "").lower()
+
+
+@pytest.mark.asyncio
+async def test_false_positive_memo_dedup_within_30_days(db_session):
+    """When a memo exists within 30 days, no duplicate is created."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.task_completion import _mark_regression_case_false_positive
+    from app.time_utils import _utcnow
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a case
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        hit_count=1,
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    # Create an existing memo task from 10 days ago
+    now = _utcnow()
+    ten_days_ago = now - timedelta(days=10)
+    old_memo = Task(
+        project_id=project.id,
+        title="Old memo",
+        payloads=[{"type": "memo"}],
+        context={
+            "memo_reasoning_kind": "regression_false_positive",
+            "memo_regression_class": "sr_catch_rate",
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=ten_days_ago,
+    )
+    db_session.add(old_memo)
+    await db_session.commit()
+
+    # Create new investigation task
+    inv_task = Task(
+        project_id=project.id,
+        title="Investigate again",
+        payloads=[{"type": "investigate", "prompt": "Another investigation"}],
+        context={
+            "regression_class": "sr_catch_rate",
+            "spawned_by": "pipeline_regression_dispatcher",
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(inv_task)
+    await db_session.commit()
+    await db_session.refresh(inv_task)
+
+    # Call _mark_regression_case_false_positive; no new memo should be created
+    await _mark_regression_case_false_positive(
+        task=inv_task,
+        verdict_reason="Still not a real regression.",
+        session=db_session,
+    )
+    await db_session.commit()
+
+    # Verify only the old memo exists, no new one was created
+    memo_tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["memo_reasoning_kind"].as_string()
+                    == "regression_false_positive",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(memo_tasks) == 1, (
+        "Expected exactly one memo (dedup should prevent new one)"
+    )
+    assert memo_tasks[0].id == old_memo.id
+
+
+@pytest.mark.asyncio
+async def test_false_positive_state_transition_with_memo(db_session):
+    """Case FALSE_POSITIVE status transition and Alert still occur alongside memo spawn."""
+    from app.models import Alert, RegressionCaseStatus, RegressionRemediationCase
+    from app.task_completion import _mark_regression_case_false_positive
+    from app.pipeline_regression_dispatcher import _REGRESSION_FALSE_POSITIVE_TTL
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create case
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        hit_count=1,
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    # Create investigation task
+    inv_task = Task(
+        project_id=project.id,
+        title="Investigate",
+        payloads=[{"type": "investigate", "prompt": "Investigation"}],
+        context={
+            "regression_class": "sr_catch_rate",
+            "spawned_by": "pipeline_regression_dispatcher",
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(inv_task)
+    await db_session.commit()
+    await db_session.refresh(inv_task)
+
+    # Call the function
+    await _mark_regression_case_false_positive(
+        task=inv_task,
+        verdict_reason="Not a real regression.",
+        session=db_session,
+    )
+    await db_session.commit()
+
+    # Verify case was updated to FALSE_POSITIVE
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.FALSE_POSITIVE
+    assert case.false_positive_reason == "Not a real regression."
+    assert case.false_positive_until_at is not None
+    now = _utcnow()
+    assert (case.false_positive_until_at - now) < _REGRESSION_FALSE_POSITIVE_TTL
+    assert (
+        case.false_positive_until_at - now
+    ) > _REGRESSION_FALSE_POSITIVE_TTL - timedelta(seconds=10)
+
+    # Verify Alert was created
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) >= 1
+    alert = next((a for a in alerts if "FALSE_POSITIVE" in (a.title or "")), None)
+    assert alert is not None
+    assert "sr_catch_rate" in alert.title
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_prompt_documents_verdict_triage(db_session):
     """Dispatcher prompt instructs the agent to set verdict=not_a_regression
     when the trip is intentional behavior or known-incomplete pipeline step."""

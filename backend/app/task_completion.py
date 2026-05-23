@@ -3147,6 +3147,99 @@ async def _maybe_escalate_diagnosis_divergence(
     return True
 
 
+# Dedup window for regression false-positive memos. Avoids creating
+# multiple memos for the same regression_class if it re-arms after the TTL.
+_REGRESSION_FALSE_POSITIVE_MEMO_DEDUP_DAYS = 30
+
+
+async def _spawn_regression_false_positive_memo(
+    *,
+    task: Task,
+    regression_class: str,
+    verdict_reason: str,
+    case_id,
+    session: AsyncSession,
+) -> Optional[Task]:
+    """Spawn a memo task documenting the regression false-positive reasoning.
+
+    Preserves the verdict_reason and investigation summary as citable artifacts
+    so strategic cycles can reference the reasoning. Dedup guard: skips if a
+    memo for this regression_class was created in the last 30 days.
+
+    Returns the spawned memo task on success, or None if deduped/failed.
+    """
+    thirty_days_ago = _utcnow() - timedelta(
+        days=_REGRESSION_FALSE_POSITIVE_MEMO_DEDUP_DAYS
+    )
+    existing = (
+        await session.execute(
+            select(Task).where(
+                Task.project_id == task.project_id,
+                Task.created_at >= thirty_days_ago,
+                Task.created_by == "ORCHESTRATOR",
+                Task.context["memo_reasoning_kind"].as_string()
+                == "regression_false_positive",
+                Task.context["memo_regression_class"].as_string() == regression_class,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        logger.debug(
+            "[INVESTIGATION_FALSE_POSITIVE] Skipping duplicate memo for class %s; "
+            "existing memo %s created within %d days",
+            regression_class,
+            existing.id,
+            _REGRESSION_FALSE_POSITIVE_MEMO_DEDUP_DAYS,
+        )
+        return None
+
+    # Prepare memo payload with reasoning
+    summary = (task.first_payload or {}).get("prompt", "")[:500] or "(no summary)"
+    direction_id = (task.context or {}).get("direction_id")
+    memo_topic = f"Regression {regression_class[:80]}: not a real regression"
+    memo_payload = validate_internal_payload(
+        {
+            "type": "memo",
+            "topic": memo_topic,
+            "reasoning_kind": "regression_false_positive",
+            "regression_class": regression_class,
+            "verdict_reason": verdict_reason[:1000] or "(no reason provided)",
+            "investigation_summary": summary,
+            **({"direction_id": direction_id} if direction_id else {}),
+            "case_id": str(case_id),
+        },
+        "task_completion:memo:regression_false_positive",
+    )
+    memo_task = Task(
+        project_id=task.project_id,
+        title=f"Memo: {memo_topic[:100]}",
+        description="Reasoning memo for false-positive regression determination",
+        parent_task_id=task.id,
+        payloads=[memo_payload],
+        context={
+            "memo_reasoning_kind": "regression_false_positive",
+            "memo_regression_class": regression_class,
+            "memo_case_id": str(case_id),
+            "memo_source_task_id": str(task.id),
+            **({"direction_id": direction_id} if direction_id else {}),
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        priority=TASK_PRIORITY_MAP.get("low", 0),
+    )
+    session.add(memo_task)
+    logger.info(
+        "[INVESTIGATION_FALSE_POSITIVE] Spawned memo task %s for regression class %s "
+        "(case_id=%s, investigation_task=%s)",
+        memo_task.id,
+        regression_class,
+        case_id,
+        task.id,
+    )
+    return memo_task
+
+
 async def _mark_regression_case_false_positive(
     *,
     task: Task,
@@ -3162,6 +3255,8 @@ async def _mark_regression_case_false_positive(
     TTL window (see ``_REGRESSION_FALSE_POSITIVE_TTL`` in
     ``pipeline_regression_dispatcher``). After the TTL lapses the dispatcher
     re-arms the case to ACTIVE so a genuine recurrence is still caught.
+
+    Also spawns a memo task to preserve the verdict reasoning as a citable artifact.
 
     No-ops (without raising) when the matching case row cannot be found —
     the dispatcher rebuilds case rows on next spawn anyway, so a missing row
@@ -3206,6 +3301,25 @@ async def _mark_regression_case_false_positive(
     now = _utcnow()
     suppressed_until = now + _REGRESSION_FALSE_POSITIVE_TTL
     reason = (verdict_reason or "")[:500]
+
+    # Spawn memo task BEFORE updating case state. If memo spawn fails, the Alert
+    # will still fire and operator will know the case was marked FALSE_POSITIVE.
+    try:
+        await _spawn_regression_false_positive_memo(
+            task=task,
+            regression_class=regression_class,
+            verdict_reason=reason,
+            case_id=case_row.id,
+            session=session,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[INVESTIGATION_FALSE_POSITIVE] Failed to spawn memo for class %s: %r; "
+            "continuing with case update",
+            regression_class,
+            exc,
+        )
+
     case_row.status = RegressionCaseStatus.FALSE_POSITIVE
     case_row.false_positive_until_at = suppressed_until
     case_row.false_positive_reason = reason
@@ -3585,6 +3699,86 @@ async def _handle_investigation_completion(
         direction["last_diagnosis_outcome"] = outcome
         flag_modified(project, "directions")
         session.add(project)
+
+    # Spawn a terminal memo for unactionable outcomes so the investigator's
+    # reasoning becomes a citable artifact. Only fires when neither a
+    # remediation task nor a low-confidence followup was spawned.
+    # Guardrail: not_a_regression returns early above, so it never reaches here.
+    if spawned_child is None and spawned_followup is None:
+        _outcome_label = (
+            "structural"
+            if structural
+            else (
+                "no_actionable_fix"
+                if not recommended_fix
+                else (
+                    "low_confidence"
+                    if confidence not in ("high", "medium")
+                    else "no_direction"
+                )
+            )
+        )
+        # Dedup: skip if a memo for this investigation task already exists.
+        _memo_window = _utcnow() - timedelta(days=30)
+        _dedup_result = await session.execute(
+            select(Task).where(
+                Task.project_id == task.project_id,
+                Task.created_at >= _memo_window,
+            )
+        )
+        _already_has_memo = any(
+            (t.context or {}).get("memo_source_task_id") == str(task.id)
+            and (t.context or {}).get("memo_reasoning_kind")
+            == "investigation_unactionable"
+            for t in _dedup_result.scalars().all()
+        )
+        if not _already_has_memo:
+            _memo_topic = (summary[:120] or f"Investigation: {_outcome_label}")[:200]
+            _inv_memo_payload = validate_internal_payload(
+                {
+                    "type": "memo",
+                    "topic": _memo_topic,
+                    "reasoning_kind": "investigation_unactionable",
+                    "source_task_id": str(task.id),
+                    **({"direction_id": direction_id} if direction_id else {}),
+                },
+                "task_completion:memo:investigation_unactionable",
+            )
+            _inv_memo_context: Dict[str, Any] = {
+                "memo_source_task_id": str(task.id),
+                "memo_reasoning_kind": "investigation_unactionable",
+                "investigation_outcome": _outcome_label,
+                "investigation_summary": summary[:500],
+                "investigation_root_cause": root_cause[:500],
+            }
+            if recommended_fix:
+                _inv_memo_context["investigation_recommended_fix"] = recommended_fix[
+                    :500
+                ]
+            if affected_paths:
+                _inv_memo_context["investigation_affected_paths"] = affected_paths[:10]
+            if direction_id:
+                _inv_memo_context["direction_id"] = direction_id
+            _inv_memo_task = Task(
+                project_id=task.project_id,
+                title=f"Memo: {_memo_topic[:120]}",
+                description=f"Reasoning memo for unactionable investigation ({_outcome_label})",
+                parent_task_id=task.id,
+                payloads=[_inv_memo_payload],
+                context=_inv_memo_context,
+                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                status=TaskStatus.QUEUED,
+                created_by="ORCHESTRATOR",
+                depends_on=[],
+                priority=TASK_PRIORITY_MAP.get("low", 0),
+            )
+            session.add(_inv_memo_task)
+            logger.info(
+                "[INVESTIGATION] Spawned memo %s for unactionable investigation %s (outcome=%s)",
+                _inv_memo_task.id,
+                task.id,
+                _outcome_label,
+            )
 
     session.add(task)
 

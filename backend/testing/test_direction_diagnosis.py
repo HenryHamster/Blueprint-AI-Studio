@@ -1329,7 +1329,16 @@ async def test_structural_diagnosis_appends_note_no_remediation(db_session, mock
         .scalars()
         .all()
     )
-    assert children == [], "structural diagnosis must not spawn a remediation task"
+    # A structural (unactionable) outcome no longer spawns a remediation task,
+    # but it does spawn a terminal reasoning memo so the verdict is citable.
+    assert all((c.first_payload or {}).get("type") == "memo" for c in children), (
+        "structural diagnosis must not spawn a remediation task"
+    )
+    assert [
+        c
+        for c in children
+        if (c.context or {}).get("memo_reasoning_kind") == "investigation_unactionable"
+    ], "structural diagnosis should spawn an unactionable-investigation memo"
 
     d = project.directions[0]
     notes = d.get("notes") or []
