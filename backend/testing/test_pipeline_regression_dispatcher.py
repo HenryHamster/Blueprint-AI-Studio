@@ -13666,7 +13666,7 @@ async def test_compliance_followup_count_cap_blocks_respawn(db_session):
 
 def test_classify_cycle_compliance_recommended_unmodifiable_counts_as_compliant():
     """_classify_cycle_compliance treats 1 targeted + 1 unmodifiable as compliant."""
-    from app.pipeline_regression_dispatcher import _classify_cycle_compliance
+    from app.dispatcher_formatters import _classify_cycle_compliance
 
     row = {
         "spawn_was_cross_layer": True,
@@ -13692,7 +13692,7 @@ def _make_case(needs_at, acked_at):
 
 def test_compute_mtti_p50_sec_no_rows():
     """Returns None when no cases are provided."""
-    from app.pipeline_regression_dispatcher import compute_mtti_p50_sec
+    from app.regression_dispatcher_metrics import compute_mtti_p50_sec
 
     assert compute_mtti_p50_sec([]) is None
 
@@ -13700,7 +13700,7 @@ def test_compute_mtti_p50_sec_no_rows():
 def test_compute_mtti_p50_sec_no_acked_cases():
     """Returns None when cases exist but none are acknowledged."""
     from datetime import datetime, timezone
-    from app.pipeline_regression_dispatcher import compute_mtti_p50_sec
+    from app.regression_dispatcher_metrics import compute_mtti_p50_sec
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     cases = [
@@ -13713,7 +13713,7 @@ def test_compute_mtti_p50_sec_no_acked_cases():
 def test_compute_mtti_p50_sec_median_two_rows():
     """Returns median seconds for two acked cases; unacked cases excluded."""
     from datetime import datetime, timezone
-    from app.pipeline_regression_dispatcher import compute_mtti_p50_sec
+    from app.regression_dispatcher_metrics import compute_mtti_p50_sec
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     cases = [
@@ -13732,7 +13732,7 @@ def test_compute_mtti_p50_sec_median_two_rows():
 def test_compute_mtti_p50_sec_idempotent():
     """Repeated calls with the same input return the same value."""
     from datetime import datetime, timezone
-    from app.pipeline_regression_dispatcher import compute_mtti_p50_sec
+    from app.regression_dispatcher_metrics import compute_mtti_p50_sec
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     cases = [
@@ -13750,10 +13750,8 @@ def test_compute_mtti_p50_sec_idempotent():
 
 def test_compute_untargeted_layers_empty_or_invalid_returns_all_canonical():
     """Empty / None / non-list fix-log → every canonical layer is untargeted."""
-    from app.pipeline_regression_dispatcher import (
-        _CANONICAL_RECURRENCE_LAYERS,
-        compute_untargeted_layers,
-    )
+    from app.pipeline_regression_dispatcher import _CANONICAL_RECURRENCE_LAYERS
+    from app.regression_dispatcher_metrics import compute_untargeted_layers
 
     expected = list(_CANONICAL_RECURRENCE_LAYERS)
     assert compute_untargeted_layers(None) == expected
@@ -13764,10 +13762,8 @@ def test_compute_untargeted_layers_empty_or_invalid_returns_all_canonical():
 
 def test_compute_untargeted_layers_single_layer_history():
     """A single-layer fix history returns the other four layers."""
-    from app.pipeline_regression_dispatcher import (
-        _CANONICAL_RECURRENCE_LAYERS,
-        compute_untargeted_layers,
-    )
+    from app.pipeline_regression_dispatcher import _CANONICAL_RECURRENCE_LAYERS
+    from app.regression_dispatcher_metrics import compute_untargeted_layers
 
     fix_log = [{"fix_pr_number": 1, "layers_targeted": ["AGENT_VM"]}]
     out = compute_untargeted_layers(fix_log)
@@ -13778,10 +13774,8 @@ def test_compute_untargeted_layers_single_layer_history():
 
 def test_compute_untargeted_layers_full_coverage_returns_empty():
     """All five canonical layers targeted at least once → empty list."""
-    from app.pipeline_regression_dispatcher import (
-        _CANONICAL_RECURRENCE_LAYERS,
-        compute_untargeted_layers,
-    )
+    from app.pipeline_regression_dispatcher import _CANONICAL_RECURRENCE_LAYERS
+    from app.regression_dispatcher_metrics import compute_untargeted_layers
 
     fix_log = [
         {"fix_pr_number": idx, "layers_targeted": [layer]}
@@ -13792,10 +13786,8 @@ def test_compute_untargeted_layers_full_coverage_returns_empty():
 
 def test_compute_untargeted_layers_drops_unrecognized_layers():
     """Unrecognized layer names are silently dropped, not counted as targeted."""
-    from app.pipeline_regression_dispatcher import (
-        _CANONICAL_RECURRENCE_LAYERS,
-        compute_untargeted_layers,
-    )
+    from app.pipeline_regression_dispatcher import _CANONICAL_RECURRENCE_LAYERS
+    from app.regression_dispatcher_metrics import compute_untargeted_layers
 
     fix_log = [
         {"fix_pr_number": 1, "layers_targeted": ["AGENT_VM", "NOT_A_REAL_LAYER", 42]},
@@ -13810,10 +13802,8 @@ def test_compute_untargeted_layers_drops_unrecognized_layers():
 
 def test_compute_untargeted_layers_canonical_order():
     """Result order follows the canonical tuple, not insertion order in fix_log."""
-    from app.pipeline_regression_dispatcher import (
-        _CANONICAL_RECURRENCE_LAYERS,
-        compute_untargeted_layers,
-    )
+    from app.pipeline_regression_dispatcher import _CANONICAL_RECURRENCE_LAYERS
+    from app.regression_dispatcher_metrics import compute_untargeted_layers
 
     # Target REVIEWER_PASS and CI_WORKFLOW; the remaining three should come back
     # in canonical order, not the order they happened to appear here.

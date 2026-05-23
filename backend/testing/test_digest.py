@@ -17,7 +17,7 @@ from app.models import (
     RegressionCaseStatus,
 )
 from app.routers.admin_analytics import _derive_completed_at
-from app.routers.admin_digest import (
+from app.digest_metrics import (
     _compute_layer_coverage_by_class,
     _compute_symptom_layers_by_class,
     _stash_projected_task_fields,

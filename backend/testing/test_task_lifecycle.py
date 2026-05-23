@@ -31,6 +31,8 @@ from app.task_lifecycle import (
     _process_post_commit,
     _record_parent_failure,
     _is_transient_scan_error,
+)
+from app.retry_prompt import (
     _extract_failing_tests,
     _extract_error_files,
     _build_scope_overflow_details,

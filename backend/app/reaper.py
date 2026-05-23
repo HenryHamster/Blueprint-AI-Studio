@@ -167,21 +167,7 @@ _TRANSIENT_5XX_PATTERNS = frozenset(
 _BATCH = 5000
 
 
-_ANALYSIS_ARTIFACT_KEYS = (
-    ("_pr_diff_summary", "_previous_diff_summary"),
-    ("_test_failure_summary", "_previous_test_failure_summary"),
-    ("_self_review_outcome", "_previous_self_review_outcome"),
-    ("_analysis_plan", "_previous_analysis_plan"),
-)
-
-
-def _copy_analysis_artifacts_to_previous(ctx: dict) -> None:
-    # Mirror failed-attempt artifacts into _previous_* so the agent's buildRetryContext
-    # surfaces them — matches task_lifecycle._requeue_parent_task.
-    for src, dst in _ANALYSIS_ARTIFACT_KEYS:
-        if ctx.get(src):
-            ctx[dst] = ctx[src]
-
+from app.retry_prompt import _copy_analysis_artifacts_to_previous  # noqa: E402, F401, RUF100
 
 _HEARTBEAT_STALE_DEFAULTS = {
     "small": 300,
@@ -1967,7 +1953,7 @@ async def reaper_service():
                                 )
                             if not is_provision_failure:
                                 try:
-                                    from app.task_lifecycle import (
+                                    from app.retry_prompt import (
                                         _build_retry_prompt_suffix,
                                         merge_retry_prompt_suffix,
                                     )

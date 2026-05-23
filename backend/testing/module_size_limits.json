@@ -25,7 +25,8 @@
     "review_pipeline.py": 2350,
     "deploy_health.py": 1250,
     "regression_layer_classifier.py": 520,
-    "pipeline_regression_dispatcher.py": 9700
+    "pipeline_regression_dispatcher.py": 9700,
+    "release_qualifier.py": 5900
   },
   "frontend": {
     "useAppState.ts": 3000,

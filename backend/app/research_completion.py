@@ -2002,7 +2002,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # task_lifecycle._requeue_parent_task so re-spawned findings get the
             # same tailored prompt_suffix as directly requeued retries.
             try:
-                from app.task_lifecycle import _build_retry_prompt_suffix  # noqa: PLC0415
+                from app.retry_prompt import _build_retry_prompt_suffix  # noqa: PLC0415
 
                 _retry_prompt_suffix, _scope_override = _build_retry_prompt_suffix(
                     failure_class_val,
