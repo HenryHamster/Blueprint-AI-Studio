@@ -24,6 +24,7 @@ from app.digest_metrics import (
     _summarize_symptoms_by_layer,
     compute_digest_trend_history,
     compute_failure_grouping,
+    compute_remediation_funnel,
 )
 from app.sr_blind_spots import aggregate_sr_reviewer_disagreements
 from testing.factories import make_project, make_task, make_membership, _utcnow
@@ -5300,6 +5301,98 @@ async def test_digest_remediation_funnel(client: AsyncClient, db_session):
         "CODE_ERROR": 1,
         "unknown": 2,
     }
+
+
+@pytest.mark.asyncio
+async def test_compute_remediation_funnel_helper_direct(db_session):
+    """compute_remediation_funnel computes the funnel directly off a session.
+
+    Exercises the extracted helper in isolation (no FastAPI layer) and confirms
+    the residual_remediation_funnel passed in lands verbatim in the returned dict
+    at its expected key.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+
+    inv_done = make_task(
+        project_id=project.id,
+        title="investigate A",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "investigate"}],
+        created_at=now - timedelta(hours=3),
+        plan_output={
+            "summary": "root cause X",
+            "root_cause": "null payload field",
+            "recommended_fix": "add a null guard before the access",
+            "confidence": "high",
+        },
+        context={"last_failure_class": "CODE_ERROR"},
+    )
+    inv_active = make_task(
+        project_id=project.id,
+        title="investigate B",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "investigate"}],
+        created_at=now - timedelta(hours=2),
+    )
+    db_session.add_all([inv_done, inv_active])
+    await db_session.commit()
+    await db_session.refresh(inv_done)
+
+    rem_merged = make_task(
+        project_id=project.id,
+        title="remediation A",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=2),
+        context={
+            "diagnosis_task_id": str(inv_done.id),
+            "direction_id": "d1",
+            "trigger_failure_class": "CODE_ERROR",
+        },
+        status_log=[
+            {"t": (now - timedelta(hours=1)).isoformat(), "status": "completed"}
+        ],
+    )
+    db_session.add(rem_merged)
+    await db_session.commit()
+
+    sentinel_residual = {"spawned": 7, "marker": "residual-stays-here"}
+    funnel, investigation_conversion = await compute_remediation_funnel(
+        db_session,
+        project_id=project.id,
+        window_start=window_start,
+        residual_remediation_funnel=sentinel_residual,
+    )
+
+    assert funnel["investigations_spawned"] == 2
+    assert funnel["investigations_completed"] == 1
+    assert funnel["investigations_with_diagnosis"] == 1
+    assert funnel["active_investigations"] == 1
+    assert funnel["remediations_spawned"] == 1
+    assert funnel["remediations_merged"] == 1
+    assert funnel["remediations_failed"] == 0
+    assert funnel["merged_remediations_by_trigger_class"] == {"CODE_ERROR": 1}
+    assert funnel["investigations_spawned_by_class"] == {
+        "CODE_ERROR": 1,
+        "unknown": 1,
+    }
+    # The caller-supplied residual funnel is spliced through unchanged.
+    assert funnel["residual_remediation_funnel"] is sentinel_residual
+    # Active-investigation detail surfaces the in-flight investigation only.
+    assert [d["task_id"] for d in funnel["active_investigations_detail"]] == [
+        str(inv_active.id)
+    ]
+    # investigation_conversion is returned separately as a top-level digest key.
+    assert investigation_conversion["total_completed"] == 1
+    assert investigation_conversion["parseable"] == 1
+    assert investigation_conversion["actionable"] == 1
+    assert investigation_conversion["remediation_spawned"] == 1
 
 
 @pytest.mark.asyncio

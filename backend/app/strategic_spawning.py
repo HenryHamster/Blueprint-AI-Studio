@@ -2041,11 +2041,7 @@ async def _spawn_strategic_review(
             "user_last_active_at": user_last_active_at,
             "self_reflection_log": (project.self_reflection_log or [])[-5:],
             "is_self_repo": bool(project.is_self_repo),
-            "enable_self_improvement": bool(
-                (project.build_config or {}).get(
-                    "enable_self_improvement", project.is_self_repo
-                )
-            ),
+            "enable_self_improvement": project.enable_self_improvement,
             "directions_summary": direction_stats,
             "outcome_evaluation": _build_outcome_evaluation(project, cycle_history),
             "recent_interventions": recent_interventions,

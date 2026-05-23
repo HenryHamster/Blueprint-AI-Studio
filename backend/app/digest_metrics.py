@@ -1,20 +1,31 @@
-"""Pure metric-computation helpers extracted from admin_digest.
+"""Metric-computation helpers extracted from admin_digest.
 
-These are synchronous transforms over already-loaded Task / RegressionRemediationCase
-data — no AsyncSession and no FastAPI Request. They are imported (and re-exported) by
+Most are synchronous transforms over already-loaded Task / RegressionRemediationCase
+data — no AsyncSession and no FastAPI Request. A small number (e.g.
+``compute_remediation_funnel``) are async DB helpers that run their own self-contained
+queries off a passed-in ``AsyncSession``. They are imported (and re-exported) by
 ``app.routers.admin_digest`` so existing call sites and test patch targets keep working.
 """
 
+import logging
 import statistics
+import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 
+from sqlalchemy import or_
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
+from sqlmodel import select
+
 from app.time_utils import _to_naive_utc
-from app.models import Task, TaskStatus, RegressionRemediationCase, _utcnow
+from app.models import Project, Task, TaskStatus, RegressionRemediationCase, _utcnow
 from app.sr_blind_spots import (
     _REVIEWER_ORIGINS,
     is_skipped_sr_outcome as _is_skipped_sr_outcome_shared,
 )
+
+logger = logging.getLogger(__name__)
 
 _SR_CODE_CHANGE_TYPES = {"create", "fix", "refactor", "migrate"}
 
@@ -1365,3 +1376,458 @@ def compute_digest_trend_history(
             }
         )
     return trend_history
+
+
+async def compute_remediation_funnel(
+    session: AsyncSession,
+    *,
+    project_id: Optional[uuid.UUID],
+    window_start: "datetime",
+    residual_remediation_funnel: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Build the investigation -> diagnosis -> remediation -> merge funnel.
+
+    Runs its own self-contained Task/Project queries off ``session`` (scoped to
+    ``window_start`` and the optional ``project_id``) and assembles the
+    ``remediation_funnel`` digest block, including the adjacent CI auto-remediation
+    funnel. The residual-remediation funnel is a separate responsibility computed by
+    the caller and passed in via ``residual_remediation_funnel`` so it lands in the
+    returned funnel dict at its original position.
+
+    Returns a ``(remediation_funnel, investigation_conversion)`` tuple — the latter
+    is a separate top-level digest key, spliced in by the caller unchanged.
+    """
+    from app.failure_classification import classify_failure as _classify_failure
+    from app.routers.admin_analytics import _derive_completed_at
+    from app.task_completion import _is_structural_diagnosis
+
+    # Query investigate + remediation tasks in-window regardless of status (the
+    # main all_tasks query is terminal-only, so investigate tasks that are still
+    # IN_PROGRESS would otherwise be missed).
+    _funnel_filters = [Task.created_at >= window_start]
+    if project_id:
+        _funnel_filters.append(Task.project_id == project_id)
+    _inv_result = await session.execute(
+        select(Task)
+        .where(
+            *_funnel_filters,
+            Task.payloads[0]["type"].as_string() == "investigate",
+        )
+        .limit(2000)
+    )
+    _inv_tasks = _inv_result.scalars().all()
+    # R4-W2 (M3): ``has_key`` uses the JSONB ``?`` operator so the
+    # ``ix_task_context_gin`` GIN index can satisfy the predicate.
+    _rem_result = await session.execute(
+        select(Task)
+        .where(
+            *_funnel_filters,
+            Task.context.has_key("diagnosis_task_id"),
+        )
+        .limit(10000)
+    )
+    _rem_tasks = _rem_result.scalars().all()
+
+    investigations_spawned = len(_inv_tasks)
+    investigations_completed = sum(
+        1 for t in _inv_tasks if t.status == TaskStatus.COMPLETED
+    )
+    investigations_with_diagnosis = sum(
+        1
+        for t in _inv_tasks
+        if t.status == TaskStatus.COMPLETED
+        and isinstance(t.plan_output, dict)
+        and str((t.plan_output or {}).get("summary") or "").strip()
+    )
+    active_investigations = sum(
+        1
+        for t in _inv_tasks
+        if t.status
+        in (
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+        )
+    )
+    remediations_spawned = len(_rem_tasks)
+    remediations_merged = sum(1 for t in _rem_tasks if t.status == TaskStatus.COMPLETED)
+    remediations_failed = sum(1 for t in _rem_tasks if t.status == TaskStatus.FAILED)
+
+    _held_projects_q = select(Project).options(
+        load_only(Project.id, Project.directions)
+    )
+    if project_id:
+        _held_projects_q = _held_projects_q.where(Project.id == project_id)
+    else:
+        _held_projects_q = _held_projects_q.where(Project.directions.isnot(None))
+    _held_projects = (
+        (await session.execute(_held_projects_q.limit(10000))).scalars().all()
+    )
+
+    fixes_held = 0
+    _window_iso = window_start.isoformat()
+    for _p in _held_projects:
+        for _d in _p.directions or []:
+            for _h in _d.get("remediation_history") or []:
+                if (_h.get("result") or "") != "held":
+                    continue
+                _ts = _h.get("held_at") or _h.get("timestamp") or ""
+                if _ts and _ts >= _window_iso:
+                    fixes_held += 1
+
+    _inv_by_id = {str(t.id): t for t in _inv_tasks}
+    _ttr_values: List[float] = []
+    for r in _rem_tasks:
+        if r.status != TaskStatus.COMPLETED:
+            continue
+        diag_id = (r.context or {}).get("diagnosis_task_id")
+        inv = _inv_by_id.get(str(diag_id)) if diag_id else None
+        if inv is None:
+            continue
+        completed_at = _derive_completed_at(r)
+        if completed_at and inv.created_at:
+            inv_created = (
+                inv.created_at.replace(tzinfo=None)
+                if inv.created_at.tzinfo is not None
+                else inv.created_at
+            )
+            delta = (completed_at - inv_created).total_seconds() / 3600.0
+            if delta >= 0:
+                _ttr_values.append(delta)
+    avg_time_to_remediation_hours = (
+        round(sum(_ttr_values) / len(_ttr_values), 2) if _ttr_values else None
+    )
+
+    investigations_by_confidence: Dict[str, int] = {}
+    for t in _inv_tasks:
+        if t.status != TaskStatus.COMPLETED or not isinstance(t.plan_output, dict):
+            continue
+        conf = (
+            str((t.plan_output or {}).get("confidence") or "unknown").strip().lower()
+            or "unknown"
+        )
+        investigations_by_confidence[conf] = (
+            investigations_by_confidence.get(conf, 0) + 1
+        )
+
+    failed_remediations_by_class: Dict[str, int] = {}
+    for r in _rem_tasks:
+        if r.status != TaskStatus.FAILED:
+            continue
+        cls = _classify_failure(r) or "unknown"
+        failed_remediations_by_class[cls] = failed_remediations_by_class.get(cls, 0) + 1
+
+    investigations_spawned_by_class: Dict[str, int] = {}
+    investigations_completed_by_class: Dict[str, int] = {}
+    for t in _inv_tasks:
+        cls = (
+            str((t.context or {}).get("last_failure_class") or "unknown").strip()
+            or "unknown"
+        )
+        investigations_spawned_by_class[cls] = (
+            investigations_spawned_by_class.get(cls, 0) + 1
+        )
+        if t.status == TaskStatus.COMPLETED:
+            investigations_completed_by_class[cls] = (
+                investigations_completed_by_class.get(cls, 0) + 1
+            )
+
+    remediations_spawned_by_class: Dict[str, int] = {}
+    for r in _rem_tasks:
+        cls = (
+            str((r.context or {}).get("trigger_failure_class") or "unknown").strip()
+            or "unknown"
+        )
+        remediations_spawned_by_class[cls] = (
+            remediations_spawned_by_class.get(cls, 0) + 1
+        )
+
+    merged_remediations_by_trigger_class: Dict[str, int] = {}
+    for r in _rem_tasks:
+        if r.status != TaskStatus.COMPLETED:
+            continue
+        trigger_cls = (r.context or {}).get("trigger_failure_class")
+        if not trigger_cls:
+            diag_id = (r.context or {}).get("diagnosis_task_id")
+            inv = _inv_by_id.get(str(diag_id)) if diag_id else None
+            if inv is not None:
+                trigger_cls = (inv.context or {}).get("last_failure_class")
+        key = str(trigger_cls).strip() if trigger_cls else "unknown"
+        if not key:
+            key = "unknown"
+        merged_remediations_by_trigger_class[key] = (
+            merged_remediations_by_trigger_class.get(key, 0) + 1
+        )
+
+    remediation_success_by_confidence: Dict[str, Dict[str, int]] = {}
+    for r in _rem_tasks:
+        if r.status not in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            continue
+        diag_id = (r.context or {}).get("diagnosis_task_id")
+        inv = _inv_by_id.get(str(diag_id)) if diag_id else None
+        conf = "unknown"
+        if inv is not None and isinstance(inv.plan_output, dict):
+            conf = (
+                str((inv.plan_output or {}).get("confidence") or "unknown")
+                .strip()
+                .lower()
+                or "unknown"
+            )
+        bucket = remediation_success_by_confidence.setdefault(
+            conf, {"merged": 0, "failed": 0}
+        )
+        if r.status == TaskStatus.COMPLETED:
+            bucket["merged"] += 1
+        else:
+            bucket["failed"] += 1
+
+    _completed_inv = [
+        t
+        for t in _inv_tasks
+        if t.status == TaskStatus.COMPLETED and isinstance(t.plan_output, dict)
+    ]
+    _completed_inv.sort(
+        key=lambda t: _derive_completed_at(t) or t.created_at or _utcnow(),
+        reverse=True,
+    )
+    recent_investigations: List[Dict[str, Any]] = []
+    for t in _completed_inv[:5]:
+        po = t.plan_output or {}
+        summary = str(po.get("summary") or "").strip()
+        if len(summary) > 200:
+            summary = summary[:200].rstrip() + "…"
+        completed_at = _derive_completed_at(t)
+        recent_investigations.append(
+            {
+                "task_id": str(t.id),
+                "direction_id": (t.context or {}).get("direction_id"),
+                "summary": summary,
+                "confidence": str(po.get("confidence") or "").strip().lower() or None,
+                "severity": str(po.get("severity") or "").strip().lower() or None,
+                "completed_at": completed_at.isoformat() if completed_at else None,
+            }
+        )
+
+    active_investigations_detail: List[Dict[str, Any]] = []
+    _now = _utcnow()
+    for t in _inv_tasks:
+        if t.status not in (
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+        ):
+            continue
+        elapsed_hours = None
+        if t.created_at:
+            elapsed_hours = round(
+                (_now - _to_naive_utc(t.created_at)).total_seconds() / 3600.0, 2
+            )
+        active_investigations_detail.append(
+            {
+                "task_id": str(t.id),
+                "direction_id": (t.context or {}).get("direction_id"),
+                "elapsed_hours": elapsed_hours,
+            }
+        )
+
+    _ci_rem_result = await session.execute(
+        select(Task).where(
+            *_funnel_filters,
+            Task.auto_remediation.is_(True),  # promoted column (audit W1)
+        )
+    )
+    _ci_rem_tasks = list(_ci_rem_result.scalars().all())
+    ci_auto_remediation: Dict[str, Any] = {
+        "spawned": len(_ci_rem_tasks),
+        "merged": sum(
+            1
+            for t in _ci_rem_tasks
+            if t.status == TaskStatus.COMPLETED
+            and (t.context or {}).get("pr_merged") is True
+        ),
+        "failed": sum(1 for t in _ci_rem_tasks if t.status == TaskStatus.FAILED),
+        "by_ci_failure_type": {},
+    }
+    _ci_type_buckets: Dict[str, Dict[str, int]] = {}
+    for t in _ci_rem_tasks:
+        ci_type = (
+            str((t.context or {}).get("ci_failure_type") or "unknown").strip()
+            or "unknown"
+        )
+        bucket = _ci_type_buckets.setdefault(
+            ci_type, {"spawned": 0, "merged": 0, "failed": 0}
+        )
+        bucket["spawned"] += 1
+        if (
+            t.status == TaskStatus.COMPLETED
+            and (t.context or {}).get("pr_merged") is True
+        ):
+            bucket["merged"] += 1
+        elif t.status == TaskStatus.FAILED:
+            bucket["failed"] += 1
+    ci_auto_remediation["by_ci_failure_type"] = _ci_type_buckets
+
+    _prior_tasks = [
+        t for t in _ci_rem_tasks if (t.context or {}).get("prior_diagnosis_task_id")
+    ]
+    _total_with_prior = len(_prior_tasks)
+    _merged_with_prior = sum(
+        1 for t in _prior_tasks if t.status == TaskStatus.COMPLETED
+    )
+    _failed_with_prior = sum(1 for t in _prior_tasks if t.status == TaskStatus.FAILED)
+    _prior_resolved = _merged_with_prior + _failed_with_prior
+    prior_investigation_reuse: Dict[str, Any] = {
+        "total_with_prior": _total_with_prior,
+        "merged_with_prior": _merged_with_prior,
+        "failed_with_prior": _failed_with_prior,
+        "merge_rate": round(_merged_with_prior / _prior_resolved, 4)
+        if _prior_resolved
+        else None,
+    }
+
+    # R4-W2 (M3): ``has_key`` uses the JSONB ``?`` operator so the
+    # ``ix_task_context_gin`` GIN index can satisfy the predicate.
+    _cum_filters = [
+        Task.status == TaskStatus.COMPLETED,
+        or_(
+            Task.context.has_key("diagnosis_task_id"),
+            Task.auto_remediation.is_(True),  # promoted column (audit W1)
+        ),
+        Task.context["pr_merged"].as_boolean() == True,  # noqa: E712
+    ]
+    if project_id:
+        _cum_filters.append(Task.project_id == project_id)
+    _CUM_TASK_CAP = 10000
+    _cum_result = await session.execute(
+        select(Task).where(*_cum_filters).limit(_CUM_TASK_CAP)
+    )
+    cumulative_merged_by_trigger_class: Dict[str, int] = {}
+    _cum_rows = _cum_result.scalars().all()
+    if len(_cum_rows) >= _CUM_TASK_CAP:
+        logger.warning(
+            "cumulative_merged_tasks: result capped at %d for project %s — "
+            "metrics may be truncated",
+            _CUM_TASK_CAP,
+            project_id,
+        )
+    for r in _cum_rows:
+        ctx = r.context or {}
+        trigger_cls = ctx.get("trigger_failure_class")
+        if not trigger_cls:
+            diag_id = ctx.get("diagnosis_task_id")
+            inv = _inv_by_id.get(str(diag_id)) if diag_id else None
+            if inv is not None:
+                trigger_cls = (inv.context or {}).get("last_failure_class")
+        key = str(trigger_cls).strip() if trigger_cls else "unknown"
+        if not key:
+            key = "unknown"
+        cumulative_merged_by_trigger_class[key] = (
+            cumulative_merged_by_trigger_class.get(key, 0) + 1
+        )
+
+    _inv_ids_with_remediation = {
+        str((r.context or {}).get("diagnosis_task_id"))
+        for r in _rem_tasks
+        if (r.context or {}).get("diagnosis_task_id")
+    }
+    _PARSEABLE_KEYS = ("summary", "root_cause", "recommended_fix", "confidence")
+    ic_total = 0
+    ic_parseable = 0
+    ic_unparseable = 0
+    ic_structural = 0
+    ic_low_confidence = 0
+    ic_actionable = 0
+    ic_remediation_spawned = 0
+    for t in _inv_tasks:
+        if t.status != TaskStatus.COMPLETED:
+            continue
+        ic_total += 1
+        po = t.plan_output if isinstance(t.plan_output, dict) else None
+        parseable = bool(po) and any(
+            str(po.get(k) or "").strip() for k in _PARSEABLE_KEYS
+        )
+        if parseable:
+            ic_parseable += 1
+        else:
+            ic_unparseable += 1
+            continue
+        root_cause = str((po or {}).get("root_cause") or "")
+        recommended_fix = str((po or {}).get("recommended_fix") or "")
+        confidence = str((po or {}).get("confidence") or "").strip().lower()
+        structural = _is_structural_diagnosis(root_cause, recommended_fix)
+        if structural:
+            ic_structural += 1
+            continue
+        if confidence == "low":
+            ic_low_confidence += 1
+        elif confidence in ("high", "medium") and recommended_fix.strip():
+            ic_actionable += 1
+        if str(t.id) in _inv_ids_with_remediation:
+            ic_remediation_spawned += 1
+    investigation_conversion = {
+        "total_completed": ic_total,
+        "parseable": ic_parseable,
+        "unparseable": ic_unparseable,
+        "structural": ic_structural,
+        "low_confidence": ic_low_confidence,
+        "actionable": ic_actionable,
+        "remediation_spawned": ic_remediation_spawned,
+    }
+
+    diagnosis_drop_off_by_reason: Dict[str, int] = {}
+    for t in _inv_tasks:
+        if t.status != TaskStatus.COMPLETED:
+            continue
+        po = t.plan_output if isinstance(t.plan_output, dict) else None
+        if not po:
+            continue
+        if not str(po.get("summary") or "").strip():
+            continue
+        if str(t.id) in _inv_ids_with_remediation:
+            continue
+        root_cause = str(po.get("root_cause") or "")
+        recommended_fix = str(po.get("recommended_fix") or "").strip()
+        confidence = str(po.get("confidence") or "").strip().lower()
+        direction_id_val = (t.context or {}).get("direction_id")
+        if _is_structural_diagnosis(root_cause, recommended_fix):
+            reason = "structural"
+        elif not recommended_fix:
+            reason = "no_recommended_fix"
+        elif confidence not in ("high", "medium"):
+            reason = "low_confidence"
+        elif not direction_id_val:
+            reason = "no_direction"
+        else:
+            continue
+        diagnosis_drop_off_by_reason[reason] = (
+            diagnosis_drop_off_by_reason.get(reason, 0) + 1
+        )
+
+    remediation_funnel = {
+        "investigations_spawned": investigations_spawned,
+        "investigations_completed": investigations_completed,
+        "investigations_with_diagnosis": investigations_with_diagnosis,
+        "remediations_spawned": remediations_spawned,
+        "remediations_merged": remediations_merged,
+        "remediations_failed": remediations_failed,
+        "fixes_held": fixes_held,
+        "avg_time_to_remediation_hours": avg_time_to_remediation_hours,
+        "active_investigations": active_investigations,
+        "investigations_by_confidence": investigations_by_confidence,
+        "failed_remediations_by_class": failed_remediations_by_class,
+        "merged_remediations_by_trigger_class": merged_remediations_by_trigger_class,
+        "investigations_spawned_by_class": investigations_spawned_by_class,
+        "investigations_completed_by_class": investigations_completed_by_class,
+        "remediations_spawned_by_class": remediations_spawned_by_class,
+        "cumulative_merged_by_trigger_class": cumulative_merged_by_trigger_class,
+        "remediation_success_by_confidence": remediation_success_by_confidence,
+        "recent_investigations": recent_investigations,
+        "active_investigations_detail": active_investigations_detail,
+        "ci_auto_remediation": ci_auto_remediation,
+        "residual_remediation_funnel": residual_remediation_funnel,
+        "prior_investigation_reuse": prior_investigation_reuse,
+        "diagnosis_drop_off_by_reason": diagnosis_drop_off_by_reason,
+    }
+    return remediation_funnel, investigation_conversion

@@ -930,6 +930,54 @@ async def test_spawn_strategic_review_proceeds_when_no_active_strategic(db_sessi
     assert tasks[0].status == TaskStatus.QUEUED
 
 
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_enable_self_improvement_decoupled_from_is_self_repo(
+    db_session,
+):
+    """enable_self_improvement in the strategic payload is driven by build_config, not is_self_repo.
+
+    is_self_repo=True without the explicit flag → False.
+    build_config={"enable_self_improvement": True} regardless of is_self_repo → True.
+    """
+    # Self-repo without explicit flag → False
+    project_self_no_flag = _make_project(
+        is_self_repo=True,
+        build_config={"some_other_key": "value"},
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project_self_no_flag)
+    await db_session.commit()
+    await db_session.refresh(project_self_no_flag)
+    await _seed_legacy_cycles(db_session, project_self_no_flag)
+
+    spawned = await _spawn_strategic_review(project_self_no_flag, db_session)
+    assert spawned is True
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project_self_no_flag.id)
+    )
+    task_self = result.scalars().one()
+    assert task_self.payloads[0]["enable_self_improvement"] is False
+
+    # Non-self-repo with explicit flag → True
+    project_flag = _make_project(
+        is_self_repo=False,
+        build_config={"enable_self_improvement": True},
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project_flag)
+    await db_session.commit()
+    await db_session.refresh(project_flag)
+    await _seed_legacy_cycles(db_session, project_flag)
+
+    spawned2 = await _spawn_strategic_review(project_flag, db_session)
+    assert spawned2 is True
+    result2 = await db_session.execute(
+        select(Task).where(Task.project_id == project_flag.id)
+    )
+    task_flag = result2.scalars().one()
+    assert task_flag.payloads[0]["enable_self_improvement"] is True
+
+
 # ── Additional _spawn_design_doc_update tests ─────────────────────────────────
 
 

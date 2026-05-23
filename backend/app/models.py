@@ -306,6 +306,10 @@ class Project(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
 
+    @property
+    def enable_self_improvement(self) -> bool:
+        return bool((self.build_config or {}).get("enable_self_improvement", False))
+
     def append_routine_digest(self, event_type: str, summary: str) -> None:
         """Append a one-line digest entry for a routine event to running_update.
 

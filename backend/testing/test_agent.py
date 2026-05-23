@@ -758,6 +758,66 @@ async def test_agent_claim_includes_project_metadata(client: AsyncClient, db_ses
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_enable_self_improvement_driven_by_build_config(
+    client: AsyncClient, db_session
+):
+    """enable_self_improvement is driven by build_config, not is_self_repo.
+
+    A non-self-repo project with the flag set true gets self-improvement enabled;
+    a self-repo project without the explicit flag gets False (decoupled).
+    """
+    # Non-self-repo with explicit flag → True
+    project_with_flag = Project(
+        name="Self-Improvement Enabled",
+        user_id="test-user-123",
+        is_self_repo=False,
+        build_config={"enable_self_improvement": True},
+    )
+    db_session.add(project_with_flag)
+    await db_session.commit()
+    await db_session.refresh(project_with_flag)
+
+    task_with_flag = Task(
+        project_id=project_with_flag.id,
+        payloads=[{"type": "create", "prompt": "do something"}],
+        vm_instance_id="agent-vm-esi-1",
+    )
+    db_session.add(task_with_flag)
+    await db_session.commit()
+    await db_session.refresh(task_with_flag)
+
+    token = create_agent_token(str(task_with_flag.id), "agent-vm-esi-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    assert resp.json()["project_metadata"]["enable_self_improvement"] is True
+
+    # Self-repo without explicit flag → False (decoupled from is_self_repo)
+    project_self_repo_no_flag = Project(
+        name="Self Repo No Flag",
+        user_id="test-user-123",
+        is_self_repo=True,
+        build_config={"some_other_key": "value"},
+    )
+    db_session.add(project_self_repo_no_flag)
+    await db_session.commit()
+    await db_session.refresh(project_self_repo_no_flag)
+
+    task_self_repo = Task(
+        project_id=project_self_repo_no_flag.id,
+        payloads=[{"type": "create", "prompt": "do something"}],
+        vm_instance_id="agent-vm-esi-2",
+    )
+    db_session.add(task_self_repo)
+    await db_session.commit()
+    await db_session.refresh(task_self_repo)
+
+    token2 = create_agent_token(str(task_self_repo.id), "agent-vm-esi-2")
+    resp2 = await client.post("/api/agent/claim", headers={"x-agent-token": token2})
+    assert resp2.status_code == 200
+    assert resp2.json()["project_metadata"]["enable_self_improvement"] is False
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_project_metadata_empty_build_config(
     client: AsyncClient, db_session
 ):

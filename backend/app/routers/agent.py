@@ -1002,9 +1002,7 @@ async def claim_task(
             "github_repo": project.github_repo,
             "build_config": _build_cfg,
             "enable_fresh_reviewer": _build_cfg.get("enable_fresh_reviewer", False),
-            "enable_self_improvement": bool(
-                _build_cfg.get("enable_self_improvement", project.is_self_repo)
-            ),
+            "enable_self_improvement": project.enable_self_improvement,
         }
 
     task_type = task.first_payload.get("type", "")

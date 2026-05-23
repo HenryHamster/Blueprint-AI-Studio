@@ -160,11 +160,7 @@ async def get_directions(
         ),
         "self_reflection_log": project.self_reflection_log or [],
         "is_self_repo": bool(project.is_self_repo),
-        "enable_self_improvement": bool(
-            (project.build_config or {}).get(
-                "enable_self_improvement", project.is_self_repo
-            )
-        ),
+        "enable_self_improvement": project.enable_self_improvement,
     }
 
 
@@ -747,11 +743,7 @@ async def create_direction_research_task(
             "directions": [direction],
             "base_branch": _runtime_config.get("integration_branch", "main"),
             "is_self_repo": bool(project.is_self_repo),
-            "enable_self_improvement": bool(
-                (project.build_config or {}).get(
-                    "enable_self_improvement", project.is_self_repo
-                )
-            ),
+            "enable_self_improvement": project.enable_self_improvement,
         },
         "directions:research",
     )
