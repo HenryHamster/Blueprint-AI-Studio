@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { RefObject } from 'react';
 import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle, Loader2, Check, RotateCcw, DollarSign, Compass } from 'lucide-react';
-import { apiFetch } from '../api';
+import { apiFetch, API_BASE_URL } from '../api';
 import { timeAgo, parseTimestamp } from '../utils/time';
 import { isSafeUrl, TaskTypeBadge, TASK_TYPE_STYLES, FAILURE_CLASS_CONFIG } from './TaskCard';
 import type { TaskType } from './TaskCard';
@@ -15,7 +15,6 @@ import {
   saveDismissed,
   formatSnoozeRemaining,
   getLastCatchUpViewed,
-  markCatchUpViewed,
   windowToHours,
 } from './catchupHelpers';
 import type { RecentCompletion, TimeWindow, DismissedState } from './catchupHelpers';
@@ -291,7 +290,11 @@ interface DigestData {
     directions_retired?: number | null;
     vision_updated?: boolean | null;
     summary_text?: string | null;
+    memos_available?: number | null;
+    memos_cited?: number | null;
   } | null;
+  memo_pathway_exits?: number | null;
+  recent_cycle_memo_stats?: Array<{ cycle_id: string | null; started_at: string | null; memos_available: number; memos_cited: number }> | null;
   remediation_funnel?: {
     investigations_spawned: number;
     investigations_completed: number;
@@ -339,6 +342,24 @@ interface DigestData {
   } | null;
 }
 
+async function fetchCatchUpLastSeen(projectId: string): Promise<number | null> {
+  try {
+    const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/last-seen?project_id=${encodeURIComponent(projectId)}`);
+    if (!res.ok) return null;
+    const { last_seen_at: val } = await res.json() as { last_seen_at?: number | null };
+    return typeof val === 'number' && val > 0 ? val : null;
+  } catch { return null; }
+}
+
+async function postCatchUpLastSeen(projectId: string, timestamp: number): Promise<void> {
+  try {
+    await apiFetch(`${API_BASE_URL}/api/admin/messages/last-seen`, {
+      method: 'PUT',
+      body: JSON.stringify({ project_id: projectId, timestamp }),
+    });
+  } catch { /* ignore — localStorage already saved */ }
+}
+
 export interface CatchUpPanelProps {
   selectedProjectId: string | null;
   projects?: Project[];
@@ -352,12 +373,32 @@ export interface CatchUpPanelProps {
   onBulkApprove?: (taskIds: string[]) => void;
   onBulkRetry?: (taskIds: string[]) => void;
   wsRef?: RefObject<WebSocket | null>;
+  userEmail?: string | null;
 }
 
-export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: _lastVisitTimestamp, refreshInterval, onSelectTask, needsAttentionCount = 0, onApprove, onRetry, onBulkApprove, onBulkRetry, wsRef }: CatchUpPanelProps) {
+export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: _lastVisitTimestamp, refreshInterval, onSelectTask, needsAttentionCount = 0, onApprove, onRetry, onBulkApprove, onBulkRetry, wsRef, userEmail }: CatchUpPanelProps) {
+  // Per-operator localStorage key for catch-up viewed timestamp.
+  // Falls back to the legacy global key when unauthenticated or email unknown.
+  const catchUpViewedKey = userEmail
+    ? `blueprint-admin:lastCatchUpViewed:${userEmail}`
+    : 'blueprint-admin:lastCatchUpViewed';
+
   // Track when the user last viewed the catch-up panel (not page load).
   // Read once on mount; updated when the user collapses the panel after reading.
-  const [lastCatchUpViewed] = useState(() => getLastCatchUpViewed() ?? _lastVisitTimestamp);
+  // Per-operator key is preferred; falls back to global key (migration) then lastVisitTimestamp.
+  const [lastCatchUpViewed, setLastCatchUpViewed] = useState<number | null>(() => {
+    try {
+      const stored = localStorage.getItem(catchUpViewedKey);
+      const ts = stored ? parseInt(stored, 10) : null;
+      if (ts && !isNaN(ts)) return ts;
+      // Migration: seed from global key if per-operator key is absent
+      if (userEmail) return getLastCatchUpViewed() ?? _lastVisitTimestamp;
+      return _lastVisitTimestamp;
+    } catch { return _lastVisitTimestamp; }
+  });
+  // Ref keeps backend-updated value accessible in fetchDigest without re-adding to its deps.
+  const lastCatchUpViewedRef = useRef<number | null>(lastCatchUpViewed);
+  lastCatchUpViewedRef.current = lastCatchUpViewed;
   const [collapsed, setCollapsed] = useState(() => {
     const wasCollapsed = localStorage.getItem('blueprint-admin:catchUpPanelCollapsed') === 'true';
     // Auto-expand on first session render if there are items needing attention
@@ -412,7 +453,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
     if (!silent) setLoading(true);
     else setUpdatingDigest(true);
     try {
-      const hours = windowToHours(activeWindow, lastCatchUpViewed);
+      const hours = windowToHours(activeWindow, lastCatchUpViewedRef.current);
       const params = new URLSearchParams({ hours: String(hours) });
       if (selectedProjectId) params.set('project_id', selectedProjectId);
       const res = await apiFetch(`/api/admin/digest?${params}`);
@@ -431,7 +472,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
       if (!silent) setLoading(false);
       else setUpdatingDigest(false);
     }
-  }, [activeWindow, lastCatchUpViewed, selectedProjectId]);
+  }, [activeWindow, selectedProjectId]);
 
   // Load cached digest when project changes
   useEffect(() => {
@@ -443,6 +484,20 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
       setDigest(null);
     }
   }, [selectedProjectId]);
+
+  // Sync last-seen from backend (same messages endpoint) — backend wins when newer (cross-device).
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    fetchCatchUpLastSeen(selectedProjectId).then(backendTs => {
+      if (backendTs !== null && backendTs > (lastCatchUpViewedRef.current ?? 0)) {
+        lastCatchUpViewedRef.current = backendTs;
+        setLastCatchUpViewed(backendTs);
+        try { localStorage.setItem(catchUpViewedKey, String(backendTs)); } catch { /* */ }
+        fetchDigest(true);
+      }
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedProjectId, catchUpViewedKey]);
 
   // Fetch on mount and when window/project changes; silent when collapsed
   useEffect(() => {
@@ -589,8 +644,11 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
   const toggle = () => {
     const next = !collapsed;
     if (next) {
-      // Collapsing → user has read the digest, record the timestamp
-      markCatchUpViewed();
+      // Collapsing → user has read the digest, record per-operator timestamp locally and cross-device
+      const now = Date.now();
+      lastCatchUpViewedRef.current = now;
+      try { localStorage.setItem(catchUpViewedKey, String(now)); } catch { /* */ }
+      if (selectedProjectId) void postCatchUpLastSeen(selectedProjectId, now);
     }
     setCollapsed(next);
     localStorage.setItem('blueprint-admin:catchUpPanelCollapsed', String(next));
@@ -626,6 +684,55 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
     { key: '24h', label: 'Last 24h' },
     { key: '7d', label: 'Last 7d' },
   ];
+
+  const costs = useMemo(
+    () => (digest?.trend_history ?? []).filter(p => p.period_cost_usd != null).map(p => p.period_cost_usd as number),
+    [digest?.trend_history]
+  );
+
+  const directionCostTotals = useMemo(() => {
+    const totals: Record<string, number> = {};
+    for (const dp of digest?.direction_progress ?? []) {
+      if (!dp.cost_by_scope) continue;
+      for (const [scope, usd] of Object.entries(dp.cost_by_scope)) {
+        if (typeof usd === 'number' && usd > 0) {
+          totals[scope] = (totals[scope] ?? 0) + usd;
+        }
+      }
+    }
+    return totals;
+  }, [digest?.direction_progress]);
+
+  const FILTER_KEYS: { key: string; label: string }[] = [
+    { key: 'hash_dedup', label: 'hash dedup' },
+    { key: 'word_overlap', label: 'word overlap' },
+    { key: 'file_overlap', label: 'file overlap' },
+    { key: 'type_filtered', label: 'type filter' },
+    { key: 'empty_prompt', label: 'empty prompt' },
+    { key: 'batch_cap', label: 'batch cap' },
+  ];
+
+  const drops = useMemo(() => {
+    const ff = digest?.pipeline_filter_funnel;
+    if (!ff) return [];
+    return FILTER_KEYS
+      .map(f => ({ ...f, v: ff[f.key] ?? 0 }))
+      .filter(f => f.v > 0)
+      .sort((a, b) => b.v - a.v);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [digest?.pipeline_filter_funnel]);
+
+  const history = useMemo(() => digest?.trend_history ?? [], [digest?.trend_history]);
+
+  const trendFor = useCallback((cat: string): { arrow: string; color: string } => {
+    if (history.length < 4) return { arrow: '–', color: 'text-neutral-500' };
+    const sumAt = (arr: typeof history) => arr.reduce((a, p) => a + (p.failed_by_taxonomy?.[cat] ?? 0), 0);
+    const recent = sumAt(history.slice(-2));
+    const prior = sumAt(history.slice(-4, -2));
+    if (recent > prior) return { arrow: '↑', color: 'text-red-400' };
+    if (recent < prior) return { arrow: '↓', color: 'text-emerald-400' };
+    return { arrow: '–', color: 'text-neutral-500' };
+  }, [history]);
 
   return (
     <div className="mb-4 shrink-0">
@@ -672,12 +779,11 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
         {!collapsed && (
           <div className="flex flex-wrap items-center gap-1 sm:ml-2">
             {windowLabels.map(({ key, label }) => (
-              // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
               <button
                 key={key}
                 onClick={() => setActiveWindow(key)}
                 aria-pressed={activeWindow === key}
-                className={`px-2 py-0.5 rounded-full text-[10px] font-medium transition-colors ${
+                className={`px-2 min-h-[44px] flex items-center rounded-full text-[10px] font-medium transition-colors ${
                   activeWindow === key
                     ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
                     : 'text-neutral-500 hover:text-neutral-300 border border-transparent'
@@ -755,6 +861,11 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                     {digest.latest_cycle.vision_updated && (
                       <span className="text-[10px] text-cyan-400">vision updated</span>
                     )}
+                    {(digest.latest_cycle.memos_available != null || digest.latest_cycle.memos_cited != null) && (
+                      <span className="text-[10px] text-violet-400" title="memos available / cited in this cycle">
+                        {digest.latest_cycle.memos_available ?? 0}m avail, {digest.latest_cycle.memos_cited ?? 0} cited
+                      </span>
+                    )}
                   </div>
                   {digest.latest_cycle.summary_text && (
                     <div className="text-[11px] text-neutral-400 leading-relaxed">
@@ -770,6 +881,28 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                           {cycleSummaryExpanded ? 'less' : 'more'}
                         </button>
                       )}
+                    </div>
+                  )}
+                </div>
+              )}
+              {/* Memo pathway metrics */}
+              {(digest.memo_pathway_exits ?? 0) > 0 && (
+                <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                  <span className="text-[10px] text-neutral-500 uppercase tracking-wide">Memo pathway</span>
+                  <span className="text-[10px] font-semibold text-violet-400 px-1.5 py-0.5 rounded border border-violet-500/30 bg-violet-500/10">
+                    {digest.memo_pathway_exits} exit{digest.memo_pathway_exits !== 1 ? 's' : ''}
+                  </span>
+                  {(digest.recent_cycle_memo_stats ?? []).length > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {(digest.recent_cycle_memo_stats ?? []).slice(0, 5).map((s, i) => (
+                        <span
+                          key={s.cycle_id ?? i}
+                          className="text-[10px] text-neutral-400 px-1.5 py-0.5 rounded border border-neutral-700/50 bg-neutral-800/50"
+                          title={s.started_at ? `cycle ${timeAgo(s.started_at)}` : undefined}
+                        >
+                          {s.memos_cited}/{s.memos_available}
+                        </span>
+                      ))}
                     </div>
                   )}
                 </div>
@@ -999,7 +1132,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                   <span className="inline-flex items-center gap-0.5 text-neutral-500 font-mono" title="Total estimated spend">
                     <DollarSign className="w-2.5 h-2.5" />{digest.total_estimated_cost_usd.toFixed(2)} total
                     {(() => {
-                      const costs = (digest.trend_history ?? []).filter(p => p.period_cost_usd != null).map(p => p.period_cost_usd as number);
                       if (costs.length < 2) return null;
                       const curr = costs[costs.length - 1];
                       const prev = costs[costs.length - 2];
@@ -1028,26 +1160,16 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                   </span>
                 )}
                 {(() => {
-                  const dps = digest.direction_progress;
-                  if (!dps || dps.length === 0) return null;
-                  const totals: Record<string, number> = {};
-                  for (const dp of dps) {
-                    if (!dp.cost_by_scope) continue;
-                    for (const [scope, usd] of Object.entries(dp.cost_by_scope)) {
-                      if (typeof usd === 'number' && usd > 0) {
-                        totals[scope] = (totals[scope] ?? 0) + usd;
-                      }
-                    }
-                  }
+                  if (!digest.direction_progress || digest.direction_progress.length === 0) return null;
                   const order = ['small', 'medium', 'large'];
-                  const entries = order.filter(s => totals[s] != null);
+                  const entries = order.filter(s => directionCostTotals[s] != null);
                   if (entries.length === 0) return null;
-                  const title = `Cost by scope: ${entries.map(s => `${s} $${totals[s].toFixed(2)}`).join(' · ')}`;
+                  const title = `Cost by scope: ${entries.map(s => `${s} $${directionCostTotals[s].toFixed(2)}`).join(' · ')}`;
                   return (
                     <span className="inline-flex items-center gap-1 font-mono text-neutral-500" title={title}>
                       {entries.map(s => (
                         <span key={s} className="inline-flex items-center gap-0.5 rounded bg-neutral-100 px-1 py-0.5 text-[10px]">
-                          {s} ${totals[s].toFixed(2)}
+                          {s} ${directionCostTotals[s].toFixed(2)}
                         </span>
                       ))}
                     </span>
@@ -1118,18 +1240,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                 const produced = ff.findings_produced ?? 0;
                 const created = ff.tasks_created ?? 0;
                 const pct = produced > 0 ? Math.round((created / produced) * 100) : 0;
-                const FILTER_KEYS: { key: string; label: string }[] = [
-                  { key: 'hash_dedup', label: 'hash dedup' },
-                  { key: 'word_overlap', label: 'word overlap' },
-                  { key: 'file_overlap', label: 'file overlap' },
-                  { key: 'type_filtered', label: 'type filter' },
-                  { key: 'empty_prompt', label: 'empty prompt' },
-                  { key: 'batch_cap', label: 'batch cap' },
-                ];
-                const drops = FILTER_KEYS
-                  .map(f => ({ ...f, v: ff[f.key] ?? 0 }))
-                  .filter(f => f.v > 0)
-                  .sort((a, b) => b.v - a.v);
                 return (
                   <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-neutral-400">
                     <span className="text-[10px] text-neutral-500 uppercase tracking-wide">Research yield</span>
@@ -1187,15 +1297,14 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                     <div className="flex flex-col gap-1.5">
                       {visibleItems.map(item => (
                         <div key={item.task_id} className="flex flex-col gap-1">
-                          {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                           <div
                             role="button"
                             tabIndex={0}
-                            className="flex flex-wrap items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
+                            className="flex flex-wrap items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50 min-h-[44px]"
                             onClick={() => onSelectTask({ id: item.task_id })}
                             onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: item.task_id }); } }}
                           >
-                            <span className="flex-1 truncate text-neutral-300">{item.title}</span>
+                            <span className="min-w-0 flex-1 truncate text-neutral-300">{item.title}</span>
                             {item.direction_text && (
                               <span
                                 className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40 truncate max-w-[12rem]"
@@ -1267,9 +1376,8 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                             )}
                             {/* Dismiss/snooze button */}
                             <div className="relative shrink-0" onClick={e => e.stopPropagation()}>
-                              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                               <button
-                                className="text-neutral-600 hover:text-neutral-400 transition-colors px-1 leading-none text-sm"
+                                className="text-neutral-600 hover:text-neutral-400 transition-colors min-h-[44px] min-w-[44px] flex items-center justify-center leading-none text-sm"
                                 title="Dismiss or snooze"
                                 aria-label="Dismiss or snooze this item"
                                 onClick={() => setOpenDropdown(openDropdown === item.task_id ? null : item.task_id)}
@@ -1349,15 +1457,14 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                               const entry = dismissed[item.task_id];
                               return (
                                 <div key={item.task_id} className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/50 px-2 py-1.5 rounded opacity-50">
-                                  <span className="flex-1 truncate text-neutral-400">{item.title}</span>
+                                  <span className="min-w-0 flex-1 truncate text-neutral-400">{item.title}</span>
                                   {entry?.type === 'snooze' && (
                                     <span className="shrink-0 text-[9px] font-mono text-neutral-500">
                                       {formatSnoozeRemaining((entry as { type: 'snooze'; until: number }).until)}
                                     </span>
                                   )}
-                                  {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                                   <button
-                                    className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded border bg-neutral-700/30 text-neutral-400 hover:bg-neutral-700/60 border-neutral-700/40 transition-colors"
+                                    className="shrink-0 text-[9px] font-semibold px-1.5 min-h-[44px] flex items-center rounded border bg-neutral-700/30 text-neutral-400 hover:bg-neutral-700/60 border-neutral-700/40 transition-colors"
                                     aria-label="Restore this item"
                                     onClick={() => restoreItem(item.task_id)}
                                   >
@@ -1389,16 +1496,15 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                   {activeExpanded && (
                     <div className="flex flex-col gap-1.5">
                       {(digest.active_tasks ?? []).map(t => (
-                        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                         <div
                           key={t.task_id}
                           role="button"
                           tabIndex={0}
-                          className="flex items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
+                          className="flex flex-wrap items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50 min-h-[44px]"
                           onClick={() => onSelectTask({ id: t.task_id })}
                           onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: t.task_id }); } }}
                         >
-                          <span className="flex-1 truncate text-neutral-400">{t.title}</span>
+                          <span className="min-w-0 flex-1 truncate text-neutral-400">{t.title}</span>
                           {t.direction_text && (
                             <span
                               className="shrink-0 inline-flex items-center gap-0.5 text-[9px] px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40 max-w-[180px] truncate"
@@ -1477,16 +1583,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                     costByTaxonomy[t.taxonomy] = (costByTaxonomy[t.taxonomy] ?? 0) + perTask;
                   }
                 }
-                const history = digest.trend_history ?? [];
-                const trendFor = (cat: string): {arrow: string; color: string} => {
-                  if (history.length < 4) return {arrow: '–', color: 'text-neutral-500'};
-                  const sumAt = (arr: typeof history) => arr.reduce((a, p) => a + (p.failed_by_taxonomy?.[cat] ?? 0), 0);
-                  const recent = sumAt(history.slice(-2));
-                  const prior = sumAt(history.slice(-4, -2));
-                  if (recent > prior) return {arrow: '↑', color: 'text-red-400'};
-                  if (recent < prior) return {arrow: '↓', color: 'text-emerald-400'};
-                  return {arrow: '–', color: 'text-neutral-500'};
-                };
                 return (
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Root cause</span>
@@ -1498,7 +1594,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                       const isActive = activeTaxonomyFilter === cat;
                       const isDominant = ftd.dominant_category === cat;
                       return (
-                        // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                         <button
                           key={cat}
                           type="button"
@@ -1508,7 +1603,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                             setFailuresExpanded(true);
                           }}
                           aria-pressed={isActive}
-                          className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border transition-all ${TAXONOMY_COLORS[cat]} ${isActive ? 'ring-2 ring-white/60' : isDominant ? 'ring-1 ring-amber-300/70 shadow-[0_0_0_1px_rgba(252,211,77,0.35)]' : 'hover:opacity-80'}`}
+                          className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 min-h-[44px] rounded border transition-all ${TAXONOMY_COLORS[cat]} ${isActive ? 'ring-2 ring-white/60' : isDominant ? 'ring-1 ring-amber-300/70 shadow-[0_0_0_1px_rgba(252,211,77,0.35)]' : 'hover:opacity-80'}`}
                           title={`${TAXONOMY_LABELS[cat]}: ${entry.count} (${Math.round(entry.percentage)}%)${cost ? ` · $${cost.toFixed(2)}` : ''}${isDominant ? ' — dominant category' : ''} — click to ${isActive ? 'clear' : 'filter'}`}
                         >
                           {isDominant && <span aria-label="dominant" className="text-amber-300">★</span>}
@@ -1549,7 +1644,6 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                     const isActive = activeStageFilter === stage;
                     const isDominant = fsd.dominant_stage === stage;
                     return (
-                      // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                       <button
                         key={stage}
                         type="button"
@@ -1559,7 +1653,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                           setFailuresExpanded(true);
                         }}
                         aria-pressed={isActive}
-                        className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded border transition-all ${STAGE_COLORS[stage] ?? 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30'} ${isActive ? 'ring-2 ring-white/60' : isDominant ? 'ring-1 ring-amber-300/70 shadow-[0_0_0_1px_rgba(252,211,77,0.35)]' : 'hover:opacity-80'}`}
+                        className={`inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 min-h-[44px] rounded border transition-all ${STAGE_COLORS[stage] ?? 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30'} ${isActive ? 'ring-2 ring-white/60' : isDominant ? 'ring-1 ring-amber-300/70 shadow-[0_0_0_1px_rgba(252,211,77,0.35)]' : 'hover:opacity-80'}`}
                         title={`${stage}: ${count}${isDominant ? ' — dominant stage' : ''} — click to ${isActive ? 'clear' : 'filter'}`}
                       >
                         {isDominant && <span aria-label="dominant" className="text-amber-300">★</span>}
@@ -1709,12 +1803,11 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                           .filter((s): s is string => !!s)
                           .map(s => s.length > 30 ? s.slice(0, 30) + '…' : s);
                         return (
-                          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                           <div
                             key={cluster.fingerprint}
                             role="button"
                             tabIndex={0}
-                            className="flex flex-col gap-0.5 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
+                            className="flex flex-col gap-0.5 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50 min-h-[44px]"
                             onClick={() => onSelectTask({ id: cluster.first_task_id })}
                             onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: cluster.first_task_id }); } }}
                           >
@@ -2386,11 +2479,10 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                               <div className="flex flex-col gap-1 ml-5 max-w-full">
                                 {group.tasks.map(t => (
                                   <div key={t.task_id} className="flex flex-col gap-0.5">
-                                    {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                                     <div
                                       role="button"
                                       tabIndex={0}
-                                      className="flex flex-wrap items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50"
+                                      className="flex flex-wrap items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50 min-h-[44px]"
                                       onClick={() => onSelectTask({ id: t.task_id })}
                                       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: t.task_id }); } }}
                                     >

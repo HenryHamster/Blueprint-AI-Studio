@@ -608,6 +608,11 @@ async def _process_direction_lifecycle(
             d["status"] = "active"
             for k in ("auto_paused", "paused_reason", "paused_at"):
                 d.pop(k, None)
+            # Grace period: stamp recovery time so _check_direction_health can skip
+            # history-based health rules until at least one new cycle is appended.
+            # Without this, the same frozen research_history that triggered the pause
+            # immediately re-triggers it on the next lifecycle tick.
+            d["auto_recovered_at"] = _utcnow().isoformat()
             # Start remediation-effectiveness monitoring when recovering a direction whose
             # remediation task merged. Subsequent failures with the same error fingerprint
             # during this window signal the fix did not hold; escalation is triggered below
@@ -917,6 +922,7 @@ async def _process_direction_lifecycle(
             d["paused_at"] = _utcnow().isoformat()
             d["auto_paused"] = True
             d["auto_pause_count"] = d.get("auto_pause_count", 0) + 1
+            d.pop("auto_recovered_at", None)  # Grace period consumed on re-pause
             d.pop(
                 "diagnosis_stall_retry_count", None
             )  # Reset retries for this pause event
@@ -1242,6 +1248,50 @@ async def _process_direction_lifecycle(
                     logger.warning(
                         f"[NOTIFY] Failed to post outcome-stalled message for {did}: "
                         f"{_notify_exc}"
+                    )
+                # Spawn one memo task to capture this signal as a citable artifact.
+                # The flag already gates first-detection only so no dedup query needed.
+                try:
+                    from app.plan_completion import TASK_PRIORITY_MAP  # noqa: PLC0415
+
+                    _scaffolding_topic = (d.get("text") or "")[
+                        :120
+                    ] or f"Direction {did}"
+                    _scaffolding_payload = validate_internal_payload(
+                        {
+                            "type": "memo",
+                            "topic": f"Outcome-less scaffolding: {_scaffolding_topic}",
+                            "reasoning_kind": "outcome_scaffolding",
+                            "direction_id": did,
+                            "scaffolding_evidence": scaffolding_ev,
+                        },
+                        "direction_lifecycle:memo:outcome_scaffolding",
+                    )
+                    _scaffolding_memo = Task(
+                        project_id=project.id,
+                        title=f"Memo: outcome-less scaffolding — {_scaffolding_topic[:80]}",
+                        description="Reasoning memo for outcome-less scaffolding detection",
+                        payloads=[_scaffolding_payload],
+                        context={
+                            "memo_reasoning_kind": "outcome_scaffolding",
+                            "memo_source_direction_id": did,
+                            "outcome_scaffolding_evidence": scaffolding_ev,
+                        },
+                        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                        status=TaskStatus.QUEUED,
+                        created_by="ORCHESTRATOR",
+                        priority=TASK_PRIORITY_MAP.get("low", 0),
+                    )
+                    session.add(_scaffolding_memo)
+                    logger.info(
+                        "[AUTONOMOUS] Spawned outcome-scaffolding memo task %s for direction %s",
+                        _scaffolding_memo.id,
+                        did,
+                    )
+                except Exception:
+                    logger.warning(
+                        f"[AUTONOMOUS] Failed to spawn scaffolding memo for direction {did}",
+                        exc_info=True,
                     )
             else:
                 # Keep the evidence fresh while the flag remains set.

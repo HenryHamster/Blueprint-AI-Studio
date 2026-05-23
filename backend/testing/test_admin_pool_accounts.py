@@ -1397,3 +1397,82 @@ async def test_scan_account_model_regressions_dedupes_notifications(db_session):
         async with _max_plan_pool_lock:
             _account_by_id.pop(acct_good, None)
             _account_by_id.pop(acct_bad, None)
+
+
+# ── Secret Manager failure: hard 503, no plaintext stored ─────────────────────
+
+
+async def test_add_max_plan_account_secret_manager_failure_returns_503(
+    client, db_session, mocker
+):
+    """When store_user_secret raises, add endpoint returns 503 and leaves no account row."""
+    mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(side_effect=RuntimeError("GCP unavailable")),
+    )
+
+    res = await client.post(
+        "/api/admin/max-plan-accounts",
+        json={"name": "SM Failure Test", "oauth_token": "sk-ant-oat01-valid_token"},
+    )
+
+    assert res.status_code == 503
+    assert "Secret storage temporarily unavailable" in res.text
+
+    # No account row must remain — the orphaned row was deleted before raising.
+    remaining = (
+        (
+            await db_session.execute(
+                select(MaxPlanAccount).where(MaxPlanAccount.name == "SM Failure Test")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert remaining == [], (
+        "Orphaned MaxPlanAccount row must not persist after SM failure"
+    )
+
+    # None of the surviving rows may carry a plaintext secret.
+    all_accounts = (await db_session.execute(select(MaxPlanAccount))).scalars().all()
+    for acct in all_accounts:
+        assert not (
+            acct.secret_blob_ref and not acct.secret_blob_ref.startswith("projects/")
+        ), (
+            f"Account {acct.id} has a plaintext secret_blob_ref: {acct.secret_blob_ref!r}"
+        )
+
+
+async def test_patch_max_plan_account_secret_manager_failure_returns_503(
+    client, db_session, mocker
+):
+    """When store_user_secret raises on PATCH, update returns 503 and existing secret is unchanged."""
+    mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(side_effect=RuntimeError("GCP unavailable")),
+    )
+
+    acct = MaxPlanAccount(
+        user_id="test-user-123",
+        name="Pre-existing Account",
+        provider=LLMProviderName.ANTHROPIC,
+        auth_mode=LLMAuthMode.OAUTH,
+        oauth_token="projects/test/secrets/existing/versions/1",
+        secret_blob_ref="projects/test/secrets/existing/versions/1",
+    )
+    db_session.add(acct)
+    await db_session.commit()
+
+    res = await client.patch(
+        f"/api/admin/max-plan-accounts/{acct.id}",
+        json={"secret": "sk-ant-oat01-new_token"},
+    )
+
+    assert res.status_code == 503
+    assert "Secret storage temporarily unavailable" in res.text
+
+    # Existing secret_blob_ref must be unchanged — no plaintext stored.
+    await db_session.refresh(acct)
+    assert acct.secret_blob_ref == "projects/test/secrets/existing/versions/1", (
+        f"secret_blob_ref must not be overwritten with plaintext on SM failure: {acct.secret_blob_ref!r}"
+    )

@@ -35,6 +35,7 @@ from app.max_plan_pool import (
     _serialize_disabled_model_info,
     cascade_disabled_models,
     describe_pool_blockage,
+    disable_account_for_auth,
     disable_account_model,
     get_account_health_stats,
     get_all_account_health_summaries,
@@ -848,7 +849,7 @@ class TestSuccessRateTiebreaking:
                 {"at": now - timedelta(hours=i + 1), "success": False} for i in range(5)
             ],
         )
-        key = lambda a: (  # noqa: E731
+        key = lambda a: (
             _compute_health_score(a, now),
             _compute_success_rate_7d(a, now) or 0.0,
             -a.get("active_tasks", 0),
@@ -897,7 +898,7 @@ class TestSuccessRateTiebreaking:
         assert _compute_success_rate_7d(busy, now) == _compute_success_rate_7d(
             idle, now
         )
-        key = lambda a: (  # noqa: E731
+        key = lambda a: (
             _compute_health_score(a, now),
             _compute_success_rate_7d(a, now) or 0.0,
             -a.get("active_tasks", 0),
@@ -1167,6 +1168,50 @@ class TestQuarantineTrigger:
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             await disable_account_model(acct_id, OPUS, kind="quota_exhausted")
         assert acct["disabled_models"][OPUS].get("kind") == "quota_exhausted"
+
+
+# ── disable_account_for_auth (non-recoverable auth hard-disable) ──────────────
+
+
+class TestDisableAccountForAuth:
+    def setup_method(self):
+        _account_by_id.clear()
+
+    def teardown_method(self):
+        _account_by_id.clear()
+
+    async def test_disables_account_and_sets_reason(self):
+        acct = _acct(id="a", enabled=True)
+        _account_by_id["a"] = acct
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            result = await disable_account_for_auth("a", "oauth_org_not_allowed")
+        assert result is True
+        assert acct["enabled"] is False
+        assert acct["disabled_reason"] == "oauth_org_not_allowed"
+
+    async def test_leaves_disabled_at_unset_to_exempt_cooldown_reenable(self):
+        # recheck_disabled_accounts() re-enables disabled accounts after a
+        # cooldown keyed on disabled_at; a non-recoverable auth disable must
+        # leave it None so that path skips the account indefinitely.
+        acct = _acct(id="a", enabled=True)
+        _account_by_id["a"] = acct
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_for_auth("a", "bad credentials")
+        assert acct.get("disabled_at") is None
+
+    async def test_idempotent_when_already_disabled(self):
+        acct = _acct(id="a", enabled=False)
+        _account_by_id["a"] = acct
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            result = await disable_account_for_auth("a", "oauth_org_not_allowed")
+        assert result is False
+
+    async def test_unknown_account_returns_false(self):
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            assert await disable_account_for_auth("missing", "reason") is False
+
+    async def test_empty_acct_id_returns_false(self):
+        assert await disable_account_for_auth("", "reason") is False
 
 
 # ── _compute_success_rate_7d_for_type ────────────────────────────────────────

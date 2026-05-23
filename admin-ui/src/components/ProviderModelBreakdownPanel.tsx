@@ -189,7 +189,71 @@ export function ProviderModelBreakdownPanel({
         </button>
       </div>
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
-        <table className="w-full text-xs">
+        {/* Mobile: stacked card layout */}
+        <div className="sm:hidden divide-y divide-neutral-800/30">
+          {visible.map(row => {
+            const key = `${row.provider}::${row.model}`;
+            const expanded = expandedKey === key;
+            return (
+              <div key={key}>
+                <div
+                  className="px-3 py-2 text-[10px] cursor-pointer"
+                  onClick={() => setExpandedKey(expanded ? null : key)}
+                >
+                  <div className="flex items-start justify-between gap-2 mb-1">
+                    <span className="font-medium text-neutral-200 break-words">{row.model}</span>
+                    <span className="text-neutral-500 shrink-0">{row.provider}</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-neutral-500">
+                    <span>Tasks: <span className="text-neutral-300 tabular-nums">{row.total_tasks}</span></span>
+                    <span>Rate: <span className={`tabular-nums ${srColor(row.success_rate)}`}>{fmtPct(row.success_rate)}</span></span>
+                    <span>Median: <span className={`tabular-nums ${srColor(row.project_median_success_rate)}`}>{fmtPct(row.project_median_success_rate)}</span></span>
+                    <span>Accts: <span className="text-neutral-400 tabular-nums">{row.distinct_accounts}</span></span>
+                  </div>
+                </div>
+                {expanded && row.accounts && row.accounts.length > 0 && (
+                  <div className="px-3 pb-3 pt-1 bg-neutral-950/40">
+                    <div className="space-y-1.5">
+                      {row.accounts.map(acct => (
+                        <div key={acct.account_id} className="rounded border border-neutral-800/50 bg-neutral-900/60 px-2.5 py-1.5">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-[10px] font-medium text-neutral-300">
+                              {labelFor(acct.account_id)}
+                            </span>
+                            <span className="text-[9px] text-neutral-500 font-mono tabular-nums">
+                              {acct.total_tasks} tasks
+                            </span>
+                            <span className={`text-[10px] font-mono font-bold tabular-nums ${srColor(acct.success_rate)}`}>
+                              {fmtPct(acct.success_rate)}
+                            </span>
+                            {acct.below_median && (
+                              <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded border bg-amber-500/20 text-amber-400 border-amber-500/30 uppercase">
+                                below median
+                              </span>
+                            )}
+                          </div>
+                          {acct.quarantine_status && (
+                            <div className="mt-1">
+                              <QuarantineBadge
+                                qs={acct.quarantine_status}
+                                accountId={acct.account_id}
+                                provider={row.provider}
+                                model={row.model}
+                                onCleared={load}
+                              />
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+        {/* Desktop: table layout */}
+        <table className="hidden sm:table w-full text-xs">
           <thead>
             <tr className="text-[10px] text-neutral-500 border-b border-neutral-800/50">
               <th className="text-left px-3 py-2 font-medium">Provider / Model</th>

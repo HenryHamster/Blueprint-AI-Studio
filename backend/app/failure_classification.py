@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from app.time_utils import _utcnow
+
 if TYPE_CHECKING:
     from app.models import Task
 
@@ -172,8 +174,33 @@ _VIEWPORT_PATTERNS: tuple[str, ...] = (
 # (Chromium missing, Docker fallback unavailable). Must be distinct from
 # _VIEWPORT_PATTERNS so infra shortfalls route to PROVISION_FAILURE rather
 # than VIEWPORT_REGRESSION or CODE_ERROR.
+#
+# Also includes raw Chromium/GTK host-library bootstrap-failure signatures that
+# surface when the agent exhausts in-task retries before the clean sentinel is
+# written. Cross-language contract with:
+#   check-viewport.sh  → BOOTSTRAP_PATTERNS regex
+#   agent/src/index.ts → VIEWPORT_BOOTSTRAP_PATTERNS array
+# Keep all three in sync so the layers agree on what constitutes a bootstrap failure.
 _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS: tuple[str, ...] = (
     "viewport_gate_infra_unavailable",
+    # GTK / Chromium shared-library names — only appear when the host VM is
+    # missing required Linux display/audio libraries for Playwright Chromium.
+    "libatk",
+    "libnss3",
+    "libgbm",
+    "libxkbcommon",
+    "libxcomposite",
+    "libasound",
+    # Generic library-load error (co-occurs with lib names above in practice).
+    "cannot open shared object file",
+    # Playwright-specific error messages.
+    "host system is missing dependencies",
+    "executable doesn't exist at",
+    "missing chromium",
+    "missing browser",
+    # Recurring production failure signature.
+    "playwright chromium install requires sudo",
+    "admin-ui viewport gate is blocked",
 )
 
 
@@ -476,6 +503,18 @@ _GENERIC_AGENT_CODE_LABELS: frozenset[str] = frozenset(
     }
 )
 
+# Wider set of generic failure labels where account-state correlation applies.
+# These produce no specific failure signal (no test/lint/pr error), so a
+# rate-limited account is a plausible cause that the text scan can't see.
+_ALL_GENERIC_CODE_ERROR_LABELS: frozenset[str] = frozenset(
+    {
+        "claude_code_failed",
+        "fatal",
+        "incomplete",
+        "agent_self_failed",
+    }
+)
+
 
 def _persist_rate_limit_signal_context(task: "Task", signal) -> None:
     """Persist rate-limit signal metadata onto task.context.
@@ -509,6 +548,81 @@ def _persist_rate_limit_signal_context(task: "Task", signal) -> None:
         task.context = ctx
     except Exception:
         logger.exception("[FAILURE_CLASS] Failed to persist rate_limit_* keys")
+
+
+def _account_was_rate_limited(task: "Task", at_time: "datetime | None" = None) -> bool:
+    """Return True if the task's assigned account was in rate-limit cooldown.
+
+    Reads the in-memory pool state (_account_by_id). Returns False when the
+    account is unresolvable (pool empty, standalone test path, no account
+    assigned) so callers degrade to today's text-only classification.
+    Never raises — any exception returns False.
+
+    at_time: reference timestamp for the cooldown check. Pass task.last_heartbeat
+    (the failure instant) so a reaper lag between failure and sweep cannot cause
+    a rate-limited silent death to miss the correlation. Defaults to _utcnow().
+    """
+    try:
+        from app.max_plan_pool import (
+            _account_by_id,
+            _cooldown_seconds_for_info,
+            get_task_llm_account_id,
+        )
+
+        account_id = get_task_llm_account_id(task)
+        if not account_id:
+            return False
+        acct = _account_by_id.get(str(account_id))
+        if not acct:
+            return False
+        dm = acct.get("disabled_models") or {}
+        if not dm:
+            return False
+        # Use naive UTC to match max_plan_pool's stored 'at' datetimes (naive via
+        # _utcnow at write time). Strip tzinfo if caller passed a tz-aware datetime
+        # to avoid TypeError in the subtraction instead of silently swallowing it.
+        now = at_time if at_time is not None else _utcnow()
+        if getattr(now, "tzinfo", None) is not None:
+            now = now.replace(tzinfo=None)
+        for info in dm.values():
+            at_dt = info.get("at")
+            if at_dt is None:
+                continue
+            if (now - at_dt).total_seconds() < _cooldown_seconds_for_info(info):
+                return True
+        return False
+    except Exception:
+        logger.debug(
+            "[FAILURE_CLASS] _account_was_rate_limited degraded to False for task %s",
+            getattr(task, "id", None),
+        )
+        return False
+
+
+def _pool_was_rate_limited(at_time: "datetime | None" = None) -> bool:
+    """Return True if the entire account pool was in rate-limit cooldown.
+
+    Complements _account_was_rate_limited for the pre-assignment case (task died
+    before an account was assigned) and the healthy-account-but-blocked-pool case.
+    Never raises — returns False with a debug log on any error.
+    """
+    try:
+        from app.max_plan_pool import pool_wide_rate_limit_cooldown
+
+        norm_time = at_time
+        if norm_time is not None and getattr(norm_time, "tzinfo", None) is not None:
+            norm_time = norm_time.replace(tzinfo=None)
+        result = pool_wide_rate_limit_cooldown(at_time=norm_time)
+        if not result:
+            logger.debug(
+                "[FAILURE_CLASS] pool_wide_rate_limit_cooldown: pool not fully blocked"
+            )
+        return result
+    except Exception:
+        logger.debug(
+            "[FAILURE_CLASS] pool_wide_rate_limit_cooldown check degraded to False"
+        )
+        return False
 
 
 def _text_provider_failure_override(task: "Task", combined: str) -> str | None:
@@ -637,6 +751,14 @@ def normalize_agent_failure_category(raw: str | None, task: "Task") -> str:
             override = _text_provider_failure_override(task, combined)
             if override:
                 return override
+            if any(kw in combined for kw in _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS):
+                return PROVISION_FAILURE
+        if (
+            mapped == CODE_ERROR
+            and label_lower in _ALL_GENERIC_CODE_ERROR_LABELS
+            and (_account_was_rate_limited(task) or _pool_was_rate_limited())
+        ):
+            return RATE_LIMIT
         return mapped
     if label in INFRA_CLASSES or label == CODE_ERROR:
         return label
@@ -792,6 +914,10 @@ def _external_api_subtype_from_message(combined: str) -> str:
         return EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG
 
     # Provider auth — token/credential failures from any upstream API.
+    # `oauth_org_not_allowed` is the Anthropic 403 raised when an org has
+    # disabled OAuth for Claude Code; matched by its specific token (NOT bare
+    # "403", which collides with GitHub/FastAPI 403s) so it routes to infra/auth
+    # instead of burning task retries as CODE_ERROR.
     if any(
         kw in combined
         for kw in (
@@ -803,6 +929,7 @@ def _external_api_subtype_from_message(combined: str) -> str:
             "token revoked",
             "authentication failed",
             "invalid api key",
+            "oauth_org_not_allowed",
         )
     ):
         return EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
@@ -906,6 +1033,30 @@ def _reactivate_residual_case(fingerprint: str) -> None:
 # Per-account failure class log — rolling 24h window, keyed account_id →
 # list[(failure_class, confidence, timestamp)].
 _account_failure_log: dict[str, list[tuple[str, float | None, float]]] = {}
+
+# Strong references to in-flight fire-and-forget DB tasks. Without this the event
+# loop only holds a weak reference and may GC the task mid-flight, silently
+# dropping the upsert (RUF006). Tasks self-remove via add_done_callback.
+_residual_bg_tasks: set = set()
+
+
+def _spawn_bg_task(coro) -> None:
+    """Fire-and-forget a coroutine on the running loop, keeping a strong ref so
+    it isn't GC'd before completion. No-op if no loop is running (e.g. sync
+    tests); the caller's in-memory path is then authoritative."""
+    import asyncio
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop (e.g. sync tests); close the coroutine so it doesn't
+        # surface a "coroutine was never awaited" warning. Caller's in-memory
+        # path is authoritative.
+        coro.close()
+        return
+    task = loop.create_task(coro)
+    _residual_bg_tasks.add(task)
+    task.add_done_callback(_residual_bg_tasks.discard)
 
 _RE_UUID = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
@@ -1272,15 +1423,9 @@ def _schedule_residual_db_upsert(
     sample_message: str,
 ) -> None:
     """Schedule a fire-and-forget DB upsert when an event loop is running."""
-    import asyncio
-
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(
-            _upsert_residual_case_async(project_id, fingerprint, now_dt, sample_message)
-        )
-    except RuntimeError:
-        pass  # No running loop (e.g. tests); in-memory store is the only path
+    _spawn_bg_task(
+        _upsert_residual_case_async(project_id, fingerprint, now_dt, sample_message)
+    )
 
 
 def get_top_residual_fingerprints(
@@ -1356,10 +1501,10 @@ def get_account_failure_class_counts(
 
 
 def classify_failure_with_confidence(
-    task: "Task", logs: str | None = None
+    task: "Task", logs: str | None = None, at_time: "datetime | None" = None
 ) -> FailureClassification:
     """Classify a failure and return a cheap rule-derived confidence score."""
-    failure_class = _classify_failure_class(task, logs)
+    failure_class = _classify_failure_class(task, logs, at_time=at_time)
     agent_category = (task.context or {}).get("failure_category")
     combined = (
         (task.latest_status_message or "").lower() + " " + (logs or "").lower()
@@ -1419,7 +1564,9 @@ def classify_failure_with_confidence(
     return FailureClassification(failure_class=failure_class, confidence=0.7)
 
 
-def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
+def _classify_failure_class(
+    task: "Task", logs: str | None = None, at_time: "datetime | None" = None
+) -> str:
     """Classify a task failure for deployment monitoring.
     Returns: CODE_ERROR, PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API,
     RATE_LIMIT, SCOPE_OVERFLOW, MIGRATION_ERROR, BLOCKED_PRECONDITION."""
@@ -1453,8 +1600,15 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
                     override = _text_provider_failure_override(task, combined)
                     if override:
                         return override
+                if any(kw in combined for kw in _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS):
+                    return PROVISION_FAILURE
                 if any(kw in combined for kw in _VIEWPORT_PATTERNS):
                     return VIEWPORT_REGRESSION
+                if agent_lower in _ALL_GENERIC_CODE_ERROR_LABELS and (
+                    _account_was_rate_limited(task, at_time=at_time)
+                    or _pool_was_rate_limited(at_time)
+                ):
+                    return RATE_LIMIT
             return mapped
         if agent_category in INFRA_CLASSES or agent_category == CODE_ERROR:
             return agent_category
@@ -1468,8 +1622,11 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     combined = status_msg + " " + logs_lower
 
     # Empty/whitespace-only combined log — agent crashed or never communicated.
-    # Classify as AGENT_TIMEOUT (infra) rather than falling through to CODE_ERROR.
+    # Check account state FIRST: a silent death during a rate-limit cooldown
+    # should classify as RATE_LIMIT, not AGENT_TIMEOUT, so no retry attempt is burned.
     if not combined.strip():
+        if _account_was_rate_limited(task, at_time=at_time):
+            return RATE_LIMIT
         return AGENT_TIMEOUT
 
     # Migration-specific failures — alembic chain/head errors, missing migration
@@ -1661,6 +1818,9 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
             "token expired",
             "token invalid",
             "token revoked",
+            # Anthropic 403 when an org has disabled OAuth for Claude Code —
+            # an auth/infra failure, not a code defect. Specific token only.
+            "oauth_org_not_allowed",
         ]
     ):
         return "EXTERNAL_API"
@@ -1726,6 +1886,17 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     if any(kw in combined for kw in _VIEWPORT_PATTERNS):
         return VIEWPORT_REGRESSION
 
+    # Account-state correlation: before defaulting to CODE_ERROR, check if the
+    # assigned account was in rate-limit cooldown, OR if the entire pool was blocked.
+    # Generic failures (no keywords, no structured signal) during a multi-hour block
+    # are most likely throttling-induced; classifying as RATE_LIMIT avoids burning a
+    # retry attempt. Pool-wide check fires even when no account was assigned (pre-
+    # assignment death) or when the assigned account itself was not flagged.
+    if _account_was_rate_limited(task, at_time=at_time) or _pool_was_rate_limited(
+        at_time
+    ):
+        return RATE_LIMIT
+
     # Default: code error — record fingerprint for residual-pattern analysis.
     # Pass `logs` so the fingerprint keys on the actual error signature
     # (Traceback/Error/FAIL line) when available, not on whatever agent
@@ -1734,9 +1905,11 @@ def _classify_failure_class(task: "Task", logs: str | None = None) -> str:
     return "CODE_ERROR"
 
 
-def classify_failure(task: "Task", logs: str | None = None) -> str:
+def classify_failure(
+    task: "Task", logs: str | None = None, at_time: "datetime | None" = None
+) -> str:
     """Backward-compatible shim that returns only the failure class string."""
-    return classify_failure_with_confidence(task, logs).failure_class
+    return classify_failure_with_confidence(task, logs, at_time=at_time).failure_class
 
 
 # ---------------------------------------------------------------------------
@@ -1769,32 +1942,31 @@ async def _transition_regression_case_async(
     status_filter = _status_filter.get(action)
 
     try:
-        async with AsyncSessionLocal() as session:
-            async with session.begin():
-                stmt = select(RegressionRemediationCase).where(
-                    RegressionRemediationCase.project_id == project_id,
-                    RegressionRemediationCase.regression_class == regression_class,
+        async with AsyncSessionLocal() as session, session.begin():
+            stmt = select(RegressionRemediationCase).where(
+                RegressionRemediationCase.project_id == project_id,
+                RegressionRemediationCase.regression_class == regression_class,
+            )
+            if status_filter is not None:
+                stmt = stmt.where(RegressionRemediationCase.status == status_filter)
+            stmt = stmt.with_for_update(skip_locked=True)
+            case = (await session.execute(stmt)).scalars().first()
+            if case is None:
+                return
+            if action == "merge":
+                case.mark_merged(
+                    kwargs["pr_number"],
+                    kwargs.get("signal_snapshot") or {},
+                    spawn_was_cross_layer=bool(
+                        kwargs.get("spawn_was_cross_layer", False)
+                    ),
+                    spawn_layers_enumerated=kwargs.get("spawn_layers_enumerated"),
                 )
-                if status_filter is not None:
-                    stmt = stmt.where(RegressionRemediationCase.status == status_filter)
-                stmt = stmt.with_for_update(skip_locked=True)
-                case = (await session.execute(stmt)).scalars().first()
-                if case is None:
-                    return
-                if action == "merge":
-                    case.mark_merged(
-                        kwargs["pr_number"],
-                        kwargs.get("signal_snapshot") or {},
-                        spawn_was_cross_layer=bool(
-                            kwargs.get("spawn_was_cross_layer", False)
-                        ),
-                        spawn_layers_enumerated=kwargs.get("spawn_layers_enumerated"),
-                    )
-                elif action == "recover":
-                    case.mark_closed()
-                elif action == "rearm":
-                    case.re_arm()
-                session.add(case)
+            elif action == "recover":
+                case.mark_closed()
+            elif action == "rearm":
+                case.re_arm()
+            session.add(case)
     except Exception:
         logger.exception(
             "[FAILURE_CLASS] Regression case transition failed (class=%r action=%s)",
@@ -1809,17 +1981,11 @@ def _schedule_regression_case_transition(
     action: str,
     **kwargs,
 ) -> None:
-    import asyncio
-
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(
-            _transition_regression_case_async(
-                project_id, regression_class, action, **kwargs
-            )
+    _spawn_bg_task(
+        _transition_regression_case_async(
+            project_id, regression_class, action, **kwargs
         )
-    except RuntimeError:
-        pass  # No running event loop (e.g. sync tests); caller must await directly
+    )
 
 
 def schedule_regression_close_loop_merge(

@@ -21,8 +21,28 @@
 import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
-import { cloneWithRetry, log } from './index.js';
+import { cloneWithRetry, log, GIT_REFERENCE_CACHE_ROOT } from './index.js';
 import { DEFAULT_CLONE_DEPTH } from './constants.js';
+
+/**
+ * Resolve the pre-baked git object mirror path for an authenticated clone URL,
+ * or null if the URL can't be parsed into an owner/repo. The image seeds a
+ * mirror at `${GIT_REFERENCE_CACHE_ROOT}/<owner>/<repo>.git` (path layout matches
+ * setupWorkspace in index.ts). Returns the path only when the mirror actually
+ * exists on disk so callers can append `--reference-if-able` safely.
+ */
+export function resolveReferenceRepo(repoUrl: string): string | null {
+  let pathname: string;
+  try {
+    pathname = new URL(repoUrl).pathname; // → '/owner/repo.git'
+  } catch {
+    return null;
+  }
+  const ownerRepo = pathname.replace(/^\/+/, '').replace(/\.git$/, '');
+  if (!ownerRepo || ownerRepo.split('/').length !== 2) return null;
+  const referenceRepo = `${GIT_REFERENCE_CACHE_ROOT}/${ownerRepo}.git`;
+  return fs.existsSync(referenceRepo) ? referenceRepo : null;
+}
 
 export interface PrepareWorkspaceOptions {
   workspace: string;
@@ -154,10 +174,21 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
     }
   }
 
-  // Cold path — byte-equivalent to the prior `rm + clone` pattern.
+  // Cold path — `rm + clone`, plus reuse of the pre-baked git object mirror
+  // when the image seeded one for this repo. `--reference-if-able` borrows
+  // objects from the local mirror and silently falls back to a normal fetch if
+  // the path is missing or invalid, so cold starts for every role (review-fix /
+  // specialized / research / design-doc) get the clone speedup, not just
+  // setupWorkspace's standard path.
   execFileSync('rm', ['-rf', workspace], { encoding: 'utf-8' });
   const cloneArgs = depthOpt > 0
-    ? ['clone', '--depth', String(depthOpt), '--branch', branch, repoUrl, workspace]
-    : ['clone', '--branch', branch, repoUrl, workspace];
+    ? ['clone', '--depth', String(depthOpt), '--branch', branch]
+    : ['clone', '--branch', branch];
+  const referenceRepo = resolveReferenceRepo(repoUrl);
+  if (referenceRepo) {
+    cloneArgs.push('--reference-if-able', referenceRepo);
+    log(`prepareWorkspaceForRole: using pre-baked git object cache at ${referenceRepo}`);
+  }
+  cloneArgs.push(repoUrl, workspace);
   await cloneWithRetry(cloneArgs);
 }

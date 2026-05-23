@@ -218,6 +218,8 @@ _PROGRESS_STALE_DEFAULTS = {
 # was reaped after 484s while in the middle of pass-1 thinking — actual
 # attempt completed cleanly in 19 min once given a budget). These types
 # get a flat longer cutoff regardless of nominal scope.
+# Memo (pure-reasoning documentation tasks with no repo) may run 5-10+ min
+# producing a reasoning artifact without any tool calls — not a sign of staleness.
 _THINKING_HEAVY_TASK_TYPES = frozenset(
     {
         "strategic_review",
@@ -225,6 +227,7 @@ _THINKING_HEAVY_TASK_TYPES = frozenset(
         "research",
         "investigate",
         "plan",
+        "memo",
     }
 )
 _THINKING_HEAVY_PROGRESS_STALE_SECONDS = 1500  # 25 min
@@ -389,7 +392,15 @@ async def _sweep_orphan_direction_holds(session) -> int:
     )
 
     live_dids: set[str] = set()
-    projects = (await session.execute(select(Project))).scalars().all()
+    projects = (
+        (
+            await session.execute(
+                select(Project).options(load_only(Project.id, Project.directions))
+            )
+        )
+        .scalars()
+        .all()
+    )
     for proj in projects:
         for d in proj.directions or []:
             if d.get("status") in ("active", "paused", "proposed"):
@@ -1204,7 +1215,12 @@ async def reaper_service():
                         )
                     )
                     is_rate_limited = (
-                        classify_failure(task, logs=combined_logs) == "RATE_LIMIT"
+                        classify_failure(
+                            task,
+                            logs=combined_logs,
+                            at_time=task.last_heartbeat,
+                        )
+                        == "RATE_LIMIT"
                     )
 
                     # ── EXTERNAL I/O BLOCK (no row lock held) ─────────────────
@@ -1644,7 +1660,9 @@ async def reaper_service():
                         # left no error context (pure heartbeat timeout), fall back to
                         # AGENT_TIMEOUT rather than the default CODE_ERROR — a silent death
                         # is not a code defect.
-                        reap_failure_class = classify_failure(task, logs=combined_logs)
+                        reap_failure_class = classify_failure(
+                            task, logs=combined_logs, at_time=task.last_heartbeat
+                        )
                         if (
                             reap_failure_class == "CODE_ERROR"
                             and not combined_logs.strip()
@@ -1901,7 +1919,7 @@ async def reaper_service():
                                 _reap_failure_class = (
                                     "PROVISION_FAILURE"
                                     if is_provision_failure
-                                    else classify_failure(task, logs=combined_logs)
+                                    else reap_failure_class
                                 )
                                 _fingerprint = _error_fingerprint(reap_reason)
                                 # Audit W1: previous_error_fingerprint is a column.

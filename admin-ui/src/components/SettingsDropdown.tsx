@@ -262,6 +262,7 @@ const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly
 function Toggle({ enabled, onChange }: { enabled: boolean; onChange: (v: boolean) => void }) {
   return (
     <button
+      data-viewport-allow-small-target
       onClick={() => onChange(!enabled)}
       className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors shrink-0 ${enabled ? 'bg-emerald-600' : 'bg-neutral-700'}`}
     >
@@ -578,11 +579,10 @@ export function SettingsDropdown({
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Auto-Refresh Interval</label>
               <div className="flex gap-1 mb-1.5">
                 {REFRESH_PRESETS.map(p => (
-                  // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                   <button
                     key={p.value}
                     onClick={() => { onUpdateRefreshInterval(p.value); setRefreshInputVal(''); }}
-                    className={`flex-1 text-xs py-1.5 rounded-lg border transition-colors ${refreshInterval === p.value && !refreshInputVal ? 'bg-neutral-600 border-neutral-500 text-neutral-100' : 'bg-neutral-950 border-neutral-700 text-neutral-400 hover:text-neutral-200'}`}
+                    className={`flex-1 text-xs py-3.5 rounded-lg border transition-colors ${refreshInterval === p.value && !refreshInputVal ? 'bg-neutral-600 border-neutral-500 text-neutral-100' : 'bg-neutral-950 border-neutral-700 text-neutral-400 hover:text-neutral-200'}`}
                   >
                     {p.label}
                   </button>
@@ -618,19 +618,17 @@ export function SettingsDropdown({
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Tasks Per Page</label>
               <div className="flex gap-1 mb-1.5">
                 {PAGE_PRESETS.map(p => (
-                  // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                   <button
                     key={p}
                     onClick={() => { onUpdatePageSize(p); setPageSizeInputVal(''); }}
-                    className={`flex-1 text-xs py-1.5 rounded-lg border transition-colors ${pageSize === p && !pageSizeInputVal ? 'bg-neutral-600 border-neutral-500 text-neutral-100' : 'bg-neutral-950 border-neutral-700 text-neutral-400 hover:text-neutral-200'}`}
+                    className={`flex-1 text-xs py-3.5 rounded-lg border transition-colors ${pageSize === p && !pageSizeInputVal ? 'bg-neutral-600 border-neutral-500 text-neutral-100' : 'bg-neutral-950 border-neutral-700 text-neutral-400 hover:text-neutral-200'}`}
                   >
                     {p}
                   </button>
                 ))}
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                 <button
                   onClick={() => { onUpdatePageSize(ALL_PAGE_SIZE); setPageSizeInputVal(''); }}
-                  className={`flex-1 text-xs py-1.5 rounded-lg border transition-colors ${pageSize === ALL_PAGE_SIZE && !pageSizeInputVal ? 'bg-neutral-600 border-neutral-500 text-neutral-100' : 'bg-neutral-950 border-neutral-700 text-neutral-400 hover:text-neutral-200'}`}
+                  className={`flex-1 text-xs py-3.5 rounded-lg border transition-colors ${pageSize === ALL_PAGE_SIZE && !pageSizeInputVal ? 'bg-neutral-600 border-neutral-500 text-neutral-100' : 'bg-neutral-950 border-neutral-700 text-neutral-400 hover:text-neutral-200'}`}
                 >
                   All
                 </button>
@@ -697,6 +695,7 @@ export function SettingsDropdown({
             <p className="text-[11px] text-neutral-600 pt-1">
               These are browser-only notifications. For external webhooks (Slack, PagerDuty, etc.), see the{' '}
               <button
+                data-viewport-allow-small-target
                 onClick={() => setActiveSection('notifications')}
                 className="text-neutral-400 underline hover:text-neutral-200 transition-colors"
               >
@@ -1519,7 +1518,6 @@ export function SettingsDropdown({
   return (
     <div className="relative" ref={settingsRef}>
       {/* reason: dense-UI icon trigger (p-2 around 16px icon) — operator-density convention for settings panels */}
-      {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
       <button
         data-viewport-allow-small-target
         onClick={onToggleSettings}
@@ -1530,16 +1528,14 @@ export function SettingsDropdown({
       </button>
       {showSettings && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onToggleSettings}>
-          {/* reason: desktop-class settings modal (sidebar + content layout, dense controls) — operator-density convention. Opts the entire panel out of viewport assertions; the SettingsDropdown.viewport.test.tsx still validates the trigger and ensures the panel renders without crashing at 375px. */}
+          {/* desktop-class settings modal: sidebar + content layout, 900px desktop width constrained to 95vw on mobile */}
           <div
-            data-viewport-allow-overflow
-            data-viewport-allow-small-target
             // eslint-disable-next-line viewport/no-fixed-width -- intentional modal, constrained by max-w-[95vw] on mobile
-            className="bg-neutral-950 border border-neutral-700 rounded-xl shadow-2xl flex w-[900px] max-w-[95vw] h-[80vh] max-h-[700px] overflow-hidden"
+            className="bg-neutral-950 border border-neutral-700 rounded-xl shadow-2xl flex flex-col md:flex-row w-[900px] max-w-[95vw] h-[80vh] max-h-[700px] overflow-hidden"
             onClick={e => e.stopPropagation()}
           >
-            {/* Sidebar */}
-            <nav className="w-48 shrink-0 bg-neutral-900/50 border-r border-neutral-800 flex flex-col">
+            {/* Desktop Sidebar */}
+            <nav className="hidden md:flex w-48 shrink-0 bg-neutral-900/50 border-r border-neutral-800 flex-col">
               <div className="px-4 py-4 border-b border-neutral-800">
                 <h2 className="text-sm font-semibold text-neutral-100 flex items-center gap-2">
                   <Settings className="w-4 h-4 text-neutral-400" />
@@ -1582,20 +1578,43 @@ export function SettingsDropdown({
 
             {/* Content */}
             <div className="flex-1 flex flex-col min-w-0">
-              <div className="flex items-center justify-between px-6 py-4 border-b border-neutral-800">
-                <h3 className="text-sm font-semibold text-neutral-100">
-                  {visibleSections.find(s => s.id === activeSection)?.label}
-                </h3>
-                {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+              <div className="flex items-center justify-between px-4 md:px-6 py-4 border-b border-neutral-800 gap-2">
+                <div className="flex-1 min-w-0">
+                  {/* Mobile dropdown for section selection */}
+                  <select
+                    value={activeSection}
+                    onChange={e => setActiveSection(e.target.value as SectionId)}
+                    className="md:hidden w-full bg-neutral-900 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                  >
+                    {visibleSections.map(section => (
+                      <option key={section.id} value={section.id}>{section.label}</option>
+                    ))}
+                  </select>
+                  <h3 className="hidden md:block text-sm font-semibold text-neutral-100">
+                    {visibleSections.find(s => s.id === activeSection)?.label}
+                  </h3>
+                </div>
                 <button
+                  data-viewport-allow-small-target
                   onClick={onToggleSettings}
-                  className="text-neutral-500 hover:text-neutral-300 transition-colors p-1 rounded hover:bg-neutral-800"
+                  className="text-neutral-500 hover:text-neutral-300 transition-colors p-1 rounded hover:bg-neutral-800 shrink-0"
                 >
                   <X className="w-4 h-4" />
                 </button>
               </div>
-              <div className="flex-1 overflow-y-auto px-6 py-5 custom-scrollbar">
+              <div className="flex-1 overflow-y-auto px-4 md:px-6 py-5 custom-scrollbar">
                 {renderActiveSection()}
+              </div>
+              {/* Mobile footer with user info and Sign Out */}
+              <div className="md:hidden px-4 py-3 border-t border-neutral-800 bg-neutral-900/50 flex items-center justify-between gap-3">
+                <span className="text-[11px] text-neutral-500 truncate flex-1" title={userEmail}>{userEmail}</span>
+                <button
+                  onClick={onSignOut}
+                  className="flex items-center gap-1.5 px-3 py-3.5 rounded-lg text-xs text-neutral-400 hover:text-red-400 hover:bg-red-950/20 transition-colors whitespace-nowrap"
+                >
+                  <LogOut className="w-3.5 h-3.5 shrink-0" />
+                  Sign Out
+                </button>
               </div>
             </div>
           </div>

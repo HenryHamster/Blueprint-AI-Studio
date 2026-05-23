@@ -291,10 +291,8 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
           <>
             <div className="w-px h-3 bg-neutral-800 shrink-0" />
             <div className="relative flex items-center">
-              {/* reason: inline status chip in header bar; height constrained by single-line layout */}
               <button
-                data-viewport-allow-small-target
-                className="flex items-center gap-1.5 cursor-pointer"
+                className="min-h-[44px] sm:min-h-0 flex items-center gap-1.5 cursor-pointer"
                 title={`Circuit breakers open for: ${openProjects.join(', ')}`}
                 onClick={() => setCircuitExpanded(v => !v)}
               >
@@ -408,13 +406,11 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                     GH: {remainingDisplay}{q.status === 'critical' ? ' ⚠' : ''}
                     {resetIn != null && resetIn > 0 && ` (${resetIn}m)`}
                   </span>
-                  {/* reason: inline icon-only probe button in compact quota row */}
                   <button
-                    data-viewport-allow-small-target
                     type="button"
                     onClick={refreshQuota}
                     disabled={refreshingQuota}
-                    className="text-neutral-500 hover:text-neutral-300 disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="min-h-[44px] min-w-[44px] sm:min-h-0 sm:min-w-0 flex items-center justify-center text-neutral-500 hover:text-neutral-300 disabled:opacity-50 disabled:cursor-not-allowed"
                     title="Probe GitHub rate_limit endpoint now"
                   >
                     <RefreshCw className={`w-3 h-3 ${refreshingQuota ? 'animate-spin' : ''}`} />
@@ -453,11 +449,9 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                 ? `Daily cost: $${dailyCostUsd.toFixed(2)} / $${dailyCostCeilingUsd.toFixed(2)} ceiling (${Math.round(ratio * 100)}%). Click to view cost section.`
                 : `Daily cost: $${dailyCostUsd.toFixed(2)}. Click to view cost section.`;
               return (
-                // reason: compact cost badge in health bar; height constrained by single-line header
                 <button
-                  data-viewport-allow-small-target
                   type="button"
-                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 text-xs rounded cursor-pointer ${isRed ? 'bg-red-900/40' : isAmber ? 'bg-amber-900/40' : ''}`}
+                  className={`inline-flex items-center gap-1 min-h-[44px] sm:min-h-0 px-1.5 py-0.5 text-xs rounded cursor-pointer ${isRed ? 'bg-red-900/40' : isAmber ? 'bg-amber-900/40' : ''}`}
                   title={titleText}
                   onClick={() => { document.getElementById('cost-section')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }}
                 >

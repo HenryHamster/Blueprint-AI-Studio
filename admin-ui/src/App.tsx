@@ -12,7 +12,7 @@ import { PipelineView } from './components/PipelineView';
 import { ProjectDashboard } from './components/ProjectDashboard';
 import { auth, signInWithGoogle, signOut } from './firebase';
 import { fetchTask, apiFetch, API_BASE_URL, fetchSrMissedRetrospectives } from './api';
-import { countHighSignalMessages, countNewSinceLastVisit, loadLastSeen } from './components/MessagesPanel.utils';
+import { countHighSignalMessages, countNewSinceLastVisit, loadLastSeen, fetchBackendLastSeen, resolveLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
 import { SrMissedRetrospective, type SrMissedTask, type SrInvestigationSignal } from './components/SrTrendBreakdown';
 import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
@@ -66,6 +66,10 @@ export default function App() {
   const [openMessageCount, setOpenMessageCount] = useState(0);
   const [newSinceLastVisit, setNewSinceLastVisit] = useState(0);
   const handleMessageCountChange = useCallback((count: number) => setOpenMessageCount(count), []);
+  // Noise prefs for the closed-panel badge — loaded from localStorage on project change and
+  // re-read when the panel closes so changes made inside the panel are reflected immediately.
+  const closedPanelNoisePrefsRef = useRef<Record<string, EventPref>>({});
+  const closedPanelTempMutesRef = useRef<TemporaryMutes>({});
   const [sortBy, setSortBy] = useState<SortBy>(() => {
     try {
       const stored = localStorage.getItem(SORT_KEY);
@@ -97,6 +101,36 @@ export default function App() {
       setNewSinceLastVisit(0);
     }
   }, [showMessages]);
+
+  // Load noise prefs from localStorage when the project changes; refresh from server async.
+  useEffect(() => {
+    if (!selectedProjectId) {
+      closedPanelNoisePrefsRef.current = {};
+      closedPanelTempMutesRef.current = {};
+      return;
+    }
+    const pid = selectedProjectId;
+    const userEmail = s.user?.email;
+    closedPanelNoisePrefsRef.current = loadEventPrefs(userEmail, pid);
+    closedPanelTempMutesRef.current = loadTemporaryMutes(userEmail, pid);
+    fetchServerNoisePrefs(pid).then(serverPrefs => {
+      if (serverPrefs !== null) {
+        closedPanelNoisePrefsRef.current = resolveNoisePrefs(loadEventPrefs(userEmail, pid), serverPrefs);
+      }
+    }).catch(() => {});
+    fetchServerTempMutes(pid).then(serverMutes => {
+      if (serverMutes !== null) {
+        closedPanelTempMutesRef.current = resolveServerTempMutes(loadTemporaryMutes(userEmail, pid), serverMutes);
+      }
+    }).catch(() => {});
+  }, [selectedProjectId, s.user?.email]);
+
+  // Re-read prefs from localStorage when panel closes (operator may have changed prefs while it was open).
+  useEffect(() => {
+    if (showMessages || !selectedProjectId) return;
+    closedPanelNoisePrefsRef.current = loadEventPrefs(s.user?.email, selectedProjectId);
+    closedPanelTempMutesRef.current = loadTemporaryMutes(s.user?.email, selectedProjectId);
+  }, [showMessages, selectedProjectId, s.user?.email]);
   useEffect(() => {
     if (!selectedProjectId || showMessages) return;
     const pid = selectedProjectId; // narrowed to string
@@ -104,14 +138,20 @@ export default function App() {
     async function fetchCount() {
       try {
         const params = new URLSearchParams({ project_id: pid, status: 'open', limit: '100' });
-        const res = await apiFetch(`${API_BASE_URL}/api/admin/messages?${params}`);
+        const [res, backendTs] = await Promise.all([
+          apiFetch(`${API_BASE_URL}/api/admin/messages?${params}`),
+          fetchBackendLastSeen(pid),
+        ]);
         if (!res.ok || cancelled) return;
         const data = await res.json();
         const msgs: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown>; created_at?: string | null }> = data.messages ?? [];
         if (!cancelled) {
-          setOpenMessageCount(countHighSignalMessages(msgs));
-          const lastSeenTs = loadLastSeen(s.user?.email, pid);
-          setNewSinceLastVisit(countNewSinceLastVisit(msgs, lastSeenTs));
+          const noisePrefs = closedPanelNoisePrefsRef.current;
+          const tempMutes = closedPanelTempMutesRef.current;
+          setOpenMessageCount(countHighSignalMessages(msgs, noisePrefs, tempMutes));
+          const localTs = loadLastSeen(s.user?.email, pid);
+          const lastSeenTs = resolveLastSeen(localTs, backendTs);
+          setNewSinceLastVisit(countNewSinceLastVisit(msgs, lastSeenTs, noisePrefs, tempMutes));
         }
       } catch { /* ignore */ }
     }
@@ -637,6 +677,7 @@ export default function App() {
           onBulkApprove={(taskIds) => s.handleBulkAction('approve', taskIds)}
           onBulkRetry={(taskIds) => s.handleBulkAction('retry', taskIds)}
           wsRef={s.wsRef}
+          userEmail={s.user?.email ?? null}
         />
       )}
 

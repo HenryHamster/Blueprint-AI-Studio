@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import {
   TrendingUp,
   TrendingDown,
@@ -11,7 +11,7 @@ import {
   Search,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { apiFetch, fetchSrUnhandledEdgesRetrospectives, setVersionPhase, triggerQualify, type PromptFingerprintAnalyticsResponse, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
+import { apiFetch, fetchQualificationVerdicts, fetchSrUnhandledEdgesRetrospectives, setVersionPhase, triggerQualify, type CiResolution, type PromptFingerprintAnalyticsResponse, type QualificationVerdictRecord, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
@@ -110,6 +110,8 @@ interface LatestCycle {
   directions_retired: number;
   vision_updated: boolean;
   summary_text?: string | null;
+  memos_available?: number | null;
+  memos_cited?: number | null;
 }
 
 interface DigestData {
@@ -304,6 +306,8 @@ interface DigestData {
     top_notes: { snippet: string; count: number }[];
   } | null;
   tasks_truncated?: boolean;
+  memo_pathway_exits?: number | null;
+  recent_cycle_memo_stats?: Array<{ cycle_id: string | null; started_at: string | null; memos_available: number; memos_cited: number }> | null;
 }
 
 interface SrFixIterationBucket { hit_rate?: number | null; miss_rate?: number | null; sample_count?: number | null; }
@@ -432,6 +436,22 @@ function QualSummary({ q }: { q: VersionQualification | null }) {
   );
 }
 
+const CI_STATE_STYLE: Record<string, string> = {
+  green: 'text-emerald-400',
+  red: 'text-red-400',
+  pending: 'text-amber-400',
+  no_checks: 'text-neutral-500',
+};
+
+function CiBadge({ ci }: { ci: CiResolution }) {
+  const color = CI_STATE_STYLE[ci.state] ?? 'text-neutral-500';
+  return (
+    <span className={`font-mono text-[9px] ${color}`} title={ci.detail}>
+      ci:{ci.state}{ci.resolved_sha ? ` @${ci.resolved_sha.slice(0, 7)}` : ''}
+    </span>
+  );
+}
+
 function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadiness | null | undefined }) {
   if (!readiness) return null;
   const { ready, reason, verdicts_evaluated, would_promote_rate, consecutive_clean_passes, recurring_blockers } = readiness;
@@ -467,6 +487,11 @@ function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadines
 function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: VersionLifecycleResponse | null; loading: boolean; projectId: string | null; onRefresh: () => void }) {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
+  const [verdicts, setVerdicts] = useState<QualificationVerdictRecord[]>([]);
+  useEffect(() => {
+    if (!projectId) { setVerdicts([]); return; }
+    fetchQualificationVerdicts(projectId, 10).then(r => setVerdicts(r.verdicts)).catch(() => {});
+  }, [projectId]);
 
   if (loading || !data || (!data.current_version && data.recent_versions.length === 0)) return null;
   const cv = data.current_version;
@@ -535,11 +560,18 @@ function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: 
             {cv.last_qualification && (
               <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
                 <QualSummary q={cv.last_qualification} />
-                {cv.last_qualification.sub_scores && (
-                  <div className="flex flex-wrap gap-x-2 text-[10px] text-neutral-500">
-                    <span>audit {Math.round(cv.last_qualification.sub_scores.audit * 100)}%</span>
-                    <span>erosion {Math.round(cv.last_qualification.sub_scores.test_erosion * 100)}%</span>
-                    <span>smoke {Math.round(cv.last_qualification.sub_scores.smoketest * 100)}%</span>
+                {(cv.last_qualification.sub_scores || cv.last_qualification.ci_resolution) && (
+                  <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-neutral-500">
+                    {cv.last_qualification.sub_scores && (
+                      <>
+                        <span>audit {Math.round(cv.last_qualification.sub_scores.audit * 100)}%</span>
+                        <span>erosion {Math.round(cv.last_qualification.sub_scores.test_erosion * 100)}%</span>
+                        <span>smoke {Math.round(cv.last_qualification.sub_scores.smoketest * 100)}%</span>
+                      </>
+                    )}
+                    {cv.last_qualification.ci_resolution && (
+                      <CiBadge ci={cv.last_qualification.ci_resolution} />
+                    )}
                   </div>
                 )}
                 {cv.last_qualification.blocker && (
@@ -548,32 +580,29 @@ function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: 
               </div>
             )}
             {projectId && (
-              <div className="flex flex-wrap items-center gap-2 pt-1">
+              <div data-testid="phase-controls" className="flex flex-wrap items-center gap-2 pt-1">
                 {cv.phase === 'build' ? (
-                  // eslint-disable-next-line viewport/min-touch-target
                   <button
                     onClick={() => handleSetPhase('stabilize')}
                     disabled={actionLoading !== null}
-                    className="text-[10px] px-2 py-0.5 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'phase' ? '…' : '→ stabilize'}
                   </button>
                 ) : (
-                  // eslint-disable-next-line viewport/min-touch-target
                   <button
                     onClick={() => handleSetPhase('build')}
                     disabled={actionLoading !== null}
-                    className="text-[10px] px-2 py-0.5 rounded border border-blue-500/40 text-blue-400 hover:bg-blue-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-blue-500/40 text-blue-400 hover:bg-blue-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'phase' ? '…' : '→ build'}
                   </button>
                 )}
                 {cv.phase === 'stabilize' && (
-                  // eslint-disable-next-line viewport/min-touch-target
                   <button
                     onClick={handleQualify}
                     disabled={actionLoading !== null}
-                    className="text-[10px] px-2 py-0.5 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {actionLoading === 'qualify' ? '…' : 'Run Qualify'}
                   </button>
@@ -586,6 +615,25 @@ function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: 
           </div>
         )}
         {readiness !== undefined && <PromotionReadinessSummary readiness={readiness} />}
+        {verdicts.length > 0 && (
+          <div data-testid="verdict-history">
+            <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Verdict History</p>
+            <div className="space-y-1">
+              {verdicts.slice(0, 8).map(v => (
+                <div key={v.id} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] pl-2 border-l-2 border-neutral-700/40">
+                  <span className={`font-mono font-semibold ${v.would_promote ? 'text-emerald-400' : 'text-amber-400'}`}>{v.confidence != null ? `${Math.round(v.confidence * 100)}%` : '—'}</span>
+                  <span className={QUAL_VERDICT_COLOR[v.terminal_status ?? ''] ?? 'text-neutral-400'}>{v.terminal_status?.replace(/_/g, '-') ?? '?'}</span>
+                  {v.promotion_enabled && <span className="text-[9px] font-mono text-emerald-600">LIVE</span>}
+                  {v.sub_scores && <span className="text-neutral-600 font-mono text-[9px]">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)} s:{Math.round(v.sub_scores.smoketest * 100)}</span>}
+                  {v.sub_scores?.ci_resolution && <CiBadge ci={v.sub_scores.ci_resolution} />}
+                  {v.blocker && <span className="text-red-400 truncate max-w-[120px]" title={v.blocker}>{v.blocker}</span>}
+                  <span className="text-neutral-700 font-mono">{v.candidate_sha.slice(0, 7)}</span>
+                  {v.finalized_at && <span className="text-neutral-600">{timeAgo(v.finalized_at)}</span>}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
         {recent.length > 0 && (
           <div>
             <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">History</p>
@@ -1167,19 +1215,18 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     return () => clearInterval(id);
   }, [fetchData]);
 
+  const { activeCount, queuedCount } = useMemo(() => ({
+    activeCount: tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length,
+    queuedCount: tasks.filter(t => t.status === 'QUEUED').length,
+  }), [tasks]);
+
   // Sparkline sampling
   useEffect(() => {
-    const active = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length;
-    const queued = tasks.filter(t => t.status === 'QUEUED').length;
     const failed = digest?.failed_count ?? 0;
-    const next = [...sparkRef.current, { active, queued, failed }].slice(-60);
+    const next = [...sparkRef.current, { active: activeCount, queued: queuedCount, failed }].slice(-60);
     sparkRef.current = next;
     setSparkData(next);
-  }, [tasks, digest?.failed_count]);
-
-  // Derived counts
-  const activeCount = tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length;
-  const queuedCount = tasks.filter(t => t.status === 'QUEUED').length;
+  }, [activeCount, queuedCount, digest?.failed_count]);
   const failedCount = digest?.failed_count ?? 0;
   const successRate = digest?.success_rate;
 
@@ -1191,21 +1238,24 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const mergeEvents = (digest?.recent_completions ?? []).filter(e => e.pr_url);
 
   // Direction progress sorted by priority (high → medium → low)
-  const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
-  const directions = [...(digest?.direction_progress ?? [])].sort((a, b) => (priorityOrder[a.priority] ?? 9) - (priorityOrder[b.priority] ?? 9));
-  const totalDirPRs = directions.reduce((s, d) => s + d.prs_merged, 0);
-  const hasAttribution = directions.some(d => d.autonomous_prs_merged != null || d.assisted_prs_merged != null);
-  const totalAutonomousPRs = hasAttribution ? directions.reduce((s, d) => s + (d.autonomous_prs_merged ?? 0), 0) : null;
-  const totalAssistedPRs = hasAttribution ? directions.reduce((s, d) => s + (d.assisted_prs_merged ?? 0), 0) : null;
-  const selfSufficientCount = directions.filter(d => {
-    const history = d.research_history ?? [];
-    const histHasAttrib = history.some(e => e.autonomous_prs_merged != null);
-    const lifetimeAutonomous = histHasAttrib
-      ? history.reduce((s, e) => s + (e.autonomous_prs_merged ?? 0), 0) + ((d.history_aggregate?.total_autonomous_prs_merged as number | null) ?? 0)
-      : null;
-    const operatorActions = (d.history_aggregate?.total_operator_actions as number | null) ?? null;
-    return (lifetimeAutonomous ?? 0) >= 10 && operatorActions === 0;
-  }).length;
+  const { directions, totalDirPRs, hasAttribution, totalAutonomousPRs, totalAssistedPRs, selfSufficientCount } = useMemo(() => {
+    const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
+    const dirs = [...(digest?.direction_progress ?? [])].sort((a, b) => (priorityOrder[a.priority] ?? 9) - (priorityOrder[b.priority] ?? 9));
+    const totalDirPRs = dirs.reduce((s, d) => s + d.prs_merged, 0);
+    const hasAttribution = dirs.some(d => d.autonomous_prs_merged != null || d.assisted_prs_merged != null);
+    const totalAutonomousPRs = hasAttribution ? dirs.reduce((s, d) => s + (d.autonomous_prs_merged ?? 0), 0) : null;
+    const totalAssistedPRs = hasAttribution ? dirs.reduce((s, d) => s + (d.assisted_prs_merged ?? 0), 0) : null;
+    const selfSufficientCount = dirs.filter(d => {
+      const history = d.research_history ?? [];
+      const histHasAttrib = history.some(e => e.autonomous_prs_merged != null);
+      const lifetimeAutonomous = histHasAttrib
+        ? history.reduce((s, e) => s + (e.autonomous_prs_merged ?? 0), 0) + ((d.history_aggregate?.total_autonomous_prs_merged as number | null) ?? 0)
+        : null;
+      const operatorActions = (d.history_aggregate?.total_operator_actions as number | null) ?? null;
+      return (lifetimeAutonomous ?? 0) >= 10 && operatorActions === 0;
+    }).length;
+    return { directions: dirs, totalDirPRs, hasAttribution, totalAutonomousPRs, totalAssistedPRs, selfSufficientCount };
+  }, [digest?.direction_progress]);
   const productPct = digest?.overall_product_ratio != null ? Math.round(digest.overall_product_ratio * 100) : null;
 
   return (
@@ -2442,6 +2492,8 @@ function AnomalyThrottleBanner({ digest }: { digest: DigestData | null }) {
 
 function SystemStatusCard({ digest, loading }: { digest: DigestData | null; loading: boolean }) {
   const cycle = digest?.latest_cycle ?? null;
+  const memoExits = digest?.memo_pathway_exits ?? 0;
+  const recentCycleMemoStats = digest?.recent_cycle_memo_stats ?? [];
   const hasContent = digest?.narrative_summary || cycle;
 
   return (
@@ -2469,11 +2521,39 @@ function SystemStatusCard({ digest, loading }: { digest: DigestData | null; load
                     Last cycle: {timeAgo(cycle.completed_at ?? cycle.started_at)} &mdash;{' '}
                     {cycle.directions_created} created, {cycle.directions_retired} retired
                   </span>
+                  {(cycle.memos_available != null || cycle.memos_cited != null) && (
+                    <span className="text-violet-400" title="memos available / cited in last cycle">
+                      {cycle.memos_available ?? 0} memo{(cycle.memos_available ?? 0) !== 1 ? 's' : ''} avail, {cycle.memos_cited ?? 0} cited
+                    </span>
+                  )}
                 </div>
                 {cycle.summary_text && (
                   <p className="text-[10px] text-neutral-500 mt-1">{cycle.summary_text}</p>
                 )}
               </>
+            )}
+            {memoExits > 0 && (
+              <div className="mt-2 pt-2 border-t border-neutral-800/50">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[10px] text-neutral-500 uppercase tracking-wide">Memo pathway</span>
+                  <span className="text-[10px] font-semibold text-violet-400 px-1.5 py-0.5 rounded border border-violet-500/30 bg-violet-500/10">
+                    {memoExits} exit{memoExits !== 1 ? 's' : ''}
+                  </span>
+                  {recentCycleMemoStats.length > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {recentCycleMemoStats.slice(0, 5).map((s, i) => (
+                        <span
+                          key={s.cycle_id ?? i}
+                          className="text-[10px] text-neutral-400 px-1.5 py-0.5 rounded border border-neutral-700/50 bg-neutral-800/50"
+                          title={s.started_at ? `cycle ${timeAgo(s.started_at)}` : undefined}
+                        >
+                          {s.memos_cited}/{s.memos_available}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
             )}
           </>
         )}

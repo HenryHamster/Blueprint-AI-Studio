@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from app.models import (
     CYCLE_META_MEMOS_AVAILABLE,
     CYCLE_META_MEMOS_CITED,
+    MaxPlanAccount,
     RegressionRemediationCase,
     StrategicCycle,
 )
@@ -122,6 +123,65 @@ def test_mark_merged_records_episode_investigate_started_at_first_episode():
     entry = case.fingerprint_to_fix_log[-1]
     assert "episode_investigate_started_at" in entry
     assert datetime.fromisoformat(entry["episode_investigate_started_at"]) == inv
+
+
+# ---------------------------------------------------------------------------
+# MaxPlanAccount.is_in_rate_limit_cooldown — persisted-state check
+# ---------------------------------------------------------------------------
+
+
+def _make_account(rate_limit_state=None):
+    return MaxPlanAccount(
+        user_id="test-user",
+        name="test-account",
+        rate_limit_state=rate_limit_state,
+    )
+
+
+def test_is_in_rate_limit_cooldown_no_state():
+    acct = _make_account(rate_limit_state=None)
+    assert acct.is_in_rate_limit_cooldown() is False
+
+
+def test_is_in_rate_limit_cooldown_empty_disabled_models():
+    acct = _make_account(rate_limit_state={"disabled_models": {}})
+    assert acct.is_in_rate_limit_cooldown() is False
+
+
+def test_is_in_rate_limit_cooldown_active_entry():
+    """An entry disabled 5 minutes ago (within 4-hour window) → True."""
+    at = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+    acct = _make_account(
+        rate_limit_state={
+            "disabled_models": {
+                "claude-sonnet-4-6": {"at": at, "hits": 1, "kind": "rate_limit"}
+            }
+        }
+    )
+    assert acct.is_in_rate_limit_cooldown() is True
+
+
+def test_is_in_rate_limit_cooldown_expired_entry():
+    """An entry disabled 5 hours ago (beyond 4-hour window) → False."""
+    at = (datetime.utcnow() - timedelta(hours=5)).isoformat()
+    acct = _make_account(
+        rate_limit_state={
+            "disabled_models": {
+                "claude-opus-4-7": {"at": at, "hits": 2, "kind": "rate_limit"}
+            }
+        }
+    )
+    assert acct.is_in_rate_limit_cooldown() is False
+
+
+def test_is_in_rate_limit_cooldown_malformed_at_field():
+    """Unparseable at string → False (no exception raised)."""
+    acct = _make_account(
+        rate_limit_state={
+            "disabled_models": {"claude-sonnet-4-6": {"at": "not-a-date"}}
+        }
+    )
+    assert acct.is_in_rate_limit_cooldown() is False
 
 
 def test_mark_merged_records_episode_investigate_started_at_re_armed():

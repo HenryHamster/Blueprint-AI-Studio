@@ -365,7 +365,7 @@ export function HeaderBar(props: HeaderBarProps) {
       <div className="flex items-center gap-1.5 ml-auto">
         <div className="hidden md:flex items-center gap-1">
           <div className="flex items-center rounded-md overflow-hidden">
-            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
             <button
               onClick={() => onSetViewMode('home')}
               className={`p-2 text-xs transition-colors ${viewMode === 'home' ? 'bg-neutral-700/80 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
@@ -373,7 +373,7 @@ export function HeaderBar(props: HeaderBarProps) {
             >
               <LayoutDashboard className="w-4 h-4" />
             </button>
-            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
             <button
               onClick={() => onSetViewMode('kanban')}
               className={`p-2 text-xs transition-colors ${viewMode === 'kanban' ? 'bg-neutral-700/80 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
@@ -381,7 +381,7 @@ export function HeaderBar(props: HeaderBarProps) {
             >
               <LayoutGrid className="w-4 h-4" />
             </button>
-            {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
             <button
               onClick={() => onSetViewMode('pipeline')}
               className={`p-2 text-xs transition-colors ${viewMode === 'pipeline' ? 'bg-neutral-700/80 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
@@ -390,7 +390,7 @@ export function HeaderBar(props: HeaderBarProps) {
               <Network className="w-4 h-4" />
             </button>
           </div>
-          {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+          {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
           <button
             onClick={onShowDirections}
             className="text-neutral-400 hover:text-neutral-200 p-2 rounded-md text-xs transition-colors hover:bg-neutral-800"
@@ -538,7 +538,7 @@ export function HeaderBar(props: HeaderBarProps) {
 
         {/* More secondary buttons — desktop only */}
         <div className="hidden md:flex items-center gap-1">
-          {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+          {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
           <button
             onClick={onToggleArchive}
             className={`p-2 rounded-md text-xs transition-colors ${
@@ -548,7 +548,7 @@ export function HeaderBar(props: HeaderBarProps) {
           >
             <Archive className="w-4 h-4" />
           </button>
-          {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+          {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
           <button
             onClick={onToggleMessages}
             className={`p-2 rounded-md text-xs transition-colors relative flex items-center ${
@@ -568,7 +568,7 @@ export function HeaderBar(props: HeaderBarProps) {
               </span>
             )}
           </button>
-          {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
+          {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
           <button
             onClick={onToggleResearchBrowser}
             className={`p-2 rounded-md text-xs transition-colors relative flex items-center ${

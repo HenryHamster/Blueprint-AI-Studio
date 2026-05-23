@@ -262,8 +262,15 @@ async def get_project_tasks(
     task_ids = [t.id for t in tasks]
     artifacts = []
     if task_ids:
-        artifacts_stmt = select(Artifact).where(Artifact.task_id.in_(task_ids))
+        artifacts_stmt = (
+            select(Artifact).where(Artifact.task_id.in_(task_ids)).limit(2000)
+        )
         artifacts = (await session.execute(artifacts_stmt)).scalars().all()
+        if len(artifacts) == 2000:
+            logger.warning(
+                "get_project_tasks: artifact fetch hit 2000-row limit for task_ids=%s; results may be truncated",
+                task_ids,
+            )
 
     # Group artifacts by task_id
     artifacts_by_task = {}

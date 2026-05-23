@@ -354,6 +354,72 @@ class TestClassifyFailureViewportGateInfra:
         t = _task("expectNoTextTruncationAt(375) failed at DashboardHome")
         assert classify_failure(t) != CODE_ERROR
 
+    def test_raw_libatk_routes_to_provision_failure(self):
+        t = _task(
+            "error while loading shared libraries: libatk-1.0.so.0: cannot open shared object file"
+        )
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_raw_libnss3_routes_to_provision_failure(self):
+        t = _task("libnss3.so => not found when launching Chromium")
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_raw_libgbm_routes_to_provision_failure(self):
+        t = _task(
+            "libgbm.so.1: cannot open shared object file: No such file or directory"
+        )
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_host_system_missing_deps_routes_to_provision_failure(self):
+        t = _task("host system is missing dependencies required by Playwright Chromium")
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_playwright_sudo_routes_to_provision_failure(self):
+        t = _task(
+            "Playwright Chromium install requires sudo and the host library is missing"
+        )
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_admin_ui_gate_blocked_routes_to_provision_failure(self):
+        t = _task("admin-ui viewport gate is blocked in this VM due to missing libs")
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_verbatim_production_message_provision_failure(self):
+        # Verbatim production message that previously landed as CODE_ERROR
+        t = _task(
+            "Retries exhausted (3/3). admin-ui viewport gate is blocked in this VM: "
+            "Playwright Chromium install requires sudo and the host library lib..."
+        )
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_fast_path_code_error_context_overridden_by_bootstrap_patterns(self):
+        # task.context already has failure_category=CODE_ERROR (fast-path) but status
+        # message contains a bootstrap signature — must still return PROVISION_FAILURE.
+        t = _task(
+            "libatk-1.0.so.0: cannot open shared object file",
+            ctx={"failure_category": "claude_code_failed"},
+        )
+        assert classify_failure(t) == PROVISION_FAILURE
+
+    def test_normalize_agent_failure_category_bootstrap_returns_provision_failure(self):
+        t = _task(
+            "Playwright Chromium install requires sudo and the host library libatk is missing",
+        )
+        assert (
+            normalize_agent_failure_category("claude_code_failed", t)
+            == PROVISION_FAILURE
+        )
+
+    def test_bootstrap_not_viewport_regression(self):
+        t = _task(
+            "libgbm.so.1: cannot open shared object file: No such file or directory"
+        )
+        assert classify_failure(t) != VIEWPORT_REGRESSION
+
+    def test_bootstrap_not_code_error(self):
+        t = _task("host system is missing dependencies required for Playwright")
+        assert classify_failure(t) != CODE_ERROR
+
 
 class TestClassifyFailureProvision:
     @pytest.mark.parametrize(
@@ -484,6 +550,9 @@ class TestClassifyFailureExternalApi:
             "401 Unauthorized",
             "Bad credentials returned from GitHub",
             "token expired",
+            # Anthropic 403 when an org has disabled OAuth for Claude Code:
+            # an auth/infra failure, must NOT fall through to CODE_ERROR.
+            "Claude subprocess exited code 1: HTTP 403 oauth_org_not_allowed",
             "Error: Overloaded",
             # Provider model-config rejections — upstream 400s (not code defects,
             # not rate limits, not auth failures). Our OpenAI/Gemini adapter
@@ -1658,6 +1727,15 @@ class TestExternalApiSubtypeFromMessage:
             == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
         )
 
+    def test_provider_auth_oauth_org_disabled(self):
+        # Anthropic 403 when an org has disabled OAuth for Claude Code.
+        assert (
+            _external_api_subtype_from_message(
+                "HTTP 403 oauth_org_not_allowed: organization has disabled this"
+            )
+            == EXTERNAL_API_SUBTYPE_PROVIDER_AUTH
+        )
+
     def test_github_pr_create(self):
         assert (
             _external_api_subtype_from_message(
@@ -1943,22 +2021,21 @@ class TestResidualFingerprintDbWrite:
         monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
 
         await _upsert_residual_case_async(project_id, "fp-closed", now_dt, "err")
-        async with session_factory() as session:
-            async with session.begin():
-                row = (
-                    (
-                        await session.execute(
-                            select(ResidualRemediationCase).where(
-                                ResidualRemediationCase.project_id == project_id,
-                                ResidualRemediationCase.fingerprint == "fp-closed",
-                            )
+        async with session_factory() as session, session.begin():
+            row = (
+                (
+                    await session.execute(
+                        select(ResidualRemediationCase).where(
+                            ResidualRemediationCase.project_id == project_id,
+                            ResidualRemediationCase.fingerprint == "fp-closed",
                         )
                     )
-                    .scalars()
-                    .first()
                 )
-                row.status = ResidualCaseStatus.CLOSED_ORGANICALLY
-                session.add(row)
+                .scalars()
+                .first()
+            )
+            row.status = ResidualCaseStatus.CLOSED_ORGANICALLY
+            session.add(row)
 
         await _upsert_residual_case_async(project_id, "fp-closed", now_dt, "err again")
 
@@ -1993,22 +2070,21 @@ class TestResidualFingerprintDbWrite:
         monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
 
         await _upsert_residual_case_async(project_id, "fp-ignored", now_dt, "err")
-        async with session_factory() as session:
-            async with session.begin():
-                row = (
-                    (
-                        await session.execute(
-                            select(ResidualRemediationCase).where(
-                                ResidualRemediationCase.project_id == project_id,
-                                ResidualRemediationCase.fingerprint == "fp-ignored",
-                            )
+        async with session_factory() as session, session.begin():
+            row = (
+                (
+                    await session.execute(
+                        select(ResidualRemediationCase).where(
+                            ResidualRemediationCase.project_id == project_id,
+                            ResidualRemediationCase.fingerprint == "fp-ignored",
                         )
                     )
-                    .scalars()
-                    .first()
                 )
-                row.status = ResidualCaseStatus.IGNORED
-                session.add(row)
+                .scalars()
+                .first()
+            )
+            row.status = ResidualCaseStatus.IGNORED
+            session.add(row)
 
         await _upsert_residual_case_async(project_id, "fp-ignored", now_dt, "err2")
 
@@ -2174,4 +2250,276 @@ class TestCrossLanguageClassificationContracts:
             "admin-ui/src/test/viewport.ts no longer defines 'expectMinTouchTargetAt'; "
             "update _VIEWPORT_PATTERNS in failure_classification.py to match "
             "the new function name, or update viewport.ts to keep the same name."
+        )
+
+    # ------------------------------------------------------------------
+    # Viewport bootstrap-failure signatures (cross-layer contract)
+    # ------------------------------------------------------------------
+
+    def test_viewport_bootstrap_patterns_in_agent_source(self):
+        """_VIEWPORT_INFRA_UNAVAILABLE_PATTERNS includes the same bootstrap
+        signatures as agent/src/index.ts VIEWPORT_BOOTSTRAP_PATTERNS.
+        If agent renames or removes any of these, the backend classifier would
+        fall back to CODE_ERROR for bootstrap failures it can no longer recognize.
+        """
+        src = self._src(_AGENT_INDEX)
+        for expected in (
+            "libatk",
+            "libgbm",
+            "libxkbcommon",
+            "libxcomposite",
+            "libasound",
+            "cannot open shared object file",
+            "host system is missing dependencies",
+            "executable doesn't exist at",
+        ):
+            assert expected in src, (
+                f"agent/src/index.ts VIEWPORT_BOOTSTRAP_PATTERNS no longer contains {expected!r}; "
+                "update _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS in failure_classification.py "
+                "to match the new pattern, or update the agent to keep the same string."
+            )
+
+
+class TestAccountStateRateLimitCorrelation:
+    """Generic failures during account rate-limit cooldowns classify as RATE_LIMIT."""
+
+    def _make_rl_account(self, account_id: str, in_cooldown: bool) -> dict:
+        from datetime import timedelta
+
+        from app.time_utils import _utcnow
+
+        if in_cooldown:
+            at = _utcnow() - timedelta(minutes=5)
+            return {
+                "enabled": True,
+                "disabled_models": {
+                    "claude-opus-4-5": {
+                        "at": at,
+                        "hits": 1,
+                        "kind": "rate_limit",
+                    }
+                },
+            }
+        return {"enabled": True, "disabled_models": {}}
+
+    def test_incomplete_with_rate_limited_account_classifies_rate_limit(
+        self, monkeypatch
+    ):
+        account_id = "acct-rl-test-1"
+        fake_pool = {account_id: self._make_rl_account(account_id, in_cooldown=True)}
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
+
+        task = _task(
+            "", ctx={"failure_category": "incomplete", "llm_account_id": account_id}
+        )
+        assert classify_failure(task) == RATE_LIMIT
+
+    def test_incomplete_with_healthy_account_stays_code_error(self, monkeypatch):
+        account_id = "acct-healthy-1"
+        fake_pool = {account_id: self._make_rl_account(account_id, in_cooldown=False)}
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
+
+        task = _task(
+            "", ctx={"failure_category": "incomplete", "llm_account_id": account_id}
+        )
+        assert classify_failure(task) == CODE_ERROR
+
+    def test_default_fallback_with_rate_limited_account_classifies_rate_limit(
+        self, monkeypatch
+    ):
+        account_id = "acct-rl-test-2"
+        fake_pool = {account_id: self._make_rl_account(account_id, in_cooldown=True)}
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
+
+        # No failure_category in context, no rate-limit keywords — generic failure
+        task = _task(
+            "failed to read investigation report", ctx={"llm_account_id": account_id}
+        )
+        assert classify_failure(task) == RATE_LIMIT
+
+    def test_default_fallback_with_no_account_stays_code_error(self, monkeypatch):
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+
+        task = _task("failed to read investigation report")
+        assert classify_failure(task) == CODE_ERROR
+
+    def test_specific_failure_not_overridden(self, monkeypatch):
+        """test_failed / lint_failed with rate-limited account stays CODE_ERROR — specific failures are authoritative."""
+        account_id = "acct-rl-test-3"
+        fake_pool = {account_id: self._make_rl_account(account_id, in_cooldown=True)}
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
+
+        task = _task(
+            "", ctx={"failure_category": "test_failed", "llm_account_id": account_id}
+        )
+        assert classify_failure(task) == CODE_ERROR
+
+    def test_normalize_incomplete_with_rate_limited_account(self, monkeypatch):
+        account_id = "acct-rl-norm-1"
+        fake_pool = {account_id: self._make_rl_account(account_id, in_cooldown=True)}
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
+
+        task = _task("", ctx={"llm_account_id": account_id})
+        assert normalize_agent_failure_category("incomplete", task) == RATE_LIMIT
+
+    def test_normalize_incomplete_with_healthy_account(self, monkeypatch):
+        account_id = "acct-healthy-2"
+        fake_pool = {account_id: self._make_rl_account(account_id, in_cooldown=False)}
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
+
+        task = _task("", ctx={"llm_account_id": account_id})
+        assert normalize_agent_failure_category("incomplete", task) == CODE_ERROR
+
+
+class TestPoolWideRateLimitCorrelation:
+    """Pool-wide cooldown correlates generic deaths even when no account was assigned."""
+
+    def test_pre_assignment_death_pool_wide_block(self, monkeypatch):
+        """No account assigned, entire pool blocked → RATE_LIMIT (not CODE_ERROR)."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+        )
+        task = _task("", ctx={"failure_category": "incomplete"})
+        assert classify_failure(task) == RATE_LIMIT
+
+    def test_healthy_account_pool_wide_block_still_rate_limit(self, monkeypatch):
+        """Assigned account is healthy; pool-wide block drives RATE_LIMIT."""
+        account_id = "acct-healthy-pool"
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(
+            pool_mod,
+            "_account_by_id",
+            {account_id: {"enabled": True, "disabled_models": {}}},
+        )
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+        )
+        task = _task(
+            "", ctx={"failure_category": "incomplete", "llm_account_id": account_id}
+        )
+        assert classify_failure(task) == RATE_LIMIT
+
+    def test_pool_not_blocked_generic_failure_code_error(self, monkeypatch):
+        """Pool not in cooldown → generic incomplete stays CODE_ERROR."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+        task = _task("", ctx={"failure_category": "incomplete"})
+        assert classify_failure(task) == CODE_ERROR
+
+    def test_specific_label_not_overridden_by_pool_block(self, monkeypatch):
+        """Authoritative labels (test_failed) are not overridden by pool-wide block."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+        )
+        task = _task("", ctx={"failure_category": "test_failed"})
+        assert classify_failure(task) == CODE_ERROR
+
+    def test_pool_was_rate_limited_accepts_tz_aware_timestamp(self, monkeypatch):
+        """Tz-aware at_time must not raise — helper normalizes to naive UTC before calling pool check."""
+        from datetime import datetime, timezone
+
+        from app.failure_classification import _pool_was_rate_limited
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+        )
+        assert _pool_was_rate_limited(at_time=datetime.now(tz=timezone.utc)) is True
+
+
+class TestAtTimeFailureInstantCorrelation:
+    """Verifies that classify_failure respects at_time so a rate-limit window
+    that has already expired by sweep time is still detected at failure time."""
+
+    def _make_rl_account(self, account_id: str, *, in_cooldown: bool):
+        """Return a fake pool entry whose cooldown state matches in_cooldown."""
+        if in_cooldown:
+            from datetime import datetime, timedelta
+
+            return {
+                "id": account_id,
+                "disabled_models": {
+                    "claude-sonnet-4-6": {
+                        "at": datetime.utcnow() - timedelta(minutes=2),
+                        "kind": "rate_limit",
+                        "hits": 1,
+                    }
+                },
+            }
+        return {"id": account_id, "disabled_models": {}}
+
+    def test_account_rate_limited_at_failure_time_not_sweep_time(self, monkeypatch):
+        """A generic failure classified at the failure instant (at_time=failure_time)
+        is RATE_LIMIT; the same failure classified at sweep time (after cooldown
+        expires) falls back to CODE_ERROR.
+
+        This locks in the fix that threads at_time through to the account-state
+        correlation helpers so a short cooldown that expired before the reaper
+        sweep still protects the retry budget.
+        """
+        from datetime import datetime, timedelta
+        import app.max_plan_pool as pool_mod
+
+        account_id = "acct-at-time-test"
+
+        # Account was rate-limited; cooldown active at failure_time, expired by sweep_time.
+        def _account_corr(task, at_time=None):
+            # Simulate cooldown active only when at_time is provided (failure instant).
+            # When at_time is None (sweep time), the cooldown has already cleared.
+            return at_time is not None
+
+        monkeypatch.setattr(
+            pool_mod,
+            "_account_by_id",
+            {account_id: self._make_rl_account(account_id, in_cooldown=True)},
+        )
+        monkeypatch.setattr(
+            "app.failure_classification._account_was_rate_limited",
+            _account_corr,
+        )
+        # Pool-wide check must be disabled so only the account-level at_time
+        # correlation drives the result — isolates the variable under test.
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+
+        task = _task(
+            "",
+            ctx={
+                "failure_category": "claude_code_failed",
+                "llm_account_id": account_id,
+            },
+        )
+
+        # With at_time=failure_time (non-None), cooldown is detected → RATE_LIMIT.
+        failure_time = datetime.utcnow() - timedelta(minutes=5)
+        assert classify_failure(task, at_time=failure_time) == RATE_LIMIT, (
+            "failure at failure_time must be RATE_LIMIT (cooldown active then)"
+        )
+
+        # With at_time=None (sweep time), cooldown has expired → CODE_ERROR.
+        assert classify_failure(task, at_time=None) == CODE_ERROR, (
+            "failure re-classified at sweep time must be CODE_ERROR (cooldown expired)"
         )

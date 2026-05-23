@@ -6,6 +6,7 @@ so existing callers (``direction_lifecycle`` and tests that import it from
 there) continue to work unchanged.
 """
 
+import asyncio
 import logging
 import subprocess
 import uuid
@@ -79,7 +80,8 @@ async def _get_recent_changes_context(session: AsyncSession) -> dict:
                 f"--since={deployed_at_iso}",
             ]
         try:
-            result = subprocess.run(
+            result = await asyncio.to_thread(
+                subprocess.run,
                 log_args,
                 capture_output=True,
                 text=True,

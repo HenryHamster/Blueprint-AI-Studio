@@ -241,13 +241,15 @@ export function WarmVmPanel({ onViewTask }: Props) {
               {vmCount === 0 ? (
                 <div className="text-neutral-500 italic py-2">No active VMs. Cold-only operation.</div>
               ) : (
-                // The wrapper is itself a horizontal scroll region — the
-                // table intentionally exceeds it on narrow viewports so
-                // the operator can swipe through dense per-VM columns.
-                // Opt out of the global overflow gate; matches the same
-                // pattern used by ProviderCostPanel's per-provider table.
-                <div className="overflow-x-auto" data-viewport-allow-overflow>
-                  <table className="w-full text-[11px] border-collapse">
+                <>
+                  {/* Mobile: stacked card layout */}
+                  <div className="sm:hidden divide-y divide-neutral-800/30">
+                    {data.active_vms.map((vm) => (
+                      <VmCard key={vm.vm_instance_id} vm={vm} onViewTask={onViewTask} />
+                    ))}
+                  </div>
+                  {/* Desktop: table layout */}
+                  <table className="hidden sm:table w-full text-[11px] border-collapse">
                     <thead>
                       <tr className="text-neutral-500 text-[10px] uppercase tracking-wide">
                         <th className="text-left font-medium pb-1.5 pr-3">VM</th>
@@ -264,12 +266,83 @@ export function WarmVmPanel({ onViewTask }: Props) {
                       ))}
                     </tbody>
                   </table>
-                </div>
+                </>
               )}
             </>
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+function VmCard({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId: string) => void }) {
+  const hbAge = ageSecs(vm.last_heartbeat);
+  const aliveDot = vm.is_alive ? 'bg-emerald-400' : 'bg-neutral-600';
+  const cur = vm.current_task;
+
+  return (
+    <div className="py-2 text-[11px]">
+      <div className="flex items-center justify-between gap-2 mb-1">
+        <span className="flex items-center gap-1.5 font-mono text-neutral-300" title={vm.vm_instance_id}>
+          <span className={`inline-block w-1.5 h-1.5 rounded-full shrink-0 ${aliveDot}`} />
+          {shortVm(vm.vm_instance_id)}
+        </span>
+        <span className="font-mono text-neutral-400 text-[10px]">
+          {hbAge === null ? <span className="text-neutral-600">no hb</span> : (
+            <span className={vm.is_alive ? 'text-neutral-400' : 'text-amber-400'}>
+              <Clock className="w-2.5 h-2.5 inline mr-0.5" />{fmtAge(hbAge)}
+            </span>
+          )}
+        </span>
+      </div>
+      {cur ? (
+        <button
+          onClick={() => onViewTask?.(cur.id)}
+          className="w-full text-left hover:text-blue-400 transition-colors mb-1"
+        >
+          <div className="flex items-center gap-1.5">
+            {cur.warm_start && <Flame aria-label="Warm start" className="w-2.5 h-2.5 text-orange-400 shrink-0"><title>Warm start</title></Flame>}
+            <span className="text-neutral-200 truncate" title={cur.title}>{cur.title || '(untitled)'}</span>
+          </div>
+          <div className="text-[10px] text-neutral-500 font-mono mt-0.5">
+            {cur.task_type}
+            {cur.pr_number !== null && <> · PR #{cur.pr_number}</>}
+            {cur.warm_start && cur.warm_claim_origin === 'backlog_reuse' && (
+              <> · <span className="text-sky-400">backlog</span></>
+            )}
+            {cur.warm_start && cur.warm_claim_origin !== 'backlog_reuse' && cur.prior_role_vm_id && (
+              <> · <span className="text-orange-400">chain</span></>
+            )}
+            {cur.warm_start && cur.prior_role_vm_id && (
+              <> · from <span title={cur.prior_role_vm_id}>{shortVm(cur.prior_role_vm_id)}</span></>
+            )}
+          </div>
+        </button>
+      ) : (
+        <div className="text-neutral-600 italic mb-1">idle</div>
+      )}
+      <div className="grid grid-cols-2 gap-x-3 text-[10px] text-neutral-500">
+        <span>Setup: <span className="font-mono text-neutral-400">{cur ? fmtSetupSecs(cur.setup_secs) : '—'}</span></span>
+        <span>Pinned: <span className="font-mono text-neutral-400">{vm.warm_pinned_queued.length || '—'}</span></span>
+        {vm.recent_completions.length > 0 && (
+          <span className="col-span-2 mt-0.5">
+            Recent:{' '}
+            <span className="font-mono">
+              {vm.recent_completions.slice(0, 5).map((rc, i) => (
+                <button
+                  key={rc.id}
+                  onClick={() => onViewTask?.(rc.id)}
+                  className={`hover:text-blue-400 transition-colors ${rc.status === 'FAILED' ? 'text-red-400' : 'text-neutral-400'}`}
+                  title={`${rc.task_type} · ${rc.status}`}
+                >
+                  {i > 0 && <span className="text-neutral-600"> · </span>}{rc.task_type}
+                </button>
+              ))}
+            </span>
+          </span>
+        )}
+      </div>
     </div>
   );
 }

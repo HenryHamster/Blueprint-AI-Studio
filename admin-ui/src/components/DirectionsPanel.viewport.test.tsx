@@ -1,9 +1,10 @@
-import { afterEach, describe, test, vi } from 'vitest';
+import { afterEach, beforeEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { DirectionsPanel } from './DirectionsPanel';
 import type { Direction } from './DirectionsPanel';
-import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
+import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt, stressStrings } from '../test/viewport';
+import { apiFetch } from '../api';
 
 // Partial mock — preserve every other export from `../api` so transitive
 // imports (TaskCard's `authGet`, etc.) resolve. Browser-mode vitest
@@ -240,5 +241,70 @@ describe('DirectionsPanel — viewport regression', () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 50));
       });
     }, { selector: 'button, a[href]' });
+  });
+});
+
+// Worst-case direction: long text, held state, path tags, diagnosis,
+// research_history, cost breakdown — exercises every conditional render
+// path in DirectionCard that can produce dense/multi-badge rows at 375px.
+const stressDir: Direction = {
+  id: 'dir-stress', text: stressStrings.directionText, priority: 'high', status: 'active',
+  category: 'product', added_at: '2026-04-01T00:00:00Z',
+  paths: ['admin-ui/', 'backend/app/', 'agent/src/'],
+  held: true, held_reason: 'Repeated CODE_ERROR failures exceeded the automatic hold threshold.', held_at: '2026-05-15T00:00:00Z', held_until: '2026-05-15T02:00:00Z',
+  needs_manual_intervention: true, diagnosis_summary: stressStrings.errorSnippet, possibly_saturated: true,
+  cost_by_provider_model: { 'anthropic|claude-opus-4-7': 38.5, 'anthropic|claude-sonnet-4-6': 8.7 },
+  merge_rate: 0.6,
+  research_history: [{ timestamp: '2026-05-10T10:00:00Z', task_id: 'r1', tasks_created: 8,
+    finding_titles: [stressStrings.shortTitle], key_finding_descriptions: [stressStrings.errorSnippet] }],
+};
+
+describe('DirectionsPanel stress fixture — realistic direction data', () => {
+  let sRoot: Root | null = null;
+  let sHost: HTMLDivElement | null = null;
+
+  beforeEach(() => {
+    vi.mocked(apiFetch).mockImplementation(async (url: string) => {
+      if (url.includes('/directions') && !url.includes('/directions/')) {
+        return new Response(JSON.stringify({ directions: [stressDir], autonomous_enabled: true,
+          design_doc: {}, problem_model: {}, running_update: null, running_update_acknowledged_at: null }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    });
+  });
+
+  afterEach(() => {
+    if (sRoot) act(() => { sRoot!.unmount(); });
+    sRoot = null;
+    sHost?.remove();
+    sHost = null;
+  });
+
+  const proj = { id: 'p', name: 'Stress Project', status: 'active' as const,
+    github_owner: 'o', github_repo: 'r', autonomous_enabled: true, directions: [], created_at: '2026-01-01T00:00:00Z' };
+
+  async function renderStressPanel(r: Root): Promise<void> {
+    await act(async () => {
+      r.render(<DirectionsPanel onClose={() => {}} addToast={() => {}} selectedProjectId="p" projects={[proj]} />);
+    });
+    await act(async () => { await new Promise<void>((res) => setTimeout(res, 50)); });
+  }
+
+  test('stress fixture renders without horizontal overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      sHost = document.createElement('div');
+      document.body.appendChild(sHost);
+      sRoot = createRoot(sHost);
+      await renderStressPanel(sRoot);
+    });
+  });
+
+  test('stress fixture has no silent text truncation at 375px', async () => {
+    await expectNoTextTruncationAt(375, async () => {
+      sHost = document.createElement('div');
+      document.body.appendChild(sHost);
+      sRoot = createRoot(sHost);
+      await renderStressPanel(sRoot);
+    });
   });
 });

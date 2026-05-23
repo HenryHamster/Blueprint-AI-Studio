@@ -42,13 +42,13 @@ async def _make_project(db_session, name="Backlog Reuse"):
 
 
 async def _make_backlog_task(db_session, project_id, **overrides):
-    defaults = dict(
-        project_id=project_id,
-        title="Queued backlog work",
-        payloads=[{"type": "create", "prompt": "do X", "base_branch": "automain"}],
-        status=TaskStatus.QUEUED,
-        context={"scope": "small"},
-    )
+    defaults = {
+        "project_id": project_id,
+        "title": "Queued backlog work",
+        "payloads": [{"type": "create", "prompt": "do X", "base_branch": "automain"}],
+        "status": TaskStatus.QUEUED,
+        "context": {"scope": "small"},
+    }
     defaults.update(overrides)
     task = Task(**defaults)
     db_session.add(task)
@@ -94,6 +94,9 @@ class _FlagGuard:
                 self._rc[key] = prior
         self._ss.warm_backlog_first_refusal.clear()
         self._ss.warm_backlog_first_refusal.update(self._prior_refusal)
+        # Reset circuit-breaker state so tests don't bleed into each other.
+        self._ss.warm_backlog_reuse_failure_events.clear()
+        self._ss.warm_backlog_reuse_suppressed_until = None
         return False
 
 
@@ -348,6 +351,60 @@ async def test_eligibility_skips_other_vm_pin(db_session):
 
 
 @pytest.mark.asyncio
+async def test_in_progress_scan_computed_once_when_reused(db_session, mocker):
+    """A caller pairing the eligibility gate with the claim can compute the
+    project's IN_PROGRESS file set once and pass it to both, so the file-conflict
+    scan runs a single time instead of once per call."""
+    import app.warm_backlog_reuse as wbr
+
+    project = await _make_project(db_session, name="Scan Reuse")
+    vm_id = "agent-vm-scan"
+    # One IN_PROGRESS task (file-conflict source) + one clean candidate.
+    await _make_backlog_task(
+        db_session,
+        project.id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"related_files": ["src/app.py"]},
+    )
+    clean = await _make_backlog_task(
+        db_session, project.id, context={"related_files": ["docs/readme.md"]}
+    )
+
+    # Compute the IN_PROGRESS file set once, then reuse it across both calls.
+    in_progress_files = await wbr._project_in_progress_files(db_session, project.id)
+    spy = mocker.spy(wbr, "_project_in_progress_files")
+
+    assert (
+        await has_eligible_backlog_task(
+            db_session, project.id, vm_id, in_progress_files=in_progress_files
+        )
+        is True
+    )
+    picked = await select_backlog_reuse_candidate(
+        db_session, project.id, vm_id, in_progress_files=in_progress_files
+    )
+    assert picked is not None and picked.id == clean.id
+    # Neither call re-scanned IN_PROGRESS — the precomputed set was reused.
+    assert spy.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_in_progress_scan_runs_when_not_provided(db_session, mocker):
+    """When no precomputed set is passed, the scan still runs (lazy default),
+    preserving the standalone behavior of each helper."""
+    import app.warm_backlog_reuse as wbr
+
+    project = await _make_project(db_session, name="Scan Lazy")
+    vm_id = "agent-vm-lazy"
+    await _make_backlog_task(
+        db_session, project.id, context={"related_files": ["docs/readme.md"]}
+    )
+    spy = mocker.spy(wbr, "_project_in_progress_files")
+    assert await has_eligible_backlog_task(db_session, project.id, vm_id) is True
+    assert spy.call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_backlog_reused_task_lifts_efficiency_axes(
     client: AsyncClient, db_session, mocker
 ):
@@ -406,3 +463,63 @@ async def test_backlog_reused_task_lifts_efficiency_axes(
         assert axes[AXIS_VM_COLD_START_P50_MS] == 12000.0
         assert cold.vm_cold_start_ms == 12000
         assert backlog.vm_cold_start_ms is None
+
+
+# ---------------------------------------------------------------------------
+# Circuit-breaker tests
+# ---------------------------------------------------------------------------
+
+
+def test_backlog_reuse_circuit_breaker_suppresses_after_threshold():
+    """Injecting >= threshold failures trips the breaker and suppresses reuse."""
+    import app.shared_state as ss
+
+    ss.warm_backlog_reuse_failure_events.clear()
+    ss.warm_backlog_reuse_suppressed_until = None
+    threshold = ss.runtime_config.get("warm_backlog_reuse_failure_rate_threshold", 5)
+    try:
+        for _ in range(threshold):
+            ss.record_backlog_reuse_failure("task_failed")
+        assert ss.count_recent_backlog_reuse_failures() >= threshold
+        assert ss.is_warm_backlog_reuse_suppressed() is True
+        assert ss.warm_backlog_reuse_suppressed_until is not None
+    finally:
+        ss.warm_backlog_reuse_failure_events.clear()
+        ss.warm_backlog_reuse_suppressed_until = None
+
+
+def test_backlog_reuse_circuit_breaker_clears_after_cooldown():
+    """With an expired suppression deadline the breaker clears on the next check."""
+    from datetime import timedelta
+
+    import app.shared_state as ss
+    from app.time_utils import _utcnow
+
+    ss.warm_backlog_reuse_failure_events.clear()
+    # Set suppression deadline in the past so the breaker is "expired".
+    ss.warm_backlog_reuse_suppressed_until = _utcnow() - timedelta(seconds=1)
+    try:
+        # No recent failures — below threshold — so breaker should clear.
+        result = ss.is_warm_backlog_reuse_suppressed()
+        assert result is False
+        assert ss.warm_backlog_reuse_suppressed_until is None
+    finally:
+        ss.warm_backlog_reuse_failure_events.clear()
+        ss.warm_backlog_reuse_suppressed_until = None
+
+
+def test_backlog_reuse_finalize_error_records_failure():
+    """record_backlog_reuse_failure increments the event count (used from finalize error path)."""
+    import app.shared_state as ss
+
+    ss.warm_backlog_reuse_failure_events.clear()
+    ss.warm_backlog_reuse_suppressed_until = None
+    try:
+        assert ss.count_recent_backlog_reuse_failures() == 0
+        ss.record_backlog_reuse_failure("finalize_error")
+        assert ss.count_recent_backlog_reuse_failures() == 1
+        ss.record_backlog_reuse_failure("task_failed")
+        assert ss.count_recent_backlog_reuse_failures() == 2
+    finally:
+        ss.warm_backlog_reuse_failure_events.clear()
+        ss.warm_backlog_reuse_suppressed_until = None

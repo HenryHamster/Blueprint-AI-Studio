@@ -3,7 +3,8 @@
 Extends the existing warm-VM continuity mechanism so an idle agent VM can
 claim the next eligible QUEUED task from its project's GENERAL backlog --
 not only a PR-chain follow-on pinned to its VM. Gated by the runtime config
-flag ``warm_backlog_reuse_enabled`` (default OFF), independent from
+flag ``warm_backlog_reuse_enabled`` (default ON, guarded by the
+is_warm_backlog_reuse_suppressed() circuit breaker), independent from
 ``warm_continuity_enabled``.
 
 This module owns the *eligibility* and *atomic selection* for a backlog
@@ -60,7 +61,11 @@ async def _project_in_progress_files(session, project_id) -> set[str]:
 
 
 async def _eligible_backlog_ids(
-    session, project_id, vm_instance_id: str
+    session,
+    project_id,
+    vm_instance_id: str,
+    *,
+    in_progress_files: Optional[set[str]] = None,
 ) -> list[uuid.UUID]:
     """QUEUED task ids in *project_id* an idle VM may claim, priority-ordered.
 
@@ -78,6 +83,12 @@ async def _eligible_backlog_ids(
     Any task type is runnable by any agent VM (the workspace is re-cloned per
     role via resetForNextRole), so no per-VM task-type capability gate is
     needed — same-project scoping is the capability boundary.
+
+    ``in_progress_files`` lets a caller that already computed the project's
+    IN_PROGRESS file set (e.g. an eligibility gate immediately followed by a
+    claim) pass it in so the file-conflict scan runs once instead of once per
+    call. When omitted it is computed lazily — and only if the QUEUED scan
+    returned rows, so an empty backlog never pays for the IN_PROGRESS scan.
     """
     now = _utcnow()
     rows = (
@@ -103,7 +114,8 @@ async def _eligible_backlog_ids(
     if not rows:
         return []
 
-    in_progress_files = await _project_in_progress_files(session, project_id)
+    if in_progress_files is None:
+        in_progress_files = await _project_in_progress_files(session, project_id)
 
     eligible: list[uuid.UUID] = []
     for task_id, depends_on, ctx in rows:
@@ -121,17 +133,34 @@ async def _eligible_backlog_ids(
     return eligible
 
 
-async def has_eligible_backlog_task(session, project_id, vm_instance_id: str) -> bool:
+async def has_eligible_backlog_task(
+    session,
+    project_id,
+    vm_instance_id: str,
+    *,
+    in_progress_files: Optional[set[str]] = None,
+) -> bool:
     """True iff *project_id* has at least one backlog task this VM could claim.
 
     Used by the teardown-deferral decision: only worth keeping an idle VM
     alive if there is genuine pending work it can run warm.
+
+    Pass ``in_progress_files`` to reuse an already-computed IN_PROGRESS file
+    set (see ``_eligible_backlog_ids``) when this gate is paired with a claim.
     """
-    return bool(await _eligible_backlog_ids(session, project_id, vm_instance_id))
+    return bool(
+        await _eligible_backlog_ids(
+            session, project_id, vm_instance_id, in_progress_files=in_progress_files
+        )
+    )
 
 
 async def select_backlog_reuse_candidate(
-    session, project_id, vm_instance_id: str
+    session,
+    project_id,
+    vm_instance_id: str,
+    *,
+    in_progress_files: Optional[set[str]] = None,
 ) -> Optional[Task]:
     """Atomically lock the next claimable backlog task for an idle VM, or None.
 
@@ -143,8 +172,14 @@ async def select_backlog_reuse_candidate(
 
     The returned Task is locked and still QUEUED; the caller finalizes the
     claim (status flip, telemetry, commit).
+
+    Pass ``in_progress_files`` to reuse an already-computed IN_PROGRESS file
+    set (see ``_eligible_backlog_ids``) when this claim follows an eligibility
+    gate in the same flow, so the file-conflict scan is not run twice.
     """
-    eligible = await _eligible_backlog_ids(session, project_id, vm_instance_id)
+    eligible = await _eligible_backlog_ids(
+        session, project_id, vm_instance_id, in_progress_files=in_progress_files
+    )
     for task_id in eligible:
         locked = (
             (

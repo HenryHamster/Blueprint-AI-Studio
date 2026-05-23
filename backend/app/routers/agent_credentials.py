@@ -111,11 +111,14 @@ async def rotate_agent_credentials(
     secret_name = f"llm-account-{account.id}"
     try:
         new_ref = await store_user_secret("system", secret_name, result.secret)
-    except Exception as exc:  # noqa: BLE001 — Secret Manager fallback mirrors the create path
+    except Exception as exc:
         logger.warning(
-            f"[ROTATE] Secret Manager unavailable; storing inline for account {account.id}: {exc}"
+            f"[ROTATE] Secret Manager unavailable for account {account.id}: {exc}"
         )
-        new_ref = result.secret
+        raise HTTPException(
+            status_code=503,
+            detail="Secret rotation temporarily unavailable, retry shortly",
+        ) from exc
 
     account.secret_blob_ref = new_ref
     if result.provider_metadata:

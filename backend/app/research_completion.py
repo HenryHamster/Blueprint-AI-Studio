@@ -811,7 +811,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     s for s in _f["sources"] if isinstance(s, dict) and s.get("ref")
                 ]
                 # Validate file-type source refs at write time
-                _f["sources"] = validate_source_refs(_f["sources"])
+                _f["sources"] = await validate_source_refs(_f["sources"])
                 # Attach a structured provenance summary when the validation
                 # marks file refs invalid. The finding still spawns; the data
                 # is here so downstream consumers (admin UI, agent prompts)
@@ -1054,6 +1054,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         .scalars()
         .all()
     )
+    # Build set of finding hashes already memoed to prevent duplicate memo spawns
+    # across research cycles for the same underlying finding.
+    _existing_memo_finding_hashes: set[str] = {
+        h
+        for t in recent_tasks_for_dedup
+        if (h := (t.context or {}).get("memo_source_finding_hash"))
+    }
     # Collect parent IDs for COMPLETED+pr_merged tasks to detect ghost merges
     # (code merged to staging branch but parent rollup PR to main failed)
     potential_ghost_parent_ids = {
@@ -1074,11 +1081,101 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             .scalars()
             .all()
         )
+        # Base case: parent FAILED or CANCELLED — code never reached integration branch.
         failed_parent_ids = {
             p.id
             for p in parent_tasks_rows
             if p.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
         }
+        # Extended case (a): parent COMPLETED but rollup PR never merged — child's
+        # code is stranded on the staging branch with no path to integration branch.
+        failed_parent_ids |= {
+            p.id
+            for p in parent_tasks_rows
+            if p.status == TaskStatus.COMPLETED
+            and not (p.context or {}).get("pr_merged")
+        }
+        # Extended case (b): parent in non-terminal state — attempt git-ancestry
+        # verification on the rollup PR's merge commit.  Only mark stranded on a
+        # DEFINITIVE negative (is_ancestor_of returns False); indeterminate (None,
+        # missing merge SHA, or API error) falls back to flag-trust so a transient
+        # GitHub outage never triggers spurious re-spawns.
+        _non_terminal_statuses = frozenset(
+            {
+                TaskStatus.EVALUATING,
+                TaskStatus.QUEUED,
+                TaskStatus.IN_PROGRESS,
+                TaskStatus.PROVISIONING,
+            }
+        )
+        _non_terminal_parents = [
+            p for p in parent_tasks_rows if p.status in _non_terminal_statuses
+        ]
+        if _non_terminal_parents:
+            _integration_branch_rc = _runtime_config.get("integration_branch", "main")
+            _gh_creds_rc: tuple | None = None
+            try:
+                from app.release_qualifier import (
+                    _resolve_github_with_session as _rc_resolve_gh,
+                )  # noqa: PLC0415
+                from app import github as _rc_github  # noqa: PLC0415
+
+                if project_obj is not None:
+                    _gh_creds_rc = await _rc_resolve_gh(session, project_obj)
+            except Exception as _exc_rc:  # noqa: BLE001 — credential failure → skip
+                logger.debug(
+                    "[RESEARCH] GitHub credential resolution skipped for ancestry check: %s",
+                    _exc_rc,
+                )
+            if _gh_creds_rc is not None:
+                _rc_token, _rc_owner, _rc_repo = _gh_creds_rc
+                _rc_pr_cache: dict[int, dict] = {}
+                for _p in _non_terminal_parents:
+                    _p_ctx = _p.context or {}
+                    _pr_num_raw = _p_ctx.get("rollup_pr_number") or _p_ctx.get(
+                        "pr_number"
+                    )
+                    if not _pr_num_raw:
+                        continue
+                    try:
+                        _pr_num = int(_pr_num_raw)
+                        if _pr_num not in _rc_pr_cache:
+                            _rc_pr_cache[_pr_num] = await _rc_github.get_pull_request(
+                                _rc_token,
+                                _rc_owner,
+                                _rc_repo,
+                                _pr_num,
+                                project_id=str(task.project_id),
+                            )
+                        _pr_data = _rc_pr_cache[_pr_num] or {}
+                        _merge_sha = _pr_data.get("merge_commit_sha")
+                        if not _merge_sha:
+                            # PR not yet merged — no commit to check; indeterminate,
+                            # fall back to flag-trust (not stranded).
+                            continue
+                        _is_anc = await _rc_github.is_ancestor_of(
+                            _rc_token,
+                            _rc_owner,
+                            _rc_repo,
+                            _merge_sha,
+                            _integration_branch_rc,
+                            project_id=str(task.project_id),
+                        )
+                        if _is_anc is False:
+                            failed_parent_ids.add(_p.id)
+                            logger.info(
+                                "[RESEARCH] Parent task %s is non-terminal but ancestry "
+                                "check confirms merge commit %s not on %s — marking stranded",
+                                _p.id,
+                                _merge_sha[:8],
+                                _integration_branch_rc,
+                            )
+                    except Exception as _exc_p:  # noqa: BLE001 — API error → skip
+                        logger.debug(
+                            "[RESEARCH] ancestry check failed for parent task %s: %s",
+                            _p.id,
+                            _exc_p,
+                        )
 
     # Cross-cycle suppression: load previously filtered hashes and retired direction
     # failed approaches so findings rejected last cycle stay rejected, and findings
@@ -2153,6 +2250,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     ] + [(f, "degradation_gate") for f in _degradation_gate_deferred]
     _research_direction_id = (task.context or {}).get("direction_id")
     for _mf, _drop_reason in _memo_candidates[:MEMO_SPAWN_CAP_PER_CYCLE]:
+        _mf_hash = _mf.get("finding_hash") or _finding_hash(
+            _mf.get("title", ""), _mf.get("description", "") or _mf.get("prompt", "")
+        )
+        if _mf_hash in _existing_memo_finding_hashes:
+            logger.debug(
+                "[RESEARCH] Skipping duplicate memo for finding hash %s (task %s)",
+                _mf_hash,
+                task.id,
+            )
+            continue
         _memo_topic = str(
             _mf.get("title")
             or (_mf.get("description") or "")[:80]
@@ -2180,6 +2287,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "memo_source_task_id": str(task.id),
                 "memo_reasoning_kind": "deferred_finding",
                 "memo_drop_reason": _drop_reason,
+                "memo_source_finding_hash": _mf_hash,
                 **({"direction_id": _memo_dir_id} if _memo_dir_id else {}),
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",

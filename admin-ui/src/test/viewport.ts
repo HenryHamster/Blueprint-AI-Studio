@@ -351,3 +351,77 @@ export async function expectFullViewportAt(
     minSize: options?.minTouchSize,
   });
 }
+
+// ---------------------------------------------------------------------------
+// Shared stress-fixture helpers
+//
+// Realistic worst-case data for viewport regression tests: longest plausible
+// titles, every optional field populated, maximum realistic badge/row counts.
+// Import these in *.viewport.test.tsx files to exercise components under
+// production-scale data rather than thin hand-written mocks.
+// ---------------------------------------------------------------------------
+
+/** Worst-case strings shared across viewport stress fixtures. */
+export const stressStrings = {
+  title:
+    'feat(auth): implement token-refresh flow with sliding expiry and cross-tab sync for long-running operator sessions',
+  directionText:
+    'Improve admin UI mobile responsiveness across all operator-facing panels including kanban board, task detail drawer, and metrics dashboard',
+  errorSnippet:
+    'backend/testing/test_pipeline_regression_dispatcher.py::TestDispatcher::test_emit_duplicate_escalation_reason_on_retry FAILED',
+  shortTitle:
+    'fix(backend): dedup escalation_reason labels in pipeline_regression_dispatcher retry loops',
+} as const;
+
+/**
+ * Returns a worst-case digest response body for CatchUpPanel / DashboardHome
+ * viewport tests — all optional fields populated, two active tasks with all
+ * badges (direction, task_type, scope, review_iteration), two needs-attention rows.
+ */
+export function stressDigestPayload(): Record<string, unknown> {
+  const { title, directionText, errorSnippet, shortTitle } = stressStrings;
+  return {
+    window_hours: 24,
+    generated_at: '2026-05-06T00:00:00Z',
+    completed_count: 12, failed_count: 4, pending_approval_count: 3,
+    research_cycles: 3, prs_opened: 7, active_count: 2, running_count: 2,
+    needs_attention: [
+      { task_id: 'ta1', title, reason: 'failed', error_snippet: errorSnippet,
+        pr_url: null, failure_class: 'CODE_ERROR', scope: 'medium',
+        direction_text: directionText, merge_retries_saved: 3, waiting_hours: 5 },
+      { task_id: 'ta2', title: shortTitle, reason: 'pending_approval', error_snippet: null,
+        pr_url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/4924',
+        failure_class: null, scope: 'small', direction_text: directionText,
+        merge_retries_saved: 0, waiting_hours: 1 },
+    ],
+    recent_failures: [
+      { task_id: 'tf1', title: 'refactor: extract viewport-assertion helpers into shared util',
+        failed_at: '2026-05-05T12:30:00Z', error_snippet: errorSnippet,
+        failure_class: 'IMPORT_ERROR' },
+    ],
+    failure_groups: [
+      { failure_class: 'CODE_ERROR', label: 'Code Error', count: 3, tasks: [] },
+      { failure_class: 'TEST_FAILURE', label: 'Test Failure', count: 1, tasks: [] },
+    ],
+    recent_completions: [
+      { task_id: 'tc1', title: 'feat: add mobile-responsive layout for operator panels',
+        completed_at: '2026-05-06T00:00:00Z',
+        pr_url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/4600',
+        task_type: 'create', direction_id: 'd-001', direction_text: directionText,
+        duration_seconds: 3600 },
+    ],
+    direction_progress: [
+      { direction_id: 'd-001', direction_text: directionText, priority: 'high',
+        cycles_in_window: 6, tasks_created: 14, prs_merged: 8, possibly_saturated: false },
+    ],
+    active_tasks: [
+      { task_id: 'tact1', title, status: 'running', task_type: 'create',
+        started_at: '2026-05-06T00:00:00Z', running_cost_usd: 1.23,
+        direction_text: directionText, scope: 'medium', review_iteration: 2, review_cap: 3 },
+      { task_id: 'tact2', title: shortTitle, status: 'running', task_type: 'fix',
+        started_at: '2026-05-06T00:00:00Z', running_cost_usd: 0.87,
+        direction_text: directionText, scope: 'small', review_iteration: 1, review_cap: 3 },
+    ],
+    fresh_reviewer_effectiveness: null,
+  };
+}

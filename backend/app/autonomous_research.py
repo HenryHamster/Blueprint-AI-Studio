@@ -7,6 +7,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -765,27 +766,23 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # Guard: limit parallel research tasks per project.
     # EVALUATING parents are just waiting on children — they don't block new research.
     max_parallel = _runtime_config.get("max_parallel_research_per_project", 3)
-    active_tasks = (
-        (
-            await session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                    Task.status.in_(
-                        [
-                            TaskStatus.QUEUED,
-                            TaskStatus.PROVISIONING,
-                            TaskStatus.IN_PROGRESS,
-                        ]
-                    ),
-                )
+    active_research_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(
+                Task.project_id == project.id,
+                Task.status.in_(
+                    [
+                        TaskStatus.QUEUED,
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                    ]
+                ),
+                Task.payloads[0]["type"].astext == "research",
             )
         )
-        .scalars()
-        .all()
-    )
-    active_research_count = sum(
-        1 for t in active_tasks if (t.first_payload).get("type") == "research"
-    )
+    ).scalar() or 0
     if active_research_count >= max_parallel:
         return
     # Second cap: total research in any non-terminal state (including
@@ -794,28 +791,24 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # base. This cap prevents the pile-up that makes downstream merges
     # incrementally more conflict-prone.
     max_total = _runtime_config.get("max_total_research_per_project", 5)
-    total_tasks = (
-        (
-            await session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                    Task.status.in_(
-                        [
-                            TaskStatus.QUEUED,
-                            TaskStatus.PROVISIONING,
-                            TaskStatus.IN_PROGRESS,
-                            TaskStatus.EVALUATING,
-                        ]
-                    ),
-                )
+    total_research_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(
+                Task.project_id == project.id,
+                Task.status.in_(
+                    [
+                        TaskStatus.QUEUED,
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                        TaskStatus.EVALUATING,
+                    ]
+                ),
+                Task.payloads[0]["type"].astext == "research",
             )
         )
-        .scalars()
-        .all()
-    )
-    total_research_count = sum(
-        1 for t in total_tasks if (t.first_payload).get("type") == "research"
-    )
+    ).scalar() or 0
     if total_research_count >= max_total:
         logger.info(
             f"[AUTONOMOUS] Total research cap reached: {total_research_count}/{max_total} "
@@ -828,8 +821,6 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     )
     chosen_directions = chosen_directions[:remaining_slots]
     # Guard: global rate limit across ALL projects
-    from sqlalchemy import func
-
     one_hour_ago = _utcnow() - timedelta(hours=1)
     global_max = _runtime_config.get(
         "max_global_autonomous_tasks_per_hour",
@@ -851,22 +842,18 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         )
         return
     # Guard: per-project rate limit for research spawns
-    recent_research = (
-        (
-            await session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                    Task.created_by == "ORCHESTRATOR",
-                    Task.created_at >= one_hour_ago,
-                )
+    recent_research_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(
+                Task.project_id == project.id,
+                Task.created_by == "ORCHESTRATOR",
+                Task.created_at >= one_hour_ago,
+                Task.payloads[0]["type"].astext == "research",
             )
         )
-        .scalars()
-        .all()
-    )
-    recent_research_count = sum(
-        1 for t in recent_research if (t.first_payload).get("type") == "research"
-    )
+    ).scalar() or 0
     if recent_research_count >= _runtime_config["max_autonomous_tasks_per_hour"]:
         return
 

@@ -3,7 +3,7 @@ import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNo
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders } from '../api';
 import { parseTimestamp } from '../utils/time';
-import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, formatSinceTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP, type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes, ROUTINE_EVENT_LABELS, countHighSignalMessages, fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews } from './MessagesPanel.utils';
+import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, formatSinceTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, HIGH_SIGNAL_NOTE_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP, type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes, ROUTINE_EVENT_LABELS, countHighSignalMessages, fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews, fetchServerTempMutes, saveServerTempMutes, fetchServerMuteWindow, saveServerMuteWindow } from './MessagesPanel.utils';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -210,7 +210,7 @@ function ContextBadges({ context, fromType }: { context: Record<string, unknown>
   else if (eventType === 'pr_merged') badges.push({ label: 'PR Merged', className: 'text-green-400 bg-green-500/10 border-green-500/30' });
   else if (eventType === 'direction_milestone') badges.push({ label: (context.milestone as string) || 'Milestone', className: 'text-cyan-400 bg-cyan-500/10 border-cyan-500/30' });
   else if (eventType === 'cycle_summary') badges.push({ label: 'Cycle Summary', className: 'text-blue-400 bg-blue-500/10 border-blue-500/30' });
-  else if (eventType === 'failure_alert') badges.push({ label: 'Failure Alert', className: 'text-red-400 bg-red-500/10 border-red-500/30' });
+  else if (eventType && HIGH_SIGNAL_NOTE_BADGE_LABELS[eventType]) badges.push({ label: HIGH_SIGNAL_NOTE_BADGE_LABELS[eventType], className: 'text-red-400 bg-red-500/10 border-red-500/30 font-semibold' });
   else if (eventType === 'feedback_reply') badges.push({ label: 'Feedback Reply', className: 'text-purple-400 bg-purple-500/10 border-purple-500/30' });
 
   if (badges.length === 0) return null;
@@ -401,6 +401,24 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
           saveEventPrefs(auth.currentUser?.email, selectedProjectId, serverPrefs);
         }
       });
+      // Prefer server temp-mutes over localStorage — expiry semantics preserved (expired entries dropped).
+      fetchServerTempMutes(selectedProjectId).then(serverMutes => {
+        if (serverMutes !== null) {
+          setTempMutes(serverMutes);
+          saveTemporaryMutes(auth.currentUser?.email, selectedProjectId, serverMutes);
+        }
+      });
+      // Prefer server mute-window over localStorage — undefined = fetch failed, keep local fallback.
+      fetchServerMuteWindow(selectedProjectId).then(serverWin => {
+        if (serverWin !== undefined) {
+          setMuteWindow(serverWin);
+          if (serverWin !== null) {
+            saveMuteWindow(auth.currentUser?.email, selectedProjectId, serverWin);
+          } else {
+            clearMuteWindow(auth.currentUser?.email, selectedProjectId);
+          }
+        }
+      });
     }
     // Reload saved views for the new project — views never bleed across projects.
     setSavedViews(loadSavedViews(auth.currentUser?.email, selectedProjectId));
@@ -433,8 +451,6 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     return ta - tb;
   };
 
-  const byTimeDesc = (a: ProjectMessage, b: ProjectMessage) => -byTime(a, b);
-
   const matchesSearch = (msg: ProjectMessage): boolean => {
     if (!searchQuery.trim()) return true;
     const q = searchQuery.toLowerCase();
@@ -450,30 +466,15 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     return false;
   };
 
-  const SEVERITY_RANK: Record<string, number> = { BLOCKER: 0, BUG_REPORT: 1, FEEDBACK: 2, NOTE: 3 };
-  const CONTEXT_SEVERITY_RANK: Record<string, number> = { high: 0, medium: 1, low: 2 };
-  const bySeverity = (a: ProjectMessage, b: ProjectMessage) => {
-    const ra = SEVERITY_RANK[a.message_type] ?? 3;
-    const rb = SEVERITY_RANK[b.message_type] ?? 3;
-    if (ra !== rb) return ra - rb;
-    // Same message_type, compare by context.severity
-    const sa = (a.context.severity as string | undefined) ?? 'undefined';
-    const sb = (b.context.severity as string | undefined) ?? 'undefined';
-    const sa_rank = CONTEXT_SEVERITY_RANK[sa] ?? 3;
-    const sb_rank = CONTEXT_SEVERITY_RANK[sb] ?? 3;
-    if (sa_rank !== sb_rank) return sa_rank - sb_rank;
-    return byTimeDesc(a, b);
-  };
-
-  const openMessages = messages.filter(m => m.status === 'open' && (!criticalOnly || isCriticalSeverity(m)));
-  const resolvedMessages = messages.filter(m => m.status === 'resolved');
-  const openFeedbackMessages = openMessages.filter(m => m.message_type === 'FEEDBACK' && matchesSearch(m));
-
-  // Filter to only new messages when showOnlyNew is enabled
-  const isNewMessage = (m: ProjectMessage): boolean => {
-    if (!showOnlyNew || !dividerTime || !m.created_at) return true;
-    return parseTimestamp(m.created_at).getTime() > dividerTime;
-  };
+  const { openMessages, resolvedMessages, openFeedbackMessages } = useMemo(() => {
+    const open = messages.filter(m => m.status === 'open' && (!criticalOnly || isCriticalSeverity(m)));
+    return {
+      openMessages: open,
+      resolvedMessages: messages.filter(m => m.status === 'resolved'),
+      openFeedbackMessages: open.filter(m => m.message_type === 'FEEDBACK' && matchesSearch(m)),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages, criticalOnly, searchQuery]);
 
   // Count new high-signal messages (created after divider time) — for visual divider only
   const newHighSignalCount = dividerTime
@@ -484,14 +485,13 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
       ).length
     : 0;
 
-  // Badge/tab-title count. Uses countHighSignalMessages (prefs-independent) so the value
-  // matches the closed-panel App.tsx badge and the fetch callback at line 806 — the count
-  // must not jump when the operator opens the panel. Operator mute/surface prefs only
-  // affect in-panel grouping (highSignalOpen/routineOpen), not the global badge.
-  const highSignalCount = countHighSignalMessages(messages);
+  // Badge/tab-title count. Passes eventPrefs/tempMutes so muted types are excluded and
+  // surfaced types are included — matching App.tsx's closed-panel count exactly so the
+  // badge does not jump when the operator opens the panel.
+  const highSignalCount = countHighSignalMessages(messages, eventPrefs, tempMutes);
 
   // Count new messages by type for the summary card (respecting mute prefs and criticalOnly)
-  const newMessageCounts = dividerTime
+  const newMessageCounts = useMemo(() => dividerTime
     ? {
         blockers: openMessages.filter(m =>
           m.message_type === 'BLOCKER' &&
@@ -523,41 +523,83 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
           effectiveSignal(m, eventPrefs, tempMutes) === 'high'
         ).length,
       }
-    : { blockers: 0, feedback: 0, bugReports: 0, routine: 0, highSignalNotes: 0 };
+    : { blockers: 0, feedback: 0, bugReports: 0, routine: 0, highSignalNotes: 0 },
+  [openMessages, dividerTime, eventPrefs, tempMutes]);
 
   // Total new count: each message counted exactly once (high-signal and routine are disjoint)
   const totalNewCount = newHighSignalCount + newMessageCounts.routine;
 
   // Split open messages by signal level, respecting per-event-type prefs and temp mutes, then filter by search
   const muteActive = isMuteWindowActive(muteWindow);
-  const highSignalOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs, tempMutes) === 'high' && matchesSearch(m) && isNewMessage(m))]
-    .sort(sortMode === 'importance' ? bySeverity : byTimeDesc);
-  // Always compute routine messages; mute only filters them from the non-promoted routine section
-  const routineOpen = [...openMessages.filter(m => effectiveSignal(m, eventPrefs, tempMutes) === 'routine' && matchesSearch(m) && isNewMessage(m))].sort(byTimeDesc);
+  const { highSignalOpen, routineOpen } = useMemo(() => {
+    const isNew = (m: ProjectMessage): boolean => {
+      if (!showOnlyNew || !dividerTime || !m.created_at) return true;
+      return parseTimestamp(m.created_at).getTime() > dividerTime;
+    };
+    const SEVERITY_RANK_INNER: Record<string, number> = { BLOCKER: 0, BUG_REPORT: 1, FEEDBACK: 2, NOTE: 3 };
+    const CONTEXT_SEVERITY_RANK_INNER: Record<string, number> = { high: 0, medium: 1, low: 2 };
+    const byTimeDescInner = (a: ProjectMessage, b: ProjectMessage) => {
+      const ta = a.created_at ? parseTimestamp(a.created_at).getTime() : 0;
+      const tb = b.created_at ? parseTimestamp(b.created_at).getTime() : 0;
+      return tb - ta;
+    };
+    const bySeverityInner = (a: ProjectMessage, b: ProjectMessage) => {
+      const ra = SEVERITY_RANK_INNER[a.message_type] ?? 3;
+      const rb = SEVERITY_RANK_INNER[b.message_type] ?? 3;
+      if (ra !== rb) return ra - rb;
+      const sa = (a.context.severity as string | undefined) ?? 'undefined';
+      const sb = (b.context.severity as string | undefined) ?? 'undefined';
+      const sa_rank = CONTEXT_SEVERITY_RANK_INNER[sa] ?? 3;
+      const sb_rank = CONTEXT_SEVERITY_RANK_INNER[sb] ?? 3;
+      if (sa_rank !== sb_rank) return sa_rank - sb_rank;
+      return byTimeDescInner(a, b);
+    };
+    return {
+      highSignalOpen: [...openMessages.filter(m => effectiveSignal(m, eventPrefs, tempMutes) === 'high' && matchesSearch(m) && isNew(m))]
+        .sort(sortMode === 'importance' ? bySeverityInner : byTimeDescInner),
+      // Always compute routine messages; mute only filters them from the non-promoted routine section
+      routineOpen: [...openMessages.filter(m => effectiveSignal(m, eventPrefs, tempMutes) === 'routine' && matchesSearch(m) && isNew(m))].sort(byTimeDescInner),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openMessages, eventPrefs, tempMutes, searchQuery, sortMode, showOnlyNew, dividerTime]);
 
   // In importance mode, pin BLOCKERs at the top with a visual divider
   const pinnedBlockers = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type === 'BLOCKER') : [];
   const otherHighSignal = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type !== 'BLOCKER') : highSignalOpen;
 
   // Failing routine groups auto-promoted above the routine ops section
-  const allRoutineRows = collapseStaleRoutineRows(groupRoutineMessages(routineOpen));
-  const promotedGroups = allRoutineRows.filter(
-    (r): r is RoutineRow<ProjectMessage> & { kind: 'group' } =>
-      r.kind === 'group' && isFailingGroup(r.msgs) && eventPrefs[r.event_type] !== 'mute',
-  );
-  const promotedKeys = new Set(promotedGroups.map(r => r.key));
-  // When mute is active, filter out routine messages from the remaining section, but keep promoted groups
-  const remainingRoutineRows = muteActive
-    ? allRoutineRows.filter(r => promotedKeys.has((r as RoutineRow<ProjectMessage> & { key?: string }).key ?? ''))
-    : allRoutineRows.filter(r => r.kind !== 'group' || !promotedKeys.has(r.key));
-
-  // Auto-expand groups that have search matches
-  const groupsWithMatches = new Set(
-    allRoutineRows
-      .filter((r): r is RoutineRow<ProjectMessage> & { kind: 'group' } => r.kind === 'group' && r.msgs.length > 0)
-      .map(r => r.key)
-  );
-  const autoExpandedKeys = searchQuery.trim() ? groupsWithMatches : new Set();
+  const { promotedGroups, remainingRoutineRows, autoExpandedKeys, visibleRoutineCount, mutedRoutineCount } = useMemo(() => {
+    const rows = collapseStaleRoutineRows(groupRoutineMessages(routineOpen));
+    const promoted = rows.filter(
+      (r): r is RoutineRow<ProjectMessage> & { kind: 'group' } =>
+        r.kind === 'group' && isFailingGroup(r.msgs) && eventPrefs[r.event_type] !== 'mute',
+    );
+    const promotedSet = new Set(promoted.map(r => r.key));
+    // When mute is active, filter out routine messages from the remaining section, but keep promoted groups
+    const remaining = muteActive
+      ? rows.filter(r => promotedSet.has((r as RoutineRow<ProjectMessage> & { key?: string }).key ?? ''))
+      : rows.filter(r => r.kind !== 'group' || !promotedSet.has(r.key));
+    // Auto-expand groups that have search matches
+    const withMatches = new Set(
+      rows
+        .filter((r): r is RoutineRow<ProjectMessage> & { kind: 'group' } => r.kind === 'group' && r.msgs.length > 0)
+        .map(r => r.key)
+    );
+    // Calculate shown vs muted routine message counts when mute is active
+    let visible = routineOpen.length;
+    let muted = 0;
+    if (muteActive && promoted.length > 0) {
+      visible = promoted.reduce((sum, row) => sum + row.msgs.length, 0);
+      muted = routineOpen.length - visible;
+    }
+    return {
+      promotedGroups: promoted,
+      remainingRoutineRows: remaining,
+      autoExpandedKeys: searchQuery.trim() ? withMatches : new Set<string>(),
+      visibleRoutineCount: visible,
+      mutedRoutineCount: muted,
+    };
+  }, [routineOpen, eventPrefs, muteActive, searchQuery]);
 
   // Calculate 24-hour volume for each event type and memoize event types
   const { eventType24hVolume, sortedEventTypes } = useMemo(() => {
@@ -610,6 +652,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     setTempMutes(prev => {
       const next = { ...prev, [eventType]: Date.now() + durationMs };
       saveTemporaryMutes(auth.currentUser?.email, selectedProjectId, next);
+      if (selectedProjectId) void saveServerTempMutes(selectedProjectId, next);
       return next;
     });
     setShowTempMuteMenu(false);
@@ -834,7 +877,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
         if (prev.length === msgs.length && prev.every((m, i) => m.id === msgs[i].id && m.status === msgs[i].status)) return prev;
         return msgs;
       });
-      onMessageCountChange?.(countHighSignalMessages(msgs));
+      onMessageCountChange?.(countHighSignalMessages(msgs, eventPrefsRef.current, tempMutesRef.current));
       // Fetch webhook delivery stats (non-critical — errors are silently ignored)
       try {
         const statsRes = await apiFetch(`${API_BASE_URL}/api/admin/notification-dispatch/stats?project_id=${selectedProjectId}`);
@@ -1126,7 +1169,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     }
 
     return (
-      <div key={msg.id} className={`flex ${userMsg ? 'justify-end' : 'justify-start'} ${faded ? 'opacity-75' : ''}`}>
+      <div key={msg.id} data-testid="message-bubble" className={`flex ${userMsg ? 'justify-end' : 'justify-start'} ${faded ? 'opacity-75' : ''}`}>
         <div className={`max-w-[85%] md:max-w-[70%] ${userMsg ? 'items-end' : 'items-start'} flex flex-col`}>
           {/* Bubble */}
           <div className={`rounded-2xl border px-4 py-3 ${config.bubbleBg} ${
@@ -1424,6 +1467,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                         <button key={label} onClick={() => {
                           const updated = { expiresAt: (muteWindow!.expiresAt) + ms };
                           saveMuteWindow(auth.currentUser?.email, selectedProjectId, updated);
+                          if (selectedProjectId) void saveServerMuteWindow(selectedProjectId, updated);
                           setMuteWindow(updated);
                           setShowMuteMenu(false);
                         }} className="w-full text-left text-xs px-2 py-2 rounded text-neutral-300 hover:bg-neutral-800 transition-colors min-h-[44px] md:min-h-auto flex items-center">{label}</button>
@@ -1431,6 +1475,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                       <div className="border-t border-neutral-800 my-1" />
                       <button onClick={() => {
                         clearMuteWindow(auth.currentUser?.email, selectedProjectId);
+                        if (selectedProjectId) void saveServerMuteWindow(selectedProjectId, null);
                         setMuteWindow(null);
                         setShowMuteMenu(false);
                       }} className="w-full text-left text-xs px-2 py-2 rounded text-amber-400 hover:bg-amber-500/10 transition-colors min-h-[44px] md:min-h-auto flex items-center">End mute early</button>
@@ -1442,6 +1487,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                         <button key={label} onClick={() => {
                           const newWin = { expiresAt: Date.now() + ms };
                           saveMuteWindow(auth.currentUser?.email, selectedProjectId, newWin);
+                          if (selectedProjectId) void saveServerMuteWindow(selectedProjectId, newWin);
                           setMuteWindow(newWin);
                           setShowMuteMenu(false);
                         }} className="w-full text-left text-xs px-2 py-2 rounded text-neutral-300 hover:bg-neutral-800 transition-colors min-h-[44px] md:min-h-auto flex items-center">{label}</button>
@@ -1889,7 +1935,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                     className="flex-1 flex items-center gap-2 px-4 py-2.5 text-left"
                   >
                     <ChevronDown className={`w-3.5 h-3.5 text-neutral-600 shrink-0 transition-transform ${routineExpanded ? 'rotate-180' : ''}`} />
-                    <span className="text-xs text-neutral-500 font-medium shrink-0">{routineOpen.length} routine ops</span>
+                    <span className="text-xs text-neutral-500 font-medium shrink-0">
+                      {visibleRoutineCount} routine ops
+                      {mutedRoutineCount > 0 && <span className="text-neutral-600 ml-1">({mutedRoutineCount} muted)</span>}
+                    </span>
                     <span className="text-[11px] text-neutral-600 truncate">{routineSummary(routineOpen)}</span>
                   </button>
                   <div className="relative shrink-0 px-2">

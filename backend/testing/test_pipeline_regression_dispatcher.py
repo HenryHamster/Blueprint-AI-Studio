@@ -44,21 +44,25 @@ def _design_doc_with_sr_regression(
     category: str = "correctness",
     prior: float = 0.80,
     current: float = 0.50,
+    trend_significant: bool | None = True,
 ) -> dict:
     """Synthesize a sr_catch_rate_trends snapshot the dispatcher will trip on.
 
     The dispatcher reads ``project.design_doc["sr_catch_rate_trends"]["categories"]``
-    and trips when current_hit_rate dropped vs previous_hit_rate by ≥ 5pp.
+    and trips when current_hit_rate dropped vs previous_hit_rate by ≥ 5pp AND
+    trend_significant is not False (i.e. True or None for backward compat).
     """
+    cat_data: dict = {
+        "current_hit_rate": current,
+        "previous_hit_rate": prior,
+        "current_human_count": 12,
+        "trend": "decreasing",
+        "trend_significant": trend_significant,
+    }
     return {
         "sr_catch_rate_trends": {
             "categories": {
-                category: {
-                    "current_hit_rate": current,
-                    "previous_hit_rate": prior,
-                    "current_human_count": 12,
-                    "trend": "decreasing",
-                },
+                category: cat_data,
             },
         },
     }
@@ -130,6 +134,27 @@ async def test_payload_shape_and_context(db_session):
     assert ctx["current_rate"] == 0.50
     assert ctx["sample_size"] >= 5
     assert "dispatcher_cooldown_until_iso" in ctx
+
+
+@pytest.mark.asyncio
+async def test_sr_catch_rate_insignificant_trend_not_spawned(db_session):
+    """A category with trend_significant=False must not spawn even when raw delta ≥ 5pp."""
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness",
+            prior=0.80,
+            current=0.60,
+            trend_significant=False,
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 0, (
+        "Dispatcher must not spawn for a statistically-insignificant catch-rate delta"
+    )
 
 
 @pytest.mark.asyncio
@@ -7784,9 +7809,13 @@ async def test_telemetry_stale_spawns_investigation_for_stale_sr_catch_rate(db_s
 
     now = _utcnow()
     stale_ts = (now - timedelta(hours=50)).isoformat()
+    fresh_ts = (now - timedelta(hours=1)).isoformat()
     project = make_project(
         design_doc={
-            "sr_catch_rate_trends": {"signal_last_computed_at": stale_ts},
+            "sr_catch_rate_trends": {
+                "signal_last_computed_at": fresh_ts,
+                "last_sufficient_computed_at": stale_ts,
+            },
         }
     )
     db_session.add(project)
@@ -7867,9 +7896,13 @@ async def test_telemetry_stale_dedup_inflight_blocks_second_spawn(db_session):
 
     now = _utcnow()
     stale_ts = (now - timedelta(hours=50)).isoformat()
+    fresh_ts = (now - timedelta(hours=1)).isoformat()
     project = make_project(
         design_doc={
-            "sr_catch_rate_trends": {"signal_last_computed_at": stale_ts},
+            "sr_catch_rate_trends": {
+                "signal_last_computed_at": fresh_ts,
+                "last_sufficient_computed_at": stale_ts,
+            },
         }
     )
     db_session.add(project)
@@ -7903,7 +7936,10 @@ async def test_telemetry_stale_recovery_closes_when_signal_refreshed(db_session)
     fresh_ts = (now - timedelta(hours=24)).isoformat()
     project = make_project(
         design_doc={
-            "sr_catch_rate_trends": {"signal_last_computed_at": fresh_ts},
+            "sr_catch_rate_trends": {
+                "signal_last_computed_at": fresh_ts,
+                "last_sufficient_computed_at": fresh_ts,
+            },
         }
     )
     db_session.add(project)
@@ -7920,6 +7956,348 @@ async def test_telemetry_stale_recovery_closes_when_signal_refreshed(db_session)
 
     await db_session.refresh(case)
     assert case.status == RegressionCaseStatus.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_telemetry_stale_no_spawn_when_heartbeat_fresh_but_no_categories(
+    db_session,
+):
+    """Fresh heartbeat with no last_sufficient_computed_at → never-sufficient spawn, not stale spawn.
+
+    The heartbeat ran recently but the signal has never reached data sufficiency.
+    The stale watchdog must not fire (signal is fresh), but the never-sufficient
+    detector should fire and spawn a telemetry_never_sufficient investigation.
+    """
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    fresh_ts = (now - timedelta(hours=12)).isoformat()
+    project = make_project(
+        design_doc={
+            # Heartbeat is fresh; no last_sufficient_computed_at — never produced real measurement.
+            "sr_catch_rate_trends": {"signal_last_computed_at": fresh_ts},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await run_once(db_session, project.id)
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    stale_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class") == "telemetry_stale:sr_catch_rate"
+    ]
+    never_sufficient_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class")
+        == "telemetry_never_sufficient:sr_catch_rate"
+    ]
+    # No ordinary stale spawn — the signal heartbeat is fresh.
+    assert len(stale_tasks) == 0
+    # But never-sufficient detection fires — the signal has run but never produced real data.
+    assert len(never_sufficient_tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_telemetry_stale_no_spawn_when_heartbeat_key_absent(db_session):
+    """No signal_last_computed_at key at all → no staleness investigation spawned.
+
+    If the heartbeat has never been written (e.g. the project is brand-new or
+    the metric was just added), the watchdog should not treat the absence as a
+    stale signal and must not spawn an investigate task.
+    """
+    project = make_project(
+        design_doc={
+            # design_doc has sr_catch_rate_trends but no signal_last_computed_at.
+            "sr_catch_rate_trends": {"categories": {}},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await run_once(db_session, project.id)
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    stale_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class") == "telemetry_stale:sr_catch_rate"
+    ]
+    assert len(stale_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_telemetry_stale_computed_at_alone_does_not_trigger(db_session):
+    """Stale computed_at with no signal_last_computed_at does not spawn an investigation.
+
+    The old dispatcher used computed_at as a fallback for sr_catch_rate staleness.
+    After the heartbeat fix, signal_last_computed_at is the sole staleness key;
+    a stale computed_at without a heartbeat must not trigger the watchdog.
+    """
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    stale_ts = (now - timedelta(hours=60)).isoformat()
+    project = make_project(
+        design_doc={
+            # Only computed_at present (the old result-stamp key), no heartbeat key.
+            "sr_catch_rate_trends": {"computed_at": stale_ts},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await run_once(db_session, project.id)
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    stale_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class") == "telemetry_stale:sr_catch_rate"
+    ]
+    assert len(stale_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_telemetry_stale_fires_on_stale_last_sufficient_even_with_fresh_heartbeat(
+    db_session,
+):
+    """data_sufficient=False with fresh signal_last_computed_at but stale last_sufficient_computed_at triggers staleness.
+
+    When compute_sr_catch_rate_trends runs but can't produce a real result
+    (insufficient findings), it stamps signal_last_computed_at as a heartbeat
+    while preserving the older last_sufficient_computed_at.  The dispatcher must
+    key staleness on last_sufficient_computed_at so a frozen trend is detected
+    even though the heartbeat looks fresh.
+    """
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    stale_sufficient = (now - timedelta(hours=60)).isoformat()
+    fresh_heartbeat = (now - timedelta(hours=1)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {
+                "signal_last_computed_at": fresh_heartbeat,
+                "last_sufficient_computed_at": stale_sufficient,
+                "data_sufficient": False,
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned >= 1
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    stale_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class") == "telemetry_stale:sr_catch_rate"
+    ]
+    assert len(stale_tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_telemetry_never_sufficient_spawns_investigation(db_session):
+    """signal_last_computed_at present but last_sufficient_computed_at absent → spawns telemetry_never_sufficient investigation."""
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    fresh_ts = (now - timedelta(hours=6)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {"signal_last_computed_at": fresh_ts},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned >= 1
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    never_sufficient_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class")
+        == "telemetry_never_sufficient:sr_catch_rate"
+    ]
+    assert len(never_sufficient_tasks) == 1
+    task = never_sufficient_tasks[0]
+    payload = task.first_payload or {}
+    assert payload.get("type") == "investigate"
+    ctx = task.context or {}
+    assert ctx["signal_name"] == "telemetry_never_sufficient"
+    prompt = payload.get("prompt", "")
+    assert "sr_catch_rate" in prompt
+    assert "sufficiency" in prompt
+
+
+@pytest.mark.asyncio
+async def test_telemetry_never_sufficient_dedup_blocks_second_spawn(db_session):
+    """A second run_once with a never-sufficient case in-flight does not spawn a duplicate."""
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    fresh_ts = (now - timedelta(hours=6)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {"signal_last_computed_at": fresh_ts},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first = await run_once(db_session, project.id)
+    assert first >= 1
+
+    await run_once(db_session, project.id)
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    never_sufficient_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class")
+        == "telemetry_never_sufficient:sr_catch_rate"
+    ]
+    assert len(never_sufficient_tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_sr_catch_rate_never_sufficient_emits_warning_alert(db_session):
+    """signal_last_computed_at present but last_sufficient absent → WARNING Alert created."""
+    from app.models import Alert, AlertSeverity
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    fresh_ts = (now - timedelta(hours=6)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {"signal_last_computed_at": fresh_ts},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await run_once(db_session, project.id)
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.title == "Signal staleness: sr_catch_rate",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "sufficiency" in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_sr_catch_rate_never_sufficient_no_alert_when_signal_has_never_run(
+    db_session,
+):
+    """Both timestamps absent (truly new project) → no never-sufficient alert created."""
+    from app.models import Alert, AlertSeverity
+
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await run_once(db_session, project.id)
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.title == "Signal staleness: sr_catch_rate",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_sr_catch_rate_never_sufficient_no_double_alert_idempotent(db_session):
+    """Running the watchdog twice with never-sufficient state produces only one alert."""
+    from app.models import Alert, AlertSeverity
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    fresh_ts = (now - timedelta(hours=6)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {"signal_last_computed_at": fresh_ts},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await run_once(db_session, project.id)
+    await run_once(db_session, project.id)
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.title == "Signal staleness: sr_catch_rate",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -9211,7 +9589,7 @@ async def test_regression_mtta_data_eta_recovery_per_case(db_session):
             ).isoformat(),
         },
     ]
-    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+    from sqlalchemy.orm.attributes import flag_modified
 
     flag_modified(case_b, "fingerprint_to_fix_log")
     await db_session.commit()
@@ -10588,7 +10966,7 @@ def _make_viewport_task(
     status_message: str,
     title: str = "Test Task",
     updated_at_offset_hours: int = 1,
-) -> "Task":
+) -> Task:
     """Create a FAILED Task whose status_message triggers VIEWPORT_REGRESSION classification."""
     now = _utcnow()
     task = make_task(
@@ -14144,7 +14522,7 @@ async def test_recurring_class_trips_when_class_spans_2_layers_across_3_cycles(
 
     # Recurring-class meta-spawns get a dedicated escalation_reason so
     # operators can distinguish them from generic cross-layer escalations.
-    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
+    from app.pipeline_regression_dispatcher import (
         ESCALATION_REASON_RECURRING_CLASS_META,
     )
 
@@ -14383,7 +14761,7 @@ async def test_recurring_class_prompt_annotates_non_compliant_cycle(db_session):
     # Single-layer fix's targeted layer is named in the guidance.
     assert "CI_WORKFLOW" in prompt
     # At least one canonical layer untargeted across the full history is named.
-    from app.regression_layer_classifier import LAYER_DISPLAY_ORDER  # noqa: PLC0415
+    from app.regression_layer_classifier import LAYER_DISPLAY_ORDER
 
     # CI_WORKFLOW + AGENT_VM are targeted; the remaining canonical layers are untargeted.
     expected_untargeted = [
@@ -15499,3 +15877,396 @@ async def test_fix_loop_divergence_non_fingerprint_does_not_trip_with_stable_rat
 
     spawned = await run_once(db_session, project.id)
     assert spawned == 0
+
+
+# ---------------------------------------------------------------------------
+# Recovery coverage — every spawnable regression_class shape must be
+# re-evaluatable by the recovery path so a merged fix can auto-close.
+# ---------------------------------------------------------------------------
+
+
+def _design_doc_for_recovery_coverage() -> dict:
+    """Design-doc that lets every telemetry-snapshot recovery branch evaluate."""
+    now = _utcnow()
+    return {
+        "sr_catch_rate_trends": {
+            "signal_last_computed_at": now.isoformat(),
+            "last_sufficient_computed_at": now.isoformat(),
+            "categories": {
+                "correctness": {
+                    "current_hit_rate": 0.80,
+                    "previous_hit_rate": 0.80,
+                    "current_human_count": 12,
+                    "trend": "stable",
+                    "false_positive_rate": 0.50,
+                    "previous_fp_rate": 0.50,
+                    "below_floor": False,
+                    "rate_history": [0.80, 0.80],
+                    "reasoning_engagement_rate": 0.95,
+                    "reasoning_engagement_total": 20,
+                },
+            },
+            "by_direction": {
+                "dir-coverage-test": {
+                    "categories": {
+                        "correctness": {
+                            "hit_rate": 0.80,
+                            "sample_count": 5,
+                            "miss_rate": 0.20,
+                        }
+                    }
+                }
+            },
+        },
+        "sr_false_attestation_trends": {
+            "per_category": {
+                "correctness": {
+                    "false_attestation_rate": 0.02,
+                    "previous_false_attestation_rate": 0.02,
+                    "false_attested": 1,
+                    "ci_confirmed": 49,
+                }
+            }
+        },
+        "viewport_coverage_snapshot": {
+            "assertion_count_before": 10,
+            "assertion_count_after": 10,
+            "new_escape_hatch_count": 0,
+            "removed_component_files": [],
+            "merged_pr": 1,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_recovery_covers_every_spawnable_regression_class(db_session):
+    """Every shape in SPAWNABLE_REGRESSION_CLASS_SHAPES is recoverable.
+
+    Enumerates the canonical declaration and asserts ``_current_signal_value_for_class``
+    returns a non-None state dict (with the full contract) for a representative
+    instance of every shape. If someone later adds a new spawnable class without
+    a recovery branch — or lists it in the registry without an evaluator/inline
+    branch — this test fails because recovery returns None for that shape.
+    """
+    from app.playbook_learning import _MIN_SR_SAMPLE
+    from app.pipeline_regression_dispatcher import (
+        SPAWNABLE_REGRESSION_CLASS_SHAPES,
+        _PIPELINE_SUCCESS_MIN_SAMPLE,
+        _current_signal_value_for_class,
+        match_spawnable_shape,
+    )
+
+    now = _utcnow()
+    project = make_project(design_doc=_design_doc_for_recovery_coverage())
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # fix_loop_divergence:lint — needs >= _MIN_SR_SAMPLE tasks in BOTH the
+    # current (0-7d) and previous (7-14d) windows.
+    for _ in range(_MIN_SR_SAMPLE):
+        db_session.add(
+            _make_fix_loop_divergence_task(
+                project.id,
+                error_tail="lint drift",
+                related_files=["backend/app/x.py"],
+                loop="lint",
+                created_at=now - timedelta(days=3),
+            )
+        )
+        db_session.add(
+            _make_fix_loop_divergence_task(
+                project.id,
+                error_tail="lint drift",
+                related_files=["backend/app/x.py"],
+                loop="lint",
+                created_at=now - timedelta(days=10),
+            )
+        )
+    # sr_blind_spot:correctness — needs reviewer-disagreement denom >= floor.
+    for _ in range(_MIN_SR_SAMPLE):
+        db_session.add(
+            _make_sr_blind_spot_task(
+                project.id,
+                category="correctness",
+                miss=True,
+                created_at=now - timedelta(days=3),
+            )
+        )
+    # pipeline_success_rate — needs >= _PIPELINE_SUCCESS_MIN_SAMPLE terminal
+    # tasks updated within the 24h window.
+    for _ in range(_PIPELINE_SUCCESS_MIN_SAMPLE + 2):
+        db_session.add(make_task(project_id=project.id, status=TaskStatus.COMPLETED))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    contract_keys = {
+        "signal_name",
+        "prior_rate",
+        "current_rate",
+        "sample_size",
+        "magnitude",
+        "tripped",
+        "extras",
+    }
+
+    assert SPAWNABLE_REGRESSION_CLASS_SHAPES, "registry must not be empty"
+    for shape in SPAWNABLE_REGRESSION_CLASS_SHAPES:
+        state = await _current_signal_value_for_class(
+            db_session,
+            project.id,
+            shape.example,
+            project.design_doc,
+        )
+        assert state is not None, (
+            f"recovery returned None for spawnable shape {shape.example!r} "
+            f"(signal={shape.signal_name}) — every spawnable class needs a "
+            f"recovery branch so its merged fix can auto-close"
+        )
+        missing = contract_keys - set(state.keys())
+        assert not missing, f"{shape.example!r} missing contract keys: {missing}"
+        assert isinstance(state["tripped"], bool)
+        assert isinstance(state["extras"], list)
+        # The canonical matcher recognizes the example as the declared shape.
+        assert match_spawnable_shape(shape.example) is not None
+
+
+@pytest.mark.asyncio
+async def test_recovery_unknown_class_returns_none(db_session):
+    """A class that is not a spawnable shape is not recoverable (returns None)."""
+    from app.pipeline_regression_dispatcher import (
+        _current_signal_value_for_class,
+        match_spawnable_shape,
+    )
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    state = await _current_signal_value_for_class(
+        db_session, project.id, "not_a_real_regression_class", project.design_doc
+    )
+    assert state is None
+    assert match_spawnable_shape("not_a_real_regression_class") is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_dynamic_shapes_return_healthy_with_no_data(db_session):
+    """Dynamic-signal recovery branches return non-None tripped=False on empty state.
+
+    This is the property that lets a merged fix auto-close: when the activity /
+    case / alert that tripped the signal is gone, recovery reads healthy rather
+    than None (which the recovery scan would skip, stranding the case).
+    """
+    from app.pipeline_regression_dispatcher import (
+        SPAWNABLE_REGRESSION_CLASS_SHAPES,
+        _current_signal_value_for_class,
+    )
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    dynamic_shapes = [
+        s for s in SPAWNABLE_REGRESSION_CLASS_SHAPES if s.evaluator is not None
+    ]
+    assert dynamic_shapes, "expected dynamic shapes with evaluators"
+    for shape in dynamic_shapes:
+        state = await _current_signal_value_for_class(
+            db_session, project.id, shape.example, project.design_doc
+        )
+        assert state is not None, shape.example
+        assert state["tripped"] is False, (
+            f"{shape.example!r} should read healthy with no underlying activity"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Evaluator fault isolation tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_evaluator_failure_does_not_abort_remaining_evaluators(
+    db_session, mocker
+):
+    """When one evaluator raises, the remaining evaluators still run.
+
+    Patches _evaluate_sr_catch_rate_signal to raise and
+    _evaluate_fix_loop_divergence_signal to return 1 (a synthetic spawn).
+    run_once must complete without raising and return 1 (the surviving spawn).
+    """
+    from app.pipeline_regression_dispatcher import _ALL_EVALUATOR_NAMES
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.pipeline_regression_dispatcher._evaluate_sr_catch_rate_signal",
+        side_effect=RuntimeError("simulated evaluator error"),
+    )
+
+    # Return 1 spawn so we can verify this evaluator ran despite the earlier failure.
+    async def _fake_fix_loop(session, project_id, budget):
+        return 1
+
+    mocker.patch(
+        "app.pipeline_regression_dispatcher._evaluate_fix_loop_divergence_signal",
+        side_effect=_fake_fix_loop,
+    )
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1, "surviving evaluator spawn should propagate"
+
+    # Cycle record should show signals_evaluated == 20, not 21.
+    records = await get_dispatcher_cycle_records(db_session, project_id=str(project.id))
+    assert records, "cycle record should be written"
+    latest = records[-1]
+    expected_evaluated = len(_ALL_EVALUATOR_NAMES) - 1  # one evaluator failed
+    assert latest["signals_evaluated"] == expected_evaluated, (
+        f"failed evaluator should not count; got {latest['signals_evaluated']}, expected {expected_evaluated}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_evaluator_opens_watchdog_alert(db_session, mocker):
+    """A failing evaluator opens a WARNING Alert deduped by evaluator name."""
+    from app.models import Alert
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.pipeline_regression_dispatcher._evaluate_sr_catch_rate_signal",
+        side_effect=RuntimeError("boom"),
+    )
+
+    await run_once(db_session, project.id)
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == "Evaluator failure: sr_catch_rate_signal",
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "exactly one open evaluator-failure alert expected"
+
+
+@pytest.mark.asyncio
+async def test_recovered_evaluator_resolves_alert(db_session, mocker):
+    """When a previously-failing evaluator succeeds, its alert is auto-resolved."""
+    from app.models import Alert, AlertSeverity
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    # Pre-plant an open evaluator-failure alert.
+    preexisting = Alert(
+        project_id=None,  # will be set after project is committed
+        severity=AlertSeverity.WARNING,
+        title="Evaluator failure: sr_catch_rate_signal",
+        message="planted for test",
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    preexisting.project_id = project.id
+    db_session.add(preexisting)
+    await db_session.commit()
+
+    # No mock — all evaluators run normally (no tripped signals on empty project).
+    await run_once(db_session, project.id)
+
+    # Alert should now be dismissed (resolved).
+    await db_session.refresh(preexisting)
+    assert preexisting.dismissed_at is not None, (
+        "open evaluator-failure alert should be auto-resolved when evaluator succeeds"
+    )
+
+
+@pytest.mark.asyncio
+async def test_watchdog_case_error_does_not_abort_other_cases(db_session, mocker):
+    """A per-case exception in run_watchdog_once does not prevent other cases from being escalated."""
+    from app.models import (
+        Alert,
+        RegressionCaseStatus,
+        RegressionRemediationCase,
+    )
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Two stale ACTIVE cases; both are old enough to be escalated.
+    stale_time = _utcnow() - timedelta(hours=30)
+    case1 = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="class_a",
+        status=RegressionCaseStatus.ACTIVE,
+        hit_count=1,
+        fingerprint_to_fix_log=[],
+        updated_at=stale_time,
+    )
+    case2 = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="class_b",
+        status=RegressionCaseStatus.ACTIVE,
+        hit_count=1,
+        fingerprint_to_fix_log=[],
+        updated_at=stale_time,
+    )
+    db_session.add(case1)
+    db_session.add(case2)
+    await db_session.commit()
+    await db_session.refresh(case1)
+    await db_session.refresh(case2)
+
+    # Make _has_active_remediation_child raise for the first case and return
+    # False for the second so the code reaches the NMI escalation path.
+    call_n = {"n": 0}
+
+    async def _mock_has_child(session, case):
+        call_n["n"] += 1
+        if call_n["n"] == 1:
+            raise RuntimeError("simulated DB error on case1")
+        return False
+
+    mocker.patch(
+        "app.pipeline_regression_dispatcher._has_active_remediation_child",
+        side_effect=_mock_has_child,
+    )
+
+    mutated = await run_watchdog_once(db_session, project.id)
+    assert mutated >= 1, "at least case2 should have been escalated"
+
+    await db_session.refresh(case2)
+    assert case2.status == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION, (
+        "case2 must be escalated even though case1 raised"
+    )
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title.like("Regression case stalled: class_b%"),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) >= 1, "Alert for case2 escalation should exist"

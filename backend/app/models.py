@@ -456,7 +456,7 @@ class Task(SQLModel, table=True):
     # — these are accepted by the CHECK constraint but should not be
     # introduced in production code paths. Enforced server-side by
     # ``chk_task_created_by`` (alembic 0065 / audit L-S1, Postgres-only).
-    created_by: str = Field(default="USER")
+    created_by: str = Field(default="USER", index=True)
     launched_by_user_id: str | None = Field(
         default=None
     )  # Firebase UID of the user who launched this task (for launcher-pays billing)
@@ -577,6 +577,13 @@ class Task(SQLModel, table=True):
     archived: bool = Field(default=False)
 
     # VM lifecycle timing for cost tracking
+    # Write-once timestamp recorded at initial dispatch (before GCE create call).
+    # Used as the anchor for vm_cold_start_ms so the measurement covers the full
+    # dispatch→agent-ready interval including GCE boot latency.  Never re-stamped.
+    vm_dispatched_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     vm_provisioned_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
@@ -1330,6 +1337,39 @@ class MaxPlanAccount(SQLModel, table=True):
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
     )
+
+    def is_in_rate_limit_cooldown(self) -> bool:
+        """Return True if any model is still in rate-limit cooldown from persisted state.
+
+        Reads self.rate_limit_state (JSONB, populated by _persist_rate_limit_state
+        in max_plan_pool). Uses a conservative 4-hour upper-bound window — the
+        maximum quarantine cooldown — to avoid a circular import of the precise
+        _cooldown_seconds_for_info helper (max_plan_pool imports models).
+        The in-memory pool check (max_plan_pool.account_in_rate_limit_cooldown)
+        is authoritative when the pool is loaded; this method is a fallback for
+        callers that have an ORM-loaded account but no live pool (e.g. tests,
+        admin tooling). Returns False on any parse failure.
+        """
+        try:
+            dm = (self.rate_limit_state or {}).get("disabled_models") or {}
+            if not dm:
+                return False
+            now = _utcnow()
+            for info in dm.values():
+                at_str = info.get("at")
+                if not at_str:
+                    continue
+                try:
+                    at_dt = datetime.fromisoformat(str(at_str))
+                    if at_dt.tzinfo is not None:
+                        at_dt = at_dt.replace(tzinfo=None)
+                except (ValueError, TypeError):
+                    continue
+                if (now - at_dt).total_seconds() < 4 * 3600:
+                    return True
+            return False
+        except Exception:
+            return False
 
 
 # --- Residual-case reaper thresholds ---

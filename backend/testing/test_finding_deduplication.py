@@ -139,6 +139,47 @@ def test_build_dedup_state_excludes_ghost_merges():
     assert "ghost1" not in hashes, "ghost merge should not block respawn"
 
 
+def test_build_dedup_state_non_terminal_parent_ancestry_negative_allows_respawn():
+    # Non-terminal parent (e.g. EVALUATING) where is_ancestor_of returned False:
+    # research_completion adds that parent's ID to failed_parent_ids.
+    # build_dedup_state must treat the child as NOT shipped so it can re-spawn.
+    parent_id = uuid.uuid4()
+    child = _make_task(
+        status=TaskStatus.COMPLETED,
+        context={"finding_hash": "stranded2", "pr_merged": True},
+        parent_task_id=parent_id,
+    )
+    hashes, _, _ = build_dedup_state([child], failed_parent_ids={parent_id})
+    assert "stranded2" not in hashes, "stranded rollup child must not block re-spawn"
+
+
+def test_build_dedup_state_confirmed_landed_child_stays_suppressed():
+    # Parent merge commit confirmed as ancestor of integration branch (is_ancestor_of
+    # returned True) → parent NOT in failed_parent_ids → child stays suppressed.
+    parent_id = uuid.uuid4()
+    child = _make_task(
+        status=TaskStatus.COMPLETED,
+        context={"finding_hash": "landed2", "pr_merged": True},
+        parent_task_id=parent_id,
+    )
+    hashes, _, _ = build_dedup_state([child], failed_parent_ids=set())
+    assert "landed2" in hashes, "genuinely landed fix must remain suppressed"
+
+
+def test_build_dedup_state_ancestry_indeterminate_trusts_pr_merged_flag():
+    # is_ancestor_of returned None (API error, missing merge SHA, no credentials):
+    # research_completion does NOT add parent to failed_parent_ids (degrade-safe).
+    # build_dedup_state must fall back to flag-trust and keep the child suppressed.
+    parent_id = uuid.uuid4()
+    child = _make_task(
+        status=TaskStatus.COMPLETED,
+        context={"finding_hash": "indet2", "pr_merged": True},
+        parent_task_id=parent_id,
+    )
+    hashes, _, _ = build_dedup_state([child], failed_parent_ids=set())
+    assert "indet2" in hashes, "indeterminate ancestry must fall back to flag-trust"
+
+
 def test_build_dedup_state_excludes_infra_failures():
     # A task whose agent-reported failure_category is in INFRA_CLASSES should
     # NOT block respawn (the code never really ran).

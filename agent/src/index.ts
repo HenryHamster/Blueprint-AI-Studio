@@ -62,6 +62,7 @@ const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode
     oauth: [
       "you've hit your limit",
       "you've hit your usage limit",
+      "you've hit your session limit",
       'claude ai usage limit reached',
       "you're out of extra usage",
       '5-hour limit reached',
@@ -71,6 +72,7 @@ const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode
     api_key: [
       "you've hit your limit",
       "you've hit your usage limit",
+      "you've hit your session limit",
       'claude ai usage limit reached',
       "you're out of extra usage",
       '5-hour limit reached',
@@ -174,9 +176,15 @@ function getRateLimitPatterns(provider: ProviderName, authMode: AuthMode): reado
   return RATE_LIMIT_PATTERNS[provider][authMode] ?? RATE_LIMIT_PATTERNS[provider].oauth ?? [];
 }
 
+// Structured, provider-agnostic 429 detection: matches JSON-shaped key/value
+// pairs emitted in the streamed result event so future banner-wording changes
+// cannot silently regress rate-limit classification.
+const STRUCTURED_429_PATTERNS = ['"api_error_status":429', '"error":"rate_limit"'] as const;
+
 export function matchesRateLimit(text: string, provider: ProviderName = PROVIDER, authMode: AuthMode = AUTH_MODE): boolean {
   const lower = text.toLowerCase();
-  return getRateLimitPatterns(provider, authMode).some(p => lower.includes(p));
+  if (getRateLimitPatterns(provider, authMode).some(p => lower.includes(p))) return true;
+  return STRUCTURED_429_PATTERNS.some(p => text.includes(p));
 }
 
 // Thrown when Claude CLI output matches a rate-limit pattern. Carries the
@@ -282,6 +290,12 @@ const ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL || 'http://localhost:8080'
 let AGENT_TOKEN = process.env.AGENT_SECRET_TOKEN || '';
 const VM_INSTANCE_ID = process.env.VM_INSTANCE_ID || 'local';
 export const WORKSPACE = process.env.AGENT_WORKSPACE || '/tmp/workspace';
+// Root of the git object cache pre-baked into the agent VM image (see
+// infra/packer/agent.pkr.hcl). A bare mirror lives at
+// <root>/<owner>/<repo>.git; setupWorkspace passes it via
+// `git clone --reference-if-able` so cold VMs reuse pre-fetched objects
+// instead of re-downloading the full target repo every task.
+export const GIT_REFERENCE_CACHE_ROOT = process.env.GIT_REFERENCE_CACHE_ROOT || '/opt/agent-cache/git';
 
 // Populated at startup by fetchVmImageIdentity(); stays null in local dev /
 // tests where the GCP metadata service is unreachable so vm-heartbeat sends
@@ -1578,8 +1592,19 @@ export async function setupWorkspace(
   sendHeartbeatSync(taskId, `Cloning ${owner}/${repo}...`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  const cloneArgs = ['clone', '--depth', '100', '--branch', baseBranch];
+  // Reuse the pre-baked git object cache when the image seeded a mirror for
+  // this repo. `--reference-if-able` borrows objects from the local mirror and
+  // silently falls back to a normal fetch if the path is missing or invalid,
+  // so this is safe for repos the image never cached.
+  const referenceRepo = `${GIT_REFERENCE_CACHE_ROOT}/${owner}/${repo}.git`;
+  if (fs.existsSync(referenceRepo)) {
+    cloneArgs.push('--reference-if-able', referenceRepo);
+    sendLog(ws, `Using pre-baked git object cache at ${referenceRepo}\n`);
+  }
+  cloneArgs.push(cloneUrl, WORKSPACE);
   try {
-    await cloneWithRetry(['clone', '--depth', '100', '--branch', baseBranch, cloneUrl, WORKSPACE]);
+    await cloneWithRetry(cloneArgs);
   } catch (e) {
     const err = e instanceof Error ? e : new Error(String(e));
     (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'clone_failed';
@@ -2136,6 +2161,33 @@ function buildFixLoopGuidanceSuffix(): string {
   return `\n\n${READ_THE_FAILURE_MESSAGE}\n${SIZE_GUARDRAIL_GUIDANCE}\n${PRIOR_ATTEMPT_DIVERGENCE}`;
 }
 
+/**
+ * Detect infrastructure-class failures that cannot be fixed by Claude.
+ * These include missing tools, Docker unavailability, OOM, DNS/network issues.
+ * Pattern set is conservative. Used by lintFixLoop's first-attempt abandon
+ * check; testFixLoop does its own runner-level setup-error detection and does
+ * not call this.
+ */
+export function isInfrastructureFailure(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  // Tool/command unavailable
+  if (lower.includes('command not found') || lower.includes('enoent')) return true;
+  // Docker daemon unavailable (Playwright, Docker-based tests)
+  if (lower.includes('cannot connect to docker daemon')) return true;
+  // OOM / SIGKILL (exit 137 shown as "killed" or "EOOM" code)
+  if (lower.includes('exit 137') || lower.includes('eoom') || lower.includes('out of memory')) return true;
+  if (lower.includes('killed') && (lower.includes('sigkill') || lower.includes('oom'))) return true;
+  // Process timeout / cannot spawn (ETIMEDOUT, spawn timeout)
+  if (lower.includes('etimedout') || lower.includes('spawn timeout')) return true;
+  // DNS / network errors
+  if (lower.includes('econnrefused') || lower.includes('enotfound') || lower.includes('enetunreach')) return true;
+  // Chromium/Playwright installation infrastructure failures
+  if (lower.includes('chromium') && (lower.includes('sudo') || lower.includes('permission denied'))) return true;
+  // Docker/container infrastructure issues
+  if (lower.includes('docker') && (lower.includes('daemon') || lower.includes('unavailable'))) return true;
+  return false;
+}
+
 export interface LintFixLoopResult {
   /** True if lint converged green within MAX_LINT_FIX_ATTEMPTS. */
   passed: boolean;
@@ -2143,6 +2195,10 @@ export interface LintFixLoopResult {
   lastErrorTail?: string;
   /** Why the loop stopped. */
   exitReason?: 'early_unchanged' | 'max_attempts' | 'divergence_oscillation' | 'divergence_similar_error' | 'divergence_diff_revert';
+  /** Infrastructure/setup failure detected; no fixer invoked. */
+  setupFailed?: boolean;
+  /** Summary of infrastructure failure when setupFailed=true. */
+  infraFailureSummary?: string;
   /** Per-attempt diff/error history, useful for downstream diagnosis. */
   attempts: FixAttempt[];
 }
@@ -2172,6 +2228,23 @@ export async function lintFixLoop(
       const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);
       lastErrorTail = msg;
       const fingerprint = errorFingerprint(msg);
+
+      // Infrastructure failure detection: on the first attempt, if the error
+      // is infrastructure-class (missing tool, Docker unavailable, OOM, DNS),
+      // abandon immediately without invoking Claude. This reduces wasted API
+      // calls on the failing tail and improves failure classification.
+      // Do NOT emit a fix-loop event here: this is not a lint outcome, and any
+      // exit_reason would either be misclassified as success ('passed' is in
+      // the backend's _FIX_LOOP_SUCCESS_REASONS) or be a misleading lint
+      // terminal reason. The infra abandon is surfaced via setupFailed=true so
+      // the caller classifies the task as an infra failure — matching the
+      // testFixLoop setup-failure precedent, which also returns without
+      // emitting a fix-loop event.
+      if (attempt === 0 && isInfrastructureFailure(msg)) {
+        sendLog(ws, `Lint check failed due to infrastructure issue (not a code/lint failure). Not invoking fixer.\n${msg.slice(0, 2000)}\n`);
+        return { passed: false, lastErrorTail, setupFailed: true, infraFailureSummary: msg.slice(0, 2000), attempts: prevAttempts };
+      }
+
       // Early exit: byte-identical consecutive error (existing behaviour).
       if (fingerprintHistory.length > 0 && fingerprint === fingerprintHistory[fingerprintHistory.length - 1]) {
         emitWrapperFixLoopEvent({

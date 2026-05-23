@@ -444,6 +444,141 @@ async def test_get_check_runs_log_fetch_timeout(mocker):
 
 
 @pytest.mark.asyncio
+async def test_get_check_runs_paginates_all_pages_failing_run_on_later_page(mocker):
+    """
+    get_check_runs() must fetch all pages of check-runs, not just the first page
+    (GitHub's default page size is 30). A failing run on page 2 must be caught
+    and aggregated correctly so the qualifier's CI gate doesn't false-green.
+    """
+    from app.github import get_check_runs
+
+    # Page 1: 30 passing runs
+    page_1_runs = [
+        {
+            "id": i,
+            "name": f"test-{i}",
+            "status": "completed",
+            "conclusion": "success",
+        }
+        for i in range(30)
+    ]
+    page_1 = {"check_runs": page_1_runs}
+
+    # Page 2: 15 runs, one of which fails
+    page_2_runs = [
+        {
+            "id": 30 + i,
+            "name": f"test-{30 + i}",
+            "status": "completed",
+            "conclusion": "failure" if i == 7 else "success",
+        }
+        for i in range(15)
+    ]
+    page_2 = {"check_runs": page_2_runs}
+
+    call_count = 0
+
+    async def mock_request(method, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First page of check-runs
+            return MockResponse(
+                200,
+                page_1,
+                links={
+                    "next": {
+                        "url": "https://api.github.com/repos/owner/repo/commits/sha/check-runs?per_page=100&page=2"
+                    }
+                },
+            )
+        elif call_count == 2:
+            # Second page of check-runs (has a failing run)
+            return MockResponse(200, page_2, links={})
+        else:
+            return MockResponse(200, page_1)
+
+    mocker.patch("httpx.AsyncClient.request", side_effect=mock_request)
+
+    result = await get_check_runs("token", "owner", "repo", "sha")
+
+    # Must see 45 total runs (30 + 15)
+    assert len(result["details"]) == 45
+    # Aggregate conclusion must be "failure" because page 2 has a failing run
+    assert result["conclusion"] == "failure"
+    assert result["status"] == "completed"
+    # Must have made at least 2 calls to fetch both pages
+    assert call_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_get_check_runs_paginates_all_pages_pending_run_on_later_page(mocker):
+    """
+    get_check_runs() must fetch all pages and correctly handle pending runs.
+    A pending/in_progress run on page 2 must be caught so the aggregate status
+    reflects that CI is still running, not completed.
+    """
+    from app.github import get_check_runs
+
+    # Page 1: 25 completed passing runs
+    page_1_runs = [
+        {
+            "id": i,
+            "name": f"test-{i}",
+            "status": "completed",
+            "conclusion": "success",
+        }
+        for i in range(25)
+    ]
+    page_1 = {"check_runs": page_1_runs}
+
+    # Page 2: 10 runs, one of which is still in_progress
+    page_2_runs = [
+        {
+            "id": 25 + i,
+            "name": f"test-{25 + i}",
+            "status": "in_progress" if i == 3 else "completed",
+            "conclusion": "success" if i != 3 else None,
+        }
+        for i in range(10)
+    ]
+    page_2 = {"check_runs": page_2_runs}
+
+    call_count = 0
+
+    async def mock_request(method, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First page: all passing
+            return MockResponse(
+                200,
+                page_1,
+                links={
+                    "next": {
+                        "url": "https://api.github.com/repos/owner/repo/commits/sha/check-runs?per_page=100&page=2"
+                    }
+                },
+            )
+        elif call_count == 2:
+            # Second page: has a pending run
+            return MockResponse(200, page_2, links={})
+        else:
+            return MockResponse(200, page_1)
+
+    mocker.patch("httpx.AsyncClient.request", side_effect=mock_request)
+
+    result = await get_check_runs("token", "owner", "repo", "sha")
+
+    # Must see 35 total runs (25 + 10)
+    assert len(result["details"]) == 35
+    # Aggregate status must be "in_progress" because page 2 has a pending run
+    assert result["status"] == "in_progress"
+    # Conclusion is "success" because all concluded checks pass (pending check not concluded yet)
+    assert result["conclusion"] == "success"
+
+
+@pytest.mark.asyncio
 async def test_merge_pull_request_rate_limit_retries_then_propagates(mocker):
     """
     A 429 rate-limit response should be retried (respecting Retry-After),
@@ -2489,3 +2624,212 @@ async def test_post_merge_summary_comment_returns_false_on_error(mocker):
     result = await post_merge_summary_comment("token", "owner", "repo", 42)
 
     assert result is False
+
+
+# ---------------------------------------------------------------------------
+# list_pull_requests_for_commit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_pull_requests_for_commit_success(mocker):
+    """200 response with a list of PR dicts is returned as-is."""
+    from app.github import list_pull_requests_for_commit
+
+    prs = [
+        {
+            "number": 42,
+            "state": "closed",
+            "merged_at": "2026-01-01T00:00:00Z",
+            "head": {"sha": "abc"},
+        },
+    ]
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, prs),
+    )
+
+    result = await list_pull_requests_for_commit("tok", "owner", "repo", "deadbeef123")
+
+    assert result == prs
+
+
+@pytest.mark.asyncio
+async def test_list_pull_requests_for_commit_non_200_returns_empty(mocker):
+    """Non-200 response (e.g. 404) returns [] without raising."""
+    from app.github import list_pull_requests_for_commit
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(404, {"message": "Not Found"}, text="Not Found"),
+    )
+
+    result = await list_pull_requests_for_commit("tok", "owner", "repo", "deadbeef123")
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_list_pull_requests_for_commit_non_list_body_returns_empty(mocker):
+    """A 200 response whose body is not a list (e.g. a dict error) returns []."""
+    from app.github import list_pull_requests_for_commit
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, {"message": "unexpected"}),
+    )
+
+    result = await list_pull_requests_for_commit("tok", "owner", "repo", "deadbeef123")
+
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_list_pull_requests_for_commit_paginates_all_pages(mocker):
+    """list_pull_requests_for_commit must follow Link: rel=next headers and
+    return all PRs across all pages.  A PR on page 2 whose head carries the
+    failing CI check must not be silently dropped."""
+    from app.github import list_pull_requests_for_commit
+
+    page1 = [
+        {
+            "number": 1,
+            "state": "closed",
+            "merged_at": "2026-01-01T00:00:00Z",
+            "head": {"sha": "sha_green_pr"},
+        }
+    ]
+    page2 = [
+        {
+            "number": 2,
+            "state": "closed",
+            "merged_at": "2026-01-02T00:00:00Z",
+            "head": {"sha": "sha_red_pr"},
+        }
+    ]
+
+    call_count = 0
+
+    def _mock_request(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return MockResponse(
+                200,
+                page1,
+                links={
+                    "next": {
+                        "url": "https://api.github.com/repos/owner/repo/commits/sha/pulls?per_page=100&page=2"
+                    }
+                },
+            )
+        return MockResponse(200, page2)
+
+    mocker.patch("httpx.AsyncClient.request", side_effect=_mock_request)
+
+    result = await list_pull_requests_for_commit("tok", "owner", "repo", "sha_multi")
+
+    assert len(result) == 2
+    assert result[0]["number"] == 1
+    assert result[1]["number"] == 2
+    assert call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# get_check_runs: treat_missing_as_success=False (strict mode)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_check_runs_strict_mode_empty_returns_no_checks(mocker):
+    """With treat_missing_as_success=False an empty check-runs list returns
+    status='no_checks' so callers can distinguish 'no CI' from 'CI passed'."""
+    from app.github import get_check_runs
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, {"check_runs": []}),
+    )
+
+    result = await get_check_runs(
+        "tok", "owner", "repo", "sha123", treat_missing_as_success=False
+    )
+
+    assert result["status"] == "no_checks"
+    assert result["conclusion"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_check_runs_default_mode_empty_returns_success(mocker):
+    """Default (treat_missing_as_success=True): empty check-runs → status='completed',
+    conclusion='success' to preserve the fail-open behaviour for all existing callers."""
+    from app.github import get_check_runs
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, {"check_runs": []}),
+    )
+
+    result = await get_check_runs("tok", "owner", "repo", "sha123")
+
+    assert result["status"] == "completed"
+    assert result["conclusion"] == "success"
+
+
+# ── get_files_changed_between_refs ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_files_changed_between_refs_returns_changed_files(mocker):
+    """Returns filenames from the compare API when it succeeds."""
+    from app.github import get_files_changed_between_refs
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(
+            200,
+            {
+                "files": [
+                    {"filename": "backend/app/foo.py"},
+                    {"filename": "backend/app/bar.py"},
+                ]
+            },
+        ),
+    )
+
+    result = await get_files_changed_between_refs(
+        "tok", "owner", "repo", "base-ref", "head-ref"
+    )
+    assert result == ["backend/app/foo.py", "backend/app/bar.py"]
+
+
+@pytest.mark.asyncio
+async def test_get_files_changed_between_refs_returns_empty_when_identical(mocker):
+    """Returns an empty list when the compare API reports no changed files."""
+    from app.github import get_files_changed_between_refs
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, {"files": []}),
+    )
+
+    result = await get_files_changed_between_refs(
+        "tok", "owner", "repo", "automain", "automain"
+    )
+    assert result == []
+
+
+@pytest.mark.asyncio
+async def test_get_files_changed_between_refs_returns_none_on_api_error(mocker):
+    """Returns None on a non-200 API response so callers can treat it as indeterminate."""
+    from app.github import get_files_changed_between_refs
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(404, {}),
+    )
+
+    result = await get_files_changed_between_refs(
+        "tok", "owner", "repo", "missing-ref", "head"
+    )
+    assert result is None

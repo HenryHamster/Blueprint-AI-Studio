@@ -1058,7 +1058,15 @@ class TestMessages:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "high_signal_event_type",
-        ["failure_alert", "rollback_recommended", "fix_loop_divergence_regressed"],
+        [
+            "failure_alert",
+            "rollback_recommended",
+            "fix_loop_divergence_regressed",
+            "release_calcifying",
+            "release_build_stalled",
+            "release_stabilize_stalled",
+            "release_ci_unresolved_stall",
+        ],
     )
     async def test_list_messages_guarantees_high_signal_notes_with_routine_flood(
         self, client: AsyncClient, db_session, high_signal_event_type: str
@@ -1168,6 +1176,208 @@ class TestMessagesLastSeen:
         )
         assert put_resp.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_get_without_project_id_returns_null_when_empty(
+        self, client: AsyncClient, db_session
+    ):
+        """GET without project_id returns null when no last-seen records exist."""
+        resp = await client.get("/api/admin/messages/last-seen")
+        assert resp.status_code == 200
+        assert resp.json()["last_seen_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_get_without_project_id_returns_max_across_projects(
+        self, client: AsyncClient, db_session
+    ):
+        """GET without project_id returns max last-seen across all operator projects."""
+        p1 = await _make_project(db_session)
+        p2 = await _make_project(db_session)
+        ts1, ts2 = 1_700_000_000_000, 1_700_000_060_000
+
+        await client.put(
+            "/api/admin/messages/last-seen",
+            json={"project_id": str(p1.id), "timestamp": ts1},
+        )
+        await client.put(
+            "/api/admin/messages/last-seen",
+            json={"project_id": str(p2.id), "timestamp": ts2},
+        )
+
+        resp = await client.get("/api/admin/messages/last-seen")
+        assert resp.status_code == 200
+        assert resp.json()["last_seen_at"] == ts2
+
+
+class TestLastVisitTimestamp:
+    @pytest.mark.asyncio
+    async def test_get_empty_returns_null(self, client: AsyncClient, db_session):
+        """Returns null when no MessagesLastSeen record exists for the operator."""
+        resp = await client.get("/api/admin/last-visit-timestamp")
+        assert resp.status_code == 200
+        assert resp.json()["last_visit_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_put_and_get_round_trip(self, client: AsyncClient, db_session):
+        """PUT persists the timestamp; GET returns it as the cross-project max."""
+        project = await _make_project(db_session)
+        ts = 1_700_000_000_000
+
+        put_resp = await client.put(
+            "/api/admin/last-visit-timestamp",
+            json={"project_id": str(project.id), "timestamp": ts},
+        )
+        assert put_resp.status_code == 200
+        assert put_resp.json()["last_visit_at"] == ts
+
+        get_resp = await client.get("/api/admin/last-visit-timestamp")
+        assert get_resp.status_code == 200
+        assert get_resp.json()["last_visit_at"] == ts
+
+    @pytest.mark.asyncio
+    async def test_get_returns_max_across_projects(
+        self, client: AsyncClient, db_session
+    ):
+        """GET returns the most recent timestamp across all user's projects."""
+        p1 = await _make_project(db_session)
+        p2 = await _make_project(db_session)
+        ts1, ts2 = 1_700_000_000_000, 1_700_000_060_000
+
+        await client.put(
+            "/api/admin/last-visit-timestamp",
+            json={"project_id": str(p1.id), "timestamp": ts1},
+        )
+        await client.put(
+            "/api/admin/last-visit-timestamp",
+            json={"project_id": str(p2.id), "timestamp": ts2},
+        )
+
+        resp = await client.get("/api/admin/last-visit-timestamp")
+        assert resp.json()["last_visit_at"] == ts2
+
+    @pytest.mark.asyncio
+    async def test_put_no_access_returns_404(self, client: AsyncClient, db_session):
+        """Cannot write last-visit-timestamp for a project the user is not a member of."""
+        random_pid = str(uuid.uuid4())
+        resp = await client.put(
+            "/api/admin/last-visit-timestamp",
+            json={"project_id": random_pid, "timestamp": 1_700_000_000_000},
+        )
+        assert resp.status_code == 404
+
+
+class TestMessagesNoisePrefs:
+    @pytest.mark.asyncio
+    async def test_get_empty(self, client: AsyncClient, db_session):
+        """Returns empty dict when no noise-prefs record exists."""
+        project = await _make_project(db_session)
+        resp = await client.get(
+            f"/api/admin/messages/noise-prefs?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["prefs"] == {}
+
+    @pytest.mark.asyncio
+    async def test_round_trip(self, client: AsyncClient, db_session):
+        """PUT stores event-visibility prefs; GET returns them."""
+        project = await _make_project(db_session)
+        prefs = {"pr_merged": "mute", "cycle_summary": "routine"}
+        put_resp = await client.put(
+            "/api/admin/messages/noise-prefs",
+            json={"project_id": str(project.id), "prefs": prefs},
+        )
+        assert put_resp.status_code == 200
+        get_resp = await client.get(
+            f"/api/admin/messages/noise-prefs?project_id={project.id}"
+        )
+        assert get_resp.json()["prefs"] == prefs
+
+    @pytest.mark.asyncio
+    async def test_noise_prefs_save_preserves_temp_mutes_and_mute_window(
+        self, client: AsyncClient, db_session
+    ):
+        """A visibility-only noise-prefs save must NOT clobber an operator's
+        server-side temp-mutes or mute-window stored in the same prefs column."""
+        import time
+
+        project = await _make_project(db_session)
+        future_ms = int(time.time() * 1000) + 3_600_000
+
+        # Operator sets a DND window and a temp-mute first.
+        await client.put(
+            "/api/admin/messages/mute-window",
+            json={"project_id": str(project.id), "expires_at": future_ms},
+        )
+        await client.put(
+            "/api/admin/messages/temp-mutes",
+            json={
+                "project_id": str(project.id),
+                "temp_mutes": {"pr_merged": future_ms},
+            },
+        )
+
+        # Then toggles an event-visibility pref (sends only the visibility map).
+        await client.put(
+            "/api/admin/messages/noise-prefs",
+            json={"project_id": str(project.id), "prefs": {"cycle_summary": "routine"}},
+        )
+
+        # The DND window and temp-mute must survive the visibility save.
+        mw_resp = await client.get(
+            f"/api/admin/messages/mute-window?project_id={project.id}"
+        )
+        assert mw_resp.json()["mute_window"] == {"expires_at": future_ms}
+        tm_resp = await client.get(
+            f"/api/admin/messages/temp-mutes?project_id={project.id}"
+        )
+        assert tm_resp.json()["temp_mutes"] == {"pr_merged": future_ms}
+
+        # And the visibility pref itself round-trips.
+        np_resp = await client.get(
+            f"/api/admin/messages/noise-prefs?project_id={project.id}"
+        )
+        assert np_resp.json()["prefs"].get("cycle_summary") == "routine"
+
+    @pytest.mark.asyncio
+    async def test_noise_prefs_payload_cannot_write_reserved_keys(
+        self, client: AsyncClient, db_session
+    ):
+        """Reserved keys in a noise-prefs payload are ignored, not persisted as
+        a fake mute-window/temp-mutes that the dedicated endpoints would honor."""
+        project = await _make_project(db_session)
+        await client.put(
+            "/api/admin/messages/noise-prefs",
+            json={
+                "project_id": str(project.id),
+                "prefs": {
+                    "pr_merged": "mute",
+                    "_mute_window": {"expires_at": 9_999_999_999_999},
+                    "_temp_mutes": {"cycle_summary": 9_999_999_999_999},
+                },
+            },
+        )
+        mw_resp = await client.get(
+            f"/api/admin/messages/mute-window?project_id={project.id}"
+        )
+        assert mw_resp.json()["mute_window"] is None
+        tm_resp = await client.get(
+            f"/api/admin/messages/temp-mutes?project_id={project.id}"
+        )
+        assert tm_resp.json()["temp_mutes"] == {}
+
+    @pytest.mark.asyncio
+    async def test_no_access_returns_404(self, client: AsyncClient, db_session):
+        """Endpoints return 404 for projects the user is not a member of."""
+        random_pid = str(uuid.uuid4())
+        get_resp = await client.get(
+            f"/api/admin/messages/noise-prefs?project_id={random_pid}"
+        )
+        assert get_resp.status_code == 404
+        put_resp = await client.put(
+            "/api/admin/messages/noise-prefs",
+            json={"project_id": random_pid, "prefs": {}},
+        )
+        assert put_resp.status_code == 404
+
 
 class TestMessagesSavedViews:
     @pytest.mark.asyncio
@@ -1247,6 +1457,158 @@ class TestMessagesSavedViews:
         )
         assert put_resp.status_code == 400
         assert "50" in put_resp.json()["error"]["message"]
+
+
+class TestMessagesTempMutes:
+    @pytest.mark.asyncio
+    async def test_get_empty(self, client: AsyncClient, db_session):
+        """Returns empty dict when no temp-mutes record exists."""
+        project = await _make_project(db_session)
+        resp = await client.get(
+            f"/api/admin/messages/temp-mutes?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["temp_mutes"] == {}
+
+    @pytest.mark.asyncio
+    async def test_round_trip(self, client: AsyncClient, db_session):
+        """PUT stores temp-mutes; GET returns only non-expired entries."""
+        import time
+
+        project = await _make_project(db_session)
+        future_ms = int(time.time() * 1000) + 3_600_000  # 1 hour from now
+        mutes = {"pr_merged": future_ms}
+
+        put_resp = await client.put(
+            "/api/admin/messages/temp-mutes",
+            json={"project_id": str(project.id), "temp_mutes": mutes},
+        )
+        assert put_resp.status_code == 200
+        assert put_resp.json()["status"] == "ok"
+
+        get_resp = await client.get(
+            f"/api/admin/messages/temp-mutes?project_id={project.id}"
+        )
+        assert get_resp.status_code == 200
+        assert get_resp.json()["temp_mutes"] == mutes
+
+    @pytest.mark.asyncio
+    async def test_expired_mutes_filtered_on_get(self, client: AsyncClient, db_session):
+        """Expired entries are filtered out on GET; active entries survive."""
+        import time
+
+        project = await _make_project(db_session)
+        now_ms = int(time.time() * 1000)
+        future_ms = now_ms + 3_600_000
+        # Write one expired + one active mute (bypass filter by writing directly via PUT
+        # with a past timestamp — PUT also filters, so use future for writing and verify active)
+        await client.put(
+            "/api/admin/messages/temp-mutes",
+            json={
+                "project_id": str(project.id),
+                "temp_mutes": {"cycle_summary": future_ms},
+            },
+        )
+        get_resp = await client.get(
+            f"/api/admin/messages/temp-mutes?project_id={project.id}"
+        )
+        assert "cycle_summary" in get_resp.json()["temp_mutes"]
+
+        # Overwrite with an already-expired entry: PUT filters it out before storing
+        past_ms = now_ms - 1000
+        put_resp = await client.put(
+            "/api/admin/messages/temp-mutes",
+            json={"project_id": str(project.id), "temp_mutes": {"pr_merged": past_ms}},
+        )
+        assert put_resp.status_code == 200
+        get_resp2 = await client.get(
+            f"/api/admin/messages/temp-mutes?project_id={project.id}"
+        )
+        assert get_resp2.json()["temp_mutes"] == {}
+
+    @pytest.mark.asyncio
+    async def test_no_access_returns_404(self, client: AsyncClient, db_session):
+        """Endpoints return 404 for projects the user is not a member of."""
+        random_pid = str(uuid.uuid4())
+        get_resp = await client.get(
+            f"/api/admin/messages/temp-mutes?project_id={random_pid}"
+        )
+        assert get_resp.status_code == 404
+
+        put_resp = await client.put(
+            "/api/admin/messages/temp-mutes",
+            json={"project_id": random_pid, "temp_mutes": {}},
+        )
+        assert put_resp.status_code == 404
+
+
+class TestMessagesMuteWindow:
+    @pytest.mark.asyncio
+    async def test_get_empty(self, client: AsyncClient, db_session):
+        """Returns null when no mute-window record exists."""
+        project = await _make_project(db_session)
+        resp = await client.get(
+            f"/api/admin/messages/mute-window?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["mute_window"] is None
+
+    @pytest.mark.asyncio
+    async def test_round_trip(self, client: AsyncClient, db_session):
+        """PUT stores mute-window; GET returns it while still active."""
+        import time
+
+        project = await _make_project(db_session)
+        future_ms = int(time.time() * 1000) + 7_200_000  # 2 hours from now
+
+        put_resp = await client.put(
+            "/api/admin/messages/mute-window",
+            json={"project_id": str(project.id), "expires_at": future_ms},
+        )
+        assert put_resp.status_code == 200
+        assert put_resp.json()["status"] == "ok"
+
+        get_resp = await client.get(
+            f"/api/admin/messages/mute-window?project_id={project.id}"
+        )
+        assert get_resp.status_code == 200
+        assert get_resp.json()["mute_window"] == {"expires_at": future_ms}
+
+    @pytest.mark.asyncio
+    async def test_clear_mute_window(self, client: AsyncClient, db_session):
+        """PUT with expires_at=null clears the mute window."""
+        import time
+
+        project = await _make_project(db_session)
+        future_ms = int(time.time() * 1000) + 7_200_000
+
+        await client.put(
+            "/api/admin/messages/mute-window",
+            json={"project_id": str(project.id), "expires_at": future_ms},
+        )
+        await client.put(
+            "/api/admin/messages/mute-window",
+            json={"project_id": str(project.id), "expires_at": None},
+        )
+        get_resp = await client.get(
+            f"/api/admin/messages/mute-window?project_id={project.id}"
+        )
+        assert get_resp.json()["mute_window"] is None
+
+    @pytest.mark.asyncio
+    async def test_no_access_returns_404(self, client: AsyncClient, db_session):
+        """Endpoints return 404 for projects the user is not a member of."""
+        random_pid = str(uuid.uuid4())
+        get_resp = await client.get(
+            f"/api/admin/messages/mute-window?project_id={random_pid}"
+        )
+        assert get_resp.status_code == 404
+
+        put_resp = await client.put(
+            "/api/admin/messages/mute-window",
+            json={"project_id": random_pid, "expires_at": None},
+        )
+        assert put_resp.status_code == 404
 
 
 class TestPlaybook:

@@ -18,6 +18,8 @@ _TOKEN_RE = re.compile(r"sk-ant-[A-Za-z0-9_\-]+")
 _RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "you've hit your limit",
     "you've hit your usage limit",
+    "you've hit your session limit",
+    "session limit · resets",
     "claude ai usage limit reached",
     "you're out of extra usage",
     "5-hour limit reached",

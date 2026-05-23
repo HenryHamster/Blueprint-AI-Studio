@@ -3,6 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { DashboardHome } from './DashboardHome';
 import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } from '../test/viewport';
+import { apiFetch } from '../api';
 import type { Task } from '../types/task';
 
 const now = Date.now();
@@ -187,6 +188,13 @@ vi.mock('../api', () => ({
     phase_reasoning: '[operator:test] operator advance',
   })),
   triggerQualify: vi.fn(async () => ({ status: 'dry_run' })),
+  fetchQualificationVerdicts: vi.fn(async () => ({
+    verdicts: [
+      { id: 'v1', release_version_id: 'rv1', candidate_sha: 'abc1234def56', confidence: 0.83, sub_scores: { audit: 0.90, test_erosion: 0.75, smoketest: 0.88 }, blocker: null, would_promote: true, promotion_enabled: false, terminal_status: 'dry_run', threshold: 0.80, started_at: '2026-05-20T10:00:00Z', finalized_at: '2026-05-20T11:00:00Z', created_at: '2026-05-20T11:00:00Z' },
+      { id: 'v2', release_version_id: 'rv1', candidate_sha: 'def5678abc12', confidence: 0.61, sub_scores: { audit: 0.70, test_erosion: 0.50, smoketest: 0.65 }, blocker: 'test_erosion below threshold', would_promote: false, promotion_enabled: true, terminal_status: 'not_promoted', threshold: 0.80, started_at: '2026-05-19T08:00:00Z', finalized_at: '2026-05-19T09:00:00Z', created_at: '2026-05-19T09:00:00Z' },
+    ],
+    total: 2,
+  })),
   CANONICAL_LAYER_NAMES: ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS', 'VIEWPORT'] as const,
   fetchCanonicalRegressionLayers: vi.fn(async () => ({ layers: [] })),
 }));
@@ -235,6 +243,28 @@ describe('DashboardHome — viewport regression', () => {
   });
 
   test('version lifecycle panel renders without overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DashboardHome
+            tasks={POPULATED_TASKS}
+            selectedProjectId="proj-abc"
+            onViewTask={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    });
+  });
+
+  test('verdict history panel renders without overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');
       host.style.padding = '12px';
@@ -320,5 +350,92 @@ describe('DashboardHome — viewport regression', () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 50));
       });
     }, { selector: 'button, a[href]' });
+  });
+
+  test('phase-control buttons in version lifecycle panel meet 44px touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DashboardHome
+            tasks={POPULATED_TASKS}
+            selectedProjectId="proj-abc"
+            onViewTask={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    }, { selector: '[data-testid="phase-controls"] button' });
+  });
+
+  test('direction portfolio cards with realistic data do not overflow at 375px', async () => {
+    vi.mocked(apiFetch).mockImplementationOnce(async (url: string) => {
+      if (url.includes('/digest')) {
+        return new Response(JSON.stringify({
+          failed_count: 3,
+          pending_approval_count: 2,
+          direction_progress: [
+            {
+              direction_id: 'd-001',
+              direction_text: 'Improve admin UI mobile responsiveness across all operator-facing panels including kanban board, task detail drawer, and metrics dashboard',
+              priority: 'high',
+              cycles_in_window: 6,
+              tasks_created: 14,
+              prs_merged: 8,
+              possibly_saturated: false,
+              estimated_cost_usd: 42.50,
+              conversion_rate: 0.57,
+              first_attempt_success_rate: 0.43,
+            },
+            {
+              direction_id: 'd-002',
+              direction_text: 'Enforce all viewport-coverage invariants in the test:viewport gate and add escape-hatch debt ceiling guardrail',
+              priority: 'medium',
+              cycles_in_window: 3,
+              tasks_created: 7,
+              prs_merged: 3,
+              possibly_saturated: true,
+              auto_paused: true,
+              paused_reason: 'Saturation detected: merge rate below viable threshold for 3 consecutive cycles',
+              estimated_cost_usd: 18.20,
+              conversion_rate: 0.43,
+            },
+          ],
+          recent_completions: [],
+          failure_groups: [{ failure_class: 'CODE_ERROR', label: 'Code Error', count: 3, tasks: [] }],
+          success_rate: 0.75,
+          trend: 'stable',
+          trend_history: [],
+          completed_count: 10,
+        }), { status: 200 });
+      }
+      return new Response('not found', { status: 404 });
+    });
+
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DashboardHome
+            tasks={POPULATED_TASKS}
+            selectedProjectId={null}
+            onViewTask={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    });
   });
 });

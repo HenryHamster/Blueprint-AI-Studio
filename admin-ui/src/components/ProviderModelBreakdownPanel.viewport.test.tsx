@@ -1,7 +1,7 @@
 import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
 import { ProviderModelBreakdownPanel } from './ProviderModelBreakdownPanel';
 import type { AccountHealthEntry } from './PoolAccountHealthPanel';
 
@@ -135,6 +135,34 @@ describe('ProviderModelBreakdownPanel — viewport regression', () => {
   });
 
   test('renders without horizontal overflow at 375px with populated rows', async () => {
+    const doRender = async () => {
+      if (!host) {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        root = createRoot(host);
+      }
+      await act(async () => {
+        root!.render(
+          <ProviderModelBreakdownPanel
+            selectedProjectId="project-test"
+            accounts={accounts}
+          />,
+        );
+      });
+      // Settle the mocked apiFetch + setRows() — without this, rows is still
+      // empty and the component returns null, making the test trivially pass.
+      await act(async () => {
+        await new Promise(resolve => setTimeout(resolve, 0));
+      });
+    };
+
+    await expectNoOverflowAt(375, doRender);
+    // Verify mobile card layout renders without silently clipping text
+    await expectNoTextTruncationAt(375, async () => {});
+  });
+
+  test('expanded account sub-cards render without overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');
       host.style.padding = '12px';
@@ -149,11 +177,16 @@ describe('ProviderModelBreakdownPanel — viewport regression', () => {
           />,
         );
       });
-      // Settle the mocked apiFetch + setRows() — without this, rows is still
-      // empty and the component returns null, making the test trivially pass.
       await act(async () => {
         await new Promise(resolve => setTimeout(resolve, 0));
       });
+      // Find the first cursor-pointer div (mobile card row) and click to expand
+      const allDivs = Array.from(host!.querySelectorAll<HTMLElement>('div'));
+      const firstClickable = allDivs.find(d => d.className.includes('cursor-pointer'));
+      if (firstClickable) {
+        await act(async () => { firstClickable.click(); });
+      }
     });
+    await expectNoTextTruncationAt(375, async () => {});
   });
 });

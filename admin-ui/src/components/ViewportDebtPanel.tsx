@@ -10,6 +10,8 @@ export interface ViewportDebtRow {
   data_viewport_allow_overflow: number;
   data_viewport_allow_truncation: number;
   total_opt_outs: number;
+  budget_cap?: number | null;
+  headroom?: number | null;
   has_viewport_test: boolean;
   regression_case_count: number;
   regression_case_breakdown?: Record<string, number>;
@@ -22,6 +24,9 @@ interface CoverageSummary {
   total_components: number;
   untested_count: number;
   untested_components: string[];
+  total_opt_outs?: number;
+  total_budget?: number | null;
+  budget_headroom?: number | null;
 }
 
 interface ViewportDebtResponse {
@@ -66,7 +71,13 @@ function renderMobileDebtRow(row: ViewportDebtRow) {
         <span>target: <span className={row.data_viewport_allow_small_target > 0 ? 'text-amber-400 font-medium' : 'text-neutral-600'}>{row.data_viewport_allow_small_target}</span></span>
         <span>overflow: <span className={row.data_viewport_allow_overflow > 0 ? 'text-amber-400 font-medium' : 'text-neutral-600'}>{row.data_viewport_allow_overflow}</span></span>
         <span>trunc: <span className={row.data_viewport_allow_truncation > 0 ? 'text-amber-400 font-medium' : 'text-neutral-600'}>{row.data_viewport_allow_truncation}</span></span>
-        <span className="col-span-2">total: <span className={row.total_opt_outs > 0 ? 'text-white font-semibold' : 'text-neutral-600'}>{row.total_opt_outs}</span>
+        <span className="col-span-2">total: {row.budget_cap != null ? (
+          <span className={row.headroom != null && row.headroom <= 0 ? 'text-red-400 font-semibold' : row.headroom != null && row.headroom <= 2 ? 'text-amber-400 font-semibold' : 'text-white font-semibold'}>
+            {row.total_opt_outs}/{row.budget_cap}
+          </span>
+        ) : (
+          <span className={row.total_opt_outs > 0 ? 'text-white font-semibold' : 'text-neutral-600'}>{row.total_opt_outs} <span className="text-neutral-600">(uncapped)</span></span>
+        )}
           {row.regression_case_count > 0 && <span className="ml-2 text-red-400">{row.regression_case_count} case{row.regression_case_count !== 1 ? 's' : ''}</span>}
         </span>
       </div>
@@ -106,8 +117,14 @@ function renderDebtRow(row: ViewportDebtRow) {
           {row.data_viewport_allow_truncation}
         </span>
       </td>
-      <td className="px-2 py-1.5 text-right font-semibold text-white">
-        {row.total_opt_outs > 0 ? row.total_opt_outs : <span className="text-neutral-600">0</span>}
+      <td className="px-2 py-1.5 text-right font-semibold">
+        {row.budget_cap != null ? (
+          <span className={row.headroom != null && row.headroom <= 0 ? 'text-red-400' : row.headroom != null && row.headroom <= 2 ? 'text-amber-400' : 'text-white'}>
+            {row.total_opt_outs}/{row.budget_cap}
+          </span>
+        ) : (
+          <span className={row.total_opt_outs > 0 ? 'text-neutral-400' : 'text-neutral-600'} title="No budget cap set">{row.total_opt_outs}</span>
+        )}
       </td>
       <td className="px-2 py-1.5 text-center">
         {row.has_viewport_test ? (
@@ -202,7 +219,23 @@ export function ViewportDebtPanel({ projectId }: { projectId: string }) {
         {data.coverage_summary && (
           <div className="flex flex-wrap items-center gap-2 px-3 py-2 border-b border-neutral-800/50">
             <span className="text-[11px] text-neutral-400 flex-1 min-w-0">
-              Components without viewport test:{' '}
+              {data.coverage_summary.total_budget != null ? (
+                <>
+                  Total opt-outs:{' '}
+                  <span className={
+                    data.coverage_summary.budget_headroom != null && data.coverage_summary.budget_headroom <= 0
+                      ? 'text-red-400 font-semibold'
+                      : data.coverage_summary.budget_headroom != null && data.coverage_summary.budget_headroom <= 5
+                      ? 'text-amber-400 font-semibold'
+                      : 'text-white font-semibold'
+                  }>{data.coverage_summary.total_opt_outs ?? '?'}/{data.coverage_summary.total_budget}</span>
+                  {data.coverage_summary.budget_headroom != null && (
+                    <span className="ml-1 text-neutral-500">({data.coverage_summary.budget_headroom} remaining)</span>
+                  )}
+                  {' · '}
+                </>
+              ) : null}
+              Untested:{' '}
               <span className="text-white font-semibold">{data.coverage_summary.untested_count}</span>
               {' '}of{' '}
               <span className="text-white font-semibold">{data.coverage_summary.total_components}</span>
@@ -252,7 +285,7 @@ export function ViewportDebtPanel({ projectId }: { projectId: string }) {
               <th className="text-right px-2 py-1.5 font-medium" title="viewport small-target override count">target</th>
               <th className="text-right px-2 py-1.5 font-medium" title="viewport overflow override count">overflow</th>
               <th className="text-right px-2 py-1.5 font-medium" title="viewport truncation override count">trunc</th>
-              <th className="text-right px-2 py-1.5 font-medium" title="Total opt-out count">total</th>
+              <th className="text-right px-2 py-1.5 font-medium" title="Total opt-out count / budget cap (red=at/over cap, amber=≤2 remaining)">total/cap</th>
               <th className="text-center px-2 py-1.5 font-medium">test</th>
               <th className="text-right px-2 py-1.5 font-medium" title="Viewport regression dispatcher cases (30d)">cases</th>
               <th className="px-2 py-1.5"></th>

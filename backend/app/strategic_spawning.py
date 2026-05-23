@@ -380,6 +380,48 @@ def _summarize_conversation_thread(thread: list) -> list:
     return thread[-_CONVERSATION_THREAD_KEEP_WHEN_TRIMMED:]
 
 
+_MEMO_CITATIONS_KEEP = 5
+_MEMO_EXCERPT_MAX_CHARS = 400
+
+
+def _summarize_memo_citations(memos: list) -> list:
+    """Trim memo citations for inclusion in strategic-agent payloads.
+
+    Keeps the most recent N memos (by task_id) and caps excerpt length
+    so the digest survives under budget pressure rather than vanishing
+    entirely. The strategic reviewer can cite memos by task_id; shorter
+    excerpts still preserve citability.
+    """
+    if not isinstance(memos, list):
+        return memos
+    if len(memos) <= _MEMO_CITATIONS_KEEP:
+        # No trimming needed for list size, but still cap excerpts
+        return [
+            {
+                **m,
+                "summary_excerpt": (m.get("summary_excerpt") or "")[
+                    :_MEMO_EXCERPT_MAX_CHARS
+                ]
+                if isinstance(m, dict)
+                else m,
+            }
+            for m in memos
+        ]
+    # Cap to most recent memos and trim excerpts
+    trimmed = memos[:_MEMO_CITATIONS_KEEP]
+    return [
+        {
+            **m,
+            "summary_excerpt": (m.get("summary_excerpt") or "")[
+                :_MEMO_EXCERPT_MAX_CHARS
+            ]
+            if isinstance(m, dict)
+            else m,
+        }
+        for m in trimmed
+    ]
+
+
 # Schemas for pack_under_budget. Each key declares its priority tier and an
 # optional summarize_fn. Critical = always shipped (raises if can't fit).
 # High = shipped unless budget exhausted by summarized criticals + earlier
@@ -439,8 +481,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # LTS version/phase context — present only on self-repo projects. High priority
     # so it survives budget pressure (the agent needs it for phase-transition decisions).
     "version_phase": {"priority": "high", "summarize": _summarize_version_phase},
-    # Citable memo digest — supplementary context, dropped first under budget pressure.
-    "memo_citations": {"priority": "low"},
+    # Citable memo digest — terminal reasoning artifacts spawned from dropped research
+    # findings. Medium priority so it survives typical payload pressure; the summarize_fn
+    # trims memos and excerpts so it degrades gracefully (fewer memos / shorter text)
+    # rather than vanishing entirely. The strategic reviewer must see memos to cite them.
+    "memo_citations": {"priority": "medium", "summarize": _summarize_memo_citations},
     # Per-axis efficiency axes with drift vs baseline. Medium priority so it
     # survives typical payload pressure; the summarize_fn trims history tails
     # so it degrades gracefully before being dropped entirely.
@@ -737,6 +782,137 @@ async def _build_recent_interventions(
         reverse=True,
     )
 
+    # Rollup-aware automain landing check.
+    # A task with pr_merged=True may not be on automain yet when it was merged
+    # into a rollup staging branch but the rollup PR itself hasn't been merged.
+    # Root tasks (no parent): on automain only when git-ancestry confirms it; unverifiable
+    # cases report False (fail-closed).
+    # Child tasks → on automain iff their rollup parent's pr_merged is True.
+    # We fetch parent contexts in one query so the per-direction loop below
+    # can reuse the same map without extra round-trips.
+    _all_parent_ids: set[uuid.UUID] = {
+        t.parent_task_id for t in merged_tasks if t.parent_task_id is not None
+    }
+    _parent_pr_merged: dict[uuid.UUID, bool] = {}
+    _parent_rollup_pr: dict[uuid.UUID, int | str | None] = {}
+    if _all_parent_ids:
+        _parents_result = await session.execute(
+            select(Task)
+            .where(Task.id.in_(_all_parent_ids))
+            .options(load_only(Task.id, Task.context, Task.status_log))
+        )
+        for _p in _parents_result.scalars().all():
+            _p_ctx = _p.context or {}
+            _parent_pr_merged[_p.id] = bool(_p_ctx.get("pr_merged", False))
+            _parent_rollup_pr[_p.id] = _p_ctx.get("rollup_pr_number") or _p_ctx.get(
+                "pr_number"
+            )
+
+    # GitHub-ancestry verification for the on_automain signal.
+    # The pr_merged flag is set when a PR is observed merged, but does NOT
+    # confirm the commit is reachable from the integration branch (e.g. the
+    # PR may have landed on a rollup staging branch that itself never merged).
+    # We attempt a best-effort ancestry check using the existing github
+    # primitives.  When credentials are unavailable or an API call fails the
+    # fallback is fail-closed (False), NOT fail-open — see _on_automain below.
+    _gh_token_ss: str | None = None
+    _gh_owner_ss: str | None = None
+    _gh_repo_ss: str | None = None
+    _integration_branch_ss = _runtime_config.get("integration_branch", "main")
+    _automain_verified: dict[uuid.UUID, bool] = {}
+
+    try:
+        from app import github as _github_ss
+        from app.release_qualifier import _resolve_github_with_session as _resolve_gh
+
+        _gh_creds = await _resolve_gh(session, project)
+        if _gh_creds:
+            _gh_token_ss, _gh_owner_ss, _gh_repo_ss = _gh_creds
+    except Exception as _exc_ss:  # noqa: BLE001 — credential failure → flag fallback
+        logger.debug("[STRATEGIC] GitHub credential resolution skipped: %s", _exc_ss)
+
+    if _gh_token_ss and _gh_owner_ss and _gh_repo_ss:
+        # Collect the bounded set of tasks that will actually appear in the feed:
+        # top-limit merges_out entries + tasks merged since the last strategic
+        # cycle (the per_direction_delta recent window).
+        _recent_cutoff_verify = _strategic_cutoff or _24h_ago
+        _to_verify_ids: set[uuid.UUID] = {t.id for t in merged_tasks[:limit]}
+        for _t_v in merged_tasks:
+            _ts_v = _t_v.updated_at or _t_v.created_at
+            if _ts_v and _ts_v >= _recent_cutoff_verify:
+                _to_verify_ids.add(_t_v.id)
+        _to_verify = [t for t in merged_tasks if t.id in _to_verify_ids]
+
+        _pr_data_cache: dict[int, dict] = {}
+
+        for _t in _to_verify:
+            _ctx_t = _t.context or {}
+            # Resolve which PR's merge commit to verify for ancestry.
+            # A rollup child task merges into the rollup staging branch, so the
+            # child PR's own merge commit lives on that branch — once the rollup
+            # PR squash-merges, the child commit is NOT an ancestor of the
+            # integration branch. The child is on automain iff the *parent's*
+            # rollup PR landed, so verify that PR instead of the child's own.
+            if _t.parent_task_id is not None:
+                _pr_num_raw = _parent_rollup_pr.get(_t.parent_task_id)
+            else:
+                _pr_num_raw = _ctx_t.get("rollup_pr_number") or _ctx_t.get("pr_number")
+            if not _pr_num_raw:
+                # No PR number available — cannot verify, use flag fallback later
+                continue
+            try:
+                _pr_num = int(_pr_num_raw)
+                if _pr_num not in _pr_data_cache:
+                    _pr_data_cache[_pr_num] = await _github_ss.get_pull_request(
+                        _gh_token_ss,
+                        _gh_owner_ss,
+                        _gh_repo_ss,
+                        _pr_num,
+                        project_id=str(project.id),
+                    )
+                _pr_data = _pr_data_cache[_pr_num]
+                _merge_sha = _pr_data.get("merge_commit_sha")
+                if not _merge_sha:
+                    # PR has no merge SHA (not yet merged or API gap) → not landed
+                    _automain_verified[_t.id] = False
+                    continue
+
+                _is_anc = await _github_ss.is_ancestor_of(
+                    _gh_token_ss,
+                    _gh_owner_ss,
+                    _gh_repo_ss,
+                    _merge_sha,
+                    _integration_branch_ss,
+                    project_id=str(project.id),
+                )
+
+                # is_ancestor_of returns True (merge commit reachable from the
+                # integration branch), False (genuinely not reachable), or None
+                # (compare API indeterminate). Only True confirms the change
+                # landed; False and None are both degrade-safe NOT-landed.
+                _automain_verified[_t.id] = _is_anc is True
+            except Exception as _exc_t:  # noqa: BLE001 — API failure → flag fallback
+                logger.debug(
+                    "[STRATEGIC] ancestry check failed for task %s (pr=%s): %s",
+                    _t.id,
+                    _pr_num_raw,
+                    _exc_t,
+                )
+                # Leave _t.id absent from _automain_verified; flag fallback used below
+
+    def _on_automain(task: Task) -> bool:
+        # Prefer the GitHub-verified result when available.
+        if task.id in _automain_verified:
+            return _automain_verified[task.id]
+        # Fallback: flag heuristic (when credentials unavailable or PR has no number).
+        # Root tasks with unverifiable ancestry report False (fail-closed) — we cannot
+        # confirm the commit is reachable from the integration branch, so we must not
+        # assume it landed.  Child tasks depend on whether their rollup parent's PR was
+        # merged (DB-recorded flag), which already defaults to False.
+        if task.parent_task_id is None:
+            return False
+        return _parent_pr_merged.get(task.parent_task_id, False)
+
     # For rollups: look up child titles so the agent sees what actually
     # shipped instead of "Rollup of 4 subtasks" + a title.
     merged_parent_ids = {str(t.id) for t in merged_tasks[:limit]}
@@ -789,6 +965,7 @@ async def _build_recent_interventions(
                 "merged_at": merged_at.isoformat() if merged_at else None,
                 "hours_ago": hours_ago,
                 "body": body,
+                "on_automain": _on_automain(t),
             }
         )
 
@@ -811,10 +988,12 @@ async def _build_recent_interventions(
         }
         if _strategic_cutoff:
             entry["since_last_strategic"] = _window_counts(d_tasks, _strategic_cutoff)
-        # Titles of things that shipped since last strategic (or last 24h as fallback)
+        # Titles of things that shipped since last strategic (or last 24h as fallback).
+        # Each entry is a dict so the agent can distinguish automain-landed from
+        # staging-only merges (on_automain=False means rollup not yet merged).
         recent_cutoff = _strategic_cutoff or _24h_ago
-        recent_merges = [
-            (t.title or "")[:160]
+        recent_merges_dicts = [
+            {"title": (t.title or "")[:160], "on_automain": _on_automain(t)}
             for t in d_tasks
             if t.status == TaskStatus.COMPLETED
             and (t.context or {}).get("pr_merged")
@@ -825,8 +1004,8 @@ async def _build_recent_interventions(
             )
             >= recent_cutoff
         ]
-        if recent_merges:
-            entry["recent_merged_titles"] = recent_merges[:10]
+        if recent_merges_dicts:
+            entry["recent_merged_titles"] = recent_merges_dicts[:10]
         per_direction_delta.append(entry)
 
     # Active-by-scope: tasks currently in flight per scope. Surfaced so the

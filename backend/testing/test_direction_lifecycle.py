@@ -1250,6 +1250,199 @@ async def test_process_lifecycle_churn_pause_emits_blocker_notification(
     )
 
 
+@pytest.mark.asyncio
+async def test_grace_period_blocks_unproductive_repause_on_stale_history(
+    db_session, mocker
+):
+    """Just-recovered direction with frozen unproductive history is NOT re-paused.
+
+    When auto_recovered_at is set and no history entry exists after that timestamp,
+    history-based rules (1, 2, 5, 6) are skipped. A direction that previously triggered
+    Rule 2 (Unproductive: 0 PRs merged) must not immediately re-trigger it before any
+    new research cycle runs.
+    """
+    recovered_at = datetime.utcnow() - timedelta(minutes=5)
+    # 5 cycles with 0 merges, all timestamped before recovery — Rule 2 would normally fire
+    history = [
+        {
+            "timestamp": (recovered_at - timedelta(days=i)).isoformat(),
+            "tasks_created": 5,
+            "tasks_completed": 5,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        }
+        for i in range(5, 0, -1)
+    ]
+    direction = {
+        "id": "d-grace-no-repause",
+        "text": "Unproductive direction in grace period",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "auto_recovered_at": recovered_at.isoformat(),
+        "research_history": history,
+    }
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "active", (
+        "grace period should block Rule 2 re-pause when no new cycle exists after recovery"
+    )
+    assert d.get("auto_recovered_at") is not None, (
+        "auto_recovered_at should remain set while still in grace period"
+    )
+
+
+@pytest.mark.asyncio
+async def test_grace_period_expires_after_new_cycle_appended_triggers_pause(
+    db_session, mocker
+):
+    """Grace period ends once a new research cycle is appended after recovery.
+
+    A direction with a new unproductive cycle (timestamp > auto_recovered_at) IS
+    paused again by Rule 2, and auto_recovered_at is cleared on re-pause.
+    """
+    mocker.patch(
+        "app.autonomous_research_diagnosis._spawn_unproductive_diagnosis",
+        new_callable=AsyncMock,
+    )
+
+    recovered_at = datetime.utcnow() - timedelta(hours=2)
+    # 4 pre-recovery cycles with 0 merges
+    pre_history = [
+        {
+            "timestamp": (recovered_at - timedelta(days=i)).isoformat(),
+            "tasks_created": 5,
+            "tasks_completed": 5,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        }
+        for i in range(4, 0, -1)
+    ]
+    # One new cycle AFTER recovery — still 0 merges, tasks fully completed
+    new_cycle = {
+        "timestamp": (recovered_at + timedelta(minutes=30)).isoformat(),
+        "tasks_created": 5,
+        "tasks_completed": 5,
+        "tasks_failed": 0,
+        "tasks_failed_infra": 0,
+        "prs_merged": 0,
+    }
+    direction = {
+        "id": "d-grace-expires",
+        "text": "Unproductive direction with new cycle after recovery",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "auto_recovered_at": recovered_at.isoformat(),
+        "research_history": pre_history + [new_cycle],
+    }
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused", (
+        "direction should be re-paused once a new unproductive cycle exists after recovery"
+    )
+    assert d.get("auto_paused") is True
+    reason = d.get("paused_reason", "")
+    assert "Unproductive" in reason, (
+        f"paused_reason should be Rule 2 (Unproductive), got: {reason!r}"
+    )
+    assert d.get("auto_recovered_at") is None, (
+        "auto_recovered_at should be cleared when re-paused"
+    )
+
+
+@pytest.mark.asyncio
+async def test_grace_period_does_not_block_code_failure_pause(db_session, mocker):
+    """Grace period does NOT protect against code-failure rules (3, 4).
+
+    A direction in grace period (auto_recovered_at set, no new cycle appended)
+    with high code failure rate IS still paused by Rule 3. Auto-retirement must
+    not be weakened by the grace period.
+    """
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    mocker.patch(
+        "app.direction_lifecycle._spawn_direction_diagnosis",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+    mocker.patch(
+        "app.autonomous_research._spawn_direction_diagnosis",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    recovered_at = datetime.utcnow() - timedelta(minutes=5)
+    # 3 cycles with 90% code failure rate — triggers Rule 3 regardless of grace
+    history = [
+        {
+            "timestamp": (recovered_at - timedelta(days=i)).isoformat(),
+            "tasks_created": 10,
+            "tasks_failed": 9,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        }
+        for i in range(3, 0, -1)
+    ]
+    direction = {
+        "id": "d-grace-code-fail",
+        "text": "Code-failing direction in grace period",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "auto_recovered_at": recovered_at.isoformat(),
+        "research_history": history,
+    }
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused", (
+        "grace period must NOT protect against code-failure rules (Rule 3)"
+    )
+    assert d.get("auto_paused") is True
+    reason = d.get("paused_reason", "")
+    assert "High code failure rate" in reason or "Recent stall" in reason, (
+        f"paused_reason should indicate a code-failure rule, got: {reason!r}"
+    )
+
+
 def _scaffolding_direction_for_lifecycle(progress_window):
     return {
         "id": "d-scaffold-lc",
@@ -1322,7 +1515,7 @@ async def test_lifecycle_flags_outcome_scaffolding_and_notifies_once(
 async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
     db_session, mocker
 ):
-    """Once the progress window shows growth, the advisory flag is cleared."""
+    """Once success-evidence advances across the window, the advisory flag is cleared."""
     mocker.patch(
         "app.notification_dispatch.post_direction_outcome_stalled_message",
         new_callable=AsyncMock,
@@ -1339,9 +1532,10 @@ async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
     await db_session.refresh(project)
     assert project.directions[0].get("outcome_scaffolding_flagged") is True
 
-    # Progress resumes -> window now shows an increase.
+    # Progress resumes -> the success-evidence fingerprint now varies across the
+    # window, which the detector reads as advancement.
     project.directions[0]["outcome_progress_history"] = [
-        {"progress": p} for p in [5, 5, 5, 5, 5, 7]
+        {"progress": 5, "success_evidence_fp": f"fp{i:015d}"} for i in range(6)
     ]
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -1358,3 +1552,110 @@ async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
     )
     await db_session.refresh(project)
     assert project.directions[0].get("outcome_scaffolding_flagged") is None
+
+
+@pytest.mark.asyncio
+async def test_scaffolding_memo_spawned_on_first_flag(db_session, mocker):
+    """A memo task is spawned the first time a direction is flagged as outcome-less scaffolding."""
+    from unittest.mock import AsyncMock
+    from sqlmodel import select
+
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    direction = _scaffolding_direction_for_lifecycle([5, 5, 5, 5, 5, 5])
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    assert project.directions[0].get("outcome_scaffolding_flagged") is True
+
+    memo_tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.created_by == "ORCHESTRATOR",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    scaffolding_memos = [
+        t
+        for t in memo_tasks
+        if isinstance(t.context, dict)
+        and t.context.get("memo_reasoning_kind") == "outcome_scaffolding"
+    ]
+    assert len(scaffolding_memos) == 1, (
+        f"expected 1 outcome_scaffolding memo, got {len(scaffolding_memos)}"
+    )
+    memo = scaffolding_memos[0]
+    assert memo.context.get("memo_source_direction_id") == direction["id"]
+    assert memo.status == TaskStatus.QUEUED
+    assert (memo.payloads[0].get("topic") or "").startswith("Outcome-less scaffolding:")
+
+
+@pytest.mark.asyncio
+async def test_scaffolding_memo_not_respawned_on_evidence_refresh(db_session, mocker):
+    """No additional memo is spawned on subsequent lifecycle passes while the flag is still set."""
+    from unittest.mock import AsyncMock
+    from sqlmodel import select
+
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    direction = _scaffolding_direction_for_lifecycle([5, 5, 5, 5, 5, 5])
+    project = await _make_cost_project(db_session, direction)
+
+    # First pass: flag is set and memo is spawned
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    assert project.directions[0].get("outcome_scaffolding_flagged") is True
+
+    # Second pass: flag already set, no new memo
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    memo_tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.created_by == "ORCHESTRATOR",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    scaffolding_memos = [
+        t
+        for t in memo_tasks
+        if isinstance(t.context, dict)
+        and t.context.get("memo_reasoning_kind") == "outcome_scaffolding"
+    ]
+    assert len(scaffolding_memos) == 1, (
+        f"expected exactly 1 memo (no re-spawn), got {len(scaffolding_memos)}"
+    )

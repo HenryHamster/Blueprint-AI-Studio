@@ -5,6 +5,7 @@ completion handlers. Contains direction health/completion checks, duplicate dete
 and the _handle_strategic_completion handler.
 """
 
+import hashlib
 import json
 import logging
 import uuid
@@ -25,6 +26,7 @@ from app.models import (
     RECOMMENDED_MODE_META_KEY,
     RECOMMENDED_MODE_SOURCE_STRATEGIC,
     Task,
+    TaskStatus,
 )
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
@@ -604,6 +606,95 @@ def _collect_retirement_metrics(
     return result
 
 
+async def _spawn_retirement_memos(
+    session: AsyncSession,
+    project: Project,
+    task: Task,
+    retired_ids: list,
+    rationales: dict,
+) -> int:
+    """Spawn one memo task per newly-retired direction as a durable citable artifact.
+
+    The memo preserves the retirement rationale so strategic-cycle citation
+    queries can reference it.  Dedup guard: skips any direction that already
+    has a retirement memo in the last 90 days.
+    """
+    if not retired_ids:
+        return 0
+    from app.payload_schemas import validate_internal_payload
+    from app.plan_completion import TASK_PRIORITY_MAP
+
+    ninety_days_ago = _utcnow() - timedelta(days=90)
+    existing_rows = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.created_at >= ninety_days_ago,
+                    Task.created_by == "ORCHESTRATOR",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    already_memed: set[str] = {
+        str(t.context.get("memo_source_direction_id"))
+        for t in existing_rows
+        if isinstance(t.context, dict)
+        and t.context.get("memo_reasoning_kind") == "direction_retirement"
+        and t.context.get("memo_source_direction_id")
+    }
+
+    by_id = {d.get("id"): d for d in (project.directions or []) if d.get("id")}
+    spawned = 0
+    for did in retired_ids:
+        if did in already_memed:
+            logger.debug(
+                "[STRATEGIC] Skipping duplicate retirement memo for direction %s", did
+            )
+            continue
+        direction = by_id.get(did)
+        direction_text = (direction.get("text") or "") if direction else ""
+        rationale = rationales.get(did) or ""
+        topic = direction_text[:120] or f"Direction {did}"
+        memo_payload = validate_internal_payload(
+            {
+                "type": "memo",
+                "topic": f"Direction retired: {topic}",
+                "reasoning_kind": "direction_retirement",
+                "direction_id": did,
+                **({"retirement_rationale": rationale} if rationale else {}),
+            },
+            "strategic_completion:memo:direction_retirement",
+        )
+        memo_task = Task(
+            project_id=project.id,
+            title=f"Memo: direction retired — {topic[:100]}",
+            description="Reasoning memo for retired direction",
+            parent_task_id=task.id,
+            payloads=[memo_payload],
+            context={
+                "memo_reasoning_kind": "direction_retirement",
+                "memo_source_direction_id": did,
+                "memo_source_task_id": str(task.id),
+                **({"retirement_rationale": rationale} if rationale else {}),
+            },
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            priority=TASK_PRIORITY_MAP.get("low", 0),
+        )
+        session.add(memo_task)
+        spawned += 1
+        logger.info(
+            "[STRATEGIC] Spawned retirement memo task %s for direction %s",
+            memo_task.id,
+            did,
+        )
+    return spawned
+
+
 def _extract_cycle_reasoning(task: Task) -> str:
     """Extract a condensed reasoning summary for the completed cycle (≤500 chars).
 
@@ -734,23 +825,38 @@ def _check_direction_health(direction: dict) -> str | None:
     """Return a pause reason if this direction should be auto-paused, else None."""
     history = direction.get("research_history") or []
 
-    # Rule 1: Persistent saturation — possibly_saturated AND last 5+ cycles all produced ≤1 task
-    if direction.get("possibly_saturated") and len(history) >= 5:
-        recent5 = history[-5:]
-        if all(entry.get("tasks_created", 0) <= 1 for entry in recent5):
-            return "Saturated: last 5 research cycles produced no actionable findings"
+    # Grace period: a just-recovered direction skips history-based rules (1, 2, 5, 6)
+    # until at least one new research cycle is appended after recovery. This prevents
+    # the frozen research_history that originally triggered the pause from immediately
+    # re-triggering it on the very next lifecycle tick. Code-failure rules (3, 4) are
+    # always evaluated so auto-retirement is never weakened by the grace period.
+    recovered_at = direction.get("auto_recovered_at")
+    in_grace = recovered_at is not None and not any(
+        (e.get("timestamp") or "") > recovered_at for e in history
+    )
 
-    # Rule 2: Zero merge rate — 5+ cycles with 0 PRs merged total, and the most
-    # recent cycle has no tasks still in-flight (tasks_created == tasks_completed + tasks_failed)
-    if len(history) >= 5:
-        total_merged = sum(entry.get("prs_merged", 0) for entry in history)
-        if total_merged == 0:
-            last = history[-1]
-            created = last.get("tasks_created", 0)
-            finished = last.get("tasks_completed", 0) + last.get("tasks_failed", 0)
-            if created == 0 or finished >= created:
-                total_created = sum(entry.get("tasks_created", 0) for entry in history)
-                return f"Unproductive: 0 PRs merged from {len(history)} research cycles ({total_created} tasks created)"
+    if not in_grace:
+        # Rule 1: Persistent saturation — possibly_saturated AND last 5+ cycles all produced ≤1 task
+        if direction.get("possibly_saturated") and len(history) >= 5:
+            recent5 = history[-5:]
+            if all(entry.get("tasks_created", 0) <= 1 for entry in recent5):
+                return (
+                    "Saturated: last 5 research cycles produced no actionable findings"
+                )
+
+        # Rule 2: Zero merge rate — 5+ cycles with 0 PRs merged total, and the most
+        # recent cycle has no tasks still in-flight (tasks_created == tasks_completed + tasks_failed)
+        if len(history) >= 5:
+            total_merged = sum(entry.get("prs_merged", 0) for entry in history)
+            if total_merged == 0:
+                last = history[-1]
+                created = last.get("tasks_created", 0)
+                finished = last.get("tasks_completed", 0) + last.get("tasks_failed", 0)
+                if created == 0 or finished >= created:
+                    total_created = sum(
+                        entry.get("tasks_created", 0) for entry in history
+                    )
+                    return f"Unproductive: 0 PRs merged from {len(history)} research cycles ({total_created} tasks created)"
 
     # Rule 3: High CODE failure rate — last 3 cycles have >70% tasks failed
     # for direction-attributable reasons (not infra failures like rate limits,
@@ -785,47 +891,48 @@ def _check_direction_health(direction: dict) -> str | None:
                 "Recent stall: last 3 research cycles all failed or produced no merges"
             )
 
-    # Rule 5: High non-merge churn — rolling window of finished tasks that did not merge.
-    # Only fires when non-merging volume is both absolutely high AND merge rate is very low,
-    # to avoid pausing productive high-throughput directions that simply have many tasks.
-    # research/investigate children are excluded conservatively by the default threshold.
-    churn_threshold = int(
-        _runtime_config.get("direction_churn_non_merge_threshold", 15) or 15
-    )
-    churn_min_merge_rate = float(
-        _runtime_config.get("direction_churn_min_merge_rate", 0.10) or 0.10
-    )
-    if churn_threshold > 0:
-        metrics = _compute_churn_metrics(direction)
-        if metrics and metrics["non_merge_finished"] >= churn_threshold:
-            if metrics["merge_rate"] < churn_min_merge_rate:
-                return (
-                    f"Churn guardrail: {metrics['non_merge_finished']} tasks finished "
-                    f"without merging, {metrics['merged']} merged in last "
-                    f"{metrics['window_cycles']} cycles "
-                    f"(merge rate {metrics['merge_rate']:.0%})"
-                )
+    if not in_grace:
+        # Rule 5: High non-merge churn — rolling window of finished tasks that did not merge.
+        # Only fires when non-merging volume is both absolutely high AND merge rate is very low,
+        # to avoid pausing productive high-throughput directions that simply have many tasks.
+        # research/investigate children are excluded conservatively by the default threshold.
+        churn_threshold = int(
+            _runtime_config.get("direction_churn_non_merge_threshold", 15) or 15
+        )
+        churn_min_merge_rate = float(
+            _runtime_config.get("direction_churn_min_merge_rate", 0.10) or 0.10
+        )
+        if churn_threshold > 0:
+            metrics = _compute_churn_metrics(direction)
+            if metrics and metrics["non_merge_finished"] >= churn_threshold:
+                if metrics["merge_rate"] < churn_min_merge_rate:
+                    return (
+                        f"Churn guardrail: {metrics['non_merge_finished']} tasks finished "
+                        f"without merging, {metrics['merged']} merged in last "
+                        f"{metrics['window_cycles']} cycles "
+                        f"(merge rate {metrics['merge_rate']:.0%})"
+                    )
 
-    # Rule 6: Lifetime cumulative burn backstop — catches slow-burn directions that stay
-    # just under the rolling-window threshold every window but accumulate hundreds of
-    # non-merging tasks over their lifetime. High threshold prevents pausing productive
-    # high-throughput directions. This pause requires manual operator intervention (retire
-    # vs. reset) because the lifetime metric will not drop on its own after auto-recovery.
-    lifetime_threshold = int(
-        _runtime_config.get("direction_lifetime_non_merge_threshold", 150) or 150
-    )
-    lifetime_min_merge_rate = float(
-        _runtime_config.get("direction_lifetime_min_merge_rate", 0.10) or 0.10
-    )
-    if lifetime_threshold > 0:
-        lm = _compute_lifetime_burn_metrics(direction)
-        if lm and lm["lifetime_non_merge_finished"] >= lifetime_threshold:
-            if lm["lifetime_merge_rate"] < lifetime_min_merge_rate:
-                return (
-                    f"Lifetime burn backstop: {lm['lifetime_non_merge_finished']} tasks "
-                    f"finished without merging lifetime, {lm['lifetime_merged']} merged "
-                    f"(lifetime merge rate {lm['lifetime_merge_rate']:.0%})"
-                )
+        # Rule 6: Lifetime cumulative burn backstop — catches slow-burn directions that stay
+        # just under the rolling-window threshold every window but accumulate hundreds of
+        # non-merging tasks over their lifetime. High threshold prevents pausing productive
+        # high-throughput directions. This pause requires manual operator intervention (retire
+        # vs. reset) because the lifetime metric will not drop on its own after auto-recovery.
+        lifetime_threshold = int(
+            _runtime_config.get("direction_lifetime_non_merge_threshold", 150) or 150
+        )
+        lifetime_min_merge_rate = float(
+            _runtime_config.get("direction_lifetime_min_merge_rate", 0.10) or 0.10
+        )
+        if lifetime_threshold > 0:
+            lm = _compute_lifetime_burn_metrics(direction)
+            if lm and lm["lifetime_non_merge_finished"] >= lifetime_threshold:
+                if lm["lifetime_merge_rate"] < lifetime_min_merge_rate:
+                    return (
+                        f"Lifetime burn backstop: {lm['lifetime_non_merge_finished']} tasks "
+                        f"finished without merging lifetime, {lm['lifetime_merged']} merged "
+                        f"(lifetime merge rate {lm['lifetime_merge_rate']:.0%})"
+                    )
 
     return None
 
@@ -978,11 +1085,14 @@ def record_outcome_progress_snapshot(direction: dict) -> None:
     total_merged = sum(e.get("prs_merged", 0) for e in history) + (
         agg.get("total_prs_merged") or 0
     )
+    se_text = ((direction.get("context") or {}).get("success_evidence") or "").encode()
+    success_evidence_fp = hashlib.sha256(se_text).hexdigest()[:16]
     snapshot = {
         "timestamp": _utcnow().isoformat(),
         "cycle_index": total_cycles,
         "progress": _compute_outcome_progress_signal(direction),
         "merged": total_merged,
+        "success_evidence_fp": success_evidence_fp,
     }
     snaps = list(direction.get("outcome_progress_history") or [])
     snaps.append(snapshot)
@@ -1031,12 +1141,12 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
         rate >= min_merge_rate, so churn/burn directions (low merge rate / high
         non-merge volume) are explicitly EXCLUDED — those are handled by the churn
         guardrail and lifetime-burn backstop in _check_direction_health;
-      - sustained no progress: the per-cycle progress signal is flat (no increase)
+      - sustained no progress: the success_evidence fingerprint is unchanged
         across the last stall_run snapshots AND the direction has never reached a
         'met' outcome.
     Guards hard against false positives: requires a FULL stall_run window of
-    snapshots, so a single low-progress cycle cannot trip the flag, and any increase
-    anywhere in the window clears it.
+    snapshots, so a single stalled cycle cannot trip the flag, and any change in
+    the success_evidence fingerprint anywhere in the window clears it.
     """
     if direction.get("outcome_progress_ever_met"):
         return None
@@ -1063,8 +1173,9 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
         return None
     window = snaps[-run:]
     progress_vals = [int(s.get("progress", 0) or 0) for s in window]
-    if max(progress_vals) > min(progress_vals):
-        return None  # progress increased somewhere in the window -> advancing
+    fp_vals = [s.get("success_evidence_fp") for s in window]
+    if len(set(fp_vals)) != 1:
+        return None  # success_evidence changed across the window -> advancing
     # Never met its outcome (current completion detector must also be negative).
     if _check_direction_completion(direction) is not None:
         return None
@@ -1080,10 +1191,15 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
         "stall_run_cycles": run,
         "progress_signal": progress_vals[-1],
         "outcome_progress_window": progress_vals,
+        "success_evidence_unchanged_cycles": run,
     }
 
 
 _RETIRED_DIRECTION_STATUSES = frozenset({"expired", "retired", "superseded"})
+
+_MIN_DISTINCTION_CHARS = (
+    20  # well-formed distinction must be at least this many characters
+)
 
 _DIRECTION_DEDUP_STOPWORDS = frozenset(
     {
@@ -1119,22 +1235,35 @@ _DIRECTION_DEDUP_STOPWORDS = frozenset(
 
 
 def _is_direction_duplicate(
-    proposal_text: str, existing_directions: list, rejected_proposals: list
+    proposal_text: str,
+    existing_directions: list,
+    rejected_proposals: list,
+    *,
+    distinction: str | None = None,
 ) -> bool:
     """Return True if proposal_text overlaps with an existing or recently rejected direction.
 
-    Retired directions (expired/retired/superseded) use a tighter threshold (3 shared
-    non-stopword tokens) to catch paraphrased retirements. Active directions keep
-    the default threshold of 4.
+    All directions (active and retired) use the same overlap threshold of 4 shared
+    non-stopword tokens. When a well-formed distinction is supplied and the only
+    matching directions are retired-status, the distinction overrides the block and
+    this function returns False. Matches against active directions and recently-rejected
+    proposals always block regardless of distinction.
     """
     words = set(proposal_text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS
     if len(words) < 2:
         return False
+    has_well_formed_distinction = bool(
+        distinction and len(distinction.strip()) >= _MIN_DISTINCTION_CHARS
+    )
     for d in existing_directions:
         existing_text = (d.get("text") or "").lower()
         existing_words = set(existing_text.split()) - _DIRECTION_DEDUP_STOPWORDS
-        threshold = 3 if d.get("status") in _RETIRED_DIRECTION_STATUSES else 4
-        if len(words & existing_words) >= threshold:
+        if len(words & existing_words) >= 4:
+            if (
+                has_well_formed_distinction
+                and d.get("status") in _RETIRED_DIRECTION_STATUSES
+            ):
+                continue  # distinction overrides match against retired direction
             return True
     cutoff = (_utcnow() - timedelta(days=30)).isoformat()
     for entry in rejected_proposals:
@@ -1165,8 +1294,7 @@ def _find_matching_direction(
         if existing_text == text_lower:
             return d
         existing_words = set(existing_text.split()) - _DIRECTION_DEDUP_STOPWORDS
-        threshold = 3 if d.get("status") in _RETIRED_DIRECTION_STATUSES else 4
-        if len(words & existing_words) >= threshold:
+        if len(words & existing_words) >= 4:
             return d
     return None
 
@@ -1465,6 +1593,7 @@ async def _handle_strategic_completion(
         dirs_retired = (task.context or {}).get("_strategic_dirs_retired", 0)
         created_ids = list((task.context or {}).get("_strategic_created_ids", []))
         retired_ids = list((task.context or {}).get("_strategic_retired_ids", []))
+        retired_rationales: Dict[str, str] = {}
         if cycle_id:
             _vision_updated = (task.context or {}).get(
                 "_strategic_vision_set", False
@@ -1524,9 +1653,22 @@ async def _handle_strategic_completion(
                 )
             _cycle_reasoning = _extract_cycle_reasoning(task)
             _memos_available = len(_memo_citations)
-            _memos_cited = strategic_cycle.count_cited_memos(
-                _memo_citations, _cycle_reasoning
-            )
+            # Prefer the structured cited-ID set written by the agent via the
+            # cite_memos API (task.context["_strategic_cited_memo_ids"]).  This is
+            # reliable because the thinker analysis text is scanned at emit-time,
+            # right after the thinker phase, before the status message is set.
+            # Fall back to text-scanning _cycle_reasoning for tasks that predate
+            # the cite_memos API (no key in context).
+            _ctx_cited_ids = (task.context or {}).get("_strategic_cited_memo_ids")
+            if _ctx_cited_ids is not None:
+                _available_ids = {
+                    m.get("task_id") for m in _memo_citations if m.get("task_id")
+                }
+                _memos_cited = len(set(_ctx_cited_ids) & _available_ids)
+            else:
+                _memos_cited = strategic_cycle.count_cited_memos(
+                    _memo_citations, _cycle_reasoning
+                )
             await strategic_cycle.mark_phase2_completed(
                 session,
                 cycle_id,
@@ -1596,6 +1738,9 @@ async def _handle_strategic_completion(
         # Per-cycle message post removed: the strategic agent now maintains
         # project.running_update as a living markdown document it rewrites
         # each cycle. Replaces the previous one-message-per-cycle noise.
+        await _spawn_retirement_memos(
+            session, project, task, retired_ids, retired_rationales
+        )
         await session.commit()
         logger.info(
             f"[STRATEGIC] Task {task.id} complete via API: vision rev {vision_rev}, {active_dirs} active directions"
@@ -1917,22 +2062,28 @@ async def _handle_strategic_completion(
                 text = text[:STRATEGIC_DIRECTION_TEXT_MAX]
                 # Dedup: skip if a semantically similar direction already exists
                 raw_dedup_reasoning = op_entry.get("dedup_reasoning")
+                distinction = (
+                    str(raw_dedup_reasoning.get("distinction") or "").strip()
+                    if isinstance(raw_dedup_reasoning, dict)
+                    else ""
+                )
                 _rejected_proposals = list(
                     (project.vision or {}).get("rejected_proposals") or []
                 )
-                if _is_direction_duplicate(text, directions, _rejected_proposals):
-                    if isinstance(raw_dedup_reasoning, dict):
-                        distinction = str(
-                            raw_dedup_reasoning.get("distinction") or ""
-                        ).strip()
-                        if distinction:
-                            logger.warning(
-                                "[STRATEGIC_DEDUP_DISAGREEMENT] Fallback path: direction rejected as duplicate but "
-                                "agent claimed distinction='%s'; matched text='%s'; project=%s",
-                                distinction[:200],
-                                text[:60],
-                                project.id,
-                            )
+                if _is_direction_duplicate(
+                    text,
+                    directions,
+                    _rejected_proposals,
+                    distinction=distinction or None,
+                ):
+                    if distinction:
+                        logger.warning(
+                            "[STRATEGIC_DEDUP_DISAGREEMENT] Fallback path: direction rejected as duplicate but "
+                            "agent claimed distinction='%s'; matched text='%s'; project=%s",
+                            distinction[:200],
+                            text[:60],
+                            project.id,
+                        )
                     matched = _find_matching_direction(text, directions)
                     if matched:
                         logger.info(
@@ -2438,6 +2589,9 @@ async def _handle_strategic_completion(
     # cycle; the user acknowledges to stamp a read-marker.
     task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} messages, {msgs_resolved} resolved"
     session.add(task)
+    await _spawn_retirement_memos(
+        session, project, task, retired_ids_fb, retired_rationales_fb
+    )
     await (
         session.commit()
     )  # Single commit: vision + directions + messages + task status

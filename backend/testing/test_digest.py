@@ -10293,6 +10293,9 @@ async def test_pipeline_regressions_surface_signal_staleness(
                 "signal_last_computed_at": (
                     datetime.utcnow() - timedelta(days=3)
                 ).isoformat(),
+                "last_sufficient_computed_at": (
+                    datetime.utcnow() - timedelta(days=3)
+                ).isoformat(),
             },
             "fix_loop_divergence_signal_last_computed_at": (
                 datetime.utcnow() - timedelta(days=8)
@@ -10486,6 +10489,68 @@ async def test_digest_sr_trends_empty_optional_fields_present(
     assert trends["sr_skip_rate"] is None
     assert trends["by_direction"] == {}
     assert trends["execution_evidence_miss_rates"] == {}
+
+
+@pytest.mark.asyncio
+async def test_serialize_sr_catch_rate_trends_is_stale(client: AsyncClient, db_session):
+    """is_stale=True when computed_at is >7 days old; False when fresh; True when absent."""
+    # Case 1: stale (8 days old)
+    project = make_project()
+    stale_ts = (datetime.utcnow() - timedelta(days=8)).isoformat()
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": stale_ts,
+            "categories": {"correctness": {"miss_rate": 0.3, "trend": "stable"}},
+            "by_task_type": {},
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    trends = response.json().get("self_review_prediction_accuracy_trends")
+    assert trends is not None
+    assert trends["is_stale"] is True
+
+    # Case 2: fresh (1 day old)
+    project2 = make_project()
+    fresh_ts = (datetime.utcnow() - timedelta(days=1)).isoformat()
+    project2.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": fresh_ts,
+            "categories": {"correctness": {"miss_rate": 0.2, "trend": "stable"}},
+            "by_task_type": {},
+        }
+    }
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project2)
+
+    response2 = await client.get(f"/api/admin/digest?project_id={project2.id}")
+    assert response2.status_code == 200
+    trends2 = response2.json().get("self_review_prediction_accuracy_trends")
+    assert trends2 is not None
+    assert trends2["is_stale"] is False
+
+    # Case 3: computed_at absent → stale
+    project3 = make_project()
+    project3.design_doc = {
+        "sr_catch_rate_trends": {
+            "categories": {"correctness": {"miss_rate": 0.1, "trend": "stable"}},
+            "by_task_type": {},
+        }
+    }
+    db_session.add(project3)
+    await db_session.commit()
+    await db_session.refresh(project3)
+
+    response3 = await client.get(f"/api/admin/digest?project_id={project3.id}")
+    assert response3.status_code == 200
+    trends3 = response3.json().get("self_review_prediction_accuracy_trends")
+    assert trends3 is not None
+    assert trends3["is_stale"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -15787,6 +15852,11 @@ async def test_version_lifecycle_with_open_version(client: AsyncClient, db_sessi
             "confidence": 0.92,
             "threshold": 0.90,
             "sub_scores": {"audit": 0.95, "test_erosion": 0.88, "smoketest": 0.90},
+            "ci_resolution": {
+                "state": "green",
+                "resolved_sha": "abc1234567",
+                "detail": "candidate commit check-runs: green",
+            },
             "blocker": None,
             "finalized_at": "2026-01-01T00:00:00",
         },
@@ -15810,6 +15880,8 @@ async def test_version_lifecycle_with_open_version(client: AsyncClient, db_sessi
     assert qual["confidence"] == 0.92
     assert qual["threshold"] == 0.90
     assert qual["sub_scores"]["audit"] == 0.95
+    assert qual["ci_resolution"]["state"] == "green"
+    assert qual["ci_resolution"]["resolved_sha"] == "abc1234567"
     assert qual["blocker"] is None
 
     assert data["recent_versions"] == []
@@ -16107,3 +16179,250 @@ async def test_digest_latest_cycle_includes_memo_stats(client: AsyncClient, db_s
     assert lc is not None
     assert lc["memos_available"] == 4
     assert lc["memos_cited"] == 1
+
+
+# ---------------------------------------------------------------------------
+# /api/admin/projects/{project_id}/qualification-verdicts tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_qualification_verdicts_empty(client: AsyncClient, db_session):
+    """Project with no QualificationVerdict rows returns an empty list."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/qualification-verdicts"
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["verdicts"] == []
+    assert data["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_list_qualification_verdicts_returns_rows_newest_first(
+    client: AsyncClient, db_session
+):
+    """Verdict rows are returned newest-first with all expected fields present."""
+    from app.models import ReleaseVersion, QualificationVerdict
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        qualification_attempts=2,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    now = _utcnow()
+    older = now - timedelta(hours=1)
+
+    v1 = QualificationVerdict(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="abc1234" + "0" * 33,
+        confidence=0.88,
+        sub_scores={"audit": 0.90, "test_erosion": 0.85, "smoketest": 0.89},
+        blocker=None,
+        would_promote=False,
+        promotion_enabled=False,
+        terminal_status="dry_run",
+        threshold=0.90,
+        started_at=older - timedelta(minutes=5),
+        finalized_at=older,
+        created_at=older,
+    )
+    v2 = QualificationVerdict(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="def5678" + "0" * 33,
+        confidence=0.93,
+        sub_scores={"audit": 0.95, "test_erosion": 0.91, "smoketest": 0.92},
+        blocker=None,
+        would_promote=True,
+        promotion_enabled=True,
+        terminal_status="promoted",
+        threshold=0.90,
+        started_at=now - timedelta(minutes=3),
+        finalized_at=now,
+        created_at=now,
+    )
+    db_session.add(v1)
+    db_session.add(v2)
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/qualification-verdicts"
+    )
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["total"] == 2
+    verdicts = data["verdicts"]
+    assert len(verdicts) == 2
+
+    # Newest first — v2 was created at `now`, v1 at `older`
+    newest = verdicts[0]
+    assert newest["terminal_status"] == "promoted"
+    assert newest["would_promote"] is True
+    assert newest["promotion_enabled"] is True
+    assert newest["confidence"] == 0.93
+    assert newest["sub_scores"]["audit"] == 0.95
+    assert newest["blocker"] is None
+    assert newest["threshold"] == 0.90
+    assert newest["candidate_sha"] == "def5678" + "0" * 33
+    assert newest["started_at"] is not None
+    assert newest["finalized_at"] is not None
+    assert newest["created_at"] is not None
+    assert "id" in newest
+    assert "release_version_id" in newest
+
+    older_verdict = verdicts[1]
+    assert older_verdict["terminal_status"] == "dry_run"
+    assert older_verdict["would_promote"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_qualification_verdicts_limit_param(client: AsyncClient, db_session):
+    """The limit query parameter is respected and caps the result set."""
+    from app.models import ReleaseVersion, QualificationVerdict
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        qualification_attempts=3,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    now = _utcnow()
+    for i in range(3):
+        db_session.add(
+            QualificationVerdict(
+                project_id=project.id,
+                release_version_id=version.id,
+                confidence=0.80 + i * 0.05,
+                terminal_status="dry_run",
+                would_promote=False,
+                promotion_enabled=False,
+                created_at=now - timedelta(hours=i),
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/qualification-verdicts?limit=2"
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 2
+    assert len(data["verdicts"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_list_qualification_verdicts_only_own_project(
+    client: AsyncClient, db_session
+):
+    """Verdicts from another project are not included in the response."""
+    from app.models import ReleaseVersion, QualificationVerdict
+
+    project_a = make_project()
+    project_b = make_project()
+    db_session.add(project_a)
+    db_session.add(project_b)
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+    db_session.add(make_membership(project_a.id))
+    db_session.add(make_membership(project_b.id))
+
+    ver_a = ReleaseVersion(
+        project_id=project_a.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        qualification_attempts=1,
+    )
+    ver_b = ReleaseVersion(
+        project_id=project_b.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        qualification_attempts=1,
+    )
+    db_session.add(ver_a)
+    db_session.add(ver_b)
+    await db_session.commit()
+    await db_session.refresh(ver_a)
+    await db_session.refresh(ver_b)
+
+    now = _utcnow()
+    db_session.add(
+        QualificationVerdict(
+            project_id=project_a.id,
+            release_version_id=ver_a.id,
+            confidence=0.88,
+            terminal_status="dry_run",
+            would_promote=False,
+            promotion_enabled=False,
+            created_at=now,
+        )
+    )
+    db_session.add(
+        QualificationVerdict(
+            project_id=project_b.id,
+            release_version_id=ver_b.id,
+            confidence=0.75,
+            terminal_status="dry_run",
+            would_promote=False,
+            promotion_enabled=False,
+            created_at=now,
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project_a.id}/qualification-verdicts"
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 1
+    assert data["verdicts"][0]["confidence"] == 0.88
+
+
+@pytest.mark.asyncio
+async def test_list_qualification_verdicts_requires_auth(
+    unauthenticated_client: AsyncClient, db_session
+):
+    """Unauthenticated requests are rejected."""
+    import uuid
+
+    fake_id = uuid.uuid4()
+    response = await unauthenticated_client.get(
+        f"/api/admin/projects/{fake_id}/qualification-verdicts"
+    )
+    assert response.status_code in (401, 403)

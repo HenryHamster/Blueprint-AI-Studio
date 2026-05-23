@@ -190,16 +190,49 @@ export function useAppState() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectsFetchError, setProjectsFetchError] = useState<string | null>(null);
 
-  // Last visit timestamp — captures when the user previously loaded the app
-  const [lastVisitTimestamp] = useState<number | null>(() => {
+  // Last visit timestamp — captures when the user previously loaded the app, scoped per operator.
+  // Global key retained as migration source and unauthenticated fallback.
+  const LAST_VISIT_GLOBAL_KEY = 'blueprint-admin:lastVisitTimestamp';
+  const lastVisitKey = (email: string | null | undefined) =>
+    email ? `blueprint-admin:lastVisitTimestamp:${email}` : LAST_VISIT_GLOBAL_KEY;
+
+  const [lastVisitTimestamp, setLastVisitTimestamp] = useState<number | null>(null);
+  const lastVisitInitRef = useRef(false);
+
+  useEffect(() => {
+    if (!user || lastVisitInitRef.current) return;
+    lastVisitInitRef.current = true;
     try {
-      const stored = localStorage.getItem('blueprint-admin:lastVisitTimestamp');
-      const ts = stored ? parseInt(stored, 10) : null;
-      // Update stored timestamp to now for next visit
-      localStorage.setItem('blueprint-admin:lastVisitTimestamp', String(Date.now()));
-      return ts && !isNaN(ts) ? ts : null;
-    } catch { return null; }
-  });
+      const key = lastVisitKey(user.email);
+      const stored = localStorage.getItem(key);
+      let ts = stored ? parseInt(stored, 10) : null;
+      // Migration: seed from global key when per-operator key is absent
+      if ((!ts || isNaN(ts)) && key !== LAST_VISIT_GLOBAL_KEY) {
+        const globalStored = localStorage.getItem(LAST_VISIT_GLOBAL_KEY);
+        const globalTs = globalStored ? parseInt(globalStored, 10) : null;
+        if (globalTs && !isNaN(globalTs)) ts = globalTs;
+      }
+      setLastVisitTimestamp(ts && !isNaN(ts) ? ts : null);
+      localStorage.setItem(key, String(Date.now()));
+    } catch { /* ignore */ }
+  }, [user]);
+
+  // Hydrate lastVisitTimestamp from backend (cross-device baseline via MessagesLastSeen store).
+  // No project_id → returns max last-seen across all operator projects. Backend wins when newer.
+  useEffect(() => {
+    if (!user) return;
+    authGet(`${API_BASE_URL}/api/admin/messages/last-seen`)
+      .then(res => res.ok ? res.json() : null)
+      .then((data: { last_seen_at?: number | null } | null) => {
+        const backendTs = (data && typeof data.last_seen_at === 'number' && data.last_seen_at > 0)
+          ? data.last_seen_at
+          : null;
+        if (backendTs !== null) {
+          setLastVisitTimestamp(prev => (prev == null || backendTs > prev) ? backendTs : prev);
+        }
+      })
+      .catch(() => {});
+  }, [user]);
 
   // Refresh indicator state
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);

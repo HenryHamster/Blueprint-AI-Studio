@@ -711,10 +711,17 @@ export async function fetchEfficiencyAxes(projectId: string): Promise<Efficiency
   return res.json();
 }
 
+export interface CiResolution {
+  state: 'green' | 'red' | 'pending' | 'no_checks';
+  resolved_sha: string | null;
+  detail: string;
+}
+
 export interface VersionQualificationSubScores {
   audit: number;
   test_erosion: number;
   smoketest: number;
+  ci_resolution?: CiResolution | null;
 }
 
 export type QualificationStatus =
@@ -731,6 +738,7 @@ export interface VersionQualification {
   confidence: number | null;
   threshold: number | null;
   sub_scores: VersionQualificationSubScores | null;
+  ci_resolution: CiResolution | null;
   blocker: string | null;
   finalized_at: string | null;
 }
@@ -836,5 +844,37 @@ export async function triggerQualify(projectId: string): Promise<QualifyTriggerR
     method: 'POST',
   });
   if (!res.ok) throw new Error(`Failed to trigger qualify: ${res.status}`);
+  return res.json();
+}
+
+export interface QualificationVerdictRecord {
+  id: string;
+  release_version_id: string;
+  candidate_sha: string;
+  confidence: number | null;
+  sub_scores: VersionQualificationSubScores | null;
+  blocker: string | null;
+  would_promote: boolean | null;
+  promotion_enabled: boolean | null;
+  terminal_status: string | null;
+  threshold: number | null;
+  started_at: string | null;
+  finalized_at: string | null;
+  created_at: string;
+}
+
+export interface QualificationVerdictsResponse {
+  verdicts: QualificationVerdictRecord[];
+  total: number;
+}
+
+export async function fetchQualificationVerdicts(
+  projectId: string,
+  limit = 20,
+): Promise<QualificationVerdictsResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/qualification-verdicts?limit=${limit}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch qualification verdicts: ${res.status}`);
   return res.json();
 }

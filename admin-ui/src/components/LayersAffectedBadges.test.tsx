@@ -106,7 +106,7 @@ describe('UntargetedLayersBadge', () => {
   });
 
   it('renders nothing when all canonical layers are untargeted (no fix history)', () => {
-    const allLayers = ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS'];
+    const allLayers = ['CI_WORKFLOW', 'AGENT_VM', 'AGENT_VERB', 'BASELINE_GATE', 'REVIEWER_PASS', 'VIEWPORT'];
     const { container } = render(<UntargetedLayersBadge untargeted_layers={allLayers} />);
     expect(container.firstChild).toBeNull();
   });

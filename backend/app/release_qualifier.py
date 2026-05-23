@@ -3577,6 +3577,277 @@ async def _reconcile_if_promotion_failed_landed(
             return False
 
 
+async def _reconcile_if_pending_auto_merge_landed(
+    version_id: uuid.UUID,
+    *,
+    session_factory=None,
+) -> bool:
+    """Reconcile an open version whose promotion PR has actually merged.
+
+    After ``promote()`` enables auto-merge on the release-vN → main PR it
+    records ``last_qualification.status == "pending"`` with a
+    ``promotion_pending`` sub-state (pr_number, candidate_sha, enabled_at).
+    That is a healthy transient — the PR will merge once CI passes.  But
+    nothing re-runs the idempotency/ancestry check when the auto-merge actually
+    fires: the version stays ``pending`` with no terminal verdict, the next
+    version is never opened, and the release lifecycle wedges silently.
+
+    This helper fills that gap.  It is called from ``sweep_stuck_qualifications``
+    for every ``open`` version whose ``last_qualification.status == "pending"``
+    AND that has a ``promotion_pending`` sub-state (pr_number + candidate_sha).
+    Two outcomes are handled:
+
+    * **Candidate is on main** (auto-merge landed): records the promotion as
+      successful via ``_record_promotion_success`` — which also opens the next
+      version.  Returns ``True``.
+
+    * **PR is closed without merging** (operator closed it, conflicting change
+      landed, auto-merge was disabled and PR force-closed): drives the version
+      to ``promotion_failed`` via ``_record_promotion_failure`` so the existing
+      retry / reconcile machinery applies.  Returns ``True``.
+
+    If the PR is still open and the candidate is not yet on main (normal
+    in-flight promotion) the function returns ``False`` without touching
+    anything.  GitHub API errors are treated conservatively — the function
+    returns ``False`` so a transient failure never mis-classifies an in-flight
+    promotion.
+
+    Lock + session pattern mirrors ``_reconcile_if_promotion_failed_landed``:
+    a dedicated session takes ``FOR UPDATE`` on the version row, releases the
+    lock via an intermediate commit BEFORE any GitHub I/O, then re-acquires
+    it (inside ``_record_promotion_success`` / ``_record_promotion_failure``)
+    for the final write.
+
+    Returns ``True`` when the version was driven to a terminal state (promoted
+    or promotion_failed), ``False`` otherwise.
+    """
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            version: release_version.ReleaseVersion | None = (
+                (
+                    await session.execute(
+                        select(release_version.ReleaseVersion)
+                        .where(release_version.ReleaseVersion.id == version_id)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if version is None:
+                return False
+            if version.status != "open":
+                return False
+            qual = version.last_qualification or {}
+            if qual.get("status") != "pending":
+                return False
+            pending = qual.get("promotion_pending")
+            if not pending:
+                return False
+            pr_number = pending.get("pr_number")
+            if not pr_number:
+                return False
+            candidate_sha: str | None = qual.get("candidate_sha")
+            if not candidate_sha:
+                return False
+
+            # base_record carries qualification metadata forward; strip the
+            # promotion_pending sub-state so it doesn't bleed into the final record.
+            base_record = {k: v for k, v in qual.items() if k != "promotion_pending"}
+            pr_url: str = pending.get("pr_url") or _idempotent_pr_url(base_record)
+
+            project = await session.get(Project, version.project_id)
+            if project is None:
+                return False
+
+            # Release the row lock before any GitHub I/O (mirrors promote()).
+            try:
+                await session.commit()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reconcile pending_auto_merge: failed to "
+                    "release row lock for v%d before GitHub I/O — skipping",
+                    version.version_number,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "[RELEASE_QUALIFIER] reconcile pending_auto_merge: rollback "
+                        "failed for v%d after commit error",
+                        version.version_number,
+                    )
+                return False
+
+            # Resolve credentials (unlocked — same as promote()).
+            resolved = await _resolve_github_with_session(session, project)
+            if resolved is None:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile pending_auto_merge: no GitHub "
+                    "credentials for v%d — skipping reconcile",
+                    version.version_number,
+                )
+                return False
+            token, owner, repo = resolved
+
+            # 1. Idempotency check — is the candidate already on main?
+            if await _candidate_already_on_main(
+                token, owner, repo, candidate_sha, version
+            ):
+                logger.info(
+                    "[RELEASE_QUALIFIER] reconcile pending_auto_merge: candidate "
+                    "%s for v%d is on main — recording promotion",
+                    candidate_sha[:8],
+                    version.version_number,
+                )
+                promoted_sha: str | None = None
+                try:
+                    promoted_sha = await github.get_branch_sha(
+                        token,
+                        owner,
+                        repo,
+                        "main",
+                        project_id=str(version.project_id),
+                    )
+                except Exception as exc:  # noqa: BLE001 — fallback to candidate_sha
+                    logger.warning(
+                        "[RELEASE_QUALIFIER] reconcile pending_auto_merge: could "
+                        "not resolve main HEAD SHA for v%d (%s) — using "
+                        "candidate_sha as promoted_sha",
+                        version.version_number,
+                        exc,
+                    )
+                result = await _record_promotion_success(
+                    session,
+                    version,
+                    candidate_sha,
+                    base_record,
+                    pr_url,
+                    token=token,
+                    owner=owner,
+                    repo=repo,
+                    promoted_sha=promoted_sha,
+                    already_landed=True,
+                    lock_released=True,
+                )
+                await session.commit()
+                return result.get("status") == "promoted" and not result.get(
+                    "already_promoted"
+                )
+
+            # 2. Check if the PR was closed without merging — if so it can never
+            #    auto-merge, and leaving the version pending indefinitely would
+            #    wedge the lifecycle.  Drive it to promotion_failed so the existing
+            #    retry machinery applies on the next strategic cycle.
+            #
+            # 3. If the PR is still open, check whether its required CI is
+            #    conclusively red.  A red-CI PR will never auto-merge; leaving it
+            #    pending indefinitely would wedge the lifecycle in the same way.
+            #    Act ONLY on _CI_RED — never on _CI_PENDING / _CI_NO_CHECKS /
+            #    _CI_GREEN, so healthy in-flight promotions are never aborted.
+            try:
+                pr_data = await github.get_pull_request(
+                    token,
+                    owner,
+                    repo,
+                    int(pr_number),
+                    project_id=str(version.project_id),
+                )
+                if pr_data.get("state") == "closed" and not pr_data.get("merged"):
+                    logger.warning(
+                        "[RELEASE_QUALIFIER] reconcile pending_auto_merge: PR #%s "
+                        "for v%d is closed without merge — driving to "
+                        "promotion_failed so retry machinery applies",
+                        pr_number,
+                        version.version_number,
+                    )
+                    await _record_promotion_failure(
+                        session,
+                        version,
+                        base_record,
+                        "pr_closed_without_merge",
+                        detail=f"PR #{pr_number} was closed without merging",
+                        pr_url=pr_url,
+                        lock_released=True,
+                    )
+                    await session.commit()
+                    return True
+
+                if pr_data.get("state") == "open":
+                    pr_head_sha: str | None = (pr_data.get("head") or {}).get("sha")
+                    if pr_head_sha:
+                        try:
+                            check_result = await github.get_check_runs_cached(
+                                token,
+                                owner,
+                                repo,
+                                pr_head_sha,
+                                project_id=str(version.project_id),
+                                treat_missing_as_success=False,
+                            )
+                            ci_state = _classify_check_runs(check_result)
+                            if ci_state == _CI_RED:
+                                logger.warning(
+                                    "[RELEASE_QUALIFIER] reconcile pending_auto_merge: "
+                                    "PR #%s for v%d has conclusively failed CI — "
+                                    "driving to promotion_failed so retry machinery "
+                                    "applies",
+                                    pr_number,
+                                    version.version_number,
+                                )
+                                await _record_promotion_failure(
+                                    session,
+                                    version,
+                                    base_record,
+                                    "pr_ci_red",
+                                    detail=(
+                                        f"PR #{pr_number} CI is conclusively failed "
+                                        f"(sha={pr_head_sha[:8]}); auto-merge will "
+                                        "never fire"
+                                    ),
+                                    pr_url=pr_url,
+                                    lock_released=True,
+                                )
+                                await session.commit()
+                                return True
+                        except Exception as exc:  # noqa: BLE001 — CI fetch failure → leave pending
+                            logger.warning(
+                                "[RELEASE_QUALIFIER] reconcile pending_auto_merge: "
+                                "could not fetch CI for PR #%s head %s for v%d "
+                                "(%s) — leaving pending",
+                                pr_number,
+                                pr_head_sha[:8] if pr_head_sha else "unknown",
+                                version.version_number,
+                                exc,
+                            )
+            except Exception as exc:  # noqa: BLE001 — PR state check must not abort sweep
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile pending_auto_merge: could not "
+                    "check PR #%s state for v%d (%s) — leaving pending",
+                    pr_number,
+                    version.version_number,
+                    exc,
+                )
+
+            return False
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] reconcile pending_auto_merge: unexpected "
+                "error for version %s",
+                version_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reconcile pending_auto_merge: rollback "
+                    "failed for version %s after unexpected error",
+                    version_id,
+                )
+            return False
+
+
 async def sweep_stuck_qualifications(
     session: AsyncSession,
     *,
@@ -3696,6 +3967,31 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep reconciled version %s "
                 "(promotion_failed candidate landed on main)",
+                version_id,
+            )
+
+    # Reconcile open versions whose promotion PR is awaiting auto-merge but
+    # has already landed on main (normal path: required CI passed, auto-merge
+    # fired) or was closed without merging (can never auto-merge, drives
+    # version to promotion_failed so retry machinery applies).
+    for version_id in version_ids:
+        try:
+            reconciled = await _reconcile_if_pending_auto_merge_landed(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: pending_auto_merge reconcile check "
+                "failed for version %s",
+                version_id,
+            )
+            continue
+        if reconciled:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep reconciled version %s "
+                "(pending_auto_merge drove to terminal state)",
                 version_id,
             )
 

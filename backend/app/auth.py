@@ -173,6 +173,12 @@ async def get_current_user(
     uid = decoded_token.get("uid")
     email = decoded_token.get("email")
 
+    if not decoded_token.get("email_verified", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email address must be verified.",
+        )
+
     # Look up user in AllowedUser table
     result = await session.execute(
         select(AllowedUser).where(AllowedUser.email == email)

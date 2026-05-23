@@ -882,12 +882,12 @@ async def claim_task(
         task.last_heartbeat = (
             _utcnow()
         )  # Immediate heartbeat — don't wait 30s for agent interval
-        # Record time-to-claim so we can measure the real distribution of VM cold-boot
-        # + auth validation + claim and tighten the reaper's pre-claim threshold later.
-        if task.vm_provisioned_at:
-            claim_latency = (
-                task.last_heartbeat - task.vm_provisioned_at
-            ).total_seconds()
+        # Record time-to-claim covering the full dispatch->agent-ready interval.
+        # Use vm_dispatched_at (set before GCE create call) when available;
+        # fall back to vm_provisioned_at for tasks created before migration 0113.
+        _cold_start_anchor = task.vm_dispatched_at or task.vm_provisioned_at
+        if _cold_start_anchor:
+            claim_latency = (task.last_heartbeat - _cold_start_anchor).total_seconds()
             task.context = {
                 **(task.context or {}),
                 "claim_latency_secs": round(claim_latency, 1),
@@ -1549,10 +1549,40 @@ async def claim_task(
             try:
                 from app.playbook_learning import compute_sr_catch_rate_trends
 
+                # Dedicated larger fetch for SR catch-rate: the metric needs
+                # two comparison buckets (current vs. previous cycle or 14-day
+                # window), each with ≥_MIN_SR_FINDINGS reviewer-rejection findings.
+                # The 50-row high_iter_rows cap is insufficient — under normal
+                # throughput all 50 rows fall in the "current" bucket, leaving
+                # "previous" empty. Load only the columns _stats_for_tasks reads
+                # (context, created_at, strategic_cycle_id) to keep memory bounded.
+                _sr_stmt = (
+                    select(Task)
+                    .options(
+                        load_only(
+                            Task.id,
+                            Task.context,
+                            Task.created_at,
+                            Task.project_id,
+                            Task.strategic_cycle_id,
+                        )
+                    )
+                    .where(
+                        Task.project_id == task.project_id,
+                        Task.status.in_([TaskStatus.FAILED, TaskStatus.COMPLETED]),
+                    )
+                    .order_by(Task.created_at.desc())
+                    .limit(200)
+                )
+                _sr_rows = (await session.execute(_sr_stmt)).scalars().all()
+                logger.debug(
+                    "[SR_CATCH_RATE] fetched %d tasks for catch-rate window",
+                    len(_sr_rows),
+                )
                 await compute_sr_catch_rate_trends(
                     project_id=task.project_id,
                     session=session,
-                    all_tasks=list(high_iter_rows),
+                    all_tasks=list(_sr_rows),
                 )
             except Exception:
                 logger.exception(
@@ -3753,7 +3783,10 @@ async def next_role(
     # skipped and behavior is byte-for-byte the pre-existing chain-only path —
     # including, on no claim, the chain-fork exit / 204 so no idle VM is kept
     # alive when there is no genuine pending work to reuse it for.
-    if _shared_state.runtime_config.get("warm_backlog_reuse_enabled", False):
+    if (
+        _shared_state.runtime_config.get("warm_backlog_reuse_enabled", False)
+        and not _shared_state.is_warm_backlog_reuse_suppressed()
+    ):
         _project_claim = token.get("project_id")
         _project_uuid = None
         if _project_claim:
@@ -3773,12 +3806,16 @@ async def next_role(
                 session, _project_uuid, req.vm_instance_id
             )
             if backlog_task is not None:
-                result = await _finalize_warm_claim(
-                    session,
-                    backlog_task,
-                    req.vm_instance_id,
-                    origin="backlog_reuse",
-                )
+                try:
+                    result = await _finalize_warm_claim(
+                        session,
+                        backlog_task,
+                        req.vm_instance_id,
+                        origin="backlog_reuse",
+                    )
+                except Exception:
+                    _shared_state.record_backlog_reuse_failure("finalize_error")
+                    raise
                 logger.info(
                     f"[NEXT-ROLE] Warm-start claim (backlog_reuse): "
                     f"task={result['task_id']} vm={req.vm_instance_id} "

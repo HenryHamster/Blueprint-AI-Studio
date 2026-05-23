@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useMemo, type ReactElement } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo, type ReactElement } from 'react';
 import { X, CheckCircle, XCircle, Microscope, Rocket, ExternalLink, Loader2, Clock, ChevronDown, ChevronRight } from 'lucide-react';
 import { List, useDynamicRowHeight, type RowComponentProps } from 'react-window';
 import { apiFetch, API_BASE_URL } from '../api';
@@ -273,7 +273,7 @@ function FeedRow({
 
               {event.type === 'TASK_COMPLETED' && event.commit_hash && (
                 event.repo_url && isSafeUrl(event.repo_url) ? (
-                  // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
+                  // eslint-disable-next-line viewport/min-touch-target -- secondary inline link within an already-tappable row; enlarging would distort the dense per-event data layout
                   <a
                     href={event.repo_url}
                     target="_blank"
@@ -341,6 +341,15 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
   const [expandedErrors, setExpandedErrors] = useState<Set<string>>(new Set());
   const [activeFilter, setActiveFilter] = useState<FilterOption>((initialFilter as FilterOption) ?? 'ALL');
   const [timeRange, setTimeRange] = useState<TimeRangeOption>(lastVisitTimestamp != null ? 'last_visit' : 'all');
+  // Track whether the user has explicitly selected a time range so we don't
+  // override their choice when lastVisitTimestamp arrives asynchronously after auth.
+  const userChangedRangeRef = useRef(false);
+
+  useEffect(() => {
+    if (lastVisitTimestamp != null && !userChangedRangeRef.current) {
+      setTimeRange('last_visit');
+    }
+  }, [lastVisitTimestamp]);
 
   const fetchEvents = useCallback(async () => {
     try {
@@ -460,10 +469,9 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
             );
           })()}
         </div>
-        {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
         <button
           onClick={onClose}
-          className="bg-neutral-800 hover:bg-neutral-700 text-neutral-400 p-1.5 rounded text-xs transition-colors border border-neutral-700"
+          className="bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded transition-colors border border-neutral-700 min-h-[44px] min-w-[44px] flex items-center justify-center"
           title="Close activity feed"
         >
           <X className="w-4 h-4" />
@@ -490,7 +498,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
         <div className="flex items-center gap-1.5 flex-wrap pb-0.5">
           {lastVisitTimestamp != null && (
             <button
-              onClick={() => setTimeRange('last_visit')}
+              onClick={() => { userChangedRangeRef.current = true; setTimeRange('last_visit'); }}
               className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
                 timeRange === 'last_visit'
                   ? 'bg-amber-500/20 text-amber-300 border-amber-500/50'
@@ -503,7 +511,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
           {TIME_RANGE_PILLS.map(pill => (
             <button
               key={pill.value}
-              onClick={() => setTimeRange(pill.value)}
+              onClick={() => { userChangedRangeRef.current = true; setTimeRange(pill.value); }}
               className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
                 timeRange === pill.value
                   ? 'bg-neutral-700 text-neutral-200 border-neutral-500'

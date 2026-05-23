@@ -317,6 +317,102 @@ async def test_update_direction_rejects_invalid_cost_budget(
 
 
 @pytest.mark.asyncio
+async def test_update_direction_rejects_invalid_recommended_mode(
+    client: AsyncClient, mocker
+):
+    """PATCH rejects a recommended_mode outside the documented set."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"recommended_mode": "turbo"},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_direction_normalizes_recommended_mode(
+    client: AsyncClient, mocker
+):
+    """PATCH normalizes mixed-case/whitespace recommended_mode before storing."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"recommended_mode": "  Ship "},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["direction"]["recommended_mode"] == "ship"
+
+
+@pytest.mark.asyncio
+async def test_update_direction_recommended_mode_set_and_clear(
+    client: AsyncClient, mocker
+):
+    """PATCH sets recommended_mode and clears it (with meta) when set to null."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"recommended_mode": "audit"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["direction"]["recommended_mode"] == "audit"
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"recommended_mode": None},
+    )
+    assert resp.status_code == 200
+    body = resp.json()["direction"]
+    assert "recommended_mode" not in body
+    assert "recommended_mode_meta" not in body
+
+
+@pytest.mark.asyncio
+async def test_update_direction_rejects_invalid_system_id(client: AsyncClient, mocker):
+    """PATCH rejects non-string and over-length system_id."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"system_id": 123},
+    )
+    assert resp.status_code == 400
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"system_id": "x" * 101},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_direction_system_id_set_and_clear(client: AsyncClient, mocker):
+    """PATCH sets system_id and clears it when set to null."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"system_id": "sys-alpha"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["direction"]["system_id"] == "sys-alpha"
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"system_id": None},
+    )
+    assert resp.status_code == 200
+    assert "system_id" not in resp.json()["direction"]
+
+
+@pytest.mark.asyncio
 async def test_update_direction_priority(client: AsyncClient, mocker):
     """PATCH updates direction priority."""
     project_id = await _deploy_project(client, mocker)
@@ -2507,14 +2603,18 @@ async def test_auto_recovery_with_frozen_churn_history(db_session):
     same rule → direction was stuck paused forever.
 
     After the fix, the recovery gate is needs_manual_intervention (only set by
-    the lifetime-burn backstop). Windowed-rule pauses recover after cooldown;
-    the active-direction pass will re-pause if fresh evidence still trips a rule.
-    The observable difference: auto_pause_count goes from 1 → 2 (recover + re-pause),
-    rather than staying at 1 (original pause just extended).
+    the lifetime-burn backstop). Windowed-rule pauses (churn, saturation, zero-merge)
+    recover after cooldown. A grace period then stamps ``auto_recovered_at`` so
+    ``_check_direction_health`` skips the history-based rules until a new research
+    cycle is appended after recovery — otherwise the same frozen history would
+    immediately re-pause the direction on the active-direction pass (pause-thrash).
+    The observable result: the direction returns to ``active`` and stays there at
+    auto_pause_count=1, with ``auto_recovered_at`` set, rather than re-pausing to 2.
     """
     # Build the frozen churn history that triggered the pause:
     # 5 cycles × 5 completed tasks, 0 merged → 25 non-merge finished, merge rate 0%
-    # This will still fire the churn guardrail when the active-direction pass re-checks.
+    # The grace period skips the churn rule until a NEW cycle is appended, so this
+    # frozen history must not re-pause the direction on the same lifecycle tick.
     churn_history = [
         {"tasks_created": 5, "tasks_completed": 5, "prs_merged": 0, "tasks_failed": 0}
         for _ in range(5)
@@ -2550,11 +2650,19 @@ async def test_auto_recovery_with_frozen_churn_history(db_session):
 
     await db_session.refresh(project)
     d = next(x for x in project.directions if x["id"] == "d-churn001")
-    # Recovery + re-pause cycle: count goes 1 → 2, proving the direction recovered
-    # rather than the original pause being silently extended.
-    assert d.get("auto_pause_count") == 2, (
-        "Direction should have been recovered and re-paused (auto_pause_count=2), "
-        "not stuck at original pause (auto_pause_count=1)"
+    # Grace-period contract: the direction recovers to active and STAYS active at
+    # auto_pause_count=1 — the frozen churn history is ignored until a new cycle is
+    # appended post-recovery, so it is not immediately re-paused (no pause-thrash).
+    assert d["status"] == "active", (
+        "Churn-paused direction should auto-recover to active after cooldown"
+    )
+    assert d.get("auto_pause_count") == 1, (
+        "Direction should stay at original pause count (1) during the grace period, "
+        "not re-pause to 2 off the frozen churn history"
+    )
+    assert d.get("auto_recovered_at"), (
+        "auto_recovered_at must be stamped so the grace period skips history-based "
+        "health rules until a new cycle is appended"
     )
 
 
@@ -6496,3 +6604,296 @@ def test_no_hardcoded_main_base_branch_in_directions_router():
         "routers/directions.py spawn payloads hardcode base_branch='main' "
         "instead of routing through integration_branch:\n" + "\n".join(offenders)
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. success_evidence and retirement_condition (context fields)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_update_direction_set_success_evidence(client: AsyncClient, mocker):
+    """PATCH sets success_evidence in direction.context."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Auth direction")
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"success_evidence": "SAML login flow passes end-to-end"},
+    )
+    assert resp.status_code == 200, resp.text
+    d = resp.json()["direction"]
+    ctx = d.get("context") or {}
+    assert ctx.get("success_evidence") == "SAML login flow passes end-to-end"
+
+
+@pytest.mark.asyncio
+async def test_update_direction_set_retirement_condition(client: AsyncClient, mocker):
+    """PATCH sets retirement_condition in direction.context."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Auth direction")
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"retirement_condition": "3 consecutive cycles with zero failures"},
+    )
+    assert resp.status_code == 200, resp.text
+    d = resp.json()["direction"]
+    ctx = d.get("context") or {}
+    assert ctx.get("retirement_condition") == "3 consecutive cycles with zero failures"
+
+
+@pytest.mark.asyncio
+async def test_update_direction_set_both_context_fields(client: AsyncClient, mocker):
+    """PATCH sets both success_evidence and retirement_condition together."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Logging direction")
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={
+            "success_evidence": "All request logging captures method, path, status",
+            "retirement_condition": "All services logging uniformly for 2 cycles",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    d = resp.json()["direction"]
+    ctx = d.get("context") or {}
+    assert (
+        ctx.get("success_evidence")
+        == "All request logging captures method, path, status"
+    )
+    assert (
+        ctx.get("retirement_condition") == "All services logging uniformly for 2 cycles"
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_direction_context_fields_persist_across_reads(
+    client: AsyncClient, mocker
+):
+    """Context fields persist when re-reading direction via GET."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Persistence test")
+    direction_id = direction["id"]
+
+    # Set context fields
+    await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={
+            "success_evidence": "Metrics endpoint responds in <100ms",
+            "retirement_condition": "P99 latency below threshold for 30 days",
+        },
+    )
+
+    # Read back and verify
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    directions = resp.json()["directions"]
+    target = next((d for d in directions if d["id"] == direction_id), None)
+    assert target is not None
+    ctx = target.get("context") or {}
+    assert ctx.get("success_evidence") == "Metrics endpoint responds in <100ms"
+    assert ctx.get("retirement_condition") == "P99 latency below threshold for 30 days"
+
+
+@pytest.mark.asyncio
+async def test_update_direction_clear_success_evidence(client: AsyncClient, mocker):
+    """PATCH clears success_evidence when set to null."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Clearable direction")
+
+    # Set it first
+    await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"success_evidence": "Initial evidence"},
+    )
+
+    # Clear it
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"success_evidence": None},
+    )
+    assert resp.status_code == 200
+    d = resp.json()["direction"]
+    ctx = d.get("context") or {}
+    assert "success_evidence" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_update_direction_clear_retirement_condition(client: AsyncClient, mocker):
+    """PATCH clears retirement_condition when set to null."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Clearable direction")
+
+    # Set it first
+    await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"retirement_condition": "Initial condition"},
+    )
+
+    # Clear it
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"retirement_condition": None},
+    )
+    assert resp.status_code == 200
+    d = resp.json()["direction"]
+    ctx = d.get("context") or {}
+    assert "retirement_condition" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_update_direction_clear_both_context_fields(client: AsyncClient, mocker):
+    """PATCH clears both context fields when set to null."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Two-field direction")
+
+    # Set both
+    await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={
+            "success_evidence": "Field A",
+            "retirement_condition": "Field B",
+        },
+    )
+
+    # Clear both
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={
+            "success_evidence": None,
+            "retirement_condition": None,
+        },
+    )
+    assert resp.status_code == 200
+    d = resp.json()["direction"]
+    ctx = d.get("context") or {}
+    assert "success_evidence" not in ctx
+    assert "retirement_condition" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_update_direction_context_fields_independent(client: AsyncClient, mocker):
+    """Updating one context field doesn't affect the other."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Independence test")
+    direction_id = direction["id"]
+
+    # Set both
+    await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={
+            "success_evidence": "Evidence value",
+            "retirement_condition": "Condition value",
+        },
+    )
+
+    # Update only success_evidence
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"success_evidence": "Updated evidence"},
+    )
+    assert resp.status_code == 200
+    d = resp.json()["direction"]
+    ctx = d.get("context") or {}
+    assert ctx.get("success_evidence") == "Updated evidence"
+    assert ctx.get("retirement_condition") == "Condition value"
+
+    # Update only retirement_condition
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"retirement_condition": "Updated condition"},
+    )
+    assert resp.status_code == 200
+    d = resp.json()["direction"]
+    ctx = d.get("context") or {}
+    assert ctx.get("success_evidence") == "Updated evidence"
+    assert ctx.get("retirement_condition") == "Updated condition"
+
+
+@pytest.mark.asyncio
+async def test_update_direction_success_evidence_validates_type(
+    client: AsyncClient, mocker
+):
+    """PATCH rejects non-string success_evidence."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"success_evidence": 123},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_direction_retirement_condition_validates_type(
+    client: AsyncClient, mocker
+):
+    """PATCH rejects non-string retirement_condition."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={"retirement_condition": {"nested": "object"}},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_update_direction_context_fields_with_other_updates(
+    client: AsyncClient, mocker
+):
+    """Context fields can be updated together with other direction fields."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(
+        client, project_id, text="Multi-update", priority="low"
+    )
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={
+            "text": "Updated text",
+            "priority": "high",
+            "success_evidence": "New evidence",
+            "retirement_condition": "New condition",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    d = resp.json()["direction"]
+    assert d["text"] == "Updated text"
+    assert d["priority"] == "high"
+    ctx = d.get("context") or {}
+    assert ctx.get("success_evidence") == "New evidence"
+    assert ctx.get("retirement_condition") == "New condition"
+
+
+@pytest.mark.asyncio
+async def test_get_directions_includes_context_fields_when_set(
+    client: AsyncClient, mocker
+):
+    """GET /directions includes context object with success_evidence/retirement_condition."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Context test")
+
+    # Set the context fields
+    await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction['id']}",
+        json={
+            "success_evidence": "All tests passing",
+            "retirement_condition": "Zero failures for 4 weeks",
+        },
+    )
+
+    # Fetch and verify they appear in the list response
+    resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert resp.status_code == 200
+    directions = resp.json()["directions"]
+    target = next((d for d in directions if d["id"] == direction["id"]), None)
+    assert target is not None
+    assert "context" in target
+    ctx = target["context"]
+    assert ctx.get("success_evidence") == "All tests passing"
+    assert ctx.get("retirement_condition") == "Zero failures for 4 weeks"

@@ -239,7 +239,9 @@ async def get_task_duration_stats(
         if project_id:
             filters.append(Task.project_id == project_id)
         completed = (
-            (await session.execute(select(Task).where(*filters))).scalars().all()
+            (await session.execute(select(Task).where(*filters).limit(50000)))
+            .scalars()
+            .all()
         )
         type_durations: dict = defaultdict(list)
         scope_durations: dict = defaultdict(list)

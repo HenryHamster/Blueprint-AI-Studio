@@ -1,7 +1,7 @@
-import { afterEach, describe, test, vi, expect } from 'vitest';
+import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
 import { ProviderCostPanel } from './ProviderCostPanel';
 
 vi.mock('../api', () => ({
@@ -49,14 +49,15 @@ describe('ProviderCostPanel — viewport regression', () => {
   });
 
   test('renders without horizontal overflow at 375px', async () => {
-    await expectNoOverflowAt(375, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      const r = createRoot(host);
-      root = r;
+    const doRender = async () => {
+      if (!host) {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        root = createRoot(host);
+      }
       await act(async () => {
-        r.render(
+        root!.render(
           <ProviderCostPanel selectedProjectId={null} windowHours={24} />,
         );
       });
@@ -64,16 +65,10 @@ describe('ProviderCostPanel — viewport regression', () => {
       await act(async () => {
         await new Promise(resolve => setTimeout(resolve, 0));
       });
-    });
+    };
 
-    // Find the actual escape-hatch (table wrapper) and assert that its
-    // IN-bounds parent (the section wrapper) stays within 375px. Hard-fail
-    // when the selector breaks rather than silently skipping.
-    const escapeHatch = host!.querySelector('[data-viewport-allow-overflow]') as HTMLElement | null;
-    expect(escapeHatch).not.toBeNull();
-    const parent = escapeHatch!.parentElement;
-    expect(parent).not.toBeNull();
-    const rect = parent!.getBoundingClientRect();
-    expect(rect.right).toBeLessThanOrEqual(388); // 375px content + 12px padding + 1px tolerance
+    await expectNoOverflowAt(375, doRender);
+    // Verify mobile card layout renders without silently clipping text
+    await expectNoTextTruncationAt(375, async () => {});
   });
 });

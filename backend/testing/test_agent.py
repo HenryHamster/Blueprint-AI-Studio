@@ -1463,14 +1463,10 @@ async def test_playbook_size_limits(client: AsyncClient, db_session):
     assert resp.status_code == 400, f"Expected 400, got: {resp.json()}"
     assert "2KB" in resp.json()["error"]["message"]
 
-    # Total playbook limit: fill up to near 30KB then overflow.
-    # Each entry ~1500 chars value; with the per-entry metadata overhead
-    # (source_task_id, updated_at, confirmed_count, and pending_source while
-    # the source task is still IN_PROGRESS) each row is ~1620B, so ~17 fit
-    # under 30KB. The point of this test is the OVERFLOW behaviour, not the
-    # exact entry count, so we keep going until the 400 fires.
+    # Total playbook limit: at capacity, new writes succeed by evicting old entries
+    # rather than hard-rejecting.  Each entry ~1500 chars value; with metadata
+    # overhead each row is ~1620B, so ~18 fit under 30KB before eviction kicks in.
     large_value = "y" * 1500
-    accepted = 0
     for i in range(40):
         r = await client.post(
             "/api/agent/playbook",
@@ -1482,18 +1478,71 @@ async def test_playbook_size_limits(client: AsyncClient, db_session):
             },
             headers=headers,
         )
-        if r.status_code == 200:
-            accepted += 1
-            continue
-        # First rejection must be the size cap with the right message.
-        assert r.status_code == 400, f"Entry {i} unexpected status: {r.json()}"
-        assert "30KB" in r.json()["error"]["message"]
-        break
-    else:  # pragma: no cover — only fires if cap never triggered
-        raise AssertionError(
-            f"Playbook size cap never triggered after {accepted} accepted entries"
+        assert r.status_code == 200, (
+            f"Entry {i} rejected (eviction should have made room): {r.json()}"
         )
-    assert accepted >= 10, f"Cap fired too early — only {accepted} entries accepted"
+
+    # After 40 writes the archive must have entries — eviction happened.
+    await db_session.refresh(project)
+    doc = project.design_doc or {}
+    assert len(doc.get("playbook_archive") or []) > 0, (
+        "Expected eviction to populate playbook_archive"
+    )
+    # Playbook must still respect the hard cap.
+    from app.playbook_learning import _playbook_size_bytes as _psb
+    from app.playbook_learning import _PLAYBOOK_CAPACITY_BYTES as _cap
+
+    assert _psb(doc) <= _cap, f"Hard cap violated: {_psb(doc)} bytes"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_playbook_set_rejects_when_nothing_evictable(
+    client: AsyncClient, db_session
+):
+    """When nothing can be evicted and the playbook is at the hard cap, set returns 400."""
+    from unittest.mock import patch
+
+    project = Project(name="Playbook Evict Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "Fix it"}],
+        vm_instance_id="agent-vm-playbook-evict",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-playbook-evict")
+    headers = {"x-agent-token": token}
+
+    # Simulate a playbook that is already over cap and has nothing to evict.
+    # Patch _playbook_size_bytes to always report > 30KB cap, and
+    # _maybe_archive_for_capacity to return doc unchanged (nothing evictable).
+    with (
+        patch("app.main._playbook_size_bytes", return_value=32_000),
+        patch(
+            "app.main._maybe_archive_for_capacity", side_effect=lambda doc, est=0: doc
+        ),
+    ):
+        resp = await client.post(
+            "/api/agent/playbook",
+            json={
+                "task_id": str(task.id),
+                "op": "set",
+                "key": "blocked-key",
+                "value": "value",
+            },
+            headers=headers,
+        )
+
+    assert resp.status_code == 400, f"Expected 400, got: {resp.json()}"
+    assert "30720" in resp.json()["error"]["message"]
 
 
 @pytest.mark.smoketest
@@ -7494,6 +7543,57 @@ async def test_rotate_credentials_allowed_after_task_terminated(
     assert res.json() == {"rotated": True}
 
 
+@pytest.mark.asyncio
+async def test_rotate_credentials_returns_503_on_secret_manager_failure(
+    client: AsyncClient, db_session, mocker
+):
+    """On Secret Manager failure the endpoint must return 503, not silently
+    store the plaintext secret."""
+    mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(side_effect=RuntimeError("Secret Manager unavailable")),
+    )
+    task, account, _ = await _make_openai_oauth_task(db_session)
+    original_ref = account.secret_blob_ref
+
+    token = create_agent_token(str(task.id), "agent-vm-rotate")
+    res = await client.post(
+        "/api/agent/credentials/rotate",
+        headers={"x-agent-token": token},
+        json={"secret": '{"tokens":{"access_token":"new","refresh_token":"rt-new"}}'},
+    )
+
+    assert res.status_code == 503
+    assert "retry" in res.text.lower()
+
+    await db_session.refresh(account)
+    assert account.secret_blob_ref == original_ref
+
+
+@pytest.mark.asyncio
+async def test_rotate_credentials_preserves_existing_ref_on_secret_manager_failure(
+    client: AsyncClient, db_session, mocker
+):
+    """After a failed rotation the existing secret_blob_ref must remain intact
+    so the account can still operate using the previous valid credential."""
+    mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(side_effect=OSError("connection refused")),
+    )
+    task, account, _ = await _make_openai_oauth_task(db_session)
+    expected_ref = account.secret_blob_ref
+
+    token = create_agent_token(str(task.id), "agent-vm-rotate")
+    await client.post(
+        "/api/agent/credentials/rotate",
+        headers={"x-agent-token": token},
+        json={"secret": '{"tokens":{"access_token":"x","refresh_token":"rt-x"}}'},
+    )
+
+    await db_session.refresh(account)
+    assert account.secret_blob_ref == expected_ref
+
+
 # ── Strategic-context fetch endpoints ─────────────────────────────────────────
 
 
@@ -9887,6 +9987,46 @@ async def test_heartbeat_beacon_does_not_set_vm_cold_start_ms(
 
 
 @pytest.mark.asyncio
+async def test_claim_uses_vm_dispatched_at_for_cold_start(
+    client: AsyncClient, db_session
+):
+    """vm_cold_start_ms must be anchored at vm_dispatched_at (dispatch time) when
+    both vm_dispatched_at and vm_provisioned_at are present, so that GCE boot
+    latency is included in the measurement."""
+    project = Project(name="Dispatch Cold Start", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # vm_dispatched_at set 20s ago (full dispatch→agent-ready window).
+    # vm_provisioned_at set only 5s ago (provision-confirm restamp; excludes boot).
+    dispatched = datetime.utcnow() - timedelta(seconds=20)
+    provisioned = datetime.utcnow() - timedelta(seconds=5)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "ls"}],
+        vm_instance_id="agent-vm-dispatched",
+        status=TaskStatus.QUEUED,
+        vm_dispatched_at=dispatched,
+        vm_provisioned_at=provisioned,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-dispatched")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.vm_cold_start_ms is not None
+    # Must reflect the full ~20s dispatch interval, not the 5s provision-confirm interval.
+    assert task.vm_cold_start_ms >= 15_000, (
+        f"Expected vm_cold_start_ms to reflect dispatch->claim (~20s), got {task.vm_cold_start_ms}ms"
+    )
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_persists_api_call_summary(client: AsyncClient, db_session):
     """Heartbeat persists llm_call_count + token totals into Task.api_call_summary."""
     project = Project(name="API Call Summary", user_id="test-user-123")
@@ -11166,3 +11306,233 @@ async def test_viewport_failure_screenshot_download_url_storage_failure(
         },
     )
     assert resp.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# Account-state-correlated RATE_LIMIT requeue tests (cluster 2/4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_generic_failure_with_rate_limited_account_requeues_free(
+    client: AsyncClient, db_session, mocker
+):
+    """Account-state-correlated RATE_LIMIT: a generic failure (no rate-limit keywords
+    in logs) while the assigned account is in cooldown should be classified RATE_LIMIT
+    and requeued without burning attempt_count.
+    """
+    from app.time_utils import _utcnow
+    import app.max_plan_pool as pool_mod
+
+    account_id = "aaaaaaaa-0001-4000-a000-000000000001"
+    # Account disabled 5 minutes ago (hits=1 → 30-min cooldown → still cooling).
+    # Use naive _utcnow() to match the production data shape: max_plan_pool stores
+    # disabled_models[...]['at'] as a NAIVE datetime, so the fixture must too —
+    # otherwise the test passes against an aware value the live pool never produces.
+    at = _utcnow() - timedelta(minutes=5)
+    fake_pool = {
+        account_id: {
+            "id": account_id,
+            "name": "test-account-rl-corr",
+            "active_tasks": 1,
+            "disabled_models": {
+                "claude-sonnet-4-6": {
+                    "at": at,
+                    "hits": 1,
+                    "kind": "rate_limit",
+                }
+            },
+        }
+    }
+    mocker.patch.object(pool_mod, "_account_by_id", fake_pool)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="RL Account Corr Test", user_id="test-user-rl-corr-001")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test task"}],
+        vm_instance_id="agent-vm-rl-corr-001",
+        status=TaskStatus.IN_PROGRESS,
+        context={"llm_account_id": account_id, "llm_model": "claude-sonnet-4-6"},
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    token = create_agent_token(task_id_str, "agent-vm-rl-corr-001")
+    # Generic failure — no rate-limit keywords; classification must fall through
+    # to account-state correlation (_account_was_rate_limited) to return RATE_LIMIT.
+    payload = {
+        "task_id": task_id_str,
+        "status": "FAILED",
+        "failure_category": "claude_code_failed",
+        "logs": "Process exited with code 1",
+    }
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED, (
+        f"Account-state-correlated RATE_LIMIT should requeue to QUEUED, got {task.status}"
+    )
+    # attempt_count must NOT be incremented — free requeue, not a retry burn
+    assert task.attempt_count == 0, (
+        f"attempt_count must stay 0 on free RATE_LIMIT requeue, got {task.attempt_count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_generic_failure_with_healthy_account_burns_retry(
+    client: AsyncClient, db_session, mocker
+):
+    """Without account-state correlation: a generic failure with a healthy account
+    classifies as CODE_ERROR and burns an attempt_count retry slot.
+    """
+    import app.max_plan_pool as pool_mod
+
+    account_id = "aaaaaaaa-0001-4000-a000-000000000002"
+    fake_pool = {
+        account_id: {
+            "id": account_id,
+            "name": "test-account-healthy-corr",
+            "active_tasks": 1,
+            "disabled_models": {},  # no disabled models — account is healthy
+        }
+    }
+    mocker.patch.object(pool_mod, "_account_by_id", fake_pool)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(
+        name="Healthy Account Corr Test", user_id="test-user-healthy-corr-001"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test task"}],
+        vm_instance_id="agent-vm-healthy-corr-001",
+        status=TaskStatus.IN_PROGRESS,
+        context={"llm_account_id": account_id, "llm_model": "claude-sonnet-4-6"},
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    token = create_agent_token(task_id_str, "agent-vm-healthy-corr-001")
+    payload = {
+        "task_id": task_id_str,
+        "status": "FAILED",
+        "failure_category": "claude_code_failed",
+        "logs": "Process exited with code 1",
+    }
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    # CODE_ERROR with retries remaining → task is retried (QUEUED), not permanently failed
+    assert task.status == TaskStatus.QUEUED, (
+        f"CODE_ERROR with retries remaining should retry to QUEUED, got {task.status}"
+    )
+    # attempt_count MUST be incremented — CODE_ERROR burns a retry slot
+    assert task.attempt_count == 1, (
+        f"attempt_count must be 1 after CODE_ERROR retry burn, got {task.attempt_count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_requeue_parent_task_uses_vm_stopped_at_for_rate_limit_correlation(
+    db_session, mocker
+):
+    """_requeue_parent_task passes child.vm_stopped_at as at_time so a pool
+    rate-limit window that expired before the requeue sweep is still detected.
+
+    Scenario: child died during a pool rate-limit block; vm_stopped_at records
+    the death instant. By the time the parent is re-evaluated, the cooldown has
+    cleared. Without the at_time fix, classify_failure would check the pool at
+    sweep time (no cooldown) and return CODE_ERROR — reducing the parent's
+    requeue budget. With the fix, at_time=vm_stopped_at is passed, the cooldown
+    is detected, and the child's failure class is RATE_LIMIT (INFRA — budget
+    not reduced).
+
+    Verification: _account_was_rate_limited side_effect returns True only when
+    at_time is not None. If the call site omits at_time, the side_effect returns
+    False → CODE_ERROR → budget reduction in compute_effective_max_requeues.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    def _rl_only_at_failure_time(task, at_time=None):
+        # Return True (rate-limited) only when a failure instant was provided.
+        return at_time is not None
+
+    mocker.patch(
+        "app.failure_classification._account_was_rate_limited",
+        side_effect=_rl_only_at_failure_time,
+    )
+
+    project = Project(name="Requeue atTime Test", user_id="test-user-requeue-attime")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "investigate X"}],
+        vm_instance_id=None,
+        status=TaskStatus.EVALUATING,
+        attempt_count=0,
+        context={},
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    # Child died at vm_stopped_at — no rate-limit keywords in the error.
+    child = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do part of X"}],
+        vm_instance_id="vm-child-rl",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        attempt_count=1,
+        latest_status_message="Process exited with code 1",
+        vm_stopped_at=datetime.utcnow() - timedelta(minutes=30),
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=31),
+        context={"failure_category": "claude_code_failed"},
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    from app.task_lifecycle import _requeue_parent_task
+
+    await _requeue_parent_task(parent, db_session)
+    await db_session.commit()
+    await db_session.refresh(parent)
+
+    # Parent should be re-queued for evaluation (EVALUATING), not failed.
+    assert parent.status == TaskStatus.EVALUATING, (
+        "parent must remain EVALUATING after rate-limit-correlated requeue "
+        f"(got {parent.status}); at_time plumbing may be broken"
+    )
+    # Requeue count must not exceed budget (RATE_LIMIT is INFRA — no reduction).
+    parent_ctx = parent.context or {}
+    assert parent_ctx.get("_requeue_count", 0) <= 1, (
+        "parent requeue count must be ≤1 after first requeue"
+    )

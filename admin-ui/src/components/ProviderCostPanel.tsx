@@ -60,9 +60,36 @@ export function ProviderCostPanel({
           <EffMetric label="review cycles" value={fmtEffIter(w7?.review_iter_median)} delta={w7?.vs_prior_review_iter_median_delta} lowerIsBetter />
         </div>
       )}
-      {/* Horizontal-scrollable provider table: columns overflow on narrow viewports to keep section in-bounds */}
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-x-auto" data-viewport-allow-overflow>
-        <table className="w-full text-xs">
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
+        {/* Mobile: stacked card layout */}
+        <div className="sm:hidden divide-y divide-neutral-800/30">
+          {data.rows.map((row, i) => {
+            const srColor = row.success_rate == null ? 'text-neutral-500'
+              : row.success_rate >= 0.8 ? 'text-emerald-400'
+              : row.success_rate >= 0.5 ? 'text-amber-400'
+              : 'text-red-400';
+            const cpmColor = row.cost_per_merged_pr == null ? 'text-neutral-500'
+              : row.cost_per_merged_pr <= 5 ? 'text-emerald-400'
+              : row.cost_per_merged_pr <= 15 ? 'text-amber-400'
+              : 'text-red-400';
+            return (
+              <div key={i} className="px-3 py-2 text-[10px]">
+                <div className="flex items-start justify-between gap-2 mb-1">
+                  <span className="font-medium text-neutral-200 break-words">{row.account_name}</span>
+                  <span className="text-neutral-500 shrink-0">{row.provider}</span>
+                </div>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-neutral-500">
+                  <span>Tasks: <span className="text-neutral-300 tabular-nums">{row.total_tasks}</span></span>
+                  <span>Success: <span className={`tabular-nums ${srColor}`}>{row.success_rate != null ? `${Math.round(row.success_rate * 100)}%` : '—'}</span></span>
+                  <span>Spend: <span className="text-neutral-300 font-mono tabular-nums">${row.total_cost_usd.toFixed(2)}</span></span>
+                  <span>$/Merge: <span className={`font-mono tabular-nums ${cpmColor}`}>{row.cost_per_merged_pr != null ? `$${row.cost_per_merged_pr.toFixed(2)}` : '—'}</span></span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        {/* Desktop: table layout */}
+        <table className="hidden sm:table w-full text-xs">
           <thead>
             <tr className="text-[10px] text-neutral-500 border-b border-neutral-800/50">
               <th className="text-left px-3 py-2 font-medium">Provider / Account</th>

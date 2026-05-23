@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, act } from '@testing-library/react';
+import { render, screen, act, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 vi.mock('../firebase', () => ({
@@ -49,6 +49,13 @@ function makeAccount(overrides: Record<string, unknown> = {}) {
   };
 }
 
+// The panel renders both a mobile card layout (sm:hidden) and a desktop
+// table layout (hidden sm:table); jsdom applies no CSS so both are present.
+// Scope queries to the desktop table to avoid duplicate-text matches.
+function inTable() {
+  return within(screen.getByRole('table'));
+}
+
 describe('ProviderModelBreakdownPanel', () => {
   beforeEach(() => {
     apiFetchMock.mockReset();
@@ -69,8 +76,8 @@ describe('ProviderModelBreakdownPanel', () => {
     render(<ProviderModelBreakdownPanel selectedProjectId={null} />);
     await act(async () => {});
 
-    expect(screen.getByText('claude-opus-4-7')).toBeInTheDocument();
-    expect(screen.getByText('anthropic')).toBeInTheDocument();
+    expect(inTable().getByText('claude-opus-4-7')).toBeInTheDocument();
+    expect(inTable().getByText('anthropic')).toBeInTheDocument();
     expect(screen.getAllByText('85%').length).toBeGreaterThan(0);
   });
 
@@ -92,10 +99,10 @@ describe('ProviderModelBreakdownPanel', () => {
     expect(screen.queryByText('below median', { exact: false })).not.toBeInTheDocument();
 
     // Click the row to expand
-    await user.click(screen.getByText('claude-opus-4-7'));
-    expect(screen.getByText(/below median/i)).toBeInTheDocument();
-    expect(screen.getByText('50%')).toBeInTheDocument();
-    expect(screen.getByText('90%')).toBeInTheDocument();
+    await user.click(inTable().getByText('claude-opus-4-7'));
+    expect(inTable().getByText(/below median/i)).toBeInTheDocument();
+    expect(inTable().getByText('50%')).toBeInTheDocument();
+    expect(inTable().getByText('90%')).toBeInTheDocument();
   });
 
   it('quarantine_status badge shows kind and rate vs median', async () => {
@@ -120,9 +127,9 @@ describe('ProviderModelBreakdownPanel', () => {
     render(<ProviderModelBreakdownPanel selectedProjectId={null} />);
     await act(async () => {});
 
-    await user.click(screen.getByText('claude-opus-4-7'));
-    expect(screen.getByText(/quarantine:regression/i)).toBeInTheDocument();
-    expect(screen.getByText(/45%.*82%/i)).toBeInTheDocument();
+    await user.click(inTable().getByText('claude-opus-4-7'));
+    expect(inTable().getByText(/quarantine:regression/i)).toBeInTheDocument();
+    expect(inTable().getByText(/45%.*82%/i)).toBeInTheDocument();
   });
 
   it('Clear quarantine button absent when quarantine_status is null', async () => {
@@ -135,7 +142,7 @@ describe('ProviderModelBreakdownPanel', () => {
     render(<ProviderModelBreakdownPanel selectedProjectId={null} />);
     await act(async () => {});
 
-    await user.click(screen.getByText('claude-opus-4-7'));
+    await user.click(inTable().getByText('claude-opus-4-7'));
     expect(screen.queryByText(/clear quarantine/i)).not.toBeInTheDocument();
   });
 
@@ -153,7 +160,7 @@ describe('ProviderModelBreakdownPanel', () => {
     render(<ProviderModelBreakdownPanel selectedProjectId={null} />);
     await act(async () => {});
 
-    await user.click(screen.getByText('claude-opus-4-7'));
+    await user.click(inTable().getByText('claude-opus-4-7'));
     expect(screen.queryByText(/clear quarantine/i)).not.toBeInTheDocument();
   });
 
@@ -180,16 +187,16 @@ describe('ProviderModelBreakdownPanel', () => {
     render(<ProviderModelBreakdownPanel selectedProjectId={null} />);
     await act(async () => {});
 
-    await user.click(screen.getByText('claude-opus-4-7'));
-    expect(screen.getByText(/clear quarantine/i)).toBeInTheDocument();
+    await user.click(inTable().getByText('claude-opus-4-7'));
+    expect(inTable().getByText(/clear quarantine/i)).toBeInTheDocument();
 
     // Click to enter confirmation state
-    await user.click(screen.getByText(/clear quarantine/i));
-    expect(screen.getByText(/confirm clear/i)).toBeInTheDocument();
+    await user.click(inTable().getByText(/clear quarantine/i));
+    expect(inTable().getByText(/confirm clear/i)).toBeInTheDocument();
 
     // Confirm
     await act(async () => {
-      await user.click(screen.getByText(/confirm clear/i));
+      await user.click(inTable().getByText(/confirm clear/i));
     });
 
     const calls = apiFetchMock.mock.calls;
@@ -229,8 +236,8 @@ describe('ProviderModelBreakdownPanel', () => {
     );
     await act(async () => {});
 
-    await user.click(screen.getByText('claude-opus-4-7'));
-    expect(screen.getByText('My Fancy Account')).toBeInTheDocument();
+    await user.click(inTable().getByText('claude-opus-4-7'));
+    expect(inTable().getByText('My Fancy Account')).toBeInTheDocument();
   });
 
   it('hide single-account toggle filters out rows with distinct_accounts < 2', async () => {
@@ -244,11 +251,11 @@ describe('ProviderModelBreakdownPanel', () => {
     render(<ProviderModelBreakdownPanel selectedProjectId={null} />);
     await act(async () => {});
 
-    expect(screen.getByText('model-a')).toBeInTheDocument();
-    expect(screen.getByText('model-b')).toBeInTheDocument();
+    expect(inTable().getByText('model-a')).toBeInTheDocument();
+    expect(inTable().getByText('model-b')).toBeInTheDocument();
 
     await user.click(screen.getByText('Hide single-account'));
-    expect(screen.queryByText('model-a')).not.toBeInTheDocument();
-    expect(screen.getByText('model-b')).toBeInTheDocument();
+    expect(inTable().queryByText('model-a')).not.toBeInTheDocument();
+    expect(inTable().getByText('model-b')).toBeInTheDocument();
   });
 });

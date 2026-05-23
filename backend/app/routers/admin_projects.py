@@ -6,6 +6,7 @@ from typing import Dict, Any, List
 import uuid
 from datetime import timedelta
 from sqlalchemy import func
+from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
@@ -459,6 +460,16 @@ async def get_direction_task_counts(
         .where(
             Task.project_id == project_id,
             Task.status.not_in([TaskStatus.CANCELLED, TaskStatus.FAILED]),
+        )
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.payloads,
+                Task.context,
+                Task.title,
+                Task.latest_status_message,
+            )
         )
         .limit(5000)
     )

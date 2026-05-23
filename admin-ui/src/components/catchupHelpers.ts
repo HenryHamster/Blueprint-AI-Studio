@@ -56,18 +56,29 @@ export function formatSnoozeRemaining(until: number): string {
   return `snoozed for ${mins}m more`;
 }
 
-const CATCH_UP_VIEWED_KEY = 'blueprint-admin:lastCatchUpViewed';
+const CATCH_UP_VIEWED_KEY_BASE = 'blueprint-admin:lastCatchUpViewed';
 
-export function getLastCatchUpViewed(): number | null {
+/** Returns the localStorage key for the last-catch-up-viewed timestamp, scoped per operator when userEmail is provided. */
+export function getCatchUpViewedKey(userEmail?: string | null): string {
+  return userEmail ? `${CATCH_UP_VIEWED_KEY_BASE}:${userEmail}` : CATCH_UP_VIEWED_KEY_BASE;
+}
+
+export function getLastCatchUpViewed(userEmail?: string | null): number | null {
   try {
-    const stored = localStorage.getItem(CATCH_UP_VIEWED_KEY);
+    const stored = localStorage.getItem(getCatchUpViewedKey(userEmail));
     const ts = stored ? parseInt(stored, 10) : null;
     return ts && !isNaN(ts) ? ts : null;
   } catch { return null; }
 }
 
-export function markCatchUpViewed() {
-  try { localStorage.setItem(CATCH_UP_VIEWED_KEY, String(Date.now())); } catch { /* */ }
+export function markCatchUpViewed(userEmail?: string | null): void {
+  try { localStorage.setItem(getCatchUpViewedKey(userEmail), String(Date.now())); } catch { /* */ }
+}
+
+/** Merges local and backend last-seen timestamps, preferring the backend value when it is newer (cross-device). */
+export function resolveLastCatchUpViewed(localTs: number | null, backendTs: number | null): number | null {
+  if (backendTs != null && (localTs == null || backendTs > localTs)) return backendTs;
+  return localTs;
 }
 
 export function windowToHours(window: TimeWindow, lastViewed: number | null): number {

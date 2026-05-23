@@ -17,7 +17,7 @@ from app.efficiency_snapshot import (
     DESIGN_DOC_KEY,
     _last_run_due,
     compute_current_axes,
-    maybe_write_weekly_snapshot,
+    maybe_write_daily_snapshot,
     read_baseline_with_drift,
     write_snapshot,
 )
@@ -245,7 +245,8 @@ async def test_write_snapshot_migrates_stale_cold_start_baseline(db_session):
     boot beacons (pre-fix). write_snapshot must clear that axis and migrate the
     baseline to the current schema head so the next snapshot re-seeds with
     honest data. A v0 baseline chains through every migration in one call
-    (v0 -> v1 cold-start, v1 -> v2 review-iterations), landing at v2.
+    (v0 -> v1 cold-start, v1 -> v2 review-iterations, v2 -> v3 cold-start),
+    landing at v3.
     """
     stale_cold_start = 500  # artificially low — was a beacon time, not claim latency
     project = make_project(
@@ -280,8 +281,8 @@ async def test_write_snapshot_migrates_stale_cold_start_baseline(db_session):
     # Old stale value must be gone; re-seeded from the new snapshot.
     assert baseline[AXIS_VM_COLD_START_P50_MS] != stale_cold_start
     assert baseline[AXIS_VM_COLD_START_P50_MS] == 15000.0
-    # Migration marker applied — a v0 baseline chains to the current head (v2).
-    assert baseline["_schema_version"] == 2
+    # Migration marker applied — a v0 baseline chains to the current head (v3).
+    assert baseline["_schema_version"] == 3
     # Other baseline axes must not be clobbered.
     assert baseline[AXIS_COST_PER_MERGED_PR] == 0.01
 
@@ -322,6 +323,49 @@ async def test_write_snapshot_reseeds_cleared_baseline_axis(db_session):
     assert baseline[AXIS_VM_COLD_START_P50_MS] == 20000.0
     # Non-cleared axes unchanged.
     assert baseline[AXIS_COST_PER_MERGED_PR] == 0.02
+
+
+@pytest.mark.asyncio
+async def test_write_snapshot_migrates_cold_start_baseline_v2_to_v3(db_session):
+    """Baselines at schema_version=2 stored vm_cold_start_p50_ms anchored at
+    provision-confirm time (excludes GCE boot).  write_snapshot must clear that
+    axis and bump to schema_version=3 so the next snapshot re-seeds with the
+    corrected dispatch->agent-ready measurement."""
+    stale_cold_start = 3000  # artificially low — provision-confirm only, no boot time
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "captured_at": "2026-01-01T00:00:00",
+                    AXIS_VM_COLD_START_P50_MS: stale_cold_start,
+                    AXIS_COST_PER_MERGED_PR: 0.05,
+                    "_schema_version": 2,
+                },
+                "snapshots": [{"captured_at": "2026-01-01T00:00:00"}],
+                "last_run_at": "2026-01-01T00:00:00",
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id, vm_cold_start_ms=25000))
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    container = project.design_doc[DESIGN_DOC_KEY]
+    baseline = container["baseline"]
+    # Stale provision-confirm-anchored value must be gone; re-seeded from new snapshot.
+    assert baseline[AXIS_VM_COLD_START_P50_MS] != stale_cold_start
+    assert baseline[AXIS_VM_COLD_START_P50_MS] == 25000.0
+    # Schema migrated to v3.
+    assert baseline["_schema_version"] == 3
+    # Other baseline axes must not be clobbered.
+    assert baseline[AXIS_COST_PER_MERGED_PR] == 0.05
 
 
 @pytest.mark.asyncio
@@ -384,18 +428,18 @@ def test_last_run_due_first_run():
 
 def test_last_run_due_recent_run_skips():
     now = _utcnow()
-    last = (now - timedelta(days=2)).isoformat()
+    last = (now - timedelta(hours=12)).isoformat()
     assert _last_run_due(last, now) is False
 
 
 def test_last_run_due_old_run_fires():
     now = _utcnow()
-    last = (now - timedelta(days=8)).isoformat()
+    last = (now - timedelta(days=2)).isoformat()
     assert _last_run_due(last, now) is True
 
 
 @pytest.mark.asyncio
-async def test_maybe_write_weekly_snapshot_skips_when_recent(db_session):
+async def test_maybe_write_daily_snapshot_skips_when_recent(db_session):
     project = make_project(
         design_doc={
             DESIGN_DOC_KEY: {
@@ -409,12 +453,12 @@ async def test_maybe_write_weekly_snapshot_skips_when_recent(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    written = await maybe_write_weekly_snapshot(db_session, project.id)
+    written = await maybe_write_daily_snapshot(db_session, project.id)
     assert written is None
 
 
 @pytest.mark.asyncio
-async def test_maybe_write_weekly_snapshot_fires_when_due(db_session):
+async def test_maybe_write_daily_snapshot_fires_when_due(db_session):
     project = make_project(design_doc={})
     db_session.add(project)
     await db_session.commit()
@@ -423,7 +467,7 @@ async def test_maybe_write_weekly_snapshot_fires_when_due(db_session):
     db_session.add(_make_efficient_task(project.id))
     await db_session.commit()
 
-    written = await maybe_write_weekly_snapshot(db_session, project.id)
+    written = await maybe_write_daily_snapshot(db_session, project.id)
     assert written is not None
     assert AXIS_COST_PER_MERGED_PR in written
 
@@ -644,6 +688,7 @@ async def test_write_snapshot_migrates_review_iterations_baseline(db_session):
     # Stale value replaced by the corrected snapshot value.
     assert baseline[AXIS_MEDIAN_REVIEW_ITERATIONS] != 4.0
     assert baseline[AXIS_MEDIAN_REVIEW_ITERATIONS] == 2.0
-    assert baseline["_schema_version"] == 2
+    # v1 chains through v2 (review-iterations) and v3 (cold-start dispatch fix).
+    assert baseline["_schema_version"] == 3
     # Other axes must not be clobbered.
     assert baseline[AXIS_COST_PER_MERGED_PR] == 0.01

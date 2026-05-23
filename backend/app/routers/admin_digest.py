@@ -45,6 +45,7 @@ from app.models import (
     CLOSE_REASON_RECOVERED_UNATTENDED,
     CYCLE_META_MEMOS_AVAILABLE,
     CYCLE_META_MEMOS_CITED,
+    QualificationVerdict,
 )
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
@@ -94,6 +95,7 @@ _SR_CATCH_RATE_MIN_FINDINGS = (
 )
 _LONE_CHECKER_ALERT_TITLE = "SR lone-checker blind spot: ≥2 categories uncorroborated"
 _LONE_CHECKER_MIN_CATEGORIES = 2
+_ACTIVE_TASKS_QUERY_LIMIT = 500
 
 
 async def _evaluate_sr_catch_rate_targets(
@@ -297,14 +299,30 @@ def _author_sr_failed_categories(check_results: Dict[str, Any]) -> set[str]:
     }
 
 
+_SR_TREND_STALENESS_DAYS = 7
+
+
 def _serialize_sr_catch_rate_trends(sr_trends: Dict[str, Any]) -> Dict[str, Any]:
+    computed_at_str = sr_trends.get("computed_at")
+    if computed_at_str:
+        try:
+            computed_at_dt = datetime.fromisoformat(computed_at_str)
+            is_stale = computed_at_dt < datetime.utcnow() - timedelta(
+                days=_SR_TREND_STALENESS_DAYS
+            )
+        except (ValueError, TypeError):
+            is_stale = True
+    else:
+        is_stale = True
+
     serialized = {
-        "computed_at": sr_trends.get("computed_at"),
+        "computed_at": computed_at_str,
         "signal_last_computed_at": sr_trends.get("signal_last_computed_at")
-        or sr_trends.get("computed_at"),
+        or computed_at_str,
         "categories": sr_trends.get("categories") or {},
         "by_task_type": sr_trends.get("by_task_type") or {},
         "by_fix_iteration": sr_trends.get("by_fix_iteration") or {},
+        "is_stale": is_stale,
     }
     for key, value in sr_trends.items():
         serialized.setdefault(key, value)
@@ -1512,6 +1530,7 @@ async def compute_pipeline_health_summary(
     # Query tasks from extended 48h window to compute both current and previous period.
     # Status is filtered in SQL to avoid loading IN_PROGRESS/QUEUED tasks; timestamp
     # window is post-filtered in Python via _derive_completed_at (uses status_log).
+    _HEALTH_SUMMARY_TASK_CAP = 5000
     tasks_result = await session.execute(
         select(Task)
         .where(
@@ -1531,8 +1550,17 @@ async def compute_pipeline_health_summary(
                 Task.status_log,
             )
         )
+        .order_by(Task.created_at.desc())
+        .limit(_HEALTH_SUMMARY_TASK_CAP)
     )
     all_tasks = tasks_result.scalars().all()
+    if len(all_tasks) >= _HEALTH_SUMMARY_TASK_CAP:
+        logger.warning(
+            "pipeline_health_summary: task result capped at %d for project %s — "
+            "metrics may be truncated; consider reducing the lookback window",
+            _HEALTH_SUMMARY_TASK_CAP,
+            project_id,
+        )
 
     # Post-filter by completion timestamp
     completed_tasks = [
@@ -2311,10 +2339,10 @@ async def compute_pipeline_health_summary(
                     [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
                 ),
                 Task.created_at >= ms_cutoff,
+                Task.context["scope"].as_string() == "medium",
             )
         )
-        ms_all = ms_result.scalars().all()
-        ms_medium = [t for t in ms_all if (t.context or {}).get("scope") == "medium"]
+        ms_medium = ms_result.scalars().all()
         if ms_medium:
             from app.routers.admin_scope_measurement import (
                 _compute_medium_scope_measurement,
@@ -2777,6 +2805,7 @@ async def list_regression_cases(
                     RegressionRemediationCase.status == RegressionCaseStatus.CLOSED,
                 )
                 .order_by(RegressionRemediationCase.last_seen_at.desc())
+                .limit(limit)
             )
         )
         .scalars()
@@ -2868,12 +2897,17 @@ async def regression_cases_layer_defense_density(
         compute_layer_defense_density,
     )
 
+    lookback_cutoff = datetime.utcnow() - timedelta(days=days)
     cases = (
         (
             await session.execute(
-                select(RegressionRemediationCase).where(
+                select(RegressionRemediationCase)
+                .where(
                     RegressionRemediationCase.project_id == project_id,
+                    RegressionRemediationCase.updated_at >= lookback_cutoff,
                 )
+                .order_by(RegressionRemediationCase.updated_at.desc())
+                .limit(2000)
             )
         )
         .scalars()
@@ -4017,6 +4051,7 @@ async def _compute_digest(
             )
             .where(*active_filters)
             .order_by(Task.started_at.asc().nullsfirst())
+            .limit(_ACTIVE_TASKS_QUERY_LIMIT)
             .options(
                 load_only(
                     Task.id,
@@ -4042,6 +4077,7 @@ async def _compute_digest(
             select(Task)
             .where(*active_filters)
             .order_by(Task.started_at.asc().nullsfirst())
+            .limit(_ACTIVE_TASKS_QUERY_LIMIT)
             .options(
                 load_only(
                     Task.id,
@@ -5843,6 +5879,7 @@ async def _compute_digest(
     self_review_prediction_accuracy_trends: Optional[Dict[str, Any]] = None
     sr_regression_risk_test_signal_trends: Optional[Dict[str, Any]] = None
     memo_pathway_exits: int = 0
+    recent_cycle_memo_stats: list[dict[str, Any]] = []
     if project_id:
         _proj = await session.get(Project, project_id)
         memo_pathway_exits = await _strategic_cycle.count_memo_exits(
@@ -5894,6 +5931,18 @@ async def _compute_digest(
                 limit=20,
             )
             prediction_calibration = _compute_prediction_calibration(_proj, _sc_history)
+            recent_cycle_memo_stats = [
+                {
+                    "cycle_id": c.get("cycle_id"),
+                    "started_at": c.get("started_at"),
+                    CYCLE_META_MEMOS_AVAILABLE: int(
+                        c.get(CYCLE_META_MEMOS_AVAILABLE) or 0
+                    ),
+                    CYCLE_META_MEMOS_CITED: int(c.get(CYCLE_META_MEMOS_CITED) or 0),
+                }
+                for c in _sc_history
+                if c.get("outcome") not in (None, "in_progress")
+            ]
             # Fresh-reviewer cycle-over-cycle trend persisted by compute_fresh_reviewer_trend.
             _fr_trends = (_proj.design_doc or {}).get("fresh_reviewer_trend") or {}
             if _fr_trends:
@@ -6093,10 +6142,12 @@ async def _compute_digest(
     if project_id:
         _funnel_filters.append(Task.project_id == project_id)
     _inv_result = await session.execute(
-        select(Task).where(
+        select(Task)
+        .where(
             *_funnel_filters,
             Task.payloads[0]["type"].as_string() == "investigate",
         )
+        .limit(2000)
     )
     _inv_tasks = _inv_result.scalars().all()
     # R4-W2 (M3): ``has_key`` uses the JSONB ``?`` operator so the
@@ -6352,7 +6403,7 @@ async def _compute_digest(
     if project_id:
         _rr_spawned_filters.append(ResidualRemediationCase.project_id == project_id)
     _rr_spawned_result = await session.execute(
-        select(ResidualRemediationCase).where(*_rr_spawned_filters)
+        select(ResidualRemediationCase).where(*_rr_spawned_filters).limit(500)
     )
     _rr_cases = list(_rr_spawned_result.scalars().all())
     _rr_active_filters = [
@@ -6378,6 +6429,7 @@ async def _compute_digest(
         select(ResidualRemediationCase)
         .where(*_rr_open_filters)
         .order_by(ResidualRemediationCase.last_seen_at.desc())
+        .limit(500)
     )
     _rr_open_cases = list(_rr_open_result.scalars().all())
     residual_remediation_funnel: Dict[str, Any] = {
@@ -6454,9 +6506,20 @@ async def _compute_digest(
     ]
     if project_id:
         _cum_filters.append(Task.project_id == project_id)
-    _cum_result = await session.execute(select(Task).where(*_cum_filters))
+    _CUM_TASK_CAP = 10000
+    _cum_result = await session.execute(
+        select(Task).where(*_cum_filters).limit(_CUM_TASK_CAP)
+    )
     cumulative_merged_by_trigger_class: Dict[str, int] = {}
-    for r in _cum_result.scalars().all():
+    _cum_rows = _cum_result.scalars().all()
+    if len(_cum_rows) >= _CUM_TASK_CAP:
+        logger.warning(
+            "cumulative_merged_tasks: result capped at %d for project %s — "
+            "metrics may be truncated",
+            _CUM_TASK_CAP,
+            project_id,
+        )
+    for r in _cum_rows:
         ctx = r.context or {}
         trigger_cls = ctx.get("trigger_failure_class")
         if not trigger_cls:
@@ -6853,6 +6916,7 @@ async def _compute_digest(
         "trend_history": trend_history,
         "latest_cycle": latest_cycle,
         "memo_pathway_exits": memo_pathway_exits,
+        "recent_cycle_memo_stats": recent_cycle_memo_stats,
         "scope_conversion_rates": scope_conversion_rates or None,
         "prev_scope_conversion_rates": prev_scope_conversion_rates or None,
         "pipeline_acceptance_rate": pipeline_acceptance_rate,
@@ -9034,9 +9098,10 @@ _VIEWPORT_DEBT_CACHE: Optional[
 _VIEWPORT_DEBT_CACHE_TTL = 300  # 5 minutes
 _VIEWPORT_DEBT_UNTESTED_CAP = 30
 
-_ESLINT_VIEWPORT_RE = _re.compile(
-    r"eslint-disable(?:-next-line)?.*viewport/(?:min-touch-target|no-fixed-width)"
-)
+# Matches any eslint-disable comment that references "viewport" — canonical pattern
+# shared with the CI gate in admin-ui/src/test/viewport-checks.js
+# (checkEscapeHatchBudget uses: /eslint-disable[^\n]*viewport/g).
+_ESLINT_VIEWPORT_RE = _re.compile(r"eslint-disable[^\n]*viewport")
 _DATA_SMALL_TARGET_RE = _re.compile(r"data-viewport-allow-small-target")
 _DATA_OVERFLOW_RE = _re.compile(r"data-viewport-allow-overflow")
 _DATA_TRUNCATION_RE = _re.compile(r"data-viewport-allow-truncation")
@@ -9050,6 +9115,24 @@ def _find_components_dir() -> Optional[_Path]:
             return candidate
         here = here.parent
     return None
+
+
+def _load_viewport_budget() -> Dict[str, Any]:
+    """Load viewport-escape-hatch-budget.json, returning empty dict on failure."""
+    here = _Path(__file__).resolve().parent
+    for _ in range(6):
+        candidate = (
+            here / "admin-ui" / "src" / "test" / "viewport-escape-hatch-budget.json"
+        )
+        if candidate.is_file():
+            try:
+                import json as _json
+
+                return _json.loads(candidate.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+        here = here.parent
+    return {}
 
 
 def _scan_viewport_debt_rows() -> tuple[
@@ -9068,13 +9151,21 @@ def _scan_viewport_debt_rows() -> tuple[
             "total_components": 0,
             "untested_count": 0,
             "untested_components": [],
+            "total_opt_outs": 0,
+            "total_budget": None,
+            "budget_headroom": None,
         }
         return [], [], empty_summary
+
+    budget = _load_viewport_budget()
+    per_component_budget: Dict[str, int] = budget.get("perComponent", {}) or {}
+    total_budget: Optional[int] = budget.get("total")
 
     rows = []
     untested_rows: List[Dict[str, Any]] = []
     untested_paths: List[str] = []
     total_components = 0
+    grand_total_opt_outs = 0
     for tsx_file in sorted(components_dir.glob("*.tsx")):
         name = tsx_file.name
         if ".test." in name or ".spec." in name:
@@ -9090,10 +9181,14 @@ def _scan_viewport_debt_rows() -> tuple[
         overflow = len(_DATA_OVERFLOW_RE.findall(content))
         truncation = len(_DATA_TRUNCATION_RE.findall(content))
         total = eslint_count + small_target + overflow + truncation
+        grand_total_opt_outs += total
 
         stem = tsx_file.stem  # e.g. "MessagesPanel"
         vp_test = (tsx_file.parent / f"{stem}.viewport.test.tsx").exists()
         rel_path = f"admin-ui/src/components/{name}"
+
+        cap: Optional[int] = per_component_budget.get(stem)
+        headroom: Optional[int] = (cap - total) if cap is not None else None
 
         if not vp_test:
             untested_paths.append(rel_path)
@@ -9108,6 +9203,8 @@ def _scan_viewport_debt_rows() -> tuple[
                         "data_viewport_allow_overflow": 0,
                         "data_viewport_allow_truncation": 0,
                         "total_opt_outs": 0,
+                        "budget_cap": cap,
+                        "headroom": headroom,
                         "has_viewport_test": False,
                         "regression_case_count": 0,
                         "regression_case_breakdown": {},
@@ -9124,6 +9221,8 @@ def _scan_viewport_debt_rows() -> tuple[
                 "data_viewport_allow_overflow": overflow,
                 "data_viewport_allow_truncation": truncation,
                 "total_opt_outs": total,
+                "budget_cap": cap,
+                "headroom": headroom,
                 "has_viewport_test": vp_test,
                 "regression_case_count": 0,
                 "regression_case_breakdown": {},
@@ -9134,10 +9233,16 @@ def _scan_viewport_debt_rows() -> tuple[
     rows.sort(key=lambda r: r["total_opt_outs"], reverse=True)
     untested_rows.sort(key=lambda r: r["component"])
 
+    budget_headroom: Optional[int] = (
+        (total_budget - grand_total_opt_outs) if total_budget is not None else None
+    )
     coverage_summary: Dict[str, Any] = {
         "total_components": total_components,
         "untested_count": len(untested_paths),
         "untested_components": sorted(untested_paths)[:50],
+        "total_opt_outs": grand_total_opt_outs,
+        "total_budget": total_budget,
+        "budget_headroom": budget_headroom,
     }
 
     rows = rows[:15]
@@ -9575,6 +9680,7 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
         "confidence": qual.get("confidence"),
         "threshold": qual.get("threshold"),
         "sub_scores": qual.get("sub_scores"),
+        "ci_resolution": qual.get("ci_resolution"),
         "blocker": qual.get("blocker"),
         "finalized_at": qual.get("finalized_at"),
     }
@@ -9730,4 +9836,55 @@ async def set_version_phase(
         if open_ver.phase_changed_at
         else None,
         "phase_reasoning": open_ver.phase_reasoning,
+    }
+
+
+_VERDICT_HISTORY_LIMIT = 50
+
+
+@router.get("/projects/{project_id}/qualification-verdicts")
+async def list_qualification_verdicts(
+    project_id: uuid.UUID,
+    limit: int = Query(default=20, ge=1, le=_VERDICT_HISTORY_LIMIT),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return recent QualificationVerdict rows for a project, newest-first.
+
+    Viewer+ role required.  Returns a bounded list (max 50) of per-verdict
+    history rows covering both dry-run and promotion-enabled regimes, giving
+    operators a live view of qualifier behavior across the full history.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+
+    stmt = (
+        select(QualificationVerdict)
+        .where(QualificationVerdict.project_id == project_id)
+        .order_by(QualificationVerdict.created_at.desc())
+        .limit(limit)
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
+
+    return {
+        "verdicts": [
+            {
+                "id": str(v.id),
+                "release_version_id": str(v.release_version_id),
+                "candidate_sha": v.candidate_sha,
+                "confidence": v.confidence,
+                "sub_scores": v.sub_scores,
+                "blocker": v.blocker,
+                "would_promote": v.would_promote,
+                "promotion_enabled": v.promotion_enabled,
+                "terminal_status": v.terminal_status,
+                "threshold": v.threshold,
+                "started_at": v.started_at.isoformat() if v.started_at else None,
+                "finalized_at": v.finalized_at.isoformat() if v.finalized_at else None,
+                "created_at": v.created_at.isoformat(),
+            }
+            for v in rows
+        ],
+        "total": len(rows),
     }

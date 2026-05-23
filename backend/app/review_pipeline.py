@@ -311,11 +311,14 @@ def _is_test_file(path: str) -> bool:
 AUTO_APPROVE_MIN_ACCEPTANCE_RATE = 0.5
 
 
-def _diff_lines_changed(diff_summary: list | None) -> int | None:
+def _diff_lines_changed(
+    diff_summary: list | None, exclude_test_files: bool = False
+) -> int | None:
     """Sum added+removed across a diff summary list.
 
     Returns None when the summary is missing or malformed, so callers can
     fall through to the full review path when diff size is unknown.
+    If exclude_test_files is True, skips entries where the file is a test file.
     """
     if not diff_summary or not isinstance(diff_summary, list):
         return None
@@ -323,6 +326,10 @@ def _diff_lines_changed(diff_summary: list | None) -> int | None:
     for entry in diff_summary:
         if not isinstance(entry, dict):
             return None
+        if exclude_test_files:
+            file_path = entry.get("file", "")
+            if isinstance(file_path, str) and _is_test_file(file_path):
+                continue
         total += int(entry.get("added") or 0) + int(entry.get("removed") or 0)
     return total
 
@@ -382,11 +389,13 @@ def should_auto_approve_diff(
     if non_test_count > max_files:
         return (False, f"{non_test_count} non-test files > {max_files}")
 
-    lines_changed = _diff_lines_changed(ctx.get("_pr_diff_summary"))
+    lines_changed = _diff_lines_changed(
+        ctx.get("_pr_diff_summary"), exclude_test_files=True
+    )
     if lines_changed is None:
         return (False, "diff size unknown")
     if lines_changed > max_lines:
-        return (False, f"{lines_changed} lines > {max_lines}")
+        return (False, f"{lines_changed} non-test lines > {max_lines}")
 
     if direction_data is not None:
         from app.research_completion import _compute_acceptance_rate
@@ -404,7 +413,7 @@ def should_auto_approve_diff(
 
     return (
         True,
-        f"auto-approve: {lines_changed} lines across {non_test_count} non-test "
+        f"auto-approve: {lines_changed} non-test lines across {non_test_count} non-test "
         f"file(s) (≤ {max_lines}/{max_files})",
     )
 
@@ -1032,6 +1041,7 @@ async def _spawn_pipeline_task(
     current_issues: list | None = None,
     ci_failure_logs: str = "",
     investigated_files: list[str] | None = None,
+    skip_rereview_minor_only: bool = False,
     suppress_warm_handoff: bool = False,
 ) -> tuple[Task | None, bool]:
     """Spawn a review or fix task as part of the automated review pipeline.
@@ -2157,6 +2167,14 @@ async def _spawn_pipeline_task(
         **(
             {"fix_agent_responses": accumulated_responses}
             if accumulated_responses
+            else {}
+        ),
+        # First-pass minor-only marker: when set, the fix-completion handler
+        # skips the follow-up re-review (CI gates the merge instead), since the
+        # fix only addressed minor nits. See task_lifecycle.py fix-completion.
+        **(
+            {"skip_rereview_minor_only": True}
+            if (task_type == "fix" and skip_rereview_minor_only)
             else {}
         ),
     }

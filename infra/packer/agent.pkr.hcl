@@ -17,6 +17,21 @@ variable "zone" {
   default = "us-central1-f"
 }
 
+# Optional GitHub token used at build time to seed the git object cache and
+# warm the npm cache. When empty the build still succeeds — cache seeding is
+# skipped and cold VMs fall back to a full clone / cold npm install.
+variable "github_token" {
+  type      = string
+  default   = env("GITHUB_TOKEN")
+  sensitive = true
+}
+
+# owner/repo to pre-bake into the git object cache (the dominant target repo).
+variable "cache_repo" {
+  type    = string
+  default = "HenryHamster/BlueprintAIStudio"
+}
+
 source "googlecompute" "agent_image" {
   project_id          = var.project_id
   source_image_family = "ubuntu-2204-lts"
@@ -36,6 +51,11 @@ build {
       "sudo apt-get install -y curl git wget gnupg",
       "curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -",
       "sudo apt-get install -y nodejs docker.io",
+      "# Point every npm invocation (build-time globals + npm ci below, and the",
+      "# agent's task-time npm ci) at a single shared cache dir that we pre-warm",
+      "# and bake into the image, so cold VMs hit cache instead of re-downloading.",
+      "sudo mkdir -p /opt/agent-cache/npm",
+      "sudo npm config set cache /opt/agent-cache/npm --global",
       "sudo systemctl enable docker",
       "sudo systemctl start docker",
       "# Pre-pull postgres:15 (used by scripts/test-backend.sh --postgres) so each",
@@ -111,6 +131,22 @@ build {
       "echo '[Install]' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
       "echo 'WantedBy=multi-user.target' | sudo tee -a /etc/systemd/system/blueprint-agent.service",
       "sudo systemctl daemon-reload"
+    ]
+  }
+
+  provisioner "shell" {
+    inline = [
+      "sudo mkdir -p /opt/agent-cache/git",
+      "# Seed a bare git mirror so cold VMs clone with `git clone --reference-if-able`",
+      "# and reuse pre-fetched objects instead of re-downloading the whole repo.",
+      "# Path layout matches GIT_REFERENCE_CACHE_ROOT/<owner>/<repo>.git in agent/src/index.ts.",
+      "if [ -n '${var.github_token}' ] && [ -n '${var.cache_repo}' ]; then sudo mkdir -p \"/opt/agent-cache/git/$(dirname '${var.cache_repo}')\" && sudo git clone --mirror \"https://x-access-token:${var.github_token}@github.com/${var.cache_repo}.git\" \"/opt/agent-cache/git/${var.cache_repo}.git\" && echo PACKER_GIT_CACHE_OK; else echo 'No github_token/cache_repo; skipping git object cache seed'; fi",
+      "# Pre-warm the shared npm cache with the target repo's admin-ui + agent deps",
+      "# so task-time `npm ci` is mostly cache hits. Best-effort: a dep-install",
+      "# failure here must not fail the build (|| true), the cache still helps partially.",
+      "if [ -d \"/opt/agent-cache/git/${var.cache_repo}.git\" ]; then sudo git clone \"/opt/agent-cache/git/${var.cache_repo}.git\" /tmp/cache-warm && (cd /tmp/cache-warm/admin-ui && sudo npm ci || true) && (cd /tmp/cache-warm/agent && sudo npm ci || true) && sudo rm -rf /tmp/cache-warm && echo PACKER_NPM_WARM_OK; fi",
+      "# The agent user runs tasks, so it must own the caches it reads and writes.",
+      "sudo chown -R agent:agent /opt/agent-cache"
     ]
   }
 

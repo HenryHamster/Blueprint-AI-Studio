@@ -186,7 +186,11 @@ async def compute_effective_max_requeues(
     recurring_tests = False
     for child in children:
         ctx = child.context or {}
-        current_class = classify_failure(child, logs=ctx.get("last_error") or None)
+        current_class = classify_failure(
+            child,
+            logs=ctx.get("last_error") or None,
+            at_time=child.vm_stopped_at or child.last_heartbeat,
+        )
         prev_class = ctx.get("_previous_failure_class")
         if (
             prev_class

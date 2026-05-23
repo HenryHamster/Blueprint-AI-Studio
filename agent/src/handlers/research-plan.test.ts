@@ -72,6 +72,7 @@ import {
   buildPortfolioComposition,
   buildVersionPhaseSection,
   buildMemoCitationsSection,
+  resolveMemoHandles,
   buildEfficiencySnapshotSection,
   buildThinkerPrompt,
   runThinkerWithGate,
@@ -1349,21 +1350,40 @@ describe('buildMemoCitationsSection', () => {
     expect(buildMemoCitationsSection([])).toBe('');
   });
 
-  it('renders a header and one bullet per memo with task id and excerpt', () => {
+  it('renders a header and one bullet per memo with handle, task_id, and excerpt', () => {
     const result = buildMemoCitationsSection([
       { task_id: 'memo-aaa', summary_excerpt: 'Caching layer is the bottleneck.' },
       { task_id: 'memo-bbb', summary_excerpt: 'Auth retries mask a real timeout.' },
     ]);
     expect(result).toContain('## Memo Citations');
-    expect(result).toContain('memo memo-aaa: Caching layer is the bottleneck.');
-    expect(result).toContain('memo memo-bbb: Auth retries mask a real timeout.');
+    expect(result).toContain('M0 (task_id: memo-aaa): Caching layer is the bottleneck.');
+    expect(result).toContain('M1 (task_id: memo-bbb): Auth retries mask a real timeout.');
   });
 
-  it('instructs the reviewer to cite memos by task id', () => {
+  it('assigns stable handles (M0, M1, M2, ...) based on position in array', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-first', summary_excerpt: 'First memo.' },
+      { task_id: 'memo-second', summary_excerpt: 'Second memo.' },
+      { task_id: 'memo-third', summary_excerpt: 'Third memo.' },
+    ]);
+    expect(result).toContain('M0 (task_id: memo-first)');
+    expect(result).toContain('M1 (task_id: memo-second)');
+    expect(result).toContain('M2 (task_id: memo-third)');
+  });
+
+  it('instructs the reviewer to cite memos by short handle', () => {
     const result = buildMemoCitationsSection([
       { task_id: 'memo-aaa', summary_excerpt: 'A finding.' },
     ]);
-    expect(result).toMatch(/cite it by task id/i);
+    expect(result).toMatch(/cite it by.*handle/i);
+    expect(result).toMatch(/memo M0|memo M1/);
+  });
+
+  it('keeps real task_id visible in digest for traceability', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-aaa-uuid-12345', summary_excerpt: 'A finding.' },
+    ]);
+    expect(result).toContain('task_id: memo-aaa-uuid-12345');
   });
 
   it('falls back gracefully when an entry is missing fields', () => {
@@ -1372,8 +1392,113 @@ describe('buildMemoCitationsSection', () => {
       { summary_excerpt: 'no id here' },
       'not-an-object',
     ]);
-    expect(result).toContain('memo memo-ccc: (no summary)');
-    expect(result).toContain('memo ?: no id here');
+    expect(result).toContain('M0 (task_id: memo-ccc): (no summary)');
+    expect(result).toContain('M1 (task_id: ?): no id here');
+  });
+});
+
+describe('resolveMemoHandles', () => {
+  it('returns empty array when no memos', () => {
+    const result = resolveMemoHandles('analysis text', []);
+    expect(result).toEqual([]);
+  });
+
+  it('returns empty array when analysis text contains no memo handles', () => {
+    const memos = [
+      { task_id: 'memo-aaa', summary_excerpt: 'Finding A' },
+      { task_id: 'memo-bbb', summary_excerpt: 'Finding B' },
+    ];
+    const analysisText = 'We discovered several issues but did not cite any memos.';
+    const result = resolveMemoHandles(analysisText, memos);
+    expect(result).toEqual([]);
+  });
+
+  it('resolves memo handle M0 to first memo task_id', () => {
+    const memos = [
+      { task_id: 'memo-first', summary_excerpt: 'First' },
+      { task_id: 'memo-second', summary_excerpt: 'Second' },
+    ];
+    const analysisText = 'This finding supports memo M0.';
+    const result = resolveMemoHandles(analysisText, memos);
+    expect(result).toEqual(['memo-first']);
+  });
+
+  it('resolves multiple memo handles in order of appearance', () => {
+    const memos = [
+      { task_id: 'memo-aaa' },
+      { task_id: 'memo-bbb' },
+      { task_id: 'memo-ccc' },
+    ];
+    const analysisText = 'Consider memo M0 and memo M2 together.';
+    const result = resolveMemoHandles(analysisText, memos);
+    expect(result).toEqual(['memo-aaa', 'memo-ccc']);
+  });
+
+  it('handles handles with parentheses like (M0)', () => {
+    const memos = [
+      { task_id: 'memo-test' },
+    ];
+    const analysisText = 'As noted in (M0), this pattern emerges.';
+    const result = resolveMemoHandles(analysisText, memos);
+    expect(result).toEqual(['memo-test']);
+  });
+
+  it('deduplicates repeated handle references', () => {
+    const memos = [
+      { task_id: 'memo-aaa' },
+      { task_id: 'memo-bbb' },
+    ];
+    const analysisText = 'We cite M0 several times. See memo M0 again.';
+    const result = resolveMemoHandles(analysisText, memos);
+    expect(result).toEqual(['memo-aaa']);
+  });
+
+  it('skips memos with missing or invalid task_id', () => {
+    const memos = [
+      { task_id: 'memo-aaa' },
+      { summary_excerpt: 'Missing task_id' },
+      { task_id: '' },
+      { task_id: 'memo-ddd' },
+    ] as Array<Record<string, unknown>>;
+    const analysisText = 'We reference M0 and M3.';
+    const result = resolveMemoHandles(analysisText, memos);
+    expect(result).toEqual(['memo-aaa', 'memo-ddd']);
+  });
+
+  it('uses word boundary matching to avoid partial matches', () => {
+    const memos = [
+      { task_id: 'memo-aaa' },
+      { task_id: 'memo-bbb' },
+      { task_id: 'memo-ccc' },
+    ];
+    // "M01" must not match handle "M0"; only the standalone "M1" resolves.
+    const analysisText = 'Found in M01 but the real cite is M1.';
+    const result = resolveMemoHandles(analysisText, memos);
+    expect(result).toEqual(['memo-bbb']);
+  });
+
+  it('handles non-object memo entries gracefully', () => {
+    const memos = [
+      { task_id: 'memo-aaa' },
+      { summary_excerpt: 'entry without task_id' },
+      { task_id: 'memo-bbb' },
+    ] as Array<Record<string, unknown>>;
+    const analysisText = 'Consider memo M0 and memo M2.';
+    const result = resolveMemoHandles(analysisText, memos);
+    expect(result).toEqual(['memo-aaa', 'memo-bbb']);
+  });
+
+  it('returns task_ids in order of indices found in analysis', () => {
+    const memos = [
+      { task_id: 'first' },
+      { task_id: 'second' },
+      { task_id: 'third' },
+      { task_id: 'fourth' },
+    ];
+    // Reverse order in text
+    const analysisText = 'memo M3 then memo M1 then memo M0.';
+    const result = resolveMemoHandles(analysisText, memos);
+    expect(result).toEqual(['fourth', 'second', 'first']);
   });
 });
 
@@ -1624,7 +1749,8 @@ describe('buildThinkerPrompt', () => {
     ]);
     const prompt = buildThinkerPrompt({ ...base, memoCitationsSection });
     expect(prompt).toContain('## Memo Citations');
-    expect(prompt).toContain('memo memo-digest-1: The provisioning path leaks VMs.');
+    // Memos are now rendered with handles and task_ids
+    expect(prompt).toContain('M0 (task_id: memo-digest-1): The provisioning path leaks VMs.');
     // Digest must land before the output instructions so the reviewer sees it.
     expect(prompt.indexOf('## Memo Citations')).toBeLessThan(prompt.indexOf('# Your job'));
   });
@@ -2104,5 +2230,58 @@ describe('handlePlan / handleResearch prompt determinism', () => {
     await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
     const prompt2 = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(prompt1).toBe(prompt2);
+  });
+});
+
+describe('buildThinkerPrompt on_automain annotation', () => {
+  const base: ThinkerPromptParams = {
+    contextPrefix: '',
+    projectName: 'Test',
+    clockHeader: '',
+    isSelfRepo: false,
+    userStateLine: '',
+    packerMetaSection: '',
+    strategicContext: '',
+    problemModelSection: '## Your current understanding (problem_model)\n_(empty)_',
+    reflectionSection: '## What you previously said was hard\n_(no prior)_',
+    selfImprovementBlock: '',
+    runningUpdateSection: '## Running update (living document — rewrite, don\'t append)\n_(empty)_',
+    designDocJson: '',
+    visionJson: '',
+    outcomeSection: '',
+    previousDecisionOutcomes: '',
+    pastRetirementCritiquesSection: '',
+    retiredDirectionsSummarySection: '',
+    dirSummaryText: 'No active directions.',
+    dirHealthSummary: 'Active: 0/10 slots.',
+    userPausedSection: '',
+    rejectedProposalsSection: '',
+    portfolioCompositionText: 'No active directions — portfolio is empty.',
+    systemMaturitySection: '',
+    driftSection: '',
+    recentWorkSection: '',
+    feedbackSection: '',
+    threadSection: '',
+    taskId: 'test-task',
+    versionPhaseSection: '',
+    memoCitationsSection: '',
+    efficiencySnapshotSection: '',
+  };
+
+  it('passes recentWorkSection with staged-not-on-automain annotation through to output', () => {
+    const section =
+      '\n# Recent Work & Rolling Outcomes\n' +
+      '  - Fix qualifier CI gate #5147 (2.1h ago) [direction: release] [staged, NOT on automain]\n';
+    const prompt = buildThinkerPrompt({ ...base, recentWorkSection: section });
+    expect(prompt).toContain('[staged, NOT on automain]');
+  });
+
+  it('does not annotate when on_automain is true (no annotation tag)', () => {
+    const section =
+      '\n# Recent Work & Rolling Outcomes\n' +
+      '  - Normal landed fix #5100 (3h ago) [direction: release]\n';
+    const prompt = buildThinkerPrompt({ ...base, recentWorkSection: section });
+    expect(prompt).not.toContain('[staged, NOT on automain]');
+    expect(prompt).toContain('Normal landed fix');
   });
 });

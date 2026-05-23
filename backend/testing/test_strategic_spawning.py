@@ -26,6 +26,7 @@ from app.strategic_spawning import (
     _spawn_design_doc_update,
     _spawn_strategic_review,
     _build_shipped_changes_manifest,
+    _build_recent_interventions,
 )
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 
@@ -3705,3 +3706,630 @@ async def test_build_stall_nudge_tasks_merged_field_is_phase_scoped(
         f"build_stall.tasks_merged should be phase-scoped count {post_phase_count}, "
         f"not version-lifetime count; got {reported_merged}"
     )
+
+
+# ── outcome_evaluation read path for success_evidence/retirement_condition ────
+
+
+@pytest.mark.asyncio
+async def test_outcome_evaluation_includes_success_evidence_and_retirement_condition(
+    db_session,
+):
+    """outcome_evaluation in strategic payload includes success_evidence and retirement_condition when set."""
+    long_evidence = "E" * 700
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-oe-ev01",
+                "status": "active",
+                "text": "Direction with outcome criteria",
+                "priority": "high",
+                "context": {
+                    "success_evidence": long_evidence,
+                    "retirement_condition": "  retire when fully satisfied  ",
+                },
+                "research_history": [
+                    {
+                        "prs_merged": 2,
+                        "prs_rejected": 0,
+                        "tasks_created": 5,
+                        "tasks_failed": 0,
+                    }
+                ],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+
+    assert "outcome_evaluation" in payload
+    outcome_eval = payload.get("outcome_evaluation", {})
+    directions = outcome_eval.get("directions", [])
+
+    assert len(directions) > 0, "outcome_evaluation should have directions"
+    outcome = next((o for o in directions if o["id"] == "d-oe-ev01"), None)
+    assert outcome is not None, "Direction should be in outcome_evaluation"
+    # success_evidence should be capped at 500 chars
+    assert outcome.get("success_evidence") == "E" * 500
+    # retirement_condition should be stripped and capped
+    assert outcome.get("retirement_condition") == "retire when fully satisfied"
+
+
+@pytest.mark.asyncio
+async def test_outcome_evaluation_omits_fields_when_not_set(db_session):
+    """outcome_evaluation omits success_evidence/retirement_condition when not in context."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-oe-ev02",
+                "status": "active",
+                "text": "Direction without outcome criteria",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    outcome_eval = payload.get("outcome_evaluation", {})
+    directions = outcome_eval.get("directions", [])
+
+    outcome = next((o for o in directions if o["id"] == "d-oe-ev02"), None)
+    assert outcome is not None
+    assert "success_evidence" not in outcome
+    assert "retirement_condition" not in outcome
+
+
+@pytest.mark.asyncio
+async def test_outcome_evaluation_handles_empty_strings(db_session):
+    """outcome_evaluation omits empty/whitespace-only success_evidence/retirement_condition."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-oe-ev03",
+                "status": "active",
+                "text": "Direction with empty criteria",
+                "priority": "low",
+                "context": {
+                    "success_evidence": "   ",  # whitespace only
+                    "retirement_condition": "",  # empty
+                },
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    outcome_eval = payload.get("outcome_evaluation", {})
+    directions = outcome_eval.get("directions", [])
+
+    outcome = next((o for o in directions if o["id"] == "d-oe-ev03"), None)
+    assert outcome is not None
+    assert "success_evidence" not in outcome
+    assert "retirement_condition" not in outcome
+
+
+# ── on_automain flag in _build_recent_interventions ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_on_automain_false_for_root_task_when_unverified(db_session):
+    """Root tasks (no parent) report on_automain=False when ancestry cannot be verified.
+
+    When GitHub credentials are unavailable the ancestry check is skipped and the
+    task is NOT assumed to have landed on the integration branch (fail-closed).
+    """
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Direct fix",
+        description="No parent",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["on_automain"] is False
+
+
+@pytest.mark.asyncio
+async def test_on_automain_true_when_rollup_merged(db_session):
+    """Child task reports on_automain=True when its rollup parent's pr_merged=True."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        title="Rollup parent",
+        description="rollup",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "rollup_pr_number": 42},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    child = Task(
+        project_id=project.id,
+        title="Child fix",
+        description="child",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        parent_task_id=parent.id,
+        context={"pr_merged": True},
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    by_title = {m["pr_title"]: m for m in merges}
+    # Child is on automain via the parent's pr_merged DB flag (fail-open for child
+    # tasks is intentional — the flag is a DB-recorded rollup-merge event).
+    assert by_title["Child fix"]["on_automain"] is True
+    # Rollup parent is a root task with no credentials → ancestry unverifiable → False.
+    assert by_title["Rollup parent"]["on_automain"] is False
+
+
+@pytest.mark.asyncio
+async def test_on_automain_false_when_rollup_not_merged(db_session):
+    """Child task reports on_automain=False when its rollup parent is not yet merged."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        title="Unmerged rollup",
+        description="rollup",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        context={"rollup_pr_number": 99},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    child = Task(
+        project_id=project.id,
+        title="Staged fix",
+        description="child merged into staging only",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        parent_task_id=parent.id,
+        context={"pr_merged": True},
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["pr_title"] == "Staged fix"
+    assert merges[0]["on_automain"] is False
+
+
+# ── git-ancestry landing verification in _build_recent_interventions ──────────
+
+
+@pytest.mark.asyncio
+async def test_on_automain_false_when_commit_not_ancestor(db_session, mocker):
+    """pr_merged=True but commit is NOT an ancestor of automain → on_automain=False.
+
+    The ancestry check returns False and there are no _pr_changed_files for the
+    content-aware fallback, so the task is correctly reported as NOT landed.
+    """
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Stranded fix",
+        description="pr_merged=True but not on automain",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 201},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merge_commit_sha": "stranded-sha",
+                "head": {"sha": "head-sha"},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=False),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["pr_title"] == "Stranded fix"
+    assert merges[0]["on_automain"] is False
+
+
+@pytest.mark.asyncio
+async def test_on_automain_true_when_commit_is_ancestor(db_session, mocker):
+    """Commit IS a git-ancestor of automain → on_automain=True via ancestry check."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Landed fix",
+        description="merge SHA is a real ancestor",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 202},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={"merge_commit_sha": "landed-sha", "head": {"sha": "head-sha"}}
+        ),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["pr_title"] == "Landed fix"
+    assert merges[0]["on_automain"] is True
+
+
+@pytest.mark.asyncio
+async def test_on_automain_false_when_ancestry_api_indeterminate(db_session, mocker):
+    """is_ancestor_of returning None (API error / diverged) → on_automain=False.
+
+    Degrade-safe convention: indeterminate result must NOT be treated as landed.
+    """
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Indeterminate fix",
+        description="ancestry API returned None",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 203},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={"merge_commit_sha": "some-sha", "head": {"sha": "head-sha"}}
+        ),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=None),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["pr_title"] == "Indeterminate fix"
+    assert merges[0]["on_automain"] is False
+
+
+@pytest.mark.asyncio
+async def test_on_automain_child_verified_via_parent_rollup_pr(db_session, mocker):
+    """Rollup child: ancestry is verified against the PARENT's rollup PR, not the child's own.
+
+    A rollup child's own PR merges into the rollup staging branch, so its merge
+    commit is never an ancestor of the integration branch once the rollup PR
+    squash-merges. The child is on automain iff the parent's rollup PR landed —
+    verifying the child's own PR would (wrongly) report on_automain=False.
+    """
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        title="Rollup parent",
+        description="rollup",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "rollup_pr_number": 500},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    child = Task(
+        project_id=project.id,
+        title="Rollup child fix",
+        description="child merged into staging branch",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        parent_task_id=parent.id,
+        context={"pr_merged": True, "pr_number": 999},
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    def _pr_side_effect(token, owner, repo, pr_num, project_id=None):
+        return {
+            999: {"merge_commit_sha": "child-merge-sha", "head": {"sha": "child-head"}},
+            500: {
+                "merge_commit_sha": "rollup-merge-sha",
+                "head": {"sha": "rollup-head"},
+            },
+        }[pr_num]
+
+    def _anc_side_effect(token, owner, repo, sha, ref, project_id=None):
+        # The child's own merge commit lives on the staging branch (not an
+        # ancestor); only the rollup PR's squash commit is on the integration
+        # branch.
+        return sha == "rollup-merge-sha"
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(side_effect=_pr_side_effect),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(side_effect=_anc_side_effect),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    by_title = {m["pr_title"]: m for m in result["merges"]}
+    # Child is on automain because the PARENT's rollup PR #500 squash-landed —
+    # not because the child's own PR #999 (staging-only) is an ancestor.
+    assert by_title["Rollup child fix"]["on_automain"] is True
+    assert by_title["Rollup parent"]["on_automain"] is True
+
+
+@pytest.mark.asyncio
+async def test_on_automain_child_false_when_parent_rollup_pr_not_ancestor(
+    db_session, mocker
+):
+    """Rollup child: on_automain=False when the parent's rollup PR has not landed.
+
+    The rollup PR's merge commit is not an ancestor of the integration branch
+    (rollup merged into a staging branch that itself never reached automain), so
+    the child is correctly reported as NOT landed.
+    """
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        title="Stranded rollup parent",
+        description="rollup",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "rollup_pr_number": 501},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    child = Task(
+        project_id=project.id,
+        title="Stranded rollup child",
+        description="child whose rollup never landed",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        parent_task_id=parent.id,
+        context={"pr_merged": True, "pr_number": 998},
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merge_commit_sha": "rollup-merge-sha",
+                "head": {"sha": "rollup-head"},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=False),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    by_title = {m["pr_title"]: m for m in result["merges"]}
+    assert by_title["Stranded rollup child"]["on_automain"] is False
+    assert by_title["Stranded rollup parent"]["on_automain"] is False
+
+
+@pytest.mark.asyncio
+async def test_on_automain_false_for_root_task_no_pr_number(db_session, mocker):
+    """Root task with no pr_number reports on_automain=False even with credentials.
+
+    When credentials resolve but the task has no pr_number or rollup_pr_number in
+    its context, no ancestry check can run for it.  The task must NOT be assumed
+    landed (fail-closed), so on_automain must be False.
+    """
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="No-PR root fix",
+        description="merged but no pr_number",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        # pr_merged=True but no pr_number/rollup_pr_number → ancestry check skipped
+        context={"pr_merged": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["pr_title"] == "No-PR root fix"
+    # No pr_number → ancestry check skipped → unverifiable → fail-closed = False
+    assert merges[0]["on_automain"] is False
+
+
+@pytest.mark.asyncio
+async def test_on_automain_false_for_root_task_ancestry_api_exception(
+    db_session, mocker
+):
+    """Root task reports on_automain=False when the ancestry API call raises an exception.
+
+    An exception during the ancestry check leaves the task absent from
+    _automain_verified.  The fallback must NOT assume landed (fail-closed).
+    """
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="API-error root fix",
+        description="ancestry API raises",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 777},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={"merge_commit_sha": "abc123", "head": {"sha": "head-sha"}}
+        ),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(side_effect=RuntimeError("GitHub API unreachable")),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    merges = result["merges"]
+    assert len(merges) == 1
+    assert merges[0]["pr_title"] == "API-error root fix"
+    # API exception → task absent from _automain_verified → fail-closed = False
+    assert merges[0]["on_automain"] is False

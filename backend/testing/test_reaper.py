@@ -194,6 +194,24 @@ def test_progress_stale_cutoff_research_design_doc_investigate_plan_thinking_hea
         )
 
 
+def test_progress_stale_cutoff_memo_uses_thinking_heavy_budget():
+    """Memo (pure-reasoning documentation) tasks use the 1500s thinking-heavy budget.
+
+    Regression: memo tasks are read-only (no repo, no tools) and may spend 5-10+ min
+    producing a reasoning artifact without any tool calls. The short 480s cutoff
+    (small scope) would incorrectly classify a heartbeating memo in mid-reasoning as
+    stalled, causing premature reap. Memo must use thinking-heavy budget.
+    """
+
+    class _T:
+        context = {"scope": "small"}  # noqa: RUF012
+        first_payload = {"type": "memo"}  # noqa: RUF012
+        payloads = [{"type": "memo"}]  # noqa: RUF012
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    assert _progress_stale_cutoff(_T(), now) == now - timedelta(seconds=1500)
+
+
 def test_progress_stale_cutoff_fix_review_create_use_scope_default():
     """Tool-cadence task types (fix, review, create) keep scope-based budgets."""
     now = datetime(2026, 1, 1, 12, 0, 0)
@@ -672,6 +690,49 @@ async def test_in_progress_no_tool_use_codex_provider_not_reaped(
 
 
 @pytest.mark.asyncio
+async def test_in_progress_memo_zero_tool_use_heartbeating_not_reaped(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Memo task heartbeating with zero tool calls for 10min must NOT be reaped.
+
+    Memo tasks are pure-reasoning read-only tasks (no repo, no tools). They
+    legitimately spend 5-10+ minutes producing reasoning artifacts without
+    any tool calls. The progress-stale watchdog would incorrectly classify this
+    as stalled if memo used the small-scope 480s cutoff (8 min). Memo uses the
+    thinking-heavy 1500s (25 min) cutoff instead.
+
+    Regression: pre-fix, memo tasks were reaped mid-think because they were not
+    in the thinking-heavy task types, causing premature termination of legitimate
+    reasoning work.
+    """
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "memo", "topic": "analyze architecture"}],
+        vm_instance_id="vm-memo-reasoning",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        # Started 10 minutes ago — would be stale under 480s cutoff but not 1500s
+        started_at=datetime.utcnow() - timedelta(minutes=10),
+        # Heartbeat fresh — agent is alive and thinking
+        last_heartbeat=datetime.utcnow() - timedelta(seconds=30),
+        # No tool calls — memo is pure reasoning, no tools needed
+        last_tool_use_at=None,
+        context={"scope": "small", "llm_provider": "anthropic"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.IN_PROGRESS, (
+        "Memo task heartbeating for 10min with zero tools must not be reaped "
+        "(uses 1500s thinking-heavy cutoff, not 480s small-scope cutoff)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_orphan_ignored_without_vm_instance_id(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):
@@ -886,6 +947,155 @@ async def test_rate_limit_requeue_blacklists_account_and_skips_budget(
     # (no retry hint, plain rate_limit kind).
     disable_mock.assert_awaited_with(
         "acct-123", "sonnet", retry_after_seconds=None, kind="rate_limit"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaper_account_cooldown_silent_death_free_requeue(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Silent death (no rate-limit keywords) with account in cooldown → RATE_LIMIT free requeue.
+
+    Regression guard for the account-state correlation path through the REAPER.
+    The existing test triggers on a log keyword; this one drives classification
+    purely via account state so a future change to keyword detection can't mask
+    a broken correlation path.
+    """
+    disable_mock = mocker.patch(
+        "app.max_plan_pool.disable_account_model", new_callable=AsyncMock
+    )
+    mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
+    # Stub account-state correlation to return True — isolates the REAPER free-requeue
+    # path from the account-pool internals (those are tested in test_failure_classification.py).
+    mocker.patch(
+        "app.failure_classification._account_was_rate_limited", return_value=True
+    )
+
+    account_id = "acct-rl-silent"
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "model": "sonnet"}],
+        vm_instance_id="vm-rl-silent",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={
+            "max_plan_account_id": account_id,
+            # No rate-limit keywords in last_error — correlation driven purely by account state.
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    ctx = t.context or {}
+    assert t.status == TaskStatus.QUEUED, "account-correlated RL must requeue"
+    assert t.attempt_count == 1, "account-correlated RL must not burn attempt budget"
+    assert account_id in (ctx.get("blacklisted_accounts") or [])
+    assert "max_plan_account_id" not in ctx
+    disable_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reaper_account_cooldown_uses_failure_instant_not_sweep_time(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """at_time=last_heartbeat is passed so edge-of-cooldown failures are caught.
+
+    Scenario: account was disabled before the task's last_heartbeat but the
+    cooldown has since expired by sweep time. The reaper must pass
+    at_time=task.last_heartbeat so classify_failure evaluates the account
+    state at the failure instant, not at the (later) sweep instant.
+
+    The side_effect returns True only when at_time is not None (i.e., when the
+    reaper correctly passes at_time=last_heartbeat). If the reaper passed
+    at_time=None instead, the side_effect returns False and the task would be
+    classified AGENT_TIMEOUT — burning a retry attempt.
+    """
+    disable_mock = mocker.patch(
+        "app.max_plan_pool.disable_account_model", new_callable=AsyncMock
+    )
+    mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
+
+    def _rl_only_at_heartbeat(task, at_time=None):
+        # Simulate cooldown active at failure instant (at_time set) but expired now.
+        return at_time is not None
+
+    mocker.patch(
+        "app.failure_classification._account_was_rate_limited",
+        side_effect=_rl_only_at_heartbeat,
+    )
+
+    account_id = "acct-rl-edge"
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "model": "sonnet"}],
+        vm_instance_id="vm-rl-edge",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=20),
+        context={
+            "max_plan_account_id": account_id,
+            # No rate-limit keywords — correlation via account state at failure instant only.
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    ctx = t.context or {}
+    assert t.status == TaskStatus.QUEUED, (
+        "failure at tail of rate-limit window must still classify RATE_LIMIT "
+        "(at_time=last_heartbeat fix)"
+    )
+    assert t.attempt_count == 1, (
+        "must not burn attempt budget (at_time=last_heartbeat plumbing)"
+    )
+    assert account_id in (ctx.get("blacklisted_accounts") or [])
+    disable_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reaper_enrichment_block_records_failure_class_from_initial_classification(
+    reaper_db, stop_after_one_cycle, reaper_side_effects
+):
+    """Regression guard: the enrichment block that writes _previous_failure_class
+    reuses reap_failure_class (computed at line 1663 with at_time=last_heartbeat)
+    rather than calling classify_failure a second time after last_heartbeat is
+    cleared to None.
+
+    Before the fix, a re-call without at_time could diverge from reap_failure_class
+    for edge-of-cooldown failures. Verified here for the AGENT_TIMEOUT case:
+    the enrichment block must write 'AGENT_TIMEOUT', not another class.
+    """
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "model": "sonnet"}],
+        vm_instance_id="vm-enrich-at",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=20),
+        # No last_error, no rate-limit keywords → AGENT_TIMEOUT
+        context={},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    ctx = t.context or {}
+    assert t.status == TaskStatus.QUEUED
+    assert ctx.get("_previous_failure_class") == "AGENT_TIMEOUT", (
+        "enrichment block must write the same class as reap_failure_class "
+        "(AGENT_TIMEOUT for heartbeat timeout with empty logs)"
     )
 
 

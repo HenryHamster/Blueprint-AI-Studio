@@ -56,11 +56,11 @@ ALL_AXES: tuple[str, ...] = (
 
 DESIGN_DOC_KEY = "efficiency_baseline"
 
-# Window over which "current" axes are computed for each weekly snapshot.
+# Window over which "current" axes are computed for each daily snapshot.
 _AXIS_WINDOW_DAYS = 7
 
-# Cap snapshot history length (~6 months of weekly snapshots).
-_SNAPSHOT_HISTORY_MAX = 26
+# Cap snapshot history length (~1 year of daily snapshots).
+_SNAPSHOT_HISTORY_MAX = 365
 
 
 async def _load_recent_tasks(
@@ -232,6 +232,13 @@ async def write_snapshot(
         if baseline.get("_schema_version") == 1:
             baseline[AXIS_MEDIAN_REVIEW_ITERATIONS] = None
             baseline["_schema_version"] = 2
+        # One-time migration: baselines captured before the vm_dispatched_at fix
+        # (schema_version 2) stored vm_cold_start_p50_ms anchored at
+        # provision-confirm time, excluding GCE boot latency. Clear and re-seed
+        # from the corrected dispatch->agent-ready measurement.
+        if baseline.get("_schema_version") == 2:
+            baseline[AXIS_VM_COLD_START_P50_MS] = None
+            baseline["_schema_version"] = 3
         # Re-seed any individual axes that were cleared (e.g. by the migration
         # above) once a valid current value is available.
         for axis in ALL_AXES:
@@ -317,17 +324,17 @@ async def read_baseline_with_drift(
 # Background-service helpers
 # ---------------------------------------------------------------------------
 
-# Snapshot cadence: one snapshot per UTC week, anchored to Sunday 00:00 UTC.
+# Snapshot cadence: one snapshot per UTC day.
 # Service ticks every hour and decides whether the cadence has elapsed.
 SNAPSHOT_INTERVAL_SECONDS = 3600
-_WEEK_SECONDS = 7 * 24 * 3600
+_DAY_SECONDS = 24 * 3600
 
 
 def _last_run_due(last_run_at_iso: Optional[str], now: datetime) -> bool:
     """Return True when a new snapshot is due.
 
-    Cadence is one snapshot per UTC week. The first call is always due.
-    Subsequent calls are due once at least seven days have passed since the
+    Cadence is one snapshot per UTC day. The first call is always due.
+    Subsequent calls are due once at least one day has passed since the
     previous ``last_run_at`` marker.
     """
     if not last_run_at_iso:
@@ -338,13 +345,13 @@ def _last_run_due(last_run_at_iso: Optional[str], now: datetime) -> bool:
         return True
     if last_run.tzinfo is not None:
         last_run = last_run.replace(tzinfo=None)
-    return (now - last_run).total_seconds() >= _WEEK_SECONDS
+    return (now - last_run).total_seconds() >= _DAY_SECONDS
 
 
-async def maybe_write_weekly_snapshot(
+async def maybe_write_daily_snapshot(
     session: AsyncSession, project_id: uuid.UUID, *, now: Optional[datetime] = None
 ) -> Optional[Dict[str, Any]]:
-    """Write a snapshot iff the weekly cadence has elapsed for the project.
+    """Write a snapshot iff the daily cadence has elapsed for the project.
 
     Reads ``design_doc["efficiency_baseline"]["last_run_at"]`` for the
     cadence marker. The marker doubles as a multi-instance-deploy guard:
@@ -354,7 +361,11 @@ async def maybe_write_weekly_snapshot(
     if now is None:
         now = _utcnow()
 
-    project = await session.get(Project, project_id)
+    # populate_existing: a caller that left a partial Project (e.g. via
+    # ``load_only(Project.id)``) in the session identity map would otherwise
+    # return that cached partial here, and the ``design_doc`` access below
+    # would fire a sync lazy-load in async context. See ``run_once``.
+    project = await session.get(Project, project_id, populate_existing=True)
     if project is None:
         return None
 

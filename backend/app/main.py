@@ -121,7 +121,7 @@ from app.strategic_constants import (
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0111"
+EXPECTED_SCHEMA_REVISION = "0114"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -952,8 +952,17 @@ async def _create_orchestrator_error_alerts(
         f"The orchestrator has encountered {consecutive_errors} consecutive errors. "
         "The pipeline may be stalled. Check logs for details."
     )
-    projects = (await session.execute(select(Project))).scalars().all()
-    project_ids = [p.id for p in projects]
+    _PROJECT_BROADCAST_LIMIT = 1000
+    project_ids = (
+        (await session.execute(select(Project.id).limit(_PROJECT_BROADCAST_LIMIT)))
+        .scalars()
+        .all()
+    )
+    if len(project_ids) == _PROJECT_BROADCAST_LIMIT:
+        logger.warning(
+            "_create_orchestrator_error_alerts: project_ids capped at %d",
+            _PROJECT_BROADCAST_LIMIT,
+        )
     existing_rows = (
         (
             await session.execute(
@@ -970,18 +979,18 @@ async def _create_orchestrator_error_alerts(
         else []
     )
     projects_with_alert = {row[0] for row in existing_rows}
-    for project in projects:
-        if project.id in projects_with_alert:
+    for pid in project_ids:
+        if pid in projects_with_alert:
             continue
         alert = Alert(
-            project_id=project.id,
+            project_id=pid,
             severity=AlertSeverity.ERROR,
             title=title,
             message=msg,
         )
         session.add(alert)
         await broadcast_to_project(
-            str(project.id),
+            str(pid),
             "alert_created",
             {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
         )
@@ -1001,17 +1010,26 @@ async def _create_halted_alerts(
         f"Halted at: {halted_at.isoformat()}. "
         "Pipeline will auto-recover after 1h cooldown, or manually set max VMs > 0."
     )
-    projects = (await session.execute(select(Project))).scalars().all()
-    for project in projects:
+    _PROJECT_BROADCAST_LIMIT = 1000
+    project_ids = (
+        (await session.execute(select(Project.id).limit(_PROJECT_BROADCAST_LIMIT)))
+        .scalars()
+        .all()
+    )
+    if len(project_ids) == _PROJECT_BROADCAST_LIMIT:
+        logger.warning(
+            "_create_halted_alerts: project_ids capped at %d", _PROJECT_BROADCAST_LIMIT
+        )
+    for pid in project_ids:
         alert = Alert(
-            project_id=project.id,
+            project_id=pid,
             severity=AlertSeverity.ERROR,
             title=title,
             message=msg,
         )
         session.add(alert)
         await broadcast_to_project(
-            str(project.id),
+            str(pid),
             "alert_created",
             {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
         )
@@ -1028,8 +1046,17 @@ async def _create_rollback_alerts(
         f"Deployment automatically rolled back from {rolled_back_from[:8]} "
         f"to {rolled_back_to[:8]}."
     )
-    projects = (await session.execute(select(Project))).scalars().all()
-    project_ids = [p.id for p in projects]
+    _PROJECT_BROADCAST_LIMIT = 1000
+    project_ids = (
+        (await session.execute(select(Project.id).limit(_PROJECT_BROADCAST_LIMIT)))
+        .scalars()
+        .all()
+    )
+    if len(project_ids) == _PROJECT_BROADCAST_LIMIT:
+        logger.warning(
+            "_create_rollback_alerts: project_ids capped at %d",
+            _PROJECT_BROADCAST_LIMIT,
+        )
     existing_rows = (
         (
             await session.execute(
@@ -1045,18 +1072,18 @@ async def _create_rollback_alerts(
         else []
     )
     projects_with_alert = {row[0] for row in existing_rows}
-    for project in projects:
-        if project.id in projects_with_alert:
+    for pid in project_ids:
+        if pid in projects_with_alert:
             continue
         alert = Alert(
-            project_id=project.id,
+            project_id=pid,
             severity=AlertSeverity.WARNING,
             title=title,
             message=msg,
         )
         session.add(alert)
         await broadcast_to_project(
-            str(project.id),
+            str(pid),
             "alert_created",
             {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
         )
@@ -1066,8 +1093,17 @@ async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
     """Create INFO alerts and dismiss existing HALTED ERROR alerts when deployment auto-recovers."""
     recovery_title = "Deployment auto-recovered from HALTED state after 1h cooldown"
     now = _utcnow()
-    projects = (await session.execute(select(Project))).scalars().all()
-    project_ids = [p.id for p in projects]
+    _PROJECT_BROADCAST_LIMIT = 1000
+    project_ids = (
+        (await session.execute(select(Project.id).limit(_PROJECT_BROADCAST_LIMIT)))
+        .scalars()
+        .all()
+    )
+    if len(project_ids) == _PROJECT_BROADCAST_LIMIT:
+        logger.warning(
+            "_create_halted_recovery_alerts: project_ids capped at %d",
+            _PROJECT_BROADCAST_LIMIT,
+        )
     # Single batched query for all undismissed HALTED ERROR alerts across all projects
     halted_alerts = (
         (
@@ -1086,21 +1122,21 @@ async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
     halted_by_project: dict = {}
     for h in halted_alerts:
         halted_by_project.setdefault(h.project_id, []).append(h)
-    for project in projects:
+    for pid in project_ids:
         # Dismiss existing HALTED ERROR alerts for this project
-        for h in halted_by_project.get(project.id, []):
+        for h in halted_by_project.get(pid, []):
             h.dismissed_at = now
             session.add(h)
         # Create INFO recovery alert
         alert = Alert(
-            project_id=project.id,
+            project_id=pid,
             severity=AlertSeverity.INFO,
             title=recovery_title,
             message=recovery_title,
         )
         session.add(alert)
         await broadcast_to_project(
-            str(project.id),
+            str(pid),
             "alert_created",
             {"alert_id": str(alert.id), "severity": "INFO", "title": alert.title},
         )
@@ -2301,6 +2337,11 @@ from app.payload_schemas import (
     ALL_TASK_TYPES as _VALID_TASK_TYPES,
     validate_internal_payload as _validate_internal_payload,
 )
+from app.playbook_learning import (
+    maybe_archive_for_capacity as _maybe_archive_for_capacity,
+    _playbook_size_bytes,
+    _PLAYBOOK_CAPACITY_BYTES,
+)
 
 
 class PlaybookUpdate(BaseModel):
@@ -2427,16 +2468,22 @@ async def update_playbook(
         # when the task ultimately fails to land the code.
         if task.status != TaskStatus.COMPLETED:
             entry["pending_source"] = str(task.id)
+        # Evict least-useful entries until there is room for the new write.
+        # Loop so a single large write or an already-over-cap state self-heals.
+        entry_estimate = len(_json.dumps(entry).encode())
+        while _playbook_size_bytes(doc) + entry_estimate > _PLAYBOOK_CAPACITY_BYTES:
+            size_before = _playbook_size_bytes(doc)
+            doc = _maybe_archive_for_capacity(doc, entry_estimate)
+            if _playbook_size_bytes(doc) >= size_before:
+                break  # nothing evictable; size didn't shrink
         doc[playbook_key] = entry
-        # Size check: all playbook/* keys combined max 30KB
-        playbook_total = sum(
-            len(_json.dumps(v)) for k, v in doc.items() if k.startswith("playbook/")
-        )
-        if playbook_total > 30_000:
+        # Final hard-cap check — only triggers when nothing was evictable.
+        playbook_total = _playbook_size_bytes(doc)
+        if playbook_total > _PLAYBOOK_CAPACITY_BYTES:
             del doc[playbook_key]  # rollback
             raise HTTPException(
                 status_code=400,
-                detail=f"Playbook too large ({playbook_total} bytes, max 30KB total)",
+                detail=f"Playbook too large ({playbook_total} bytes, max {_PLAYBOOK_CAPACITY_BYTES} bytes) and no evictable entries",
             )
     elif op == "delete":
         doc.pop(f"playbook/{key}", None)
@@ -2700,22 +2747,27 @@ async def strategic_operation(
             data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
         )
         raw_dedup_reasoning = data.get("dedup_reasoning")
+        distinction = (
+            str(raw_dedup_reasoning.get("distinction") or "").strip()
+            if isinstance(raw_dedup_reasoning, dict)
+            else ""
+        )
         directions = list(project.directions or [])
         # Dedup: skip if semantically similar direction already exists
         _rejected_proposals = list(
             (project.vision or {}).get("rejected_proposals") or []
         )
-        if _is_direction_duplicate(text, directions, _rejected_proposals):
-            if isinstance(raw_dedup_reasoning, dict):
-                distinction = str(raw_dedup_reasoning.get("distinction") or "").strip()
-                if distinction:
-                    logger.warning(
-                        "[STRATEGIC_DEDUP_DISAGREEMENT] API path: direction rejected as duplicate but agent claimed "
-                        "distinction='%s'; matched text='%s'; project=%s",
-                        distinction[:200],
-                        text[:60],
-                        project.id,
-                    )
+        if _is_direction_duplicate(
+            text, directions, _rejected_proposals, distinction=distinction or None
+        ):
+            if distinction:
+                logger.warning(
+                    "[STRATEGIC_DEDUP_DISAGREEMENT] API path: direction rejected as duplicate but agent claimed "
+                    "distinction='%s'; matched text='%s'; project=%s",
+                    distinction[:200],
+                    text[:60],
+                    project.id,
+                )
             matched = _find_matching_direction(text, directions)
             if matched:
                 logger.info(
@@ -2733,10 +2785,8 @@ async def strategic_operation(
                 "matched_direction_id": matched.get("id") if matched else None,
                 "rejected_at": _utcnow().isoformat(),
             }
-            if isinstance(raw_dedup_reasoning, dict):
-                distinction = str(raw_dedup_reasoning.get("distinction") or "").strip()
-                if distinction:
-                    rejection_record["dedup_reasoning"] = distinction[:500]
+            if distinction:
+                rejection_record["dedup_reasoning"] = distinction[:500]
             dedup_rejections.append(rejection_record)
             task.context = {
                 **ctx,
@@ -2924,6 +2974,36 @@ async def strategic_operation(
                     mode = _normalize_recommended_mode(changes["recommended_mode"])
                     if mode is not None:
                         d["recommended_mode"] = mode
+                # Handle success_evidence and retirement_condition in context
+                _DIR_FIELD_MAX = 500
+                if "success_evidence" in changes:
+                    ctx = d.get("context", {})
+                    se = changes["success_evidence"]
+                    if se is None or se == "":
+                        # Clear success_evidence
+                        ctx.pop("success_evidence", None)
+                    else:
+                        ctx["success_evidence"] = _cap_str(
+                            se,
+                            _DIR_FIELD_MAX,
+                            "changes.success_evidence",
+                            warnings,
+                        )
+                    d["context"] = ctx
+                if "retirement_condition" in changes:
+                    ctx = d.get("context", {})
+                    rc = changes["retirement_condition"]
+                    if rc is None or rc == "":
+                        # Clear retirement_condition
+                        ctx.pop("retirement_condition", None)
+                    else:
+                        ctx["retirement_condition"] = _cap_str(
+                            rc,
+                            _DIR_FIELD_MAX,
+                            "changes.retirement_condition",
+                            warnings,
+                        )
+                    d["context"] = ctx
                 if rationale:
                     notes = d.get("notes", [])
                     notes.append(
@@ -3623,6 +3703,42 @@ async def strategic_operation(
         return _resp(
             {"status": "ok", "op": "set_evidence_progress", "count": len(cleaned_ep)}
         )
+
+    elif payload.op == "cite_memos":
+        # Store the memo task_ids the thinker cited in its analysis.
+        # The completion handler reads this to count memos_cited reliably —
+        # the previous text-scan approach always returned 0 because it scanned
+        # the status message (a mechanical template) rather than the thinker prose.
+        # data must be {"cited_memo_ids": [<uuid-string>, ...]}.
+        if not isinstance(data, dict) or not isinstance(
+            data.get("cited_memo_ids"), list
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail='cite_memos: data must be {"cited_memo_ids": [...]}',
+            )
+        raw_ids = data["cited_memo_ids"]
+        cited_ids = [
+            str(i).strip()[:64]
+            for i in raw_ids
+            if isinstance(i, str) and str(i).strip()
+        ]
+        ctx = task.context or {}
+        # NOTE: deliberately do NOT set _strategic_api_called here. cite_memos
+        # is auto-invoked by the thinker pass whenever memos exist (before the
+        # executor runs), so flagging api-usage would mask a no-op/broken
+        # executor cycle as a success and suppress the failure circuit-breaker.
+        task.context = {
+            **ctx,
+            "_strategic_cited_memo_ids": cited_ids,
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            f"[STRATEGIC API] Stored {len(cited_ids)} cited memo id(s) for task {task.id}"
+        )
+        return _resp({"status": "ok", "op": "cite_memos", "count": len(cited_ids)})
 
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")

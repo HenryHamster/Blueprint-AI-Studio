@@ -1222,6 +1222,58 @@ def get_all_account_health_summaries(
     return results
 
 
+def account_in_rate_limit_cooldown(account_id: str | None) -> bool:
+    """Return True if the given account has any model currently in rate-limit cooldown.
+
+    Reads the in-memory pool state (_account_by_id). Returns False when the
+    account is unresolvable (pool empty, standalone test path, no account
+    assigned). Safe to call from synchronous contexts — individual dict reads
+    are atomic in CPython and do not require the async lock.
+    """
+    if not account_id:
+        return False
+    acct = _account_by_id.get(str(account_id))
+    if not acct:
+        return False
+    dm = acct.get("disabled_models") or {}
+    if not dm:
+        return False
+    now = _utcnow()
+    for info in dm.values():
+        at_dt = info.get("at")
+        if at_dt is None:
+            continue
+        if (now - at_dt).total_seconds() < _cooldown_seconds_for_info(info):
+            return True
+    return False
+
+
+def pool_wide_rate_limit_cooldown(at_time: datetime | None = None) -> bool:
+    """Return True if every account in the pool is in rate-limit cooldown.
+
+    Fires when NO account is healthy or probing and at least one account has an
+    active rate-limit entry. Returns False when the pool is empty (no accounts
+    configured) or when any account is healthy/probing. Safe to call from
+    synchronous contexts — individual dict reads are atomic in CPython.
+    """
+    accts = _all_accounts()
+    if not accts:
+        return False
+    now = at_time if at_time is not None else _utcnow()
+    for acct in accts:
+        if _account_state_for_model(acct, None, now=now) in ("healthy", "probing"):
+            return False
+    # All accounts unavailable — confirm at least one has an active rate-limit entry.
+    for acct in accts:
+        for info in (acct.get("disabled_models") or {}).values():
+            at_dt = info.get("at")
+            if at_dt is not None and (
+                now - at_dt
+            ).total_seconds() < _cooldown_seconds_for_info(info):
+                return True
+    return False
+
+
 def describe_pool_blockage(model: str | None, user_id: str | None = None) -> str:
     """Human-readable description of why no account can pick up a task.
     Used by reaper queued-age alerts to distinguish rate-limit cooldown from
@@ -1438,7 +1490,7 @@ async def select_max_plan_account_balanced(
                         pool_median = sorted(sampled)[len(sampled) // 2]
                         preferred = [
                             c
-                            for c, r in zip(candidates_healthy, rates)
+                            for c, r in zip(candidates_healthy, rates, strict=False)
                             if r is None
                             or r >= pool_median - _SUCCESS_RATE_DEPRIORITIZE_MARGIN
                         ]
@@ -1988,6 +2040,49 @@ async def disable_account_model(
                 _pending_rl_persists.append(acct_id)
 
 
+async def disable_account_for_auth(acct_id: str, reason: str) -> bool:
+    """Hard-disable an account after a NON-recoverable auth failure.
+
+    Unlike a rate-limit cooldown (disable_account_model), this does NOT
+    auto-recover: the failure (e.g. Anthropic ``oauth_org_not_allowed`` — the
+    org has disabled OAuth for Claude Code, or expired/revoked credentials)
+    persists until an operator re-authenticates / re-enables OAuth and manually
+    re-enables the account. We leave ``disabled_at`` unset so
+    recheck_disabled_accounts() skips it (its cooldown re-enable keys on
+    disabled_at), keeping the account out of selection indefinitely. Persisting
+    ``enabled=False`` is what stops further tasks from selecting it and burning
+    VM hours on a credential that will only 4xx again.
+
+    Returns True if the account was newly disabled, False if it was already
+    disabled or unknown. Acquires _max_plan_pool_lock.
+    """
+    if not acct_id:
+        return False
+    async with _max_plan_pool_lock:
+        acct = _account_by_id.get(acct_id)
+        if acct is None or not acct.get("enabled", True):
+            return False
+        acct["enabled"] = False
+        # Intentionally NOT setting disabled_at — that flag drives the
+        # cooldown-based auto-re-enable in recheck_disabled_accounts(), which
+        # must not fire for a non-recoverable auth failure.
+        acct["disabled_at"] = None
+        acct["disabled_reason"] = reason
+        _pending_cap_persists.add(acct_id)
+        logger.warning(
+            f"[POOL] Account {acct['name']} HARD-DISABLED (non-recoverable auth): {reason}"
+        )
+        try:
+            await _persist_rate_limit_state(acct_id)
+        except SQLAlchemyError as e:
+            logger.warning(
+                f"[POOL] Failed to persist auth-disable for {acct_id}: {e} — queued for retry"
+            )
+            if acct_id not in _pending_rl_persists:
+                _pending_rl_persists.append(acct_id)
+        return True
+
+
 async def clear_rate_limit_state_on_success(acct_id: str, model: str) -> bool:
     """Clear cascade-scoped disabled_models entries after a successful task.
 
@@ -2152,7 +2247,7 @@ async def scan_account_model_regressions(session) -> list[dict[str, Any]]:
     Tolerant on errors: a DB failure inside the regression query is logged
     and returns an empty list rather than poisoning the calling reaper loop.
     """
-    from app.account_model_regression import find_account_model_regressions  # noqa: PLC0415
+    from app.account_model_regression import find_account_model_regressions
 
     async with _max_plan_pool_lock:
         account_ids = list(_account_by_id.keys())

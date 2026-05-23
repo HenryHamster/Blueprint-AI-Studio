@@ -916,7 +916,11 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
 
         # Capture before cancellation — cancellation overwrites both
         child_extra_logs = (child.context or {}).get("last_error", "")
-        failure_class = classify_failure(child, logs=child_extra_logs or None)
+        failure_class = classify_failure(
+            child,
+            logs=child_extra_logs or None,
+            at_time=child.vm_stopped_at or child.last_heartbeat,
+        )
         original_status_message = child.latest_status_message
 
         # BLOCKED_PRECONDITION: agent surfaced a "BLOCKER:" message and paused
@@ -4137,6 +4141,21 @@ async def _process_post_commit(
                         fix_prompt_text = f"{disagreement_hint}A code review requested changes. Address the following issues:{structured}{ci_errors_text}"
                     else:
                         fix_prompt_text = f"{disagreement_hint}A code review requested changes. Please address the following feedback:\n\n{feedback}{ci_errors_text}"
+                    # First-pass minor-only verdict: when every blocking finding
+                    # from the initial review is minor-severity, the spawned fix
+                    # only addresses nits. Mark the fix so its completion handler
+                    # skips the follow-up re-review (CI gates the merge instead),
+                    # saving one review iteration + one review-phase LLM call.
+                    review_iteration = review_loop.get("iteration", 1)
+                    first_attempt_minor_only = (
+                        review_iteration == 1
+                        and bool(issues)
+                        and all(
+                            (i.get("severity", "minor") or "minor").lower() == "minor"
+                            for i in issues
+                            if i.get("description")
+                        )
+                    )
                     fix_task, _ = await _spawn_pipeline_task(
                         task,
                         "fix",
@@ -4150,6 +4169,7 @@ async def _process_post_commit(
                         current_feedback=feedback,
                         current_issues=issues,
                         investigated_files=investigated_files,
+                        skip_rereview_minor_only=first_attempt_minor_only,
                     )
                     if fix_task:
                         logger.info(
@@ -4270,7 +4290,6 @@ async def _process_post_commit(
                     # on the original task.  Iteration 1 → _first_attempt_rejection_categories
                     # (existing field); all iterations → _all_iterations_rejection_categories
                     # (accumulated superset used by all-iterations catch-rate metric).
-                    review_iteration = review_loop.get("iteration", 1)
                     if issues and original_task_id:
                         try:
                             from app.playbook_learning import (
@@ -4308,20 +4327,11 @@ async def _process_post_commit(
                                     }
                                     if rejection_cats:
                                         if review_iteration == 1:
-                                            minor_only = all(
-                                                (
-                                                    i.get("severity", "minor")
-                                                    or "minor"
-                                                ).lower()
-                                                == "minor"
-                                                for i in issues
-                                                if i.get("description")
-                                            )
                                             task_ctx[
                                                 "_first_attempt_rejection_categories"
                                             ] = rejection_cats
                                             task_ctx["_first_attempt_minor_only"] = (
-                                                minor_only
+                                                first_attempt_minor_only
                                             )
                                         existing_all = dict(
                                             task_ctx.get(
@@ -4459,6 +4469,13 @@ async def _process_post_commit(
                     await session.commit()
 
                 fix_reason = review_loop.get("fix_reason", "code_review")
+                # First-pass minor-only fix: the initial review flagged only
+                # minor nits, so this fix carries skip_rereview_minor_only (set
+                # at spawn time in _spawn_pipeline_task). It skips the re-review
+                # the same way ci_failure/merge_conflict fixes do.
+                skip_rereview_minor_only = bool(
+                    review_loop.get("skip_rereview_minor_only")
+                )
                 # Skip re-review for fixes whose origin doesn't add review-worthy
                 # logic on top of an already-decided merge gate:
                 #   - ci_failure  → original review already approved code; CI is
@@ -4468,7 +4485,14 @@ async def _process_post_commit(
                 #                   intermediate); rebase output is mechanical;
                 #                   re-reviewing would be inconsistent with the
                 #                   no-conflict happy path. Wait for CI then merge.
-                if not scan_blocked and fix_reason in ("ci_failure", "merge_conflict"):
+                #   - minor-only first-pass verdict → the fix only addressed
+                #                   minor nits; a re-review would near-certainly
+                #                   approve, so spend CI as the only gate.
+                skip_rereview = (
+                    fix_reason in ("ci_failure", "merge_conflict")
+                    or skip_rereview_minor_only
+                )
+                if not scan_blocked and skip_rereview:
                     from app import pause_clock
 
                     ci_loop = review_loop.copy()
@@ -4481,16 +4505,22 @@ async def _process_post_commit(
                     ci_loop["ci_poll_interval"] = 10
                     task.status = TaskStatus.EVALUATING
                     task.context = {**(task.context or {}), "review_loop": ci_loop}
-                    label = (
-                        "CI-only fix"
-                        if fix_reason == "ci_failure"
-                        else "merge-conflict fix"
+                    if fix_reason == "ci_failure":
+                        label = "CI-only fix"
+                    elif fix_reason == "merge_conflict":
+                        label = "merge-conflict fix"
+                    else:
+                        label = "minor-nit fix"
+                    skip_detail = (
+                        fix_reason
+                        if fix_reason in ("ci_failure", "merge_conflict")
+                        else "minor_only"
                     )
-                    task.latest_status_message = f"{label} applied for PR #{pr_number} — waiting for CI (review skipped: {fix_reason})"
+                    task.latest_status_message = f"{label} applied for PR #{pr_number} — waiting for CI (review skipped: {skip_detail})"
                     session.add(task)
                     await session.commit()
                     logger.info(
-                        f"[REVIEW PIPELINE] {label} for PR #{pr_number} (fix_reason={fix_reason}) — skipping re-review, waiting for CI"
+                        f"[REVIEW PIPELINE] {label} for PR #{pr_number} (skip reason={skip_detail}) — skipping re-review, waiting for CI"
                     )
                 elif not scan_blocked:
                     review_task, _ = await _spawn_pipeline_task(

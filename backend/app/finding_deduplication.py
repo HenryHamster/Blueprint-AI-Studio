@@ -130,6 +130,15 @@ def build_dedup_state(
 ) -> tuple[set[str], dict[str, object], dict[str, Task]]:
     """Build hash-dedup state from a list of recent tasks.
 
+    ``failed_parent_ids`` is the "stranded parent" set: parent task IDs whose
+    rollup code is confirmed NOT on the integration branch.  It covers:
+      * parents that FAILED or CANCELLED (rollup never landed),
+      * parents that COMPLETED without ``pr_merged`` (rollup PR closed/
+        superseded without merging), and
+      * non-terminal parents (EVALUATING/QUEUED/IN_PROGRESS/PROVISIONING)
+        where a git-ancestry check definitively confirmed the rollup merge
+        commit is not reachable from the integration branch.
+
     Returns ``(recent_finding_hashes, failed_hashes, prior_failure_by_hash)``:
       * ``recent_finding_hashes``: set of finding_hash values that should block
         a new spawn. Excludes ghost merges, infra failures, and CODE_ERROR
