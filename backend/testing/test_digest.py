@@ -22,6 +22,8 @@ from app.digest_metrics import (
     _compute_symptom_layers_by_class,
     _stash_projected_task_fields,
     _summarize_symptoms_by_layer,
+    compute_digest_trend_history,
+    compute_failure_grouping,
 )
 from app.sr_blind_spots import aggregate_sr_reviewer_disagreements
 from testing.factories import make_project, make_task, make_membership, _utcnow
@@ -16567,3 +16569,292 @@ async def test_list_qualification_verdicts_requires_auth(
         f"/api/admin/projects/{fake_id}/qualification-verdicts"
     )
     assert response.status_code in (401, 403)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for compute_failure_grouping (pure function, no DB required)
+# ---------------------------------------------------------------------------
+
+
+def _make_failed_task(**kwargs):
+    """Minimal failed Task object for compute_failure_grouping unit tests."""
+    return make_task(status=TaskStatus.FAILED, **kwargs)
+
+
+def test_compute_failure_grouping_empty():
+    """Empty failed-task list returns zeroed-out structure."""
+    now = _utcnow()
+    result = compute_failure_grouping(
+        failed_tasks=[],
+        error_log_map={},
+        dir_id_to_text={},
+        window_start=now - timedelta(hours=24),
+        now=now,
+    )
+    assert result["failure_groups"] == []
+    assert result["cost_by_failure_class"] == {}
+    assert result["total_failed_cost_usd"] == 0.0
+    assert result["provision_waste_cost_usd"] == 0.0
+    assert result["failure_stage_counts"] == {}
+    assert result["analysis_overflow_summary"]["total_count"] == 0
+    assert result["provision_waste_by_direction"] == []
+
+
+def test_compute_failure_grouping_rate_limit_class():
+    """Task with a rate-limit error message is placed in the RATE_LIMIT failure group."""
+    now = _utcnow()
+    task = _make_failed_task(
+        title="Rate Limited Task",
+        latest_status_message="API Error: Rate limit reached",
+    )
+    result = compute_failure_grouping(
+        failed_tasks=[task],
+        error_log_map={str(task.id): "API Error: Rate limit reached"},
+        dir_id_to_text={},
+        window_start=now - timedelta(hours=24),
+        now=now,
+    )
+    classes = {g["failure_class"] for g in result["failure_groups"]}
+    assert "RATE_LIMIT" in classes
+    rate_group = next(
+        g for g in result["failure_groups"] if g["failure_class"] == "RATE_LIMIT"
+    )
+    assert rate_group["count"] == 1
+    assert rate_group["tasks"][0]["title"] == "Rate Limited Task"
+    assert rate_group["label"] == "Rate Limit"
+
+
+def test_compute_failure_grouping_provision_failure_waste():
+    """PROVISION_FAILURE tasks contribute to provision_waste_cost_usd."""
+    now = _utcnow()
+    prov_at = now - timedelta(hours=1)
+    stop_at = now - timedelta(minutes=30)
+    task = _make_failed_task(
+        title="Quota Exceeded Task",
+        latest_status_message="CPUS_ALL_REGIONS quota exceeded for region us-central1",
+        vm_provisioned_at=prov_at,
+        vm_stopped_at=stop_at,
+        vm_spot=False,
+    )
+    result = compute_failure_grouping(
+        failed_tasks=[task],
+        error_log_map={},
+        dir_id_to_text={},
+        window_start=now - timedelta(hours=24),
+        now=now,
+    )
+    assert result["provision_waste_cost_usd"] > 0.0
+    assert "PROVISION_FAILURE" in result["cost_by_failure_class"]
+    assert result["provision_waste_cost_usd"] == pytest.approx(
+        result["cost_by_failure_class"]["PROVISION_FAILURE"]
+    )
+
+
+def test_compute_failure_grouping_sorted_by_count_descending():
+    """failure_groups are sorted by count descending."""
+    now = _utcnow()
+    tasks = [
+        _make_failed_task(
+            title=f"Code Error {i}",
+            latest_status_message="TypeError: something broke",
+        )
+        for i in range(3)
+    ] + [
+        _make_failed_task(
+            title="Rate Task",
+            latest_status_message="API Error: Rate limit reached",
+        )
+    ]
+    result = compute_failure_grouping(
+        failed_tasks=tasks,
+        error_log_map={str(t.id): t.latest_status_message for t in tasks},
+        dir_id_to_text={},
+        window_start=now - timedelta(hours=24),
+        now=now,
+    )
+    counts = [g["count"] for g in result["failure_groups"]]
+    assert counts == sorted(counts, reverse=True)
+    assert result["failure_groups"][0]["count"] >= 3
+
+
+def test_compute_failure_grouping_provision_waste_by_direction():
+    """provision_waste_by_direction groups PROVISION_FAILURE cost by direction_id."""
+    import uuid
+
+    now = _utcnow()
+    dir_id = str(uuid.uuid4())
+    prov_at = now - timedelta(hours=1)
+    stop_at = now - timedelta(minutes=30)
+    task = _make_failed_task(
+        title="Provision Fail",
+        latest_status_message="CPUS_ALL_REGIONS quota exceeded for region us-central1",
+        vm_provisioned_at=prov_at,
+        vm_stopped_at=stop_at,
+        vm_spot=False,
+        context={"direction_id": dir_id},
+    )
+    result = compute_failure_grouping(
+        failed_tasks=[task],
+        error_log_map={},
+        dir_id_to_text={dir_id: "My Direction"},
+        window_start=now - timedelta(hours=24),
+        now=now,
+    )
+    breakdown = result["provision_waste_by_direction"]
+    assert len(breakdown) == 1
+    assert breakdown[0]["direction_id"] == dir_id
+    assert breakdown[0]["direction_text"] == "My Direction"
+    assert breakdown[0]["provision_cost_usd"] > 0.0
+    assert breakdown[0]["provision_task_count"] == 1
+
+
+def test_compute_failure_grouping_analysis_overflow_summary():
+    """Tasks with scope_gate_triggered='analysis_overflow' appear in analysis_overflow_summary."""
+    now = _utcnow()
+    prov_at = now - timedelta(minutes=20)
+    stop_at = now - timedelta(minutes=10)
+    task = _make_failed_task(
+        title="Overflow Task",
+        context={"scope_gate_triggered": "analysis_overflow", "scope": "medium"},
+        vm_provisioned_at=prov_at,
+        vm_stopped_at=stop_at,
+        vm_spot=True,
+    )
+    result = compute_failure_grouping(
+        failed_tasks=[task],
+        error_log_map={},
+        dir_id_to_text={},
+        window_start=now - timedelta(hours=24),
+        now=now,
+    )
+    summary = result["analysis_overflow_summary"]
+    assert summary["total_count"] == 1
+    assert summary["by_scope"].get("medium") == 1
+    assert summary["cost_usd"] > 0.0
+
+
+def test_compute_failure_grouping_task_entry_fields():
+    """Each task entry in failure_groups contains the expected keys."""
+    now = _utcnow()
+    task = _make_failed_task(
+        title="Code Error Task",
+        latest_status_message="TypeError: cannot read property",
+        attempt_count=2,
+    )
+    result = compute_failure_grouping(
+        failed_tasks=[task],
+        error_log_map={str(task.id): "TypeError: cannot read property"},
+        dir_id_to_text={},
+        window_start=now - timedelta(hours=24),
+        now=now,
+    )
+    assert len(result["failure_groups"]) == 1
+    entry = result["failure_groups"][0]["tasks"][0]
+    assert entry["task_id"] == str(task.id)
+    assert entry["title"] == "Code Error Task"
+    assert entry["attempt_count"] == 2
+    assert entry["error_snippet"] == "TypeError: cannot read property"
+    assert "taxonomy" in entry
+    assert "timeout_subtype" in entry
+    assert entry["timeout_subtype"] is None  # not AGENT_TIMEOUT
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for compute_digest_trend_history (pure function, no DB required)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_digest_trend_history_length():
+    """Returns exactly 7 entries regardless of task list."""
+    now = _utcnow()
+    result = compute_digest_trend_history(all_tasks=[], hours=24, now=now)
+    assert len(result) == 7
+
+
+def test_compute_digest_trend_history_entry_keys():
+    """Each entry contains the expected keys."""
+    now = _utcnow()
+    result = compute_digest_trend_history(all_tasks=[], hours=24, now=now)
+    for entry in result:
+        assert "period_end" in entry
+        assert "success_rate" in entry
+        assert "completed" in entry
+        assert "failed" in entry
+        assert "failed_by_class" in entry
+        assert "failed_by_taxonomy" in entry
+        assert "period_cost_usd" in entry
+        assert "first_attempt_success_rate" in entry
+        assert "first_attempt_sample_size" in entry
+
+
+def test_compute_digest_trend_history_empty_tasks():
+    """With no tasks all counts are 0 and rates are None."""
+    now = _utcnow()
+    result = compute_digest_trend_history(all_tasks=[], hours=24, now=now)
+    for entry in result:
+        assert entry["completed"] == 0
+        assert entry["failed"] == 0
+        assert entry["success_rate"] is None
+        assert entry["first_attempt_success_rate"] is None
+        assert entry["first_attempt_sample_size"] == 0
+
+
+def test_compute_digest_trend_history_completed_task_in_last_period():
+    """A COMPLETED task in the most recent period appears in the last entry."""
+    now = _utcnow()
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=1),
+    )
+    result = compute_digest_trend_history(all_tasks=[task], hours=24, now=now)
+    last = result[-1]
+    assert last["completed"] == 1
+    assert last["failed"] == 0
+    assert last["success_rate"] == 1.0
+
+
+def test_compute_digest_trend_history_failed_task_classified():
+    """A FAILED task is reflected in failed_by_class for the correct period."""
+    now = _utcnow()
+    task = make_task(
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        latest_status_message="API Error: Rate limit reached",
+        created_at=now - timedelta(hours=1),
+    )
+    result = compute_digest_trend_history(all_tasks=[task], hours=24, now=now)
+    last = result[-1]
+    assert last["failed"] == 1
+    assert last["success_rate"] == 0.0
+    assert isinstance(last["failed_by_class"], dict)
+    assert isinstance(last["failed_by_taxonomy"], dict)
+
+
+def test_compute_digest_trend_history_oldest_first():
+    """Entries are in ascending chronological order (period_end increases)."""
+    now = _utcnow()
+    result = compute_digest_trend_history(all_tasks=[], hours=24, now=now)
+    period_ends = [entry["period_end"] for entry in result]
+    assert period_ends == sorted(period_ends)
+
+
+def test_compute_digest_trend_history_first_attempt_rate():
+    """first_attempt_success_rate reflects _first_attempt_succeeded context flag."""
+    now = _utcnow()
+    t_pass = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"_first_attempt_succeeded": True},
+        created_at=now - timedelta(hours=1),
+    )
+    t_fail = make_task(
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"_first_attempt_succeeded": False},
+        created_at=now - timedelta(hours=1),
+    )
+    result = compute_digest_trend_history(all_tasks=[t_pass, t_fail], hours=24, now=now)
+    last = result[-1]
+    assert last["first_attempt_sample_size"] == 2
+    assert last["first_attempt_success_rate"] == 0.5

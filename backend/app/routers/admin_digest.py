@@ -94,6 +94,8 @@ from app.digest_metrics import (
     _summarize_symptoms_by_layer,
     _task_prompt_fingerprint,
     compute_cross_layer_compliance,
+    compute_digest_trend_history,  # noqa: F401  re-exported for external importers
+    compute_failure_grouping,  # noqa: F401  re-exported for external importers
 )
 
 logger = logging.getLogger(__name__)
@@ -3812,135 +3814,27 @@ async def _compute_digest(
 
     # --- failure_groups (classify failures by type) ---
     from app.failure_classification import (
-        classify_failure as _classify_failure,
         classify_failure_taxonomy as _classify_taxonomy,
         TAXONOMY_REVIEW_QUALITY,
         TAXONOMY_SCOPE_RELATED,
         TAXONOMY_CODE_DEFECT,
         TAXONOMY_INFRA_RELATED,
     )
-    from app.failure_stage import _derive_failure_stage
 
-    _failure_class_labels = {
-        "CODE_ERROR": "Code Error",
-        "PROVISION_FAILURE": "Provision Failure",
-        "AGENT_TIMEOUT": "Agent Timeout",
-        "EXTERNAL_API": "External API",
-        "RATE_LIMIT": "Rate Limit",
-        "SCOPE_OVERFLOW": "Scope Overflow",
-    }
-    _failure_class_groups: Dict[str, List[Dict[str, Any]]] = {}
-    _failure_stage_counts: Dict[str, int] = {}
-    _cost_by_failure_class: Dict[str, float] = {}
-    _provision_waste_cost = 0.0
-    _provision_waste_by_dir: Dict[str, Dict[str, Any]] = {}
-    for t in failed_tasks:
-        tid = str(t.id)
-        cls = _classify_failure(t, error_log_map.get(tid))
-        _task_cost = 0.0
-        if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start:
-            _rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-            _task_cost = _rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
-            _cost_by_failure_class[cls] = (
-                _cost_by_failure_class.get(cls, 0.0) + _task_cost
-            )
-        if cls == "PROVISION_FAILURE":
-            _provision_waste_cost += _task_cost
-            _pw_did = (t.context or {}).get("direction_id")
-            if _pw_did:
-                _pw_key = str(_pw_did)
-                _pw_entry = _provision_waste_by_dir.setdefault(
-                    _pw_key,
-                    {
-                        "direction_id": _pw_key,
-                        "direction_text": dir_id_to_text.get(_pw_key, ""),
-                        "provision_cost_usd": 0.0,
-                        "provision_task_count": 0,
-                    },
-                )
-                _pw_entry["provision_cost_usd"] += _task_cost
-                _pw_entry["provision_task_count"] += 1
-        waiting_since = _derive_completed_at(t)
-        waiting_hours = (
-            round((_now - waiting_since).total_seconds() / 3600)
-            if waiting_since
-            else None
-        )
-        t_dir_id = (t.context or {}).get("direction_id")
-        t_dir_text = dir_id_to_text.get(str(t_dir_id)) if t_dir_id else None
-        _stage = (t.context or {}).get("_previous_failure_stage")
-        if not _stage:
-            _stage = _derive_failure_stage(
-                cls, t.latest_status_message or error_log_map.get(tid) or ""
-            )
-        if _stage:
-            _failure_stage_counts[_stage] = _failure_stage_counts.get(_stage, 0) + 1
-        _failure_class_groups.setdefault(cls, []).append(
-            {
-                "task_id": tid,
-                "title": t.title or "Failed task",
-                "error_snippet": error_log_map.get(tid),
-                "attempt_count": t.attempt_count,
-                "waiting_hours": waiting_hours,
-                "taxonomy": _classify_taxonomy(t),
-                "timeout_subtype": _classify_timeout_subtype(t, error_log_map.get(tid))
-                if cls == _AGENT_TIMEOUT
-                else None,
-                "direction_id": t_dir_id,
-                "direction_text": t_dir_text,
-                "failure_stage": _stage,
-            }
-        )
-    failure_groups = sorted(
-        [
-            {
-                "failure_class": cls,
-                "label": _failure_class_labels.get(cls, cls),
-                "count": len(tasks),
-                "tasks": tasks,
-            }
-            for cls, tasks in _failure_class_groups.items()
-        ],
-        key=lambda x: x["count"],
-        reverse=True,
+    _fg = compute_failure_grouping(
+        failed_tasks=failed_tasks,
+        error_log_map=error_log_map,
+        dir_id_to_text=dir_id_to_text,
+        window_start=window_start,
+        now=_now,
     )
-    cost_by_failure_class = {k: round(v, 4) for k, v in _cost_by_failure_class.items()}
-    total_failed_cost_usd = round(sum(_cost_by_failure_class.values()), 4)
-    provision_waste_cost_usd = round(_provision_waste_cost, 4)
-
-    _analysis_overflow_count = 0
-    _analysis_overflow_cost = 0.0
-    _analysis_overflow_by_scope: Dict[str, int] = {}
-    for t in failed_tasks:
-        _ctx = t.context or {}
-        if _ctx.get("scope_gate_triggered") == "analysis_overflow":
-            _analysis_overflow_count += 1
-            _scope = _ctx.get("scope") or "unknown"
-            _analysis_overflow_by_scope[_scope] = (
-                _analysis_overflow_by_scope.get(_scope, 0) + 1
-            )
-            if (
-                t.vm_provisioned_at
-                and t.vm_stopped_at
-                and t.vm_stopped_at >= window_start
-            ):
-                _rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-                _analysis_overflow_cost += (
-                    _rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
-                )
-    analysis_overflow_summary = {
-        "total_count": _analysis_overflow_count,
-        "by_scope": _analysis_overflow_by_scope,
-        "cost_usd": round(_analysis_overflow_cost, 4),
-    }
-    provision_waste_by_direction = sorted(
-        [
-            {**e, "provision_cost_usd": round(e["provision_cost_usd"], 4)}
-            for e in _provision_waste_by_dir.values()
-        ],
-        key=lambda x: x["provision_cost_usd"],
-        reverse=True,
-    )[:5]
+    failure_groups = _fg["failure_groups"]
+    cost_by_failure_class = _fg["cost_by_failure_class"]
+    total_failed_cost_usd = _fg["total_failed_cost_usd"]
+    provision_waste_cost_usd = _fg["provision_waste_cost_usd"]
+    _failure_stage_counts = _fg["failure_stage_counts"]
+    analysis_overflow_summary = _fg["analysis_overflow_summary"]
+    provision_waste_by_direction = _fg["provision_waste_by_direction"]
 
     _retry_overhead_cost = 0.0
     _retry_task_count = 0
@@ -4193,77 +4087,11 @@ async def _compute_digest(
         trend = None
 
     # Compute trend history: 7 periods (6 previous + current), oldest first
-    _now = _utcnow()
-    trend_history = []
-    for _i in range(7):
-        _p_start = _now - timedelta(hours=hours * (7 - _i))
-        _p_end = _now - timedelta(hours=hours * (6 - _i))
-        _p_completed = sum(
-            1
-            for t in all_tasks
-            if t.status == TaskStatus.COMPLETED
-            and _p_start <= _derive_completed_at(t) < _p_end
-        )
-        _p_failed_tasks = [
-            t
-            for t in all_tasks
-            if t.status == TaskStatus.FAILED
-            and _p_start <= _derive_completed_at(t) < _p_end
-        ]
-        _p_failed = len(_p_failed_tasks)
-        _p_by_class: dict[str, int] = {}
-        _p_by_taxonomy: dict[str, int] = {}
-        for _ft in _p_failed_tasks:
-            _cls = _classify_failure(_ft)
-            _p_by_class[_cls] = _p_by_class.get(_cls, 0) + 1
-            _tax = _classify_taxonomy(_ft)
-            _p_by_taxonomy[_tax] = _p_by_taxonomy.get(_tax, 0) + 1
-        _p_total = _p_completed + _p_failed
-        _p_cost = sum(
-            ((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE)
-            * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
-            for t in all_tasks
-            if t.vm_provisioned_at
-            and t.vm_stopped_at
-            and _p_start <= t.vm_stopped_at < _p_end
-        )
-        _p_terminal = [
-            t
-            for t in all_tasks
-            if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
-            and _p_start <= _derive_completed_at(t) < _p_end
-        ]
-        _p_measured = [
-            t for t in _p_terminal if "_first_attempt_succeeded" in (t.context or {})
-        ]
-        _p_fa_rate = (
-            round(
-                sum(
-                    1
-                    for t in _p_measured
-                    if (t.context or {}).get("_first_attempt_succeeded")
-                )
-                / len(_p_measured),
-                2,
-            )
-            if _p_measured
-            else None
-        )
-        trend_history.append(
-            {
-                "period_end": _p_end.isoformat(),
-                "success_rate": round(_p_completed / _p_total, 2)
-                if _p_total > 0
-                else None,
-                "completed": _p_completed,
-                "failed": _p_failed,
-                "failed_by_class": _p_by_class,
-                "failed_by_taxonomy": _p_by_taxonomy,
-                "period_cost_usd": round(_p_cost, 4),
-                "first_attempt_success_rate": _p_fa_rate,
-                "first_attempt_sample_size": len(_p_measured),
-            }
-        )
+    trend_history = compute_digest_trend_history(
+        all_tasks=all_tasks,
+        hours=hours,
+        now=_now,
+    )
 
     # Action-first narrative: executives want "what do I need to do?" before "how did things go?"
     narrative_parts = []
