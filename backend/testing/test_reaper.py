@@ -4201,6 +4201,35 @@ async def test_step9_calcification_alert_not_fired_for_dry_run_hold(
     assert len(alerts) == 0
 
 
+@pytest.mark.asyncio
+async def test_step9_sweep_scan_error_blocks_liveness_counter(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """A scan-level failure in the Step 9 qualification sweep (e.g. DB error
+    on the initial open-versions query) must NOT advance the reaper liveness
+    counter.  The sweep re-raises scan-level errors so the outer
+    consecutive_errors handler engages — unlike per-version finalize crashes,
+    which are swallowed inside sweep_stuck_qualifications."""
+    import app.reaper as _reaper_mod
+    from app import release_qualifier as _rq
+
+    _reaper_mod._reaper_cycles_completed_count = 0
+    _reaper_mod._reaper_last_cycle_completed_at = None
+
+    mocker.patch.object(
+        _rq,
+        "sweep_stuck_qualifications",
+        new=AsyncMock(side_effect=RuntimeError("simulated scan-level DB failure")),
+    )
+
+    await _run_reaper_once()
+
+    # Cycle FAILED — liveness counter must NOT have advanced.
+    stats = _reaper_mod.get_reaper_stats()
+    assert stats["cycles_completed_total"] == 0
+    assert stats["last_cycle_age_seconds"] == -1
+
+
 # ── Step 7: stalled-cycle reaper + linked task reconciliation ────────────────
 
 

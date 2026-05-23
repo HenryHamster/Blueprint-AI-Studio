@@ -222,6 +222,12 @@ _MIN_CALCIFICATION_ATTEMPTS = 3
 # strongly suggest the qualifier pipeline itself (agent VM / clone) is broken.
 _MIN_INFRA_ERROR_STREAK = 3
 
+# Consecutive sweep-finalize crashes before force-finalizing the pending
+# qualification and raising an operator alert.  Mirrors _MIN_INFRA_ERROR_STREAK:
+# three consecutive crashes strongly suggest a persistent bug in the finalize
+# path rather than a transient error, and the loop must self-recover.
+_MAX_SWEEP_CRASH_STREAK = 3
+
 # Build-phase calcification thresholds — the backstop for the OTHER end of the
 # lifecycle from _check_version_calcification.  build→stabilize is entirely
 # agent-driven (the strategic agent must emit a version_phase_decision); there
@@ -2819,6 +2825,75 @@ async def _force_finalize_timed_out_qualification(
     )
 
 
+async def _force_finalize_sweep_crash_loop(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    streak: int,
+) -> None:
+    """Force-finalize a qualification whose sweep finalize has crash-looped.
+
+    Called when _finalize_in_dedicated_session has raised on every consecutive
+    sweep attempt for this version (_MAX_SWEEP_CRASH_STREAK times).  Records
+    last_qualification.status='not_promoted' with
+    blocker='sweep_finalize_crash_loop', resets the version to stabilize phase,
+    raises an Alert, and notifies the operator.  The caller commits the session.
+    """
+    qual = dict(version.last_qualification or {})
+    record = {
+        **qual,
+        "status": "not_promoted",
+        "blocker": "sweep_finalize_crash_loop",
+        "detail": (
+            f"sweep finalize raised on {streak} consecutive sweep(s) — "
+            "force-finalized to unblock the qualification loop"
+        ),
+        "finalized_at": _utcnow().isoformat(),
+        "sweep_crash_streak": 0,
+    }
+    version.last_qualification = record
+    flag_modified(version, "last_qualification")
+    release_version.set_version_phase(
+        version,
+        "stabilize",
+        reasoning=(
+            f"qualification v{version.version_number} sweep crash-looped "
+            f"({streak} consecutive finalize errors) — returning to stabilize"
+        ),
+    )
+    session.add(version)
+    session.add(
+        Alert(
+            project_id=version.project_id,
+            severity=AlertSeverity.WARNING,
+            title=f"Release qualification v{version.version_number} sweep crash-loop",
+            message=(
+                f"The qualification sweep for release v{version.version_number} "
+                f"has raised {streak} consecutive finalize errors. "
+                f"Force-finalized as sweep_finalize_crash_loop; the version "
+                f"returns to the stabilize phase. Inspect the release_qualifier "
+                f"logs for the root cause."
+            ),
+        )
+    )
+    await _notify_operator(
+        session,
+        version,
+        "release_qualification_crash_loop",
+        (
+            f"v{version.version_number} qualification sweep crash-looped "
+            f"({streak} consecutive finalize errors) — force-finalized, "
+            f"returned to stabilize."
+        ),
+        extra={"consecutive_finalize_errors": streak},
+    )
+    logger.warning(
+        "[RELEASE_QUALIFIER] sweep: version v%d finalize crash-looped "
+        "(%d consecutive errors) — force-finalized as sweep_finalize_crash_loop",
+        version.version_number,
+        streak,
+    )
+
+
 async def _check_version_calcification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -3932,6 +4007,49 @@ async def sweep_stuck_qualifications(
                 "qualification for version %s",
                 version_id,
             )
+            # Track consecutive sweep crashes on this version.  When the streak
+            # reaches _MAX_SWEEP_CRASH_STREAK, force-finalize to unblock the loop
+            # so the same crash cannot recur on every subsequent sweep.
+            _factory = session_factory or AsyncSessionLocal
+            try:
+                async with _factory() as crash_session:
+                    locked_v = (
+                        (
+                            await crash_session.execute(
+                                select(release_version.ReleaseVersion)
+                                .where(release_version.ReleaseVersion.id == version_id)
+                                .with_for_update()
+                            )
+                        )
+                        .scalars()
+                        .first()
+                    )
+                    if (
+                        locked_v is not None
+                        and isinstance(locked_v.last_qualification, dict)
+                        and locked_v.last_qualification.get("status") == "pending"
+                    ):
+                        streak = (
+                            locked_v.last_qualification.get("sweep_crash_streak") or 0
+                        ) + 1
+                        if streak >= _MAX_SWEEP_CRASH_STREAK:
+                            await _force_finalize_sweep_crash_loop(
+                                crash_session, locked_v, streak
+                            )
+                        else:
+                            locked_v.last_qualification = {
+                                **locked_v.last_qualification,
+                                "sweep_crash_streak": streak,
+                            }
+                            flag_modified(locked_v, "last_qualification")
+                            crash_session.add(locked_v)
+                        await crash_session.commit()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] sweep: crash-streak update failed "
+                    "for version %s",
+                    version_id,
+                )
             continue
         if result is not None:
             finalized += 1

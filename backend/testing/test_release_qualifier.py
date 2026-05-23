@@ -4215,6 +4215,110 @@ async def test_sweep_commits_each_version_independently(db_session, mocker):
     assert version_b.last_qualification["status"] == "pending"
 
 
+@pytest.mark.asyncio
+async def test_sweep_finalize_crash_increments_streak(db_session, mocker):
+    """A single finalize crash increments sweep_crash_streak by 1 but does NOT
+    force-finalize — self-recovery fires only after _MAX_SWEEP_CRASH_STREAK
+    consecutive crashes.  The version stays pending and will be retried."""
+    project, version = await _make_project_and_version(db_session)
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+
+    mocker.patch.object(
+        rq,
+        "_finalize_qualification",
+        new=AsyncMock(side_effect=RuntimeError("simulated finalize crash")),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert count == 0  # crash was caught; nothing finalized on this sweep
+
+    await db_session.refresh(version)
+    qual = version.last_qualification
+    assert qual is not None
+    assert qual.get("status") == "pending"  # NOT force-finalized yet
+    assert qual.get("sweep_crash_streak") == 1  # streak incremented once
+
+
+@pytest.mark.asyncio
+async def test_sweep_finalize_crash_loop_force_finalizes_and_alerts(db_session, mocker):
+    """After _MAX_SWEEP_CRASH_STREAK consecutive finalize crashes the sweep
+    force-finalizes the version as not_promoted/sweep_finalize_crash_loop, resets
+    it to the stabilize phase, posts a WARNING Alert, and sends an operator
+    notification — the crash-loop is never invisible to operators."""
+    project, version = await _make_project_and_version(db_session)
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+
+    # Simulate (MAX - 1) prior crashes already recorded.
+    await db_session.refresh(version)
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    version.last_qualification = {
+        **version.last_qualification,
+        "sweep_crash_streak": rq._MAX_SWEEP_CRASH_STREAK - 1,
+    }
+    _flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch.object(
+        rq,
+        "_finalize_qualification",
+        new=AsyncMock(side_effect=RuntimeError("persistent finalize crash")),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    # force-finalize path does not count as a normal finalization
+    assert count == 0
+
+    await db_session.refresh(version)
+    qual = version.last_qualification
+    assert qual is not None
+    assert qual["status"] == "not_promoted"
+    assert qual["blocker"] == "sweep_finalize_crash_loop"
+    assert qual.get("sweep_crash_streak") == 0  # reset after force-finalize
+    assert version.phase == "stabilize"  # returned to stabilize for re-qualification
+
+    # A WARNING Alert must be raised so the crash-loop is visible to operators.
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "crash" in alerts[0].title.lower()
+
+    # An operator ProjectMessage must be posted.
+    messages = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert any("crash" in (m.content or "").lower() for m in messages)
+
+
 # ===========================================================================
 # Round 5 — R4-C1 / R4-H1: promote() idempotency on a crash-retry
 # ===========================================================================

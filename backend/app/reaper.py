@@ -3235,6 +3235,12 @@ async def reaper_service():
                         f"[REAPER] Stuck qualification sweep error: {e}",
                         exc_info=True,
                     )
+                    # Re-raise so the outer consecutive_errors counter engages
+                    # and the liveness timestamp stops advancing.  Per-version
+                    # crashes are swallowed inside the sweep (they get their own
+                    # crash-streak self-recovery path); this re-raise covers
+                    # scan-level failures (e.g. DB error on the initial query).
+                    raise
                 # Step 10: Routine message retention — purge stale routine ops messages.
                 try:
                     _purged = await _purge_stale_routine_messages(session)
