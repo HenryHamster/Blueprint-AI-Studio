@@ -65,6 +65,79 @@ def _review_respawn_count(task: Task) -> int:
         return 0
 
 
+def _extract_rollup_migration_sources(diff: str) -> dict[str, str]:
+    """Reconstruct added/changed Alembic migration file contents from a PR diff.
+
+    Returns a mapping of ``alembic/versions`` file path -> reconstructed source
+    (the post-image, from the diff's ``+`` lines). Newly-added migration files
+    appear in full; this is enough to read their in-file revision/down_revision.
+    An empty result means the rollup diff does not touch the versions directory.
+    """
+    sources: dict[str, list[str]] = {}
+    current: list[str] | None = None
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            current = None
+        elif line.startswith("+++ "):
+            path = line[4:].strip()
+            if path.startswith("b/"):
+                path = path[2:]
+            if "alembic/versions/" in path and path.endswith(".py"):
+                current = sources.setdefault(path, [])
+            else:
+                current = None
+        elif current is not None and line.startswith("+") and not line.startswith("+++"):
+            current.append(line[1:])
+    return {path: "\n".join(lines) for path, lines in sources.items()}
+
+
+def _touches_alembic_versions(filename: str) -> bool:
+    return "alembic/versions/" in filename and filename.endswith(".py")
+
+
+async def _validate_rollup_migration_chain(
+    gh_token: str, owner: str, repo: str, pr_number: int
+) -> tuple[str, str | None]:
+    """Fail-safe Alembic-chain guard for rollup auto-merge.
+
+    Returns ``("ok", None)`` when the rollup does not touch ``alembic/versions``
+    or the combined migration set is valid (single head, unique revisions).
+    Returns ``("defer", reason)`` when GitHub metadata cannot be fetched (retry
+    next sweep) and ``("block", reason)`` when the combined chain is invalid or
+    a touched migration file is unparseable. Never waves a merge through on an
+    inability to fetch or parse the migration files.
+    """
+    from app.github import get_pr_files, get_pull_request_diff
+    from app.migration_chain import validate_added_migrations
+
+    try:
+        files = await get_pr_files(gh_token, owner, repo, pr_number)
+    except Exception as e:
+        return (
+            "defer",
+            f"could not list rollup files to check Alembic migrations: "
+            f"{type(e).__name__}: {e}",
+        )
+    if not any(_touches_alembic_versions(f.get("filename", "")) for f in files):
+        return ("ok", None)
+
+    try:
+        diff = await get_pull_request_diff(gh_token, owner, repo, pr_number)
+    except Exception as e:
+        return (
+            "defer",
+            f"could not fetch rollup diff to validate Alembic migrations: "
+            f"{type(e).__name__}: {e}",
+        )
+    if not diff:
+        return (
+            "defer",
+            "could not fetch rollup diff to validate Alembic migrations (empty response)",
+        )
+    reason = validate_added_migrations(_extract_rollup_migration_sources(diff))
+    return ("ok", None) if reason is None else ("block", reason)
+
+
 class _ParentMutatedDuringPRCreation(Exception):
     """Sentinel: parent row was mutated by a peer during create_pull_request.
 
@@ -741,6 +814,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         create_pull_request,
         merge_pull_request,
         get_pull_request,
+        get_pull_request_diff,
         get_pr_files,
         get_branch_sha,
         close_pull_request,
@@ -1504,10 +1578,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             logger.info(
                                 f"[ROLLUP] PR #{existing_pr} already merged — marking COMPLETED"
                             )
+                            _integration_br = _runtime_config.get("integration_branch", "main")
+                            _landed = target_branch == _integration_br
                             parent.status = TaskStatus.COMPLETED
                             parent.context = {
                                 **_clear_rollup_transient_state(parent_ctx),
-                                "pr_merged": True,
+                                **({"pr_merged": True} if _landed else {}),
                             }
                             parent.latest_status_message = (
                                 f"Rollup PR #{existing_pr} already merged"
@@ -1856,6 +1932,18 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             exc_info=True,
                         )
 
+                    # Validate the combined Alembic migration chain on the rollup
+                    # branch before auto-merge. Two child PRs can each add a
+                    # migration with the same revision off the same head; each
+                    # passes its own CI in isolation but the merged rollup then
+                    # has duplicate revisions / multiple heads, breaking
+                    # `alembic upgrade head` on the integration branch for every
+                    # subsequent task. Fail-safe: fetch/parse failure does not
+                    # auto-merge. Runs in this unlocked window (GitHub I/O).
+                    alembic_status, alembic_reason = await _validate_rollup_migration_chain(
+                        gh_token, owner, repo, rollup_pr_number
+                    )
+
                     # Re-acquire to apply mutations / dispatch alerts.
                     parent = await _relock_parent(
                         session,
@@ -1938,6 +2026,65 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             logger.warning(
                                 f"[ROLLUP] Failed to post scan comment on PR #{rollup_pr_number}: {e}"
                             )
+
+                    # Alembic combined-chain guard (parent is locked here).
+                    if alembic_status == "defer":
+                        logger.info(
+                            f"[ROLLUP] Deferring auto-merge for PR #{rollup_pr_number} — "
+                            f"could not validate Alembic chain: {alembic_reason}"
+                        )
+                        parent.latest_status_message = (
+                            f"Rollup PR #{rollup_pr_number} — Alembic chain unverified, "
+                            f"retrying next cycle"
+                        )[:500]
+                        session.add(parent)
+                        await session.commit()
+                        return
+                    if alembic_status == "block":
+                        parent.requires_approval = True
+                        parent.latest_status_message = (
+                            f"Rollup PR #{rollup_pr_number} blocked — invalid Alembic "
+                            f"migration chain: {alembic_reason}"
+                        )[:500]
+                        parent.context = {
+                            **parent_ctx,
+                            "rollup_pr_url": rollup_pr_url,
+                            "rollup_pr_number": rollup_pr_number,
+                        }
+                        session.add(parent)
+                        await _dispatch_rollup_approval_alert(
+                            parent,
+                            session,
+                            f"Rollup PR #{rollup_pr_number} blocked — invalid Alembic "
+                            f"migration chain: {alembic_reason}",
+                            pr_number=rollup_pr_number,
+                        )
+                        await session.commit()
+                        _alembic_fix_prompt = (
+                            f"Rollup PR #{rollup_pr_number} merging {staging_branch} into "
+                            f"{target_branch} has an invalid combined Alembic migration "
+                            f"chain: {alembic_reason}. Two sibling PRs added migrations "
+                            f"that collide. Do NOT modify any already-landed migration "
+                            f"(applied history is immutable); instead rename and re-chain "
+                            f"your migration to the next free NNNN revision with "
+                            f"down_revision pointing at the current head, then bump "
+                            f"EXPECTED_SCHEMA_REVISION in backend/app/main.py to match."
+                        )
+                        await _spawn_pipeline_task(
+                            parent,
+                            "fix",
+                            session,
+                            rollup_pr_number,
+                            staging_branch,
+                            target_branch,
+                            fix_prompt=_alembic_fix_prompt,
+                            original_task_id=str(parent.id),
+                        )
+                        logger.warning(
+                            f"[ROLLUP] PR #{rollup_pr_number} blocked — invalid Alembic "
+                            f"chain ({alembic_reason}) — held for approval, spawned re-chain fix"
+                        )
+                        return
 
                     # Release lock around the actual merge call (slowest of all).
                     pre_actual_merge_snapshot = await _release_parent_lock(parent, session)
@@ -2042,10 +2189,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         return
                     parent_ctx = parent.context or {}
                     if merge_result.get("merged"):
+                        _integration_br = _runtime_config.get("integration_branch", "main")
+                        _landed = target_branch == _integration_br
                         parent.status = TaskStatus.COMPLETED
                         parent.context = {
                             **_clear_rollup_transient_state(parent_ctx),
-                            "pr_merged": True,
+                            **({"pr_merged": True} if _landed else {}),
                             "rollup_pr_url": rollup_pr_url,
                         }
                         parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR auto-merged"

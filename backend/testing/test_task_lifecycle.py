@@ -4211,3 +4211,175 @@ async def test_close_loop_merge_compliant_with_one_targeted_plus_one_unmodifiabl
         f"targeted={sorted(targeted)}, recommended={sorted(recommended)}; "
         "this fix would incorrectly trigger a compliance re-spawn"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _close_loop_regression_case_on_merge — git-ancestry guard
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_close_loop_merge_skips_when_ancestry_indeterminate(tl_db, mocker):
+    """mark_merged is skipped when ancestry check returns None (indeterminate) —
+    fail-safe: an unresolvable ancestry result must not conclude 'landed'."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.task_lifecycle import _close_loop_regression_case_on_merge
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="test-token"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"merge_commit_sha": "deadbeef"}),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=None),
+    )
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    project.github_owner = "owner"
+    project.github_repo = "repo"
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={"regression_class": "sr_catch_rate"},
+    )
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=1,
+        hit_count=1,
+        last_remediation_task_id=task.id,
+    )
+    session.add(case)
+    await session.commit()
+    await session.refresh(case)
+
+    await _close_loop_regression_case_on_merge(task, 101, session)
+    await session.commit()
+    await session.refresh(case)
+
+    assert case.status == RegressionCaseStatus.ACTIVE, (
+        "case must stay ACTIVE when ancestry check returns None (indeterminate treated as not landed)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_close_loop_merge_skips_when_ancestry_false(tl_db, mocker):
+    """mark_merged is skipped when ancestry check returns False (definitive not-ancestor) —
+    fix PR merged to a staging branch, not yet on integration branch."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.task_lifecycle import _close_loop_regression_case_on_merge
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="test-token"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"merge_commit_sha": "staging-sha"}),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=False),
+    )
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    project.github_owner = "owner"
+    project.github_repo = "repo"
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={"regression_class": "sr_catch_rate"},
+    )
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=1,
+        hit_count=1,
+        last_remediation_task_id=task.id,
+    )
+    session.add(case)
+    await session.commit()
+    await session.refresh(case)
+
+    await _close_loop_regression_case_on_merge(task, 102, session)
+    await session.commit()
+    await session.refresh(case)
+
+    assert case.status == RegressionCaseStatus.ACTIVE, (
+        "case must stay ACTIVE when fix PR merge commit is not an ancestor of integration branch"
+    )
+
+
+@pytest.mark.asyncio
+async def test_close_loop_merge_advances_when_ancestry_confirmed(tl_db, mocker):
+    """mark_merged proceeds when ancestry check returns True (confirmed ancestor)."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.task_lifecycle import _close_loop_regression_case_on_merge
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="test-token"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"merge_commit_sha": "main-sha"}),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    project.github_owner = "owner"
+    project.github_repo = "repo"
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={"regression_class": "sr_catch_rate"},
+    )
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=1,
+        hit_count=1,
+        last_remediation_task_id=task.id,
+    )
+    session.add(case)
+    await session.commit()
+    await session.refresh(case)
+
+    await _close_loop_regression_case_on_merge(task, 103, session)
+    await session.commit()
+    await session.refresh(case)
+
+    assert case.status == RegressionCaseStatus.MERGED, (
+        "case must advance to MERGED when fix PR merge commit is confirmed on integration branch"
+    )

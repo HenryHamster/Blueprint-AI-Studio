@@ -1028,7 +1028,9 @@ async def update_agent_status(
         from app.failure_classification import normalize_agent_failure_category
 
         normalized_failure_category = normalize_agent_failure_category(
-            payload.failure_category, task
+            payload.failure_category,
+            task,
+            at_time=task.last_heartbeat or task.started_at,
         )
         ctx = dict(task.context or {})
         ctx["failure_category"] = normalized_failure_category
@@ -1764,7 +1766,9 @@ async def update_agent_status(
             else:
                 from app.failure_classification import classify_failure_with_confidence
 
-                classification = classify_failure_with_confidence(task, payload.logs)
+                classification = classify_failure_with_confidence(
+                    task, payload.logs, at_time=task.last_heartbeat or task.started_at
+                )
                 failure_class = classification.failure_class
                 from app.failure_classification import (
                     EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
@@ -2114,7 +2118,9 @@ async def update_agent_status(
 
                     ctx = dict(task.context or {})
                     ctx["failure_category"] = normalize_agent_failure_category(
-                        payload.failure_category, task
+                        payload.failure_category,
+                        task,
+                        at_time=task.last_heartbeat or task.started_at,
                     )
                     task.context = ctx
                     flag_modified(task, "context")

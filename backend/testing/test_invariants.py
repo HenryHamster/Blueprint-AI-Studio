@@ -211,23 +211,22 @@ class TestSchemaRevisionSync:
         so a mismatch means the filename is misleading about ordering.
         """
         import glob as globmod
-        import re
+
+        from app.migration_chain import parse_revision_identifiers
 
         migrations_dir = os.path.join(
             os.path.dirname(__file__), "..", "alembic", "versions"
         )
         files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
-        rev_re = re.compile(r"^revision\s*=\s*['\"](\w+)['\"]", re.MULTILINE)
         mismatches: list[str] = []
         for path in files:
             filename_rev = os.path.basename(path).split("_")[0]
             with open(path) as f:
                 content = f.read()
-            match = rev_re.search(content)
-            if not match:
+            internal_rev, _ = parse_revision_identifiers(content)
+            if internal_rev is None:
                 mismatches.append(f"{os.path.basename(path)}: no revision field found")
                 continue
-            internal_rev = match.group(1)
             if internal_rev != filename_rev:
                 mismatches.append(
                     f"{os.path.basename(path)}: filename says {filename_rev}, "
@@ -239,33 +238,42 @@ class TestSchemaRevisionSync:
 
     def test_migration_chain_is_linear(self):
         """The alembic migration chain must be a single linear sequence —
-        no gaps, no branches, no dangling down_revision references.
+        no gaps, no branches, no dangling down_revision references, and no
+        duplicate revision identifiers across files.
+
+        Uses the same DB-free parser (``app.migration_chain``) that the
+        rollup auto-merge guard consumes, so the invariant test and the
+        runtime guard assert against identical revision/down_revision
+        resolution.
         """
         import glob as globmod
-        import re
+
+        from app.migration_chain import build_migration_chain, find_heads
 
         migrations_dir = os.path.join(
             os.path.dirname(__file__), "..", "alembic", "versions"
         )
         files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
-        rev_re = re.compile(r"^revision\s*=\s*['\"](\w+)['\"]", re.MULTILINE)
-        # Match either down_revision = '0033' or down_revision = None
-        down_re = re.compile(
-            r"^down_revision\s*=\s*(?:['\"](\w+)['\"]|None)", re.MULTILINE
-        )
 
-        chain: dict[str, str | None] = {}  # revision -> down_revision
+        sources: dict[str, str] = {}
         for path in files:
             with open(path) as f:
-                content = f.read()
-            rev_match = rev_re.search(content)
-            down_match = down_re.search(content)
-            if rev_match:
-                # group(1) is the quoted revision string or None if matched 'None' literal
-                down = (
-                    down_match.group(1) if down_match and down_match.group(1) else None
-                )
-                chain[rev_match.group(1)] = down
+                sources[os.path.basename(path)] = f.read()
+
+        chain, duplicates, unparseable = build_migration_chain(sources)
+
+        # No unparseable migration files (every file must declare a revision).
+        assert not unparseable, (
+            "Migration files with no parseable revision identifier:\n  "
+            + "\n  ".join(sorted(unparseable))
+        )
+
+        # No two files may declare the same Alembic revision id — that is the
+        # rollup-collision regression this invariant exists to catch.
+        assert not duplicates, (
+            "Duplicate Alembic revision identifier(s) across migration files: "
+            + ", ".join(sorted(set(duplicates)))
+        )
 
         # Every down_revision must point to a revision that exists (or None for the root)
         missing_parents = [
@@ -283,8 +291,7 @@ class TestSchemaRevisionSync:
             f"Expected exactly 1 root migration, found {len(roots)}: {roots}"
         )
 
-        pointed_to = {d for d in chain.values() if d is not None}
-        heads = [r for r in chain if r not in pointed_to]
+        heads = find_heads(chain)
         assert len(heads) == 1, (
             f"Expected exactly 1 head migration, found {len(heads)}: {heads}"
         )

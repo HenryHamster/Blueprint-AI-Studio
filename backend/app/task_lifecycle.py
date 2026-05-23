@@ -1049,9 +1049,10 @@ async def _close_loop_regression_case_on_merge(
     # Verify the PR's merge commit is reachable from the integration branch before
     # advancing the case.  A PR merged only into a rollup staging branch has NOT
     # landed on the integration branch — advancing the case would suppress re-spawning
-    # while the regression is still live.  Fail-open (proceed) when credentials are
-    # unavailable, the API returns None, or any error occurs; skip ONLY on a definitive
-    # False (merge commit confirmed unreachable from the integration branch).
+    # while the regression is still live.  Fail-safe (skip) on INDETERMINATE (None) as
+    # well as a definitive False; only a confirmed True (ancestor) proceeds.  Exception
+    # in the outer try/except is still fail-open (credentials unavailable, etc.) because
+    # the ancestry helper was unreachable, not because it returned a negative signal.
     try:
         from app.github import (
             get_pull_request as _get_pull_request,
@@ -1086,14 +1087,16 @@ async def _close_loop_regression_case_on_merge(
                         _integration_branch,
                         project_id=str(task.project_id),
                     )
-                    if _is_anc is False:
+                    if _is_anc is not True:
                         logger.info(
                             "[REGRESSION-CASE] Skipping mark_merged for PR #%s "
-                            "project=%s: merge commit %s not reachable from %s",
+                            "project=%s: merge commit %s not confirmed ancestor of %s "
+                            "(result=%s — indeterminate treated as not landed)",
                             pr_number,
                             task.project_id,
                             _merge_sha,
                             _integration_branch,
+                            _is_anc,
                         )
                         return
     except Exception as _exc_anc:

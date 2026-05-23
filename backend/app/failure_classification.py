@@ -512,6 +512,7 @@ _ALL_GENERIC_CODE_ERROR_LABELS: frozenset[str] = frozenset(
         "fatal",
         "incomplete",
         "agent_self_failed",
+        "parse_failed",
     }
 )
 
@@ -548,6 +549,27 @@ def _persist_rate_limit_signal_context(task: "Task", signal) -> None:
         task.context = ctx
     except Exception:
         logger.exception("[FAILURE_CLASS] Failed to persist rate_limit_* keys")
+
+
+def _persist_correlation_reclassification_context(task: "Task") -> None:
+    """Persist a marker on task.context when RATE_LIMIT is inferred via account/pool
+    correlation with no text/keyword signal matched.
+
+    Writes rate_limit_kind="unknown" (if not already set) and
+    rate_limit_correlation_reclassified=True so operators and downstream digest
+    consumers can distinguish correlation-based reclassifications from text-matched ones,
+    and so the cooldown bookkeeping path has a rate_limit_kind value to act on.
+    """
+    try:
+        ctx = dict(task.context or {})
+        if "rate_limit_kind" not in ctx:
+            ctx["rate_limit_kind"] = "unknown"
+        ctx["rate_limit_correlation_reclassified"] = True
+        task.context = ctx
+    except Exception:
+        logger.exception(
+            "[FAILURE_CLASS] Failed to persist correlation reclassification marker"
+        )
 
 
 def _account_was_rate_limited(task: "Task", at_time: "datetime | None" = None) -> bool:
@@ -732,16 +754,22 @@ def persist_failure_category(
         )
 
 
-def normalize_agent_failure_category(raw: str | None, task: "Task") -> str:
+def normalize_agent_failure_category(
+    raw: str | None, task: "Task", *, at_time: "datetime | None" = None
+) -> str:
     """Canonicalize an agent-reported ``failure_category`` label to an uppercase class name.
 
     The agent posts lowercase short labels (``rate_limited``, ``claude_code_failed``, …)
     but every consumer (rollups, dedup, analytics) compares against the uppercase
     canonical names. Normalize at the write boundary so the rest of the system sees
     a single vocabulary.
+
+    at_time: reference timestamp for rate-limit cooldown checks. Pass
+    ``task.last_heartbeat`` (the failure instant) so a lag between failure and
+    report time cannot cause a now-elapsed cooldown to be missed.
     """
     if not raw:
-        return classify_failure(task)
+        return classify_failure(task, at_time=at_time)
     label = raw.strip()
     label_lower = label.lower()
     mapped = _AGENT_CATEGORY_TO_CLASS.get(label_lower)
@@ -756,8 +784,12 @@ def normalize_agent_failure_category(raw: str | None, task: "Task") -> str:
         if (
             mapped == CODE_ERROR
             and label_lower in _ALL_GENERIC_CODE_ERROR_LABELS
-            and (_account_was_rate_limited(task) or _pool_was_rate_limited())
+            and (
+                _account_was_rate_limited(task, at_time=at_time)
+                or _pool_was_rate_limited(at_time=at_time)
+            )
         ):
+            _persist_correlation_reclassification_context(task)
             return RATE_LIMIT
         return mapped
     if label in INFRA_CLASSES or label == CODE_ERROR:
@@ -767,7 +799,7 @@ def normalize_agent_failure_category(raw: str | None, task: "Task") -> str:
         raw,
         getattr(task, "id", "?"),
     )
-    return classify_failure(task)
+    return classify_failure(task, at_time=at_time)
 
 
 # AGENT_TIMEOUT sub-types — finer breakdown of the catch-all timeout class so
@@ -1057,6 +1089,7 @@ def _spawn_bg_task(coro) -> None:
     task = loop.create_task(coro)
     _residual_bg_tasks.add(task)
     task.add_done_callback(_residual_bg_tasks.discard)
+
 
 _RE_UUID = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
@@ -1608,6 +1641,7 @@ def _classify_failure_class(
                     _account_was_rate_limited(task, at_time=at_time)
                     or _pool_was_rate_limited(at_time)
                 ):
+                    _persist_correlation_reclassification_context(task)
                     return RATE_LIMIT
             return mapped
         if agent_category in INFRA_CLASSES or agent_category == CODE_ERROR:
@@ -1895,6 +1929,7 @@ def _classify_failure_class(
     if _account_was_rate_limited(task, at_time=at_time) or _pool_was_rate_limited(
         at_time
     ):
+        _persist_correlation_reclassification_context(task)
         return RATE_LIMIT
 
     # Default: code error — record fingerprint for residual-pattern analysis.

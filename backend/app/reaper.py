@@ -2182,7 +2182,14 @@ async def reaper_service():
                             )
 
                             classification = classify_failure_with_confidence(
-                                task, logs=extra_logs or None
+                                task,
+                                logs=extra_logs or None,
+                                # Fall back to started_at when last_heartbeat is None
+                                # (never-claimed provision deaths) so the cooldown
+                                # correlation still evaluates at the failure instant
+                                # rather than silently defaulting to sweep time.
+                                # Matches the agent_status.py call sites.
+                                at_time=task.last_heartbeat or task.started_at,
                             )
                             failure_class = classification.failure_class
                             if reap_reason_code == "agent_stalled":

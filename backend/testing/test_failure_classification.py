@@ -2586,3 +2586,176 @@ class TestAtTimeFailureInstantCorrelation:
         assert failure_class_without_at_time == CODE_ERROR, (
             "classify_failure without at_time falls back to CODE_ERROR (broken path)"
         )
+
+    def test_normalize_agent_failure_category_uses_failure_instant(self, monkeypatch):
+        """normalize_agent_failure_category threads at_time into the account/pool
+        rate-limit correlation.
+
+        A generic agent-reported code-error label is RATE_LIMIT when normalized at
+        the failure instant (cooldown active then) but CODE_ERROR at sweep time
+        (cooldown expired). Guards the at_time plumbing added to
+        normalize_agent_failure_category itself — the sibling tests above exercise
+        classify_failure, which is a distinct entry point.
+        """
+        from datetime import datetime, timedelta
+        import app.max_plan_pool as pool_mod
+
+        account_id = "acct-normalize-at-time"
+
+        def _account_corr(task, at_time=None):
+            # Cooldown active only when at_time is provided (failure instant);
+            # expired at sweep time (at_time=None).
+            return at_time is not None
+
+        monkeypatch.setattr(
+            pool_mod,
+            "_account_by_id",
+            {account_id: self._make_rl_account(account_id, in_cooldown=True)},
+        )
+        monkeypatch.setattr(
+            "app.failure_classification._account_was_rate_limited",
+            _account_corr,
+        )
+        # Isolate the account-level at_time correlation from the pool-wide check.
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+
+        failure_time = datetime.utcnow() - timedelta(minutes=5)
+        task = _task("", ctx={"llm_account_id": account_id})
+
+        # Generic code-error label + cooldown active at the failure instant → RATE_LIMIT.
+        assert (
+            normalize_agent_failure_category("incomplete", task, at_time=failure_time)
+            == RATE_LIMIT
+        ), "generic label at failure instant must correlate to RATE_LIMIT"
+
+        # Same label re-classified at sweep time (at_time=None) → CODE_ERROR.
+        assert (
+            normalize_agent_failure_category("incomplete", task, at_time=None)
+            == CODE_ERROR
+        ), "generic label at sweep time (cooldown expired) falls back to CODE_ERROR"
+
+
+class TestParseFailedCorrelation:
+    """parse_failed deaths correlate to RATE_LIMIT when pool/account is rate-limited."""
+
+    def _make_rl_account(self, account_id: str, in_cooldown: bool) -> dict:
+        from datetime import timedelta
+
+        from app.time_utils import _utcnow
+
+        if in_cooldown:
+            at = _utcnow() - timedelta(minutes=5)
+            return {
+                "enabled": True,
+                "disabled_models": {
+                    "claude-opus-4-5": {
+                        "at": at,
+                        "hits": 1,
+                        "kind": "rate_limit",
+                    }
+                },
+            }
+        return {"enabled": True, "disabled_models": {}}
+
+    def test_parse_failed_with_rate_limited_account_reclassifies_to_rate_limit(
+        self, monkeypatch
+    ):
+        account_id = "acct-pf-rl-1"
+        fake_pool = {account_id: self._make_rl_account(account_id, in_cooldown=True)}
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+
+        task = _task("", ctx={"llm_account_id": account_id})
+        result = normalize_agent_failure_category("parse_failed", task)
+        assert result == RATE_LIMIT
+        assert task.context.get("rate_limit_correlation_reclassified") is True
+        assert task.context.get("rate_limit_kind") == "unknown"
+
+    def test_parse_failed_with_healthy_pool_stays_code_error(self, monkeypatch):
+        account_id = "acct-pf-healthy-1"
+        fake_pool = {account_id: self._make_rl_account(account_id, in_cooldown=False)}
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+
+        task = _task("", ctx={"llm_account_id": account_id})
+        result = normalize_agent_failure_category("parse_failed", task)
+        assert result == CODE_ERROR
+        assert "rate_limit_correlation_reclassified" not in task.context
+
+    def test_classify_failure_class_parse_failed_pool_rate_limited(self, monkeypatch):
+        """classify_failure fast-path via agent_category=parse_failed during pool block."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+        )
+
+        task = _task("", ctx={"failure_category": "parse_failed"})
+        assert classify_failure(task) == RATE_LIMIT
+
+
+class TestCorrelationReclassificationMarker:
+    """Verify _persist_correlation_reclassification_context is written correctly."""
+
+    def _make_rl_account(self, account_id: str) -> dict:
+        from datetime import timedelta
+
+        from app.time_utils import _utcnow
+
+        at = _utcnow() - timedelta(minutes=5)
+        return {
+            "enabled": True,
+            "disabled_models": {
+                "claude-opus-4-5": {"at": at, "hits": 1, "kind": "rate_limit"}
+            },
+        }
+
+    def test_correlation_marker_persisted_for_generic_labels_when_pool_rate_limited(
+        self, monkeypatch
+    ):
+        """correlation marker is written for incomplete/fatal correlation paths."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+        )
+
+        for label in ("incomplete", "fatal"):
+            task = _task("", ctx={"failure_category": label})
+            result = normalize_agent_failure_category(label, task)
+            assert result == RATE_LIMIT, (
+                f"label={label} should reclassify to RATE_LIMIT"
+            )
+            assert task.context.get("rate_limit_correlation_reclassified") is True, (
+                f"label={label} missing correlation marker"
+            )
+            assert task.context.get("rate_limit_kind") == "unknown", (
+                f"label={label} missing rate_limit_kind"
+            )
+
+    def test_correlation_marker_not_written_when_text_signal_matched(self, monkeypatch):
+        """When the text signal fires, _persist_rate_limit_signal_context runs — not correlation marker."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+        )
+
+        msg = "Fatal error: Quota exceeded for quota metric 'GenerateRequests'. Please retry in 39.8s."
+        task = _task(msg, ctx={"llm_provider": "gemini", "llm_auth_mode": "api_key"})
+        result = normalize_agent_failure_category("fatal", task)
+        assert result == RATE_LIMIT
+        # Text-matched signal sets rate_limit_kind via _persist_rate_limit_signal_context
+        assert task.context.get("rate_limit_kind") is not None
+        # But correlation marker must NOT be set when text signal matched
+        assert "rate_limit_correlation_reclassified" not in task.context

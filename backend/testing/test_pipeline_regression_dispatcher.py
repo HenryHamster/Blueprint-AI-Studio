@@ -2145,11 +2145,11 @@ async def test_run_recovery_once_proceeds_when_ancestry_confirmed(db_session, mo
 
 
 @pytest.mark.asyncio
-async def test_run_recovery_once_proceeds_when_ancestry_indeterminate(
+async def test_run_recovery_once_stays_merged_when_ancestry_indeterminate(
     db_session, mocker
 ):
-    """MERGED case proceeds to close when ancestry check is indeterminate (None result,
-    missing merge_sha, or exception) — degrade-safe fail-open behavior."""
+    """MERGED case stays MERGED when ancestry check is indeterminate (None) —
+    fail-safe behavior: an unresolvable ancestry result must not conclude 'landed'."""
     from app.models import RegressionCaseStatus, RegressionRemediationCase
 
     project = make_project(
@@ -2158,7 +2158,7 @@ async def test_run_recovery_once_proceeds_when_ancestry_indeterminate(
         design_doc=_design_doc_with_sr_regression(
             category="correctness",
             prior=0.80,
-            current=0.80,  # signal recovered
+            current=0.80,  # signal recovered — close would proceed absent ancestry guard
         ),
     )
     db_session.add(project)
@@ -2184,7 +2184,7 @@ async def test_run_recovery_once_proceeds_when_ancestry_indeterminate(
     await db_session.commit()
     await db_session.refresh(case)
 
-    # is_ancestor_of returns None (API indeterminate) → fail-open, proceed with close.
+    # is_ancestor_of returns None (API indeterminate) → fail-safe, keep tracking.
     mocker.patch(
         "app.github.get_repo_installation_token",
         new=mocker.AsyncMock(return_value="fake-token"),
@@ -2200,12 +2200,12 @@ async def test_run_recovery_once_proceeds_when_ancestry_indeterminate(
 
     changed = await run_recovery_once(db_session, project.id)
 
-    assert changed == 1, (
-        "recovery must proceed when ancestry check is indeterminate (None)"
+    assert changed == 0, (
+        "recovery must be skipped when ancestry check is indeterminate (None)"
     )
     await db_session.refresh(case)
-    assert case.status == RegressionCaseStatus.CLOSED, (
-        "case must be CLOSED when ancestry check returns None (fail-open)"
+    assert case.status == RegressionCaseStatus.MERGED, (
+        "case must stay MERGED when ancestry check returns None (indeterminate treated as not landed)"
     )
 
 
