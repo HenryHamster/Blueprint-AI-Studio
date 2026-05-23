@@ -72,6 +72,12 @@ interface FixLoopConvergenceWidgetProps {
 const POLL_MS = 60_000;
 const DIST_KEYS = ['1', '2', '3', '4+'] as const;
 
+const TOOLTIP_CONTENT_STYLE = { background: '#1a1a1a', border: '1px solid #404040', borderRadius: 4, padding: '4px 8px', fontSize: 10 };
+const TOOLTIP_LABEL_STYLE = { color: '#a3a3a3' };
+const TOOLTIP_ITEM_STYLE = { color: '#e5e5e5' };
+const tooltipFormatter = (value: unknown, name: unknown): [string, string] => [value == null ? '—' : `${value}%`, name === 'conv' ? 'converged' : 'diverged'];
+const tooltipLabelFormatter = (label: unknown): string => String(label);
+
 function IterDistBar({ dist }: { dist: Record<string, number> }) {
   const total = DIST_KEYS.reduce((s, k) => s + (dist[k] ?? 0), 0);
   if (total === 0) return <span className="text-neutral-600 text-xs">no data</span>;
@@ -344,11 +350,11 @@ function TrendSparkline({ loop, buckets }: { loop: string; buckets: TrendBucket[
               </linearGradient>
             </defs>
             <Tooltip
-              contentStyle={{ background: '#1a1a1a', border: '1px solid #404040', borderRadius: 4, padding: '4px 8px', fontSize: 10 }}
-              labelStyle={{ color: '#a3a3a3' }}
-              itemStyle={{ color: '#e5e5e5' }}
-              formatter={(value, name) => [value == null ? '—' : `${value}%`, name === 'conv' ? 'converged' : 'diverged']}
-              labelFormatter={(label) => String(label)}
+              contentStyle={TOOLTIP_CONTENT_STYLE}
+              labelStyle={TOOLTIP_LABEL_STYLE}
+              itemStyle={TOOLTIP_ITEM_STYLE}
+              formatter={tooltipFormatter}
+              labelFormatter={tooltipLabelFormatter}
               isAnimationActive={false}
             />
             <Area type="monotone" dataKey="conv" stroke={colors.conv} fill={`url(#tconv-${loop})`} strokeWidth={1.5} dot={false} isAnimationActive={false} connectNulls />

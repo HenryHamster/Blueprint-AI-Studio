@@ -1724,15 +1724,17 @@ async def memory_snapshot(
     import tracemalloc
     import os
 
-    rss_mb = None
-    try:
-        with open(f"/proc/{os.getpid()}/status", "r") as _st:
-            for _line in _st:
-                if _line.startswith("VmRSS:"):
-                    rss_mb = int(_line.split()[1]) / 1024
-                    break
-    except Exception as _rss_exc:
-        logger.debug(f"[MEMORY] RSS read failed: {_rss_exc}")
+    def _read_rss_mb() -> float | None:
+        try:
+            with open(f"/proc/{os.getpid()}/status", "r") as _st:
+                for _line in _st:
+                    if _line.startswith("VmRSS:"):
+                        return int(_line.split()[1]) / 1024
+        except Exception as _rss_exc:
+            logger.debug(f"[MEMORY] RSS read failed: {_rss_exc}")
+        return None
+
+    rss_mb = await asyncio.to_thread(_read_rss_mb)
 
     if not tracemalloc.is_tracing():
         logger.warning(f"[MEMORY SNAPSHOT] rss_mb={rss_mb} tracemalloc=off")

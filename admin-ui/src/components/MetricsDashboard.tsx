@@ -45,6 +45,11 @@ const TOOLTIP_STYLE = {
   labelStyle: { color: '#a3a3a3' },
 };
 
+const formatCostPerHr = (value: unknown): [string, string] => [(value as number).toFixed(2) + ' $/hr', 'VM Cost/Hr'];
+const formatActiveVMs = (value: unknown): [string, string] => [String(value) + ' VMs', 'Active VMs'];
+const formatFailureRate = (value: unknown): [string, string] => [(value as number).toFixed(1) + '%', 'Failure Rate'];
+const makeLabelFormatter = (windowMs: number) => (ts: unknown) => formatTime(Number(ts), windowMs);
+
 function formatTime(ts: number, windowMs?: number): string {
   const d = new Date(ts);
   if (windowMs !== undefined && windowMs >= 43200000) {
@@ -67,6 +72,7 @@ function NoDataMessage() {
 function CostChart({ points, windowMs }: { points: MetricsPoint[]; windowMs: number }) {
   const [now] = useState(Date.now);
   const filtered = points.filter((p) => p.timestamp >= now - windowMs);
+  const labelFmt = useMemo(() => makeLabelFormatter(windowMs), [windowMs]);
   if (filtered.length < 2) return <NoDataMessage />;
 
   return (
@@ -77,8 +83,8 @@ function CostChart({ points, windowMs }: { points: MetricsPoint[]; windowMs: num
         <YAxis tick={TICK_STYLE} />
         <Tooltip
           {...TOOLTIP_STYLE}
-          formatter={(value: unknown) => [(value as number).toFixed(2) + ' $/hr', 'VM Cost/Hr']}
-          labelFormatter={(ts) => formatTime(Number(ts), windowMs)}
+          formatter={formatCostPerHr}
+          labelFormatter={labelFmt}
         />
         <Area dataKey="costPerHr" stroke="#10b981" fill="#10b981" fillOpacity={0.15} dot={false} />
       </AreaChart>
@@ -89,6 +95,7 @@ function CostChart({ points, windowMs }: { points: MetricsPoint[]; windowMs: num
 function VMChart({ points, maxConcurrentVMs, windowMs }: { points: MetricsPoint[]; maxConcurrentVMs: number; windowMs: number }) {
   const [now] = useState(Date.now);
   const filtered = points.filter((p) => p.timestamp >= now - windowMs);
+  const labelFmt = useMemo(() => makeLabelFormatter(windowMs), [windowMs]);
   if (filtered.length < 2) return <NoDataMessage />;
 
   return (
@@ -99,8 +106,8 @@ function VMChart({ points, maxConcurrentVMs, windowMs }: { points: MetricsPoint[
         <YAxis tick={TICK_STYLE} />
         <Tooltip
           {...TOOLTIP_STYLE}
-          formatter={(value: unknown) => [String(value) + ' VMs', 'Active VMs']}
-          labelFormatter={(ts) => formatTime(Number(ts), windowMs)}
+          formatter={formatActiveVMs}
+          labelFormatter={labelFmt}
         />
         <ReferenceLine y={maxConcurrentVMs} stroke="#3b82f6" strokeDasharray="4 3" strokeOpacity={0.5} />
         <Area dataKey="activeVMs" stroke="#3b82f6" fill="#3b82f6" fillOpacity={0.15} dot={false} />
@@ -112,6 +119,7 @@ function VMChart({ points, maxConcurrentVMs, windowMs }: { points: MetricsPoint[
 function TaskOutcomesChart({ points, tasks, windowMs }: { points: MetricsPoint[]; tasks: Task[]; windowMs: number }) {
   const [now] = useState(Date.now);
   const filtered = points.filter((p) => p.timestamp >= now - windowMs);
+  const labelFmt = useMemo(() => makeLabelFormatter(windowMs), [windowMs]);
   if (filtered.length < 2) return <NoDataMessage />;
 
   const baselineCompleted = tasks.filter((t) => t.status === 'COMPLETED').length;
@@ -141,7 +149,7 @@ function TaskOutcomesChart({ points, tasks, windowMs }: { points: MetricsPoint[]
         <YAxis tick={TICK_STYLE} />
         <Tooltip
           {...TOOLTIP_STYLE}
-          labelFormatter={(ts) => formatTime(Number(ts), windowMs)}
+          labelFormatter={labelFmt}
         />
         <Legend wrapperStyle={{ fontSize: 11, color: '#a3a3a3' }} />
         <Line dataKey="cumCompleted" stroke="#10b981" dot={false} name="Completed" />
@@ -154,6 +162,7 @@ function TaskOutcomesChart({ points, tasks, windowMs }: { points: MetricsPoint[]
 function FailureRateChart({ points, windowMs }: { points: MetricsPoint[]; windowMs: number }) {
   const [now] = useState(Date.now);
   const filtered = points.filter((p) => p.timestamp >= now - windowMs);
+  const labelFmt = useMemo(() => makeLabelFormatter(windowMs), [windowMs]);
   if (filtered.length < 2) return <NoDataMessage />;
 
   const ratePoints = filtered.map((p) => {
@@ -170,8 +179,8 @@ function FailureRateChart({ points, windowMs }: { points: MetricsPoint[]; window
         <YAxis tick={TICK_STYLE} domain={[0, 100]} tickFormatter={(v) => `${v}%`} />
         <Tooltip
           {...TOOLTIP_STYLE}
-          formatter={(value: unknown) => [(value as number).toFixed(1) + '%', 'Failure Rate']}
-          labelFormatter={(ts) => formatTime(Number(ts), windowMs)}
+          formatter={formatFailureRate}
+          labelFormatter={labelFmt}
         />
         <Line dataKey="failureRate" stroke="#ef4444" dot={false} name="Failure Rate" />
       </LineChart>

@@ -8,6 +8,7 @@ and reset circuit breakers.
 
 import os
 import uuid
+import asyncio
 import logging
 from typing import Optional, Dict, List, TypedDict
 from datetime import datetime, timedelta, timezone
@@ -221,7 +222,7 @@ async def _build_stuck_tasks(
 
     # Fetch zone health once for provision_timeout hints
     try:
-        zone_health = get_zone_health()
+        zone_health = await asyncio.to_thread(get_zone_health)
     except Exception:
         zone_health = {}
 
