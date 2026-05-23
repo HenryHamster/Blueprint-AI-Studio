@@ -2,9 +2,9 @@ import { describe, it, expect } from 'vitest';
 import { resolveBuildConfig } from './build-config.js';
 
 describe('resolveBuildConfig', () => {
-  it('returns undefined when project_metadata.is_self_repo is true', () => {
+  it('returns undefined when project_metadata.skip_build_config is true', () => {
     const task = {
-      project_metadata: { is_self_repo: true },
+      project_metadata: { skip_build_config: true },
       build_config: { directories: [{ path: 'src', type: 'node' }] },
     };
     expect(resolveBuildConfig(task)).toBeUndefined();

@@ -1062,13 +1062,11 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   });
 
   // Fresh reviewer pass: read-only second session to catch what the implementing
-  // session missed. Enabled per-project via project_metadata.enable_fresh_reviewer,
-  // and auto-on for self-repo projects (the Blueprint repo measuring itself) so
-  // the cycle-over-cycle catch-rate measurement always has a meaningful sample.
+  // session missed. Enabled per-project via project_metadata.enable_fresh_reviewer.
   // Skipped for auto-remediation tasks (their job IS to fix what a reviewer would flag).
   const projectMeta = task.project_metadata as Record<string, unknown> | undefined;
   const freshReviewerEnabled =
-    projectMeta?.enable_fresh_reviewer === true || projectMeta?.is_self_repo === true;
+    projectMeta?.enable_fresh_reviewer === true;
   let freshReviewerAlreadyRan = false;
   if (freshReviewerEnabled && !isAutoRemediation) {
     freshReviewerAlreadyRan = true;
@@ -1091,7 +1089,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
   // Auto-trigger fresh-reviewer when lone-checker categories overlap this task's
   // risk surface. SR is the sole corroborator for these categories, so a PASS is
-  // uncorroborated. Fires regardless of enable_fresh_reviewer / is_self_repo.
+  // uncorroborated. Fires regardless of enable_fresh_reviewer.
   if (!isAutoRemediation && !freshReviewerAlreadyRan) {
     const loneCheckerRelatedFiles = (
       (payload.related_files as string[] | undefined) ||
@@ -1115,8 +1113,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
   // Auto-trigger fresh-reviewer recovery when SR admits incomplete_review and
   // the normal fresh-reviewer path hasn't already run. Fires regardless of
-  // project_metadata.enable_fresh_reviewer / is_self_repo. Skipped for
-  // auto-remediation tasks (same exclusion as the normal path).
+  // project_metadata.enable_fresh_reviewer. Skipped for auto-remediation tasks
+  // (same exclusion as the normal path).
   if (!isAutoRemediation && !freshReviewerAlreadyRan) {
     const srRecoveryPath = `/tmp/self_review_${taskId}.json`;
     let srRecovery: Record<string, unknown> = {};

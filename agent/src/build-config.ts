@@ -11,12 +11,12 @@ const VALID_TYPES = new Set(['python', 'node', 'go', 'rust']);
  * Extract and type-narrow build_config from a task object.
  *
  * Returns undefined (triggers hardcoded fallback) when:
- * - task.project_metadata?.is_self_repo is true (Blueprint's own repo)
+ * - task.project_metadata?.skip_build_config is true (project opted into hardcoded fallback)
  * - directories array is missing or empty
  */
 export function resolveBuildConfig(task: Record<string, unknown>): BuildConfig | undefined {
   const projectMetadata = task.project_metadata as Record<string, unknown> | undefined;
-  if (projectMetadata?.is_self_repo === true) return undefined;
+  if (projectMetadata?.skip_build_config === true) return undefined;
 
   const raw = task.build_config as Record<string, unknown> | undefined;
   if (!raw) return undefined;
