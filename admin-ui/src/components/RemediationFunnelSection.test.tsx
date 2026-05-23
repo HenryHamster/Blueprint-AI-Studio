@@ -108,8 +108,10 @@ describe('RemediationFunnelSection', () => {
         conversion={null}
       />
     );
-    expect(screen.getByText('CODE_ERROR')).toBeInTheDocument();
-    expect(screen.getByText('AGENT_TIMEOUT')).toBeInTheDocument();
+    // The breakdown renders in both a mobile card layout and a desktop list, so
+    // each class label appears twice — assert presence rather than uniqueness.
+    expect(screen.getAllByText('CODE_ERROR').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('AGENT_TIMEOUT').length).toBeGreaterThan(0);
     expect(screen.getByText('By failure class')).toBeInTheDocument();
   });
 

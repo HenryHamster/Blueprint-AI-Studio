@@ -134,6 +134,8 @@ function makeProps(overrides: Record<string, unknown> = {}) {
     onUpdateAutoRemediationConfig: vi.fn(),
     issueImplementationConfig: null,
     onUpdateIssueImplementationConfig: vi.fn(),
+    autoReviewConfig: null,
+    onUpdateAutoReviewConfig: vi.fn(),
     ...overrides,
   };
 }
@@ -144,7 +146,7 @@ describe('SettingsDropdown — Project Members trigger', () => {
     render(<SettingsDropdown {...(props as Parameters<typeof SettingsDropdown>[0])} />);
 
     // Navigate to Accounts section
-    fireEvent.click(screen.getByText('Accounts'));
+    fireEvent.click(screen.getByRole('button', { name: 'Accounts' }));
 
     expect(screen.getByTestId('toggle-project-members')).toBeInTheDocument();
     expect(screen.getByText('Manage Project Members')).toBeInTheDocument();
@@ -156,7 +158,7 @@ describe('SettingsDropdown — Project Members trigger', () => {
     const props = makeProps({ onToggleProjectMembers, onToggleSettings });
     render(<SettingsDropdown {...(props as Parameters<typeof SettingsDropdown>[0])} />);
 
-    fireEvent.click(screen.getByText('Accounts'));
+    fireEvent.click(screen.getByRole('button', { name: 'Accounts' }));
     fireEvent.click(screen.getByTestId('toggle-project-members'));
 
     expect(onToggleProjectMembers).toHaveBeenCalledOnce();
@@ -167,7 +169,7 @@ describe('SettingsDropdown — Project Members trigger', () => {
     const props = makeProps({ selectedProjectId: null });
     render(<SettingsDropdown {...(props as Parameters<typeof SettingsDropdown>[0])} />);
 
-    fireEvent.click(screen.getByText('Accounts'));
+    fireEvent.click(screen.getByRole('button', { name: 'Accounts' }));
 
     expect(screen.queryByTestId('toggle-project-members')).toBeNull();
   });
@@ -176,7 +178,7 @@ describe('SettingsDropdown — Project Members trigger', () => {
     const props = makeProps({ userRole: 'user' as const, selectedProjectMyRole: 'member' });
     render(<SettingsDropdown {...(props as Parameters<typeof SettingsDropdown>[0])} />);
 
-    fireEvent.click(screen.getByText('Accounts'));
+    fireEvent.click(screen.getByRole('button', { name: 'Accounts' }));
 
     expect(screen.queryByTestId('toggle-project-members')).toBeNull();
   });

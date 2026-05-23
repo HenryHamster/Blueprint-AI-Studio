@@ -497,15 +497,15 @@ async def add_max_plan_account(
         session.add(db_account)
         await session.commit()
     except Exception as exc:
-        logger.warning(
-            f"[POOL] Secret Manager unavailable, secret stored inline for account {db_account.id}: {exc}"
+        logger.exception(
+            f"[POOL] Secret Manager unavailable, aborting account creation for {db_account.id}: {exc}"
         )
-        db_account.secret_blob_ref = normalized_secret
-        db_account.oauth_token = _stored_oauth_token_ref(
-            provider, auth_mode, normalized_secret
-        )
-        session.add(db_account)
+        await session.delete(db_account)
         await session.commit()
+        raise HTTPException(
+            status_code=503,
+            detail="Secret storage temporarily unavailable, please retry",
+        ) from exc
 
     entry = {
         "id": str(db_account.id),
@@ -790,10 +790,13 @@ async def update_max_plan_account(
                 "system", secret_name, normalized_secret
             )
         except Exception as exc:
-            logger.warning(
-                f"[POOL] Secret Manager unavailable, secret stored inline for account {account_id}: {exc}"
+            logger.exception(
+                f"[POOL] Secret Manager unavailable, aborting secret update for account {account_id}: {exc}"
             )
-            stored_secret_ref = normalized_secret
+            raise HTTPException(
+                status_code=503,
+                detail="Secret storage temporarily unavailable, please retry",
+            ) from exc
         db_account.secret_blob_ref = stored_secret_ref
         db_account.oauth_token = _stored_oauth_token_ref(
             target_provider, target_auth_mode, stored_secret_ref

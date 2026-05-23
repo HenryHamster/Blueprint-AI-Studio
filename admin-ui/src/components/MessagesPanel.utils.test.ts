@@ -552,11 +552,13 @@ describe('Saved Views storage', () => {
     return {
       id: 'view_1',
       name: 'Unresolved blockers',
+      description: undefined,
       query: 'blocker',
       prefs: { pr_merged: 'mute' } as Record<string, EventPref>,
       sort: 'importance',
       showResolved: false,
       routineExpanded: false,
+      showOnlyNew: false,
       createdAt: 1700000000000,
       ...overrides,
     };

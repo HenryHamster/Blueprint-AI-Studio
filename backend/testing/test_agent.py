@@ -7543,6 +7543,57 @@ async def test_rotate_credentials_allowed_after_task_terminated(
     assert res.json() == {"rotated": True}
 
 
+@pytest.mark.asyncio
+async def test_rotate_credentials_returns_503_on_secret_manager_failure(
+    client: AsyncClient, db_session, mocker
+):
+    """On Secret Manager failure the endpoint must return 503, not silently
+    store the plaintext secret."""
+    mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(side_effect=RuntimeError("Secret Manager unavailable")),
+    )
+    task, account, _ = await _make_openai_oauth_task(db_session)
+    original_ref = account.secret_blob_ref
+
+    token = create_agent_token(str(task.id), "agent-vm-rotate")
+    res = await client.post(
+        "/api/agent/credentials/rotate",
+        headers={"x-agent-token": token},
+        json={"secret": '{"tokens":{"access_token":"new","refresh_token":"rt-new"}}'},
+    )
+
+    assert res.status_code == 503
+    assert "retry" in res.text.lower()
+
+    await db_session.refresh(account)
+    assert account.secret_blob_ref == original_ref
+
+
+@pytest.mark.asyncio
+async def test_rotate_credentials_preserves_existing_ref_on_secret_manager_failure(
+    client: AsyncClient, db_session, mocker
+):
+    """After a failed rotation the existing secret_blob_ref must remain intact
+    so the account can still operate using the previous valid credential."""
+    mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(side_effect=OSError("connection refused")),
+    )
+    task, account, _ = await _make_openai_oauth_task(db_session)
+    expected_ref = account.secret_blob_ref
+
+    token = create_agent_token(str(task.id), "agent-vm-rotate")
+    await client.post(
+        "/api/agent/credentials/rotate",
+        headers={"x-agent-token": token},
+        json={"secret": '{"tokens":{"access_token":"x","refresh_token":"rt-x"}}'},
+    )
+
+    await db_session.refresh(account)
+    assert account.secret_blob_ref == expected_ref
+
+
 # ── Strategic-context fetch endpoints ─────────────────────────────────────────
 
 

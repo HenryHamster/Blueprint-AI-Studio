@@ -10,7 +10,14 @@ const apiFetchMock = apiFetch as unknown as ReturnType<typeof vi.fn>;
 const fetchComplianceMock = fetchCrossLayerCompliance as unknown as ReturnType<typeof vi.fn>;
 const response = (cases: unknown[]): Response => ({ ok: true, status: 200, json: async () => ({ cases }) } as Response);
 
-beforeEach(() => apiFetchMock.mockReset());
+beforeEach(() => {
+  apiFetchMock.mockReset();
+  // The panel fetches several endpoints beyond recently-closed (layer-defense-density,
+  // and — via its child panels — first-attempt-compliance-trend and escalation-outcomes).
+  // A default keeps apiFetch from returning undefined (which crashes `.then`) for any
+  // call a test does not explicitly stub with mockResolvedValueOnce/mockImplementation.
+  apiFetchMock.mockResolvedValue({ ok: false, status: 200, json: async () => ({}) } as Response);
+});
 
 describe('RecentlyResolvedRegressionsPanel', () => {
   it('shows time-to-detect when timestamps are present', async () => {
@@ -430,8 +437,10 @@ describe('RecentlyResolvedRegressionsPanel', () => {
     render(<RecentlyResolvedRegressionsPanel projectId="proj-1" />);
     await screen.findByTestId('escalation-outcome-panel');
     expect(screen.getByText('Meta-Escalation Outcomes (30d)')).toBeInTheDocument();
-    expect(screen.getByText('Cross-layer')).toBeInTheDocument();
-    expect(screen.getByText('All other')).toBeInTheDocument();
+    // The panel renders both a mobile card layout and a desktop table, so each
+    // reason label appears twice — assert presence rather than uniqueness.
+    expect(screen.getAllByText('Cross-layer').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('All other').length).toBeGreaterThan(0);
   });
 
   it('renders assertion-type chip for viewport_regression with assertion type', async () => {

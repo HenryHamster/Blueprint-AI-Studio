@@ -42,6 +42,7 @@ describe('SrTrendBreakdown all_iterations_miss_rate', () => {
           miss_rate: 0.2,
           all_iterations_miss_rate: 0.35,
           trend: 'stable',
+          current_finding_count: 10,
         },
       },
     };
@@ -72,6 +73,7 @@ describe('SrTrendBreakdown all_iterations_miss_rate', () => {
           miss_rate: 0.1,          // first-attempt: mostly caught
           all_iterations_miss_rate: 0.25,  // all-iterations: higher — iter-2 misses counted
           trend: 'stable',
+          current_finding_count: 10,
         },
       },
     };
@@ -389,8 +391,8 @@ describe('DirectionSrBreakdownPanel', () => {
       overall_catch_rate: 0.4,
       worst_category: 'correctness',
       categories: {
-        style: { sample_count: 2, hit_rate: 0.5, miss_rate: 0.5 },
-        correctness: { sample_count: 3, hit_rate: 0.33, miss_rate: 0.67 },
+        style: { sample_count: 6, hit_rate: 0.5, miss_rate: 0.5 },
+        correctness: { sample_count: 6, hit_rate: 0.33, miss_rate: 0.67 },
       },
     }];
     render(<DirectionSrBreakdownPanel entries={entries} />);
@@ -1047,7 +1049,7 @@ describe('SrTrendBreakdown reasoning engagement', () => {
       },
     };
     render(<SrTrendBreakdown trends={trends} variant="card" />);
-    const engEl = screen.getByTitle(/Reasoning engagement/i);
+    const engEl = screen.getByTitle(/Reasoning thinning/i);
     expect(engEl).toHaveTextContent('eng:40%');
   });
 

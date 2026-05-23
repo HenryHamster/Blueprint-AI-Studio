@@ -12,6 +12,9 @@ const response = (cases: unknown[]): Response =>
 
 beforeEach(() => apiFetchMock.mockReset());
 
+// 'sr_catch_rate' is a recognized composite-class prefix, so RegressionClassLabel
+// renders it as a prefix chip + 'correctness' subkey span rather than one text node.
+// Tests gate render-completion on findByText('correctness') (the subkey) accordingly.
 const baseCase = {
   id: 'mi-1',
   regression_class: 'sr_catch_rate:correctness',
@@ -47,7 +50,7 @@ describe('ManualInterventionPanel — layer badges', () => {
       },
     ]));
     render(<ManualInterventionPanel projectId="proj-1" />);
-    await screen.findByText('sr_catch_rate:correctness');
+    await screen.findByText('correctness');
     expect(screen.getByTestId('layer-badge-CI_WORKFLOW')).toHaveTextContent('CI · 5');
     expect(screen.getByTestId('layer-badge-AGENT_VM')).toHaveTextContent('VM · 2');
     expect(screen.getByTestId('cross-layer-badge')).toBeInTheDocument();
@@ -68,7 +71,7 @@ describe('ManualInterventionPanel — layer badges', () => {
       },
     ]));
     render(<ManualInterventionPanel projectId="proj-1" />);
-    await screen.findByText('sr_catch_rate:correctness');
+    await screen.findByText('correctness');
     expect(screen.getByTestId('layer-badge-REVIEWER_PASS')).toHaveTextContent('REVIEWER · 2');
     expect(screen.queryByTestId('cross-layer-badge')).toBeNull();
   });
@@ -76,7 +79,7 @@ describe('ManualInterventionPanel — layer badges', () => {
   it('renders no badges when layer_summary is omitted', async () => {
     apiFetchMock.mockResolvedValueOnce(response([baseCase]));
     render(<ManualInterventionPanel projectId="proj-1" />);
-    await screen.findByText('sr_catch_rate:correctness');
+    await screen.findByText('correctness');
     expect(screen.queryByTestId('layers-affected-badges')).toBeNull();
   });
 });
@@ -91,7 +94,7 @@ describe('ManualInterventionPanel — phase chips', () => {
       time_to_investigate_sec: 600,
     }]));
     render(<ManualInterventionPanel projectId="proj-1" />);
-    await screen.findByText('sr_catch_rate:correctness');
+    await screen.findByText('correctness');
     const timeline = screen.getByTestId('active-phase-timeline');
     expect(timeline).toBeInTheDocument();
     expect(timeline).toHaveTextContent('investigate→');
@@ -107,7 +110,7 @@ describe('ManualInterventionPanel — phase chips', () => {
       time_to_investigate_sec: null,
     }]));
     render(<ManualInterventionPanel projectId="proj-1" />);
-    await screen.findByText('sr_catch_rate:correctness');
+    await screen.findByText('correctness');
     const timeline = screen.getByTestId('active-phase-timeline');
     expect(timeline).toHaveTextContent('pending');
   });
@@ -122,7 +125,7 @@ describe('ManualInterventionPanel — phase chips', () => {
       time_to_investigate_sec: null,
     }]));
     render(<ManualInterventionPanel projectId="proj-1" />);
-    await screen.findByText('sr_catch_rate:correctness');
+    await screen.findByText('correctness');
     const timeline = screen.getByTestId('active-phase-timeline');
     const pendingSpan = Array.from(timeline.querySelectorAll('span')).find(
       (el) => el.textContent === 'pending'
@@ -136,7 +139,7 @@ describe('ManualInterventionPanel — layer mismatch badge', () => {
   it('shows no badge when layer_mismatch is absent', async () => {
     apiFetchMock.mockResolvedValueOnce(response([baseCase]));
     render(<ManualInterventionPanel projectId="proj-1" />);
-    await screen.findByText('sr_catch_rate:correctness');
+    await screen.findByText('correctness');
     expect(screen.queryByTestId('layer-mismatch-badge')).toBeNull();
   });
 
@@ -156,7 +159,7 @@ describe('ManualInterventionPanel — layer mismatch badge', () => {
       },
     ]));
     render(<ManualInterventionPanel projectId="proj-1" />);
-    await screen.findByText('sr_catch_rate:correctness');
+    await screen.findByText('correctness');
     expect(screen.queryByTestId('layer-mismatch-badge')).toBeNull();
   });
 
@@ -176,7 +179,7 @@ describe('ManualInterventionPanel — layer mismatch badge', () => {
       },
     ]));
     render(<ManualInterventionPanel projectId="proj-1" />);
-    await screen.findByText('sr_catch_rate:correctness');
+    await screen.findByText('correctness');
     const badge = screen.getByTestId('layer-mismatch-badge');
     expect(badge).toBeInTheDocument();
     expect(badge).toHaveTextContent('layer mismatch');

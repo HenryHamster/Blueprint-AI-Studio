@@ -1169,7 +1169,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     }
 
     return (
-      <div key={msg.id} className={`flex ${userMsg ? 'justify-end' : 'justify-start'} ${faded ? 'opacity-75' : ''}`}>
+      <div key={msg.id} data-testid="message-bubble" className={`flex ${userMsg ? 'justify-end' : 'justify-start'} ${faded ? 'opacity-75' : ''}`}>
         <div className={`max-w-[85%] md:max-w-[70%] ${userMsg ? 'items-end' : 'items-start'} flex flex-col`}>
           {/* Bubble */}
           <div className={`rounded-2xl border px-4 py-3 ${config.bubbleBg} ${

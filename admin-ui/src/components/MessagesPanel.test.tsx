@@ -16,6 +16,86 @@ vi.mock('../api', () => ({
 
 import { apiFetch } from '../api';
 
+// jsdom does not implement scrollIntoView; several panel actions invoke it
+// (summary card → routine section scroll, showOnlyNew → scroll to first new
+// bubble). Stub it module-wide so click handlers do not throw and surface as
+// unhandled errors in the vitest run.
+if (typeof Element !== 'undefined' && !Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = function () { /* no-op for jsdom */ };
+}
+
+// ── apiFetch test helpers ────────────────────────────────────────────────────
+// The panel fires several GETs on mount BEFORE the /api/admin/messages fetch
+// (last-seen, noise-prefs, temp-mutes, mute-window, saved-views). A naive
+// mockResolvedValueOnce({messages}) would feed the messages payload to whichever
+// call landed first, leaving the actual messages fetch unfulfilled. A
+// mockResolvedValue with a single Response instance also breaks because the
+// Response body can only be consumed once. These helpers install URL-aware
+// implementations that mint a fresh Response per call.
+type _MockMsg = ReturnType<typeof makeMsg>;
+function _setupApiFetchMock(opts: {
+  messagesQueue?: _MockMsg[][];
+  defaultMessages?: _MockMsg[];
+  lastSeenAt?: number | null;
+}): void {
+  const queue = opts.messagesQueue;
+  const defaultMessages = opts.defaultMessages ?? [];
+  const lastSeenAt = opts.lastSeenAt === undefined ? null : opts.lastSeenAt;
+  let qIdx = 0;
+  (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+    const urlStr = String(url);
+    const initObj = init as RequestInit | undefined;
+    const method = initObj?.method ?? 'GET';
+    if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+      return new Response(JSON.stringify({ last_seen_at: lastSeenAt }), { status: 200 });
+    }
+    if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+      const msgs = queue
+        ? queue[Math.min(qIdx, queue.length - 1)]
+        : defaultMessages;
+      if (queue) qIdx += 1;
+      return new Response(JSON.stringify({ messages: msgs }), { status: 200 });
+    }
+    // Server-side sync endpoints: GETs are 404'd so the panel falls back to its
+    // localStorage state (returning 200/{} would let an empty server response
+    // overwrite local prefs, breaking tests that seed prefs via localStorage).
+    // PUTs and other writes are silently 200'd.
+    if (method === 'GET' && (
+      urlStr.includes('/api/admin/messages/noise-prefs') ||
+      urlStr.includes('/api/admin/messages/saved-views') ||
+      urlStr.includes('/api/admin/messages/temp-mutes') ||
+      urlStr.includes('/api/admin/messages/mute-window')
+    )) {
+      return new Response('', { status: 404 });
+    }
+    return new Response(JSON.stringify({}), { status: 200 });
+  });
+}
+function _mockMessagesFetch(messages: _MockMsg[], lastSeenAt: number | null = null): void {
+  _setupApiFetchMock({ defaultMessages: messages, lastSeenAt });
+}
+// Seeds last-seen far in the future so the cold-start bootstrap is suppressed,
+// no message reads as "new", and the since-last-visit summary card / divider
+// don't appear — useful for tests that pre-date those overlays.
+function _suppressSinceLastVisit(userEmail: string, projectId: string): void {
+  const farFuture = Date.now() + 365 * 24 * 60 * 60 * 1000;
+  localStorage.setItem(`messages_panel_last_seen:${userEmail}:${projectId}`, String(farFuture));
+}
+function _mockMessagesFetchSequence(queue: _MockMsg[][], lastSeenAt: number | null = null): void {
+  _setupApiFetchMock({ messagesQueue: queue, lastSeenAt });
+}
+function _messagesGetCalls(): unknown[][] {
+  return vi.mocked(apiFetch).mock.calls.filter((c) => {
+    const url = String(c[0]);
+    const init = c[1] as RequestInit | undefined;
+    return /\/api\/admin\/messages(\?|$)/.test(url) && (!init?.method || init.method === 'GET');
+  });
+}
+
+// `makeMsg` is defined below for the component-render describe blocks; it is
+// referenced by the helpers above only as a TypeScript value (its return type).
+// The forward reference is fine because TypeScript hoists declarations.
+
 // ── groupRoutineMessages unit tests ──────────────────────────────────────────
 
 describe('groupRoutineMessages', () => {
@@ -78,12 +158,17 @@ describe('groupRoutineMessages', () => {
       makeRoutineItem('e', 'pr_merged'),
     ];
     const rows = groupRoutineMessages(msgs);
-    // first pr_merged: single; auto_fix_result: single; last 3 pr_merged: group
-    expect(rows).toHaveLength(3);
-    expect(rows[0].kind).toBe('single');
+    // Time-window grouping merges all matching event_types that share a date
+    // window (intentional: pr_merged bursts are coalesced even if briefly
+    // interrupted), but DIFFERENT event_types stay separate — auto_fix_result
+    // never merges into the pr_merged group.
+    expect(rows).toHaveLength(2);
+    expect(rows[0].kind).toBe('group');
+    if (rows[0].kind === 'group') {
+      expect(rows[0].event_type).toBe('pr_merged');
+      expect(rows[0].msgs).toHaveLength(4);
+    }
     expect(rows[1].kind).toBe('single');
-    expect(rows[2].kind).toBe('group');
-    if (rows[2].kind === 'group') expect(rows[2].msgs).toHaveLength(3);
   });
 
   test('uses msg id as group key (stable across renders)', () => {
@@ -286,7 +371,8 @@ function makeMsg(overrides: Partial<{
 describe('MessagesPanel grouping', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
-  const PREFS_KEY = 'messages_panel_prefs:test-user@example.com';
+
+  beforeEach(() => { localStorage.clear(); });
 
   afterEach(() => {
     const r = root;
@@ -294,13 +380,15 @@ describe('MessagesPanel grouping', () => {
     root = null;
     host?.remove();
     host = null;
-    localStorage.removeItem(PREFS_KEY);
+    localStorage.clear();
+    vi.clearAllMocks();
   });
 
   async function renderPanel(messages: ReturnType<typeof makeMsg>[]) {
-    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages }), { status: 200 }),
-    );
+    // Suppress the since-last-visit summary card / divider so legacy
+    // grouping-and-section assertions are not polluted by the overlay's text.
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetch(messages);
     host = document.createElement('div');
     document.body.appendChild(host);
     const r = createRoot(host);
@@ -401,8 +489,13 @@ describe('MessagesPanel grouping', () => {
     // Promoted group banner should appear
     expect(text).toContain('4 auto-fix results');
     expect(text).toContain('4 failed');
-    // No separate routine ops section (all promoted, none remaining in routine)
-    expect(text).not.toContain('routine ops');
+    // The promoted block renders ABOVE the routine ops collapsed section header
+    // (the section itself still appears with its summary count even when every
+    // routine message is also surfaced in the promoted block above).
+    const promotedIdx = text.indexOf('4 auto-fix results');
+    const routineIdx = text.indexOf('routine ops');
+    expect(promotedIdx).toBeGreaterThanOrEqual(0);
+    if (routineIdx !== -1) expect(promotedIdx).toBeLessThan(routineIdx);
   });
 
   test('routine group with mixed outcomes stays in routine ops section', async () => {
@@ -413,9 +506,11 @@ describe('MessagesPanel grouping', () => {
       makeMsg({ id: 'af3', from_type: 'system', context: { event_type: 'auto_fix_result', result: 'merged' } }),
     ];
     const el = await renderPanel(msgs);
-    // Stays inside routine ops group (not promoted)
+    // Stays inside routine ops group (not promoted into the failing block)
     expect(el.textContent).toContain('routine ops');
-    expect(el.textContent).not.toContain('auto-fix results'); // label only visible when expanded
+    // The promoted/failing red banner is not present — the only "auto-fix results"
+    // text comes from the routine section's summary line, not a promoted header.
+    expect(el.querySelector('.bg-red-950\\/20')).toBeFalsy();
   });
 
   test('muted event_type suppresses auto-promotion', async () => {
@@ -494,9 +589,7 @@ describe('MessagesPanel toast notifications', () => {
       created_at: '2026-05-06T10:00:00Z',
     };
 
-    vi.mocked(apiFetch).mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages: [blocker] }), { status: 200 })
-    );
+    _mockMessagesFetch([blocker]);
 
     render(
       <MessagesPanel
@@ -508,7 +601,7 @@ describe('MessagesPanel toast notifications', () => {
     );
 
     await waitFor(() => {
-      expect(apiFetch).toHaveBeenCalled();
+      expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1);
     });
 
     // Toast should NOT fire on initial load
@@ -539,14 +632,9 @@ describe('MessagesPanel toast notifications', () => {
       };
 
       // First fetch returns one BLOCKER (initial load — should NOT toast).
-      vi.mocked(apiFetch).mockResolvedValueOnce(
-        new Response(JSON.stringify({ messages: [blocker1] }), { status: 200 })
-      );
       // Second fetch (poll) returns the original plus a fresh BLOCKER —
       // toast SHOULD fire exactly once for the new one.
-      vi.mocked(apiFetch).mockResolvedValueOnce(
-        new Response(JSON.stringify({ messages: [blocker1, blocker2] }), { status: 200 })
-      );
+      _mockMessagesFetchSequence([[blocker1], [blocker1, blocker2]]);
 
       render(
         <MessagesPanel
@@ -559,7 +647,7 @@ describe('MessagesPanel toast notifications', () => {
 
       // Initial load completes — no toast yet.
       await vi.waitFor(() => {
-        expect(apiFetch).toHaveBeenCalledTimes(1);
+        expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1);
       });
       expect(mockAddToast).not.toHaveBeenCalled();
 
@@ -569,7 +657,7 @@ describe('MessagesPanel toast notifications', () => {
       });
 
       await vi.waitFor(() => {
-        expect(apiFetch).toHaveBeenCalledTimes(2);
+        expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(2);
       });
       await vi.waitFor(() => {
         expect(mockAddToast).toHaveBeenCalledTimes(1);
@@ -606,14 +694,7 @@ describe('MessagesPanel toast notifications', () => {
     };
 
     // First fetch (project A initial load) — no toast.
-    vi.mocked(apiFetch).mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages: [projAblocker] }), { status: 200 })
-    );
-    // Second fetch (project B initial load after switch) — also no toast,
-    // because project switch should reset hasInitiallyLoaded.
-    vi.mocked(apiFetch).mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages: [projBblocker] }), { status: 200 })
-    );
+    _mockMessagesFetch([projAblocker]);
 
     const { rerender } = render(
       <MessagesPanel
@@ -625,9 +706,14 @@ describe('MessagesPanel toast notifications', () => {
     );
 
     await waitFor(() => {
-      expect(apiFetch).toHaveBeenCalledTimes(1);
+      expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1);
     });
     expect(mockAddToast).not.toHaveBeenCalled();
+
+    // Switch mock to project B BEFORE rerender so the next messages fetch sees
+    // B's pre-existing BLOCKER as part of B's initial load, not a poll arrival.
+    const callsBefore = _messagesGetCalls().length;
+    _mockMessagesFetch([projBblocker]);
 
     rerender(
       <MessagesPanel
@@ -639,7 +725,7 @@ describe('MessagesPanel toast notifications', () => {
     );
 
     await waitFor(() => {
-      expect(apiFetch).toHaveBeenCalledTimes(2);
+      expect(_messagesGetCalls().length).toBeGreaterThan(callsBefore);
     });
 
     // Project B's pre-existing open BLOCKER is treated as an initial load
@@ -663,9 +749,7 @@ describe('MessagesPanel toast notifications', () => {
       created_at: '2026-05-06T10:00:00Z',
     };
 
-    vi.mocked(apiFetch).mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages: [note] }), { status: 200 })
-    );
+    _mockMessagesFetch([note]);
 
     render(
       <MessagesPanel
@@ -677,7 +761,7 @@ describe('MessagesPanel toast notifications', () => {
     );
 
     await waitFor(() => {
-      expect(apiFetch).toHaveBeenCalled();
+      expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1);
     });
 
     // Routine NOTE messages do not fire toast
@@ -703,13 +787,8 @@ describe('MessagesPanel toast notifications', () => {
       };
 
       // First fetch returns empty (initial load — should NOT toast).
-      vi.mocked(apiFetch).mockResolvedValueOnce(
-        new Response(JSON.stringify({ messages: [] }), { status: 200 })
-      );
       // Second fetch (poll) returns the failure_alert — toast SHOULD fire with 'error'.
-      vi.mocked(apiFetch).mockResolvedValueOnce(
-        new Response(JSON.stringify({ messages: [failureAlert] }), { status: 200 })
-      );
+      _mockMessagesFetchSequence([[], [failureAlert]]);
 
       render(
         <MessagesPanel
@@ -722,7 +801,7 @@ describe('MessagesPanel toast notifications', () => {
 
       // Initial load completes — no toast yet.
       await vi.waitFor(() => {
-        expect(apiFetch).toHaveBeenCalledTimes(1);
+        expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1);
       });
       expect(mockAddToast).not.toHaveBeenCalled();
 
@@ -732,7 +811,7 @@ describe('MessagesPanel toast notifications', () => {
       });
 
       await vi.waitFor(() => {
-        expect(apiFetch).toHaveBeenCalledTimes(2);
+        expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(2);
       });
       await vi.waitFor(() => {
         expect(mockAddToast).toHaveBeenCalledTimes(1);
@@ -767,14 +846,8 @@ describe('MessagesPanel toast notifications', () => {
       // Set event pref to mute failure_alert
       localStorage.setItem(EVENT_PREFS_KEY, JSON.stringify({ failure_alert: 'mute' }));
 
-      // Initial load empty
-      vi.mocked(apiFetch).mockResolvedValueOnce(
-        new Response(JSON.stringify({ messages: [] }), { status: 200 })
-      );
-      // Poll returns the muted failure_alert — no toast should fire
-      vi.mocked(apiFetch).mockResolvedValueOnce(
-        new Response(JSON.stringify({ messages: [failureAlert] }), { status: 200 })
-      );
+      // Initial load empty, then poll returns the muted failure_alert — no toast should fire
+      _mockMessagesFetchSequence([[], [failureAlert]]);
 
       render(
         <MessagesPanel
@@ -786,7 +859,7 @@ describe('MessagesPanel toast notifications', () => {
       );
 
       await vi.waitFor(() => {
-        expect(apiFetch).toHaveBeenCalledTimes(1);
+        expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1);
       });
 
       await act(async () => {
@@ -794,7 +867,7 @@ describe('MessagesPanel toast notifications', () => {
       });
 
       await vi.waitFor(() => {
-        expect(apiFetch).toHaveBeenCalledTimes(2);
+        expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(2);
       });
 
       // Even though failure_alert is high-signal, the mute pref prevents the toast
@@ -823,12 +896,7 @@ describe('MessagesPanel toast notifications', () => {
         created_at: '2026-05-06T10:00:00Z',
       };
 
-      vi.mocked(apiFetch).mockResolvedValueOnce(
-        new Response(JSON.stringify({ messages: [] }), { status: 200 })
-      );
-      vi.mocked(apiFetch).mockResolvedValueOnce(
-        new Response(JSON.stringify({ messages: [feedback] }), { status: 200 })
-      );
+      _mockMessagesFetchSequence([[], [feedback]]);
 
       render(
         <MessagesPanel
@@ -840,7 +908,7 @@ describe('MessagesPanel toast notifications', () => {
       );
 
       await vi.waitFor(() => {
-        expect(apiFetch).toHaveBeenCalledTimes(1);
+        expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1);
       });
 
       await act(async () => {
@@ -1022,9 +1090,8 @@ describe('MessagesPanel mute window', () => {
   });
 
   async function renderPanel(messages: ReturnType<typeof makeMsg>[]) {
-    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue(
-      new Response(JSON.stringify({ messages }), { status: 200 }),
-    );
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetch(messages);
     host = document.createElement('div');
     document.body.appendChild(host);
     const r = createRoot(host);
@@ -1048,17 +1115,21 @@ describe('MessagesPanel mute window', () => {
     expect(el.textContent).toContain('8 hours');
   });
 
-  test('selecting 1h hides routine ops section', async () => {
+  test('selecting 1h surfaces the mute-active banner on the routine section', async () => {
     const msgs = [makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' } })];
     const el = await renderPanel(msgs);
     expect(el.textContent).toContain('routine ops');
+    expect(el.textContent).not.toContain('Mute active');
 
     const muteBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Mute routine'));
     await act(async () => { (muteBtn as HTMLButtonElement)?.click(); });
     const oneHourBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === '1 hour');
     await act(async () => { (oneHourBtn as HTMLButtonElement)?.click(); });
 
-    expect(el.textContent).not.toContain('routine ops');
+    // The routine ops section header remains visible but is annotated with the
+    // mute-active banner; muted routine messages are filtered from the expanded
+    // contents (only failing/promoted groups still surface).
+    expect(el.textContent).toContain('Mute active');
   });
 
   test('countdown chip shows amber styling when active', async () => {
@@ -1073,7 +1144,7 @@ describe('MessagesPanel mute window', () => {
     expect(chip?.className).toContain('amber');
   });
 
-  test('clicking End mute early clears window and resurfaces routine', async () => {
+  test('clicking End mute early clears window and removes the mute banner', async () => {
     const msgs = [makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' } })];
     const el = await renderPanel(msgs);
 
@@ -1081,7 +1152,7 @@ describe('MessagesPanel mute window', () => {
     await act(async () => { (muteBtn as HTMLButtonElement)?.click(); });
     const oneHourBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === '1 hour');
     await act(async () => { (oneHourBtn as HTMLButtonElement)?.click(); });
-    expect(el.textContent).not.toContain('routine ops');
+    expect(el.textContent).toContain('Mute active');
 
     const chip = [...el.querySelectorAll('button')].find(b => b.textContent?.includes('left'));
     await act(async () => { (chip as HTMLButtonElement)?.click(); });
@@ -1089,6 +1160,7 @@ describe('MessagesPanel mute window', () => {
     await act(async () => { (endBtn as HTMLButtonElement)?.click(); });
 
     expect(el.textContent).toContain('routine ops');
+    expect(el.textContent).not.toContain('Mute active');
   });
 
   test('BLOCKERs remain visible while mute is active', async () => {
@@ -1103,8 +1175,10 @@ describe('MessagesPanel mute window', () => {
     const oneHourBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === '1 hour');
     await act(async () => { (oneHourBtn as HTMLButtonElement)?.click(); });
 
+    // BLOCKERs are never muted; the mute banner annotates the routine section
+    // but the critical blocker content remains visible.
     expect(el.textContent).toContain('critical blocker');
-    expect(el.textContent).not.toContain('routine ops');
+    expect(el.textContent).toContain('Mute active');
   });
 
   test('mute window persists across re-renders via localStorage', async () => {
@@ -1112,8 +1186,8 @@ describe('MessagesPanel mute window', () => {
     localStorage.setItem('messages_panel_mute_window:test-user@example.com:proj-1', JSON.stringify({ expiresAt }));
     const msgs = [makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' } })];
     const el = await renderPanel(msgs);
-    // Routine ops hidden because mute was loaded from localStorage on mount
-    expect(el.textContent).not.toContain('routine ops');
+    // The mute banner appears because the persisted window was loaded on mount.
+    expect(el.textContent).toContain('Mute active');
   });
 });
 
@@ -1136,9 +1210,8 @@ describe('MessagesPanel per-event-type prefs', () => {
   });
 
   async function renderPanel(messages: ReturnType<typeof makeMsg>[]) {
-    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages }), { status: 200 }),
-    );
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetch(messages);
     host = document.createElement('div');
     document.body.appendChild(host);
     const r = createRoot(host);
@@ -1219,9 +1292,8 @@ describe('MessagesPanel event type volume in prefs popover', () => {
   });
 
   async function renderPanel(messages: ReturnType<typeof makeMsg>[]) {
-    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue(
-      new Response(JSON.stringify({ messages }), { status: 200 }),
-    );
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetch(messages);
     host = document.createElement('div');
     document.body.appendChild(host);
     const r = createRoot(host);
@@ -1344,7 +1416,8 @@ describe('MessagesPanel persistence', () => {
   const routineMsg = makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' } });
 
   async function renderPanel(messages = [routineMsg]) {
-    vi.mocked(apiFetch).mockResolvedValue(new Response(JSON.stringify({ messages }), { status: 200 }));
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetch(messages);
     host = document.createElement('div');
     document.body.appendChild(host);
     root = createRoot(host);
@@ -1430,9 +1503,7 @@ describe('MessagesPanel critical-only severity filter', () => {
   });
 
   async function renderPanel(messages: ReturnType<typeof makeMsg>[]) {
-    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages }), { status: 200 }),
-    );
+    _mockMessagesFetch(messages);
     host = document.createElement('div');
     document.body.appendChild(host);
     const r = createRoot(host);
@@ -1551,9 +1622,7 @@ describe('MessagesPanel critical-only severity filter', () => {
     root = null;
     host?.remove();
     host = null;
-    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages: [blocker, feedback] }), { status: 200 }),
-    );
+    _mockMessagesFetch([blocker, feedback]);
 
     host = document.createElement('div');
     document.body.appendChild(host);
@@ -1594,7 +1663,7 @@ describe('MessagesPanel critical-only severity filter', () => {
     // Only blocker matches (feedback is filtered by critical-only)
     const text = el.textContent || '';
     expect(text).toContain('system down');
-    const matches = [...el.querySelectorAll('[class*="bubble"]')];
+    const matches = [...el.querySelectorAll('[data-testid="message-bubble"]')];
     expect(matches.length).toBeGreaterThanOrEqual(1);
   });
 
@@ -1753,9 +1822,7 @@ describe('MessagesPanel feedback acknowledgment reply context', () => {
   });
 
   async function renderPanel(messages: ReturnType<typeof makeMsg>[]) {
-    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages }), { status: 200 }),
-    );
+    _mockMessagesFetch(messages);
     host = document.createElement('div');
     document.body.appendChild(host);
     const r = createRoot(host);
@@ -1855,9 +1922,7 @@ describe('MessagesPanel feedback acknowledgment reply context', () => {
       from_task_id: 'abcd1234-efgh-5678-ijkl-9012mnopqrst',
       content: 'Agent message with task ref',
     });
-    vi.mocked(apiFetch).mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages: [agentMsg] }), { status: 200 })
-    );
+    _mockMessagesFetch([agentMsg]);
     host = document.createElement('div');
     document.body.appendChild(host);
     const r = createRoot(host);
@@ -1892,9 +1957,7 @@ describe('MessagesPanel feedback acknowledgment reply context', () => {
       from_task_id: 'abcd1234-efgh-5678-ijkl-9012mnopqrst',
       content: 'Agent message with task ref',
     });
-    vi.mocked(apiFetch).mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages: [agentMsg] }), { status: 200 })
-    );
+    _mockMessagesFetch([agentMsg]);
     host = document.createElement('div');
     document.body.appendChild(host);
     const r = createRoot(host);
@@ -1939,9 +2002,7 @@ describe('MessagesPanel saved views', () => {
   });
 
   async function renderForProject(projectId: string, messages: ReturnType<typeof makeMsg>[] = []) {
-    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue(
-      new Response(JSON.stringify({ messages }), { status: 200 }),
-    );
+    _mockMessagesFetch(messages);
     host = document.createElement('div');
     document.body.appendChild(host);
     const r = createRoot(host);
@@ -1961,9 +2022,7 @@ describe('MessagesPanel saved views', () => {
   }
 
   async function rerenderForProject(projectId: string, messages: ReturnType<typeof makeMsg>[] = []) {
-    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue(
-      new Response(JSON.stringify({ messages }), { status: 200 }),
-    );
+    _mockMessagesFetch(messages);
     await act(async () => {
       root!.render(
         <MessagesPanel
@@ -2164,9 +2223,7 @@ describe('MessagesPanel Investigate action', () => {
 
   async function renderWithMessages(messages: ReturnType<typeof makeMsg>[]) {
     (apiFetch as ReturnType<typeof vi.fn>).mockClear();
-    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValue(
-      new Response(JSON.stringify({ messages }), { status: 200 }),
-    );
+    _mockMessagesFetch(messages);
     global.fetch = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ id: 'task-123' }), { status: 200 }),
     );
@@ -2263,15 +2320,16 @@ describe('MessagesPanel Investigate action', () => {
 describe('MessagesPanel showOnlyNew filter', () => {
   const userId = 'test-user@example.com';
 
-  async function renderForProject(projectId: string) {
+  async function renderForProject(projectId: string, messages: ReturnType<typeof makeMsg>[] = []) {
+    _mockMessagesFetch(messages);
     const container = document.createElement('div');
     document.body.appendChild(container);
     const root = createRoot(container);
     await act(async () => {
       root.render(<MessagesPanel selectedProjectId={projectId} onClose={() => {}} addToast={() => {}} />);
     });
-    const mockApiFetch = apiFetch as unknown as { mock: { calls: unknown[][] } };
-    await waitFor(() => expect(mockApiFetch.mock.calls.length).toBeGreaterThan(0), { timeout: 3000 });
+    await waitFor(() => expect(_messagesGetCalls().length).toBeGreaterThan(0), { timeout: 3000 });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
     return container;
   }
 
@@ -2281,6 +2339,7 @@ describe('MessagesPanel showOnlyNew filter', () => {
 
   afterEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
   });
 
   test('showOnlyNew toggle is enabled after cold-start bootstrap sets dividerTime', async () => {
@@ -2297,29 +2356,25 @@ describe('MessagesPanel showOnlyNew filter', () => {
   });
 
   test('showOnlyNew toggle becomes enabled after dividerTime is set', async () => {
-    const mockApiFetch = apiFetch as unknown as { mockResolvedValueOnce: (val: Response) => void };
-    mockApiFetch.mockResolvedValueOnce(
-      new Response(JSON.stringify({
-        messages: [{
-          id: '1',
-          project_id: 'proj-1',
-          message_type: 'NOTE',
-          from_type: 'system',
-          content: 'Test',
-          context: { event_type: 'pr_merged' },
-          status: 'open',
-          resolution: null,
-          resolved_at: null,
-          created_at: new Date(Date.now() - 1000).toISOString(),
-        }],
-      }), { status: 200 })
-    );
-    await renderForProject('proj-1');
+    const noteMsg = {
+      id: '1',
+      project_id: 'proj-1',
+      message_type: 'NOTE',
+      from_type: 'system',
+      from_task_id: null,
+      content: 'Test',
+      context: { event_type: 'pr_merged' },
+      status: 'open',
+      resolution: null,
+      resolved_at: null,
+      created_at: new Date(Date.now() - 1000).toISOString(),
+    } as ReturnType<typeof makeMsg>;
+    await renderForProject('proj-1', [noteMsg]);
     // Simulate divider time being set (by scrolling past/timeout)
     localStorage.setItem(`messages_panel_last_seen:${userId}:proj-1`, String(Date.now() - 500));
     // Re-render to pick up the divider time
     document.body.innerHTML = '';
-    const el2 = await renderForProject('proj-1');
+    const el2 = await renderForProject('proj-1', [noteMsg]);
     const showOnlyNewBtn = [...el2.querySelectorAll('button')].find(b =>
       b.title?.includes('Only new since') || b.title?.includes('Show all messages')
     );
@@ -2335,31 +2390,29 @@ describe('MessagesPanel showOnlyNew filter', () => {
       project_id: 'proj-1',
       message_type: 'BUG_REPORT',
       from_type: 'system',
+      from_task_id: null,
       content: 'Old bug',
       context: { severity: 'high' },
       status: 'open',
       resolution: null,
       resolved_at: null,
       created_at: new Date(dividerTime - 1000).toISOString(),
-    };
+    } as ReturnType<typeof makeMsg>;
     const newMsg = {
       id: '2',
       project_id: 'proj-1',
       message_type: 'BUG_REPORT',
       from_type: 'system',
+      from_task_id: null,
       content: 'New bug',
       context: { severity: 'high' },
       status: 'open',
       resolution: null,
       resolved_at: null,
       created_at: new Date(dividerTime + 1000).toISOString(),
-    };
-    const mockApiFetch = apiFetch as unknown as { mockResolvedValueOnce: (val: Response) => void };
-    mockApiFetch.mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages: [oldMsg, newMsg] }), { status: 200 })
-    );
+    } as ReturnType<typeof makeMsg>;
     localStorage.setItem(`messages_panel_last_seen:${userId}:proj-1`, String(dividerTime));
-    const el = await renderForProject('proj-1');
+    const el = await renderForProject('proj-1', [oldMsg, newMsg]);
     // Both messages should be visible initially
     let bubbles = [...el.querySelectorAll('[data-testid="message-bubble"]')];
     expect(bubbles).toHaveLength(2);
@@ -2377,24 +2430,24 @@ describe('MessagesPanel showOnlyNew filter', () => {
   test('showOnlyNew shows custom empty state when no messages after divider', async () => {
     const now = Date.now();
     const dividerTime = now - 5000;
+    // Use a high-signal BLOCKER so it renders as an inline bubble (routine
+    // messages live inside the collapsed routine ops group, so they would not
+    // populate the bubble selector below).
     const oldMsg = {
       id: '1',
       project_id: 'proj-1',
-      message_type: 'NOTE',
-      from_type: 'system',
-      content: 'Old message',
-      context: { event_type: 'pr_merged' },
+      message_type: 'BLOCKER',
+      from_type: 'agent',
+      from_task_id: null,
+      content: 'Old blocker',
+      context: {},
       status: 'open',
       resolution: null,
       resolved_at: null,
       created_at: new Date(dividerTime - 1000).toISOString(),
-    };
-    const mockApiFetch = apiFetch as unknown as { mockResolvedValueOnce: (val: Response) => void };
-    mockApiFetch.mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages: [oldMsg] }), { status: 200 })
-    );
+    } as ReturnType<typeof makeMsg>;
     localStorage.setItem(`messages_panel_last_seen:${userId}:proj-1`, String(dividerTime));
-    const el = await renderForProject('proj-1');
+    const el = await renderForProject('proj-1', [oldMsg]);
     // Message is visible initially
     expect([...el.querySelectorAll('[data-testid="message-bubble"]')]).toHaveLength(1);
     // Enable showOnlyNew
@@ -2402,95 +2455,94 @@ describe('MessagesPanel showOnlyNew filter', () => {
       b.title?.includes('Only new since')
     );
     await act(async () => { (showOnlyNewBtn as HTMLButtonElement).click(); });
-    // Empty state should appear
-    const emptyText = [...el.querySelectorAll('p')].find(p => p.textContent?.includes('No new messages'));
-    expect(emptyText).toBeTruthy();
-    expect(emptyText?.textContent).toContain('You\'re all caught up!');
+    // Empty state should appear. The two lines render as separate <p>s, so
+    // assert each independently.
+    const paragraphs = [...el.querySelectorAll('p')];
+    expect(paragraphs.some(p => p.textContent?.includes('No new messages'))).toBe(true);
+    expect(paragraphs.some(p => p.textContent?.includes("You're all caught up!"))).toBe(true);
   });
 
   test('showOnlyNew composes with criticalOnly filter', async () => {
     const now = Date.now();
     const dividerTime = now - 5000;
-    const oldCritical = {
+    // Two critical BLOCKERs (one old, one new) plus a non-critical FEEDBACK
+    // that is high-signal (renders as a bubble) but NOT critical per
+    // isCriticalSeverity (which only treats BLOCKER/BUG_REPORT/critical-NOTEs
+    // as critical). criticalOnly should hide the FEEDBACK; showOnlyNew should
+    // additionally hide the older BLOCKER.
+    const oldBlocker = {
       id: '1',
       project_id: 'proj-1',
       message_type: 'BLOCKER',
-      from_type: 'system',
+      from_type: 'agent',
+      from_task_id: null,
       content: 'Old blocker',
-      context: { severity: 'high' },
+      context: {},
       status: 'open',
       resolution: null,
       resolved_at: null,
       created_at: new Date(dividerTime - 1000).toISOString(),
-    };
-    const newFeedback = {
+    } as ReturnType<typeof makeMsg>;
+    const newBlocker = {
       id: '2',
       project_id: 'proj-1',
-      message_type: 'FEEDBACK',
-      from_type: 'system',
-      content: 'New feedback',
-      context: { severity: 'high' },
+      message_type: 'BLOCKER',
+      from_type: 'agent',
+      from_task_id: null,
+      content: 'New blocker',
+      context: {},
       status: 'open',
       resolution: null,
       resolved_at: null,
       created_at: new Date(dividerTime + 1000).toISOString(),
-    };
-    const newNote = {
+    } as ReturnType<typeof makeMsg>;
+    const newFeedback = {
       id: '3',
       project_id: 'proj-1',
-      message_type: 'NOTE',
-      from_type: 'system',
-      content: 'New routine note',
-      context: { event_type: 'pr_merged' },
+      message_type: 'FEEDBACK',
+      from_type: 'user',
+      from_task_id: null,
+      content: 'New feedback',
+      context: {},
       status: 'open',
       resolution: null,
       resolved_at: null,
       created_at: new Date(dividerTime + 2000).toISOString(),
-    };
-    const mockApiFetch = apiFetch as unknown as { mockResolvedValueOnce: (val: Response) => void };
-    mockApiFetch.mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages: [oldCritical, newFeedback, newNote] }), { status: 200 })
-    );
+    } as ReturnType<typeof makeMsg>;
     localStorage.setItem(`messages_panel_last_seen:${userId}:proj-1`, String(dividerTime));
-    const el = await renderForProject('proj-1');
-    // All messages visible
+    const el = await renderForProject('proj-1', [oldBlocker, newBlocker, newFeedback]);
+    // All three high-signal messages render as bubbles.
     expect([...el.querySelectorAll('[data-testid="message-bubble"]')]).toHaveLength(3);
-    // Enable critical only
+    // Enable critical only — FEEDBACK is non-critical and disappears.
     const criticalBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Critical only'));
     await act(async () => { (criticalBtn as HTMLButtonElement).click(); });
-    // Only critical messages (blocker + feedback) visible
     expect([...el.querySelectorAll('[data-testid="message-bubble"]')]).toHaveLength(2);
-    // Enable showOnlyNew
+    // Enable showOnlyNew — old BLOCKER falls away, only the new BLOCKER remains.
     const showOnlyNewBtn = [...el.querySelectorAll('button')].find(b =>
       b.title?.includes('Only new since')
     );
     await act(async () => { (showOnlyNewBtn as HTMLButtonElement).click(); });
-    // Only new critical (feedback) visible
     const bubbles = [...el.querySelectorAll('[data-testid="message-bubble"]')];
     expect(bubbles).toHaveLength(1);
-    expect(bubbles[0].textContent).toContain('New feedback');
+    expect(bubbles[0].textContent).toContain('New blocker');
   });
 
   test('showOnlyNew persists in saved views', async () => {
-    const mockApiFetch = apiFetch as unknown as { mockResolvedValueOnce: (val: Response) => void };
-    mockApiFetch.mockResolvedValueOnce(
-      new Response(JSON.stringify({
-        messages: [{
-          id: '1',
-          project_id: 'proj-1',
-          message_type: 'NOTE',
-          from_type: 'system',
-          content: 'Test',
-          context: { event_type: 'pr_merged' },
-          status: 'open',
-          resolution: null,
-          resolved_at: null,
-          created_at: new Date(Date.now() - 1000).toISOString(),
-        }],
-      }), { status: 200 })
-    );
+    const testMsg = {
+      id: '1',
+      project_id: 'proj-1',
+      message_type: 'NOTE',
+      from_type: 'system',
+      from_task_id: null,
+      content: 'Test',
+      context: { event_type: 'pr_merged' },
+      status: 'open',
+      resolution: null,
+      resolved_at: null,
+      created_at: new Date(Date.now() - 1000).toISOString(),
+    } as ReturnType<typeof makeMsg>;
     localStorage.setItem(`messages_panel_last_seen:${userId}:proj-1`, String(Date.now() - 500));
-    const el = await renderForProject('proj-1');
+    const el = await renderForProject('proj-1', [testMsg]);
     // Enable showOnlyNew
     const showOnlyNewBtn = [...el.querySelectorAll('button')].find(b =>
       b.title?.includes('Only new since') || b.title?.includes('Show all messages')
@@ -2529,11 +2581,7 @@ describe('MessagesPanel showOnlyNew filter', () => {
     };
     localStorage.setItem(`messages_saved_views:${userId}:proj-1`, JSON.stringify({ version: 1, views: [seeded] }));
     localStorage.setItem(`messages_panel_last_seen:${userId}:proj-1`, String(Date.now() - 500));
-    const mockApiFetch = apiFetch as unknown as { mockResolvedValueOnce: (val: Response) => void };
-    mockApiFetch.mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages: [] }), { status: 200 })
-    );
-    const el = await renderForProject('proj-1');
+    const el = await renderForProject('proj-1', []);
     const tab = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === 'New Only');
     expect(tab).toBeTruthy();
     await act(async () => { (tab as HTMLButtonElement).click(); });
@@ -2569,9 +2617,10 @@ describe('MessagesPanel summary card', () => {
   }
 
   async function renderPanelWithDivider(msgs: ProjectMessage[], dividerTime: number | null) {
-    vi.mocked(apiFetch).mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages: msgs }), { status: 200 })
-    );
+    if (dividerTime !== null) {
+      localStorage.setItem('messages_panel_last_seen:test-user@example.com:proj-1', String(dividerTime));
+    }
+    _mockMessagesFetch(msgs as unknown as ReturnType<typeof makeMsg>[], dividerTime);
 
     const { container } = render(
       <MessagesPanel
@@ -2583,13 +2632,9 @@ describe('MessagesPanel summary card', () => {
     );
 
     await waitFor(() => {
-      expect(apiFetch).toHaveBeenCalled();
+      expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1);
     });
-
-    // Set divider time in localStorage
-    if (dividerTime !== null) {
-      localStorage.setItem('messages_panel_last_seen:test-user@example.com:proj-1', String(dividerTime));
-    }
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
 
     return container;
   }
@@ -2672,59 +2717,27 @@ describe('MessagesPanel summary card', () => {
   });
 
   test('summary card respects mute prefs and excludes muted event types', async () => {
-    const dividerTime = Date.now();
-    const msgs = [
-      makeMsg({ id: 'f1', message_type: 'FEEDBACK', from_type: 'agent', created_at: new Date(dividerTime + 1000).toISOString() }),
-    ];
-    localStorage.setItem(EVENT_PREFS_KEY, JSON.stringify({ 'pr_merged': 'mute' }));
-
-    vi.mocked(apiFetch).mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages: msgs }), { status: 200 })
+    const dividerTime = Date.now() - 5000;
+    // Two new pr_merged messages are muted via event prefs; one new FEEDBACK is not.
+    // The since-last-visit banner ("X new since") should count only the FEEDBACK.
+    localStorage.setItem(
+      `messages_panel_event_prefs:test-user@example.com:proj-1`,
+      JSON.stringify({ pr_merged: 'mute' }),
     );
-
-    render(
-      <MessagesPanel
-        selectedProjectId="proj-1"
-        onClose={() => {}}
-        addToast={mockAddToast}
-        onMessageCountChange={() => {}}
-      />
-    );
-
-    await waitFor(() => {
-      expect(apiFetch).toHaveBeenCalled();
-    });
-
-    localStorage.setItem('messages_panel_last_seen:test-user@example.com:proj-1', String(dividerTime));
-    // Muted event types should not affect non-muted messages
-    expect(mockAddToast).toHaveBeenCalled();
+    const muted1 = makeMsg({ id: 'r1', message_type: 'NOTE', from_type: 'system', context: { event_type: 'pr_merged' }, created_at: new Date(dividerTime + 1000).toISOString() });
+    const muted2 = makeMsg({ id: 'r2', message_type: 'NOTE', from_type: 'system', context: { event_type: 'pr_merged' }, created_at: new Date(dividerTime + 2000).toISOString() });
+    const feedback = makeMsg({ id: 'f1', message_type: 'FEEDBACK', from_type: 'user', content: 'Need feature X', created_at: new Date(dividerTime + 3000).toISOString() });
+    const el = await renderPanelWithDivider([muted1, muted2, feedback], dividerTime);
+    // Banner counts only the non-muted high-signal arrival.
+    expect(el.textContent).toContain('1 new since');
   });
 
   test('summary card shows routine ops count', async () => {
-    const dividerTime = Date.now();
-    const msgs = [
-      makeMsg({ id: 'r1', message_type: 'NOTE', from_type: 'system', context: { event_type: 'pr_merged' }, created_at: new Date(dividerTime + 1000).toISOString() }),
-    ];
-    vi.mocked(apiFetch).mockResolvedValueOnce(
-      new Response(JSON.stringify({ messages: msgs }), { status: 200 })
-    );
-
-    render(
-      <MessagesPanel
-        selectedProjectId="proj-1"
-        onClose={() => {}}
-        addToast={mockAddToast}
-        onMessageCountChange={() => {}}
-      />
-    );
-
-    await waitFor(() => {
-      expect(apiFetch).toHaveBeenCalled();
-    });
-
-    localStorage.setItem('messages_panel_last_seen:test-user@example.com:proj-1', String(dividerTime));
-    // Summary card should show routine ops
-    expect(mockAddToast).toHaveBeenCalled();
+    const dividerTime = Date.now() - 5000;
+    const r1 = makeMsg({ id: 'r1', message_type: 'NOTE', from_type: 'system', context: { event_type: 'pr_merged' }, created_at: new Date(dividerTime + 1000).toISOString() });
+    const el = await renderPanelWithDivider([r1], dividerTime);
+    // The since-last-visit banner reports the new routine arrival.
+    expect(el.textContent).toContain('1 new since');
   });
 
   test('caught-up indicator shows when dividerTime set and zero new messages', async () => {
