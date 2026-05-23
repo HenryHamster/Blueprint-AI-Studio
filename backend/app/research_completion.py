@@ -1205,8 +1205,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     "recently_completed_finding_titles": _parsed_rc.get(
                         "confirmed", []
                     ),
+                    "category": _d.get("category") or "mixed",
                 }
             )
+    _direction_categories: dict[str, str] = {
+        _d["id"]: _d.get("category") or "mixed"
+        for _d in _dedup_project_dirs
+        if _d.get("id")
+    }
     _retired_failed_approaches = extract_retired_failed_approaches(_retired_ctx_list)
     _archived_diagnoses = extract_archived_diagnoses(
         project_obj.design_doc if project_obj else None
@@ -1265,6 +1271,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         open_pr_files,
         retired_failed_approaches=_retired_failed_approaches,
         archived_diagnoses=_archived_diagnoses,
+        direction_categories=_direction_categories,
     )
     deduplicated = _dedup_outcome.deduplicated
     hash_dedup_count = _dedup_outcome.hash_dedup_count

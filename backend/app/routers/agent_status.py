@@ -318,7 +318,7 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
                 t.status if isinstance(t.status, str) else "UNKNOWN"
             )
             bucket = (
-                classify_failure(t)
+                classify_failure(t, at_time=t.last_heartbeat or t.started_at)
                 if status_val == TaskStatus.FAILED.value
                 else status_val
             )
@@ -499,7 +499,7 @@ async def _check_recurring_failures(task: Task, session: AsyncSession) -> None:
     # Group by failure_class
     by_class: dict[str, list] = {}
     for t in all_failed:
-        fc = classify_failure(t)
+        fc = classify_failure(t, at_time=t.last_heartbeat or t.started_at)
         by_class.setdefault(fc, []).append(t)
 
     for failure_class, tasks_in_class in by_class.items():
@@ -2981,7 +2981,9 @@ async def update_agent_status(
         #  - infra_failure_count: infra wall (PROVISION_FAILURE, RATE_LIMIT, EXTERNAL_API) → opens at 5
         # Both walls block autonomous spawning, but infra opens use a shorter cooldown
         # because infra cascades typically self-heal faster than code regressions.
-        _cb_failure_class = classify_failure(task, payload.logs)
+        _cb_failure_class = classify_failure(
+            task, payload.logs, at_time=task.last_heartbeat or task.started_at
+        )
         if payload.status == TaskStatus.FAILED and task.created_by == "ORCHESTRATOR":
             project_key = str(task.project_id)
             breaker = _shared_state.get_circuit_breaker(project_key)

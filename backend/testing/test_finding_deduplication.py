@@ -803,16 +803,20 @@ def test_extract_retired_failed_approaches_combines_approaches_and_titles():
                 "redis cluster approach",
             ],
             "recently_completed_finding_titles": ["fix logging timestamps"],
+            "category": "structural",
         },
         {"failed_approaches": ["async migration approach"]},
     ]
     result = extract_retired_failed_approaches(retired)
-    assert result == [
-        "cache invalidation strategy",
-        "redis cluster approach",
-        "fix logging timestamps",
-        "async migration approach",
-    ]
+    assert len(result) == 4
+    assert result[0] == {
+        "text": "cache invalidation strategy",
+        "category": "structural",
+    }
+    assert result[1] == {"text": "redis cluster approach", "category": "structural"}
+    assert result[2] == {"text": "fix logging timestamps", "category": "structural"}
+    # No category → defaults to "mixed"
+    assert result[3] == {"text": "async migration approach", "category": "mixed"}
 
 
 def test_extract_retired_failed_approaches_empty_and_none():
@@ -823,8 +827,8 @@ def test_extract_retired_failed_approaches_empty_and_none():
 
 def test_find_retired_approach_match_3_word_threshold():
     approaches = [
-        "cache invalidation performance problem",
-        "redis migration strategy gone",
+        {"text": "cache invalidation performance problem", "category": "mixed"},
+        {"text": "redis migration strategy gone", "category": "mixed"},
     ]
     # 3 non-stopword overlap → match
     assert (
@@ -858,7 +862,9 @@ def test_deduplicate_findings_retired_approach_suppresses():
         failed_hashes={},
         existing_tasks_with_dirs=[],
         open_pr_files=set(),
-        retired_failed_approaches=["cache invalidation performance problem"],
+        retired_failed_approaches=[
+            {"text": "cache invalidation performance problem", "category": "mixed"}
+        ],
     )
     assert outcome.retired_approach_count == 1
     assert outcome.deduplicated == []
@@ -880,12 +886,133 @@ def test_deduplicate_findings_distinct_finding_passes_through_both_filters():
         failed_hashes={},
         existing_tasks_with_dirs=[],
         open_pr_files=set(),
-        retired_failed_approaches=["cache invalidation performance problem"],
+        retired_failed_approaches=[
+            {"text": "cache invalidation performance problem", "category": "mixed"}
+        ],
     )
     assert len(outcome.deduplicated) == 1
     assert outcome.deduplicated[0][2] == fhash
     assert outcome.retired_approach_count == 0
     assert outcome.hash_dedup_count == 0
+
+
+def test_retired_approach_cross_category_does_not_suppress():
+    """structural finding vs product retired approach → NOT blocked (cross-category)."""
+    finding = {
+        "title": "cache invalidation performance problem revisited",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-structural",
+    }
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+        retired_failed_approaches=[
+            {"text": "cache invalidation performance problem", "category": "product"}
+        ],
+        direction_categories={"dir-structural": "structural"},
+    )
+    assert outcome.retired_approach_count == 0
+    assert len(outcome.deduplicated) == 1
+
+
+def test_retired_approach_same_category_suppresses():
+    """structural finding vs structural retired approach → blocked."""
+    finding = {
+        "title": "cache invalidation performance problem revisited",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-structural",
+    }
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+        retired_failed_approaches=[
+            {"text": "cache invalidation performance problem", "category": "structural"}
+        ],
+        direction_categories={"dir-structural": "structural"},
+    )
+    assert outcome.retired_approach_count == 1
+    assert outcome.deduplicated == []
+
+
+def test_retired_approach_mixed_category_suppresses_any():
+    """mixed retired approach vs structural finding → blocked (permissive)."""
+    finding = {
+        "title": "cache invalidation performance problem revisited",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-structural",
+    }
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+        retired_failed_approaches=[
+            {"text": "cache invalidation performance problem", "category": "mixed"}
+        ],
+        direction_categories={"dir-structural": "structural"},
+    )
+    assert outcome.retired_approach_count == 1
+    assert outcome.deduplicated == []
+
+
+def test_retired_approach_mixed_finding_blocked_by_specific_category():
+    """mixed finding vs structural retired approach → blocked (permissive)."""
+    finding = {
+        "title": "cache invalidation performance problem revisited",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-mixed",
+    }
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+        retired_failed_approaches=[
+            {"text": "cache invalidation performance problem", "category": "structural"}
+        ],
+        direction_categories={"dir-mixed": "mixed"},
+    )
+    assert outcome.retired_approach_count == 1
+    assert outcome.deduplicated == []
+
+
+def test_retired_approach_missing_category_treated_as_mixed():
+    """Retired approach with no category key defaults to mixed → suppresses any finding."""
+    finding = {
+        "title": "cache invalidation performance problem revisited",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-structural",
+    }
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=[],
+        open_pr_files=set(),
+        # No "category" key — should default to mixed
+        retired_failed_approaches=[{"text": "cache invalidation performance problem"}],
+        direction_categories={"dir-structural": "structural"},
+    )
+    assert outcome.retired_approach_count == 1
+    assert outcome.deduplicated == []
 
 
 def test_extract_archived_diagnoses_from_design_doc():

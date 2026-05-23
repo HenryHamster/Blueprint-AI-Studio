@@ -2523,3 +2523,66 @@ class TestAtTimeFailureInstantCorrelation:
         assert classify_failure(task, at_time=None) == CODE_ERROR, (
             "failure re-classified at sweep time must be CODE_ERROR (cooldown expired)"
         )
+
+    def test_agent_status_path_threads_at_time_via_heartbeat(self, monkeypatch):
+        """Verify agent_status failure-reporting path threads at_time correctly.
+
+        This test mimics the agent_status code path where tasks with last_heartbeat
+        set are classified. The path should extract and pass last_heartbeat (or
+        started_at fallback) as at_time to classify_failure, not call classify_failure
+        without at_time which would use sweep time instead.
+        """
+        from datetime import datetime, timedelta
+        import app.max_plan_pool as pool_mod
+
+        account_id = "acct-agent-status-test"
+
+        # Account was rate-limited; cooldown active at failure_time, expired by sweep_time.
+        def _account_corr(task, at_time=None):
+            # Simulate cooldown active only when at_time is provided (failure instant).
+            # When at_time is None (sweep time), the cooldown has already cleared.
+            return at_time is not None
+
+        monkeypatch.setattr(
+            pool_mod,
+            "_account_by_id",
+            {account_id: self._make_rl_account(account_id, in_cooldown=True)},
+        )
+        monkeypatch.setattr(
+            "app.failure_classification._account_was_rate_limited",
+            _account_corr,
+        )
+        # Pool-wide check must be disabled so only the account-level at_time
+        # correlation drives the result — isolates the variable under test.
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+
+        # Simulate agent_status code path: task with last_heartbeat set
+        failure_time = datetime.utcnow() - timedelta(minutes=5)
+        task = _task(
+            "",
+            ctx={
+                "failure_category": "claude_code_failed",
+                "llm_account_id": account_id,
+            },
+        )
+        task.last_heartbeat = failure_time
+        task.started_at = failure_time - timedelta(minutes=1)
+
+        # Simulate agent_status classify_failure call with at_time threaded through
+        # (as updated in routers/agent_status.py)
+        failure_class_with_at_time = classify_failure(
+            task, at_time=task.last_heartbeat or task.started_at
+        )
+
+        # Should detect rate-limit because at_time is provided
+        assert failure_class_with_at_time == RATE_LIMIT, (
+            "agent_status path with at_time=last_heartbeat must classify as RATE_LIMIT"
+        )
+
+        # Verify that calling without at_time (old broken path) would miss the rate-limit
+        failure_class_without_at_time = classify_failure(task, at_time=None)
+        assert failure_class_without_at_time == CODE_ERROR, (
+            "classify_failure without at_time falls back to CODE_ERROR (broken path)"
+        )

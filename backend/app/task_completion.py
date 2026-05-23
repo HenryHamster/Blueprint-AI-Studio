@@ -187,7 +187,9 @@ def _stamp_orphan_remediation_outcome(
     if not merged:
         from app.failure_classification import classify_failure  # noqa: PLC0415
 
-        outcome["failure_class"] = classify_failure(task)
+        outcome["failure_class"] = classify_failure(
+            task, at_time=task.last_heartbeat or task.started_at
+        )
         outcome["error_summary"] = (task.latest_status_message or "")[:200]
     ctx["orphan_remediation_outcome"] = outcome
     task.context = ctx
@@ -299,7 +301,9 @@ async def _record_remediation_outcome(
     else:
         from app.failure_classification import classify_failure  # noqa: PLC0415
 
-        target["last_remediation_failure_class"] = classify_failure(task)
+        target["last_remediation_failure_class"] = classify_failure(
+            task, at_time=task.last_heartbeat or task.started_at
+        )
         target["last_remediation_error_summary"] = (task.latest_status_message or "")[
             :200
         ]
@@ -516,7 +520,9 @@ async def _record_project_remediation_outcome(
     if not merged:
         from app.failure_classification import classify_failure  # noqa: PLC0415
 
-        failure_class = classify_failure(task)
+        failure_class = classify_failure(
+            task, at_time=task.last_heartbeat or task.started_at
+        )
         error_summary = (task.latest_status_message or "")[:200]
         entry["failure_class"] = failure_class
         entry["error_summary"] = error_summary
@@ -1499,7 +1505,10 @@ async def _maybe_spawn_reinvestigation_after_failure(
     failure_summary = investigation_task.latest_status_message or "(no error message)"
     from app.failure_classification import classify_failure  # noqa: PLC0415
 
-    failure_class = classify_failure(investigation_task)
+    failure_class = classify_failure(
+        investigation_task,
+        at_time=investigation_task.last_heartbeat or investigation_task.started_at,
+    )
     partial_summary = (direction.get("partial_diagnosis_summary") or "").strip()
     partial_root_cause = (direction.get("partial_diagnosis_root_cause") or "").strip()
     partial_files = direction.get("partial_diagnosis_files") or []
@@ -1660,7 +1669,9 @@ async def _handle_investigation_terminal_failure(
             return
         from app.failure_classification import classify_failure, INFRA_CLASSES  # noqa: PLC0415
 
-        failure_class = classify_failure(task)
+        failure_class = classify_failure(
+            task, at_time=task.last_heartbeat or task.started_at
+        )
         has_salvageable_root_cause = bool(partial and partial.get("root_cause"))
         if failure_class not in INFRA_CLASSES and not has_salvageable_root_cause:
             return
@@ -2005,7 +2016,7 @@ async def _ensure_branch(
     from app.failure_classification import classify_failure, persist_failure_category  # noqa: PLC0415
     from app.routers.agent_status import record_task_result  # noqa: PLC0415
 
-    _fc = classify_failure(task)
+    _fc = classify_failure(task, at_time=task.last_heartbeat or task.started_at)
     persist_failure_category(task, _fc)
     record_task_result(
         success=False,
