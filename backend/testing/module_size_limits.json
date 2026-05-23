@@ -14,7 +14,7 @@
     "routers/admin_pool_accounts.py": 1200,
     "max_plan_pool.py": 2750,
     "anomaly_detection.py": 2050,
-    "routers/agent.py": 4500,
+    "routers/agent.py": 4600,
     "services.py": 2850,
     "routers/agent_status.py": 3850,
     "autonomous_research.py": 2750,
@@ -25,7 +25,7 @@
     "review_pipeline.py": 2350,
     "deploy_health.py": 1250,
     "regression_layer_classifier.py": 520,
-    "pipeline_regression_dispatcher.py": 9450
+    "pipeline_regression_dispatcher.py": 9700
   },
   "frontend": {
     "useAppState.ts": 3000,

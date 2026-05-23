@@ -286,6 +286,12 @@ _SIGNAL_STALENESS_WINDOWS = {
     "ci_completion": timedelta(hours=6),
 }
 
+# SR catch-rate frozen-but-fresh detection window. When signal_last_computed_at is
+# recent (signal is still computing) but last_sufficient_computed_at is stale,
+# the metric is frozen (not accumulating new data). Alert faster than the general
+# staleness window to catch frozen-in-place metrics before 48h passes.
+_SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW = timedelta(hours=24)
+
 # Per-project last cycle timestamp (monotonic). Updated in run_once finally
 # block even when run_once raises. Used by the staleness watchdog alarm.
 # An absent entry means no cycle has ever completed for this process boot.
@@ -400,12 +406,57 @@ async def _run_signal_staleness_watchdog(
             )
             created += 1
 
+    # Detect frozen-but-fresh: signal is computing (signal_last_computed_at recent)
+    # but last_sufficient_computed_at is stale. The metric has frozen and stopped
+    # producing real data. Use a tighter window than general staleness to alert faster.
+    _sr_trends = doc.get("sr_catch_rate_trends") or {}
+    signal_ts = _sr_trends.get("signal_last_computed_at")
+    sufficient_ts = _sr_trends.get("last_sufficient_computed_at")
+    if signal_ts and sufficient_ts:
+        signal_at = _parse_iso_timestamp(signal_ts)
+        sufficient_at = _parse_iso_timestamp(sufficient_ts)
+        if (
+            signal_at is not None
+            and sufficient_at is not None
+            and (now - signal_at) <= timedelta(hours=6)  # Signal is fresh
+            and (now - sufficient_at) > _SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW
+        ):
+            title = "Signal frozen: sr_catch_rate"
+            age = now - sufficient_at
+            message = (
+                f"sr_catch_rate signal is computing (fresh heartbeat) but real data "
+                f"has not refreshed in {round(age.total_seconds() / 3600, 1)}h. "
+                f"The trend is frozen."
+            )
+            existing = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == project_id,
+                            Alert.task_id.is_(None),
+                            Alert.severity == AlertSeverity.WARNING,
+                            Alert.dismissed_at.is_(None),
+                            Alert.title == title,
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if existing is None:
+                session.add(
+                    Alert(
+                        project_id=project_id,
+                        severity=AlertSeverity.WARNING,
+                        title=title,
+                        message=message,
+                    )
+                )
+                created += 1
+
     # Detect never-sufficient: signal has run (heartbeat present) but has never
     # produced a real, well-sampled measurement (last_sufficient_computed_at absent).
-    _sr_trends = doc.get("sr_catch_rate_trends") or {}
-    if _sr_trends.get("signal_last_computed_at") and not _sr_trends.get(
-        "last_sufficient_computed_at"
-    ):
+    if signal_ts and not sufficient_ts:
         title = "Signal staleness: sr_catch_rate"
         message = (
             "sr_catch_rate has been computed but has never reached data sufficiency. "
@@ -2237,6 +2288,37 @@ async def _current_signal_value_for_class(
             }
         return None
 
+    if regression_class.startswith("telemetry_sufficiency_stale:"):
+        signal = regression_class[len("telemetry_sufficiency_stale:") :]
+        if signal == "sr_catch_rate":
+            doc = project_design_doc or {}
+            _sr_trends = doc.get("sr_catch_rate_trends") or {}
+            signal_ts = _sr_trends.get("signal_last_computed_at")
+            sufficient_ts = _sr_trends.get("last_sufficient_computed_at")
+            if not signal_ts or not sufficient_ts:
+                return None
+            signal_at = _parse_iso_timestamp(signal_ts)
+            sufficient_at = _parse_iso_timestamp(sufficient_ts)
+            now = _utcnow()
+            if signal_at is None or sufficient_at is None:
+                return None
+            is_fresh = (now - signal_at) <= timedelta(hours=6)
+            is_frozen = (now - sufficient_at) > _SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW
+            age = now - sufficient_at
+            return {
+                "signal_name": "telemetry_sufficiency_stale",
+                "prior_rate": None,
+                "current_rate": None,
+                "sample_size": 0,
+                "magnitude": round(age.total_seconds() / 3600, 2),
+                "tripped": is_fresh and is_frozen,
+                "extras": [
+                    f"Signal '{signal}' frozen: real data stale for "
+                    f"{round(age.total_seconds() / 3600, 1)}h but signal computing."
+                ],
+            }
+        return None
+
     if regression_class.startswith("background_service_crash:"):
         service = regression_class[len("background_service_crash:") :]
         from app.models import Task as TaskModel
@@ -3117,6 +3199,12 @@ SPAWNABLE_REGRESSION_CLASS_SHAPES: tuple[RegressionClassShape, ...] = (
         "prefix",
         "telemetry_never_sufficient:",
         "telemetry_never_sufficient:sr_catch_rate",
+    ),
+    RegressionClassShape(
+        "telemetry_sufficiency_stale",
+        "prefix",
+        "telemetry_sufficiency_stale:",
+        "telemetry_sufficiency_stale:sr_catch_rate",
     ),
     RegressionClassShape(
         "background_service_crash",
@@ -6875,13 +6963,74 @@ async def _evaluate_telemetry_staleness_signal(
         if spawn is not None:
             spawned += 1
 
+    # Detect frozen-but-fresh: signal is computing (fresh heartbeat) but real data
+    # has not refreshed in the sufficiency-stale window. The metric is frozen.
+    if spawned < spawn_budget_left:
+        _sr_trends = doc.get("sr_catch_rate_trends") or {}
+        signal_ts = _sr_trends.get("signal_last_computed_at")
+        sufficient_ts = _sr_trends.get("last_sufficient_computed_at")
+        if signal_ts and sufficient_ts:
+            signal_at = _parse_iso_timestamp(signal_ts)
+            sufficient_at = _parse_iso_timestamp(sufficient_ts)
+            if (
+                signal_at is not None
+                and sufficient_at is not None
+                and (now - signal_at) <= timedelta(hours=6)
+                and (now - sufficient_at) > _SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW
+            ):
+                source_module = "playbook_learning.compute_sr_catch_rate_trends"
+                regression_class = "telemetry_sufficiency_stale:sr_catch_rate"
+                age = now - sufficient_at
+                prompt = "\n".join(
+                    [
+                        "Telemetry frozen: signal 'sr_catch_rate' is computing (fresh heartbeat)"
+                        f" but real data has not refreshed in {round(age.total_seconds() / 3600, 1)}h.",
+                        f"signal_last_computed_at: {signal_at.isoformat()} (fresh)",
+                        f"last_sufficient_computed_at: {sufficient_at.isoformat()} "
+                        f"({round(age.total_seconds() / 3600, 1)}h stale)",
+                        f"This signal is computed by: {source_module}.",
+                        "",
+                        "The metric is running its computation cycle but failing to accumulate"
+                        " sufficient data. Diagnose why new data is not flowing into the measurement.",
+                        "Possible causes: insufficient reviewer rejections, bucket starvation,"
+                        " changed sampling rules, or blocked data pipeline.",
+                        "Produce the structured diagnosis JSON"
+                        " ({summary, root_cause, recommended_fix, severity, confidence, affected_files}).",
+                        "Do NOT prescribe a fix — let the investigate→fix chain produce the remediation.",
+                    ]
+                )
+                spawn = await _maybe_spawn(
+                    session,
+                    project_id,
+                    signal_name="telemetry_sufficiency_stale",
+                    regression_class=regression_class,
+                    prior_rate=None,
+                    current_rate=None,
+                    sample_size=0,
+                    magnitude=round(age.total_seconds() / 3600, 2),
+                    extras=[
+                        f"Signal 'sr_catch_rate' frozen: real data stale for "
+                        f"{round(age.total_seconds() / 3600, 1)}h but signal computing."
+                    ],
+                    title_hint="telemetry frozen: sr_catch_rate",
+                    prompt_override=prompt,
+                    extra_snapshot_fields={
+                        "signal_last_computed_at": signal_at.isoformat(),
+                        "last_sufficient_computed_at": sufficient_at.isoformat(),
+                        "sufficiency_stale_hours": round(age.total_seconds() / 3600, 1),
+                        "source_module": source_module,
+                    },
+                )
+                if spawn is not None:
+                    spawned += 1
+
     # Detect never-sufficient: sr_catch_rate has been running (heartbeat present)
     # but has never produced a real measurement (last_sufficient_computed_at absent).
     if spawned < spawn_budget_left:
         _sr_trends = doc.get("sr_catch_rate_trends") or {}
-        if _sr_trends.get("signal_last_computed_at") and not _sr_trends.get(
-            "last_sufficient_computed_at"
-        ):
+        signal_ts = _sr_trends.get("signal_last_computed_at")
+        sufficient_ts = _sr_trends.get("last_sufficient_computed_at")
+        if signal_ts and not sufficient_ts:
             source_module = "playbook_learning.compute_sr_catch_rate_trends"
             regression_class = "telemetry_never_sufficient:sr_catch_rate"
             prompt = "\n".join(

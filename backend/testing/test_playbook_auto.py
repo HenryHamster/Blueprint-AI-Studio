@@ -7759,6 +7759,73 @@ async def test_compute_sr_catch_rate_trends_example_cap_per_category(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 'other' bucket exclusion from SR catch-rate denominator
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_excludes_other_from_denominator(
+    db_session: AsyncSession,
+):
+    """'other' category must not appear as a 0% catch-rate row nor depress overall_hit_rate.
+
+    Self-review never emits 'other', so any task whose human-truth set contains
+    'other' would otherwise be a guaranteed miss that silently drags the headline
+    down.  This test builds two windows where the only human-flagged category in
+    some tasks is 'other', verifies that 'other' is absent from the categories
+    dict, and that overall_hit_rate reflects only the canonical categories.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 5 canonical 'correctness' tasks (SR hits all 5) + 2 tasks
+    # flagging only 'other' (SR can never emit 'other').  Without filtering,
+    # overall_hit_rate would be 5/7 ≈ 0.714; with 'other' excluded it must be 5/5 = 1.0.
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(2):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"other": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: 5 tasks all hitting 'correctness' (needed for trend gating)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cats = result.get("categories", {})
+    assert "other" not in cats, "'other' must not appear as a catch-rate category"
+    assert "correctness" in cats, "canonical categories must still be present"
+    # overall_hit_rate must reflect only canonical categories (5 hits / 5 findings = 1.0)
+    assert result.get("overall_hit_rate") == 1.0, (
+        f"overall_hit_rate should be 1.0 (5/5 canonical hits) but got "
+        f"{result.get('overall_hit_rate')} — 'other' is depressing it"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Tests for regression notifications in compute_sr_catch_rate_trends
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -14001,3 +14068,63 @@ async def test_overall_trend_verdict_stable_when_not_significant(
     assert result["overall_trend_verdict"] == "stable"
     assert result["overall_trend_significant"] is False
     assert result["overall_trend_data_sufficient"] is True
+
+
+@pytest.mark.asyncio
+async def test_sr_catch_rate_previous_bucket_not_starved_by_throughput(
+    db_session: AsyncSession,
+):
+    """Regression: when the current window has more tasks than the old fetch cap (200),
+    the previous window must still be populated. The fix in agent.py uses a 28-day
+    time-bounded query instead of a flat row-count cap so both 14-day buckets are
+    always loaded regardless of current-window throughput."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    OLD_CAP = 200
+    # Create more tasks than the old cap in the current window (last 7 days).
+    current_tasks = []
+    for _ in range(OLD_CAP + 10):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        current_tasks.append(t)
+    # Create 5 tasks in the previous window (15-28 days ago).
+    previous_tasks = []
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        previous_tasks.append(t)
+    await db_session.flush()
+
+    # OLD behaviour: only the most-recent OLD_CAP rows — all land in the current
+    # window (age_days=2), previous bucket is empty → metric freezes at None.
+    old_cap_rows = sorted(
+        current_tasks + previous_tasks,
+        key=lambda t: t.created_at,
+        reverse=True,
+    )[:OLD_CAP]
+    result_old = await compute_sr_catch_rate_trends(
+        project.id, db_session, old_cap_rows
+    )
+    assert result_old is None, (
+        "flat cap fetch should leave the previous bucket empty and return None"
+    )
+
+    # NEW behaviour: time-bounded fetch (28 days) loads both windows → both
+    # buckets populated → real result returned with data_sufficient=True.
+    all_tasks = current_tasks + previous_tasks
+    result_new = await compute_sr_catch_rate_trends(project.id, db_session, all_tasks)
+    assert result_new is not None, (
+        "window-bounded fetch must populate both buckets and return a real result"
+    )
+    assert result_new.get("data_sufficient") is True

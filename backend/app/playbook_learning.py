@@ -2767,7 +2767,9 @@ def _stats_for_tasks(
             rev_cats = _categorize_review_issues(rev_hist)
             for cat_name, issues in rev_cats.items():
                 cat_weights[cat_name] = max(_sw.get(i["severity"], 1) for i in issues)
-        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {}) - {
+            "other"
+        }
 
         # FP tracking: among SR-failed categories, count those never confirmed by
         # any human reviewer across all review iterations (first rejection OR later).
@@ -2892,9 +2894,11 @@ def _stats_for_tasks(
         # categorising review_history in-line, then to first-attempt categories.
         _stored_all_iter = ctx.get("_all_iterations_rejection_categories") or {}
         if _stored_all_iter:
-            all_iter_cats = set(_stored_all_iter.keys())
+            all_iter_cats = set(_stored_all_iter.keys()) - {"other"}
         elif rev_hist:
-            all_iter_cats = set(_categorize_review_issues_keyword(rev_hist).keys())
+            all_iter_cats = set(_categorize_review_issues_keyword(rev_hist).keys()) - {
+                "other"
+            }
         else:
             all_iter_cats = human_cats
         for cat in all_iter_cats:

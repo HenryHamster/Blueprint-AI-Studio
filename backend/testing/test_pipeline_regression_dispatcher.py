@@ -16270,3 +16270,136 @@ async def test_watchdog_case_error_does_not_abort_other_cases(db_session, mocker
         .all()
     )
     assert len(alerts) >= 1, "Alert for case2 escalation should exist"
+
+
+@pytest.mark.asyncio
+async def test_frozen_but_fresh_does_not_fire_when_sufficient_recent(db_session):
+    """Recent last_sufficient_computed_at does not trigger frozen-but-fresh alert."""
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    signal_fresh = (now - timedelta(hours=2)).isoformat()
+    sufficient_fresh = (now - timedelta(hours=6)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {
+                "signal_last_computed_at": signal_fresh,
+                "last_sufficient_computed_at": sufficient_fresh,
+                "data_sufficient": True,
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await run_once(db_session, project.id)
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    frozen_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class")
+        == "telemetry_sufficiency_stale:sr_catch_rate"
+    ]
+    assert len(frozen_tasks) == 0, "Healthy metric should not trigger frozen detection"
+
+
+@pytest.mark.asyncio
+async def test_frozen_but_fresh_absent_sufficient_fires_never_sufficient_not_frozen(
+    db_session,
+):
+    """Absent last_sufficient fires never-sufficient path, not frozen-but-fresh."""
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    signal_fresh = (now - timedelta(hours=2)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {
+                "signal_last_computed_at": signal_fresh,
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await run_once(db_session, project.id)
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    frozen_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class")
+        == "telemetry_sufficiency_stale:sr_catch_rate"
+    ]
+    never_sufficient_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class")
+        == "telemetry_never_sufficient:sr_catch_rate"
+    ]
+    assert len(frozen_tasks) == 0, (
+        "Should not fire frozen detection when sufficient absent"
+    )
+    assert len(never_sufficient_tasks) >= 1, (
+        "Should fire never-sufficient when sufficient absent"
+    )
+
+
+@pytest.mark.asyncio
+async def test_frozen_but_fresh_spawns_when_signal_fresh_and_sufficient_stale(
+    db_session,
+):
+    """Present-but-stale last_sufficient with fresh signal fires frozen-but-fresh spawn."""
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    signal_fresh = (now - timedelta(hours=3)).isoformat()
+    sufficient_stale = (now - timedelta(hours=30)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {
+                "signal_last_computed_at": signal_fresh,
+                "last_sufficient_computed_at": sufficient_stale,
+                "data_sufficient": False,
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned >= 1, "Should spawn when signal fresh but sufficient stale"
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    frozen_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class")
+        == "telemetry_sufficiency_stale:sr_catch_rate"
+    ]
+    assert len(frozen_tasks) == 1, (
+        "Should spawn exactly one frozen-but-fresh investigation"
+    )
+    task = frozen_tasks[0]
+    payload = task.first_payload or {}
+    assert payload.get("type") == "investigate"
+    ctx = task.context or {}
+    assert ctx["signal_name"] == "telemetry_sufficiency_stale"
+    prompt = payload.get("prompt", "")
+    assert "sr_catch_rate" in prompt
+    assert "frozen" in prompt
+    assert "fresh" in prompt.lower()
