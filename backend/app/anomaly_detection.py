@@ -189,7 +189,9 @@ def find_directions_sharing_fingerprint(
 def _is_recurring_failure_class(proj_anomalies: dict, failure_class: str) -> bool:
     """Return True if the given failure class has a persistent anomaly with occurrence_count >= 3."""
     entry = proj_anomalies.get(failure_class)
-    return bool(entry and entry.get("occurrence_count", 0) >= 3)
+    return bool(
+        isinstance(entry, dict) and entry.get("occurrence_count", 0) >= 3
+    )
 
 
 def _expire_stale_project_anomalies(

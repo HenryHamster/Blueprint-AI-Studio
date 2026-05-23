@@ -1250,6 +1250,8 @@ def summarize_failure_hotspots(direction: dict, project_id) -> dict | None:
         if _anoms:
             active_anomalies = []
             for key, info in list(_anoms.items())[:5]:
+                if not isinstance(info, dict):
+                    continue
                 details = (info.get("latest_details") or "")[:140]
                 active_anomalies.append(
                     {

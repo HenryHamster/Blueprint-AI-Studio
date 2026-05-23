@@ -1197,6 +1197,12 @@ def _build_anomaly_summary(project: Project) -> dict[str, Any] | None:
     cross_direction: list[dict[str, Any]] = []
     recurring: list[dict[str, Any]] = []
     for key, entry in proj_anomalies.items():
+        # Skip non-dict sibling values (e.g. the "signal_last_computed_at"
+        # ISO-string sentinel written by anomaly_detection._compute_research_anomalies
+        # for the staleness watchdog). Every other consumer of persistent_anomalies
+        # guards the same way; this one was the lone exception and crashed here.
+        if not isinstance(entry, dict):
+            continue
         occurrences = entry.get("occurrence_count") or 0
         if occurrences < 3:
             continue
