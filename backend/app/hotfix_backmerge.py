@@ -327,8 +327,31 @@ async def open_backmerge_pr(
 
     msg = merge_result.get("message", "merge not completed")
 
-    # 6. Conflict (409) — raise an Alert AND spawn a conflict-resolution plan.
-    if merge_result.get("conflict"):
+    # 6. Conflict — raise an Alert AND spawn a conflict-resolution plan.
+    #    merge_pull_request flags an explicit 409 conflict, but a PR that is
+    #    ALREADY dirty/conflicting returns 405 "not mergeable" (so ``conflict``
+    #    is unset).  Without also consulting the PR's ``mergeable_state`` such a
+    #    genuinely-conflicting back-merge falls through to the generic "blocked"
+    #    path below and spins there forever — alerting every cycle but NEVER
+    #    spawning a resolver (observed on PR #5277).  So when the merge didn't
+    #    land and wasn't flagged a conflict, fetch the PR and treat
+    #    ``mergeable_state == "dirty"`` as a conflict too.
+    is_conflict = bool(merge_result.get("conflict"))
+    if not is_conflict:
+        try:
+            pr_detail = await github.get_pull_request(
+                token, owner, repo, pr_number, project_id=str(project_id)
+            )
+            if str(pr_detail.get("mergeable_state") or "").lower() == "dirty":
+                is_conflict = True
+        except Exception as exc:  # noqa: BLE001 — best-effort; fall through to blocked
+            logger.debug(
+                "[BACKMERGE] could not read mergeable_state for PR #%s: %s",
+                pr_number,
+                exc,
+            )
+
+    if is_conflict:
         logger.warning(
             "[BACKMERGE] back-merge PR #%s for project %s hit a merge "
             "conflict: %s",

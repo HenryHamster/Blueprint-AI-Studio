@@ -263,6 +263,69 @@ async def test_open_backmerge_pr_conflict_raises_alert_and_spawns_plan(
     assert any(h.action == "SPAWNED" for h in history)
 
 
+@pytest.mark.asyncio
+async def test_open_backmerge_pr_dirty_pr_detected_as_conflict_spawns_plan(
+    db_session, mocker
+):
+    """An ALREADY-dirty/conflicting PR returns 405 "not mergeable" (so
+    merge_pull_request does NOT set conflict=True).  open_backmerge_pr must
+    still detect it via the PR's mergeable_state == "dirty" and route to the
+    conflict-resolution path (Alert + plan) — NOT spin forever in the generic
+    "blocked" branch.  Regression for the stuck PR #5277 case."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 77, "html_url": "http://pr/77"},
+        # merged=False with NO conflict flag — exactly the 405 "not mergeable"
+        # shape GitHub returns for an already-dirty PR.
+        merge_return={"merged": False, "message": "Pull Request is not mergeable"},
+    )
+    # The PR's authoritative state says it's dirty (has conflicts).
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"number": 77, "mergeable_state": "dirty"}),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
+    await db_session.commit()
+
+    # Detected as a conflict despite the missing conflict flag.
+    assert result["status"] == "conflict"
+
+    # A resolution plan was spawned (the whole point — not a silent "blocked").
+    tasks = await _tasks_for(db_session, project.id)
+    plans = [t for t in tasks if (t.first_payload or {}).get("type") == "plan"]
+    assert len(plans) == 1
+    assert plans[0].context["backmerge_conflict"] is True
+    assert plans[0].first_payload["base_branch"] == "automain"
+
+
+@pytest.mark.asyncio
+async def test_open_backmerge_pr_blocked_when_not_dirty(db_session, mocker):
+    """A non-merge that is NOT a conflict (e.g. pending required checks —
+    mergeable_state "blocked") stays in the "blocked" path and does NOT spawn a
+    resolution plan (a conflict resolver can't fix a checks block)."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 78, "html_url": "http://pr/78"},
+        merge_return={"merged": False, "message": "required status checks pending"},
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"number": 78, "mergeable_state": "blocked"}),
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
+    await db_session.commit()
+
+    assert result["status"] == "blocked"
+    tasks = await _tasks_for(db_session, project.id)
+    plans = [t for t in tasks if (t.first_payload or {}).get("type") == "plan"]
+    assert len(plans) == 0
+
+
+@pytest.mark.asyncio
 async def test_open_backmerge_pr_conflict_no_duplicate_plan(db_session, mocker):
     """A second back-merge attempt for the SAME hotfix must raise another Alert
     but must NOT spawn a second resolution plan (dedupe guard)."""
