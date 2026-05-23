@@ -2128,6 +2128,45 @@ async def test_anomaly_summary_absent_when_no_qualifying_entries(db_session):
         _shared_state.persistent_anomalies.pop(proj_key, None)
 
 
+@pytest.mark.asyncio
+async def test_anomaly_summary_skips_non_dict_sentinel(db_session):
+    """A non-dict sibling value (the 'signal_last_computed_at' ISO-string sentinel
+    written by anomaly_detection._compute_research_anomalies) must not crash the
+    strategic-review spawn. Regression: _build_anomaly_summary previously called
+    .get() on the string and raised AttributeError, hard-killing every spawn."""
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    proj_key = str(project.id)
+    _shared_state.persistent_anomalies[proj_key] = {
+        # Bookkeeping sentinel — a string value living alongside the entry dicts.
+        "signal_last_computed_at": "2026-05-23T00:00:00",
+        "CODE_ERROR": {
+            "occurrence_count": 5,
+            "severity": "high",
+            "first_seen": "2026-04-01T00:00:00",
+            "last_seen": "2026-04-10T00:00:00",
+        },
+    }
+    try:
+        spawned = await _spawn_strategic_review(project, db_session)
+        assert spawned is True
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        payload = result.scalars().all()[0].payloads[0]
+
+        # The real entry is still surfaced; the sentinel is silently skipped.
+        summary = payload["anomaly_summary"]
+        recurring_keys = [e["key"] for e in summary["recurring_anomalies"]]
+        assert "CODE_ERROR" in recurring_keys
+        assert "signal_last_computed_at" not in recurring_keys
+    finally:
+        _shared_state.persistent_anomalies.pop(proj_key, None)
+
+
 # ── playbook_summary in _spawn_strategic_review payload ──────────────────────
 
 
