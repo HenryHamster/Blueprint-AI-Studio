@@ -34,6 +34,8 @@ _is_skipped_sr_outcome = _is_skipped_sr_outcome_shared
 
 _SR_TREND_STALENESS_DAYS = 7
 
+_CPM_RETIREMENT_MULTIPLIER = 3.0  # cost_per_merge > median × this → retirement signal
+
 _LAYER_SUMMARY_WINDOW = timedelta(hours=48)
 
 _REVIEW_ELIGIBLE_TYPES = {"create", "refactor"}
@@ -1376,6 +1378,314 @@ def compute_digest_trend_history(
             }
         )
     return trend_history
+
+
+def compute_digest_cost_economics(
+    *,
+    all_tasks: List[Task],
+    direction_progress_list: List[Dict[str, Any]],
+    window_start: "datetime",
+    now: "datetime",
+    daily_cost_ceiling_usd: float,
+) -> Dict[str, Any]:
+    """Compute the digest's entire cost/economics section.
+
+    Pure function — no database calls. Reads only the already-loaded task
+    list, the already-computed direction-progress list, the window start,
+    the current time, and the configured daily cost ceiling.
+
+    Mutates ``direction_progress_list`` in place: stamps a
+    ``cost_per_merge_exceeds_threshold`` flag onto each direction entry
+    (preserving the original in-place behavior of ``_compute_digest``).
+
+    Returns a dict with total/spot/on-demand estimated cost, provisioning
+    overhead (USD and pct), daily cost vs ceiling, overall product_ratio,
+    median cost-per-merged-PR, per-task-type cost-per-merge, and
+    pipeline-level acceptance/conversion rates, autonomous/assisted merge
+    counts, operator-action count, overall type distribution, and
+    filter-funnel aggregation.
+    """
+    from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+
+    # Compute total estimated cost (directed + undirected tasks)
+    directed_task_ids = {
+        t.id for t in all_tasks if (t.context or {}).get("direction_id")
+    }
+    undirected_cost = sum(
+        ((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE)
+        * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+        for t in all_tasks
+        if t.vm_provisioned_at
+        and t.vm_stopped_at
+        and t.vm_stopped_at >= window_start
+        and t.id not in directed_task_ids
+    )
+    total_estimated_cost_usd = round(
+        sum(d["estimated_cost_usd"] for d in direction_progress_list) + undirected_cost,
+        2,
+    )
+    total_spot_cost_usd = 0.0
+    total_on_demand_cost_usd = 0.0
+    for t in all_tasks:
+        if not (
+            t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start
+        ):
+            continue
+        rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
+        t_cost = rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+        if t.vm_spot:
+            total_spot_cost_usd += t_cost
+        else:
+            total_on_demand_cost_usd += t_cost
+    total_spot_cost_usd = round(total_spot_cost_usd, 2)
+    total_on_demand_cost_usd = round(total_on_demand_cost_usd, 2)
+
+    # Provisioning overhead: cost of time spent between VM provision and agent claim
+    # (vm_provisioned_at → vm_started_at). When vm_started_at is missing, the agent
+    # never claimed the task, so the entire VM lifetime counts as provisioning waste.
+    _provisioning_overhead_raw = 0.0
+    _total_compute_cost_raw = total_spot_cost_usd + total_on_demand_cost_usd
+    for t in all_tasks:
+        if not (
+            t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start
+        ):
+            continue
+        rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
+        prov_end = (
+            t.vm_started_at
+            if (t.vm_started_at and t.vm_started_at >= t.vm_provisioned_at)
+            else t.vm_stopped_at
+        )
+        if prov_end <= t.vm_provisioned_at:
+            continue
+        _provisioning_overhead_raw += (
+            rate * (prov_end - t.vm_provisioned_at).total_seconds()
+        )
+    provisioning_overhead_usd = round(_provisioning_overhead_raw, 2)
+    provisioning_overhead_pct = (
+        round(_provisioning_overhead_raw / _total_compute_cost_raw, 3)
+        if _total_compute_cost_raw > 0
+        else None
+    )
+
+    # Compute today's cost for cost ceiling warning
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    daily_cost_usd = round(
+        sum(
+            ((t.vm_spot and SPOT_RATE) or ON_DEMAND_RATE)
+            * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+            for t in all_tasks
+            if t.vm_provisioned_at
+            and t.vm_stopped_at
+            and t.vm_stopped_at >= today_start
+        ),
+        2,
+    )
+
+    # Compute overall product_ratio and type_distribution across all directions
+    all_product_ratios = [
+        d["product_ratio"]
+        for d in direction_progress_list
+        if d.get("product_ratio") is not None
+    ]
+    overall_product_ratio = (
+        round(sum(all_product_ratios) / len(all_product_ratios), 3)
+        if all_product_ratios
+        else None
+    )
+
+    all_cpms = [
+        d["cost_per_merged_pr"]
+        for d in direction_progress_list
+        if d.get("cost_per_merged_pr") is not None
+    ]
+    median_cost_per_merged_pr = (
+        round(statistics.median(all_cpms), 4) if all_cpms else None
+    )
+    for d in direction_progress_list:
+        cpm = d.get("cost_per_merged_pr")
+        if cpm is not None and median_cost_per_merged_pr is not None:
+            d["cost_per_merge_exceeds_threshold"] = cpm > (
+                median_cost_per_merged_pr * _CPM_RETIREMENT_MULTIPLIER
+            )
+        else:
+            d["cost_per_merge_exceeds_threshold"] = False
+
+    # Per-task-type cost-per-merge: for each task type, total VM cost / merged PR count
+    _type_cost: Dict[str, float] = {}
+    _type_merges: Dict[str, int] = {}
+    for t in all_tasks:
+        if not (
+            t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start
+        ):
+            continue
+        rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
+        t_cost = rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+        task_type = (t.first_payload or {}).get("type", "unknown")
+        _type_cost[task_type] = _type_cost.get(task_type, 0.0) + t_cost
+        if (t.context or {}).get("pr_merged") is True:
+            _type_merges[task_type] = _type_merges.get(task_type, 0) + 1
+    _type_cpms = {
+        ttype: _type_cost[ttype] / _type_merges[ttype]
+        for ttype in _type_cost
+        if _type_merges.get(ttype, 0) > 0
+    }
+    median_cpm_by_type = (
+        round(statistics.median(list(_type_cpms.values())), 4) if _type_cpms else None
+    )
+    cost_per_merge_by_type = {
+        ttype: {
+            "total_cost_usd": round(_type_cost[ttype], 4),
+            "merged_count": _type_merges.get(ttype, 0),
+            "cost_per_merge": round(_type_cpms[ttype], 4)
+            if ttype in _type_cpms
+            else None,
+            "exceeds_threshold": (
+                _type_cpms[ttype] > (median_cpm_by_type * _CPM_RETIREMENT_MULTIPLIER)
+                if ttype in _type_cpms and median_cpm_by_type is not None
+                else False
+            ),
+        }
+        for ttype in _type_cost
+    }
+
+    # Pipeline-level acceptance rate: total merged / (total merged + total rejected) across directions in window
+    _pipeline_total_merged_d = sum(
+        d.get("prs_merged") or 0 for d in direction_progress_list
+    )
+    _pipeline_total_rejected_d = sum(
+        d.get("prs_rejected") or 0 for d in direction_progress_list
+    )
+    _pipeline_total_decided = _pipeline_total_merged_d + _pipeline_total_rejected_d
+    pipeline_acceptance_rate = (
+        round(_pipeline_total_merged_d / _pipeline_total_decided, 3)
+        if _pipeline_total_decided > 0
+        else None
+    )
+    _pipeline_total_created_d = sum(
+        d.get("tasks_created") or 0 for d in direction_progress_list
+    )
+    pipeline_conversion_rate = (
+        round(_pipeline_total_merged_d / _pipeline_total_created_d, 3)
+        if _pipeline_total_created_d > 0
+        else None
+    )
+    pipeline_autonomous_prs_merged = sum(
+        d.get("autonomous_prs_merged") or 0 for d in direction_progress_list
+    )
+    pipeline_assisted_prs_merged = sum(
+        d.get("assisted_prs_merged") or 0 for d in direction_progress_list
+    )
+    pipeline_operator_action_count = sum(
+        d.get("operator_action_count") or 0 for d in direction_progress_list
+    )
+    overall_type_distribution: Dict[str, int] = {}
+    for d in direction_progress_list:
+        for ttype, cnt in (d.get("type_distribution") or {}).items():
+            overall_type_distribution[ttype] = (
+                overall_type_distribution.get(ttype, 0) + cnt
+            )
+
+    pipeline_filter_funnel: Dict[str, int] = {}
+    for d in direction_progress_list:
+        ff = d.get("filter_funnel") or {}
+        for _k, _v in ff.items():
+            pipeline_filter_funnel[_k] = pipeline_filter_funnel.get(_k, 0) + (_v or 0)
+
+    return {
+        "total_estimated_cost_usd": total_estimated_cost_usd,
+        "total_spot_cost_usd": total_spot_cost_usd,
+        "total_on_demand_cost_usd": total_on_demand_cost_usd,
+        "provisioning_overhead_usd": provisioning_overhead_usd,
+        "provisioning_overhead_pct": provisioning_overhead_pct,
+        "daily_cost_usd": daily_cost_usd,
+        "daily_cost_ceiling_usd": daily_cost_ceiling_usd,
+        "overall_product_ratio": overall_product_ratio,
+        "median_cost_per_merged_pr": median_cost_per_merged_pr,
+        "cost_per_merge_by_type": cost_per_merge_by_type,
+        "median_cpm_by_type": median_cpm_by_type,
+        "pipeline_acceptance_rate": pipeline_acceptance_rate,
+        "pipeline_conversion_rate": pipeline_conversion_rate,
+        "pipeline_autonomous_prs_merged": pipeline_autonomous_prs_merged,
+        "pipeline_assisted_prs_merged": pipeline_assisted_prs_merged,
+        "pipeline_operator_action_count": pipeline_operator_action_count,
+        "overall_type_distribution": overall_type_distribution,
+        "pipeline_filter_funnel": pipeline_filter_funnel,
+    }
+
+
+def compute_scope_mismatch_summary(
+    *,
+    completed_tasks: List[Task],
+    failed_tasks: List[Task],
+    dir_id_to_text: Dict[str, str],
+) -> Optional[Dict[str, Any]]:
+    """Aggregate scope-calibration data across terminal tasks in the window.
+
+    Surfaces systematic scope-estimation drift and chronic-calibration
+    directions: counts calibrated tasks, computes their success rate, builds a
+    breakdown keyed by original declared scope, and ranks the top directions by
+    calibration rate. Pure function — reads only the already-loaded
+    completed/failed task lists and the direction-id-to-text map; no database
+    calls. Returns the summary dict, or None when no calibrated tasks exist in
+    the window.
+    """
+    terminal_in_window = completed_tasks + failed_tasks
+    calibrated_tasks = [
+        t for t in terminal_in_window if (t.context or {}).get("scope_calibrated_from")
+    ]
+    if not calibrated_tasks:
+        return None
+
+    cal_completed = sum(1 for t in calibrated_tasks if t.status == TaskStatus.COMPLETED)
+    cal_total = len(calibrated_tasks)
+    by_orig: Dict[str, Dict[str, int]] = {}
+    by_dir_calibrated: Dict[str, int] = {}
+    for t in calibrated_tasks:
+        orig_raw = str((t.context or {}).get("scope_calibrated_from") or "")
+        orig = orig_raw.split(":", 1)[0] or "unknown"
+        bucket = by_orig.setdefault(orig, {"total": 0, "completed": 0, "failed": 0})
+        bucket["total"] += 1
+        if t.status == TaskStatus.COMPLETED:
+            bucket["completed"] += 1
+        elif t.status == TaskStatus.FAILED:
+            bucket["failed"] += 1
+        did = (t.context or {}).get("direction_id")
+        if did:
+            by_dir_calibrated[str(did)] = by_dir_calibrated.get(str(did), 0) + 1
+
+    by_dir_total: Dict[str, int] = {}
+    for t in terminal_in_window:
+        did = (t.context or {}).get("direction_id")
+        if did:
+            by_dir_total[str(did)] = by_dir_total.get(str(did), 0) + 1
+
+    top_dirs = []
+    for did, cal_cnt in by_dir_calibrated.items():
+        tot = by_dir_total.get(did, 0)
+        if tot <= 0:
+            continue
+        top_dirs.append(
+            {
+                "direction_id": did,
+                "direction_text": dir_id_to_text.get(did, ""),
+                "calibrated_count": cal_cnt,
+                "total_tasks": tot,
+                "calibration_rate": round(cal_cnt / tot, 3),
+            }
+        )
+    top_dirs.sort(
+        key=lambda d: (d["calibration_rate"], d["calibrated_count"]), reverse=True
+    )
+
+    return {
+        "total_calibrated": cal_total,
+        "calibrated_success_rate": round(cal_completed / cal_total, 3)
+        if cal_total
+        else None,
+        "by_original_scope": by_orig,
+        "top_directions": top_dirs[:3],
+    }
 
 
 async def compute_remediation_funnel(

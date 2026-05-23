@@ -25,6 +25,7 @@ from app.task_locking import (
     task_lock,
     with_design_doc_locked,
     with_directions_locked,
+    with_vision_locked,
 )
 
 
@@ -907,3 +908,52 @@ async def test_expire_stale_proposals_serializes_with_concurrent_append(db_sessi
     assert by_id.get("d-old", {}).get("status") == "expired", (
         f"stale-proposal expiry not applied: {dirs}"
     )
+
+
+# ── with_vision_locked ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_with_vision_locked_applies_mutation(db_session):
+    """with_vision_locked must atomically apply the mutate_fn and preserve
+    pre-existing keys so callers writing disjoint key sets don't clobber each other."""
+    project = Project(name="vision-lock", user_id="user")
+    project.vision = {"existing": "kept"}
+    db_session.add(project)
+    await db_session.commit()
+
+    await with_vision_locked(
+        db_session, project.id, lambda v: v.update({"added": "yes"})
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert project.vision == {"existing": "kept", "added": "yes"}
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
+@pytest.mark.asyncio
+async def test_with_vision_locked_serializes_concurrent_writers(db_session):
+    """Two concurrent callers writing disjoint keys via with_vision_locked
+    must both survive — the second must see the first's committed write."""
+    project = Project(name="vision-lock-concurrent", user_id="user")
+    project.vision = {}
+    db_session.add(project)
+    await db_session.commit()
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def write_key(key: str) -> None:
+        async with Session() as s:
+            await with_vision_locked(s, project.id, lambda v: v.update({key: "v"}))
+            await s.commit()
+
+    await asyncio.gather(write_key("key_a"), write_key("key_b"))
+
+    async with Session() as verify:
+        result = await verify.execute(select(Project).where(Project.id == project.id))
+        vision = result.scalar_one().vision
+    assert vision.get("key_a") == "v", f"key_a missing from {vision}"
+    assert vision.get("key_b") == "v", f"key_b missing from {vision}"

@@ -486,6 +486,39 @@ async def with_design_doc_locked(
     return True
 
 
+async def with_vision_locked(
+    session: AsyncSession,
+    project_id,
+    mutate_fn: Callable[[dict], None],
+    *,
+    skip_locked: bool = False,
+) -> bool:
+    """Atomic read-modify-write of project.vision under a project row lock.
+
+    Mirror of ``with_design_doc_locked`` for the sibling ``vision`` JSON
+    column. Acquires SELECT FOR UPDATE (skip_locked=False — background callers
+    wait rather than silently skip), hands ``mutate_fn`` the current vision
+    dict loaded *inside* the lock, then writes the result back. Caller is
+    responsible for committing.
+
+    This is the canonical helper for serializing vision mutations from
+    background task completions (strategic_completion, research_completion,
+    etc.). Using it consistently prevents concurrent background writers from
+    clobbering each other's updates via stale read-modify-write races — the
+    same lost-update class already eliminated for ``design_doc`` and
+    ``directions``.
+    """
+    async with project_lock(session, project_id, skip_locked=skip_locked) as project:
+        if project is None:
+            return False
+        vision = dict(project.vision or {})
+        mutate_fn(vision)
+        project.vision = vision
+        flag_modified(project, "vision")
+        session.add(project)
+    return True
+
+
 async def with_directions_locked(
     session: AsyncSession,
     project_id,

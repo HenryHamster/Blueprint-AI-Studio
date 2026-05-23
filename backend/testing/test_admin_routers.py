@@ -526,6 +526,134 @@ class TestUpdateProject:
         )
         assert resp.status_code == 400
 
+    @pytest.mark.asyncio
+    async def test_design_doc_stale_revision_returns_409(
+        self, client: AsyncClient, db_session
+    ):
+        """Supplying an outdated base_revision for design_doc returns 409."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        # Simulate one prior agent write that bumped _meta.revision to 3
+        project.design_doc = {"key": "value", "_meta": {"revision": 3}}
+        flag_modified(project, "design_doc")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"design_doc": {"key": "overwrite"}, "design_doc_base_revision": 1},
+        )
+        assert resp.status_code == 409
+        msg = resp.json()["error"]["message"]
+        assert "base_revision=1" in msg
+        assert "current=3" in msg
+
+    @pytest.mark.asyncio
+    async def test_design_doc_current_revision_succeeds_and_bumps_meta(
+        self, client: AsyncClient, db_session
+    ):
+        """Matching base_revision saves doc and advances _meta.revision."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.design_doc = {"key": "old", "_meta": {"revision": 2}}
+        flag_modified(project, "design_doc")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"design_doc": {"key": "new"}, "design_doc_base_revision": 2},
+        )
+        assert resp.status_code == 200
+
+        await db_session.refresh(project)
+        doc = project.design_doc or {}
+        assert doc.get("key") == "new"
+        assert doc.get("_meta", {}).get("revision") == 3
+        # Divergent top-level revision key must not be present
+        assert "revision" not in doc
+
+    @pytest.mark.asyncio
+    async def test_design_doc_no_base_revision_always_succeeds(
+        self, client: AsyncClient, db_session
+    ):
+        """Omitting base_revision skips the CAS check (backwards compat)."""
+        project = await _make_project(db_session)
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"design_doc": {"mykey": "hello"}},
+        )
+        assert resp.status_code == 200
+
+        await db_session.refresh(project)
+        doc = project.design_doc or {}
+        assert doc.get("mykey") == "hello"
+        assert doc.get("_meta", {}).get("revision") == 1
+
+    @pytest.mark.asyncio
+    async def test_vision_stale_revision_returns_409(
+        self, client: AsyncClient, db_session
+    ):
+        """Supplying an outdated base_revision for vision returns 409."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.vision = {"content": "v1", "revision": 5}
+        flag_modified(project, "vision")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"vision": {"content": "overwrite"}, "vision_base_revision": 2},
+        )
+        assert resp.status_code == 409
+        msg = resp.json()["error"]["message"]
+        assert "base_revision=2" in msg
+        assert "current=5" in msg
+
+    @pytest.mark.asyncio
+    async def test_concurrent_design_doc_write_no_data_loss(
+        self, client: AsyncClient, db_session
+    ):
+        """Second writer with a stale revision is rejected; first writer's data survives."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.design_doc = {"owner_key": "owner_value", "_meta": {"revision": 1}}
+        flag_modified(project, "design_doc")
+        db_session.add(project)
+        await db_session.commit()
+
+        # First writer succeeds with the correct base revision.
+        resp_a = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "design_doc": {"owner_key": "writer_a"},
+                "design_doc_base_revision": 1,
+            },
+        )
+        assert resp_a.status_code == 200
+
+        # Second writer tries to write with the old base revision — must be rejected.
+        resp_b = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "design_doc": {"owner_key": "writer_b_clobber"},
+                "design_doc_base_revision": 1,
+            },
+        )
+        assert resp_b.status_code == 409
+
+        # Writer A's data must be intact — not overwritten.
+        await db_session.refresh(project)
+        doc = project.design_doc or {}
+        assert doc.get("owner_key") == "writer_a"
+        assert doc.get("_meta", {}).get("revision") == 2
+
 
 class TestDeleteProject:
     @pytest.mark.asyncio

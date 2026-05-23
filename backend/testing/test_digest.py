@@ -22,9 +22,11 @@ from app.digest_metrics import (
     _compute_symptom_layers_by_class,
     _stash_projected_task_fields,
     _summarize_symptoms_by_layer,
+    compute_digest_cost_economics,
     compute_digest_trend_history,
     compute_failure_grouping,
     compute_remediation_funnel,
+    compute_scope_mismatch_summary,
 )
 from app.sr_blind_spots import aggregate_sr_reviewer_disagreements
 from testing.factories import make_project, make_task, make_membership, _utcnow
@@ -16951,3 +16953,336 @@ def test_compute_digest_trend_history_first_attempt_rate():
     last = result[-1]
     assert last["first_attempt_sample_size"] == 2
     assert last["first_attempt_success_rate"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for compute_digest_cost_economics (pure function, no DB required)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_digest_cost_economics_empty():
+    """Empty tasks and directions return a zeroed-out cost structure."""
+    now = _utcnow()
+    result = compute_digest_cost_economics(
+        all_tasks=[],
+        direction_progress_list=[],
+        window_start=now - timedelta(hours=24),
+        now=now,
+        daily_cost_ceiling_usd=12.5,
+    )
+    assert result["total_estimated_cost_usd"] == 0.0
+    assert result["total_spot_cost_usd"] == 0.0
+    assert result["total_on_demand_cost_usd"] == 0.0
+    assert result["provisioning_overhead_usd"] == 0.0
+    assert result["provisioning_overhead_pct"] is None
+    assert result["daily_cost_usd"] == 0.0
+    assert result["daily_cost_ceiling_usd"] == 12.5
+    assert result["overall_product_ratio"] is None
+    assert result["median_cost_per_merged_pr"] is None
+    assert result["cost_per_merge_by_type"] == {}
+    assert result["median_cpm_by_type"] is None
+    assert result["pipeline_acceptance_rate"] is None
+    assert result["pipeline_conversion_rate"] is None
+    assert result["pipeline_autonomous_prs_merged"] == 0
+    assert result["pipeline_assisted_prs_merged"] == 0
+    assert result["pipeline_operator_action_count"] == 0
+    assert result["overall_type_distribution"] == {}
+    assert result["pipeline_filter_funnel"] == {}
+
+
+def test_compute_digest_cost_economics_spot_on_demand_split():
+    """Spot and on-demand task costs are split and totaled with known VM timing."""
+    from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    spot_task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now - timedelta(minutes=30),  # 1800s
+    )
+    od_task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix"}],
+        vm_spot=False,
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(hours=1),  # 3600s
+    )
+    result = compute_digest_cost_economics(
+        all_tasks=[spot_task, od_task],
+        direction_progress_list=[],
+        window_start=window_start,
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    expected_spot = round(SPOT_RATE * 1800, 2)
+    expected_od = round(ON_DEMAND_RATE * 3600, 2)
+    assert result["total_spot_cost_usd"] == expected_spot
+    assert result["total_on_demand_cost_usd"] == expected_od
+    # Both tasks are undirected (no direction_id) and inside the window.
+    assert result["total_estimated_cost_usd"] == round(
+        SPOT_RATE * 1800 + ON_DEMAND_RATE * 3600, 2
+    )
+
+
+def test_compute_digest_cost_economics_provisioning_overhead():
+    """Time between provision and agent claim counts as provisioning overhead."""
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    # Provisioned 1h before now, claimed (started) 50m before → 600s overhead,
+    # stopped 30m before → 1800s total compute.
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        vm_spot=False,
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_started_at=now - timedelta(minutes=50),
+        vm_stopped_at=now - timedelta(minutes=30),
+    )
+    result = compute_digest_cost_economics(
+        all_tasks=[task],
+        direction_progress_list=[],
+        window_start=window_start,
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    # overhead_raw = ON_DEMAND_RATE * 600 = 0.0111…; rounds to 0.01.
+    assert result["provisioning_overhead_usd"] == 0.01
+    # pct = round(overhead_raw / rounded_total_compute, 3) = round(0.01117/0.03, 3).
+    assert result["provisioning_overhead_pct"] == 0.372
+
+
+def test_compute_digest_cost_economics_threshold_flag_in_place():
+    """cost_per_merge_exceeds_threshold is stamped onto direction dicts in place."""
+    now = _utcnow()
+    dirs = [
+        {"estimated_cost_usd": 0.0, "cost_per_merged_pr": 1.0},
+        {"estimated_cost_usd": 0.0, "cost_per_merged_pr": 2.0},
+        {"estimated_cost_usd": 0.0, "cost_per_merged_pr": 100.0},
+    ]
+    result = compute_digest_cost_economics(
+        all_tasks=[],
+        direction_progress_list=dirs,
+        window_start=now - timedelta(hours=24),
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    # median([1, 2, 100]) = 2.0; threshold = 2.0 * 3 = 6.0.
+    assert result["median_cost_per_merged_pr"] == 2.0
+    # In-place mutation on the same dict objects.
+    assert dirs[0]["cost_per_merge_exceeds_threshold"] is False
+    assert dirs[1]["cost_per_merge_exceeds_threshold"] is False
+    assert dirs[2]["cost_per_merge_exceeds_threshold"] is True
+
+
+def test_compute_digest_cost_economics_cost_per_merge_by_type():
+    """Per-task-type cost-per-merge counts merged tasks by payload type."""
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    merged = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now - timedelta(minutes=30),
+        context={"pr_merged": True},
+    )
+    unmerged = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now - timedelta(minutes=30),
+        context={},
+    )
+    result = compute_digest_cost_economics(
+        all_tasks=[merged, unmerged],
+        direction_progress_list=[],
+        window_start=window_start,
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    by_type = result["cost_per_merge_by_type"]
+    assert "create" in by_type
+    assert by_type["create"]["merged_count"] == 1
+    assert by_type["create"]["cost_per_merge"] is not None
+    assert by_type["create"]["total_cost_usd"] > 0.0
+
+
+def test_compute_digest_cost_economics_pipeline_aggregates():
+    """Pipeline-level rates and counts aggregate across all directions."""
+    now = _utcnow()
+    dirs = [
+        {
+            "estimated_cost_usd": 0.0,
+            "prs_merged": 3,
+            "prs_rejected": 1,
+            "tasks_created": 10,
+            "autonomous_prs_merged": 2,
+            "assisted_prs_merged": 1,
+            "operator_action_count": 4,
+            "type_distribution": {"create": 5},
+            "filter_funnel": {"a": 2},
+        },
+        {
+            "estimated_cost_usd": 0.0,
+            "prs_merged": 1,
+            "prs_rejected": 1,
+            "tasks_created": 5,
+            "autonomous_prs_merged": 1,
+            "assisted_prs_merged": 0,
+            "operator_action_count": 1,
+            "type_distribution": {"create": 2, "fix": 1},
+            "filter_funnel": {"a": 1, "b": 3},
+        },
+    ]
+    result = compute_digest_cost_economics(
+        all_tasks=[],
+        direction_progress_list=dirs,
+        window_start=now - timedelta(hours=24),
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    # merged=4, rejected=2 → 4/6 = 0.667; created=15 → 4/15 = 0.267.
+    assert result["pipeline_acceptance_rate"] == 0.667
+    assert result["pipeline_conversion_rate"] == 0.267
+    assert result["pipeline_autonomous_prs_merged"] == 3
+    assert result["pipeline_assisted_prs_merged"] == 1
+    assert result["pipeline_operator_action_count"] == 5
+    assert result["overall_type_distribution"] == {"create": 7, "fix": 1}
+    assert result["pipeline_filter_funnel"] == {"a": 3, "b": 3}
+
+
+def test_compute_scope_mismatch_summary_no_calibrated_tasks():
+    """Returns None when no terminal task carries scope_calibrated_from."""
+    completed = [make_task(status=TaskStatus.COMPLETED, context={})]
+    failed = [make_task(status=TaskStatus.FAILED, context={"direction_id": "d-1"})]
+    result = compute_scope_mismatch_summary(
+        completed_tasks=completed, failed_tasks=failed, dir_id_to_text={}
+    )
+    assert result is None
+
+
+def test_compute_scope_mismatch_summary_empty_inputs():
+    """Empty task lists yield None."""
+    result = compute_scope_mismatch_summary(
+        completed_tasks=[], failed_tasks=[], dir_id_to_text={}
+    )
+    assert result is None
+
+
+def test_compute_scope_mismatch_summary_success_rate_and_total():
+    """total_calibrated counts all calibrated tasks; success rate uses COMPLETED."""
+    completed = [
+        make_task(
+            status=TaskStatus.COMPLETED, context={"scope_calibrated_from": "medium"}
+        ),
+        make_task(
+            status=TaskStatus.COMPLETED, context={"scope_calibrated_from": "small"}
+        ),
+    ]
+    failed = [
+        make_task(status=TaskStatus.FAILED, context={"scope_calibrated_from": "large"}),
+    ]
+    result = compute_scope_mismatch_summary(
+        completed_tasks=completed, failed_tasks=failed, dir_id_to_text={}
+    )
+    assert result is not None
+    assert result["total_calibrated"] == 3
+    assert result["calibrated_success_rate"] == round(2 / 3, 3)
+
+
+def test_compute_scope_mismatch_summary_by_original_scope_breakdown():
+    """by_original_scope buckets by the prefix before ':' and tallies outcomes."""
+    completed = [
+        make_task(
+            status=TaskStatus.COMPLETED,
+            context={"scope_calibrated_from": "medium:reason-text"},
+        ),
+    ]
+    failed = [
+        make_task(
+            status=TaskStatus.FAILED,
+            context={"scope_calibrated_from": "medium:other-reason"},
+        ),
+    ]
+    result = compute_scope_mismatch_summary(
+        completed_tasks=completed, failed_tasks=failed, dir_id_to_text={}
+    )
+    assert result is not None
+    assert result["by_original_scope"] == {
+        "medium": {"total": 2, "completed": 1, "failed": 1}
+    }
+
+
+def test_compute_scope_mismatch_summary_blank_original_scope_is_unknown():
+    """An empty scope_calibrated_from value is not calibrated; a bare ':' → 'unknown'."""
+    # Empty string is falsy → excluded from calibrated set entirely.
+    excluded = make_task(
+        status=TaskStatus.COMPLETED, context={"scope_calibrated_from": ""}
+    )
+    # A value with no scope prefix before ':' falls back to "unknown".
+    bare = make_task(
+        status=TaskStatus.COMPLETED, context={"scope_calibrated_from": ":reason"}
+    )
+    result = compute_scope_mismatch_summary(
+        completed_tasks=[excluded, bare], failed_tasks=[], dir_id_to_text={}
+    )
+    assert result is not None
+    assert result["total_calibrated"] == 1
+    assert "unknown" in result["by_original_scope"]
+
+
+def test_compute_scope_mismatch_summary_top_directions_ranking():
+    """top_directions ranks by calibration_rate, attaches text, and caps at 3."""
+    completed = []
+    failed = []
+    # d-hi: 2/2 calibrated → rate 1.0
+    for _ in range(2):
+        completed.append(
+            make_task(
+                status=TaskStatus.COMPLETED,
+                context={"scope_calibrated_from": "small", "direction_id": "d-hi"},
+            )
+        )
+    # d-lo: 1/3 calibrated → rate ~0.333
+    completed.append(
+        make_task(
+            status=TaskStatus.COMPLETED,
+            context={"scope_calibrated_from": "small", "direction_id": "d-lo"},
+        )
+    )
+    for _ in range(2):
+        failed.append(
+            make_task(status=TaskStatus.FAILED, context={"direction_id": "d-lo"})
+        )
+    result = compute_scope_mismatch_summary(
+        completed_tasks=completed,
+        failed_tasks=failed,
+        dir_id_to_text={"d-hi": "High dir", "d-lo": "Low dir"},
+    )
+    assert result is not None
+    top = result["top_directions"]
+    assert [d["direction_id"] for d in top] == ["d-hi", "d-lo"]
+    assert top[0]["calibration_rate"] == 1.0
+    assert top[0]["total_tasks"] == 2
+    assert top[0]["direction_text"] == "High dir"
+    assert top[1]["calibration_rate"] == round(1 / 3, 3)
+
+
+def test_compute_scope_mismatch_summary_top_directions_capped_at_three():
+    """Only the top 3 directions are returned even when more are calibrated."""
+    completed = [
+        make_task(
+            status=TaskStatus.COMPLETED,
+            context={"scope_calibrated_from": "small", "direction_id": f"d-{i}"},
+        )
+        for i in range(5)
+    ]
+    result = compute_scope_mismatch_summary(
+        completed_tasks=completed, failed_tasks=[], dir_id_to_text={}
+    )
+    assert result is not None
+    assert len(result["top_directions"]) == 3

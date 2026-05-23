@@ -144,7 +144,13 @@ class ProjectUpdate(BaseModel):
     name: str | None = None
     directions: List[Dict[str, Any]] | None = None
     vision: Dict[str, Any] | None = None
+    # Optimistic concurrency: supply the _meta.revision value the client
+    # loaded.  Server rejects with 409 if another writer has advanced it.
+    vision_base_revision: int | None = None
     design_doc: Dict[str, Any] | None = None
+    # Optimistic concurrency: supply the _meta.revision value the client
+    # loaded.  Server rejects with 409 if another writer has advanced it.
+    design_doc_base_revision: int | None = None
     build_config: Dict[str, Any] | None = None
     autonomous_enabled: bool | None = None
     # Per-category SR catch-rate targets, e.g. {'security': 0.80}.
@@ -167,12 +173,25 @@ async def update_project(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
-    # The directions branch below is a whole-array overwrite. Lock the row and
-    # re-read directions inside the lock so a concurrent autonomous writer's
-    # append isn't silently dropped by this operator replace.
-    if payload.directions is not None:
+    # Lock the project row whenever directions, design_doc, or vision are
+    # being overwritten so concurrent agent writers cannot silently clobber.
+    needs_lock = (
+        payload.directions is not None
+        or payload.design_doc is not None
+        or payload.vision is not None
+    )
+    if needs_lock:
         project = await lock_project_or_429(session, project.id)
-        await session.refresh(project, attribute_names=["directions"])
+        attrs = [
+            a
+            for a, p in (
+                ("directions", payload.directions),
+                ("design_doc", payload.design_doc),
+                ("vision", payload.vision),
+            )
+            if p is not None
+        ]
+        await session.refresh(project, attribute_names=attrs)
 
     if payload.name is not None:
         project.name = payload.name
@@ -197,18 +216,48 @@ async def update_project(
         project.directions = normalized
         flag_modified(project, "directions")
     if payload.vision is not None:
+        stored_vision = project.vision or {}
+        stored_rev = stored_vision.get("revision", 0) or 0
+        if (
+            payload.vision_base_revision is not None
+            and payload.vision_base_revision != stored_rev
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"vision was modified by another writer "
+                    f"(base_revision={payload.vision_base_revision}, current={stored_rev}). "
+                    "Reload and retry."
+                ),
+            )
         vision = dict(payload.vision)
-        current_rev = (project.vision or {}).get("revision", 0)
-        vision["revision"] = (current_rev or 0) + 1
+        vision["revision"] = stored_rev + 1
         vision["last_updated"] = _utcnow().isoformat()
         project.vision = vision
         flag_modified(project, "vision")
     if payload.design_doc is not None:
+        stored_meta = (project.design_doc or {}).get("_meta", {}) or {}
+        stored_rev = stored_meta.get("revision", 0) or 0
+        if (
+            payload.design_doc_base_revision is not None
+            and payload.design_doc_base_revision != stored_rev
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"design_doc was modified by another writer "
+                    f"(base_revision={payload.design_doc_base_revision}, current={stored_rev}). "
+                    "Reload and retry."
+                ),
+            )
         doc = dict(payload.design_doc)
-        current_rev = (project.design_doc or {}).get("revision", 0)
-        doc["revision"] = (current_rev or 0) + 1
-        doc["last_updated"] = _utcnow().isoformat()
-        doc["updated_by"] = "user"
+        # Remove the divergent top-level "revision" key; canonical counter is _meta.revision
+        doc.pop("revision", None)
+        meta = dict(stored_meta)
+        meta["revision"] = stored_rev + 1
+        meta["last_updated"] = _utcnow().isoformat()
+        meta["updated_by"] = "user"
+        doc["_meta"] = meta
         project.design_doc = doc
         flag_modified(project, "design_doc")
     if payload.build_config is not None:
