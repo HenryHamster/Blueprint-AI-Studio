@@ -14128,3 +14128,61 @@ async def test_sr_catch_rate_previous_bucket_not_starved_by_throughput(
         "window-bounded fetch must populate both buckets and return a real result"
     )
     assert result_new.get("data_sufficient") is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_sr_catch_rate_fetch_covers_both_windows(
+    db_session: AsyncSession,
+):
+    """Integration: _refresh_sr_catch_rate must fetch tasks from both the current
+    and previous calendar windows (0-14 days and 14-28 days ago) so the metric
+    is data_sufficient=True even when the current window alone saturates a
+    row-count cap.  Catches fetch-window regressions that bypass compute_sr_catch_rate_trends
+    unit tests (which accept hand-built task lists)."""
+    from app.routers.agent import _refresh_sr_catch_rate
+
+    project = await _make_project(db_session)
+
+    # 6 SR tasks in current window (age_days=3 → inside 0–14-day bucket)
+    for _ in range(6):
+        t = _make_sr_task(
+            project.id,
+            age_days=3,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+
+    # 6 SR tasks in previous window (age_days=20 → inside 14–28-day bucket)
+    for _ in range(6):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+
+    # Non-SR tasks that must NOT affect the metric (no _self_review_outcome)
+    for _ in range(3):
+        t = Task(
+            project_id=project.id,
+            title="non-SR task",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.COMPLETED,
+            context={"scope": "small"},
+        )
+        db_session.add(t)
+
+    await db_session.flush()
+
+    # Call the router-level helper that performs the actual DB fetch
+    await _refresh_sr_catch_rate(session=db_session, project_id=project.id)
+    await db_session.flush()
+
+    trends = (project.design_doc or {}).get("sr_catch_rate_trends")
+    assert trends is not None, "_refresh_sr_catch_rate must write sr_catch_rate_trends"
+    assert trends.get("data_sufficient") is True, (
+        "fetch must cover both 0-14 and 14-28 day windows; "
+        "data_sufficient=False means the previous window was starved"
+    )

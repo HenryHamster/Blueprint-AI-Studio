@@ -815,6 +815,61 @@ async def _stamp_reviewer_recovery_count(
         session.add(proj)
 
 
+async def _refresh_sr_catch_rate(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> None:
+    """Fetch SR-relevant tasks and refresh the catch-rate trend metric.
+
+    Restricts the fetch to tasks carrying ``_self_review_outcome`` so the
+    2000-row budget spans more calendar time on high-throughput projects.
+    Postgres: ``has_key`` hits the GIN index on context; SQLite (standalone
+    tests) omits the JSON filter and ``_stats_for_tasks`` skips non-SR rows.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    _sr_cutoff = _utcnow() - timedelta(days=28)
+    dialect_name = session.bind.dialect.name if session.bind else "postgresql"
+    _where = [
+        Task.project_id == project_id,
+        Task.status.in_([TaskStatus.FAILED, TaskStatus.COMPLETED]),
+        Task.created_at >= _sr_cutoff,
+    ]
+    if dialect_name != "sqlite":
+        _where.append(Task.context.has_key("_self_review_outcome"))
+    _sr_rows = (
+        (
+            await session.execute(
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.context,
+                        Task.created_at,
+                        Task.project_id,
+                        Task.strategic_cycle_id,
+                        Task.payloads,
+                    )
+                )
+                .where(*_where)
+                .order_by(Task.created_at.desc())
+                .limit(2000)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    logger.debug(
+        "[SR_CATCH_RATE] fetched %d SR-relevant tasks for catch-rate window",
+        len(_sr_rows),
+    )
+    await compute_sr_catch_rate_trends(
+        project_id=project_id,
+        session=session,
+        all_tasks=list(_sr_rows),
+    )
+
+
 @router.post("/claim")
 @limiter.limit("200/minute")
 async def claim_task(
@@ -1562,45 +1617,7 @@ async def claim_task(
                     "[AGENT] Failed to compute review_effectiveness (non-critical)"
                 )
             try:
-                from app.playbook_learning import compute_sr_catch_rate_trends
-
-                # Window-bounded fetch for SR catch-rate: must cover both the
-                # "current" and "previous" comparison windows. A flat row-count
-                # cap starves the previous bucket on high-throughput projects —
-                # all N rows fall in the current window and the previous window
-                # is empty, so the metric freezes at data_sufficient=False.
-                # Load from 28 days ago (current 14d + previous 14d windows)
-                # with a generous safety cap to keep memory bounded.
-                _sr_cutoff = _utcnow() - timedelta(days=28)
-                _sr_stmt = (
-                    select(Task)
-                    .options(
-                        load_only(
-                            Task.id,
-                            Task.context,
-                            Task.created_at,
-                            Task.project_id,
-                            Task.strategic_cycle_id,
-                        )
-                    )
-                    .where(
-                        Task.project_id == task.project_id,
-                        Task.status.in_([TaskStatus.FAILED, TaskStatus.COMPLETED]),
-                        Task.created_at >= _sr_cutoff,
-                    )
-                    .order_by(Task.created_at.desc())
-                    .limit(2000)
-                )
-                _sr_rows = (await session.execute(_sr_stmt)).scalars().all()
-                logger.debug(
-                    "[SR_CATCH_RATE] fetched %d tasks for catch-rate window",
-                    len(_sr_rows),
-                )
-                await compute_sr_catch_rate_trends(
-                    project_id=task.project_id,
-                    session=session,
-                    all_tasks=list(_sr_rows),
-                )
+                await _refresh_sr_catch_rate(session, task.project_id)
             except Exception:
                 logger.exception(
                     "[AGENT] Failed to compute sr_catch_rate_trends (non-critical)"
@@ -2546,34 +2563,7 @@ async def claim_task(
                         "[AGENT] Failed to compute research review_effectiveness (non-critical)"
                     )
                 try:
-                    from app.playbook_learning import compute_sr_catch_rate_trends
-
-                    _sr_cutoff_r = _utcnow() - timedelta(days=28)
-                    _sr_stmt_r = (
-                        select(Task)
-                        .options(
-                            load_only(
-                                Task.id,
-                                Task.context,
-                                Task.created_at,
-                                Task.project_id,
-                                Task.strategic_cycle_id,
-                            )
-                        )
-                        .where(
-                            Task.project_id == task.project_id,
-                            Task.status.in_([TaskStatus.FAILED, TaskStatus.COMPLETED]),
-                            Task.created_at >= _sr_cutoff_r,
-                        )
-                        .order_by(Task.created_at.desc())
-                        .limit(2000)
-                    )
-                    _sr_rows_r = (await session.execute(_sr_stmt_r)).scalars().all()
-                    await compute_sr_catch_rate_trends(
-                        project_id=task.project_id,
-                        session=session,
-                        all_tasks=list(_sr_rows_r),
-                    )
+                    await _refresh_sr_catch_rate(session, task.project_id)
                 except Exception:
                     logger.exception(
                         "[AGENT] Failed to compute research sr_catch_rate_trends (non-critical)"
