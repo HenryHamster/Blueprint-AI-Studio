@@ -1460,6 +1460,14 @@ describe('matchesRateLimit', () => {
     expect(matchesRateLimit("you've hit your session limit · resets 7:10am (UTC)")).toBe(true);
   });
 
+  it('detects "you\'ve hit your weekly limit" for anthropic/oauth', () => {
+    expect(matchesRateLimit("You've hit your weekly limit · resets 9pm (UTC)", 'anthropic', 'oauth')).toBe(true);
+  });
+
+  it('detects "you\'ve hit your weekly limit" for default provider (anthropic/oauth)', () => {
+    expect(matchesRateLimit("You've hit your weekly limit · resets 9pm (UTC)")).toBe(true);
+  });
+
   it('detects structured api_error_status:429 in transcript regardless of provider', () => {
     const transcript = '{"type":"result","is_error":true,"api_error_status":429,"error":"rate_limit"}';
     expect(matchesRateLimit(transcript)).toBe(true);

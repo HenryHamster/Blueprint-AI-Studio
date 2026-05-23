@@ -20,6 +20,8 @@ _RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "you've hit your usage limit",
     "you've hit your session limit",
     "session limit · resets",
+    "you've hit your weekly limit",
+    "weekly limit · resets",
     "claude ai usage limit reached",
     "you're out of extra usage",
     "5-hour limit reached",
