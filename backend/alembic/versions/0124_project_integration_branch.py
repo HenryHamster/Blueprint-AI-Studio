@@ -3,8 +3,8 @@
 Backfills 'automain' for the self-repo project (is_self_repo=True)
 and leaves all other rows NULL (falls back to runtime_config then 'main').
 
-Revision ID: 0123
-Revises: 0122
+Revision ID: 0124
+Revises: 0123
 Create Date: 2026-05-23 00:00:00.000000
 
 """
@@ -12,8 +12,8 @@ Create Date: 2026-05-23 00:00:00.000000
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0123"
-down_revision = "0122"
+revision = "0124"
+down_revision = "0123"
 branch_labels = None
 depends_on = None
 
