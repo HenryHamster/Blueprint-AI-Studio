@@ -1,20 +1,15 @@
 name: CI
 
-# Triggers: PR events (branch-protection gate) + push to MAIN only. The push
-# trigger was dropped earlier when the suite was ~15 min (post-merge run was a
-# redundant ~50% of CI minutes); now that the backend suite is sharded to ~4
-# min it's re-enabled, and main pushes are rare (promotions only) so the cost is
-# negligible. The main push run activates the per-shard baseline save + the
-# testmon-cache refresh (both gated on push+main) and gives a definitive
-# post-promotion green signal. NOT enabled on automain: that fires on every
-# rollup merge (frequent) and is already covered by the qualifier's candidate-CI
-# check before promotion.
+# Trigger on PR events only. A push-to-main trigger was briefly tried, but it
+# re-ran the full suite post-merge (redundant with the promotion PR's CI that
+# already validated that exact candidate) AND dragged in a full SERIAL testmon
+# job (~11 min — the very thing sharding eliminated) just to refresh a local-dev
+# cache that the system runs fine without. Net: ~triple redundant work per
+# promotion for negligible value. PR CI is the gate; keep it single.
 on:
   pull_request:
     branches: [main, automain]
     types: [opened, synchronize, reopened, edited]
-  push:
-    branches: [main]
   workflow_dispatch:
 
 # Cancel superseded runs when a new commit lands on the same PR. Autonomous
@@ -371,91 +366,6 @@ jobs:
           fi
           echo "::error::Backend shards result: $R"
           exit 1
-
-  # testmon cache refresh — main-only, full SERIAL run with coverage tracing so
-  # the orphan testmon-cache branch (consumed by scripts/test-backend.sh for
-  # local --testmon-forceselect) stays fresh. Decoupled from the sharded gating
-  # job because testmon needs the WHOLE suite in one process. Non-gating: it only
-  # runs on main pushes and never blocks a PR (the sharded backend job gates).
-  backend-testmon:
-    name: CI / Backend testmon cache
-    runs-on: ubuntu-latest
-    needs: detect
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.detect.outputs.backend == 'true'
-    permissions:
-      contents: write
-    services:
-      postgres:
-        image: postgres:15
-        env:
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-          POSTGRES_DB: test_blueprint
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U test -d test_blueprint"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
-    env:
-      TEST_DB_URL: postgresql+asyncpg://test:test@localhost:5432/test_blueprint
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build backend image
-        run: |
-          cp CLAUDE.md backend/CLAUDE.md
-          docker build -t blueprint-backend-test ./backend
-
-      - name: Run migrations on test DB
-        run: |
-          docker run --rm --network host \
-            -e DATABASE_URL=${{ env.TEST_DB_URL }} \
-            blueprint-backend-test \
-            alembic upgrade head
-
-      - name: Run full suite with testmon collection
-        continue-on-error: true
-        run: |
-          mkdir -p .testmon-out
-          docker run --rm --network host \
-            -e DATABASE_URL=${{ env.TEST_DB_URL }} \
-            -e USE_TEST_POSTGRES=true \
-            -e AGENT_JWT_SECRET=ci-test-secret \
-            -e WS_TICKET_SECRET=ci-test-secret \
-            -v "$PWD/.testmon-out:/out" -e TESTMON_DATAFILE=/out/.testmondata \
-            blueprint-backend-test \
-            python -m pytest testing/ -q --tb=short --timeout=45 --timeout-method=signal --log-cli-level=WARNING --testmon-noselect
-
-      - name: Vacuum testmon cache
-        run: |
-          docker run --rm \
-            -v "$PWD/.testmon-out:/out" \
-            blueprint-backend-test \
-            python -c 'import sqlite3; c=sqlite3.connect("/out/.testmondata"); c.execute("PRAGMA wal_checkpoint(FULL)"); c.execute("VACUUM"); c.close()'
-          ls -lh .testmon-out/.testmondata
-
-      - name: Push testmon cache to orphan branch
-        run: |
-          # Move the artifact out of the working tree before we wipe it.
-          cp .testmon-out/.testmondata /tmp/.testmondata-cache
-          git config user.name "blueprint-bot"
-          git config user.email "blueprint-bot@users.noreply.github.com"
-          # Orphan branch: no merge history, single commit per main push.
-          # Force-push because each refresh fully replaces the previous one.
-          git checkout --orphan testmon-cache-tmp
-          git rm -rf --cached . > /dev/null 2>&1 || true
-          git clean -fdx -e .testmon-out
-          cp /tmp/.testmondata-cache .testmondata
-          cat > .gitignore <<'EOF'
-          *
-          !.testmondata
-          !.gitignore
-          EOF
-          git add .testmondata .gitignore
-          git commit -m "testmon: refresh from ${GITHUB_SHA}"
-          git push --force origin testmon-cache-tmp:testmon-cache
 
   agent:
     name: CI / Agent
