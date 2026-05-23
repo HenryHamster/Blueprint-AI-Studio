@@ -227,6 +227,7 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     """
     # Deferred import to avoid circular dependency (main.py imports this module)
     from app.failure_classification import classify_failure  # noqa: PLC0415
+    from app.direction_outcomes import _is_cascade_cancelled  # noqa: PLC0415
 
     now = _utcnow()
     window_48h = now - timedelta(hours=48)
@@ -269,13 +270,20 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     anomalies = []
 
     # --- Failure class analysis ---
+    # Exclude benign orchestrator-cascade terminations (requeue replacements,
+    # dependency/parent cancellations, and pipeline supersessions) so that
+    # routine lifecycle bookkeeping never produces false spike or fingerprint signals.
     recent_failures = [
-        t for t in terminal_tasks if t.created_at and t.created_at >= window_48h
+        t
+        for t in terminal_tasks
+        if t.created_at and t.created_at >= window_48h and not _is_cascade_cancelled(t)
     ]
     prior_failures = [
         t
         for t in terminal_tasks
-        if t.created_at and prior_window_start <= t.created_at < window_48h
+        if t.created_at
+        and prior_window_start <= t.created_at < window_48h
+        and not _is_cascade_cancelled(t)
     ]
 
     # Group by failure class
@@ -379,6 +387,8 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     from app.time_utils import _to_naive_utc
 
     for t in terminal_tasks:
+        if _is_cascade_cancelled(t):
+            continue
         # Task.created_at TIMESTAMPTZ since 0061; momentum_window_start + now are naive.
         t_created = _to_naive_utc(t.created_at)
         if not t_created or t_created < momentum_window_start:

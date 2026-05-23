@@ -2630,6 +2630,16 @@ def test_is_cascade_cancelled_detects_signals():
     # Dependency cascade
     t.latest_status_message = "Cancelled: dependency task failed"
     assert _is_cascade_cancelled(t)
+    # Review-pipeline supersession ("Superseded by fix on PR #N: ...")
+    t.latest_status_message = (
+        "Superseded by fix on PR #5317: review was scoped to a pre-conflict snapshot"
+    )
+    assert _is_cascade_cancelled(t)
+    # Stale-heartbeat supersession ("Superseded by new review for PR #N: ...")
+    t.latest_status_message = (
+        "Superseded by new review for PR #42: no heartbeat for >30min"
+    )
+    assert _is_cascade_cancelled(t)
     # Genuine cancellation (operator action with no cascade marker)
     t.latest_status_message = "Cancelled by admin"
     assert not _is_cascade_cancelled(t)

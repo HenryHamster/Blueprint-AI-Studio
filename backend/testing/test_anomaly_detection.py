@@ -10,9 +10,14 @@ from datetime import timedelta
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from app.anomaly_detection import _compute_research_anomalies
+import app.shared_state as _shared_state
+from app.anomaly_detection import (
+    _compute_research_anomalies,
+    _spawn_proactive_fingerprint_investigations,
+    _spawn_proactive_intra_direction_investigations,
+)
 from app.failure_classification import classify_failure
-from app.models import TaskStatus, Project
+from app.models import Task as _TaskModel, TaskStatus, Project
 from testing.factories import make_task, make_project, _utcnow
 
 
@@ -651,10 +656,6 @@ async def test_cross_direction_below_count_threshold_no_anomaly():
 # Proactive fingerprint investigation spawning
 # ─────────────────────────────────────────────────────────────────────────────
 
-import app.shared_state as _shared_state
-from app.anomaly_detection import _spawn_proactive_fingerprint_investigations
-from app.models import Task as _TaskModel
-
 
 @pytest.fixture(autouse=True)
 def _stub_recent_changes_for_proactive(monkeypatch):
@@ -909,10 +910,6 @@ async def test_proactive_fingerprint_system_concurrent_cap(monkeypatch):
 # ─────────────────────────────────────────────────────────────────────────────
 # Intra-direction fingerprint detection + proactive spawning
 # ─────────────────────────────────────────────────────────────────────────────
-
-from app.anomaly_detection import (
-    _spawn_proactive_intra_direction_investigations,
-)
 
 
 @pytest.mark.asyncio
@@ -1254,3 +1251,71 @@ async def test_compute_research_anomalies_records_last_run_timestamp():
         assert before - timedelta(seconds=1) <= recorded <= after + timedelta(seconds=1)
     finally:
         _shared_state.last_anomaly_detection_run_at = saved
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Benign cancellation exclusion (cascade, supersession, parent-requeue)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_supersession_only_window_produces_no_agent_timeout_spike():
+    """A window of supersession cancellations does not produce an AGENT_TIMEOUT spike.
+
+    Superseded tasks are CANCELLED with 'Superseded by ...' messages. Without the
+    _is_cascade_cancelled filter they would classify as AGENT_TIMEOUT and exceed the
+    >3 spike threshold. With the filter they are excluded from the failure counts
+    entirely so no anomaly fires.
+    """
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    project = make_project(directions=[])
+
+    # 5 superseded tasks — exceeds the spike threshold (>3) when not filtered
+    superseded = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.CANCELLED,
+            latest_status_message="Superseded by fix on PR #5377: stale review snapshot",
+            context={"direction_id": f"d-r{i:03d}"},
+            created_at=now - timedelta(hours=5 + i),
+        )
+        for i in range(5)
+    ]
+    session = _make_session(tasks=superseded, project=project)
+
+    result = await _compute_research_anomalies(project_id, session)
+
+    assert not any("AGENT_TIMEOUT" in a["signal"] for a in result)
+
+
+@pytest.mark.asyncio
+async def test_parent_requeued_no_cross_direction_fingerprint():
+    """'Parent requeued' messages across directions produce no CrossDirectionFingerprint.
+
+    These messages are identical by construction so they would always cluster into a
+    high-severity cross-direction fingerprint if counted. _is_cascade_cancelled must
+    exclude them before the fingerprint-grouping pass so the anomaly never fires.
+    """
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    project = make_project(directions=[])
+
+    # 3 cancelled tasks with the same 'Parent requeued' message spread across 3 directions.
+    # Without exclusion: 3 directions + 3 failures ≥ the CrossDirectionFingerprint threshold.
+    msg = "Parent requeued - replaced by retry"
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.CANCELLED,
+            latest_status_message=msg,
+            context={"direction_id": f"d-{label}"},
+            created_at=now - timedelta(hours=2 + i),
+        )
+        for i, label in enumerate(["qqq", "rrr", "sss"])
+    ]
+    session = _make_session(tasks=tasks, project=project)
+
+    result = await _compute_research_anomalies(project_id, session)
+
+    assert not any(a["signal"].startswith("CrossDirectionFingerprint_") for a in result)

@@ -47,6 +47,7 @@ def _is_cascade_cancelled(task: Task) -> bool:
         msg.startswith("Parent requeued")
         or msg.startswith("Cancelled: parent ")
         or msg.startswith("Cancelled: dependency ")
+        or msg.startswith("Superseded by")
     )
 
 
