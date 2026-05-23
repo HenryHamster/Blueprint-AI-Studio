@@ -1411,3 +1411,26 @@ async def test_llm_cost_breakdown_endpoint_window_days_validation(
         f"/api/admin/projects/{project.id}/llm-cost-breakdown?window_days=91"
     )
     assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_read_baseline_with_drift_includes_reuse_funnel(db_session):
+    """read_baseline_with_drift must include a reuse_funnel key with rolling counters."""
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    result = await read_baseline_with_drift(db_session, project.id)
+    assert "reuse_funnel" in result
+    funnel = result["reuse_funnel"]
+    assert "window_hours" in funnel
+    assert "completed_vms_with_eligible_backlog" in funnel
+    assert "teardown_defers_scheduled" in funnel
+    assert "next_role_polls_during_defer" in funnel
+    assert "warm_claims_succeeded" in funnel
+    assert "claim_skipped_by_reason" in funnel
+    assert "claim_skipped_total" in funnel
+    # On a fresh instance all counters start at zero.
+    assert funnel["completed_vms_with_eligible_backlog"] == 0
+    assert funnel["warm_claims_succeeded"] == 0

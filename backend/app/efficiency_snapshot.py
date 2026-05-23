@@ -633,7 +633,14 @@ async def read_baseline_with_drift(
     operators see the same numbers the snapshot service published. Endpoint
     consumers that want a freshly recomputed view should call
     ``compute_current_axes`` directly.
+
+    Also includes ``reuse_funnel``: rolling 24h warm-reuse claim funnel
+    counters (see :func:`app.warm_backlog_reuse.get_reuse_funnel_snapshot`).
+    These counters are in-memory and instance-local; they reset on restart and
+    are not stored in the efficiency baseline snapshot.
     """
+    from app.warm_backlog_reuse import get_reuse_funnel_snapshot  # noqa: PLC0415
+
     project = await session.get(Project, project_id)
     if project is None:
         raise ValueError(f"Project {project_id} not found")
@@ -674,6 +681,7 @@ async def read_baseline_with_drift(
         "baseline_captured_at": baseline.get("captured_at"),
         "last_snapshot_at": container.get("last_run_at") or latest.get("captured_at"),
         "vm_cold_start_breakdown": latest.get("vm_cold_start_breakdown"),
+        "reuse_funnel": get_reuse_funnel_snapshot(),
     }
 
 
