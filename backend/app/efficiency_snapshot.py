@@ -77,13 +77,34 @@ ALL_AXES: tuple[str, ...] = (
 )
 
 # LLM token pricing table: (provider, model) -> (input_$/token, output_$/token).
-# Sourced from public Anthropic pricing (2025). Per-token = per-million / 1_000_000.
-# Unknown provider/model combinations are skipped (zero contribution, no crash).
+# Per-token rates = per-million-token rate / 1_000_000.
+#
+# Sources (retrieved 2026-05):
+#   Anthropic — https://www.anthropic.com/pricing#api
+#   OpenAI    — https://openai.com/api/pricing
+#   Gemini    — https://ai.google.dev/gemini-api/docs/pricing
+#
+# NOTE: Gemini tasks today carry llm_call_count but NOT total_input_tokens /
+# total_output_tokens because the Gemini CLI invocation path in agent/src/index.ts
+# runs with outputMode='text' (no JSONL parser, no usage block extraction).
+# The Gemini pricing entries below will fire correctly once the agent-side
+# telemetry gap is closed; until then Gemini tasks have zero token counts and
+# are correctly treated as "not priceable" by _compute_llm_cost_pricing_coverage.
 LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
+    # Anthropic
     ("anthropic", "claude-opus-4-7"): (15e-6, 75e-6),
     ("anthropic", "claude-opus-4-6"): (15e-6, 75e-6),
     ("anthropic", "claude-sonnet-4-6"): (3e-6, 15e-6),
     ("anthropic", "claude-haiku-4-5-20251001"): (0.8e-6, 4e-6),
+    # OpenAI (openai.com/api/pricing, 2026-05)
+    ("openai", "gpt-5.4"): (5e-6, 25e-6),
+    ("openai", "gpt-5.4-mini"): (0.5e-6, 2e-6),
+    ("openai", "gpt-5.3-codex"): (3e-6, 12e-6),
+    # Gemini (ai.google.dev/gemini-api/docs/pricing, 2026-05)
+    # Token counts are zero today (agent telemetry gap — see note above).
+    ("gemini", "gemini-2.5-pro"): (1.25e-6, 10e-6),
+    ("gemini", "gemini-2.5-flash"): (0.30e-6, 2.5e-6),
+    ("gemini", "gemini-2.5-flash-lite"): (0.10e-6, 0.40e-6),
 }
 
 DESIGN_DOC_KEY = "efficiency_baseline"
@@ -178,6 +199,56 @@ def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
     if not merged:
         return None
     return round(total_cost / merged, 6)
+
+
+_UNPRICED_COMBOS_CAP = 10
+
+
+def _compute_llm_cost_pricing_coverage(
+    tasks: list[Task],
+) -> Dict[str, Any]:
+    """Coverage diagnostic: how many token-bearing tasks have a pricing entry.
+
+    A task is "priceable" when it has non-zero total tokens AND a non-null
+    (provider, model). A priceable task is "priced" when (provider, model) is
+    in LLM_TOKEN_PRICING; otherwise it is "unpriced" and silently contributes
+    zero to llm_cost_per_merged_pr.
+    """
+    priced = 0
+    unpriced = 0
+    unpriced_combos: list[str] = []
+    for t in tasks:
+        summary = t.api_call_summary or {}
+        input_tokens = summary.get("total_input_tokens")
+        output_tokens = summary.get("total_output_tokens")
+        has_tokens = (
+            isinstance(input_tokens, (int, float))
+            and isinstance(output_tokens, (int, float))
+            and (input_tokens + output_tokens) > 0
+        )
+        if not has_tokens or not t.provider or not t.model:
+            continue
+        key = (t.provider.lower(), t.model.lower())
+        if key in LLM_TOKEN_PRICING:
+            priced += 1
+        else:
+            unpriced += 1
+            combo = f"{t.provider.lower()}:{t.model.lower()}"
+            if (
+                combo not in unpriced_combos
+                and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
+            ):
+                unpriced_combos.append(combo)
+    priceable = priced + unpriced
+    coverage_fraction: Optional[float] = (
+        round(priced / priceable, 4) if priceable else None
+    )
+    return {
+        "priced_tasks": priced,
+        "unpriced_tasks": unpriced,
+        "coverage_fraction": coverage_fraction,
+        "unpriced_combos": unpriced_combos,
+    }
 
 
 def _compute_vm_cold_start_p50_ms(tasks: list[Task]) -> Optional[float]:
@@ -304,6 +375,7 @@ async def compute_current_axes(
         AXIS_MEDIAN_REVIEW_ITERATIONS: _compute_median_review_iterations(tasks),
         AXIS_LLM_COST_PER_MERGED_PR: _compute_llm_cost_per_merged_pr(tasks),
         "vm_cold_start_breakdown": _compute_cold_start_breakdown_p50(tasks),
+        "llm_cost_pricing_coverage": _compute_llm_cost_pricing_coverage(tasks),
     }
 
 

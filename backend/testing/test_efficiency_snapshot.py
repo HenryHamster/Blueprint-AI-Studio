@@ -18,6 +18,7 @@ from app.efficiency_snapshot import (
     DESIGN_DOC_KEY,
     LLM_TOKEN_PRICING,
     _compute_cold_start_breakdown_p50,
+    _compute_llm_cost_pricing_coverage,
     _last_run_due,
     compute_current_axes,
     maybe_write_daily_snapshot,
@@ -176,7 +177,10 @@ async def test_compute_current_axes_empty_returns_none(db_session):
     await db_session.refresh(project)
 
     axes = await compute_current_axes(db_session, project.id)
-    assert all(v is None for v in axes.values())
+    # Scalar axes are None when no tasks exist. Structural metadata keys
+    # (vm_cold_start_breakdown, llm_cost_pricing_coverage) are exempt —
+    # they return None / empty-dict rather than a scalar None.
+    assert all(axes[k] is None for k in ALL_AXES)
 
 
 @pytest.mark.asyncio
@@ -1033,3 +1037,127 @@ async def test_schema_version_v3_migrates_llm_axis(db_session):
     assert baseline["_schema_version"] == 4
     # Other axes untouched.
     assert baseline[AXIS_COST_PER_MERGED_PR] == 0.03
+
+
+@pytest.mark.asyncio
+async def test_llm_token_pricing_openai_model(db_session):
+    """OpenAI task with token counts produces correct LLM cost per merged PR."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("openai", "gpt-5.4-mini")]
+    db_session.add(
+        _make_efficient_task(
+            project.id,
+            api_call_summary={
+                "llm_call_count": 8,
+                "total_input_tokens": 2000,
+                "total_output_tokens": 800,
+            },
+            provider="openai",
+            model="gpt-5.4-mini",
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    expected = round(2000 * input_rate + 800 * output_rate, 6)
+    assert axes[AXIS_LLM_COST_PER_MERGED_PR] == expected
+
+
+@pytest.mark.asyncio
+async def test_llm_token_pricing_gemini_model(db_session):
+    """Gemini task with explicitly-provided token counts produces correct LLM cost.
+
+    In production Gemini tasks carry zero token counts today (agent telemetry gap —
+    outputMode='text' in index.ts skips usage extraction). This test guards the
+    pricing entry so it fires correctly once the agent-side gap is closed.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("gemini", "gemini-2.5-flash")]
+    db_session.add(
+        _make_efficient_task(
+            project.id,
+            api_call_summary={
+                "llm_call_count": 5,
+                "total_input_tokens": 3000,
+                "total_output_tokens": 1200,
+            },
+            provider="gemini",
+            model="gemini-2.5-flash",
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    expected = round(3000 * input_rate + 1200 * output_rate, 6)
+    assert axes[AXIS_LLM_COST_PER_MERGED_PR] == expected
+
+
+def test_llm_cost_pricing_coverage_shape():
+    """Coverage dict: priced=1, unpriced=1, coverage_fraction=0.5, combo listed."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    # Priced task: Anthropic with tokens.
+    priced = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # Unpriced task: made-up provider+model with tokens.
+    unpriced = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 500,
+            "total_output_tokens": 200,
+        },
+        provider="fakeprovider",
+        model="fake-model-x",
+    )
+    # Not-priceable task: no token counts.
+    no_tokens = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={"llm_call_count": 3},
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    result = _compute_llm_cost_pricing_coverage([priced, unpriced, no_tokens])
+    assert result["priced_tasks"] == 1
+    assert result["unpriced_tasks"] == 1
+    assert result["coverage_fraction"] == 0.5
+    assert "fakeprovider:fake-model-x" in result["unpriced_combos"]
+
+
+def test_llm_cost_pricing_coverage_empty_window():
+    """Empty window (no priceable tasks) yields coverage_fraction=None, empty combos."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    no_tokens = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={"llm_call_count": 2},
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    result = _compute_llm_cost_pricing_coverage([no_tokens])
+    assert result["priced_tasks"] == 0
+    assert result["unpriced_tasks"] == 0
+    assert result["coverage_fraction"] is None
+    assert result["unpriced_combos"] == []
