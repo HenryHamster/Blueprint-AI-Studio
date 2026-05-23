@@ -9,7 +9,7 @@ import json
 import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import func, update
+from sqlalchemy import func, update, case
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 
@@ -477,28 +477,26 @@ async def get_all_tasks(
         }
         result_list.append(task_dict)
 
-    # Global counts (not affected by pagination/filters)
-    active_count = (
+    # Global counts (not affected by pagination/filters) — single query via CASE/WHEN
+    _counts_row = (
         await session.execute(
-            select(func.count())
-            .select_from(Task)
-            .where(Task.status.in_([TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]))
+            select(
+                func.count(
+                    case(
+                        (
+                            Task.status.in_(
+                                [TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]
+                            ),
+                            1,
+                        )
+                    )
+                ),
+                func.count(case((Task.status == TaskStatus.EVALUATING, 1))),
+                func.count(case((Task.status == TaskStatus.QUEUED, 1))),
+            ).select_from(Task)
         )
-    ).scalar() or 0
-    evaluating_count = (
-        await session.execute(
-            select(func.count())
-            .select_from(Task)
-            .where(Task.status == TaskStatus.EVALUATING)
-        )
-    ).scalar() or 0
-    queued_count = (
-        await session.execute(
-            select(func.count())
-            .select_from(Task)
-            .where(Task.status == TaskStatus.QUEUED)
-        )
-    ).scalar() or 0
+    ).one()
+    active_count, evaluating_count, queued_count = _counts_row
 
     return {
         "tasks": result_list,

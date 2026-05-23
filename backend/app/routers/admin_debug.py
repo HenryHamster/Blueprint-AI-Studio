@@ -463,7 +463,8 @@ async def get_autonomy_debug(
     # report `research_task_active` blocks that the spawn path would not
     # actually hit, which was misleading the autonomy-debug UI.
     busy_tasks_result = await session.execute(
-        select(Task).where(
+        select(Task)
+        .where(
             Task.project_id == project_id,
             Task.status.in_(
                 [
@@ -474,6 +475,7 @@ async def get_autonomy_debug(
                 ]
             ),
         )
+        .limit(1000)
     )
     busy_direction_ids: list[str] = []
     active_research_count = 0
@@ -571,11 +573,13 @@ async def get_autonomy_debug(
     # Guard 5: rate_limit_exceeded
     one_hour_ago = now - timedelta(hours=1)
     recent_tasks_result = await session.execute(
-        select(Task).where(
+        select(Task)
+        .where(
             Task.project_id == project_id,
             Task.created_by == "ORCHESTRATOR",
             Task.created_at >= one_hour_ago,
         )
+        .limit(5000)
     )
     recent_tasks = recent_tasks_result.scalars().all()
     tasks_this_hour = sum(
@@ -700,20 +704,25 @@ async def get_strategic_debug(
 
     # Active strategic task (design_doc_update or strategic_review) — mirrors
     # _has_active_strategic_task but without the FOR UPDATE lock (read-only view).
-    active_stmt = select(Task).where(
-        Task.project_id == project_id,
-        Task.status.in_(
-            [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
-        ),
+    active_stmt = (
+        select(Task)
+        .where(
+            Task.project_id == project_id,
+            Task.status.in_(
+                [TaskStatus.QUEUED, TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+            ),
+            Task.payloads[0]["type"].astext.in_(
+                ["design_doc_update", "strategic_review"]
+            ),
+        )
+        .limit(1)
     )
     active_strategic_task: Optional[Task] = None
     active_phase: Optional[str] = None
-    for t in (await session.execute(active_stmt)).scalars().all():
-        ptype = (t.first_payload).get("type")
-        if ptype in ("design_doc_update", "strategic_review"):
-            active_strategic_task = t
-            active_phase = ptype
-            break
+    result = (await session.execute(active_stmt)).scalars().first()
+    if result is not None:
+        active_strategic_task = result
+        active_phase = (result.first_payload).get("type")
 
     # Trigger countdowns
     strategic_frequency = vision.get(

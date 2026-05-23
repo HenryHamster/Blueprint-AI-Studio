@@ -3620,13 +3620,15 @@ async def get_regression_case_trend(
     rows = (
         (
             await session.execute(
-                select(RegressionRemediationCase).where(
+                select(RegressionRemediationCase)
+                .where(
                     RegressionRemediationCase.project_id == project_id,
                     or_(
                         RegressionRemediationCase.first_seen_at >= cutoff,
                         RegressionRemediationCase.updated_at >= cutoff,
                     ),
                 )
+                .limit(5000)
             )
         )
         .scalars()
@@ -6161,10 +6163,12 @@ async def _compute_digest(
     # R4-W2 (M3): ``has_key`` uses the JSONB ``?`` operator so the
     # ``ix_task_context_gin`` GIN index can satisfy the predicate.
     _rem_result = await session.execute(
-        select(Task).where(
+        select(Task)
+        .where(
             *_funnel_filters,
             Task.context.has_key("diagnosis_task_id"),
         )
+        .limit(10000)
     )
     _rem_tasks = _rem_result.scalars().all()
 
@@ -6201,7 +6205,10 @@ async def _compute_digest(
         _held_projects_q = _held_projects_q.where(Project.id == project_id)
     else:
         _held_projects_q = _held_projects_q.where(Project.directions.isnot(None))
-    _held_projects = (await session.execute(_held_projects_q)).scalars().all()
+    _held_projects = (
+        (await session.execute(_held_projects_q.limit(10000))).scalars().all()
+    )
+
     fixes_held = 0
     _window_iso = window_start.isoformat()
     for _p in _held_projects:
@@ -7587,6 +7594,7 @@ async def get_fix_loop_diverged_tasks(
             )
         )
         .order_by(Task.created_at.desc())
+        .limit(5000)
     )
     if project_id is not None:
         stmt = stmt.where(Task.project_id == project_id)

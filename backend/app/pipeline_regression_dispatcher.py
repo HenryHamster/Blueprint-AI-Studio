@@ -5997,12 +5997,22 @@ async def _evaluate_reviewer_sla_signal(
         .all()
     )
 
+    task_ids = [c.last_remediation_task_id for c in cases if c.last_remediation_task_id]
+    tasks_by_id: dict = {}
+    if task_ids:
+        tasks_by_id = {
+            t.id: t
+            for t in (await session.execute(select(Task).where(Task.id.in_(task_ids))))
+            .scalars()
+            .all()
+        }
+
     spawned = 0
     for case in cases:
         if spawned >= spawn_budget_left:
             break
 
-        task = await session.get(Task, case.last_remediation_task_id)
+        task = tasks_by_id.get(case.last_remediation_task_id)
         if task is None:
             continue
 

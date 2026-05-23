@@ -296,6 +296,34 @@ export function KanbanBoard({
   }, [taskColumnMap, tasksByColumn]);
 
   const columnRefs = useRef<(HTMLDivElement | null)[][]>([]);
+
+  // Stable factory that returns a cached ref callback for (colIdx, cardIdx).
+  // Uses a plain-object cache inside useMemo so no ref is accessed during render.
+  const makeCardRef = useMemo(() => {
+    const cache: Record<string, (el: HTMLDivElement | null) => void> = {};
+    return (colIdx: number, cardIdx: number): (el: HTMLDivElement | null) => void => {
+      const key = `${colIdx}:${cardIdx}`;
+      if (!cache[key]) {
+        cache[key] = (el: HTMLDivElement | null) => {
+          if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = [];
+          columnRefs.current[colIdx][cardIdx] = el;
+        };
+      }
+      return cache[key];
+    };
+  }, []);
+
+  // Curried variant for KanbanColumnComponent's getCardRef prop.
+  const makeGetCardRef = useMemo(() => {
+    const cache: Record<number, (cardIdx: number) => (el: HTMLDivElement | null) => void> = {};
+    return (colIdx: number): (cardIdx: number) => (el: HTMLDivElement | null) => void => {
+      if (!cache[colIdx]) {
+        cache[colIdx] = (cardIdx: number) => makeCardRef(colIdx, cardIdx);
+      }
+      return cache[colIdx];
+    };
+  }, [makeCardRef]);
+
   const tasksByColumnRef = useRef(tasksByColumn);
   // eslint-disable-next-line react-hooks/refs
   tasksByColumnRef.current = tasksByColumn;
@@ -357,7 +385,34 @@ export function KanbanBoard({
     return map;
   }, [tasks]);
 
-  const taskProps = { selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery, onDirectionClick };
+  const taskProps = useMemo(() => ({ selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery, onDirectionClick }), [selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery, onDirectionClick]);
+
+  const mobileGroupedSorted = useMemo(() => {
+    if (groupBy !== 'type') return {} as Record<string, Array<[string, Task[]]>>;
+    const result: Record<string, Array<[string, Task[]]>> = {};
+    for (const col of columns) {
+      const colTasks = tasksByColumn[col.id] ?? [];
+      const groups = new Map<string, Task[]>();
+      for (const task of colTasks) {
+        const type = task.task_type || 'create';
+        const list = groups.get(type) ?? [];
+        list.push(task);
+        groups.set(type, list);
+      }
+      result[col.id] = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    }
+    return result;
+  }, [groupBy, columns, tasksByColumn]);
+
+  const mobileTaskFlatIndex = useMemo(() => {
+    if (groupBy !== 'type') return {} as Record<string, Map<string, number>>;
+    const result: Record<string, Map<string, number>> = {};
+    for (const col of columns) {
+      const colTasks = tasksByColumn[col.id] ?? [];
+      result[col.id] = new Map(colTasks.map((t, i) => [t.id, i]));
+    }
+    return result;
+  }, [groupBy, columns, tasksByColumn]);
 
   return (
     <DndContext
@@ -407,15 +462,8 @@ export function KanbanBoard({
 
           let mobileContent: React.ReactNode;
           if (groupBy === 'type') {
-            const groups = new Map<string, Task[]>();
-            for (const task of columnTasks) {
-              const type = task.task_type || 'create';
-              const list = groups.get(type) ?? [];
-              list.push(task);
-              groups.set(type, list);
-            }
-            const sorted = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-            const taskFlatIndex = new Map(columnTasks.map((t, i) => [t.id, i]));
+            const sorted = mobileGroupedSorted[col.id] ?? [];
+            const taskFlatIndex = mobileTaskFlatIndex[col.id] ?? new Map<string, number>();
             mobileContent = sorted.length === 0 && !loading ? (
               <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">No tasks</div>
             ) : (
@@ -442,7 +490,7 @@ export function KanbanBoard({
                               isTracked={trackedTaskIds?.has(task.id)}
                               colIdx={colIdx}
                               cardIdx={flatIdx}
-                              cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][flatIdx] = el; }}
+                              cardRef={makeCardRef(colIdx, flatIdx)}
                               onNavigate={handleNavigate}
                             />
                           );
@@ -494,7 +542,7 @@ export function KanbanBoard({
                               isTracked={trackedTaskIds?.has(task.id)}
                               colIdx={colIdx}
                               cardIdx={flatIdx}
-                              cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][flatIdx] = el; }}
+                              cardRef={makeCardRef(colIdx, flatIdx)}
                               onNavigate={handleNavigate}
                             />
                           );
@@ -524,7 +572,7 @@ export function KanbanBoard({
                       blockingCount={blockingMap[task.id]}
                       colIdx={colIdx}
                       cardIdx={cardIdx}
-                      cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][cardIdx] = el; }}
+                      cardRef={makeCardRef(colIdx, cardIdx)}
                       onNavigate={handleNavigate}
                       onApprove={onApprove}
                       onRequestChanges={onRequestChanges}
@@ -634,10 +682,7 @@ export function KanbanBoard({
               handleResizeStart={handleResizeStart}
               showResizeHandle={showResizeHandle}
               prevColId={prevColId}
-              getCardRef={(cardIdx) => (el) => {
-                if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = [];
-                columnRefs.current[colIdx][cardIdx] = el;
-              }}
+              getCardRef={makeGetCardRef(colIdx)}
               handleNavigate={handleNavigate}
               onDirectionClick={onDirectionClick}
             />
