@@ -333,8 +333,7 @@ async def _run_signal_staleness_watchdog(
     specs: list[tuple[str, Any, timedelta]] = [
         (
             "sr_catch_rate",
-            (doc.get("sr_catch_rate_trends") or {}).get("last_sufficient_computed_at")
-            or (doc.get("sr_catch_rate_trends") or {}).get("signal_last_computed_at"),
+            (doc.get("sr_catch_rate_trends") or {}).get("last_sufficient_computed_at"),
             _SIGNAL_STALENESS_WINDOWS["sr_catch_rate"],
         ),
         (
@@ -399,6 +398,44 @@ async def _run_signal_staleness_watchdog(
                 )
             )
             created += 1
+
+    # Detect never-sufficient: signal has run (heartbeat present) but has never
+    # produced a real, well-sampled measurement (last_sufficient_computed_at absent).
+    _sr_trends = doc.get("sr_catch_rate_trends") or {}
+    if _sr_trends.get("signal_last_computed_at") and not _sr_trends.get(
+        "last_sufficient_computed_at"
+    ):
+        title = "Signal staleness: sr_catch_rate"
+        message = (
+            "sr_catch_rate has been computed but has never reached data sufficiency. "
+            "The metric is running but has not produced a real, well-sampled measurement."
+        )
+        existing = (
+            (
+                await session.execute(
+                    select(Alert).where(
+                        Alert.project_id == project_id,
+                        Alert.task_id.is_(None),
+                        Alert.severity == AlertSeverity.WARNING,
+                        Alert.dismissed_at.is_(None),
+                        Alert.title == title,
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if existing is None:
+            session.add(
+                Alert(
+                    project_id=project_id,
+                    severity=AlertSeverity.WARNING,
+                    title=title,
+                    message=message,
+                )
+            )
+            created += 1
+
     return created
 
 
@@ -2177,6 +2214,28 @@ async def _current_signal_value_for_class(
             ],
         }
 
+    if regression_class.startswith("telemetry_never_sufficient:"):
+        signal = regression_class[len("telemetry_never_sufficient:") :]
+        if signal == "sr_catch_rate":
+            doc = project_design_doc or {}
+            _sr_trends = doc.get("sr_catch_rate_trends") or {}
+            if not _sr_trends.get("signal_last_computed_at"):
+                return None
+            has_sufficient = bool(_sr_trends.get("last_sufficient_computed_at"))
+            suffix = "" if not has_sufficient else "now has"
+            return {
+                "signal_name": "telemetry_never_sufficient",
+                "prior_rate": None,
+                "current_rate": None,
+                "sample_size": 0,
+                "magnitude": 0.0,
+                "tripped": not has_sufficient,
+                "extras": [
+                    f"Signal '{signal}' has {suffix if suffix else 'not'} reached data sufficiency."
+                ],
+            }
+        return None
+
     if regression_class.startswith("background_service_crash:"):
         service = regression_class[len("background_service_crash:") :]
         from app.models import Task as TaskModel
@@ -3051,6 +3110,12 @@ SPAWNABLE_REGRESSION_CLASS_SHAPES: tuple[RegressionClassShape, ...] = (
         "prefix",
         "telemetry_stale:",
         "telemetry_stale:sr_catch_rate",
+    ),
+    RegressionClassShape(
+        "telemetry_never_sufficient",
+        "prefix",
+        "telemetry_never_sufficient:",
+        "telemetry_never_sufficient:sr_catch_rate",
     ),
     RegressionClassShape(
         "background_service_crash",
@@ -6705,9 +6770,7 @@ def _get_staleness_raw_ts(
     """Return (raw_timestamp_str, freshness_threshold) for a staleness-monitored signal."""
     if signal_name == "sr_catch_rate":
         _sr_trends = doc.get("sr_catch_rate_trends") or {}
-        raw = _sr_trends.get("last_sufficient_computed_at") or _sr_trends.get(
-            "signal_last_computed_at"
-        )
+        raw = _sr_trends.get("last_sufficient_computed_at")
     elif signal_name == "fix_loop_divergence":
         raw = doc.get("fix_loop_divergence_signal_last_computed_at") or doc.get(
             "fix_loop_divergence_detected_at"
@@ -6800,6 +6863,54 @@ async def _evaluate_telemetry_staleness_signal(
         )
         if spawn is not None:
             spawned += 1
+
+    # Detect never-sufficient: sr_catch_rate has been running (heartbeat present)
+    # but has never produced a real measurement (last_sufficient_computed_at absent).
+    if spawned < spawn_budget_left:
+        _sr_trends = doc.get("sr_catch_rate_trends") or {}
+        if _sr_trends.get("signal_last_computed_at") and not _sr_trends.get(
+            "last_sufficient_computed_at"
+        ):
+            source_module = "playbook_learning.compute_sr_catch_rate_trends"
+            regression_class = "telemetry_never_sufficient:sr_catch_rate"
+            prompt = "\n".join(
+                [
+                    "Telemetry degenerate: signal 'sr_catch_rate' has been computed repeatedly"
+                    " but has never reached data sufficiency.",
+                    "signal_last_computed_at is set but last_sufficient_computed_at is absent.",
+                    f"This signal is computed by: {source_module}.",
+                    "",
+                    "Diagnose why this signal never reaches data sufficiency and ship a fix.",
+                    "Possible causes: sample size too small, no reviewer rejections in task"
+                    " history, bucket thresholds too high.",
+                    "Produce the structured diagnosis JSON"
+                    " ({summary, root_cause, recommended_fix, severity, confidence, affected_files}).",
+                    "Do NOT prescribe a fix — let the investigate→fix chain produce the remediation.",
+                ]
+            )
+            spawn = await _maybe_spawn(
+                session,
+                project_id,
+                signal_name="telemetry_never_sufficient",
+                regression_class=regression_class,
+                prior_rate=None,
+                current_rate=None,
+                sample_size=0,
+                magnitude=0.0,
+                extras=["Signal 'sr_catch_rate' has never reached data sufficiency."],
+                title_hint="telemetry never-sufficient: sr_catch_rate",
+                prompt_override=prompt,
+                extra_snapshot_fields={
+                    "signal_last_computed_at": _sr_trends.get(
+                        "signal_last_computed_at"
+                    ),
+                    "last_sufficient_computed_at": None,
+                    "source_module": source_module,
+                },
+            )
+            if spawn is not None:
+                spawned += 1
+
     return spawned
 
 

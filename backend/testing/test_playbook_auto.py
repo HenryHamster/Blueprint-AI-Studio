@@ -13708,3 +13708,215 @@ async def test_auto_playbook_recreates_after_cooldown_carries_prior_data(
     assert entry["confirmed_count"] == 6
     # Prior retirement reason preserved
     assert entry.get("prior_retirement_reason") == "low_success_rate:0.10"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# E2E non-degeneracy guard for compute_sr_catch_rate_trends
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_sr_task_production_shaped(
+    project_id,
+    *,
+    age_days: float,
+    all_hits: bool = True,
+) -> Task:
+    """Build a Task that mirrors the full production context shape.
+
+    Populates all three human-truth layers:
+    - review_loop.review_history with CRITICAL/MAJOR/MINOR issues whose
+      descriptions match known _REVIEW_CATEGORIES keywords
+    - _first_attempt_rejection_categories (regression_risk, type-safety)
+    - _all_iterations_rejection_categories (regression_risk, type-safety, correctness)
+
+    check_results distinguish sr_alone (regression_risk, no origin) vs
+    reviewer_save (type-safety, origin="reviewer").
+
+    When all_hits=False, neither category appears in sr_failed so both are
+    misses (hit_rate drops), exercising the miss path.
+    """
+    check_results: dict = {}
+    if all_hits:
+        check_results["regression_risk"] = {
+            "passed": False,
+            "issue": "regression in test_bar",
+        }
+        check_results["type-safety"] = {
+            "passed": False,
+            "issue": "type hint missing for return value",
+            "origin": "reviewer",
+        }
+
+    ctx: dict = {
+        "_self_review_outcome": {"check_results": check_results},
+        "review_loop": {
+            "review_history": [
+                {
+                    "iteration": 0,
+                    "issues": [
+                        {
+                            "description": "regression in test_bar broke the test suite",
+                            "severity": "CRITICAL",
+                        },
+                        {
+                            "description": "type hint missing for return value parameter",
+                            "severity": "MAJOR",
+                        },
+                    ],
+                },
+                {
+                    "iteration": 1,
+                    "issues": [
+                        {
+                            "description": "logic bug in edge case boundary handling",
+                            "severity": "MINOR",
+                        },
+                    ],
+                },
+            ]
+        },
+        "_first_attempt_rejection_categories": {
+            "regression_risk": 1,
+            "type-safety": 1,
+        },
+        "_all_iterations_rejection_categories": {
+            "regression_risk": 1,
+            "type-safety": 1,
+            "correctness": 1,
+        },
+    }
+    task = Task(
+        project_id=project_id,
+        title="Production-shaped SR task",
+        payloads=[{"type": "create", "prompt": "implement feature X"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    task.created_at = _utcnow() - timedelta(days=age_days)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_e2e_production_shaped(
+    db_session: AsyncSession,
+):
+    """Non-degeneracy guard: the metric produces a real, in-range result on
+    production-shaped task data with full review_loop.review_history,
+    origin-tagged check_results, and both rejection-category sets.
+
+    Uses two completed StrategicCycles so cycle-mode engages. Asserts the
+    headline contract: data_sufficient=True, overall_hit_rate and
+    previous_overall_hit_rate are real floats in [0,1], categories is
+    non-empty with non-None current_hit_rate, and a trend label is present.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    c_cycle = _make_cycle(project.id, age_days=5)
+    p_cycle = _make_cycle(project.id, age_days=30)
+    db_session.add(c_cycle)
+    db_session.add(p_cycle)
+    await db_session.flush()
+
+    tasks = []
+    # Current cycle: 5 tasks are full hits, 1 task misses — hit_rate 5/6 per category.
+    for _ in range(5):
+        t = _make_sr_task_production_shaped(project.id, age_days=3, all_hits=True)
+        t.strategic_cycle_id = c_cycle.id
+        db_session.add(t)
+        tasks.append(t)
+    t_miss = _make_sr_task_production_shaped(project.id, age_days=4, all_hits=False)
+    t_miss.strategic_cycle_id = c_cycle.id
+    db_session.add(t_miss)
+    tasks.append(t_miss)
+
+    # Previous cycle: all 6 tasks are full hits — hit_rate 6/6 = 1.0.
+    for _ in range(6):
+        t = _make_sr_task_production_shaped(project.id, age_days=25, all_hits=True)
+        t.strategic_cycle_id = p_cycle.id
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    # ── Headline contract ─────────────────────────────────────────────────────
+    assert result is not None, "Should produce a real result on production-shaped data"
+    assert result["data_sufficient"] is True, "data_sufficient must be True"
+    assert result["bucket_mode"] == "cycle", (
+        "Should use cycle-mode with two completed cycles"
+    )
+
+    # overall_hit_rate is a real float in [0, 1]
+    overall = result["overall_hit_rate"]
+    assert isinstance(overall, float), (
+        f"overall_hit_rate must be a float, got {overall!r}"
+    )
+    assert 0.0 <= overall <= 1.0, f"overall_hit_rate out of range: {overall}"
+
+    previous_overall = result["previous_overall_hit_rate"]
+    assert isinstance(previous_overall, float), (
+        f"previous_overall_hit_rate must be a float, got {previous_overall!r}"
+    )
+    assert 0.0 <= previous_overall <= 1.0, (
+        f"previous_overall_hit_rate out of range: {previous_overall}"
+    )
+
+    # categories is non-empty; categories with findings must have non-None rates
+    cats = result["categories"]
+    assert cats, "categories must be non-empty"
+    for cat_name, cat_data in cats.items():
+        # A trend label must always be present
+        assert cat_data["trend"] in ("stable", "increasing", "decreasing"), (
+            f"category {cat_name!r} has unexpected trend: {cat_data['trend']!r}"
+        )
+        # current_hit_rate is None only when current_human_count == 0 (e.g. a
+        # category present in _all_iterations but not _first_attempt set); for
+        # categories that have findings in the current window, rate must be a
+        # real float in [0, 1].
+        if cat_data["current_human_count"] > 0:
+            hr = cat_data["current_hit_rate"]
+            assert hr is not None, (
+                f"category {cat_name!r} has None current_hit_rate despite "
+                f"current_human_count={cat_data['current_human_count']} — metric degenerated"
+            )
+            assert isinstance(hr, float), (
+                f"category {cat_name!r} current_hit_rate must be a float, got {hr!r}"
+            )
+            assert 0.0 <= hr <= 1.0, (
+                f"category {cat_name!r} current_hit_rate out of range: {hr}"
+            )
+
+    # At least the two explicitly-seeded categories must have current findings
+    assert any(d["current_human_count"] > 0 for d in cats.values()), (
+        "No category has current_human_count > 0 — metric degenerated"
+    )
+
+    # ── Origin-split wiring ───────────────────────────────────────────────────
+    # regression_risk should be an SR-alone hit; type-safety a reviewer-save hit
+    rr = cats.get("regression_risk")
+    ts = cats.get("type-safety")
+    assert rr is not None, "regression_risk must appear in categories"
+    assert ts is not None, "type-safety must appear in categories"
+
+    # SR-alone hits come from the 5 hitting tasks (no origin tag)
+    assert rr["sr_alone_hit_count"] == 5, (
+        f"Expected 5 sr_alone hits for regression_risk, got {rr['sr_alone_hit_count']}"
+    )
+    assert rr["reviewer_save_hit_count"] == 0
+
+    # reviewer_save hits come from the 5 hitting tasks (origin=reviewer)
+    assert ts["reviewer_save_hit_count"] == 5, (
+        f"Expected 5 reviewer_save hits for type-safety, got {ts['reviewer_save_hit_count']}"
+    )
+    assert ts["sr_alone_hit_count"] == 0
+
+    # ── Cycle-over-cycle rates ────────────────────────────────────────────────
+    # Current: 5/6 ≈ 0.833; Previous: 6/6 = 1.0
+    assert rr["current_hit_rate"] == round(5 / 6, 3), (
+        f"regression_risk current_hit_rate wrong: {rr['current_hit_rate']}"
+    )
+    assert rr["previous_hit_rate"] == 1.0, (
+        f"regression_risk previous_hit_rate wrong: {rr['previous_hit_rate']}"
+    )

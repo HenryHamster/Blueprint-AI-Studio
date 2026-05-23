@@ -7809,9 +7809,13 @@ async def test_telemetry_stale_spawns_investigation_for_stale_sr_catch_rate(db_s
 
     now = _utcnow()
     stale_ts = (now - timedelta(hours=50)).isoformat()
+    fresh_ts = (now - timedelta(hours=1)).isoformat()
     project = make_project(
         design_doc={
-            "sr_catch_rate_trends": {"signal_last_computed_at": stale_ts},
+            "sr_catch_rate_trends": {
+                "signal_last_computed_at": fresh_ts,
+                "last_sufficient_computed_at": stale_ts,
+            },
         }
     )
     db_session.add(project)
@@ -7892,9 +7896,13 @@ async def test_telemetry_stale_dedup_inflight_blocks_second_spawn(db_session):
 
     now = _utcnow()
     stale_ts = (now - timedelta(hours=50)).isoformat()
+    fresh_ts = (now - timedelta(hours=1)).isoformat()
     project = make_project(
         design_doc={
-            "sr_catch_rate_trends": {"signal_last_computed_at": stale_ts},
+            "sr_catch_rate_trends": {
+                "signal_last_computed_at": fresh_ts,
+                "last_sufficient_computed_at": stale_ts,
+            },
         }
     )
     db_session.add(project)
@@ -7928,7 +7936,10 @@ async def test_telemetry_stale_recovery_closes_when_signal_refreshed(db_session)
     fresh_ts = (now - timedelta(hours=24)).isoformat()
     project = make_project(
         design_doc={
-            "sr_catch_rate_trends": {"signal_last_computed_at": fresh_ts},
+            "sr_catch_rate_trends": {
+                "signal_last_computed_at": fresh_ts,
+                "last_sufficient_computed_at": fresh_ts,
+            },
         }
     )
     db_session.add(project)
@@ -7951,11 +7962,11 @@ async def test_telemetry_stale_recovery_closes_when_signal_refreshed(db_session)
 async def test_telemetry_stale_no_spawn_when_heartbeat_fresh_but_no_categories(
     db_session,
 ):
-    """Fresh signal_last_computed_at with no categories (low-sample/idle state) does not spawn.
+    """Fresh heartbeat with no last_sufficient_computed_at → never-sufficient spawn, not stale spawn.
 
-    This is the key idle-vs-broken distinction: the heartbeat ran recently but review
-    volume was below the minimum sample threshold so no result was produced.  The
-    watchdog must treat this as a healthy idle state, not a broken signal.
+    The heartbeat ran recently but the signal has never reached data sufficiency.
+    The stale watchdog must not fire (signal is fresh), but the never-sufficient
+    detector should fire and spawn a telemetry_never_sufficient investigation.
     """
     from app.time_utils import _utcnow
 
@@ -7963,7 +7974,7 @@ async def test_telemetry_stale_no_spawn_when_heartbeat_fresh_but_no_categories(
     fresh_ts = (now - timedelta(hours=12)).isoformat()
     project = make_project(
         design_doc={
-            # Heartbeat is fresh; no categories key — simulates low-sample early return.
+            # Heartbeat is fresh; no last_sufficient_computed_at — never produced real measurement.
             "sr_catch_rate_trends": {"signal_last_computed_at": fresh_ts},
         }
     )
@@ -7982,7 +7993,16 @@ async def test_telemetry_stale_no_spawn_when_heartbeat_fresh_but_no_categories(
         for t in all_tasks
         if (t.context or {}).get("regression_class") == "telemetry_stale:sr_catch_rate"
     ]
+    never_sufficient_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class")
+        == "telemetry_never_sufficient:sr_catch_rate"
+    ]
+    # No ordinary stale spawn — the signal heartbeat is fresh.
     assert len(stale_tasks) == 0
+    # But never-sufficient detection fires — the signal has run but never produced real data.
+    assert len(never_sufficient_tasks) == 1
 
 
 @pytest.mark.asyncio
@@ -8097,6 +8117,187 @@ async def test_telemetry_stale_fires_on_stale_last_sufficient_even_with_fresh_he
         if (t.context or {}).get("regression_class") == "telemetry_stale:sr_catch_rate"
     ]
     assert len(stale_tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_telemetry_never_sufficient_spawns_investigation(db_session):
+    """signal_last_computed_at present but last_sufficient_computed_at absent → spawns telemetry_never_sufficient investigation."""
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    fresh_ts = (now - timedelta(hours=6)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {"signal_last_computed_at": fresh_ts},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned >= 1
+
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    never_sufficient_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class")
+        == "telemetry_never_sufficient:sr_catch_rate"
+    ]
+    assert len(never_sufficient_tasks) == 1
+    task = never_sufficient_tasks[0]
+    payload = task.first_payload or {}
+    assert payload.get("type") == "investigate"
+    ctx = task.context or {}
+    assert ctx["signal_name"] == "telemetry_never_sufficient"
+    prompt = payload.get("prompt", "")
+    assert "sr_catch_rate" in prompt
+    assert "sufficiency" in prompt
+
+
+@pytest.mark.asyncio
+async def test_telemetry_never_sufficient_dedup_blocks_second_spawn(db_session):
+    """A second run_once with a never-sufficient case in-flight does not spawn a duplicate."""
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    fresh_ts = (now - timedelta(hours=6)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {"signal_last_computed_at": fresh_ts},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    first = await run_once(db_session, project.id)
+    assert first >= 1
+
+    await run_once(db_session, project.id)
+    all_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    never_sufficient_tasks = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("regression_class")
+        == "telemetry_never_sufficient:sr_catch_rate"
+    ]
+    assert len(never_sufficient_tasks) == 1
+
+
+@pytest.mark.asyncio
+async def test_sr_catch_rate_never_sufficient_emits_warning_alert(db_session):
+    """signal_last_computed_at present but last_sufficient absent → WARNING Alert created."""
+    from app.models import Alert, AlertSeverity
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    fresh_ts = (now - timedelta(hours=6)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {"signal_last_computed_at": fresh_ts},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await run_once(db_session, project.id)
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.title == "Signal staleness: sr_catch_rate",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "sufficiency" in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_sr_catch_rate_never_sufficient_no_alert_when_signal_has_never_run(
+    db_session,
+):
+    """Both timestamps absent (truly new project) → no never-sufficient alert created."""
+    from app.models import Alert, AlertSeverity
+
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await run_once(db_session, project.id)
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.title == "Signal staleness: sr_catch_rate",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_sr_catch_rate_never_sufficient_no_double_alert_idempotent(db_session):
+    """Running the watchdog twice with never-sufficient state produces only one alert."""
+    from app.models import Alert, AlertSeverity
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    fresh_ts = (now - timedelta(hours=6)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {"signal_last_computed_at": fresh_ts},
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await run_once(db_session, project.id)
+    await run_once(db_session, project.id)
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.title == "Signal staleness: sr_catch_rate",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -15690,6 +15891,7 @@ def _design_doc_for_recovery_coverage() -> dict:
     return {
         "sr_catch_rate_trends": {
             "signal_last_computed_at": now.isoformat(),
+            "last_sufficient_computed_at": now.isoformat(),
             "categories": {
                 "correctness": {
                     "current_hit_rate": 0.80,

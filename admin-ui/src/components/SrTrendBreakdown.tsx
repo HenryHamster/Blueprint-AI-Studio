@@ -178,6 +178,10 @@ export interface SrTrendData {
   computed_at?: string | null;
   /** True when the stored trend is older than the freshness window (7 days) or was never computed. */
   is_stale?: boolean | null;
+  /** False when the most-recent computation had insufficient data and the displayed numbers are frozen. */
+  data_sufficient?: boolean | null;
+  /** ISO timestamp of the last run that actually produced real trend data (i.e. data_sufficient=true). */
+  last_sufficient_computed_at?: string | null;
   bucket_mode?: 'cycle' | 'calendar' | null;
   current_cycle_id?: string | null;
   previous_cycle_id?: string | null;
@@ -1569,6 +1573,19 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRate
               stale · as of {trends.computed_at ? new Date(trends.computed_at).toLocaleDateString() : '?'}
             </span>
           )}
+          {trends?.data_sufficient === false && (() => {
+            const lastRealAt = trends.last_sufficient_computed_at ?? trends.computed_at;
+            const lastRealDate = lastRealAt ? new Date(lastRealAt).toLocaleDateString() : '?';
+            return (
+              <span
+                data-testid="sr-trend-insufficient-badge"
+                className="text-[9px] text-amber-500 font-mono ml-auto"
+                title="Most recent measurement windows had insufficient reviewer-finding data — displayed numbers are frozen and may not reflect current production."
+              >
+                frozen · last real data {lastRealDate}
+              </span>
+            );
+          })()}
         </div>
         {!srCatchRateTargets || Object.keys(srCatchRateTargets).length === 0 ? (
           <p className="text-[11px] text-neutral-400 hover:text-neutral-200 mb-1">
@@ -1646,6 +1663,19 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRate
           [stale]
         </span>
       )}
+      {trends?.data_sufficient === false && (() => {
+        const lastRealAt = trends.last_sufficient_computed_at ?? trends.computed_at;
+        const lastRealDate = lastRealAt ? new Date(lastRealAt).toLocaleDateString() : '?';
+        return (
+          <span
+            data-testid="sr-trend-insufficient-badge"
+            className="text-[9px] text-amber-500 font-mono"
+            title="Most recent measurement windows had insufficient reviewer-finding data — displayed numbers are frozen."
+          >
+            [frozen · last real data {lastRealDate}]
+          </span>
+        );
+      })()}
       {trends?.by_severity && Object.keys(trends.by_severity).length > 0 && (
         <SeveritySection bySeverity={trends.by_severity} inline />
       )}

@@ -2007,6 +2007,77 @@ describe('SrTrendBreakdown finding-count gating (catch-rate true denominator)', 
   });
 });
 
+describe('SrTrendBreakdown data_sufficient / frozen badge', () => {
+  const baseTrends: SrTrendData = {
+    categories: { correctness: { miss_rate: 0.3, trend: 'stable' } },
+  };
+
+  it('renders frozen badge in card variant when data_sufficient is false', () => {
+    const trends: SrTrendData = {
+      ...baseTrends,
+      data_sufficient: false,
+      last_sufficient_computed_at: '2026-05-01T00:00:00',
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const badge = screen.getByTestId('sr-trend-insufficient-badge');
+    expect(badge).toBeInTheDocument();
+    expect(badge.textContent).toMatch(/frozen/);
+    expect(badge.textContent).toContain(new Date('2026-05-01T00:00:00').toLocaleDateString());
+  });
+
+  it('renders frozen badge in inline variant when data_sufficient is false', () => {
+    const trends: SrTrendData = {
+      ...baseTrends,
+      data_sufficient: false,
+      last_sufficient_computed_at: '2026-05-01T00:00:00',
+    };
+    render(<SrTrendBreakdown trends={trends} variant="inline" />);
+    const badge = screen.getByTestId('sr-trend-insufficient-badge');
+    expect(badge).toBeInTheDocument();
+    expect(badge.textContent).toMatch(/frozen/);
+  });
+
+  it('does not render frozen badge when data_sufficient is true', () => {
+    const trends: SrTrendData = {
+      ...baseTrends,
+      data_sufficient: true,
+      last_sufficient_computed_at: '2026-05-21T00:00:00',
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.queryByTestId('sr-trend-insufficient-badge')).not.toBeInTheDocument();
+  });
+
+  it('does not render frozen badge when data_sufficient is absent', () => {
+    render(<SrTrendBreakdown trends={baseTrends} variant="card" />);
+    expect(screen.queryByTestId('sr-trend-insufficient-badge')).not.toBeInTheDocument();
+  });
+
+  it('falls back to computed_at when last_sufficient_computed_at is null', () => {
+    const trends: SrTrendData = {
+      ...baseTrends,
+      data_sufficient: false,
+      computed_at: '2026-04-15T00:00:00',
+      last_sufficient_computed_at: null,
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const badge = screen.getByTestId('sr-trend-insufficient-badge');
+    expect(badge.textContent).toContain(new Date('2026-04-15T00:00:00').toLocaleDateString());
+  });
+
+  it('shows both stale and frozen badges simultaneously when both conditions hold', () => {
+    const trends: SrTrendData = {
+      ...baseTrends,
+      is_stale: true,
+      computed_at: '2026-04-01T00:00:00',
+      data_sufficient: false,
+      last_sufficient_computed_at: '2026-03-20T00:00:00',
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.getByTestId('sr-trend-stale-badge')).toBeInTheDocument();
+    expect(screen.getByTestId('sr-trend-insufficient-badge')).toBeInTheDocument();
+  });
+});
+
 describe('SrTrendBreakdown is_stale badge', () => {
   it('renders stale badge in card variant when is_stale is true', () => {
     const trends: SrTrendData = {

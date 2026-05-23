@@ -10293,6 +10293,9 @@ async def test_pipeline_regressions_surface_signal_staleness(
                 "signal_last_computed_at": (
                     datetime.utcnow() - timedelta(days=3)
                 ).isoformat(),
+                "last_sufficient_computed_at": (
+                    datetime.utcnow() - timedelta(days=3)
+                ).isoformat(),
             },
             "fix_loop_divergence_signal_last_computed_at": (
                 datetime.utcnow() - timedelta(days=8)
