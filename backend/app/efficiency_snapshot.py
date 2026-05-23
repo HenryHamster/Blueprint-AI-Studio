@@ -201,6 +201,169 @@ def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
 _UNPRICED_COMBOS_CAP = 10
 
 
+def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
+    """Per-provider and per-model LLM cost/token rollup over the given tasks.
+
+    Returns a structured dict with:
+      - ``by_provider``: list of provider-level rollups.
+      - ``by_model``: list of (provider, model) rollups with a ``priced`` flag.
+      - ``totals``: aggregate totals plus priced/unpriced task counts.
+      - ``unpriced_combos``: capped list of ``provider:model`` strings that
+        have non-zero tokens but no entry in :data:`LLM_TOKEN_PRICING`.
+
+    A task contributes to a bucket when it has a non-null provider, non-null
+    model, and numeric ``total_input_tokens`` / ``total_output_tokens`` in
+    ``api_call_summary``. Unpriced (provider, model) combos are still counted
+    in ``task_count`` and feed ``unpriced_coverage_fraction`` but contribute
+    ``0.0`` cost. Cost values are rounded to 6 decimals and shares to 4
+    decimals, matching the rest of this module.
+    """
+    from collections import defaultdict
+
+    model_buckets: Dict[tuple[str, str], Dict[str, float]] = defaultdict(
+        lambda: {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "llm_call_count": 0,
+            "task_count": 0,
+            "cost_usd": 0.0,
+        }
+    )
+    provider_buckets: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "llm_call_count": 0,
+            "task_count": 0,
+            "cost_usd": 0.0,
+        }
+    )
+    priced_combos: set[tuple[str, str]] = set()
+    unpriced_combos: list[str] = []
+    priced_task_count = 0
+    unpriced_task_count = 0
+    total_input = 0
+    total_output = 0
+    total_cost = 0.0
+    total_task_count = 0
+
+    for t in tasks:
+        summary = t.api_call_summary or {}
+        input_tokens = summary.get("total_input_tokens")
+        output_tokens = summary.get("total_output_tokens")
+        if (
+            not isinstance(input_tokens, (int, float))
+            or not isinstance(output_tokens, (int, float))
+            or not t.provider
+            or not t.model
+        ):
+            continue
+        provider = t.provider.lower()
+        model = t.model.lower()
+        key = (provider, model)
+        pricing = LLM_TOKEN_PRICING.get(key)
+        if pricing:
+            input_rate, output_rate = pricing
+            cost = input_tokens * input_rate + output_tokens * output_rate
+            priced_combos.add(key)
+            priced_task_count += 1
+        else:
+            cost = 0.0
+            unpriced_task_count += 1
+            combo = f"{provider}:{model}"
+            if (
+                combo not in unpriced_combos
+                and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
+            ):
+                unpriced_combos.append(combo)
+
+        llm_call_count = summary.get("llm_call_count")
+        call_count = (
+            int(llm_call_count)
+            if isinstance(llm_call_count, (int, float)) and llm_call_count >= 0
+            else 0
+        )
+
+        mb = model_buckets[key]
+        mb["input_tokens"] += int(input_tokens)
+        mb["output_tokens"] += int(output_tokens)
+        mb["llm_call_count"] += call_count
+        mb["task_count"] += 1
+        mb["cost_usd"] += cost
+
+        pb = provider_buckets[provider]
+        pb["input_tokens"] += int(input_tokens)
+        pb["output_tokens"] += int(output_tokens)
+        pb["llm_call_count"] += call_count
+        pb["task_count"] += 1
+        pb["cost_usd"] += cost
+
+        total_input += int(input_tokens)
+        total_output += int(output_tokens)
+        total_cost += cost
+        total_task_count += 1
+
+    def _share(cost: float) -> Optional[float]:
+        if total_cost <= 0:
+            return None
+        return round(cost / total_cost, 4)
+
+    by_provider = [
+        {
+            "provider": provider,
+            "total_input_tokens": int(pb["input_tokens"]),
+            "total_output_tokens": int(pb["output_tokens"]),
+            "total_cost_usd": round(pb["cost_usd"], 6),
+            "mean_cost_per_task": round(pb["cost_usd"] / pb["task_count"], 6)
+            if pb["task_count"]
+            else 0.0,
+            "share_of_total_cost": _share(pb["cost_usd"]),
+            "task_count": int(pb["task_count"]),
+            "llm_call_count": int(pb["llm_call_count"]),
+        }
+        for provider, pb in sorted(
+            provider_buckets.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True
+        )
+    ]
+    by_model = [
+        {
+            "provider": provider,
+            "model": model,
+            "total_input_tokens": int(mb["input_tokens"]),
+            "total_output_tokens": int(mb["output_tokens"]),
+            "total_cost_usd": round(mb["cost_usd"], 6),
+            "mean_cost_per_task": round(mb["cost_usd"] / mb["task_count"], 6)
+            if mb["task_count"]
+            else 0.0,
+            "share_of_total_cost": _share(mb["cost_usd"]),
+            "task_count": int(mb["task_count"]),
+            "llm_call_count": int(mb["llm_call_count"]),
+            "priced": (provider, model) in priced_combos,
+        }
+        for (provider, model), mb in sorted(
+            model_buckets.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True
+        )
+    ]
+    priceable = priced_task_count + unpriced_task_count
+    unpriced_coverage_fraction: Optional[float] = (
+        round(priced_task_count / priceable, 4) if priceable else None
+    )
+    return {
+        "by_provider": by_provider,
+        "by_model": by_model,
+        "totals": {
+            "total_input_tokens": total_input,
+            "total_output_tokens": total_output,
+            "total_cost_usd": round(total_cost, 6),
+            "task_count": total_task_count,
+            "priced_task_count": priced_task_count,
+            "unpriced_task_count": unpriced_task_count,
+            "unpriced_coverage_fraction": unpriced_coverage_fraction,
+        },
+        "unpriced_combos": unpriced_combos,
+    }
+
+
 def _compute_llm_cost_pricing_coverage(
     tasks: list[Task],
 ) -> Dict[str, Any]:

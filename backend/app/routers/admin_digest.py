@@ -7008,6 +7008,80 @@ async def get_efficiency_axes(
     return await read_baseline_with_drift(session, project_id)
 
 
+@router.get("/projects/{project_id}/llm-cost-breakdown")
+async def get_llm_cost_breakdown(
+    project_id: uuid.UUID,
+    window_days: int = Query(default=7, ge=1, le=90),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Per-provider and per-model LLM cost/token breakdown over a project window.
+
+    Read-only view over recently-terminal tasks (COMPLETED/FAILED/CANCELLED
+    within ``window_days``, default 7). Reuses the snapshot pricing table
+    (:data:`app.efficiency_snapshot.LLM_TOKEN_PRICING`) so cost numbers are
+    consistent with ``llm_cost_per_merged_pr``.
+
+    Response shape::
+
+        {
+          "window_days": int,
+          "generated_at": iso8601,
+          "by_provider": [
+            {
+              "provider": str,
+              "total_input_tokens": int,
+              "total_output_tokens": int,
+              "total_cost_usd": float,
+              "mean_cost_per_task": float,
+              "share_of_total_cost": float|None,
+              "task_count": int,
+              "llm_call_count": int
+            }, ...
+          ],
+          "by_model": [
+            {
+              "provider": str,
+              "model": str,
+              "total_input_tokens": int,
+              "total_output_tokens": int,
+              "total_cost_usd": float,
+              "mean_cost_per_task": float,
+              "share_of_total_cost": float|None,
+              "task_count": int,
+              "llm_call_count": int,
+              "priced": bool
+            }, ...
+          ],
+          "totals": {
+            "total_input_tokens": int,
+            "total_output_tokens": int,
+            "total_cost_usd": float,
+            "task_count": int,
+            "priced_task_count": int,
+            "unpriced_task_count": int,
+            "unpriced_coverage_fraction": float|None
+          },
+          "unpriced_combos": [str, ...]
+        }
+    """
+    from app.efficiency_snapshot import (  # noqa: PLC0415
+        _load_recent_tasks,
+        compute_llm_cost_breakdown,
+    )
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+    tasks = await _load_recent_tasks(session, project_id, window_days=window_days)
+    breakdown = compute_llm_cost_breakdown(tasks)
+    return {
+        "window_days": window_days,
+        "generated_at": _utcnow().isoformat(),
+        **breakdown,
+    }
+
+
 @router.get("/regression-dispatcher/escalation-outcomes")
 async def get_regression_escalation_outcomes(
     project_id: Optional[uuid.UUID] = Query(default=None),
