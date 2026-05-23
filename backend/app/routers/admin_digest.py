@@ -7082,6 +7082,36 @@ async def get_llm_cost_breakdown(
     }
 
 
+@router.get("/projects/{project_id}/warm-reuse-funnel")
+async def get_warm_reuse_funnel(
+    project_id: uuid.UUID,
+    window_hours: int = Query(default=24, ge=1, le=168),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Rolling warm-VM backlog reuse funnel counters for the last ``window_hours``.
+
+    Returns stage counters for the warm-reuse pipeline so the bottleneck is
+    identifiable without changing claim behavior:
+
+    - ``completed_vms_with_eligible_backlog``: COMPLETION events that found ≥1
+      eligible QUEUED backlog task.
+    - ``teardown_defers_scheduled``: VMs that entered the teardown-defer window.
+    - ``next_role_polls_during_defer``: /next-role calls inside the defer window.
+    - ``warm_claims_succeeded``: polls that claimed a task (vm_warm_start=True).
+    - ``claim_skipped_by_reason``: dict of reason→count for missed claims.
+    - ``claim_skipped_total``: total missed claims.
+
+    Counters are in-memory and reset on instance restart.
+    """
+    from app.warm_backlog_reuse import get_reuse_funnel_snapshot  # noqa: PLC0415
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+    return get_reuse_funnel_snapshot(window_hours=window_hours)
+
+
 @router.get("/regression-dispatcher/escalation-outcomes")
 async def get_regression_escalation_outcomes(
     project_id: Optional[uuid.UUID] = Query(default=None),
