@@ -3409,6 +3409,72 @@ async def test_stabilize_stall_hint_fires_for_old_stabilize_version(
 
 
 @pytest.mark.asyncio
+async def test_stabilize_hint_points_at_carried_audit_findings(
+    db_session, mocker, _lts_split_active
+):
+    """A stabilize version whose last_qualification carries audit findings gets
+    a prompt_suffix that names the findings and tells the agent to target them
+    with an audit-mode direction — and the findings ride through in
+    version_phase.last_qualification.audit_findings."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=4,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={
+            "status": "not_promoted",
+            "confidence": 0.85,
+            "blocker": None,
+            "sub_scores": {"audit": 0.74, "test_erosion": 1.0},
+            "audit_findings": [
+                {"severity": "high", "summary": "Token baked into VM image."},
+                {"severity": "low", "summary": "Private cross-module import."},
+            ],
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "audit_findings" in suffix, f"Expected findings pointer; got: {suffix}"
+    assert "Token baked into VM image" in suffix
+    assert "recommended_mode='audit'" in suffix
+
+    vp = payload.get("version_phase")
+    assert vp is not None
+    carried = (vp.get("last_qualification") or {}).get("audit_findings")
+    assert carried == [
+        {"severity": "high", "summary": "Token baked into VM image."},
+        {"severity": "low", "summary": "Private cross-module import."},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_stabilize_stall_hint_suppressed_for_dry_run(
     db_session, mocker, _lts_split_active
 ):

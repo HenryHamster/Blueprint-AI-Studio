@@ -742,6 +742,66 @@ class TestScoreAudit:
         assert erosion == pytest.approx(1.0)
 
 
+class TestExtractAuditFindings:
+    """_extract_audit_findings carries the findings (not just the score) into
+    last_qualification so the strategic agent can target them — see the
+    findings → strategic-payload wiring."""
+
+    def test_none_report_returns_empty(self):
+        assert rq._extract_audit_findings(None) == []
+
+    def test_no_findings_key_returns_empty(self):
+        assert rq._extract_audit_findings({"audit_score": 0.8}) == []
+
+    def test_dict_findings_extracted_with_severity_and_summary(self):
+        report = {
+            "audit_score": 0.74,
+            "findings": [
+                {"severity": "high", "summary": "Token baked into VM image."},
+                {"severity": "low", "description": "Private import."},
+            ],
+        }
+        out = rq._extract_audit_findings(report)
+        assert out == [
+            {"severity": "high", "summary": "Token baked into VM image."},
+            {"severity": "low", "summary": "Private import."},
+        ]
+
+    def test_sorted_most_severe_first(self):
+        report = {
+            "findings": [
+                {"severity": "low", "summary": "low one"},
+                {"severity": "high", "summary": "high one"},
+                {"severity": "medium", "summary": "medium one"},
+            ]
+        }
+        out = rq._extract_audit_findings(report)
+        assert [f["severity"] for f in out] == ["high", "medium", "low"]
+
+    def test_issues_key_fallback(self):
+        """Some audits key the list as 'issues' rather than 'findings'."""
+        report = {"issues": [{"level": "medium", "title": "an issue"}]}
+        out = rq._extract_audit_findings(report)
+        assert out == [{"severity": "medium", "summary": "an issue"}]
+
+    def test_caps_count_and_truncates_summary(self):
+        report = {
+            "findings": [
+                {"severity": "low", "summary": "x" * 500}
+                for _ in range(rq._MAX_CARRIED_FINDINGS + 5)
+            ]
+        }
+        out = rq._extract_audit_findings(report)
+        assert len(out) == rq._MAX_CARRIED_FINDINGS
+        assert all(len(f["summary"]) <= rq._FINDING_SUMMARY_MAX for f in out)
+
+    def test_string_findings_and_blank_summaries_handled(self):
+        report = {"findings": ["a plain string", {"severity": "high", "summary": ""}]}
+        out = rq._extract_audit_findings(report)
+        # The blank-summary finding is dropped; the string one is kept.
+        assert out == [{"severity": "unknown", "summary": "a plain string"}]
+
+
 class TestScoreSmoketest:
     def test_all_tests_pass(self):
         """A fully-passing smoketest yields a 1.0 score."""
@@ -1949,6 +2009,58 @@ async def test_finalize_not_promoted_on_blocker_sets_stabilize(db_session):
     assert version.phase == "stabilize"
     assert version.last_qualification["status"] == "not_promoted"
     assert version.last_qualification["blocker"] == "test_file_deleted"
+
+
+@pytest.mark.asyncio
+async def test_finalize_carries_audit_findings_into_last_qualification(
+    db_session, mocker
+):
+    """A below-threshold qualification stores the audit findings on the version
+    so the strategic agent's payload (via to_phase_block) can target them —
+    not just the composite score."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        # audit 0.74 + erosion 1.0 + smoketest 1.0 → composite 0.896 < 0.90:
+        # not_promoted with no hard blocker, exercising the soft-miss path.
+        audit_logs={
+            "audit_score": 0.74,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 840,
+                "test_count_delta": 373,
+            },
+            "findings": [
+                {"severity": "low", "summary": "Private cross-module import."},
+                {"severity": "high", "summary": "Token baked into VM image."},
+            ],
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] is None
+
+    await db_session.refresh(version)
+    findings = version.last_qualification["audit_findings"]
+    # Most-severe first, both findings carried with severity + summary.
+    assert findings == [
+        {"severity": "high", "summary": "Token baked into VM image."},
+        {"severity": "low", "summary": "Private cross-module import."},
+    ]
 
 
 @pytest.mark.asyncio
