@@ -692,3 +692,32 @@ async def test_write_snapshot_migrates_review_iterations_baseline(db_session):
     assert baseline["_schema_version"] == 3
     # Other axes must not be clobbered.
     assert baseline[AXIS_COST_PER_MERGED_PR] == 0.01
+
+
+@pytest.mark.asyncio
+async def test_write_snapshot_preserves_other_design_doc_keys(db_session):
+    """write_snapshot must not clobber sibling keys written by concurrent
+    background writers (e.g. playbook_learning, sr_blind_spots).
+
+    Regression guard for the unlocked read-modify-write pattern: a writer
+    that read design_doc before another writer committed would silently
+    overwrite the other writer's keys on its own commit.  The fix routes
+    write_snapshot through project_lock so the read is always post-lock.
+    """
+    sentinel = {"some_other_key": {"value": 42}}
+    project = make_project(design_doc=dict(sentinel))
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # The efficiency baseline key must be written.
+    assert DESIGN_DOC_KEY in project.design_doc
+    # Pre-existing sibling key must be intact.
+    assert project.design_doc.get("some_other_key") == {"value": 42}

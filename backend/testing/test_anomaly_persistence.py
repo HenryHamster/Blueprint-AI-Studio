@@ -22,9 +22,20 @@ from testing.factories import make_project
 
 
 def _make_get_session(project):
-    """Mock session whose .get(Project, pid) returns project."""
+    """Mock session for persist_anomaly_snapshot.
+
+    persist_anomaly_snapshot now writes through ``with_design_doc_locked`` ->
+    ``project_lock``, which loads the row for its read-modify-write via
+    ``session.execute(select(Project)...FOR UPDATE).scalar_one_or_none()`` rather
+    than the old ``session.get(Project, pid)``. Wire the execute() path to return
+    the project so the lock yields a real instance (``session.get`` is kept as a
+    harmless legacy stub).
+    """
     session = AsyncMock()
     session.get = AsyncMock(return_value=project)
+    _result = MagicMock()
+    _result.scalar_one_or_none.return_value = project
+    session.execute = AsyncMock(return_value=_result)
     session.add = MagicMock()
     return session
 

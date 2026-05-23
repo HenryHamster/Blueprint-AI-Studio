@@ -250,17 +250,13 @@ async def compute_sr_blind_spot_themes(
     dispatcher can detect when this job stops running and spawn an
     investigation automatically.
     """
-    from app.models import Project
-    from sqlalchemy.orm.attributes import flag_modified
+    from app.shared_state import with_design_doc_locked
 
-    project = await session.get(Project, project_id)
-    if project is None:
-        return
-    doc = dict(project.design_doc or {})
-    stamp_sr_blind_spot_computed_at(doc, now=now)
-    project.design_doc = doc
-    flag_modified(project, "design_doc")
-    session.add(project)
+    await with_design_doc_locked(
+        session,
+        project_id,
+        lambda doc: stamp_sr_blind_spot_computed_at(doc, now=now),
+    )
 
 
 async def aggregate_sr_blind_spot_themes(

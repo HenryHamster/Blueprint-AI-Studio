@@ -840,6 +840,29 @@ async def hydrate_persistent_anomalies(session) -> int:
     return loaded
 
 
+async def with_design_doc_locked(
+    session,
+    project_id: str,
+    mutate_fn: Any,
+) -> None:
+    """Read-modify-write project.design_doc under a project row lock.
+
+    Thin wrapper over the canonical ``task_locking.with_design_doc_locked``
+    that additionally coerces ``project_id`` (which background callers pass
+    as a str) to ``UUID`` and silently no-ops on malformed input. The
+    lock/mutate/flag_modified logic lives in exactly one place — the
+    canonical helper — so the two never drift apart.
+    """
+    from app.task_locking import with_design_doc_locked as _canonical
+    import uuid as _uuid
+
+    try:
+        pid = _uuid.UUID(str(project_id))
+    except (TypeError, ValueError):
+        return
+    await _canonical(session, pid, mutate_fn)
+
+
 async def persist_anomaly_snapshot(
     project_id: str, proj_anomalies: dict, session
 ) -> None:
@@ -848,24 +871,13 @@ async def persist_anomaly_snapshot(
     Called after each anomaly detection cycle so the state survives the next
     pod restart. Safe to call within an already-open session (caller commits).
     """
-    from app.models import Project
-    from sqlalchemy.orm.attributes import flag_modified
-    import uuid as _uuid
 
-    try:
-        pid = _uuid.UUID(project_id)
-    except (TypeError, ValueError):
-        return
-    project = await session.get(Project, pid)
-    if project is None:
-        return
-    doc = dict(project.design_doc or {})
-    doc[_ANOMALY_FINGERPRINTS_KEY] = {
-        k: dict(v) if isinstance(v, dict) else v for k, v in proj_anomalies.items()
-    }
-    project.design_doc = doc
-    flag_modified(project, "design_doc")
-    session.add(project)
+    def _mutate(doc: dict) -> None:
+        doc[_ANOMALY_FINGERPRINTS_KEY] = {
+            k: dict(v) if isinstance(v, dict) else v for k, v in proj_anomalies.items()
+        }
+
+    await with_design_doc_locked(session, project_id, _mutate)
 
 
 # --- Regression Signal State (first-tripped timestamps for MTTD) ---

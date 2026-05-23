@@ -23,6 +23,7 @@ from app.database import get_session
 from app.models import Task, TaskStatus, _utcnow
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
+from app.task_locking import lock_project_or_429
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +193,7 @@ async def update_auto_remediation_config(
     current_user: dict = Depends(get_current_user),
 ):
     """Update auto-remediation config fields (partial update)."""
-    project = await _get_user_project_with_role(
+    await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
     )
 
@@ -243,7 +244,8 @@ async def update_auto_remediation_config(
                 status_code=422, detail="'suspended_branches' must be a list of strings"
             )
 
-    # Merge into existing stored config
+    # Lock project row before read-modify-write to prevent lost updates.
+    project = await lock_project_or_429(session, project_id)
     design_doc = dict(project.design_doc or {})
     stored = dict(design_doc.get("_auto_remediation", {}))
     stored.update(body)
@@ -294,7 +296,7 @@ async def update_issue_implementation_config(
     current_user: dict = Depends(get_current_user),
 ):
     """Update issue-implementation config fields (partial update)."""
-    project = await _get_user_project_with_role(
+    await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
     )
 
@@ -347,7 +349,8 @@ async def update_issue_implementation_config(
                 detail="'default_effort' must be one of: low, medium, high",
             )
 
-    # Merge into existing stored config
+    # Lock project row before read-modify-write to prevent lost updates.
+    project = await lock_project_or_429(session, project_id)
     design_doc = dict(project.design_doc or {})
     stored = dict(design_doc.get("_issue_implementation", {}))
     stored.update(body)
@@ -395,7 +398,7 @@ async def update_auto_review_config(
     current_user: dict = Depends(get_current_user),
 ):
     """Update auto-review config fields (partial update)."""
-    project = await _get_user_project_with_role(
+    await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
     )
 
@@ -426,7 +429,8 @@ async def update_auto_review_config(
                 detail="'max_concurrent' must be an integer between 1 and 10",
             )
 
-    # Merge into existing stored config
+    # Lock project row before read-modify-write to prevent lost updates.
+    project = await lock_project_or_429(session, project_id)
     design_doc = dict(project.design_doc or {})
     stored = dict(design_doc.get("_auto_review", {}))
     stored.update(body)
@@ -460,9 +464,11 @@ async def update_playbook_entry(
             status_code=422, detail="'action' must be one of: promote, demote, archive"
         )
 
-    project = await _get_user_project_with_role(
+    await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+    # Lock project row before read-modify-write to prevent lost updates.
+    project = await lock_project_or_429(session, project_id)
     doc = dict(project.design_doc or {})
     full_key = f"playbook/{key}"
     if full_key not in doc or not isinstance(doc[full_key], dict):

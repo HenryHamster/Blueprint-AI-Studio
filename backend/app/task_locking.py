@@ -31,13 +31,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
 import uuid
 from fastapi import HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import DeploymentState, Project, Task
 
@@ -180,7 +181,9 @@ async def lock_project_or_429(
     result = await session.execute(
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=True)
+        # FOR NO KEY UPDATE — see project_lock: serializes project-row writers
+        # without blocking FK child-row inserts (FOR KEY SHARE). PK never changes.
+        .with_for_update(skip_locked=True, key_share=True)
     )
     project = result.scalars().first()
     if project is not None:
@@ -271,7 +274,16 @@ async def project_lock(
     stmt = (
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=skip_locked)
+        # FOR NO KEY UPDATE (key_share=True), not FOR UPDATE: still serializes
+        # concurrent project-row writers (it conflicts with itself and FOR
+        # UPDATE), but does NOT conflict with the FOR KEY SHARE lock that every
+        # insert of a project-child row (ProjectMessage / Task / Alert ...) takes
+        # on the parent for its FK. Plain FOR UPDATE deadlocks across connections
+        # when a lock holder (or a chain it awaits) inserts such a child row — the
+        # release-qualifier infra-failure path hit exactly this (operator-message
+        # INSERT blocked on a held project lock). The project PK is never updated,
+        # so FOR NO KEY UPDATE is the correct, strictly-safer lock here.
+        .with_for_update(skip_locked=skip_locked, key_share=True)
     )
     try:
         result = await asyncio.wait_for(session.execute(stmt), timeout=timeout)
@@ -334,7 +346,9 @@ async def lock_project_then_task(
     project_stmt = (
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=skip_locked)
+        # FOR NO KEY UPDATE — see project_lock: serializes project-row writers
+        # without blocking FK child-row inserts (FOR KEY SHARE). PK never changes.
+        .with_for_update(skip_locked=skip_locked, key_share=True)
     )
     try:
         project_result = await asyncio.wait_for(
@@ -415,7 +429,9 @@ async def lock_project_for_strategic_transition(
         result = await session.execute(
             select(Project)
             .where(Project.id == project_id)
-            .with_for_update(skip_locked=True)
+            # FOR NO KEY UPDATE — see project_lock: serializes project-row writers
+            # without blocking FK child-row inserts (FOR KEY SHARE). PK never changes.
+            .with_for_update(skip_locked=True, key_share=True)
         )
         project = result.scalars().first()
         if project is not None:
@@ -428,3 +444,29 @@ async def lock_project_for_strategic_transition(
             return None  # genuinely missing
         await asyncio.sleep(0.5 * (attempt + 1))
     return None  # row held past retry window — caller defers
+
+
+async def with_design_doc_locked(
+    session: AsyncSession,
+    project_id,
+    mutate_fn: Callable[[dict], None],
+) -> None:
+    """Atomic read-modify-write of project.design_doc under a project row lock.
+
+    Acquires SELECT FOR UPDATE (skip_locked=False — background callers wait
+    rather than silently skip), calls mutate_fn(doc) with a copy of the
+    current doc dict, then writes the result back. Caller is responsible for
+    committing the session.
+
+    This is the canonical helper for all design_doc mutations. Using it
+    consistently prevents concurrent writers from clobbering each other's
+    keys via stale read-modify-write races.
+    """
+    async with project_lock(session, project_id, skip_locked=False) as project:
+        if project is None:
+            return
+        doc = dict(project.design_doc or {})
+        mutate_fn(doc)
+        project.design_doc = doc
+        flag_modified(project, "design_doc")
+        session.add(project)

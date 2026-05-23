@@ -30,6 +30,7 @@ from sqlmodel import select
 
 from app.models import Project, Task, TaskStatus, _utcnow
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+from app.task_locking import project_lock
 
 logger = logging.getLogger(__name__)
 
@@ -204,59 +205,64 @@ async def write_snapshot(
     calls only append to ``snapshots`` (capped at _SNAPSHOT_HISTORY_MAX).
     Returns the snapshot dict that was written.
     """
-    project = await session.get(Project, project_id)
-    if project is None:
-        raise ValueError(f"Project {project_id} not found")
-
+    # Compute axes before acquiring lock — reads only Task rows, not the project.
     axes = await compute_current_axes(session, project_id)
     captured_at = _utcnow().isoformat()
     snapshot: Dict[str, Any] = {"captured_at": captured_at, **axes}
 
-    doc = dict(project.design_doc or {})
-    container = dict(doc.get(DESIGN_DOC_KEY) or {})
+    # Lock the project row for the read-modify-write so concurrent background
+    # writers (e.g. sr_blind_spots, playbook_learning) cannot clobber each
+    # other's keys with stale reads.  skip_locked=False: background callers
+    # should wait rather than silently skip (no 429 to surface).
+    async with project_lock(session, project_id, skip_locked=False) as project:
+        if project is None:
+            raise ValueError(f"Project {project_id} not found")
 
-    if not container.get("baseline"):
-        container["baseline"] = dict(snapshot)
-    else:
-        baseline = dict(container["baseline"])
-        # One-time migration: baselines captured before the heartbeat-beacon fix
-        # (schema_version 0) stored vm_cold_start_p50_ms from the first boot
-        # beacon rather than true dispatch-to-claim latency. Clear it so the
-        # next snapshot re-seeds with accurate data.
-        if not baseline.get("_schema_version"):
-            baseline[AXIS_VM_COLD_START_P50_MS] = None
-            baseline["_schema_version"] = 1
-        # One-time migration: baselines captured before review-skipped tasks
-        # counted as 0 iterations (schema_version 1) excluded auto-approved
-        # tasks, biasing the median upward. Clear and re-seed.
-        if baseline.get("_schema_version") == 1:
-            baseline[AXIS_MEDIAN_REVIEW_ITERATIONS] = None
-            baseline["_schema_version"] = 2
-        # One-time migration: baselines captured before the vm_dispatched_at fix
-        # (schema_version 2) stored vm_cold_start_p50_ms anchored at
-        # provision-confirm time, excluding GCE boot latency. Clear and re-seed
-        # from the corrected dispatch->agent-ready measurement.
-        if baseline.get("_schema_version") == 2:
-            baseline[AXIS_VM_COLD_START_P50_MS] = None
-            baseline["_schema_version"] = 3
-        # Re-seed any individual axes that were cleared (e.g. by the migration
-        # above) once a valid current value is available.
-        for axis in ALL_AXES:
-            if baseline.get(axis) is None and snapshot.get(axis) is not None:
-                baseline[axis] = snapshot[axis]
-        container["baseline"] = baseline
+        doc = dict(project.design_doc or {})
+        container = dict(doc.get(DESIGN_DOC_KEY) or {})
 
-    snapshots = list(container.get("snapshots") or [])
-    snapshots.append(snapshot)
-    if len(snapshots) > _SNAPSHOT_HISTORY_MAX:
-        snapshots = snapshots[-_SNAPSHOT_HISTORY_MAX:]
-    container["snapshots"] = snapshots
-    container["last_run_at"] = captured_at
+        if not container.get("baseline"):
+            container["baseline"] = dict(snapshot)
+        else:
+            baseline = dict(container["baseline"])
+            # One-time migration: baselines captured before the heartbeat-beacon fix
+            # (schema_version 0) stored vm_cold_start_p50_ms from the first boot
+            # beacon rather than true dispatch-to-claim latency. Clear it so the
+            # next snapshot re-seeds with accurate data.
+            if not baseline.get("_schema_version"):
+                baseline[AXIS_VM_COLD_START_P50_MS] = None
+                baseline["_schema_version"] = 1
+            # One-time migration: baselines captured before review-skipped tasks
+            # counted as 0 iterations (schema_version 1) excluded auto-approved
+            # tasks, biasing the median upward. Clear and re-seed.
+            if baseline.get("_schema_version") == 1:
+                baseline[AXIS_MEDIAN_REVIEW_ITERATIONS] = None
+                baseline["_schema_version"] = 2
+            # One-time migration: baselines captured before the vm_dispatched_at fix
+            # (schema_version 2) stored vm_cold_start_p50_ms anchored at
+            # provision-confirm time, excluding GCE boot latency. Clear and re-seed
+            # from the corrected dispatch->agent-ready measurement.
+            if baseline.get("_schema_version") == 2:
+                baseline[AXIS_VM_COLD_START_P50_MS] = None
+                baseline["_schema_version"] = 3
+            # Re-seed any individual axes that were cleared (e.g. by the migration
+            # above) once a valid current value is available.
+            for axis in ALL_AXES:
+                if baseline.get(axis) is None and snapshot.get(axis) is not None:
+                    baseline[axis] = snapshot[axis]
+            container["baseline"] = baseline
 
-    doc[DESIGN_DOC_KEY] = container
-    project.design_doc = doc
-    flag_modified(project, "design_doc")
-    session.add(project)
+        snapshots = list(container.get("snapshots") or [])
+        snapshots.append(snapshot)
+        if len(snapshots) > _SNAPSHOT_HISTORY_MAX:
+            snapshots = snapshots[-_SNAPSHOT_HISTORY_MAX:]
+        container["snapshots"] = snapshots
+        container["last_run_at"] = captured_at
+
+        doc[DESIGN_DOC_KEY] = container
+        project.design_doc = doc
+        flag_modified(project, "design_doc")
+        session.add(project)
 
     logger.info(
         "[EFFICIENCY_SNAPSHOT] project=%s captured_at=%s axes=%s",

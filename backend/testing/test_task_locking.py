@@ -23,6 +23,7 @@ from app.task_locking import (
     lock_project_or_429,
     project_lock,
     task_lock,
+    with_design_doc_locked,
 )
 
 
@@ -736,3 +737,54 @@ async def test_acquire_pr_spawn_lock_different_prs_dont_block(db_session):
             await session.commit()
 
     await asyncio.gather(hold_a(), acquire_b())
+
+
+# ── with_design_doc_locked ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_with_design_doc_locked_applies_mutation(db_session):
+    """with_design_doc_locked must atomically apply the mutate_fn and preserve
+    pre-existing keys so callers writing disjoint key sets don't clobber each other."""
+    project = Project(name="design-doc-lock", user_id="user")
+    project.design_doc = {"existing": "kept"}
+    db_session.add(project)
+    await db_session.commit()
+
+    await with_design_doc_locked(
+        db_session, project.id, lambda doc: doc.update({"added": "yes"})
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert project.design_doc == {"existing": "kept", "added": "yes"}
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
+@pytest.mark.asyncio
+async def test_with_design_doc_locked_serializes_concurrent_writers(db_session):
+    """Two concurrent callers writing disjoint keys via with_design_doc_locked
+    must both survive — the second must see the first's committed write."""
+    project = Project(name="design-doc-concurrent", user_id="user")
+    project.design_doc = {}
+    db_session.add(project)
+    await db_session.commit()
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def write_key(key: str) -> None:
+        async with Session() as s:
+            await with_design_doc_locked(
+                s, project.id, lambda doc: doc.update({key: "v"})
+            )
+            await s.commit()
+
+    await asyncio.gather(write_key("key_a"), write_key("key_b"))
+
+    async with Session() as verify:
+        result = await verify.execute(select(Project).where(Project.id == project.id))
+        doc = result.scalar_one().design_doc
+    assert doc.get("key_a") == "v", f"key_a missing from {doc}"
+    assert doc.get("key_b") == "v", f"key_b missing from {doc}"

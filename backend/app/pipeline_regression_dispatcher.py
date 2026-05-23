@@ -5830,17 +5830,17 @@ async def update_viewport_coverage_snapshot_from_diff(
     Called by the PR-merge hook (rollup_management) each time a PR merges.
     Skips silently when the project has no admin-ui directory in the diff.
     """
-    from sqlalchemy.orm.attributes import flag_modified
+    from app.shared_state import with_design_doc_locked
 
     if "admin-ui/" not in diff_text:
         return
 
     snap = compute_viewport_coverage_snapshot(diff_text, pr_number=pr_number)
-    doc = dict(project.design_doc or {})
-    doc["viewport_coverage_snapshot"] = snap
-    project.design_doc = doc
-    flag_modified(project, "design_doc")
-    session.add(project)
+
+    def _mutate(doc: dict) -> None:
+        doc["viewport_coverage_snapshot"] = snap
+
+    await with_design_doc_locked(session, project.id, _mutate)
     logger.info(
         "[REGRESSION_DISPATCHER] viewport_coverage_snapshot updated "
         "project=%s pr=%s before=%d after=%d escape_hatches=%d removed=%d",

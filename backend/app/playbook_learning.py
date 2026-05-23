@@ -404,7 +404,12 @@ async def finalize_pending_playbook_entries(
     Returns the number of entries finalised (cleared or removed). No-op when
     the project has no design_doc or no matching pending entries.
     """
-    project = await session.get(Project, task.project_id)
+    _proj_row = await session.execute(
+        select(Project)
+        .where(Project.id == task.project_id)
+        .with_for_update(skip_locked=False, key_share=True)
+    )
+    project = _proj_row.scalar_one_or_none()
     if project is None or not project.design_doc:
         return 0
 
@@ -1077,7 +1082,12 @@ async def _maybe_auto_playbook(
         return None
 
     # ── 3. Check if playbook entry already exists ───────────────────────────
-    project = await session.get(Project, task.project_id)
+    _proj_row = await session.execute(
+        select(Project)
+        .where(Project.id == task.project_id)
+        .with_for_update(skip_locked=False, key_share=True)
+    )
+    project = _proj_row.scalar_one_or_none()
     if not project:
         return None
 
@@ -1602,7 +1612,12 @@ async def capture_success_pattern(
 
     tests_added = test_file_count > 0
 
-    project = await session.get(Project, task.project_id)
+    _proj_row = await session.execute(
+        select(Project)
+        .where(Project.id == task.project_id)
+        .with_for_update(skip_locked=False, key_share=True)
+    )
+    project = _proj_row.scalar_one_or_none()
     if not project:
         return None
 
@@ -2036,7 +2051,12 @@ async def extract_review_feedback_to_playbook(
     if not review_history:
         return []
 
-    project = await session.get(Project, task.project_id)
+    _proj_row = await session.execute(
+        select(Project)
+        .where(Project.id == task.project_id)
+        .with_for_update(skip_locked=False, key_share=True)
+    )
+    project = _proj_row.scalar_one_or_none()
     if not project:
         return []
 
@@ -2373,7 +2393,12 @@ async def compute_review_effectiveness(
         }
 
     # Update per-category window history for persistent-issue tracking.
-    project = await session.get(Project, project_id)
+    _proj_row = await session.execute(
+        select(Project)
+        .where(Project.id == project_id)
+        .with_for_update(skip_locked=False, key_share=True)
+    )
+    project = _proj_row.scalar_one_or_none()
     if not project:
         return None
 
@@ -3898,7 +3923,12 @@ async def compute_sr_catch_rate_trends(
         # that the computation broke.  Mirrors sr_blind_spots heartbeat pattern.
         # data_sufficient=False distinguishes this from a real refresh so the
         # watchdog and UI can tell when the displayed trend is actually current.
-        _project = await session.get(Project, project_id)
+        _proj_row = await session.execute(
+            select(Project)
+            .where(Project.id == project_id)
+            .with_for_update(skip_locked=False, key_share=True)
+        )
+        _project = _proj_row.scalar_one_or_none()
         if _project is not None:
             _doc = dict(_project.design_doc or {})
             _trends = dict(_doc.get("sr_catch_rate_trends") or {})
@@ -4107,7 +4137,12 @@ async def compute_sr_catch_rate_trends(
         if examples:
             categories[cat]["examples"] = examples
 
-    project = await session.get(Project, project_id)
+    _proj_row = await session.execute(
+        select(Project)
+        .where(Project.id == project_id)
+        .with_for_update(skip_locked=False, key_share=True)
+    )
+    project = _proj_row.scalar_one_or_none()
     if not project:
         return None
 
@@ -5480,7 +5515,12 @@ async def check_fix_loop_divergence_regression(
     iso_year, iso_week, _ = now.isocalendar()
     window_key = f"{iso_year}-W{iso_week:02d}"
 
-    project = await session.get(Project, project_id)
+    _proj_row = await session.execute(
+        select(Project)
+        .where(Project.id == project_id)
+        .with_for_update(skip_locked=False, key_share=True)
+    )
+    project = _proj_row.scalar_one_or_none()
     if not project:
         return None
     doc = dict(project.design_doc or {})
@@ -5836,7 +5876,12 @@ async def compute_fresh_reviewer_trend(
         "approval_rate_lift": approval_rate_lift,
     }
 
-    project = await session.get(Project, project_id)
+    _proj_row = await session.execute(
+        select(Project)
+        .where(Project.id == project_id)
+        .with_for_update(skip_locked=False, key_share=True)
+    )
+    project = _proj_row.scalar_one_or_none()
     if not project:
         return None
 
@@ -5920,7 +5965,12 @@ async def compute_sr_reviewer_disagreements(
         "disagreements": entries,
     }
 
-    project = await session.get(Project, project_id)
+    _proj_row = await session.execute(
+        select(Project)
+        .where(Project.id == project_id)
+        .with_for_update(skip_locked=False, key_share=True)
+    )
+    project = _proj_row.scalar_one_or_none()
     if project:
         doc = dict(project.design_doc or {})
         doc["sr_reviewer_disagreements"] = result
@@ -6078,7 +6128,12 @@ async def compute_edges_trend(
         "reviewer_caught_trend": reviewer_caught_trend,
     }
 
-    project = await session.get(Project, project_id)
+    _proj_row = await session.execute(
+        select(Project)
+        .where(Project.id == project_id)
+        .with_for_update(skip_locked=False, key_share=True)
+    )
+    project = _proj_row.scalar_one_or_none()
     if not project:
         return None
 
@@ -6315,7 +6370,12 @@ async def compute_sr_regression_risk_test_signal_trends(
         "trend": trend,
     }
 
-    project = await session.get(Project, project_id)
+    _proj_row = await session.execute(
+        select(Project)
+        .where(Project.id == project_id)
+        .with_for_update(skip_locked=False, key_share=True)
+    )
+    project = _proj_row.scalar_one_or_none()
     if not project:
         return None
 
@@ -6477,7 +6537,12 @@ async def compute_sr_false_attestation_trends(
         "per_category": per_category,
     }
 
-    project = await session.get(Project, project_id)
+    _proj_row = await session.execute(
+        select(Project)
+        .where(Project.id == project_id)
+        .with_for_update(skip_locked=False, key_share=True)
+    )
+    project = _proj_row.scalar_one_or_none()
     if not project:
         return None
 
