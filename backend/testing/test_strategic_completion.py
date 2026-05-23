@@ -844,7 +844,9 @@ class TestIsDirectionDuplicate:
     def test_duplicate_with_existing_direction(self):
         proposal = "improve caching layer performance database queries"
         existing = [{"text": "improve caching layer performance database queries"}]
-        assert _is_direction_duplicate(proposal, existing, []) is True
+        is_dup, override = _is_direction_duplicate(proposal, existing, [])
+        assert is_dup is True
+        assert override is None
 
     def test_not_duplicate_when_overlap_below_threshold(self):
         # Only 3 shared non-stopword words
@@ -853,7 +855,9 @@ class TestIsDirectionDuplicate:
         # Words after stopwords: {improve, database, query, performance}
         # Existing after stopwords: {improve, database, query, latency, optimization}
         # Overlap: improve, database, query = 3 < 4 threshold
-        assert _is_direction_duplicate(proposal, existing, []) is False
+        is_dup, override = _is_direction_duplicate(proposal, existing, [])
+        assert is_dup is False
+        assert override is None
 
     def test_duplicate_with_recent_rejected_proposal(self):
         recent = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
@@ -864,7 +868,9 @@ class TestIsDirectionDuplicate:
                 "rejected_at": recent,
             }
         ]
-        assert _is_direction_duplicate(proposal, [], rejected) is True
+        is_dup, override = _is_direction_duplicate(proposal, [], rejected)
+        assert is_dup is True
+        assert override is None
 
     def test_old_rejected_proposal_ignored(self):
         old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
@@ -875,35 +881,47 @@ class TestIsDirectionDuplicate:
                 "rejected_at": old,
             }
         ]
-        assert _is_direction_duplicate(proposal, [], rejected) is False
+        is_dup, override = _is_direction_duplicate(proposal, [], rejected)
+        assert is_dup is False
+        assert override is None
 
     def test_stopwords_filtered_from_proposal(self):
         # After filtering stopwords from "feat fix refactor add update improve",
         # fewer than 2 non-stopword tokens remain → returns False immediately
         proposal = "feat fix refactor add update improve"
         existing = [{"text": "feat fix refactor add update improve"}]
-        assert _is_direction_duplicate(proposal, existing, []) is False
+        is_dup, override = _is_direction_duplicate(proposal, existing, [])
+        assert is_dup is False
+        assert override is None
 
     def test_requires_at_least_2_non_stopword_tokens(self):
         # Only one non-stopword word
         proposal = "improve"
         existing = [{"text": "improve performance database caching queries"}]
-        assert _is_direction_duplicate(proposal, existing, []) is False
+        is_dup, override = _is_direction_duplicate(proposal, existing, [])
+        assert is_dup is False
+        assert override is None
 
     def test_no_match_against_empty_lists(self):
         proposal = "refactor authentication middleware pipeline"
-        assert _is_direction_duplicate(proposal, [], []) is False
+        is_dup, override = _is_direction_duplicate(proposal, [], [])
+        assert is_dup is False
+        assert override is None
 
     def test_exactly_4_shared_words_triggers_duplicate(self):
         proposal = "cache database query performance results"
         existing = [{"text": "cache database query performance improvements"}]
         # Shared non-stopword words: cache, database, query, performance = 4
-        assert _is_direction_duplicate(proposal, existing, []) is True
+        is_dup, override = _is_direction_duplicate(proposal, existing, [])
+        assert is_dup is True
+        assert override is None
 
     def test_case_insensitive_matching(self):
         proposal = "Cache Database Query Performance Results"
         existing = [{"text": "cache database query performance improvements"}]
-        assert _is_direction_duplicate(proposal, existing, []) is True
+        is_dup, override = _is_direction_duplicate(proposal, existing, [])
+        assert is_dup is True
+        assert override is None
 
     def test_retired_direction_3_word_overlap_no_longer_triggers_duplicate(self):
         # 3-word overlap against an expired direction no longer triggers (threshold = 4 for all)
@@ -913,7 +931,9 @@ class TestIsDirectionDuplicate:
             {"text": "cache database query latency optimization", "status": "expired"}
         ]
         # Non-stopword overlap: cache, database, query = 3 < threshold 4 → False
-        assert _is_direction_duplicate(proposal, existing, []) is False
+        is_dup, override = _is_direction_duplicate(proposal, existing, [])
+        assert is_dup is False
+        assert override is None
 
     def test_active_direction_still_requires_4_words(self):
         # Same 3-word overlap against an active direction should NOT be flagged (threshold 4)
@@ -922,7 +942,9 @@ class TestIsDirectionDuplicate:
             {"text": "cache database query latency optimization", "status": "active"}
         ]
         # Non-stopword overlap: cache, database, query = 3 < threshold 4 for active → False
-        assert _is_direction_duplicate(proposal, existing, []) is False
+        is_dup, override = _is_direction_duplicate(proposal, existing, [])
+        assert is_dup is False
+        assert override is None
 
     def test_superseded_direction_4_word_overlap_triggers_duplicate(self):
         # 4-word overlap against a superseded direction still triggers (threshold = 4)
@@ -934,7 +956,9 @@ class TestIsDirectionDuplicate:
             }
         ]
         # Overlap: migrate, authentication, service, token = 4 >= threshold 4 → True
-        assert _is_direction_duplicate(proposal, existing, []) is True
+        is_dup, override = _is_direction_duplicate(proposal, existing, [])
+        assert is_dup is True
+        assert override is None
 
     def test_retired_threshold_2_words_does_not_trigger(self):
         # Only 2 shared non-stopword words even against a retired direction → False
@@ -943,7 +967,9 @@ class TestIsDirectionDuplicate:
             {"text": "caching performance strategy deployment", "status": "expired"}
         ]
         # Overlap: caching, performance = 2 < threshold 4 → False
-        assert _is_direction_duplicate(proposal, existing, []) is False
+        is_dup, override = _is_direction_duplicate(proposal, existing, [])
+        assert is_dup is False
+        assert override is None
 
     def test_retired_direction_4_word_overlap_still_blocked(self):
         # 4-word overlap against a retired direction still blocks (threshold = 4)
@@ -955,7 +981,9 @@ class TestIsDirectionDuplicate:
             }
         ]
         # Overlap: migrate, authentication, service, oauth, token = 5 >= 4 → True
-        assert _is_direction_duplicate(proposal, existing, []) is True
+        is_dup, override = _is_direction_duplicate(proposal, existing, [])
+        assert is_dup is True
+        assert override is None
 
     def test_distinction_bypasses_retired_direction_match(self):
         # Well-formed distinction overrides a 4-word overlap against a retired direction
@@ -969,13 +997,14 @@ class TestIsDirectionDuplicate:
         distinction = (
             "This focuses on the refresh-token rotation path, not initial login"
         )
-        assert (
-            _is_direction_duplicate(proposal, existing, [], distinction=distinction)
-            is False
+        is_dup, override = _is_direction_duplicate(
+            proposal, existing, [], distinction=distinction
         )
+        assert is_dup is False
+        assert override is None
 
-    def test_distinction_does_not_bypass_active_direction_match(self):
-        # Distinction has no effect on active-direction matches
+    def test_distinction_does_not_bypass_active_direction_match_without_category(self):
+        # Distinction has no effect on active-direction matches when categories not specified
         proposal = "migrate authentication service oauth token"
         existing = [
             {
@@ -986,10 +1015,60 @@ class TestIsDirectionDuplicate:
         distinction = (
             "This focuses on the refresh-token rotation path, not initial login"
         )
-        assert (
-            _is_direction_duplicate(proposal, existing, [], distinction=distinction)
-            is True
+        is_dup, override = _is_direction_duplicate(
+            proposal, existing, [], distinction=distinction
         )
+        assert is_dup is True
+        assert override is None
+
+    def test_distinction_bypasses_active_same_category_direction(self):
+        # Well-formed distinction OVERRIDES a 4-word overlap against an active direction
+        # of the SAME category
+        proposal = "migrate authentication service oauth token"
+        existing = [
+            {
+                "id": "d-auth1",
+                "text": "migrate authentication service oauth2 token system",
+                "status": "active",
+                "category": "structural",
+            }
+        ]
+        distinction = (
+            "This focuses on the refresh-token rotation path, not initial login"
+        )
+        is_dup, override = _is_direction_duplicate(
+            proposal,
+            existing,
+            [],
+            distinction=distinction,
+            proposal_category="structural",
+        )
+        assert is_dup is False
+        assert override is not None
+        assert override["id"] == "d-auth1"
+
+    def test_distinction_does_not_bypass_active_cross_category_direction(self):
+        # Distinction does NOT override when categories differ (even if distinction is well-formed)
+        proposal = "migrate authentication service oauth token"
+        existing = [
+            {
+                "text": "migrate authentication service oauth2 token system",
+                "status": "active",
+                "category": "product",
+            }
+        ]
+        distinction = (
+            "This focuses on the refresh-token rotation path, not initial login"
+        )
+        is_dup, override = _is_direction_duplicate(
+            proposal,
+            existing,
+            [],
+            distinction=distinction,
+            proposal_category="structural",
+        )
+        assert is_dup is True
+        assert override is None
 
     def test_distinction_too_short_does_not_bypass(self):
         # A trivially short distinction (< 20 chars) does not override the check
@@ -1001,10 +1080,11 @@ class TestIsDirectionDuplicate:
             }
         ]
         distinction = "different"  # only 9 chars, not well-formed
-        assert (
-            _is_direction_duplicate(proposal, existing, [], distinction=distinction)
-            is True
+        is_dup, override = _is_direction_duplicate(
+            proposal, existing, [], distinction=distinction
         )
+        assert is_dup is True
+        assert override is None
 
     def test_distinction_bypasses_retired_but_not_rejected_proposal(self):
         # distinction bypasses a retired-direction match, but rejected proposals always block
@@ -1022,10 +1102,117 @@ class TestIsDirectionDuplicate:
             "This focuses on the refresh-token rotation path, not initial login"
         )
         # Match is against a rejected proposal, not a retired direction → still True
-        assert (
-            _is_direction_duplicate(proposal, [], rejected, distinction=distinction)
-            is True
+        is_dup, override = _is_direction_duplicate(
+            proposal, [], rejected, distinction=distinction
         )
+        assert is_dup is True
+        assert override is None
+
+    def test_same_category_active_with_distinction_allowed(self):
+        # Test case (a): same-category active + distinction → allowed
+        # Note: need 4+ overlapping non-stopwords to trigger the duplicate check
+        proposal = "migrate authentication service oauth token rotation mechanism"
+        existing = [
+            {
+                "id": "d-auth1",
+                "text": "migrate authentication service oauth token refresh",
+                "status": "active",
+                "category": "structural",
+            }
+        ]
+        distinction = "This targets token refresh rotation, not the initial oauth flow"
+        is_dup, override = _is_direction_duplicate(
+            proposal,
+            existing,
+            [],
+            distinction=distinction,
+            proposal_category="structural",
+        )
+        assert is_dup is False
+        assert override is not None
+        assert override["id"] == "d-auth1"
+
+    def test_same_category_active_no_distinction_blocked(self):
+        # Test case (b): same-category active + no distinction → blocked
+        proposal = "migrate authentication service oauth token rotation"
+        existing = [
+            {
+                "id": "d-auth1",
+                "text": "migrate authentication service oauth token system",
+                "status": "active",
+                "category": "structural",
+            }
+        ]
+        is_dup, override = _is_direction_duplicate(
+            proposal, existing, [], distinction=None, proposal_category="structural"
+        )
+        assert is_dup is True
+        assert override is None
+
+    def test_cross_category_active_still_blocks(self):
+        # Test case (c): cross-category active → still blocked (keep current behavior)
+        # Different categories do NOT allow distinction override
+        proposal = "migrate authentication service oauth token rotation"
+        existing = [
+            {
+                "id": "d-auth1",
+                "text": "migrate authentication service oauth token system",
+                "status": "active",
+                "category": "product",
+            }
+        ]
+        is_dup, override = _is_direction_duplicate(
+            proposal, existing, [], distinction=None, proposal_category="structural"
+        )
+        # Different categories still block
+        assert is_dup is True
+        assert override is None
+
+    def test_mixed_category_does_not_match_same_category(self):
+        # Mixed category should not be treated as matching any specific category
+        proposal = "migrate authentication service oauth token rotation"
+        existing = [
+            {
+                "id": "d-auth1",
+                "text": "migrate authentication service oauth token system",
+                "status": "active",
+                "category": "mixed",
+            }
+        ]
+        distinction = "This targets token rotation specifically"
+        is_dup, override = _is_direction_duplicate(
+            proposal,
+            existing,
+            [],
+            distinction=distinction,
+            proposal_category="structural",
+        )
+        # mixed category does not match structural, so distinction doesn't override
+        assert is_dup is True
+        assert override is None
+
+    def test_retired_direction_preserved_behavior(self):
+        # Test case (d): retired direction case (preserve current behavior)
+        proposal = "migrate authentication service oauth token rotation"
+        existing = [
+            {
+                "id": "d-auth1",
+                "text": "migrate authentication service oauth token system",
+                "status": "retired",
+                "category": "structural",
+            }
+        ]
+        distinction = "This targets token rotation specifically"
+        is_dup, override = _is_direction_duplicate(
+            proposal,
+            existing,
+            [],
+            distinction=distinction,
+            proposal_category="structural",
+        )
+        # Retired direction with distinction should still allow (distinction bypasses retired)
+        assert is_dup is False
+        assert override is None
 
 
 # ── _record_strategic_task_failure ───────────────────────────────────────────
