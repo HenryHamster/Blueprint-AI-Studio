@@ -139,6 +139,8 @@ async def test_backlog_reuse_claims_same_project_task(
         timing = (backlog.context or {}).get("_timing", {})
         assert timing.get("warm_start") is True
         assert timing.get("warm_claim_origin") == "backlog_reuse"
+        # Both context flag and column must be synchronized.
+        assert backlog.vm_warm_start is True
         # Warm claim must NOT stamp a cold-start sample.
         assert backlog.vm_cold_start_ms is None
 

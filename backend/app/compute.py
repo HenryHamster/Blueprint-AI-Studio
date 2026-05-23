@@ -1169,8 +1169,14 @@ async def _provision_gcp(
                 )
                 zone_region = "-".join(zone.split("-")[:-1])
                 network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{subnet_name}"
+                # pd-balanced (SSD-backed) boots faster than the pd-standard
+                # (HDD) default; disk_type is zone-qualified so it must track the
+                # zone being attempted. Mutate disk.initialize_params (not the
+                # pre-loop local) because the proto copied the params on assignment.
+                disk.initialize_params.disk_type = f"zones/{zone}/diskTypes/pd-balanced"
                 # Re-assign to ensure protobuf picks up the change
                 instance_config.network_interfaces = [network_interface]
+                instance_config.disks = [disk]
 
                 # Delete any existing VM with this name first (stale from retries)
                 try:
@@ -1369,6 +1375,12 @@ async def _provision_gcp(
                     )
                     zone_region = "-".join(wait_zone.split("-")[:-1])
                     network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{wait_subnet}"
+                    disk.initialize_params.disk_type = (
+                        f"zones/{wait_zone}/diskTypes/pd-balanced"
+                    )
+                    # Re-assign to ensure protobuf picks up the change
+                    instance_config.network_interfaces = [network_interface]
+                    instance_config.disks = [disk]
                     operation = instance_client.insert(
                         project=GCP_PROJECT_ID,
                         zone=wait_zone,

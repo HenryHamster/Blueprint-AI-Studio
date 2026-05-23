@@ -7,7 +7,11 @@ from httpx import AsyncClient
 async def test_list_users_empty(client: AsyncClient):
     response = await client.get("/api/admin/users")
     assert response.status_code == 200
-    assert response.json() == []
+    data = response.json()
+    assert data["users"] == []
+    assert data["total"] == 0
+    assert data["limit"] == 100
+    assert data["offset"] == 0
 
 
 @pytest.mark.asyncio
@@ -94,7 +98,7 @@ async def test_delete_user(client: AsyncClient):
 
     # Verify removed from list
     listing = await client.get("/api/admin/users")
-    emails = [u["email"] for u in listing.json()]
+    emails = [u["email"] for u in listing.json()["users"]]
     assert "del@example.com" not in emails
 
 
@@ -129,10 +133,47 @@ async def test_list_users_populated(client: AsyncClient):
 
     response = await client.get("/api/admin/users")
     assert response.status_code == 200
-    users = response.json()
-    assert len(users) == 2
-    emails = {u["email"] for u in users}
+    data = response.json()
+    assert data["total"] == 2
+    assert len(data["users"]) == 2
+    emails = {u["email"] for u in data["users"]}
     assert emails == {"a@example.com", "b@example.com"}
+
+
+@pytest.mark.asyncio
+async def test_list_users_pagination(client: AsyncClient):
+    for i in range(5):
+        await client.post(
+            "/api/admin/users", json={"email": f"u{i}@example.com", "role": "user"}
+        )
+
+    response = await client.get("/api/admin/users?limit=2&offset=0")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 5
+    assert data["limit"] == 2
+    assert data["offset"] == 0
+    assert len(data["users"]) == 2
+
+    response2 = await client.get("/api/admin/users?limit=2&offset=2")
+    assert response2.status_code == 200
+    data2 = response2.json()
+    assert data2["total"] == 5
+    assert data2["offset"] == 2
+    assert len(data2["users"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_list_users_offset_exceeds_total(client: AsyncClient):
+    response = await client.get("/api/admin/users?offset=999")
+    assert response.status_code == 400
+    assert "offset" in response.json()["error"]["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_list_users_limit_exceeds_max(client: AsyncClient):
+    response = await client.get("/api/admin/users?limit=1001")
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio

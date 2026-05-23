@@ -6,6 +6,7 @@ Tests two areas:
 2. _build_stuck_tasks()     — stuck detection for all 4 patterns
 """
 
+import os
 import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
@@ -14,8 +15,17 @@ from app.routers.admin_debug import (
     _classify_stuck_failure,
     _build_stuck_tasks,
     _build_direction_remediation_state,
+    get_global_diagnostics,
+    DIAGNOSTICS_TOP_N,
 )
 from app.models import Project, Task, TaskStatus
+
+# The /diagnostics endpoint filters projects with func.jsonb_array_length(...),
+# which SQLite does not implement — these endpoint tests require real Postgres
+# (CI full suite / `bash scripts/test-backend.sh testing/test_diagnostics.py`).
+USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -814,3 +824,119 @@ class TestBuildDirectionRemediationState:
     def test_handles_empty_or_missing_directions(self):
         assert _build_direction_remediation_state(self._project([])) == []
         assert _build_direction_remediation_state(self._project(None)) == []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Section 4 — GET /api/admin/diagnostics (pagination + global counters)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="/diagnostics uses jsonb_array_length — Postgres-only",
+)
+class TestGlobalDiagnosticsPagination:
+    """Endpoint-level tests calling get_global_diagnostics() directly with a DB session."""
+
+    async def _make_project(self, db_session, name):
+        project = Project(name=name, user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        return project
+
+    @pytest.mark.asyncio
+    async def test_default_limit_caps_scan_and_global_counts_independent_of_page(
+        self, db_session
+    ):
+        """Default limit=50 caps the scanned window, but queued/in_progress counts
+        come from a GROUP BY over the FULL active set (not the page)."""
+        project = await self._make_project(db_session, "diag-page")
+
+        # 55 fresh QUEUED (older) + 5 fresh IN_PROGRESS (newest). created_at ASC
+        # ordering means the default 50-row window is all QUEUED, so a page-scoped
+        # in_progress_count would be 0 — the bug this asserts against.
+        for _ in range(55):
+            db_session.add(
+                _make_task(project.id, TaskStatus.QUEUED, created_ago_secs=300)
+            )
+        for _ in range(5):
+            db_session.add(
+                _make_task(
+                    project.id,
+                    TaskStatus.IN_PROGRESS,
+                    created_ago_secs=0,
+                    heartbeat_ago_secs=30,
+                )
+            )
+        await db_session.commit()
+
+        result = await get_global_diagnostics(
+            limit=50, offset=0, session=db_session, current_user={}
+        )
+
+        assert result["total_active_tasks_scanned"] == 50
+        assert result["queued_count"] == 55
+        assert result["in_progress_count"] == 5
+        assert result["truncated"] is True
+        assert any("not scanned" in w for w in result["warnings"])
+
+    @pytest.mark.asyncio
+    async def test_offset_windowing(self, db_session):
+        """offset advances the window; the tail page is not flagged truncated."""
+        project = await self._make_project(db_session, "diag-offset")
+        for _ in range(60):
+            db_session.add(
+                _make_task(project.id, TaskStatus.QUEUED, created_ago_secs=300)
+            )
+        await db_session.commit()
+
+        result = await get_global_diagnostics(
+            limit=50, offset=50, session=db_session, current_user={}
+        )
+
+        assert result["total_active_tasks_scanned"] == 10
+        assert result["queued_count"] == 60
+        assert result["truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_high_limit_emits_near_maximum_warning(self, db_session):
+        """limit>=400 surfaces a 'near the maximum' warning regardless of row count."""
+        project = await self._make_project(db_session, "diag-highlimit")
+        db_session.add(_make_task(project.id, TaskStatus.QUEUED, created_ago_secs=60))
+        await db_session.commit()
+
+        result = await get_global_diagnostics(
+            limit=400, offset=0, session=db_session, current_user={}
+        )
+
+        assert any("near the maximum" in w for w in result["warnings"])
+        # Only 1 active task < 400 window → nothing beyond the window.
+        assert result["truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_stuck_tasks_top_n_truncation_with_full_count(self, db_session):
+        """stuck_tasks is capped at DIAGNOSTICS_TOP_N, sorted most-stuck-first,
+        while total_stuck_count reflects every stuck task in the scanned window."""
+        project = await self._make_project(db_session, "diag-topn")
+        stuck_n = DIAGNOSTICS_TOP_N + 5
+        # long_queued: QUEUED, no deps, created >30 min ago. Vary age so ordering
+        # by stuck_for_seconds is deterministic.
+        for i in range(stuck_n):
+            db_session.add(
+                _make_task(
+                    project.id,
+                    TaskStatus.QUEUED,
+                    created_ago_secs=35 * 60 + i * 60,
+                )
+            )
+        await db_session.commit()
+
+        result = await get_global_diagnostics(
+            limit=100, offset=0, session=db_session, current_user={}
+        )
+
+        assert len(result["stuck_tasks"]) == DIAGNOSTICS_TOP_N
+        assert result["total_stuck_count"] == stuck_n
+        secs = [s["stuck_for_seconds"] for s in result["stuck_tasks"]]
+        assert secs == sorted(secs, reverse=True)

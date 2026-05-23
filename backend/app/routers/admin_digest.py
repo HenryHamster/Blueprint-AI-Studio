@@ -2339,7 +2339,8 @@ async def compute_pipeline_health_summary(
     try:
         ms_cutoff = _now - timedelta(days=365)
         ms_result = await session.execute(
-            select(Task).where(
+            select(Task)
+            .where(
                 Task.project_id == project_id,
                 Task.status.in_(
                     [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
@@ -2347,6 +2348,8 @@ async def compute_pipeline_health_summary(
                 Task.created_at >= ms_cutoff,
                 Task.context["scope"].as_string() == "medium",
             )
+            .order_by(Task.created_at.desc())
+            .limit(500)
         )
         ms_medium = ms_result.scalars().all()
         if ms_medium:
@@ -4744,11 +4747,12 @@ async def _compute_digest(
     pr_artifact_map: Dict[str, str] = {}  # task_id -> pr_url
     error_log_map: Dict[str, str] = {}  # task_id -> truncated error snippet
 
-    if all_task_ids:
+    for _chunk_start in range(0, len(all_task_ids), 200):
+        _chunk = all_task_ids[_chunk_start : _chunk_start + 200]
         artifacts_result = await session.execute(
             select(Artifact)
             .where(
-                Artifact.task_id.in_(all_task_ids),
+                Artifact.task_id.in_(_chunk),
                 Artifact.artifact_type.in_(
                     [
                         ArtifactType.PULL_REQUEST,

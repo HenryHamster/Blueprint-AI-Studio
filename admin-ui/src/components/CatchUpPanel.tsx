@@ -674,10 +674,8 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
   );
 
   // Failures not already in needs_attention
-  const attentionIds = new Set((digest?.needs_attention ?? []).map(i => i.task_id));
-  const extraFailureGroups = (digest?.failure_groups ?? [])
-    .map(g => ({ ...g, tasks: g.tasks.filter(t => !attentionIds.has(t.task_id)) }))
-    .filter(g => g.tasks.length > 0);
+  const attentionIds = useMemo(() => new Set((digest?.needs_attention ?? []).map(i => i.task_id)), [digest?.needs_attention]);
+  const extraFailureGroups = useMemo(() => (digest?.failure_groups ?? []).map(g => ({ ...g, tasks: g.tasks.filter(t => !attentionIds.has(t.task_id)) })).filter(g => g.tasks.length > 0), [digest?.failure_groups, attentionIds]);
 
   const windowLabels: { key: TimeWindow; label: string }[] = [
     { key: 'last_visit', label: lastCatchUpViewed ? 'Since last visit' : 'Since last visit (24h)' },

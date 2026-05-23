@@ -732,6 +732,13 @@ class Task(SQLModel, table=True):
         Index("ix_task_depends_on_gin", "depends_on", postgresql_using="gin"),
         Index("ix_task_provider_created_at", "provider", "created_at"),
         Index("ix_task_account_id_created_at", "account_id", "created_at"),
+        Index(
+            "ix_task_account_model_provider_created",
+            "account_id",
+            "provider",
+            "model",
+            "created_at",
+        ),
         # Partial expression index on the leading payload's pr_number so the
         # review-pipeline per-PR iteration-cap query (review_pipeline.py) can
         # filter in SQL rather than loading every terminal Task row in the

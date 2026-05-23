@@ -64,7 +64,7 @@ class TestListUsers:
 
         resp = await client.get("/api/admin/users")
         assert resp.status_code == 200
-        emails = [u["email"] for u in resp.json()]
+        emails = [u["email"] for u in resp.json()["users"]]
         assert "alice@example.com" in emails
 
     @pytest.mark.asyncio

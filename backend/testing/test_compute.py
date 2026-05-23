@@ -868,3 +868,53 @@ class TestGetVmStatus:
         with patch("google.cloud.compute_v1.InstancesClient") as mock_client:
             mock_client.return_value.get.side_effect = Exception("503 backend timeout")
             assert compute.get_vm_status("agent-vm-abc", "us-central1-a") is None
+
+
+class TestBootDiskType:
+    """provision_agent_vm requests a pd-balanced (SSD-backed) boot disk.
+
+    pd-balanced boots meaningfully faster than the pd-standard (HDD) default
+    GCP uses when disk_type is unset. disk_type is zone-qualified, so the value
+    sent to insert() must reference the same zone the instance is created in.
+    """
+
+    async def test_disk_type_is_pd_balanced_and_zone_matched(
+        self, monkeypatch, clean_zone_health
+    ):
+        captured = {}
+
+        def _capture_insert(*args, **kwargs):
+            inst = kwargs["instance_resource"]
+            captured["zone"] = kwargs["zone"]
+            captured["disk_type"] = inst.disks[0].initialize_params.disk_type
+            captured["machine_type"] = inst.machine_type
+            op = MagicMock()
+            op.name = "op-disk-test"
+            return op
+
+        async def _ok(*args, **kwargs):
+            return True
+
+        async def _noop(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(compute, "_acquire_provision_slot", _ok)
+        monkeypatch.setattr(compute, "_release_provision_slot", _noop)
+
+        with patch("google.cloud.compute_v1.InstancesClient") as mock_client:
+            # No stale VM to clean up — get() raising 404 short-circuits the delete.
+            mock_client.return_value.get.side_effect = Exception("404 was not found")
+            mock_client.return_value.insert.side_effect = _capture_insert
+
+            result = await compute._provision_gcp(
+                "vm-disktype-test",
+                uuid.uuid4(),
+                secret_version_name="projects/p/secrets/s/versions/1",
+            )
+
+        assert result is True
+        assert (
+            captured["disk_type"] == f"zones/{captured['zone']}/diskTypes/pd-balanced"
+        )
+        # Disk zone must track the machine-type zone (same insert target).
+        assert f"zones/{captured['zone']}/" in captured["machine_type"]

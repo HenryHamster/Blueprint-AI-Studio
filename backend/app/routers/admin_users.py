@@ -2,8 +2,9 @@
 
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, field_validator
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -224,22 +225,43 @@ async def remove_project_member(
 async def list_users(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
 ):
+    total_result = await session.execute(select(func.count()).select_from(AllowedUser))
+    total = total_result.scalar_one()
+
+    if offset > total:
+        raise HTTPException(
+            status_code=400,
+            detail=f"offset {offset} exceeds total user count {total}",
+        )
+
     result = await session.execute(
-        select(AllowedUser).order_by(AllowedUser.created_at.desc())
+        select(AllowedUser)
+        .order_by(AllowedUser.created_at.desc())
+        .limit(limit)
+        .offset(offset)
     )
     users = result.scalars().all()
-    return [
-        {
-            "id": str(u.id),
-            "email": u.email,
-            "role": u.role,
-            "display_name": u.display_name,
-            "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
-            "created_at": u.created_at.isoformat() if u.created_at else None,
-        }
-        for u in users
-    ]
+    return {
+        "users": [
+            {
+                "id": str(u.id),
+                "email": u.email,
+                "role": u.role,
+                "display_name": u.display_name,
+                "last_login_at": u.last_login_at.isoformat()
+                if u.last_login_at
+                else None,
+                "created_at": u.created_at.isoformat() if u.created_at else None,
+            }
+            for u in users
+        ],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.post("/users", status_code=201)

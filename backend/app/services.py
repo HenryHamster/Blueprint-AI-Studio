@@ -325,7 +325,7 @@ def _pr_possibly_open(ctx: dict | None) -> bool:
     )
 
 
-async def _get_project_github_token(project, session):
+async def _get_project_github_token(project, session, *, integration=None):
     """Retrieve a GitHub token for a project via its UserIntegration.
 
     Reuses the same in-process cache as ``get_github_token_for_task`` so a
@@ -333,6 +333,9 @@ async def _get_project_github_token(project, session):
     60s cache) doesn't mint a fresh install token on every cache-miss.  That
     pattern was silently draining the ~60/hr App-JWT bucket even with zero
     agents running.
+
+    Pass a pre-loaded ``integration`` to skip the per-project DB query (used
+    by ``_run_stale_branch_cleanup`` which batch-loads all integrations upfront).
     """
     from app.models import UserIntegration
     from app.github import (
@@ -358,17 +361,18 @@ async def _get_project_github_token(project, session):
         ):
             return cached["token"]
 
-    integration = (
-        (
-            await session.execute(
-                select(UserIntegration).where(
-                    UserIntegration.user_id == project.user_id
+    if integration is None:
+        integration = (
+            (
+                await session.execute(
+                    select(UserIntegration).where(
+                        UserIntegration.user_id == project.user_id
+                    )
                 )
             )
+            .scalars()
+            .first()
         )
-        .scalars()
-        .first()
-    )
 
     token: str | None = None
     if integration and integration.github_installation_id:
@@ -448,6 +452,24 @@ async def _run_stale_branch_cleanup():
             .all()
         )
 
+        # Batch-load UserIntegrations for all projects upfront to avoid an
+        # N+1 query pattern (one SELECT per project inside the loop).
+        from app.models import UserIntegration
+
+        project_user_ids = list({p.user_id for p in projects})
+        user_integrations = (
+            (
+                await session.execute(
+                    select(UserIntegration).where(
+                        UserIntegration.user_id.in_(project_user_ids)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        user_integration_lookup: dict = {ui.user_id: ui for ui in user_integrations}
+
         ACTIVE_STATUSES = [
             TaskStatus.QUEUED,
             TaskStatus.PROVISIONING,
@@ -506,7 +528,11 @@ async def _run_stale_branch_cleanup():
                 active_branches.add(f"blueprint/{type_prefix}-{short_id}")
 
             try:
-                token = await _get_project_github_token(project, session)
+                token = await _get_project_github_token(
+                    project,
+                    session,
+                    integration=user_integration_lookup.get(project.user_id),
+                )
                 if not token:
                     logger.warning(
                         f"[BRANCH CLEANUP] No token for project {project.id}, skipping"
@@ -687,8 +713,7 @@ async def stale_branch_cleanup_service():
             # Demote to a one-line warning so the dashboard doesn't flag it.
             msg = str(e)
             is_close_collateral = (
-                "connection is closed" in msg
-                or "InterfaceError" in type(e).__name__
+                "connection is closed" in msg or "InterfaceError" in type(e).__name__
             )
             if is_close_collateral:
                 logger.warning(
@@ -1405,9 +1430,7 @@ async def _check_evaluating_timeouts():
                         await session.execute(
                             select(Task)
                             .options(
-                                load_only(
-                                    Task.id, Task.parent_task_id, Task.status
-                                )
+                                load_only(Task.id, Task.parent_task_id, Task.status)
                             )
                             .where(Task.parent_task_id.in_(_eval_parent_ids))
                         )
@@ -1822,9 +1845,7 @@ async def _check_evaluating_timeouts():
                     children = (
                         (
                             await session.execute(
-                                select(Task).where(
-                                    Task.parent_task_id == task.id
-                                )
+                                select(Task).where(Task.parent_task_id == task.id)
                             )
                         )
                         .scalars()
@@ -1899,9 +1920,7 @@ async def _check_evaluating_timeouts():
                         f"but is still EVALUATING — triggering missed rollup"
                     )
                     # Re-fetch a terminal child fresh to trigger rollup.
-                    trigger_child = await session.get(
-                        Task, child_status_snap[0][0]
-                    )
+                    trigger_child = await session.get(Task, child_status_snap[0][0])
                     if trigger_child is not None:
                         await _check_and_trigger_rollup(trigger_child, session)
                     await session.commit()

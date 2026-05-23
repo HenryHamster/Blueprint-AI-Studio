@@ -12,7 +12,7 @@ import logging
 from typing import Optional, Dict, List, TypedDict
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -992,15 +992,21 @@ async def get_project_diagnostics(
 # GET /api/admin/diagnostics  (aggregated across all projects)
 # ---------------------------------------------------------------------------
 
-DIAGNOSTICS_TASK_SCAN_LIMIT = 5000
+DIAGNOSTICS_TOP_N = 20
 
 
 @router.get("/diagnostics")
 async def get_global_diagnostics(
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
-    """Aggregate pipeline diagnostics across all projects."""
+    """Aggregate pipeline diagnostics across all projects.
+
+    Uses limit/offset pagination over active tasks (default limit=50, max=500).
+    Returns stuck_tasks and direction_remediation as top-N summaries with total counts.
+    """
     from app.shared_state import get_circuit_breaker, circuit_breakers
     from app.compute import get_zone_health_summary
 
@@ -1012,6 +1018,37 @@ async def get_global_diagnostics(
         TaskStatus.IN_PROGRESS,
         TaskStatus.EVALUATING,
     ]
+
+    # Count total active tasks for pagination warnings without loading full rows.
+    count_result = await session.execute(
+        select(func.count())
+        .select_from(Task)
+        .where(
+            Task.status.in_(active_statuses),
+            Task.archived.is_(False),
+        )
+    )
+    total_active_count = count_result.scalar() or 0
+
+    # Global per-status counts over the FULL active set (independent of the
+    # paginated window below). queued_count / in_progress_count are consumed as
+    # global totals by scripts/ops.py and scripts/audit_tasks_prs.py, so they must
+    # not be derived from the page (which is oldest-first and would drop fresh
+    # QUEUED tasks). Cheap GROUP BY, no row payloads loaded.
+    status_count_result = await session.execute(
+        select(Task.status, func.count())
+        .where(
+            Task.status.in_(active_statuses),
+            Task.archived.is_(False),
+        )
+        .group_by(Task.status)
+    )
+    status_counts: Dict[TaskStatus, int] = {
+        row[0]: row[1] for row in status_count_result.all()
+    }
+    total_queued = status_counts.get(TaskStatus.QUEUED, 0)
+    total_in_progress = status_counts.get(TaskStatus.IN_PROGRESS, 0)
+
     active_result = await session.execute(
         select(Task)
         .options(
@@ -1040,12 +1077,25 @@ async def get_global_diagnostics(
             Task.status.in_(active_statuses),
             Task.archived.is_(False),
         )
-        .limit(DIAGNOSTICS_TASK_SCAN_LIMIT + 1)
+        .order_by(Task.created_at.asc())
+        .limit(limit)
+        .offset(offset)
     )
     active_tasks = list(active_result.scalars().all())
-    truncated = len(active_tasks) > DIAGNOSTICS_TASK_SCAN_LIMIT
-    if truncated:
-        active_tasks = active_tasks[:DIAGNOSTICS_TASK_SCAN_LIMIT]
+
+    # Build warnings when the scan window doesn't cover all active tasks.
+    warnings: List[str] = []
+    tasks_beyond_window = total_active_count - (offset + len(active_tasks))
+    if tasks_beyond_window > 0:
+        warnings.append(
+            f"Showing {len(active_tasks)} of {total_active_count} active tasks "
+            f"(offset={offset}, limit={limit}); {tasks_beyond_window} tasks not scanned — "
+            "use offset to paginate."
+        )
+    if limit >= 400:
+        warnings.append(
+            f"limit={limit} is near the maximum (500); response may be large."
+        )
 
     # Group tasks by project
     by_project: Dict[str, List[Task]] = {}
@@ -1070,17 +1120,16 @@ async def get_global_diagnostics(
     all_stuck: List[StuckTaskInfo] = []
     project_summaries: List[ProjectSummary] = []
     all_remediation: List[DirectionRemediationInfo] = []
-    total_queued = 0
-    total_in_progress = 0
 
     project_ids = set(by_project.keys()) | set(remediation_by_project.keys())
     for pid in project_ids:
         tasks = by_project.get(pid, [])
         stuck = await _build_stuck_tasks(tasks, now, session) if tasks else []
+        # Per-project queued/in_progress are window-scoped (reflect only the
+        # tasks on this page); the global queued_count / in_progress_count in the
+        # response come from the GROUP BY above.
         queued = sum(1 for t in tasks if t.status == TaskStatus.QUEUED)
         in_prog = sum(1 for t in tasks if t.status == TaskStatus.IN_PROGRESS)
-        total_queued += queued
-        total_in_progress += in_prog
         all_stuck.extend(stuck)
         remediation = remediation_by_project.get(pid, [])
         all_remediation.extend(remediation)
@@ -1108,19 +1157,42 @@ async def get_global_diagnostics(
     except Exception:
         zone_health = {"available": 0, "exhausted": []}
 
+    # Return top-N for stuck_tasks and direction_remediation to bound response size.
+    # Callers that need the full list should page through all offsets and aggregate.
+    stuck_by_urgency = sorted(
+        all_stuck, key=lambda x: x["stuck_for_seconds"], reverse=True
+    )
+    remediation_by_priority = sorted(
+        all_remediation,
+        key=lambda x: (not x["needs_manual_intervention"], x.get("direction_text", "")),
+    )
+
     return {
-        "stuck_tasks": all_stuck,
+        "stuck_tasks": stuck_by_urgency[:DIAGNOSTICS_TOP_N],
+        # total_stuck_count reflects the scanned window only. Stuck detection is a
+        # per-task derived property (heartbeat/timing/JSONB) with no cheap GROUP BY
+        # equivalent, so computing it globally would require the full active-set
+        # scan this endpoint is designed to bound. Stuck tasks are old by
+        # definition and the window is ordered created_at ASC (oldest first), so
+        # the default window captures them; widen via limit/offset for an exhaustive count.
         "total_stuck_count": len(all_stuck),
         "queued_count": total_queued,
         "in_progress_count": total_in_progress,
+        "total_active_tasks_scanned": len(active_tasks),
         "projects": project_summaries,
         "circuit_breakers": all_circuit_breakers,
         "zone_health": zone_health,
-        "direction_remediation": all_remediation,
+        "direction_remediation": remediation_by_priority[:DIAGNOSTICS_TOP_N],
+        "total_direction_remediation_count": len(all_remediation),
         "needs_manual_intervention_count": sum(
             1 for e in all_remediation if e["needs_manual_intervention"]
         ),
-        "truncated": truncated,
+        # NOTE: semantics changed with pagination. truncated now means "this page
+        # does not cover all active tasks" (tasks_beyond_window > 0), not the prior
+        # ">5000 active tasks exist" sentinel. The global endpoint has no frontend
+        # consumer reading this field; see warnings for the human-readable detail.
+        "truncated": tasks_beyond_window > 0,
+        "warnings": warnings,
     }
 
 

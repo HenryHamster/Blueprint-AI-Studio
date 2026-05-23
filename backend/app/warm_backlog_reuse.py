@@ -111,25 +111,59 @@ async def _eligible_backlog_ids(
             .limit(_BACKLOG_SCAN_LIMIT)
         )
     ).all()
+
+    rows_fetched = len(rows)
+    saturated = rows_fetched >= _BACKLOG_SCAN_LIMIT
+
     if not rows:
+        logger.debug(
+            "[BACKLOG-REUSE] scan project_id=%s vm_instance_id=%s "
+            "rows_fetched=%d rows_eligible=0 saturated=%s",
+            project_id,
+            vm_instance_id,
+            rows_fetched,
+            saturated,
+        )
         return []
 
     if in_progress_files is None:
         in_progress_files = await _project_in_progress_files(session, project_id)
 
     eligible: list[uuid.UUID] = []
+    skipped_depends_on = 0
+    skipped_pinned_vm = 0
+    skipped_file_conflict = 0
+
     for task_id, depends_on, ctx in rows:
         if depends_on:
+            skipped_depends_on += 1
             continue
         ctx = ctx or {}
         pinned_vm = ctx.get("warm_target_vm_id")
         if pinned_vm and pinned_vm != vm_instance_id:
+            skipped_pinned_vm += 1
             continue
         if in_progress_files:
             cfiles = _prod_files(ctx.get("related_files", []))
             if cfiles & in_progress_files:
+                skipped_file_conflict += 1
                 continue
         eligible.append(task_id)
+
+    logger.debug(
+        "[BACKLOG-REUSE] scan project_id=%s vm_instance_id=%s "
+        "rows_fetched=%d rows_eligible=%d saturated=%s "
+        "skipped_depends_on=%d skipped_pinned_vm=%d skipped_file_conflict=%d",
+        project_id,
+        vm_instance_id,
+        rows_fetched,
+        len(eligible),
+        saturated,
+        skipped_depends_on,
+        skipped_pinned_vm,
+        skipped_file_conflict,
+    )
+
     return eligible
 
 
@@ -180,18 +214,22 @@ async def select_backlog_reuse_candidate(
     eligible = await _eligible_backlog_ids(
         session, project_id, vm_instance_id, in_progress_files=in_progress_files
     )
-    for task_id in eligible:
-        locked = (
-            (
-                await session.execute(
-                    select(Task)
-                    .where(Task.id == task_id, Task.status == TaskStatus.QUEUED)
-                    .with_for_update(skip_locked=True)
-                )
-            )
-            .scalars()
-            .first()
-        )
-        if locked is not None:
-            return locked
-    return None
+    if not eligible:
+        return None
+    result = await session.execute(
+        select(Task)
+        .where(Task.id.in_(eligible), Task.status == TaskStatus.QUEUED)
+        .order_by(Task.priority.desc().nullslast(), Task.created_at.asc())
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    )
+    claimed = result.scalars().first()
+    logger.debug(
+        "[BACKLOG-REUSE] claim project_id=%s vm_instance_id=%s "
+        "task_id=%s rows_eligible=%d",
+        project_id,
+        vm_instance_id,
+        claimed.id if claimed is not None else None,
+        len(eligible),
+    )
+    return claimed

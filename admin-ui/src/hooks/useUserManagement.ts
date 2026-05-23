@@ -15,8 +15,11 @@ export function useUserManagement(showUserManagement: boolean) {
 
   const fetchAllowedUsers = useCallback(async () => {
     try {
-      const res = await authGet(`${API_BASE_URL}/api/admin/users`);
-      if (res.ok) setAllowedUsers(await res.json());
+      const res = await authGet(`${API_BASE_URL}/api/admin/users?limit=1000`);
+      if (res.ok) {
+        const data = await res.json();
+        setAllowedUsers(data.users ?? data);
+      }
     } catch { /* ignore */ }
   }, []);
 

@@ -3613,6 +3613,7 @@ async def _finalize_warm_claim(
     # cold-start sample (the warm task stays vm_cold_start_ms=NULL).
     task.vm_provisioned_at = _utcnow()
     task.vm_spot = VM_PROVISIONING_MODEL == "SPOT"
+    task.vm_warm_start = True
     if task.started_at is None:
         task.started_at = _utcnow()
     # Carry warm-start signal forward into context._timing. setdefault keeps
