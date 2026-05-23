@@ -1107,9 +1107,10 @@ async def get_global_diagnostics(
     # needs_manual_intervention directions even for projects with no active tasks.
     # Skip projects with no directions — they can never contribute remediation entries.
     projects_result = await session.execute(
-        select(Project).where(
-            func.coalesce(func.jsonb_array_length(Project.directions), 0) > 0
-        )
+        select(Project)
+        .where(func.coalesce(func.jsonb_array_length(Project.directions), 0) > 0)
+        .options(load_only(Project.id, Project.directions))
+        .limit(500)
     )
     remediation_by_project: Dict[str, List[DirectionRemediationInfo]] = {}
     for proj in projects_result.scalars().all():

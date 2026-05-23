@@ -8310,6 +8310,13 @@ async def get_efficiency_axes(
     immutable baseline value, percentage drift from baseline, and a
     time-series of up to 26 weekly snapshots for trend rendering.
 
+    Also returns ``vm_cold_start_breakdown``: a per-stage p50 ms breakdown of
+    the cold-start interval from the latest snapshot.  ``dispatch_to_slot_ms``
+    is the queue-wait before a provisioning slot is acquired (isolates our own
+    concurrency throttle from real GCE boot latency); the remaining stages
+    decompose boot through agent claim.  All values are None when no tasks in
+    the latest snapshot had stage data.
+
     Response shape::
 
         {
@@ -8323,7 +8330,16 @@ async def get_efficiency_axes(
             ...
           },
           "baseline_captured_at": iso8601|None,
-          "last_snapshot_at": iso8601|None
+          "last_snapshot_at": iso8601|None,
+          "vm_cold_start_breakdown": {
+            "dispatch_to_slot_ms": float|None,
+            "dispatch_to_creds_ms": float|None,
+            "creds_to_env_ms": float|None,
+            "env_to_payload_ms": float|None,
+            "payload_to_systemctl_ms": float|None,
+            "systemctl_to_startup_ms": float|None,
+            "startup_to_claim_ms": float|None
+          } | None
         }
 
     ``drift_pct`` is None whenever either side is missing or baseline is 0.

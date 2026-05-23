@@ -10091,6 +10091,50 @@ async def test_claim_uses_vm_dispatched_at_for_cold_start(
 
 
 @pytest.mark.asyncio
+async def test_claim_stamps_provision_slot_acquired_at_from_compute(
+    client: AsyncClient, db_session
+):
+    """Claim backfills provision_slot_acquired_at from compute's in-memory store into
+    _cold_start_stages so the efficiency snapshot can compute dispatch_to_slot_ms."""
+    import app.compute as _compute
+
+    project = Project(name="Slot Acquired Claim", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    dispatched = datetime.utcnow() - timedelta(seconds=30)
+    vm_id = "agent-vm-slot-acquired-test"
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "ls"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.QUEUED,
+        vm_dispatched_at=dispatched,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    slot_ts = (datetime.utcnow() - timedelta(seconds=20)).isoformat()
+    _compute._vm_provision_slot_times[vm_id] = slot_ts
+
+    try:
+        token = create_agent_token(str(task.id), vm_id)
+        resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+        assert resp.status_code == 200
+
+        await db_session.refresh(task)
+        stages = (task.context or {}).get("_cold_start_stages") or {}
+        assert "provision_slot_acquired_at" in stages, (
+            "provision_slot_acquired_at must be backfilled from compute's in-memory store"
+        )
+        assert stages["provision_slot_acquired_at"] == slot_ts
+    finally:
+        _compute._vm_provision_slot_times.pop(vm_id, None)
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_persists_api_call_summary(client: AsyncClient, db_session):
     """Heartbeat persists llm_call_count + token totals into Task.api_call_summary."""
     project = Project(name="API Call Summary", user_id="test-user-123")

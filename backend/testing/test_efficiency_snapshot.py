@@ -812,6 +812,58 @@ def test_compute_cold_start_breakdown_p50_partial_stages():
     assert result["startup_to_claim_ms"] is None
 
 
+def test_compute_cold_start_breakdown_p50_queue_wait_stage():
+    """dispatch_to_slot_ms captures queue-wait time when provision_slot_acquired_at is present.
+
+    Older tasks without this key produce None for the stage (not an error).
+    """
+    import uuid
+
+    project_id = uuid.uuid4()
+    now = datetime(2026, 1, 1, 12, 0, 0)
+
+    # Task WITH slot-acquired timestamp: 8s queue wait.
+    stages_with_slot = {
+        "provision_slot_acquired_at": (now + timedelta(seconds=8)).isoformat(),
+        "beacon_a_at": (now + timedelta(seconds=15)).isoformat(),
+        "beacon_b_at": (now + timedelta(seconds=18)).isoformat(),
+        "beacon_c_at": (now + timedelta(seconds=20)).isoformat(),
+        "beacon_d_at": (now + timedelta(seconds=21)).isoformat(),
+        "startup_complete_at": (now + timedelta(seconds=51)).isoformat(),
+        "claim_at": (now + timedelta(seconds=61)).isoformat(),
+    }
+    t_with = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"_cold_start_stages": stages_with_slot},
+        vm_dispatched_at=now,
+    )
+    result = _compute_cold_start_breakdown_p50([t_with])
+    assert result is not None
+    assert result["dispatch_to_slot_ms"] == 8000.0
+    assert result["dispatch_to_creds_ms"] == 15000.0
+
+    # Older task WITHOUT slot-acquired timestamp: dispatch_to_slot_ms is None.
+    stages_without_slot = {
+        "beacon_a_at": (now + timedelta(seconds=15)).isoformat(),
+        "beacon_b_at": (now + timedelta(seconds=18)).isoformat(),
+        "beacon_c_at": (now + timedelta(seconds=20)).isoformat(),
+        "beacon_d_at": (now + timedelta(seconds=21)).isoformat(),
+        "startup_complete_at": (now + timedelta(seconds=51)).isoformat(),
+        "claim_at": (now + timedelta(seconds=61)).isoformat(),
+    }
+    t_old = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"_cold_start_stages": stages_without_slot},
+        vm_dispatched_at=now,
+    )
+    result_old = _compute_cold_start_breakdown_p50([t_old])
+    assert result_old is not None
+    assert result_old["dispatch_to_slot_ms"] is None
+    assert result_old["dispatch_to_creds_ms"] == 15000.0
+
+
 @pytest.mark.asyncio
 async def test_compute_current_axes_includes_breakdown(db_session):
     """compute_current_axes includes vm_cold_start_breakdown key."""

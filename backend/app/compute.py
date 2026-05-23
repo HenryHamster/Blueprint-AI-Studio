@@ -63,6 +63,11 @@ _vm_zones: dict[str, str] = {}
 
 # Track per-VM image identity reported via heartbeats: vm_id -> (image_name, build_ts)
 _vm_images: dict[str, tuple[str | None, int | None]] = {}
+
+# Track when each VM's provisioning slot was actually acquired (ISO timestamp string).
+# Written by _provision_gcp after both Redis and local semaphore guards are passed;
+# read by the orchestrator to populate _cold_start_stages["provision_slot_acquired_at"].
+_vm_provision_slot_times: dict[str, str] = {}
 _IMAGE_STALENESS_THRESHOLD_HOURS = int(os.getenv("VM_IMAGE_STALENESS_HOURS", "24"))
 
 # Semaphores to cap concurrent GCP API calls — prevents thread pool starvation
@@ -517,6 +522,11 @@ def record_vm_image(
 def get_vm_image(vm_instance_id: str) -> tuple[str | None, int | None]:
     """Return (image_name, build_ts) for a VM, or (None, None) if unknown."""
     return _vm_images.get(vm_instance_id, (None, None))
+
+
+def get_provision_slot_acquired_at(vm_instance_id: str) -> str | None:
+    """Return the ISO timestamp when this VM's provisioning slot was acquired, or None."""
+    return _vm_provision_slot_times.get(vm_instance_id)
 
 
 def get_stale_image_vms(threshold_hours: int | None = None) -> list[dict]:
@@ -1425,6 +1435,11 @@ async def _provision_gcp(
 
     try:
         async with _gcp_provision_semaphore:  # Local guard still useful for thread pool
+            # Both Redis slot and local semaphore are now held — stamp queue-wait boundary
+            # so the orchestrator can split dispatch→slot (throttle time) from slot→boot.
+            _vm_provision_slot_times[vm_instance_id] = datetime.now(
+                timezone.utc
+            ).isoformat()
             # 420s outer = 240s inner insert + 180s headroom for stale-delete,
             # zone iteration, and secret setup. Previously 360s, which routinely
             # cancelled near-complete GCP operations (surfaced as
@@ -1598,6 +1613,7 @@ async def _delete_gcp(vm_instance_id: str):
         with _zone_lock:
             known_zone = _vm_zones.pop(vm_instance_id, None)
         _vm_images.pop(vm_instance_id, None)
+        _vm_provision_slot_times.pop(vm_instance_id, None)
         if known_zone:
             zones_to_try.append(known_zone)
         zones_to_try.extend(z for z, _ in FALLBACK_ZONES if z not in zones_to_try)

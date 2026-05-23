@@ -2245,7 +2245,12 @@ async def _handle_security_audit_completion(
 
 
 async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
-    """Parse perf findings and spawn create tasks for high-severity issues."""
+    """Parse perf findings and spawn a bundled create task for all high-severity issues.
+
+    Bundles all high-severity findings into a single child task to eliminate the fan-out
+    (which previously spawned one task per finding, each with its own VM, PR, and review).
+    Medium/low findings are surfaced as an informational PR comment.
+    """
     findings = None
     try:
         json_str = _extract_json_array(logs, "severity")
@@ -2270,40 +2275,53 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
 
     base_branch = (task.first_payload).get("base_branch", "main")
 
-    # Spawn create tasks for high-severity findings
+    # Collect high-severity findings (capped at 10 as before)
     actionable = [f for f in findings if f.get("severity") == "high"]
     if len(actionable) > 10:
         actionable = actionable[:10]
 
     child_tasks = []
-    for i, finding in enumerate(actionable):
-        fix_prompt = finding.get("fix_prompt", finding.get("description", ""))
-        if not fix_prompt:
-            continue
-        title = finding.get("title", f"Perf fix #{i + 1}")
-        area = finding.get("area", "")
+
+    # Bundle all high-severity findings into a single child task
+    if actionable:
+        # Enumerate findings in the prompt so the agent addresses them all
+        findings_text = "\n".join(
+            f"{i + 1}. [{finding.get('area', 'general')}] {finding.get('title', f'Finding {i + 1}')}\n"
+            f"   Description: {finding.get('description', '')}\n"
+            f"   Suggested approach: {finding.get('fix_prompt', '')}"
+            for i, finding in enumerate(actionable)
+        )
+
+        bundled_prompt = (
+            f"Performance audit identified {len(actionable)} high-severity findings:\n\n"
+            f"{findings_text}\n\n"
+            f"Address each finding independently in a single PR. You may skip individual "
+            f"findings that prove risky or out of scope rather than failing the entire task. "
+            f"Aim to fix as many as feasible without coupling unrelated changes."
+        )
 
         new_task = Task(
             project_id=task.project_id,
-            title=f"[PERF] {title}",
-            description=finding.get("description", fix_prompt[:200]),
+            title=f"[PERF] Fix {len(actionable)} high-severity performance findings",
+            description=f"Bundle of {len(actionable)} performance findings from audit",
             parent_task_id=task.id,
             payloads=[
                 validate_internal_payload(
                     {
                         "type": "create",
-                        "prompt": fix_prompt,
+                        "prompt": bundled_prompt,
                         "base_branch": base_branch,
                     },
-                    "task_completion:perf_finding",
+                    "task_completion:perf_findings_bundle",
                 )
             ],
             context={
                 "perf_task_id": str(task.id),
-                "finding_index": i,
+                "finding_count": len(actionable),
                 "severity": "high",
-                "area": area,
-                "related_files": finding.get("related_files", []),
+                "findings_areas": list(
+                    set(f.get("area", "") for f in actionable if f.get("area"))
+                ),
             },
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,
@@ -2366,7 +2384,7 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     if child_tasks:
         task.status = TaskStatus.EVALUATING
         task.latest_status_message = (
-            f"{len(child_tasks)} high-severity fix task(s) spawned, "
+            f"1 high-severity fix task spawned for {len(actionable)} findings, "
             f"{len(informational)} medium/low finding(s) surfaced as PR comment"
         )
     else:
@@ -2391,7 +2409,8 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
         {"perf_task_id": str(task.id), "tasks_created": len(child_tasks)},
     )
     logger.info(
-        f"[PERF] Created {len(child_tasks)} fix tasks from perf analysis {task.id}"
+        f"[PERF] Created 1 bundled fix task from perf analysis {task.id} "
+        f"(findings={len(actionable)})"
     )
 
 

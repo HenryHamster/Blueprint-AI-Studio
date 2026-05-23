@@ -892,6 +892,14 @@ async def claim_task(
             claim_latency = (task.last_heartbeat - _cold_start_anchor).total_seconds()
             _stgs = dict((task.context or {}).get("_cold_start_stages") or {})
             _stgs["claim_at"] = task.last_heartbeat.isoformat()
+            # Backfill provision_slot_acquired_at from compute's in-memory store if
+            # not already present — lets efficiency snapshot compute dispatch_to_slot_ms.
+            if "provision_slot_acquired_at" not in _stgs and task.vm_instance_id:
+                from app.compute import get_provision_slot_acquired_at as _get_slot_at
+
+                _slot_ts = _get_slot_at(task.vm_instance_id)
+                if _slot_ts:
+                    _stgs["provision_slot_acquired_at"] = _slot_ts
             task.context = {
                 **(task.context or {}),
                 "claim_latency_secs": round(claim_latency, 1),

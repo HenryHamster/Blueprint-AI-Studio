@@ -39,6 +39,10 @@ from app.task_locking import project_lock
 # resolved from Task.vm_dispatched_at; all others are ISO strings written into
 # task.context["_cold_start_stages"] by agent_heartbeat and claim_task.
 _COLD_START_STAGE_PAIRS: tuple[tuple[str, str, str], ...] = (
+    # Queue-wait: time dispatch spends waiting for a provisioning slot to open.
+    # Populated by compute.py after _acquire_provision_slot succeeds. Absent on
+    # older tasks — stage value is None in that case, not an error.
+    ("vm_dispatched_at", "provision_slot_acquired_at", "dispatch_to_slot_ms"),
     ("vm_dispatched_at", "beacon_a_at", "dispatch_to_creds_ms"),
     ("beacon_a_at", "beacon_b_at", "creds_to_env_ms"),
     ("beacon_b_at", "beacon_c_at", "env_to_payload_ms"),

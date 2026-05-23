@@ -3677,3 +3677,73 @@ class TestResetIterationCap:
 
         resp = await client.post(f"/api/admin/tasks/{parking.id}/reset-iteration-cap")
         assert resp.status_code == 400
+
+
+class TestGetAllTasksHistory:
+    """GET /api/admin/tasks fetches each task's 10 most-recent TaskHistory
+    entries. The fetch uses a per-task ROW_NUMBER() window, so a single
+    high-activity task cannot exhaust a global LIMIT budget and starve other
+    tasks in the same page of their history."""
+
+    @pytest.mark.asyncio
+    async def test_per_task_history_not_starved_by_high_activity_task(
+        self, client: AsyncClient, db_session
+    ):
+        from datetime import datetime, timedelta
+        from app.models import TaskHistory
+
+        project = await _make_project(db_session)
+
+        busy = Task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create"}],
+        )
+        quiet = Task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create"}],
+        )
+        db_session.add(busy)
+        db_session.add(quiet)
+        await db_session.commit()
+        await db_session.refresh(busy)
+        await db_session.refresh(quiet)
+
+        base = datetime(2026, 5, 1, 0, 0, 0)
+        # The busy task has 25 entries, all NEWER than the quiet task's. Under a
+        # global LIMIT of len(task_ids)*10 == 20, every retained row would belong
+        # to the busy task and the quiet task would receive 0 history entries.
+        for i in range(25):
+            db_session.add(
+                TaskHistory(
+                    task_id=busy.id,
+                    action="STATUS_CHANGE",
+                    details={"i": i},
+                    timestamp=base + timedelta(hours=100 + i),
+                )
+            )
+        for i in range(8):
+            db_session.add(
+                TaskHistory(
+                    task_id=quiet.id,
+                    action="STATUS_CHANGE",
+                    details={"i": i},
+                    timestamp=base + timedelta(hours=i),
+                )
+            )
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/tasks")
+        assert resp.status_code == 200, resp.text
+        by_id = {t["id"]: t for t in resp.json()["tasks"]}
+
+        # Busy task is capped at its 10 most-recent entries.
+        busy_hist = by_id[str(busy.id)]["history"]
+        assert len(busy_hist) == 10
+        assert [h["details"]["i"] for h in busy_hist] == list(range(24, 14, -1))
+
+        # Quiet task still receives all 8 of its entries — not starved.
+        quiet_hist = by_id[str(quiet.id)]["history"]
+        assert len(quiet_hist) == 8
+        assert [h["details"]["i"] for h in quiet_hist] == list(range(7, -1, -1))

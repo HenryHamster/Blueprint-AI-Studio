@@ -353,8 +353,21 @@ async def get_all_tasks(
     if task_ids:
         artifact_stmt = (
             select(Artifact)
+            .options(
+                load_only(
+                    Artifact.id,
+                    Artifact.task_id,
+                    Artifact.artifact_type,
+                    Artifact.pr_url,
+                    Artifact.commit_hash,
+                    Artifact.repo_url,
+                    Artifact.iteration,
+                    Artifact.created_at,
+                )
+            )
             .where(Artifact.task_id.in_(task_ids))
             .order_by(Artifact.created_at.asc())
+            .limit(len(task_ids) * 20)
         )
         artifacts = (await session.execute(artifact_stmt)).scalars().all()
         for a in artifacts:
@@ -373,43 +386,70 @@ async def get_all_tasks(
             )
             if a.artifact_type == ArtifactType.PULL_REQUEST and a.pr_url:
                 pr_map[tid] = a.pr_url
+            if a.artifact_type == ArtifactType.GIT_COMMIT and a.commit_hash:
+                commit_map[tid] = {"commit_hash": a.commit_hash, "repo_url": a.repo_url}
+
+        # Fetch logs columns separately to avoid loading large blobs in the main query
+        logs_stmt = (
+            select(Artifact)
+            .options(load_only(Artifact.task_id, Artifact.artifact_type, Artifact.logs))
+            .where(
+                Artifact.task_id.in_(task_ids),
+                Artifact.artifact_type.in_(
+                    [ArtifactType.ERROR_LOG, ArtifactType.RESEARCH_FINDINGS]
+                ),
+            )
+        )
+        logs_artifacts = (await session.execute(logs_stmt)).scalars().all()
+        for a in logs_artifacts:
+            tid = str(a.task_id)
             if a.artifact_type == ArtifactType.ERROR_LOG and a.logs:
                 logs_map[tid] = a.logs[:2000]
             if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
                 try:
-                    parsed = json.loads(a.logs[:100000])
+                    parsed = await asyncio.to_thread(json.loads, a.logs[:100000])
                     if isinstance(parsed, list):
-                        research_map[str(a.task_id)] = parsed
+                        research_map[tid] = parsed
                     elif isinstance(parsed, dict):
                         logs = parsed.get("logs", [])
                         if isinstance(logs, list):
-                            research_map[str(a.task_id)] = logs
+                            research_map[tid] = logs
                 except (json.JSONDecodeError, AttributeError):
                     pass
-            if a.artifact_type == ArtifactType.GIT_COMMIT and a.commit_hash:
-                commit_map[tid] = {"commit_hash": a.commit_hash, "repo_url": a.repo_url}
 
-    # Fetch task history (last 10 entries per task)
+    # Fetch task history (last 10 entries per task). A per-task ROW_NUMBER()
+    # window keeps each task's 10 most-recent rows, so a single high-activity
+    # task can't exhaust a global budget and starve other tasks of history.
     history_map: Dict[str, List[Dict[str, Any]]] = {}
     if task_ids:
-        history_stmt = (
-            select(TaskHistory)
-            .where(TaskHistory.task_id.in_(task_ids))
-            .order_by(TaskHistory.timestamp.desc())
+        row_number = (
+            func.row_number()
+            .over(
+                partition_by=TaskHistory.task_id,
+                order_by=TaskHistory.timestamp.desc(),
+            )
+            .label("rn")
         )
-        all_history = (await session.execute(history_stmt)).scalars().all()
+        ranked = (
+            select(TaskHistory, row_number)
+            .where(TaskHistory.task_id.in_(task_ids))
+            .subquery()
+        )
+        history_stmt = (
+            select(ranked).where(ranked.c.rn <= 10).order_by(ranked.c.timestamp.desc())
+        )
+        all_history = (await session.execute(history_stmt)).all()
         for h in all_history:
             tid = str(h.task_id)
             if tid not in history_map:
                 history_map[tid] = []
-            if len(history_map[tid]) < 10:
-                history_map[tid].append(
-                    {
-                        "timestamp": h.timestamp.isoformat() if h.timestamp else None,
-                        "action": h.action,
-                        "details": h.details,
-                    }
-                )
+            history_map[tid].append(
+                {
+                    "timestamp": h.timestamp.isoformat() if h.timestamp else None,
+                    "action": h.action,
+                    "details": h.details,
+                }
+            )
 
     # Build parent→children map from the fetched result set (no extra DB query)
     children_map: Dict[str, List[str]] = {}

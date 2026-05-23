@@ -222,6 +222,40 @@ interface EfficiencyAxesLocal {
   axes: Record<string, EfficiencyAxisLocal>;
   baseline_captured_at: string | null;
   last_snapshot_at: string | null;
+  vm_cold_start_breakdown?: Record<string, number | null> | null;
+}
+
+const COLD_START_STAGE_LABELS: [string, string, boolean][] = [
+  ['dispatch_to_slot_ms', 'Queue wait (slot)', true],
+  ['dispatch_to_creds_ms', 'Dispatch → creds', false],
+  ['creds_to_env_ms', 'Creds → env', false],
+  ['env_to_payload_ms', 'Env → payload', false],
+  ['payload_to_systemctl_ms', 'Payload → systemctl', false],
+  ['systemctl_to_startup_ms', 'Systemctl → startup', false],
+  ['startup_to_claim_ms', 'Startup → claim', false],
+];
+
+function ColdStartBreakdown({ breakdown }: { breakdown: Record<string, number | null> }) {
+  const hasAny = COLD_START_STAGE_LABELS.some(([key]) => breakdown[key] != null);
+  if (!hasAny) return null;
+  return (
+    <div className="mt-2 pt-2 border-t border-neutral-700/50">
+      <div className="text-[10px] text-neutral-500 mb-1 uppercase tracking-wide">Cold-start stage breakdown (p50)</div>
+      <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
+        {COLD_START_STAGE_LABELS.map(([key, label, isQueueWait]) => {
+          const val = breakdown[key];
+          return (
+            <div key={key} className="flex justify-between items-center text-[10px]">
+              <span className={isQueueWait ? 'text-amber-400/80' : 'text-neutral-500'}>{label}</span>
+              <span className={`font-mono ${isQueueWait ? 'text-amber-400' : 'text-neutral-400'}`}>
+                {val != null ? `${val.toFixed(0)}ms` : '—'}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 function AxisSparkline({ history, favorableDirection }: {
@@ -325,6 +359,9 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
             </div>
             {axisData.history && axisData.history.length >= 2 && (
               <AxisSparkline history={axisData.history} favorableDirection={axisDef.favorableDirection} />
+            )}
+            {axisDef.key === 'vm_cold_start_p50_ms' && data.vm_cold_start_breakdown && (
+              <ColdStartBreakdown breakdown={data.vm_cold_start_breakdown} />
             )}
           </div>
         );
