@@ -1160,16 +1160,24 @@ def cmd_regression_cases(args):
         print(f"    class: {cls[:200]}")
 
 
-def cmd_qualify(_args):
+def cmd_qualify(args):
     """Show the release-version qualifier state + the latest audit's findings.
 
     Usage:
         ops.py qualify          — current version, last verdict, and WHY
                                   (the latest release_audit's score + findings)
+        ops.py qualify --run    — manually TRIGGER a qualification of the open
+                                  version (member+; spawns the release_audit
+                                  child), then show the state. Used to seed a
+                                  fresh verdict during calibration.
     """
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     pid = get_project_id()
+    if args and args[0] == "--run":
+        print("=== TRIGGERING QUALIFICATION ===")
+        result = api("POST", f"/api/admin/projects/{pid}/qualify")
+        print(f"  {json.dumps(result)}\n")
     data = api("GET", f"/api/admin/projects/{pid}/version-lifecycle")
     cv = data.get("current_version")
     print("=== RELEASE VERSION ===")
