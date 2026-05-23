@@ -1432,11 +1432,16 @@ async def get_latest_release_audit_report(
 
 _AUDIT_DEDUCTIONS: dict[str, float] = {
     "critical": 0.30,
+    "blocker": 0.30,
     "high": 0.15,
     "medium": 0.07,
     "moderate": 0.07,
+    "warning": 0.07,
     "low": 0.02,
+    "info": 0.02,
 }
+# Fallback deduction for any non-empty severity label not listed above.
+_AUDIT_DEDUCTION_UNKNOWN: float = 0.02
 
 
 def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | None]:
@@ -1460,13 +1465,18 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
         return None, None
 
     # Derive audit_score deterministically from findings.
+    # Mirror _extract_audit_findings: fall back to "issues" key when "findings"
+    # is absent or not a list, and resolve severity via "level" as alternate field.
     findings = report.get("findings")
+    if not isinstance(findings, list):
+        findings = report.get("issues")
     derived: float = 1.0
     if isinstance(findings, list):
         for f in findings:
             if isinstance(f, dict):
-                sev = str(f.get("severity", "")).lower()
-                derived -= _AUDIT_DEDUCTIONS.get(sev, 0.0)
+                sev = str(f.get("severity") or f.get("level") or "").lower()
+                if sev:
+                    derived -= _AUDIT_DEDUCTIONS.get(sev, _AUDIT_DEDUCTION_UNKNOWN)
     derived = _clamp01(derived)
 
     # Observability: log when the model's self-reported score diverges materially.
@@ -1482,7 +1492,33 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
                 abs(derived - reported),
             )
 
-    erosion = report.get("test_erosion")
+    # Prefer computed_test_erosion (deterministic git-diff computation, authoritative)
+    # over the LLM's self-reported test_erosion.  Fall back to test_erosion when
+    # computed_test_erosion is absent (older artifacts or agent-side failure).
+    computed_erosion = report.get("computed_test_erosion")
+    llm_erosion = report.get("test_erosion")
+
+    if isinstance(computed_erosion, dict):
+        # Cross-check: warn when the LLM's deleted_test_files disagrees with the
+        # deterministic computation — helps surface model blind spots in review.
+        if isinstance(llm_erosion, dict):
+            llm_deleted = llm_erosion.get("deleted_test_files")
+            computed_deleted = computed_erosion.get("deleted_test_files")
+            if (
+                isinstance(llm_deleted, list)
+                and isinstance(computed_deleted, list)
+                and {str(x) for x in llm_deleted} != {str(x) for x in computed_deleted}
+            ):
+                logger.warning(
+                    "[RELEASE_QUALIFIER] test_erosion divergence: "
+                    "computed deleted=%s llm deleted=%s — computed is authoritative",
+                    computed_deleted,
+                    llm_deleted,
+                )
+        erosion: dict[str, Any] | None = computed_erosion
+    else:
+        erosion = llm_erosion
+
     if not isinstance(erosion, dict):
         # No test-erosion block — assume neutral (no erosion detected).
         return derived, 1.0

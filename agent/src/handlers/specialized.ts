@@ -1146,6 +1146,57 @@ export async function handleReleaseAudit(
     return;
   }
 
+  // Deterministically compute test erosion from the actual diff so the
+  // hard-blocker (deleted test files) and sub-score deltas are not dependent
+  // on the LLM spotting every change in a potentially large diff.
+  type ComputedTestErosion = {
+    deleted_test_files: string[];
+    assertion_delta: number;
+    test_count_delta: number;
+  };
+  let computedTestErosion: ComputedTestErosion | null = null;
+  try {
+    const TEST_PATH_RE = /\/(testing|tests|__tests__)\/|\.test\.|\.spec\./;
+
+    const nameStatus = execFileSync('git', ['diff', '--name-status', diffRange], {
+      cwd: WORKSPACE, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const deletedTestFiles = nameStatus
+      .split('\n')
+      .filter((line: string) => line.startsWith('D\t'))
+      .map((line: string) => line.slice(2).trim())
+      .filter((p: string) => TEST_PATH_RE.test(p));
+
+    const diffText = execFileSync('git', ['diff', diffRange], {
+      cwd: WORKSPACE, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 50 * 1024 * 1024,
+    });
+
+    const ASSERTION_RE = /\b(assert[\s(]|expect\(|assertEqual|assertRaises|it\(|describe\()/;
+    const TEST_FN_RE = /\b(def test_|test\(|it\(|describe\()/;
+
+    let assertionDelta = 0;
+    let testCountDelta = 0;
+    for (const line of diffText.split('\n')) {
+      if (line.startsWith('+') && !line.startsWith('+++')) {
+        if (ASSERTION_RE.test(line)) assertionDelta++;
+        if (TEST_FN_RE.test(line)) testCountDelta++;
+      } else if (line.startsWith('-') && !line.startsWith('---')) {
+        if (ASSERTION_RE.test(line)) assertionDelta--;
+        if (TEST_FN_RE.test(line)) testCountDelta--;
+      }
+    }
+
+    computedTestErosion = {
+      deleted_test_files: deletedTestFiles,
+      assertion_delta: assertionDelta,
+      test_count_delta: testCountDelta,
+    };
+    sendLog(ws, `[AUDIT] Computed test erosion: ${deletedTestFiles.length} deleted test file(s), assertion_delta=${assertionDelta}, test_count_delta=${testCountDelta}\n`);
+  } catch (e) {
+    sendLog(ws, `[WARNING] Could not compute deterministic test erosion: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('release_audit');
@@ -1228,17 +1279,27 @@ Rules:
   const handlerOutput = readHandlerOutput(taskId, 'release_audit_report', ws) as {
     audit_score?: number;
     test_erosion?: { deleted_test_files?: unknown[]; assertion_delta?: number; test_count_delta?: number };
+    computed_test_erosion?: { deleted_test_files: string[]; assertion_delta: number; test_count_delta: number };
     findings?: unknown[];
   } | null;
 
+  // Inject computed_test_erosion into the artifact so the backend can use it
+  // as the authoritative signal rather than the LLM's self-reported test_erosion.
+  const enrichedOutput = handlerOutput !== null && computedTestErosion !== null
+    ? { ...handlerOutput, computed_test_erosion: computedTestErosion }
+    : handlerOutput;
+
   let logs = '';
-  if (handlerOutput !== null) {
-    logs = sanitize(JSON.stringify(handlerOutput));
+  if (enrichedOutput !== null) {
+    logs = sanitize(JSON.stringify(enrichedOutput));
   } else {
     const haystack = (allOutput || '') + '\n' + (lastResultText || '');
     const objExtract = extractJsonObjectDetailed(haystack, 'audit_score', 'findings');
     if (objExtract.ok) {
-      logs = sanitize(JSON.stringify(objExtract.value));
+      const enrichedExtracted = computedTestErosion !== null
+        ? { ...objExtract.value, computed_test_erosion: computedTestErosion }
+        : objExtract.value;
+      logs = sanitize(JSON.stringify(enrichedExtracted));
     } else {
       sendLog(ws, `[WARNING] Could not extract release audit JSON: ${describeJsonExtractionResult(objExtract)}\n`);
       logs = sanitize(lastResultText || allOutput.slice(-50_000));

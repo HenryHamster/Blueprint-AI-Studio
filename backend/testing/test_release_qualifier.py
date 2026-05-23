@@ -822,6 +822,157 @@ class TestScoreAudit:
         audit, _ = rq._score_audit(report)
         assert audit == pytest.approx(1.0 - 0.07)
 
+    def test_findings_under_issues_key_applies_deductions(self):
+        """When 'findings' is absent, fall back to 'issues' and apply deductions."""
+        report = {
+            "issues": [
+                {
+                    "severity": "high",
+                    "summary": "Token in source.",
+                    "file": "app/auth.py",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        # Should deduct 0.15 for high, not produce 1.0 (fail-open)
+        assert audit == pytest.approx(1.0 - 0.15)
+
+    def test_severity_via_level_field_applies_deductions(self):
+        """Finding with 'level' instead of 'severity' must apply the correct deduction."""
+        report = {
+            "findings": [
+                {"level": "critical", "summary": "SQL injection", "file": "app/db.py"},
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0 - 0.30)
+
+    def test_unrecognized_severity_applies_nonzero_deduction(self):
+        """Off-list severity labels ('blocker', 'warning', 'info', 'unknown') must not score 0."""
+        for sev, expected_deduction in [
+            ("blocker", 0.30),
+            ("warning", 0.07),
+            ("info", 0.02),
+            ("custom_label", rq._AUDIT_DEDUCTION_UNKNOWN),
+        ]:
+            report = {"findings": [{"severity": sev, "summary": "Issue", "file": ""}]}
+            audit, _ = rq._score_audit(report)
+            assert audit == pytest.approx(1.0 - expected_deduction), (
+                f"severity={sev!r} should deduct {expected_deduction} but got {1.0 - audit:.4f}"
+            )
+
+    def test_score_audit_and_extract_findings_agree_on_source(self):
+        """Both _score_audit and _extract_audit_findings must read from the same key/field.
+
+        Regression guard: a report whose findings live under 'issues' with 'level'
+        severity must produce a sub-1.0 score AND non-empty findings — not 1.0 / [].
+        """
+        report = {
+            "issues": [
+                {
+                    "level": "high",
+                    "summary": "Token baked into source.",
+                    "file": "app/secret.py",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        findings = rq._extract_audit_findings(report)
+        # Gate must not pass 1.0 while findings are surfaced
+        assert audit < 1.0, "score should reflect the finding, not fail open to 1.0"
+        assert len(findings) > 0, "findings should be surfaced for the same report"
+        assert findings[0]["severity"] == "high"
+
+
+class TestScoreAuditComputedErosion:
+    """_score_audit prefers computed_test_erosion (authoritative, deterministic
+    from git diff) over the LLM's self-reported test_erosion when the key is present."""
+
+    def test_computed_erosion_authoritative_over_llm(self):
+        """computed_test_erosion with a deleted file → None even when LLM omits it."""
+        report = {
+            "audit_score": 0.9,
+            "computed_test_erosion": {
+                "deleted_test_files": ["testing/test_gone.py"],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "test_erosion": {
+                "deleted_test_files": [],  # LLM missed the deletion
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "findings": [],
+        }
+        _, erosion = rq._score_audit(report)
+        assert erosion is None
+
+    def test_llm_reports_deletion_but_computed_does_not(self):
+        """computed wins: no deletions → score=1.0 even when LLM hallucinates one."""
+        report = {
+            "computed_test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "test_erosion": {
+                "deleted_test_files": ["testing/test_hallucinated.py"],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "findings": [],
+        }
+        _, erosion = rq._score_audit(report)
+        assert erosion == pytest.approx(1.0)
+
+    def test_computed_assertion_delta_penalizes(self):
+        """Negative assertion_delta in computed_test_erosion yields a penalty."""
+        report = {
+            "computed_test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": -10,
+                "test_count_delta": 0,
+            },
+            "findings": [],
+        }
+        _, erosion = rq._score_audit(report)
+        assert erosion is not None
+        assert erosion < 1.0
+
+    def test_fallback_to_llm_when_no_computed_key(self):
+        """When computed_test_erosion is absent, existing test_erosion logic is unchanged."""
+        report = {
+            "test_erosion": {
+                "deleted_test_files": ["testing/test_gone.py"],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "findings": [],
+        }
+        _, erosion = rq._score_audit(report)
+        assert erosion is None
+
+    def test_divergence_warning_logged(self, caplog):
+        """When computed and LLM deleted_test_files disagree, a warning is logged."""
+        import logging
+
+        report = {
+            "computed_test_erosion": {
+                "deleted_test_files": ["testing/test_gone.py"],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "test_erosion": {
+                "deleted_test_files": [],  # LLM missed it
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "findings": [],
+        }
+        with caplog.at_level(logging.WARNING, logger="backend.app.release_qualifier"):
+            rq._score_audit(report)
+        assert any("test_erosion divergence" in r.message for r in caplog.records)
+
 
 class TestExtractAuditFindings:
     """_extract_audit_findings carries the findings (not just the score) into
