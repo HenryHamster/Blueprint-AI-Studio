@@ -462,6 +462,24 @@ SCOPE_AWARE_RETRY_BUDGETS: Dict[str, Dict[str, int]] = {
 }
 
 
+def get_project_integration_branch(project) -> str:
+    """Return the integration branch for a project.
+
+    Fallback chain:
+      1. project.integration_branch (per-project column, added by migration 0122+)
+      2. runtime_config["integration_branch"] (DEPRECATED global — transitional fallback for one release)
+      3. "main"
+
+    Using getattr so this helper is safe to call before the model migration lands
+    (cluster 2/9 adds the column; until then the attribute will not exist).
+    """
+    per_project = getattr(project, "integration_branch", None)
+    if per_project:
+        return per_project
+    # DEPRECATED: global runtime_config fallback — remove after per-project column is stable
+    return runtime_config.get("integration_branch", "main")
+
+
 def _migrate_legacy_provider_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """Translate legacy routing/effort keys to the unified shape in-place.
 
