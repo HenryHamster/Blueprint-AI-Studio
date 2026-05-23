@@ -1470,6 +1470,61 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
     return audit_score, _clamp01(score)
 
 
+# Cap on findings carried into last_qualification (and thus the strategic
+# agent's payload). Kept small so the version_phase block stays well under the
+# pack budget while still giving the agent enough to target the audit sub-score.
+_MAX_CARRIED_FINDINGS = 12
+_FINDING_SUMMARY_MAX = 280
+# Lower number sorts first (most severe). Unknown severities sort last.
+_SEVERITY_RANK = {"critical": 0, "high": 0, "medium": 1, "moderate": 1, "low": 2}
+
+
+def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str]]:
+    """Pull a compact, severity-sorted findings list from a RELEASE_AUDIT_REPORT.
+
+    The audit sub-score is usually the binding constraint on promotion, but the
+    composite only records the *number*, not WHAT to fix.  ``_score_audit``
+    discards the findings after scoring, leaving the strategic agent blind to
+    its own audit feedback — so it does generic stabilize cleanup instead of
+    targeting the actual blockers.  This carries the findings (severity + short
+    summary) into ``last_qualification`` so they reach the agent's payload via
+    ``release_version.to_phase_block``.
+
+    Returns ``[]`` when the report has no usable findings.  Capped at
+    ``_MAX_CARRIED_FINDINGS`` and each summary truncated to keep the payload
+    small; ordered most-severe first.
+    """
+    if not isinstance(report, dict):
+        return []
+    raw = report.get("findings")
+    if not isinstance(raw, list) or not raw:
+        # Some audits key the list as "issues".
+        raw = report.get("issues")
+    if not isinstance(raw, list):
+        return []
+
+    out: list[dict[str, str]] = []
+    for f in raw:
+        if isinstance(f, dict):
+            sev = str(f.get("severity") or f.get("level") or "unknown").lower()
+            summary = (
+                f.get("summary")
+                or f.get("description")
+                or f.get("title")
+                or f.get("text")
+                or ""
+            )
+        else:
+            sev = "unknown"
+            summary = str(f)
+        summary = str(summary).strip()[:_FINDING_SUMMARY_MAX]
+        if summary:
+            out.append({"severity": sev, "summary": summary})
+
+    out.sort(key=lambda d: _SEVERITY_RANK.get(d["severity"], 3))
+    return out[:_MAX_CARRIED_FINDINGS]
+
+
 def _score_smoketest(result: dict[str, Any] | None) -> float | None:
     """Derive a ``smoketest_score`` in [0,1] from a SMOKETEST_RESULT.
 
@@ -2019,6 +2074,10 @@ async def _finalize_qualification(
                 version.version_number,
             )
     audit_score, test_erosion_score = _score_audit(audit_report)
+    # Carry the findings (not just the score) into last_qualification so the
+    # strategic agent can target them — otherwise the audit sub-score, usually
+    # the binding constraint, is opaque to the loop.
+    audit_findings = _extract_audit_findings(audit_report)
 
     # --- Read the smoketest result -----------------------------------------
     # Audit H3: only when the smoketest subsystem was enabled — a disabled run
@@ -2066,6 +2125,7 @@ async def _finalize_qualification(
         "finalized_at": finalized_at,
         "audit_task_id": audit_task_id,
         "smoketest_task_id": smoketest_task_id,
+        "audit_findings": audit_findings,
     }
 
     promotion_enabled = bool(_runtime_config.get("promotion_enabled"))
