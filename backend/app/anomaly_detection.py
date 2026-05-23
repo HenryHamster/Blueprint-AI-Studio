@@ -189,9 +189,7 @@ def find_directions_sharing_fingerprint(
 def _is_recurring_failure_class(proj_anomalies: dict, failure_class: str) -> bool:
     """Return True if the given failure class has a persistent anomaly with occurrence_count >= 3."""
     entry = proj_anomalies.get(failure_class)
-    return bool(
-        isinstance(entry, dict) and entry.get("occurrence_count", 0) >= 3
-    )
+    return bool(isinstance(entry, dict) and entry.get("occurrence_count", 0) >= 3)
 
 
 def _expire_stale_project_anomalies(
@@ -1762,10 +1760,19 @@ async def _check_anomaly_proposals(project, session):
 async def _expire_stale_proposals(session) -> int:
     """Expire direction proposals older than 30 days across all projects."""
     cutoff = (_utcnow() - timedelta(days=30)).isoformat()
+    # Lock the project rows under the canonical FOR NO KEY UPDATE project-row
+    # lock (see task_locking.project_lock) so this cron's read-modify-write of
+    # project.directions can't lose an update racing a concurrent same-project
+    # completion: each row is read fresh under the lock and held until this
+    # transaction ends. skip_locked=False mirrors with_directions_locked — a
+    # background sweep waits for the lock rather than silently dropping the
+    # expiry. The loop does no external I/O, so the hold is brief.
     projects = (
         (
             await session.execute(
-                select(Project).where(Project.autonomous_enabled.is_(True))
+                select(Project)
+                .where(Project.autonomous_enabled.is_(True))
+                .with_for_update(skip_locked=False, key_share=True)
             )
         )
         .scalars()
@@ -1792,5 +1799,11 @@ async def _expire_stale_proposals(session) -> int:
                 f"[DIRECTIONS] Expired {expired_count} stale proposals for project {project.id}"
             )
     if total_expired:
-        await session.commit()
+        await session.commit()  # commit releases the project-row locks
+    else:
+        # Nothing changed, but the FOR-UPDATE select still took row locks;
+        # release them now rather than holding them for the rest of the
+        # idle-research cycle (which performs external I/O) until the session
+        # is closed.
+        await session.rollback()
     return total_expired

@@ -857,3 +857,53 @@ async def test_with_directions_locked_serializes_concurrent_appends(db_session):
         dirs = result.scalar_one().directions
     ids = {d["id"] for d in dirs}
     assert ids == {"d-a", "d-b"}, f"lost update: {dirs}"
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
+@pytest.mark.asyncio
+async def test_expire_stale_proposals_serializes_with_concurrent_append(db_session):
+    """The _expire_stale_proposals cron now reads project.directions under the
+    canonical project row lock. An interleaved direction append via
+    with_directions_locked must survive AND the stale proposal must still expire
+    — before the lock, the cron's whole-array write-back could clobber the
+    concurrent append (lost update)."""
+    from datetime import timedelta
+
+    from app.anomaly_detection import _expire_stale_proposals
+    from app.time_utils import _utcnow
+
+    old_iso = (_utcnow() - timedelta(days=40)).isoformat()
+    project = Project(name="expire-lock-concurrent", user_id="user")
+    project.directions = [{"id": "d-old", "status": "proposed", "proposed_at": old_iso}]
+    db_session.add(project)
+    await db_session.commit()
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def expire():
+        async with Session() as s:
+            await _expire_stale_proposals(s)  # commits internally
+
+    async def append():
+        async with Session() as s:
+            await with_directions_locked(
+                s,
+                project.id,
+                lambda dirs: dirs.append({"id": "d-new", "status": "active"}),
+            )
+            await s.commit()
+
+    await asyncio.gather(expire(), append())
+
+    async with Session() as verify:
+        result = await verify.execute(select(Project).where(Project.id == project.id))
+        dirs = result.scalar_one().directions
+    by_id = {d["id"]: d for d in dirs}
+    assert by_id.get("d-new", {}).get("status") == "active", (
+        f"lost concurrent append: {dirs}"
+    )
+    assert by_id.get("d-old", {}).get("status") == "expired", (
+        f"stale-proposal expiry not applied: {dirs}"
+    )

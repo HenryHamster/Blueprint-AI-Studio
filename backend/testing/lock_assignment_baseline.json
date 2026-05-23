@@ -1,0 +1,35 @@
+{
+  "_doc": "Per-file occurrence-count ratchet for direct project.design_doc and project.directions assignments. Read by TestDesignDocLockInvariant and TestDirectionsLockInvariant in test_invariants.py. Counts should only decrease over time as write sites are migrated to canonical helpers (with_design_doc_locked / with_directions_locked in task_locking.py). Never increase a count — that widens the tripwire hole. When a site is migrated to the canonical helper, lower the count by 1. Remove the entry when the count reaches 0.",
+  "design_doc": {
+    "auto_remediation.py": 2,
+    "direction_outcomes.py": 1,
+    "efficiency_snapshot.py": 1,
+    "main.py": 2,
+    "notification_dispatch.py": 2,
+    "playbook_learning.py": 22,
+    "research_direction_state.py": 1,
+    "routers/admin_notifications.py": 3,
+    "routers/admin_onboard.py": 1,
+    "routers/admin_project_config.py": 4,
+    "routers/admin_projects.py": 1,
+    "routers/agent.py": 2,
+    "routers/agent_status.py": 3,
+    "task_completion.py": 1,
+    "task_locking.py": 1
+  },
+  "directions": {
+    "anomaly_detection.py": 2,
+    "auto_remediation.py": 1,
+    "direction_lifecycle.py": 1,
+    "direction_outcomes.py": 1,
+    "main.py": 5,
+    "research_completion.py": 5,
+    "research_direction_state.py": 5,
+    "rollup_management.py": 1,
+    "routers/admin_projects.py": 1,
+    "routers/directions.py": 5,
+    "strategic_completion.py": 2,
+    "task_completion.py": 12,
+    "task_locking.py": 1
+  }
+}
