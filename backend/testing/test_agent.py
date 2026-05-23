@@ -6974,6 +6974,65 @@ async def test_smoketest_main_failure_post_cutover_spawns_hotfix(
 
 
 @pytest.mark.asyncio
+async def test_smoketest_post_promotion_detection_uses_promotion_target_config(
+    client: AsyncClient, db_session, mocker
+):
+    """post-promotion smoketest detection keys off promotion_target config, not literal 'main'.
+
+    With integration_branch='develop' and promotion_target='stable', a smoketest
+    on base_branch='stable' should be treated as a post-promotion production failure
+    (hotfix, priority >= 90) even though neither 'automain' nor 'main' appear.
+    """
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"integration_branch": "develop", "promotion_target": "stable"},
+    )
+
+    _, task = await _setup_smoketest_task(
+        db_session, "agent-vm-smoke-promo-cfg", base_branch="stable"
+    )
+
+    import json as _json
+
+    smoketest_payload = {
+        "passed": False,
+        "tests": [
+            {"name": "login_flow", "status": "fail", "message": "assertion failed"}
+        ],
+        "suites": {
+            "startup": {"passed": True, "tests": []},
+            "curated": {
+                "passed": False,
+                "tests": [{"name": "login_flow", "status": "fail"}],
+            },
+        },
+    }
+    token = create_agent_token(str(task.id), "agent-vm-smoke-promo-cfg")
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "SMOKETEST_RESULT",
+        "logs": _json.dumps(smoketest_payload),
+    }
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200
+
+    result = await db_session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )
+    spawned = result.scalars().all()
+    assert len(spawned) == 1
+    assert spawned[0].priority >= 90
+    assert spawned[0].first_payload.get("hotfix") is True
+    assert spawned[0].first_payload.get("type") == "plan"
+
+
+@pytest.mark.asyncio
 async def test_smoketest_passing_does_not_spawn_plan_task(
     client: AsyncClient, db_session, mocker
 ):
@@ -10712,6 +10771,9 @@ async def test_hotfix_backmerge_runs_for_hotfix_merge_to_main(db_session, mocker
     await db_session.commit()
     await db_session.refresh(project)
 
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"integration_branch": "automain"}
+    )
     mocker.patch(
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="gh-token"),

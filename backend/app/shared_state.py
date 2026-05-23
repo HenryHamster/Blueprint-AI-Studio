@@ -427,6 +427,12 @@ runtime_config: Dict = {
     # preserves existing behavior until Phase 1 activates.
     # Operator-tunable via runtime_config_json; persisted across restarts.
     "integration_branch": "main",
+    # Promotion/deploy target branch — the LTS branch that integration_branch
+    # promotes INTO and that hotfixes land on. Defaults to "main" so self-repo
+    # behavior is byte-for-byte identical. The LTS model is considered active
+    # whenever integration_branch and promotion_target are distinct branches.
+    # Operator-tunable via runtime_config_json; persisted across restarts.
+    "promotion_target": "main",
     # Release qualifier (Phase 3+). promotion_enabled gates whether the
     # qualifier may promote a qualified automain candidate to main — default
     # False ships the qualifier in dry-run (score + log, never promote).
@@ -718,6 +724,8 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     )
                 if "integration_branch" in config_json:
                     _set("integration_branch", str(config_json["integration_branch"]))
+                if "promotion_target" in config_json:
+                    _set("promotion_target", str(config_json["promotion_target"]))
                 if "promotion_enabled" in config_json:
                     _set(
                         "promotion_enabled",

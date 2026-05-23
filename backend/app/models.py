@@ -298,6 +298,13 @@ class Project(SQLModel, table=True):
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
+    # Approval gate configuration for PR file-path flagging.
+    # Shape: {"infra_files": [...], "critical_files": [...]}.
+    # When unset, defaults to Blueprint's hardcoded sensitive paths.
+    approval_gate_config: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
 
     def append_routine_digest(self, event_type: str, summary: str) -> None:
         """Append a one-line digest entry for a routine event to running_update.

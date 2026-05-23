@@ -136,6 +136,18 @@ logger = logging.getLogger(__name__)
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "promotion_policy.yaml"
 
 
+def _lts_branch_names() -> tuple[str, str]:
+    """Return (integration_branch, promotion_target) from runtime_config.
+
+    integration_branch — the trunk the pipeline builds ON (default "automain").
+    promotion_target   — the LTS/deploy branch promotions land on (default "main").
+    LTS model is considered active when these two differ.
+    """
+    integration = str(_runtime_config.get("integration_branch", "automain"))
+    promotion = str(_runtime_config.get("promotion_target", "main"))
+    return integration, promotion
+
+
 def _load_policy() -> dict[str, Any]:
     """Read backend/promotion_policy.yaml; fall back to hardcoded defaults.
 
@@ -786,14 +798,18 @@ async def run_qualification(
         return {"status": "no_credentials"}
     token, owner, repo = resolved
 
-    # 2. Snapshot the candidate SHA — automain HEAD.  Audit C3: this GitHub
-    #    round-trip is done BEFORE taking the ReleaseVersion row lock so the
-    #    lock is not held across external I/O.
+    # 2. Snapshot the candidate SHA — integration branch HEAD.  Audit C3: this
+    #    GitHub round-trip is done BEFORE taking the ReleaseVersion row lock so
+    #    the lock is not held across external I/O.
+    integration_branch, promotion_target = _lts_branch_names()
     try:
-        candidate_sha = await github.get_branch_sha(token, owner, repo, "automain")
+        candidate_sha = await github.get_branch_sha(
+            token, owner, repo, integration_branch
+        )
     except Exception as exc:  # noqa: BLE001 — a missing branch / API error is recoverable
         logger.warning(
-            "[RELEASE_QUALIFIER] could not snapshot automain SHA for %s/%s: %s",
+            "[RELEASE_QUALIFIER] could not snapshot %s SHA for %s/%s: %s",
+            integration_branch,
             owner,
             repo,
             exc,
@@ -915,13 +931,12 @@ async def run_qualification(
 
     # 5. Spawn the heavy children.
     started_at = _utcnow().isoformat()
-    # The LTS branch is always "main" (deploy.yml deploys from main) — NOT
-    # integration_branch, which is the branch the pipeline builds ON (automain
-    # post-Phase-1).  Audit C4: the diff range is pinned to the exact snapshot
-    # commit (main...<candidate_sha>) rather than the live automain branch —
-    # automain advances during the 10-30 min the children take to run, and an
-    # un-pinned diff would audit a different changeset than was qualified.
-    diff_range = f"main...{candidate_sha}"
+    # Audit C4: the diff range is pinned to the exact snapshot commit
+    # (promotion_target...<candidate_sha>) rather than the live integration
+    # branch — the integration branch advances during the 10-30 min the
+    # children take to run, and an un-pinned diff would audit a different
+    # changeset than was qualified.
+    diff_range = f"{promotion_target}...{candidate_sha}"
     # Audit H3: the qualifier-smoketest child is spawned only when the
     # smoketest subsystem is enabled.  smoketest_enabled defaults False (the
     # subsystem is deferred), in which case no qualifier-smoketest task is
@@ -936,7 +951,7 @@ async def run_qualification(
             session,
             project_id,
             version_id=version.id,
-            base_branch="main",
+            base_branch=promotion_target,
             diff_range=diff_range,
             candidate_sha=candidate_sha,
         )
@@ -1126,11 +1141,12 @@ async def _spawn_qualifier_smoketest_task(
     keeps advancing while the task is queued (audit C4 contract — the payload
     field name is exactly ``candidate_sha``).
     """
+    integration_branch, _promotion_target = _lts_branch_names()
     payload: dict[str, Any] = {
         "type": "smoketest",
-        "base_branch": "automain",
+        "base_branch": integration_branch,
         # Audit C4: pin the smoketest to the exact qualified commit.  The agent
-        # clones automain then checks out this SHA.
+        # clones the integration branch then checks out this SHA.
         "candidate_sha": candidate_sha,
     }
     type_model = (_runtime_config.get("task_type_models", {}) or {}).get("smoketest")
@@ -3295,21 +3311,23 @@ async def _reconcile_if_promotion_failed_landed(
                 version.version_number,
             )
 
-            # Resolve the real main HEAD SHA so promoted_sha points at the merge
-            # commit, not the candidate (which may be a parent of the merge commit).
+            # Resolve the real promotion-target HEAD SHA so promoted_sha points
+            # at the merge commit, not the candidate (which may be a parent).
+            _integration_branch, promotion_target = _lts_branch_names()
             promoted_sha: str | None = None
             try:
                 promoted_sha = await github.get_branch_sha(
                     token,
                     owner,
                     repo,
-                    "main",
+                    promotion_target,
                     project_id=str(version.project_id),
                 )
             except Exception as exc:  # noqa: BLE001 — fallback to candidate_sha
                 logger.warning(
-                    "[RELEASE_QUALIFIER] reconcile: could not resolve main HEAD "
+                    "[RELEASE_QUALIFIER] reconcile: could not resolve %s HEAD "
                     "SHA for v%d (%s) — using candidate_sha as promoted_sha",
+                    promotion_target,
                     version.version_number,
                     exc,
                 )
@@ -3471,20 +3489,22 @@ async def _reconcile_if_pending_auto_merge_landed(
                     candidate_sha[:8],
                     version.version_number,
                 )
+                _integration_branch, promotion_target = _lts_branch_names()
                 promoted_sha: str | None = None
                 try:
                     promoted_sha = await github.get_branch_sha(
                         token,
                         owner,
                         repo,
-                        "main",
+                        promotion_target,
                         project_id=str(version.project_id),
                     )
                 except Exception as exc:  # noqa: BLE001 — fallback to candidate_sha
                     logger.warning(
                         "[RELEASE_QUALIFIER] reconcile pending_auto_merge: could "
-                        "not resolve main HEAD SHA for v%d (%s) — using "
+                        "not resolve %s HEAD SHA for v%d (%s) — using "
                         "candidate_sha as promoted_sha",
+                        promotion_target,
                         version.version_number,
                         exc,
                     )
@@ -3882,13 +3902,14 @@ async def _candidate_already_on_main(
     would skip a real merge.  A genuinely-already-merged candidate will be
     re-detected on the next retry once GitHub is reachable again.
     """
+    _integration_branch, promotion_target = _lts_branch_names()
     try:
         ancestry = await github.is_ancestor_of(
             token,
             owner,
             repo,
             candidate_sha,
-            "main",
+            promotion_target,
             project_id=str(version.project_id),
         )
     except Exception as exc:  # noqa: BLE001 — a check failure must not abort promotion
@@ -4194,6 +4215,7 @@ async def promote(
     Returns a result dict.
     """
     base_record = dict(base_record or {})
+    _integration_branch, promotion_target = _lts_branch_names()
     project = await session.get(Project, version.project_id)
     if project is None:
         logger.warning(
@@ -4346,18 +4368,18 @@ async def promote(
             lock_released=True,
         )
 
-    # 1. Open the release-branch → main PR.  The release branch is frozen at
-    #    candidate_sha, so this PR promotes exactly the qualified commit.
+    # 1. Open the release-branch → promotion-target PR.  The release branch is
+    #    frozen at candidate_sha, so this PR promotes exactly the qualified commit.
     try:
         pr = await github.create_pull_request(
             token,
             owner,
             repo,
             title=(
-                f"Release v{version.version_number}: promote {release_branch} → main"
+                f"Release v{version.version_number}: promote {release_branch} → {promotion_target}"
             ),
             head=release_branch,
-            base="main",
+            base=promotion_target,
             body=(
                 f"Automated promotion of release v{version.version_number}.\n\n"
                 f"Candidate SHA: `{candidate_sha}`\n"
@@ -4516,13 +4538,14 @@ async def promote(
             merged_sha_retry: str | None = None
             try:
                 merged_sha_retry = await github.get_branch_sha(
-                    token, owner, repo, "main"
+                    token, owner, repo, promotion_target
                 )
             except Exception:  # noqa: BLE001 — best-effort; degrade to candidate
                 logger.warning(
-                    "[RELEASE_QUALIFIER] promote: could not re-resolve main "
+                    "[RELEASE_QUALIFIER] promote: could not re-resolve %s "
                     "HEAD after detecting an already-merged PR #%s for v%d — "
                     "recording candidate_sha",
+                    promotion_target,
                     pr_number,
                     version.version_number,
                 )
@@ -4624,13 +4647,14 @@ async def promote(
     #    successful promotion.
     merged_sha: str | None = None
     try:
-        merged_sha = await github.get_branch_sha(token, owner, repo, "main")
+        merged_sha = await github.get_branch_sha(token, owner, repo, promotion_target)
     except Exception as exc:  # noqa: BLE001 — merge already succeeded; SHA read is best-effort
         logger.warning(
             "[RELEASE_QUALIFIER] promote: merged PR #%s for v%d but could not "
-            "resolve the new main HEAD (%s) — recording candidate_sha instead",
+            "resolve the new %s HEAD (%s) — recording candidate_sha instead",
             pr_number,
             version.version_number,
+            promotion_target,
             exc,
         )
 
@@ -4883,6 +4907,7 @@ async def _record_promotion_success(
     is non-fatal — it is wrapped in try/except and only logs a warning.  The
     merge already succeeded; the tag is cosmetic convenience.
     """
+    integration_branch, promotion_target = _lts_branch_names()
     locked = await _relock_version_for_promotion_write(
         session, version, lock_released=lock_released
     )
@@ -4999,7 +5024,7 @@ async def _record_promotion_success(
                 repo,
                 tag_name,
                 effective_sha,
-                message=f"Release {tag_name} (automain → main promotion)",
+                message=f"Release {tag_name} ({integration_branch} → {promotion_target} promotion)",
                 project_id=str(version.project_id),
             )
             logger.info(
@@ -5019,7 +5044,7 @@ async def _record_promotion_success(
         version,
         "release_promoted",
         (
-            f"Released v{version.version_number} — automain → main promoted "
+            f"Released v{version.version_number} — {integration_branch} → {promotion_target} promoted "
             f"(confidence {float(base_record.get('confidence') or 0.0):.2f}). "
             f"Production deploy is running; v{next_version.version_number} is "
             f"now open for build."

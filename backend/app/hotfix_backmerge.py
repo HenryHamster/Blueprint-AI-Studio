@@ -68,7 +68,7 @@ from app.broadcast import broadcast_to_project
 # release_qualifier does NOT import this module, so importing from it here is
 # safe — no circular import.  _resolve_github_with_session is the shared
 # credential resolver used by the whole LTS machinery.
-from app.release_qualifier import _resolve_github_with_session
+from app.release_qualifier import _lts_branch_names, _resolve_github_with_session
 from app.models import (
     Alert,
     AlertSeverity,
@@ -81,20 +81,6 @@ from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
 
 logger = logging.getLogger(__name__)
-
-# Title of the conflict-resolution Alert.  Used both when creating the Alert
-# and when checking whether an unresolved one already exists, so a retried /
-# periodic back-merge does not stack duplicate alerts.
-_CONFLICT_ALERT_TITLE = "Back-merge conflict: main -> automain"
-
-# Title of the generic (non-conflict) failure Alert — a 405, a PR-creation
-# failure, or any unexpected exception.  Only raised for one-shot callers
-# (``periodic=False``); the periodic reconciler logs + retries instead.
-_BLOCKED_ALERT_TITLE = "Back-merge failed: main -> automain"
-
-# The conflict-resolution plan task always targets automain — it is a normal
-# automain-bound fix, NOT a hotfix.  It must NOT carry hotfix:true.
-_RESOLUTION_BASE_BRANCH = "automain"
 
 # Priority for the conflict-resolution plan task — expedited (design doc:
 # back-merge conflict resolution gates the next promotion; >= 90).
@@ -134,8 +120,8 @@ async def reconcile_main_into_automain(
     result, or ``{"status": "skipped", "reason": "lts_inactive"}`` when the LTS
     branch model is not active.
     """
-    integration_branch = str(_runtime_config.get("integration_branch", "main"))
-    if integration_branch != "automain":
+    integration_branch, promotion_target = _lts_branch_names()
+    if integration_branch == promotion_target:
         return {"status": "skipped", "reason": "lts_inactive"}
     return await open_backmerge_pr(session, project_id, periodic=True)
 
@@ -183,6 +169,7 @@ async def open_backmerge_pr(
 
     The caller commits the session.  Returns a status dict.
     """
+    integration_branch, promotion_target = _lts_branch_names()
     hotfix_task_id_str = str(hotfix_task_id) if hotfix_task_id is not None else None
     trigger_desc = _describe_trigger(merged_pr_url, hotfix_task_id_str)
 
@@ -206,8 +193,7 @@ async def open_backmerge_pr(
     resolved = await _resolve_github_with_session(session, project)
     if resolved is None:
         logger.warning(
-            "[BACKMERGE] no GitHub credentials for project %s — "
-            "cannot back-merge",
+            "[BACKMERGE] no GitHub credentials for project %s — cannot back-merge",
             project_id,
         )
         await _raise_blocked_alert(
@@ -229,15 +215,15 @@ async def open_backmerge_pr(
             token,
             owner,
             repo,
-            title="Back-merge: main -> automain",
-            head="main",
-            base="automain",
+            title=f"Back-merge: {promotion_target} -> {integration_branch}",
+            head=promotion_target,
+            base=integration_branch,
             body=(
-                "Automated back-merge of the LTS branch `main` into the "
-                "integration trunk `automain`.\n\n"
+                f"Automated back-merge of the LTS branch `{promotion_target}` into the "
+                f"integration trunk `{integration_branch}`.\n\n"
                 f"{trigger_line}"
-                "Without this back-merge `main` and `automain` diverge and the "
-                "next `automain -> main` promotion conflicts (see "
+                f"Without this back-merge `{promotion_target}` and `{integration_branch}` diverge and the "
+                f"next `{integration_branch} -> {promotion_target}` promotion conflicts (see "
                 "docs/plans/automain-lts-plan-v1.md Phase 5).\n\n"
                 "Opened by the back-merge machinery "
                 "(backend/app/hotfix_backmerge.py)."
@@ -299,8 +285,7 @@ async def open_backmerge_pr(
         )
     except Exception as exc:  # noqa: BLE001 — a 5xx raises HTTPException; treat as blocked
         logger.warning(
-            "[BACKMERGE] merge raised for back-merge PR #%s "
-            "(project %s): %s",
+            "[BACKMERGE] merge raised for back-merge PR #%s (project %s): %s",
             pr_number,
             project_id,
             exc,
@@ -318,8 +303,7 @@ async def open_backmerge_pr(
     # 5. Success.
     if merge_result.get("merged"):
         logger.info(
-            "[BACKMERGE] project %s: main -> automain back-merge "
-            "merged via PR #%s",
+            "[BACKMERGE] project %s: main -> automain back-merge merged via PR #%s",
             project_id,
             pr_number,
         )
@@ -353,8 +337,7 @@ async def open_backmerge_pr(
 
     if is_conflict:
         logger.warning(
-            "[BACKMERGE] back-merge PR #%s for project %s hit a merge "
-            "conflict: %s",
+            "[BACKMERGE] back-merge PR #%s for project %s hit a merge conflict: %s",
             pr_number,
             project_id,
             msg,
@@ -446,9 +429,7 @@ async def _resolution_plan_already_open(
         .scalars()
         .all()
     )
-    return any(
-        (task.context or {}).get("backmerge_conflict") is True for task in rows
-    )
+    return any((task.context or {}).get("backmerge_conflict") is True for task in rows)
 
 
 async def _handle_conflict(
@@ -496,17 +477,21 @@ async def _handle_conflict(
         )
         return
 
+    integration_branch, promotion_target = _lts_branch_names()
+    conflict_alert_title = (
+        f"Back-merge conflict: {promotion_target} -> {integration_branch}"
+    )
     trigger_clause = f" (triggered by {trigger_desc})" if trigger_desc else ""
     alert = Alert(
         project_id=project_id,
         severity=AlertSeverity.ERROR,
-        title=_CONFLICT_ALERT_TITLE,
+        title=conflict_alert_title,
         message=(
-            f"The automated main -> automain back-merge "
+            f"The automated {promotion_target} -> {integration_branch} back-merge "
             f"(PR #{pr_number}{trigger_clause}) hit a merge conflict and "
             f"could not be merged automatically. A resolution plan task has "
-            f"been spawned. Until automain absorbs main, the next "
-            f"automain -> main promotion will conflict. ({message[:160]})"
+            f"been spawned. Until {integration_branch} absorbs {promotion_target}, the next "
+            f"{integration_branch} -> {promotion_target} promotion will conflict. ({message[:160]})"
         ),
     )
     session.add(alert)
@@ -552,31 +537,32 @@ async def _spawn_resolution_plan(
     ``git merge origin/main`` conflict resolution.  It is a NORMAL
     automain-bound fix — it deliberately does NOT carry ``hotfix:true``.
     """
+    integration_branch, promotion_target = _lts_branch_names()
     trigger_clause = f" ({trigger_desc})" if trigger_desc else ""
     prompt = (
-        f"The automated `main -> automain` back-merge PR #{pr_number} "
+        f"The automated `{promotion_target} -> {integration_branch}` back-merge PR #{pr_number} "
         f"({pr_url or 'no URL'}) hit a merge conflict and could not be merged.\n\n"
-        f"A change has landed on `main` that `automain` does not have"
-        f"{trigger_clause}, and `automain` must absorb it or the next "
-        f"`automain -> main` promotion will conflict.\n\n"
-        f"Resolve it: from a checkout of `automain`, run `git merge origin/main`, "
-        f"resolve every conflict so that `automain` contains both the `main` "
+        f"A change has landed on `{promotion_target}` that `{integration_branch}` does not have"
+        f"{trigger_clause}, and `{integration_branch}` must absorb it or the next "
+        f"`{integration_branch} -> {promotion_target}` promotion will conflict.\n\n"
+        f"Resolve it: from a checkout of `{integration_branch}`, run `git merge origin/{promotion_target}`, "
+        f"resolve every conflict so that `{integration_branch}` contains both the `{promotion_target}` "
         f"changes and the in-flight integration work, and commit the merge. "
-        f"Do NOT discard the `main` changes and do NOT discard automain's "
+        f"Do NOT discard the `{promotion_target}` changes and do NOT discard {integration_branch}'s "
         f"integration work.\n\n"
         f"IMPORTANT GUARDRAILS:\n"
-        f"- This is a normal automain-targeted fix, NOT a hotfix.\n"
+        f"- This is a normal {integration_branch}-targeted fix, NOT a hotfix.\n"
         f"- Do NOT delete or skip tests just to make the merge build pass.\n"
-        f"- Keep both sides of every conflict reconciled — a `main` line and an "
+        f"- Keep both sides of every conflict reconciled — a `{promotion_target}` line and an "
         f"integration line that touch the same code must be merged, not "
         f"clobbered.\n"
-        f"- Produce subtasks that land the resolved merge on `automain`."
+        f"- Produce subtasks that land the resolved merge on `{integration_branch}`."
     )
 
     payload: dict[str, Any] = {
         "type": "plan",
         "prompt": prompt,
-        "base_branch": _RESOLUTION_BASE_BRANCH,
+        "base_branch": integration_branch,
     }
     type_model = (_runtime_config.get("task_type_models", {}) or {}).get("plan")
     if type_model:
@@ -666,13 +652,17 @@ async def _raise_blocked_alert(
     No fix task is spawned either way — a 405 is a branch-protection / CI
     problem the operator resolves, not a code conflict.
     """
+    integration_branch, promotion_target = _lts_branch_names()
+    blocked_alert_title = (
+        f"Back-merge failed: {promotion_target} -> {integration_branch}"
+    )
     if periodic:
         existing = (
             (
                 await session.execute(
                     select(Alert).where(
                         Alert.project_id == project_id,
-                        Alert.title == _BLOCKED_ALERT_TITLE,
+                        Alert.title == blocked_alert_title,
                         Alert.dismissed_at.is_(None),
                     )
                 )
@@ -698,9 +688,9 @@ async def _raise_blocked_alert(
 
     trigger_clause = f" (triggered by {trigger_desc})" if trigger_desc else ""
     message = (
-        f"The automated main -> automain back-merge{trigger_clause} did not "
-        f"complete: {reason}. main and automain remain diverged — the next "
-        f"automain -> main promotion will conflict until this is resolved "
+        f"The automated {promotion_target} -> {integration_branch} back-merge{trigger_clause} did not "
+        f"complete: {reason}. {promotion_target} and {integration_branch} remain diverged — the next "
+        f"{integration_branch} -> {promotion_target} promotion will conflict until this is resolved "
         f"manually."
     )
     if pr_url:
@@ -708,7 +698,7 @@ async def _raise_blocked_alert(
     alert = Alert(
         project_id=project_id,
         severity=AlertSeverity.ERROR,
-        title=_BLOCKED_ALERT_TITLE,
+        title=blocked_alert_title,
         message=message,
     )
     session.add(alert)

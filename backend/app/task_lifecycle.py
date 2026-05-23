@@ -185,6 +185,47 @@ async def _increment_research_spawn_count(
     return new_count
 
 
+def _get_approval_gate_file_lists(project: Project) -> tuple[set, set]:
+    """Get infra_files and critical_files for approval gate.
+
+    Returns (infra_files_set, critical_files_set).
+    Uses project config if available, otherwise falls back to Blueprint defaults
+    for self-repo or empty sets for other projects.
+    """
+    config = (project.approval_gate_config or {}) if project else {}
+
+    # Use project config if provided
+    if config.get("infra_files") or config.get("critical_files"):
+        return (
+            set(config.get("infra_files", [])),
+            set(config.get("critical_files", [])),
+        )
+
+    # Fall back to Blueprint defaults only for self-repo
+    if project and project.is_self_repo:
+        infra_files = {
+            "backend/app/main.py",
+            "backend/app/compute.py",
+            "backend/app/models.py",
+            "backend/app/database.py",
+            "backend/app/security.py",
+            "backend/app/auth.py",
+            "agent/src/index.ts",
+            "CLAUDE.md",
+            "backend/promotion_policy.yaml",
+        }
+        critical_files = {
+            "backend/app/security.py",
+            "backend/app/auth.py",
+            "CLAUDE.md",
+            "backend/promotion_policy.yaml",
+        }
+        return infra_files, critical_files
+
+    # No config and not self-repo: use empty lists
+    return set(), set()
+
+
 async def _requeue_parent_task(parent: Task, session: AsyncSession):
     """Re-evaluate a parent task by retrying its failed children.
     Cancels FAILED children and clones them as new QUEUED tasks.
@@ -1998,34 +2039,18 @@ async def _process_post_commit(
 
                     # PR file-path flagging: flag infrastructure/security-critical file changes
                     # Don't block here — let review run, block at merge time.
-                    # Gated by require_approval_gates — these paths are hardcoded for the
-                    # Blueprint repo and irrelevant for other projects.
+                    # Gated by require_approval_gates — uses project config if available,
+                    # falls back to Blueprint defaults for self-repo.
                     if _runtime_config.get("require_approval_gates", True):
                         try:
                             pr_files = await get_pr_files(
                                 gh_token, owner, repo, pr_number
                             )
-                            INFRA_FILES = {
-                                "backend/app/main.py",
-                                "backend/app/compute.py",
-                                "backend/app/models.py",
-                                "backend/app/database.py",
-                                "backend/app/security.py",
-                                "backend/app/auth.py",
-                                "agent/src/index.ts",
-                                "CLAUDE.md",
-                                # Phase 4 trusted core — also in CRITICAL_FILES.
-                                "backend/promotion_policy.yaml",
-                            }
-                            CRITICAL_FILES = {
-                                "backend/app/security.py",
-                                "backend/app/auth.py",
-                                "CLAUDE.md",
-                                # The release-qualifier promotion rubric — the
-                                # human-owned trusted core. Autonomous changes to
-                                # it must be human-approved before merge.
-                                "backend/promotion_policy.yaml",
-                            }
+                            # Fetch project to get approval gate config
+                            project = await session.get(Project, task.project_id)
+                            INFRA_FILES, CRITICAL_FILES = _get_approval_gate_file_lists(
+                                project
+                            )
                             touched_infra = [
                                 f["filename"]
                                 for f in pr_files
