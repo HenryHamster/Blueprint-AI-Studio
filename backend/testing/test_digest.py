@@ -15217,7 +15217,7 @@ async def test_viewport_debt_coverage_summary_in_response(
     }
 
     with patch(
-        "app.routers.admin_digest._scan_viewport_debt_rows",
+        "app.viewport_debt._scan_viewport_debt_rows",
         return_value=(top_rows, [], expected_summary),
     ):
         response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
@@ -15273,7 +15273,7 @@ async def test_viewport_debt_coverage_summary_counts_full_set(
     }
 
     with patch(
-        "app.routers.admin_digest._scan_viewport_debt_rows",
+        "app.viewport_debt._scan_viewport_debt_rows",
         return_value=(top_rows, [], expected_summary),
     ):
         response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
@@ -15330,7 +15330,7 @@ async def test_viewport_debt_counts_assertion_type_regressions(
     ]
 
     with patch(
-        "app.routers.admin_digest._scan_viewport_debt_rows",
+        "app.viewport_debt._scan_viewport_debt_rows",
         return_value=(
             fake_rows,
             [],
@@ -15410,7 +15410,7 @@ async def test_viewport_debt_returns_per_assertion_type_breakdown(
     ]
 
     with patch(
-        "app.routers.admin_digest._scan_viewport_debt_rows",
+        "app.viewport_debt._scan_viewport_debt_rows",
         return_value=(
             fake_rows,
             [],

@@ -3351,7 +3351,7 @@ class TestViewportDebt:
             "untested_components": [],
         }
         with patch(
-            "app.routers.admin_digest._scan_viewport_debt_rows",
+            "app.viewport_debt._scan_viewport_debt_rows",
             return_value=(fake_rows, [], fake_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
@@ -3404,7 +3404,7 @@ class TestViewportDebt:
             "untested_components": [],
         }
         with patch(
-            "app.routers.admin_digest._scan_viewport_debt_rows",
+            "app.viewport_debt._scan_viewport_debt_rows",
             return_value=(fake_rows, [], fake_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
@@ -3427,7 +3427,7 @@ class TestViewportDebt:
             "untested_components": [],
         }
         with patch(
-            "app.routers.admin_digest._scan_viewport_debt_rows",
+            "app.viewport_debt._scan_viewport_debt_rows",
             return_value=([], [], empty_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
@@ -3483,7 +3483,7 @@ class TestViewportDebt:
             "untested_components": [],
         }
         with patch(
-            "app.routers.admin_digest._scan_viewport_debt_rows",
+            "app.viewport_debt._scan_viewport_debt_rows",
             return_value=(cached_rows, [], cached_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
@@ -3535,7 +3535,7 @@ class TestViewportDebt:
             ],
         }
         with patch(
-            "app.routers.admin_digest._scan_viewport_debt_rows",
+            "app.viewport_debt._scan_viewport_debt_rows",
             return_value=([], fake_untested, fake_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
