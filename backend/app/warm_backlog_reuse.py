@@ -212,11 +212,17 @@ async def select_backlog_reuse_candidate(
     Pass ``in_progress_files`` to reuse an already-computed IN_PROGRESS file
     set (see ``_eligible_backlog_ids``) when this claim follows an eligibility
     gate in the same flow, so the file-conflict scan is not run twice.
+
+    Records the funnel skip reason for the two None-returning cases, which the
+    caller cannot distinguish on its own: ``no_eligible`` when no backlog task
+    qualifies, ``lost_claim_race`` when one or more qualified but a concurrent
+    claimer won the SKIP-LOCKED row.
     """
     eligible = await _eligible_backlog_ids(
         session, project_id, vm_instance_id, in_progress_files=in_progress_files
     )
     if not eligible:
+        record_claim_skipped("no_eligible")
         return None
     result = await session.execute(
         select(Task)
@@ -234,6 +240,8 @@ async def select_backlog_reuse_candidate(
         claimed.id if claimed is not None else None,
         len(eligible),
     )
+    if claimed is None:
+        record_claim_skipped("lost_claim_race")
     return claimed
 
 

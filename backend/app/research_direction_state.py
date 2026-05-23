@@ -636,9 +636,10 @@ async def apply_post_spawn_state(
                 )[:500]
                 if not proposal_text.strip():
                     continue
-                if _is_direction_duplicate(
+                is_dup, _override = _is_direction_duplicate(
                     proposal_text, proj_directions, rejected_proposals
-                ):
+                )
+                if is_dup:
                     logger.info(
                         "[RESEARCH] Skipping direction proposal — overlaps with existing direction"
                     )

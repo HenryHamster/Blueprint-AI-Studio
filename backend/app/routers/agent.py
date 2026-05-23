@@ -3859,7 +3859,6 @@ async def next_role(
                     _project_uuid = None
             if _project_uuid is not None:
                 from app.warm_backlog_reuse import (
-                    record_claim_skipped as _record_claim_skipped,
                     record_next_role_poll_during_defer as _record_next_role_poll,
                     record_warm_claim_succeeded as _record_warm_claim_succeeded,
                     select_backlog_reuse_candidate,
@@ -3898,8 +3897,9 @@ async def next_role(
                         f"project={_project_uuid}"
                     )
                     return result
-                else:
-                    _record_claim_skipped("no_eligible")
+                # select_backlog_reuse_candidate records the skip reason
+                # (no_eligible vs lost_claim_race) itself — it is the only
+                # caller that can tell the two None cases apart.
 
     # No matching warm-pinned task. Check whether another VM owns an
     # IN_PROGRESS task for this PR — if so, the warm chain has already

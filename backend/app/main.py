@@ -2761,9 +2761,10 @@ async def strategic_operation(
         _rejected_proposals = list(
             (project.vision or {}).get("rejected_proposals") or []
         )
-        if _is_direction_duplicate(
+        is_dup, _override = _is_direction_duplicate(
             text, directions, _rejected_proposals, distinction=distinction or None
-        ):
+        )
+        if is_dup:
             if distinction:
                 logger.warning(
                     "[STRATEGIC_DEDUP_DISAGREEMENT] API path: direction rejected as duplicate but agent claimed "
