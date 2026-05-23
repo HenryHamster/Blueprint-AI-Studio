@@ -108,7 +108,13 @@ warn_return_any = false
 asyncio_mode = "auto"
 timeout = 60  # seconds; prevents hung async tests from blocking CI
 timeout_method = "thread"  # works with asyncio
-addopts = "-m 'not integration'"
+# --reruns is a SIGNATURE-SCOPED safety net: pytest-rerunfailures only retries
+# a failure whose message matches an --only-rerun pattern, so genuine assertion
+# failures still fail immediately (no masking). The patterns target async
+# event-loop contamination — a pooled production-engine connection bound to a
+# prior test's loop (see testing/conftest.py _dispose_production_engine_per_test,
+# which fixes the root cause; this is defense-in-depth).
+addopts = "-m 'not integration' --reruns 2 --only-rerun 'attached to a different loop' --only-rerun 'Event loop is closed'"
 markers = [
     "smoketest: Critical tests run by the smoketest agent after every merge to main",
     "slow: Tests that take >10s (excluded from fast test runs)",
