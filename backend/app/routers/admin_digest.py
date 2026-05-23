@@ -5880,11 +5880,13 @@ async def _compute_digest(
     sr_regression_risk_test_signal_trends: Optional[Dict[str, Any]] = None
     memo_pathway_exits: int = 0
     recent_cycle_memo_stats: list[dict[str, Any]] = []
+    memo_ever_cited: dict[str, Any] | None = None
     if project_id:
         _proj = await session.get(Project, project_id)
         memo_pathway_exits = await _strategic_cycle.count_memo_exits(
             session, project_id
         )
+        memo_ever_cited = await _strategic_cycle.ever_cited_memo(session, project_id)
         if _proj:
             _sr_trends = (_proj.design_doc or {}).get("sr_catch_rate_trends") or {}
             if _sr_trends:
@@ -6916,6 +6918,7 @@ async def _compute_digest(
         "trend_history": trend_history,
         "latest_cycle": latest_cycle,
         "memo_pathway_exits": memo_pathway_exits,
+        "memo_ever_cited": memo_ever_cited,
         "recent_cycle_memo_stats": recent_cycle_memo_stats,
         "scope_conversion_rates": scope_conversion_rates or None,
         "prev_scope_conversion_rates": prev_scope_conversion_rates or None,

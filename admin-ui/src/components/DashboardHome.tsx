@@ -307,6 +307,7 @@ interface DigestData {
   } | null;
   tasks_truncated?: boolean;
   memo_pathway_exits?: number | null;
+  memo_ever_cited?: { ever_cited: boolean; first_cycle_id: string | null; first_cited_at: string | null } | null;
   recent_cycle_memo_stats?: Array<{ cycle_id: string | null; started_at: string | null; memos_available: number; memos_cited: number }> | null;
 }
 
@@ -2493,6 +2494,7 @@ function AnomalyThrottleBanner({ digest }: { digest: DigestData | null }) {
 function SystemStatusCard({ digest, loading }: { digest: DigestData | null; loading: boolean }) {
   const cycle = digest?.latest_cycle ?? null;
   const memoExits = digest?.memo_pathway_exits ?? 0;
+  const memoEverCited = digest?.memo_ever_cited ?? null;
   const recentCycleMemoStats = digest?.recent_cycle_memo_stats ?? [];
   const hasContent = digest?.narrative_summary || cycle;
 
@@ -2539,6 +2541,18 @@ function SystemStatusCard({ digest, loading }: { digest: DigestData | null; load
                   <span className="text-[10px] font-semibold text-violet-400 px-1.5 py-0.5 rounded border border-violet-500/30 bg-violet-500/10">
                     {memoExits} exit{memoExits !== 1 ? 's' : ''}
                   </span>
+                  {memoEverCited?.ever_cited ? (
+                    <span
+                      className="text-[10px] font-semibold text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/30 bg-emerald-500/10"
+                      title={memoEverCited.first_cited_at ? `first cited ${timeAgo(memoEverCited.first_cited_at)}` : undefined}
+                    >
+                      ever cited ✓
+                    </span>
+                  ) : memoEverCited != null ? (
+                    <span className="text-[10px] text-neutral-500 px-1.5 py-0.5 rounded border border-neutral-700/50">
+                      not yet cited
+                    </span>
+                  ) : null}
                   {recentCycleMemoStats.length > 0 && (
                     <div className="flex flex-wrap gap-1">
                       {recentCycleMemoStats.slice(0, 5).map((s, i) => (

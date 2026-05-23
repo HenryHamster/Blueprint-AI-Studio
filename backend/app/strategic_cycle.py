@@ -297,6 +297,40 @@ async def query_recent_memo_citations(
     return citations
 
 
+async def ever_cited_memo(
+    session: AsyncSession,
+    project_id,
+) -> dict[str, Any]:
+    """All-time signal: has any completed cycle ever cited at least one memo?
+
+    Scans the full cycle history (not just the recent display window) so the
+    signal persists even after many cycles have elapsed since the citation.
+    Returns the first cycle (chronologically) that cited a memo.
+    """
+    from app.models import CYCLE_META_MEMOS_CITED  # noqa: PLC0415
+
+    stmt = (
+        select(StrategicCycle)
+        .where(
+            StrategicCycle.project_id == project_id,
+            StrategicCycle.outcome == OUTCOME_COMPLETED,
+        )
+        .order_by(StrategicCycle.phase1_started_at)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    for row in rows:
+        cited = int((row.cycle_metadata or {}).get(CYCLE_META_MEMOS_CITED) or 0)
+        if cited > 0:
+            return {
+                "ever_cited": True,
+                "first_cycle_id": row.id,
+                "first_cited_at": row.phase2_completed_at.isoformat()
+                if row.phase2_completed_at
+                else None,
+            }
+    return {"ever_cited": False, "first_cycle_id": None, "first_cited_at": None}
+
+
 async def count_memo_exits(
     session: AsyncSession,
     project_id,

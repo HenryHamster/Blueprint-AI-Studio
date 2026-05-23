@@ -817,13 +817,18 @@ Only request qualification from the **stabilize** phase — it is ignored in **b
  */
 export function buildMemoCitationsSection(memoCitations: unknown): string {
   if (!Array.isArray(memoCitations) || memoCitations.length === 0) return '';
-  const lines: string[] = ['\n## Memo Citations (recent terminal reasoning artifacts)'];
+  const lines: string[] = ['\n## Memo Citations (cross-cycle institutional memory)'];
   lines.push(
-    'Memos are short reasoning notes spawned from research findings dropped ' +
-    'under budget pressure in earlier cycles. Each is a completed, terminal ' +
-    'artifact. When a memo informs a gap or direction, cite it by its short handle ' +
-    '(e.g. "memo M0", "memo M1") — the handle is easy to reproduce and maps reliably ' +
-    'back to the full task_id for traceability.',
+    'Memos are durable cross-cycle institutional memory: reasoning artifacts from ' +
+    'prior cycles that capture why findings were set aside, why directions were ' +
+    'retired, or why patterns emerged. Each memo is a completed terminal reasoning ' +
+    'task — genuinely useful context that transcends a single cycle.\n' +
+    'As you reason about gaps and directions below, actively check whether any memo ' +
+    'is relevant to your thinking. If a memo genuinely informs a decision or shapes ' +
+    'your understanding of a pattern, cite it by its short handle (e.g., "memo M0", ' +
+    '"memo M1"). The handle is stable and maps reliably back to the full task_id for ' +
+    'traceability. Cite only when a memo authentically informs your reasoning — ' +
+    'valuable citations strengthen the record; performative ones do not.',
   );
   for (let i = 0; i < memoCitations.length; i++) {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment

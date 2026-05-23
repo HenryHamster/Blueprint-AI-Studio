@@ -294,6 +294,7 @@ interface DigestData {
     memos_cited?: number | null;
   } | null;
   memo_pathway_exits?: number | null;
+  memo_ever_cited?: { ever_cited: boolean; first_cycle_id: string | null; first_cited_at: string | null } | null;
   recent_cycle_memo_stats?: Array<{ cycle_id: string | null; started_at: string | null; memos_available: number; memos_cited: number }> | null;
   remediation_funnel?: {
     investigations_spawned: number;
@@ -892,6 +893,18 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                   <span className="text-[10px] font-semibold text-violet-400 px-1.5 py-0.5 rounded border border-violet-500/30 bg-violet-500/10">
                     {digest.memo_pathway_exits} exit{digest.memo_pathway_exits !== 1 ? 's' : ''}
                   </span>
+                  {digest.memo_ever_cited?.ever_cited ? (
+                    <span
+                      className="text-[10px] font-semibold text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/30 bg-emerald-500/10"
+                      title={digest.memo_ever_cited.first_cited_at ? `first cited ${timeAgo(digest.memo_ever_cited.first_cited_at)}` : undefined}
+                    >
+                      ever cited ✓
+                    </span>
+                  ) : digest.memo_ever_cited != null ? (
+                    <span className="text-[10px] text-neutral-500 px-1.5 py-0.5 rounded border border-neutral-700/50">
+                      not yet cited
+                    </span>
+                  ) : null}
                   {(digest.recent_cycle_memo_stats ?? []).length > 0 && (
                     <div className="flex flex-wrap gap-1">
                       {(digest.recent_cycle_memo_stats ?? []).slice(0, 5).map((s, i) => (

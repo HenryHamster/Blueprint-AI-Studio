@@ -16181,6 +16181,70 @@ async def test_digest_latest_cycle_includes_memo_stats(client: AsyncClient, db_s
     assert lc["memos_cited"] == 1
 
 
+@pytest.mark.asyncio
+async def test_digest_memo_ever_cited_false_when_no_citations(
+    client: AsyncClient, db_session
+):
+    """memo_ever_cited.ever_cited is False when no cycle has memos_cited > 0."""
+    from app import strategic_cycle as _sc
+
+    project = make_project()
+    db_session.add(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await _sc.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await _sc.mark_phase2_completed(
+        db_session, cycle.id, memos_available=3, memos_cited=0
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+    mec = data.get("memo_ever_cited")
+    assert mec is not None
+    assert mec["ever_cited"] is False
+    assert mec["first_cycle_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_digest_memo_ever_cited_true_with_oldest_cycle_cited(
+    client: AsyncClient, db_session
+):
+    """memo_ever_cited.ever_cited=True even when citation is outside the 20-cycle display window."""
+    from app import strategic_cycle as _sc
+
+    project = make_project()
+    db_session.add(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create 22 cycles; only the first one has a citation (outside recent 20-cycle window)
+    first_cycle_id = None
+    for i in range(22):
+        c = await _sc.create(db_session, project_id=project.id)
+        await db_session.commit()
+        cited = 1 if i == 0 else 0
+        await _sc.mark_phase2_completed(
+            db_session, c.id, memos_available=1, memos_cited=cited
+        )
+        await db_session.commit()
+        if i == 0:
+            first_cycle_id = c.id
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+    mec = data.get("memo_ever_cited")
+    assert mec is not None
+    assert mec["ever_cited"] is True
+    assert mec["first_cycle_id"] == first_cycle_id
+
+
 # ---------------------------------------------------------------------------
 # /api/admin/projects/{project_id}/qualification-verdicts tests
 # ---------------------------------------------------------------------------

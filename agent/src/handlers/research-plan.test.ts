@@ -1395,6 +1395,34 @@ describe('buildMemoCitationsSection', () => {
     expect(result).toContain('M0 (task_id: memo-ccc): (no summary)');
     expect(result).toContain('M1 (task_id: ?): no id here');
   });
+
+  it('reframes memos as cross-cycle institutional memory (not budget scraps)', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-aaa', summary_excerpt: 'A finding.' },
+    ]);
+    expect(result).toContain('cross-cycle institutional memory');
+    expect(result).toContain('durable');
+    expect(result).toContain('why findings were set aside');
+    expect(result).toContain('why directions were retired');
+    // Should NOT contain the old "budget pressure" framing
+    expect(result).not.toMatch(/dropped.*budget|budget.*pressure/i);
+  });
+
+  it('explicitly prompts agent to actively check memos for relevance', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-aaa', summary_excerpt: 'A finding.' },
+    ]);
+    expect(result).toMatch(/actively check.*memo.*relevant/i);
+    expect(result).toMatch(/as you reason about gaps and directions/i);
+  });
+
+  it('emphasizes authentic citation over performative citation', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-aaa', summary_excerpt: 'A finding.' },
+    ]);
+    expect(result).toMatch(/authentic|genuinely informs/i);
+    expect(result).toMatch(/performative.*not|valuable citations.*strengthen/i);
+  });
 });
 
 describe('resolveMemoHandles', () => {
