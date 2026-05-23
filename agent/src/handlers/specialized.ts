@@ -1199,7 +1199,7 @@ IMPORTANT: You are running on \`${baseBranch}\` intentionally. You must judge th
 \`\`\`
 
 Field semantics:
-- \`audit_score\`: float [0, 1] — 1.0 means no issues found; deduct per finding by severity (critical: -0.30, high: -0.15, medium: -0.07, low: -0.02). Clamp to [0, 1].
+- \`audit_score\`: float [0, 1] — holistic cross-check of your overall assessment (1.0 = no issues found, 0.0 = critical problems). The backend derives the authoritative gating score from the \`findings\` list, so focus on producing accurate, well-categorised findings rather than computing this number precisely.
 - \`test_erosion.deleted_test_files\`: list of test file paths deleted in the diff. An empty list is good.
 - \`test_erosion.assertion_delta\`: integer — positive means more assertions added than removed (good), negative means erosion.
 - \`test_erosion.test_count_delta\`: integer — positive means more tests added than removed (good), negative means erosion.

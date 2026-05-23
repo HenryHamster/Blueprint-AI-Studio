@@ -682,7 +682,7 @@ class TestLoadPolicy:
 
 class TestScoreAudit:
     def test_clean_audit_report(self):
-        """A clean report yields the audit_score and a 1.0 erosion score."""
+        """An empty findings list yields derived audit_score=1.0 and 1.0 erosion."""
         report = {
             "audit_score": 0.85,
             "test_erosion": {
@@ -693,7 +693,61 @@ class TestScoreAudit:
             "findings": [],
         }
         audit, erosion = rq._score_audit(report)
-        assert audit == pytest.approx(0.85)
+        # derived from findings (empty) → 1.0; reported 0.85 is observability only
+        assert audit == pytest.approx(1.0)
+        assert erosion == pytest.approx(1.0)
+
+    def test_findings_deducted_correctly(self):
+        """1 high + 1 medium finding → 1.0 - 0.15 - 0.07 = 0.78."""
+        report = {
+            "audit_score": 0.78,
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Token in source.",
+                    "file": "app/auth.py",
+                },
+                {
+                    "severity": "medium",
+                    "summary": "Missing null check.",
+                    "file": "app/api.py",
+                },
+            ],
+        }
+        audit, erosion = rq._score_audit(report)
+        assert audit == pytest.approx(0.78)
+        assert erosion == pytest.approx(1.0)
+
+    def test_critical_finding_deducted(self):
+        """A critical finding deducts 0.30 → 1.0 - 0.30 = 0.70."""
+        report = {
+            "findings": [
+                {
+                    "severity": "critical",
+                    "summary": "SQL injection.",
+                    "file": "app/db.py",
+                },
+            ],
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(0.70)
+
+    def test_clamped_below_zero(self):
+        """Many critical findings clamp to 0.0."""
+        report = {
+            "findings": [
+                {"severity": "critical", "summary": f"Issue {i}", "file": ""}
+                for i in range(10)
+            ],
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(0.0)
+
+    def test_missing_findings_key_scores_1_0(self):
+        """A report with no findings key derives score 1.0 (no deductions)."""
+        report = {"audit_score": 0.5, "test_erosion": {"deleted_test_files": []}}
+        audit, erosion = rq._score_audit(report)
+        assert audit == pytest.approx(1.0)
         assert erosion == pytest.approx(1.0)
 
     def test_deleted_test_file_returns_none_erosion(self):
@@ -705,9 +759,11 @@ class TestScoreAudit:
                 "assertion_delta": 0,
                 "test_count_delta": -5,
             },
+            "findings": [],
         }
         audit, erosion = rq._score_audit(report)
-        assert audit == pytest.approx(0.9)
+        # No findings → derived audit = 1.0
+        assert audit == pytest.approx(1.0)
         assert erosion is None
 
     def test_net_test_count_reduction_penalized(self):
@@ -724,11 +780,11 @@ class TestScoreAudit:
         assert erosion is not None
         assert erosion < 1.0
 
-    def test_missing_audit_score_returns_none(self):
-        """An absent audit_score yields None (a hard blocker downstream)."""
+    def test_missing_audit_score_no_findings_scores_1_0(self):
+        """An absent self-reported audit_score still yields derived 1.0 (no findings)."""
         report = {"test_erosion": {"deleted_test_files": []}}
         audit, erosion = rq._score_audit(report)
-        assert audit is None
+        assert audit == pytest.approx(1.0)
         assert erosion == pytest.approx(1.0)
 
     def test_none_report_returns_none_none(self):
@@ -737,9 +793,34 @@ class TestScoreAudit:
 
     def test_no_erosion_block_assumes_neutral(self):
         """A report with no test_erosion block assumes neutral (1.0)."""
-        audit, erosion = rq._score_audit({"audit_score": 0.7})
-        assert audit == pytest.approx(0.7)
+        audit, erosion = rq._score_audit({"audit_score": 0.7, "findings": []})
+        assert audit == pytest.approx(1.0)
         assert erosion == pytest.approx(1.0)
+
+    def test_divergence_log_emitted(self, caplog):
+        """When derived and reported scores diverge by >0.10 a warning is logged."""
+        import logging
+
+        report = {
+            "audit_score": 0.90,  # reported
+            # derived = 1.0 - 0.30 - 0.30 = 0.40 → delta 0.50
+            "findings": [
+                {"severity": "critical", "summary": "Issue A", "file": ""},
+                {"severity": "critical", "summary": "Issue B", "file": ""},
+            ],
+        }
+        with caplog.at_level(logging.WARNING, logger="backend.app.release_qualifier"):
+            audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(0.40)
+        assert any("audit_score drift" in r.message for r in caplog.records)
+
+    def test_moderate_severity_treated_as_medium(self):
+        """'moderate' is an alias for 'medium' (same 0.07 deduction)."""
+        report = {
+            "findings": [{"severity": "moderate", "summary": "Style issue", "file": ""}]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0 - 0.07)
 
 
 class TestExtractAuditFindings:
@@ -2027,8 +2108,8 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
         db_session,
         project,
         version,
-        # audit 0.74 + erosion 1.0 + smoketest 1.0 → composite 0.896 < 0.90:
-        # not_promoted with no hard blocker, exercising the soft-miss path.
+        # findings: 2 high + 1 low → derived audit=0.68; erosion 1.0 + smoketest
+        # 1.0 → composite 0.872 < 0.90: not_promoted, exercising the soft-miss path.
         audit_logs={
             "audit_score": 0.74,
             "test_erosion": {
@@ -2039,6 +2120,7 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
             "findings": [
                 {"severity": "low", "summary": "Private cross-module import."},
                 {"severity": "high", "summary": "Token baked into VM image."},
+                {"severity": "high", "summary": "Unsafe dependency pinning."},
             ],
         },
         smoke_logs={
@@ -2056,9 +2138,10 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
 
     await db_session.refresh(version)
     findings = version.last_qualification["audit_findings"]
-    # Most-severe first, both findings carried with severity + summary.
+    # Most-severe first, all three findings carried with severity + summary.
     assert findings == [
         {"severity": "high", "summary": "Token baked into VM image."},
+        {"severity": "high", "summary": "Unsafe dependency pinning."},
         {"severity": "low", "summary": "Private cross-module import."},
     ]
 
