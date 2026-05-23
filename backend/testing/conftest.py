@@ -141,6 +141,46 @@ async def db_session():
             await conn.run_sync(SQLModel.metadata.drop_all)
 
 
+@pytest_asyncio.fixture(autouse=True)
+async def _dispose_production_engine_per_test():
+    """Dispose the lazy production engine after every test so its pooled
+    connections never outlive the test's event loop.
+
+    ``app.database.engine`` is a *pooled* engine (``_make_engine``: pool_size=10,
+    pool_recycle=540) created on first use and bound to whatever event loop
+    first touches it.  Code paths that use the production ``AsyncSessionLocal``
+    rather than this module's ``TestingSessionLocal`` — notably the release
+    qualifier's dedicated-session promote chain
+    (``_finalize_in_dedicated_session``), plus assorted background-task helpers
+    in ``agent.py`` / ``admin_pool_accounts.py`` — bind that engine's pool to
+    the loop of whichever test runs first.  Because pytest-asyncio uses a fresh
+    function-scoped event loop per test, a *later* test that touches the same
+    engine on a different loop raises ``got Future <...> attached to a different
+    loop`` / ``Event loop is closed`` — an order-dependent flake (it is exactly
+    why ``test_promote_does_not_commit_caller_unrelated_transaction`` failed in
+    the full suite but passed in isolation).
+
+    Nulling ``_LazyEngine._engine`` forces ``AsyncSessionLocal`` (bound to the
+    lazy proxy) to rebuild a fresh engine on the *next* test's own loop.
+    ``dispose()`` is best-effort cleanup — a pool bound to an already-dead loop
+    may raise, which is harmless once the reference is dropped.  Reaching into
+    ``_LazyEngine._engine`` directly (not via the proxy) avoids re-creating the
+    engine on the teardown loop just to dispose it.
+    """
+    yield
+    import contextlib
+
+    from app import database
+
+    eng = database._LazyEngine._engine
+    if eng is not None:
+        # dispose() may raise if the pool is bound to an already-dead loop —
+        # intentionally ignorable; dropping the reference below is what matters.
+        with contextlib.suppress(Exception):
+            await eng.dispose()
+        database._LazyEngine._engine = None
+
+
 @pytest.fixture(scope="function")
 def override_get_session(db_session):
     """
