@@ -8962,6 +8962,151 @@ async def test_pending_auto_merge_pr_closed_without_merge_drives_to_promotion_fa
     assert version.last_qualification["error"] == "pr_closed_without_merge"
 
 
+# ---------------------------------------------------------------------------
+# get_latest_release_audit_report — observability helper
+#
+# A qualification verdict only persists the composite + sub-scores, and the
+# task API strips artifact logs, so operators are blind to WHY a candidate
+# scored what it did.  This helper surfaces the latest release_audit task's
+# RELEASE_AUDIT_REPORT (audit_score, findings, test_erosion) server-side.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_latest_release_audit_report_none_when_no_audit_task(db_session):
+    """No release_audit task → None (a fresh project has no audit history)."""
+    project, _version = await _make_project_and_version(db_session)
+
+    result = await rq.get_latest_release_audit_report(db_session, project.id)
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_latest_release_audit_report_returns_parsed_report(db_session):
+    """A release_audit task with a RELEASE_AUDIT_REPORT artifact → parsed
+    report plus task metadata (id, status, candidate_sha, created_at)."""
+    project, version = await _make_project_and_version(db_session)
+
+    report_logs = {
+        "audit_score": 0.74,
+        "test_erosion": {
+            "deleted_test_files": [],
+            "assertion_delta": 12,
+            "test_count_delta": 3,
+        },
+        "findings": [
+            {"severity": "high", "description": "Diff is unusually large."},
+        ],
+    }
+    audit_task = Task(
+        project_id=project.id,
+        title="release audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "release_version_id": str(version.id),
+            "candidate_sha": "feed" * 10,
+        },
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+    db_session.add(
+        Artifact(
+            task_id=audit_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps(report_logs),
+        )
+    )
+    await db_session.commit()
+
+    result = await rq.get_latest_release_audit_report(db_session, project.id)
+
+    assert result is not None
+    assert result["audit_task_id"] == str(audit_task.id)
+    assert result["task_status"] == "COMPLETED"
+    assert result["candidate_sha"] == "feed" * 10
+    assert result["created_at"] is not None
+    assert result["report"] == report_logs
+
+
+@pytest.mark.asyncio
+async def test_get_latest_release_audit_report_report_none_when_no_artifact(db_session):
+    """A release_audit task that crashed without posting a report → the task
+    metadata is returned but ``report`` is None (not an error)."""
+    project, _version = await _make_project_and_version(db_session)
+
+    audit_task = Task(
+        project_id=project.id,
+        title="crashed audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        status=TaskStatus.FAILED,
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    result = await rq.get_latest_release_audit_report(db_session, project.id)
+
+    assert result is not None
+    assert result["audit_task_id"] == str(audit_task.id)
+    assert result["task_status"] == "FAILED"
+    assert result["report"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_latest_release_audit_report_picks_most_recent(db_session):
+    """With several release_audit tasks, the most recent (by created_at) wins —
+    so a re-qualification's audit supersedes the prior attempt's."""
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    project, _version = await _make_project_and_version(db_session)
+    base = _utcnow()
+
+    old_task = Task(
+        project_id=project.id,
+        title="old audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_at=base - timedelta(hours=2),
+    )
+    new_task = Task(
+        project_id=project.id,
+        title="new audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_at=base,
+    )
+    # A non-audit task that must be ignored even though it is the newest.
+    other_task = Task(
+        project_id=project.id,
+        title="some smoketest",
+        payloads=[{"type": "smoketest", "base_branch": "automain"}],
+        status=TaskStatus.COMPLETED,
+        created_at=base + timedelta(hours=1),
+    )
+    db_session.add_all([old_task, new_task, other_task])
+    await db_session.commit()
+    await db_session.refresh(new_task)
+    db_session.add(
+        Artifact(
+            task_id=new_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps({"audit_score": 0.91}),
+        )
+    )
+    await db_session.commit()
+
+    result = await rq.get_latest_release_audit_report(db_session, project.id)
+
+    assert result is not None
+    assert result["audit_task_id"] == str(new_task.id)
+    assert result["report"] == {"audit_score": 0.91}
+
+
 @pytest.mark.asyncio
 async def test_pending_auto_merge_pr_ci_red_drives_to_promotion_failed(
     db_session, mocker

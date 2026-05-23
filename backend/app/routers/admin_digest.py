@@ -9700,7 +9700,10 @@ async def get_version_lifecycle(
     and an empty ``recent_versions`` list.
     """
     from app.release_version import count_merged_since  # noqa: PLC0415
-    from app.release_qualifier import compute_promotion_readiness  # noqa: PLC0415
+    from app.release_qualifier import (  # noqa: PLC0415
+        compute_promotion_readiness,
+        get_latest_release_audit_report,
+    )
 
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, min_role="viewer"
@@ -9726,6 +9729,10 @@ async def get_version_lifecycle(
     if open_row is not None:
         merged_count = await count_merged_since(session, project_id, open_row.opened_at)
         qual = open_row.last_qualification or {}
+        # Surface the latest release_audit's actual findings/score so a verdict
+        # is explainable (the verdict record only keeps the composite, and the
+        # task API strips artifact logs — otherwise operators are blind to WHY).
+        latest_audit = await get_latest_release_audit_report(session, project_id)
         current_version_out = {
             "version_number": open_row.version_number,
             "phase": open_row.phase,
@@ -9738,6 +9745,7 @@ async def get_version_lifecycle(
             "qualification_attempts": open_row.qualification_attempts,
             "merged_task_count": merged_count,
             "last_qualification": _format_qualification(qual) if qual else None,
+            "latest_audit": latest_audit,
         }
 
     history_rows = (

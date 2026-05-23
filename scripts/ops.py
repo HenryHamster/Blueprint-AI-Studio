@@ -1160,8 +1160,67 @@ def cmd_regression_cases(args):
         print(f"    class: {cls[:200]}")
 
 
+def cmd_qualify(_args):
+    """Show the release-version qualifier state + the latest audit's findings.
+
+    Usage:
+        ops.py qualify          — current version, last verdict, and WHY
+                                  (the latest release_audit's score + findings)
+    """
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    pid = get_project_id()
+    data = api("GET", f"/api/admin/projects/{pid}/version-lifecycle")
+    cv = data.get("current_version")
+    print("=== RELEASE VERSION ===")
+    if not cv:
+        print("  (no open version)")
+        return
+    print(f"  v{cv.get('version_number')}  phase={cv.get('phase')}  "
+          f"attempts={cv.get('qualification_attempts')}  merged_tasks={cv.get('merged_task_count')}")
+    print(f"  goal: {(cv.get('goal') or '')[:200]}")
+    lq = cv.get("last_qualification") or {}
+    if lq:
+        print("\n=== LAST VERDICT ===")
+        print(f"  status={lq.get('status')}  confidence={lq.get('confidence')}  "
+              f"threshold={lq.get('threshold')}  blocker={lq.get('blocker')}")
+        print(f"  sub_scores: {json.dumps(lq.get('sub_scores') or {})}")
+        if lq.get("ci_resolution"):
+            print(f"  ci_resolution: {json.dumps(lq.get('ci_resolution'))}")
+    audit = cv.get("latest_audit")
+    print("\n=== LATEST AUDIT (why) ===")
+    if not audit:
+        print("  (no release_audit task yet)")
+    else:
+        print(f"  task={audit.get('audit_task_id')}  status={audit.get('task_status')}  "
+              f"candidate={(audit.get('candidate_sha') or '')[:12]}  at={audit.get('created_at')}")
+        rep = audit.get("report")
+        if not rep:
+            print("  report: (none — audit posted no parseable RELEASE_AUDIT_REPORT)")
+        else:
+            print(f"  audit_score: {rep.get('audit_score')}")
+            te = rep.get("test_erosion") or {}
+            print(f"  test_erosion: deleted={te.get('deleted_test_files')} "
+                  f"assertion_delta={te.get('assertion_delta')} test_count_delta={te.get('test_count_delta')}")
+            findings = rep.get("findings") or rep.get("issues") or []
+            print(f"  findings ({len(findings)}):")
+            for f in findings[:20]:
+                if isinstance(f, dict):
+                    sev = f.get("severity") or f.get("level") or ""
+                    txt = f.get("description") or f.get("title") or f.get("text") or json.dumps(f)
+                    print(f"    - [{sev}] {str(txt)[:200]}")
+                else:
+                    print(f"    - {str(f)[:200]}")
+            for k in ("summary", "reasoning", "assessment", "rationale"):
+                if rep.get(k):
+                    print(f"  {k}: {str(rep[k])[:500]}")
+    rd = data.get("promotion_readiness") or {}
+    print(f"\n=== READINESS === ready={rd.get('ready')} reason={(rd.get('reason') or '')[:120]}")
+
+
 COMMANDS = {
     'status': cmd_status,
+    'qualify': cmd_qualify,
     'resume': cmd_resume,
     'pause': cmd_pause,
     'repair': cmd_repair,

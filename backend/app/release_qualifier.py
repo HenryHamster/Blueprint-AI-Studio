@@ -1372,6 +1372,58 @@ async def _latest_artifact_logs(
     return parsed if isinstance(parsed, dict) else None
 
 
+async def get_latest_release_audit_report(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> dict[str, Any] | None:
+    """Return the latest ``release_audit`` task's parsed report for a project.
+
+    Observability: a qualification verdict only persists the composite +
+    sub-scores, and the task API strips artifact ``logs`` — so operators are
+    blind to WHY a candidate scored what it did.  This surfaces the audit
+    agent's actual reasoning (``audit_score``, ``findings``, ``test_erosion``)
+    from the most recent ``release_audit`` task's RELEASE_AUDIT_REPORT artifact.
+
+    Returns ``None`` when no ``release_audit`` task exists yet.  ``report`` is
+    ``None`` when the task ran but posted no parseable report (crashed / killed).
+    """
+    audit_task = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.payloads[0]["type"].as_string() == "release_audit",
+                )
+                .order_by(Task.created_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if audit_task is None:
+        return None
+    report = await _latest_artifact_logs(
+        session, audit_task.id, ArtifactType.RELEASE_AUDIT_REPORT
+    )
+    ctx = audit_task.context or {}
+    status_val = (
+        audit_task.status.value
+        if hasattr(audit_task.status, "value")
+        else str(audit_task.status)
+    )
+    return {
+        "audit_task_id": str(audit_task.id),
+        "task_status": status_val,
+        "candidate_sha": ctx.get("candidate_sha"),
+        "created_at": audit_task.created_at.isoformat()
+        if audit_task.created_at
+        else None,
+        "report": report,
+    }
+
+
 def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | None]:
     """Derive ``(audit_score, test_erosion_score)`` from a RELEASE_AUDIT_REPORT.
 
