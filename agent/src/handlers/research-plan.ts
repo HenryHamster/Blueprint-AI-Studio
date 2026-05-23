@@ -2418,7 +2418,7 @@ echo ""
 
     const pastRetirementCritiquesSection = formatPastRetirementCritiques(payload.past_retirement_critiques);
 
-    const selfImprovementBlock = isSelfRepo ? `
+    const selfImprovementBlock = payload.enable_self_improvement === true ? `
 
 # Self-improvement
 

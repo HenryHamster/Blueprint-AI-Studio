@@ -444,6 +444,70 @@ async def test_agent_heartbeat_accepts_pre_claim_provisioning_task(
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_stamps_cold_start_stage(client: AsyncClient, db_session):
+    """PROVISION_PROGRESS beacons write timestamped entries into
+    task.context['_cold_start_stages'] for per-stage breakdown telemetry.
+    The first beacon for a given stage key wins; subsequent duplicates are ignored.
+    """
+    project = Project(name="Cold Start Stage Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-cold-stage",
+        status=TaskStatus.PROVISIONING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-cold-stage")
+    headers = {"x-agent-token": token}
+
+    # First beacon — creds fetched (maps to beacon_a_at)
+    payload = {
+        "task_id": str(task.id),
+        "status_message": "PROVISION_PROGRESS: creds fetched, entering env setup",
+    }
+    resp = await client.post("/api/agent/heartbeat", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    stages = (task.context or {}).get("_cold_start_stages") or {}
+    assert "beacon_a_at" in stages, (
+        "beacon_a_at must be stamped on creds-fetched beacon"
+    )
+    first_stamp = stages["beacon_a_at"]
+
+    # Second beacon — env materialized (maps to beacon_b_at)
+    payload["status_message"] = (
+        "PROVISION_PROGRESS: env file materialized, preparing payload"
+    )
+    resp = await client.post("/api/agent/heartbeat", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    stages = (task.context or {}).get("_cold_start_stages") or {}
+    assert "beacon_b_at" in stages, (
+        "beacon_b_at must be stamped on env-materialized beacon"
+    )
+
+    # Duplicate beacon_a_at — must not overwrite the first stamp.
+    payload["status_message"] = "PROVISION_PROGRESS: creds fetched, entering env setup"
+    resp = await client.post("/api/agent/heartbeat", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    stages = (task.context or {}).get("_cold_start_stages") or {}
+    assert stages["beacon_a_at"] == first_stamp, (
+        "first-write-wins: duplicate beacon must not overwrite"
+    )
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_count_increments_per_heartbeat(
     client: AsyncClient, db_session
 ):
@@ -689,7 +753,7 @@ async def test_agent_claim_includes_project_metadata(client: AsyncClient, db_ses
     assert pm["project_name"] == "Build Config Test"
     assert pm["github_owner"] == "acme"
     assert pm["github_repo"] == "myapp"
-    assert pm["is_self_repo"] is False
+    assert pm["enable_self_improvement"] is False
     assert pm["build_config"]["test_command"] == "pytest"
 
 

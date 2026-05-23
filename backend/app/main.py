@@ -152,6 +152,11 @@ _ORCHESTRATOR_DELETE_TTL: float = 1800.0  # 30 minutes
 # likely to consult next.
 _ORCHESTRATOR_DELETE_MAX_ENTRIES: int = 5000
 
+# Broadcast alert safety cap — limits the number of projects receiving
+# cross-project broadcast alerts (orchestrator errors, halts, rollbacks, recovery).
+# Single source of truth: changed here and applies to all broadcast helpers.
+_PROJECT_BROADCAST_LIMIT: int = 1000
+
 
 def is_orchestrator_initiated_delete(vm_id: str) -> tuple[bool, str | None]:
     """Return (True, reason) if `vm_id` was deleted by the orchestrator
@@ -952,7 +957,6 @@ async def _create_orchestrator_error_alerts(
         f"The orchestrator has encountered {consecutive_errors} consecutive errors. "
         "The pipeline may be stalled. Check logs for details."
     )
-    _PROJECT_BROADCAST_LIMIT = 1000
     project_ids = (
         (await session.execute(select(Project.id).limit(_PROJECT_BROADCAST_LIMIT)))
         .scalars()
@@ -1010,7 +1014,6 @@ async def _create_halted_alerts(
         f"Halted at: {halted_at.isoformat()}. "
         "Pipeline will auto-recover after 1h cooldown, or manually set max VMs > 0."
     )
-    _PROJECT_BROADCAST_LIMIT = 1000
     project_ids = (
         (await session.execute(select(Project.id).limit(_PROJECT_BROADCAST_LIMIT)))
         .scalars()
@@ -1046,7 +1049,6 @@ async def _create_rollback_alerts(
         f"Deployment automatically rolled back from {rolled_back_from[:8]} "
         f"to {rolled_back_to[:8]}."
     )
-    _PROJECT_BROADCAST_LIMIT = 1000
     project_ids = (
         (await session.execute(select(Project.id).limit(_PROJECT_BROADCAST_LIMIT)))
         .scalars()
@@ -1093,7 +1095,6 @@ async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
     """Create INFO alerts and dismiss existing HALTED ERROR alerts when deployment auto-recovers."""
     recovery_title = "Deployment auto-recovered from HALTED state after 1h cooldown"
     now = _utcnow()
-    _PROJECT_BROADCAST_LIMIT = 1000
     project_ids = (
         (await session.execute(select(Project.id).limit(_PROJECT_BROADCAST_LIMIT)))
         .scalars()

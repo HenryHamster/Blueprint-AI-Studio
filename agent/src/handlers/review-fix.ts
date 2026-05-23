@@ -1502,12 +1502,10 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
   });
 
   // Fresh reviewer pass: read-only second session to catch issues the fix
-  // agent missed. Enabled per-project via project_metadata.enable_fresh_reviewer,
-  // and auto-on for self-repo projects so cycle-over-cycle catch-rate has a
-  // meaningful sample without an operator toggling the flag.
+  // agent missed. Enabled per-project via project_metadata.enable_fresh_reviewer.
   const fixProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
   const freshReviewerEnabled =
-    fixProjectMeta?.enable_fresh_reviewer === true || fixProjectMeta?.is_self_repo === true;
+    fixProjectMeta?.enable_fresh_reviewer === true;
   if (freshReviewerEnabled) {
     const fixTaskTitle = strVal(task.title) || originalPrompt.slice(0, 80) || 'Fix task';
     await runFreshReviewerPass(

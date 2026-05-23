@@ -962,7 +962,7 @@ describe('handleFix — runCodeChangeTask delegation', () => {
     expect(vi.mocked(runCodeChangeTask)).not.toHaveBeenCalled();
   });
 
-  it('runs fresh-reviewer pass when project_metadata.is_self_repo is true and enable_fresh_reviewer is unset', async () => {
+  it('does NOT run fresh-reviewer pass when only is_self_repo is true and enable_fresh_reviewer is unset', async () => {
     vi.mocked(indexMod.git).mockReturnValue(Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n'));
     vi.mocked(indexMod.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
 
@@ -979,7 +979,7 @@ describe('handleFix — runCodeChangeTask delegation', () => {
     const reviewerCall = vi.mocked(indexMod.runClaudeCode).mock.calls.find(
       call => typeof call[0] === 'string' && call[0].includes('You are reviewing a PR'),
     );
-    expect(reviewerCall).toBeDefined();
+    expect(reviewerCall).toBeUndefined();
   });
 
   it('forwards project_context into the fresh-reviewer calibration block when enabled', async () => {

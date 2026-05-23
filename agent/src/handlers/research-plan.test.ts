@@ -1695,15 +1695,14 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('some data');
   });
 
-  it('self-improvement block rendered only when isSelfRepo=true', () => {
+  it('self-improvement block rendered when selfImprovementBlock is non-empty', () => {
     const selfRepoPrompt = buildThinkerPrompt({
       ...base,
-      isSelfRepo: true,
       selfImprovementBlock: '\n\n# Self-improvement\n\nThis project\'s codebase includes your own prompts.',
     });
     expect(selfRepoPrompt).toContain('# Self-improvement');
 
-    const notSelfRepo = buildThinkerPrompt({ ...base, isSelfRepo: false, selfImprovementBlock: '' });
+    const notSelfRepo = buildThinkerPrompt({ ...base, selfImprovementBlock: '' });
     expect(notSelfRepo).not.toContain('# Self-improvement');
   });
 

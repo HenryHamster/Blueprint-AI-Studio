@@ -437,6 +437,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "project_name": {"priority": "critical"},
     "base_branch": {"priority": "critical"},
     "is_self_repo": {"priority": "critical"},
+    "enable_self_improvement": {"priority": "critical"},
     "model": {"priority": "critical"},
     "effort": {"priority": "critical"},
     "prompt_suffix": {"priority": "high"},
@@ -2040,6 +2041,11 @@ async def _spawn_strategic_review(
             "user_last_active_at": user_last_active_at,
             "self_reflection_log": (project.self_reflection_log or [])[-5:],
             "is_self_repo": bool(project.is_self_repo),
+            "enable_self_improvement": bool(
+                (project.build_config or {}).get(
+                    "enable_self_improvement", project.is_self_repo
+                )
+            ),
             "directions_summary": direction_stats,
             "outcome_evaluation": _build_outcome_evaluation(project, cycle_history),
             "recent_interventions": recent_interventions,

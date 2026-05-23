@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 from httpx import AsyncClient
@@ -10,11 +10,14 @@ from httpx import AsyncClient
 from app.efficiency_snapshot import (
     ALL_AXES,
     AXIS_COST_PER_MERGED_PR,
+    AXIS_LLM_COST_PER_MERGED_PR,
     AXIS_MEDIAN_API_CALLS_PER_TASK,
     AXIS_MEDIAN_REVIEW_ITERATIONS,
     AXIS_VM_COLD_START_P50_MS,
     AXIS_VM_REUSE_RATE,
     DESIGN_DOC_KEY,
+    LLM_TOKEN_PRICING,
+    _compute_cold_start_breakdown_p50,
     _last_run_due,
     compute_current_axes,
     maybe_write_daily_snapshot,
@@ -281,8 +284,8 @@ async def test_write_snapshot_migrates_stale_cold_start_baseline(db_session):
     # Old stale value must be gone; re-seeded from the new snapshot.
     assert baseline[AXIS_VM_COLD_START_P50_MS] != stale_cold_start
     assert baseline[AXIS_VM_COLD_START_P50_MS] == 15000.0
-    # Migration marker applied — a v0 baseline chains to the current head (v3).
-    assert baseline["_schema_version"] == 3
+    # Migration marker applied — a v0 baseline chains to the current head (v4).
+    assert baseline["_schema_version"] == 4
     # Other baseline axes must not be clobbered.
     assert baseline[AXIS_COST_PER_MERGED_PR] == 0.01
 
@@ -362,8 +365,8 @@ async def test_write_snapshot_migrates_cold_start_baseline_v2_to_v3(db_session):
     # Stale provision-confirm-anchored value must be gone; re-seeded from new snapshot.
     assert baseline[AXIS_VM_COLD_START_P50_MS] != stale_cold_start
     assert baseline[AXIS_VM_COLD_START_P50_MS] == 25000.0
-    # Schema migrated to v3.
-    assert baseline["_schema_version"] == 3
+    # Schema migrated to v4.
+    assert baseline["_schema_version"] == 4
     # Other baseline axes must not be clobbered.
     assert baseline[AXIS_COST_PER_MERGED_PR] == 0.05
 
@@ -688,8 +691,8 @@ async def test_write_snapshot_migrates_review_iterations_baseline(db_session):
     # Stale value replaced by the corrected snapshot value.
     assert baseline[AXIS_MEDIAN_REVIEW_ITERATIONS] != 4.0
     assert baseline[AXIS_MEDIAN_REVIEW_ITERATIONS] == 2.0
-    # v1 chains through v2 (review-iterations) and v3 (cold-start dispatch fix).
-    assert baseline["_schema_version"] == 3
+    # v1 chains through v2 (review-iterations), v3 (cold-start dispatch fix), and v4 (llm cost).
+    assert baseline["_schema_version"] == 4
     # Other axes must not be clobbered.
     assert baseline[AXIS_COST_PER_MERGED_PR] == 0.01
 
@@ -721,3 +724,260 @@ async def test_write_snapshot_preserves_other_design_doc_keys(db_session):
     assert DESIGN_DOC_KEY in project.design_doc
     # Pre-existing sibling key must be intact.
     assert project.design_doc.get("some_other_key") == {"value": 42}
+
+
+def _make_staged_task(project_id, dispatch_offset_s=0, stages=None, **overrides):
+    """Create a Task with _cold_start_stages populated for breakdown tests."""
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    dispatch_at = now - timedelta(seconds=dispatch_offset_s + 60)
+    defaults = dict(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"_cold_start_stages": stages or {}},
+        vm_dispatched_at=dispatch_at,
+    )
+    defaults.update(overrides)
+    return make_task(**defaults)
+
+
+def test_compute_cold_start_breakdown_p50_basic():
+    """Tasks with full stage timestamps produce correct per-stage p50 values."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    now = datetime(2026, 1, 1, 12, 0, 0)
+
+    def _iso(dt):
+        return dt.isoformat()
+
+    dispatch_at = now
+    # Stage durations (seconds): a=5, b=3, c=2, d=1, e=30, f=10
+    stages = {
+        "beacon_a_at": _iso(now + timedelta(seconds=5)),
+        "beacon_b_at": _iso(now + timedelta(seconds=8)),
+        "beacon_c_at": _iso(now + timedelta(seconds=10)),
+        "beacon_d_at": _iso(now + timedelta(seconds=11)),
+        "startup_complete_at": _iso(now + timedelta(seconds=41)),
+        "claim_at": _iso(now + timedelta(seconds=51)),
+    }
+    t = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"_cold_start_stages": stages},
+        vm_dispatched_at=dispatch_at,
+    )
+
+    result = _compute_cold_start_breakdown_p50([t])
+    assert result is not None
+    assert result["dispatch_to_creds_ms"] == 5000.0
+    assert result["creds_to_env_ms"] == 3000.0
+    assert result["env_to_payload_ms"] == 2000.0
+    assert result["payload_to_systemctl_ms"] == 1000.0
+    assert result["systemctl_to_startup_ms"] == 30000.0
+    assert result["startup_to_claim_ms"] == 10000.0
+
+
+def test_compute_cold_start_breakdown_p50_no_stage_data():
+    """Tasks with no _cold_start_stages context return None."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    t = make_task(project_id=project_id, status=TaskStatus.COMPLETED, context={})
+    assert _compute_cold_start_breakdown_p50([t]) is None
+
+
+def test_compute_cold_start_breakdown_p50_partial_stages():
+    """Tasks missing some beacons produce None for incomplete stage deltas."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    stages = {
+        "beacon_a_at": now.isoformat(),
+        "beacon_b_at": (now + timedelta(seconds=4)).isoformat(),
+        # beacon_c_at..claim_at absent
+    }
+    t = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        context={"_cold_start_stages": stages},
+        vm_dispatched_at=now - timedelta(seconds=10),
+    )
+    result = _compute_cold_start_breakdown_p50([t])
+    assert result is not None
+    assert result["dispatch_to_creds_ms"] == 10000.0
+    assert result["creds_to_env_ms"] == 4000.0
+    assert result["env_to_payload_ms"] is None
+    assert result["systemctl_to_startup_ms"] is None
+    assert result["startup_to_claim_ms"] is None
+
+
+@pytest.mark.asyncio
+async def test_compute_current_axes_includes_breakdown(db_session):
+    """compute_current_axes includes vm_cold_start_breakdown key."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime(2026, 1, 1, 12, 0, 0)
+    stages = {
+        "beacon_a_at": (now + timedelta(seconds=5)).isoformat(),
+        "beacon_b_at": (now + timedelta(seconds=8)).isoformat(),
+        "beacon_c_at": (now + timedelta(seconds=10)).isoformat(),
+        "beacon_d_at": (now + timedelta(seconds=11)).isoformat(),
+        "startup_complete_at": (now + timedelta(seconds=41)).isoformat(),
+        "claim_at": (now + timedelta(seconds=51)).isoformat(),
+    }
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"_cold_start_stages": stages},
+            vm_dispatched_at=now,
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    assert "vm_cold_start_breakdown" in axes
+    breakdown = axes["vm_cold_start_breakdown"]
+    assert breakdown is not None
+    assert breakdown["dispatch_to_creds_ms"] == 5000.0
+    assert breakdown["startup_to_claim_ms"] == 10000.0
+
+
+def test_llm_cost_axis_in_all_axes():
+    assert AXIS_LLM_COST_PER_MERGED_PR in ALL_AXES
+    assert AXIS_LLM_COST_PER_MERGED_PR == "llm_cost_per_merged_pr"
+
+
+@pytest.mark.asyncio
+async def test_llm_token_pricing_known_model(db_session):
+    """Task with known provider/model and token counts produces correct LLM cost per merged PR."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    db_session.add(
+        _make_efficient_task(
+            project.id,
+            api_call_summary={
+                "llm_call_count": 10,
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    expected = round(1000 * input_rate + 500 * output_rate, 6)
+    assert axes[AXIS_LLM_COST_PER_MERGED_PR] == expected
+
+
+@pytest.mark.asyncio
+async def test_llm_token_pricing_unknown_model(db_session):
+    """Task with missing provider/model contributes zero LLM cost and does not crash."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # One merged task with no provider/model — LLM cost should be 0 / 1 merged = 0.0
+    db_session.add(
+        _make_efficient_task(
+            project.id,
+            api_call_summary={
+                "llm_call_count": 10,
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+            },
+            provider=None,
+            model=None,
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    assert axes[AXIS_LLM_COST_PER_MERGED_PR] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_llm_token_pricing_no_token_data(db_session):
+    """Task with no token data in api_call_summary contributes zero LLM cost."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        _make_efficient_task(
+            project.id,
+            api_call_summary={"llm_call_count": 10},
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    assert axes[AXIS_LLM_COST_PER_MERGED_PR] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_schema_version_v3_migrates_llm_axis(db_session):
+    """Existing baseline at schema_version=3 gets llm_cost_per_merged_pr cleared
+    and re-seeded, then bumped to schema_version=4."""
+    project = make_project(
+        design_doc={
+            DESIGN_DOC_KEY: {
+                "baseline": {
+                    "captured_at": "2026-01-01T00:00:00",
+                    AXIS_LLM_COST_PER_MERGED_PR: 9999.0,  # stale / incorrect value
+                    AXIS_COST_PER_MERGED_PR: 0.03,
+                    "_schema_version": 3,
+                },
+                "snapshots": [{"captured_at": "2026-01-01T00:00:00"}],
+                "last_run_at": "2026-01-01T00:00:00",
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    db_session.add(
+        _make_efficient_task(
+            project.id,
+            api_call_summary={
+                "llm_call_count": 5,
+                "total_input_tokens": 2000,
+                "total_output_tokens": 1000,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    await db_session.commit()
+
+    await write_snapshot(db_session, project.id)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    container = project.design_doc[DESIGN_DOC_KEY]
+    baseline = container["baseline"]
+
+    # Stale value must be gone; re-seeded from the new snapshot.
+    assert baseline[AXIS_LLM_COST_PER_MERGED_PR] != 9999.0
+    expected = round(2000 * input_rate + 1000 * output_rate, 6)
+    assert baseline[AXIS_LLM_COST_PER_MERGED_PR] == expected
+    # Schema bumped to v4.
+    assert baseline["_schema_version"] == 4
+    # Other axes untouched.
+    assert baseline[AXIS_COST_PER_MERGED_PR] == 0.03

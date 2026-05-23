@@ -32,6 +32,21 @@ from app.models import Project, Task, TaskStatus, _utcnow
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 from app.task_locking import project_lock
 
+# ---------------------------------------------------------------------------
+# Cold-start stage breakdown (per-stage p50 decomposition)
+# ---------------------------------------------------------------------------
+# Each entry is (source_key, dest_key, metric_label). "vm_dispatched_at" is
+# resolved from Task.vm_dispatched_at; all others are ISO strings written into
+# task.context["_cold_start_stages"] by agent_heartbeat and claim_task.
+_COLD_START_STAGE_PAIRS: tuple[tuple[str, str, str], ...] = (
+    ("vm_dispatched_at", "beacon_a_at", "dispatch_to_creds_ms"),
+    ("beacon_a_at", "beacon_b_at", "creds_to_env_ms"),
+    ("beacon_b_at", "beacon_c_at", "env_to_payload_ms"),
+    ("beacon_c_at", "beacon_d_at", "payload_to_systemctl_ms"),
+    ("beacon_d_at", "startup_complete_at", "systemctl_to_startup_ms"),
+    ("startup_complete_at", "claim_at", "startup_to_claim_ms"),
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -46,6 +61,7 @@ AXIS_VM_COLD_START_P50_MS = "vm_cold_start_p50_ms"
 AXIS_VM_REUSE_RATE = "vm_reuse_rate"
 AXIS_MEDIAN_API_CALLS_PER_TASK = "median_api_calls_per_task"
 AXIS_MEDIAN_REVIEW_ITERATIONS = "median_review_iterations"
+AXIS_LLM_COST_PER_MERGED_PR = "llm_cost_per_merged_pr"
 
 ALL_AXES: tuple[str, ...] = (
     AXIS_COST_PER_MERGED_PR,
@@ -53,7 +69,18 @@ ALL_AXES: tuple[str, ...] = (
     AXIS_VM_REUSE_RATE,
     AXIS_MEDIAN_API_CALLS_PER_TASK,
     AXIS_MEDIAN_REVIEW_ITERATIONS,
+    AXIS_LLM_COST_PER_MERGED_PR,
 )
+
+# LLM token pricing table: (provider, model) -> (input_$/token, output_$/token).
+# Sourced from public Anthropic pricing (2025). Per-token = per-million / 1_000_000.
+# Unknown provider/model combinations are skipped (zero contribution, no crash).
+LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
+    ("anthropic", "claude-opus-4-7"): (15e-6, 75e-6),
+    ("anthropic", "claude-opus-4-6"): (15e-6, 75e-6),
+    ("anthropic", "claude-sonnet-4-6"): (3e-6, 15e-6),
+    ("anthropic", "claude-haiku-4-5-20251001"): (0.8e-6, 4e-6),
+}
 
 DESIGN_DOC_KEY = "efficiency_baseline"
 
@@ -99,6 +126,9 @@ async def _load_recent_tasks(
                 Task.vm_cold_start_ms,
                 Task.vm_warm_start,
                 Task.api_call_summary,
+                Task.vm_dispatched_at,
+                Task.provider,
+                Task.model,
             )
         )
         .limit(5000)
@@ -119,6 +149,31 @@ def _compute_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
     if not merged:
         return None
     return round(total_cost / merged, 4)
+
+
+def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
+    """Total LLM token cost / merged PR count over the window. None when no merges."""
+    total_cost = 0.0
+    merged = 0
+    for t in tasks:
+        summary = t.api_call_summary or {}
+        input_tokens = summary.get("total_input_tokens")
+        output_tokens = summary.get("total_output_tokens")
+        if (
+            isinstance(input_tokens, (int, float))
+            and isinstance(output_tokens, (int, float))
+            and t.provider
+            and t.model
+        ):
+            pricing = LLM_TOKEN_PRICING.get((t.provider.lower(), t.model.lower()))
+            if pricing:
+                input_rate, output_rate = pricing
+                total_cost += input_tokens * input_rate + output_tokens * output_rate
+        if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
+            merged += 1
+    if not merged:
+        return None
+    return round(total_cost / merged, 6)
 
 
 def _compute_vm_cold_start_p50_ms(tasks: list[Task]) -> Optional[float]:
@@ -182,10 +237,60 @@ def _compute_median_review_iterations(tasks: list[Task]) -> Optional[float]:
     return round(float(statistics.median(iters)), 2)
 
 
+def _parse_stage_ts(val: Any) -> Optional[datetime]:
+    """Parse a stage timestamp (datetime or ISO string) to a naive datetime."""
+    if isinstance(val, datetime):
+        return val.replace(tzinfo=None) if val.tzinfo is not None else val
+    if isinstance(val, str):
+        try:
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _compute_cold_start_breakdown_p50(
+    tasks: list[Task],
+) -> Optional[Dict[str, Optional[float]]]:
+    """Per-stage p50 ms breakdown of the VM cold-start interval.
+
+    Returns None when no tasks have any stage data.  Individual stage values
+    are None when fewer than one sample exists for that stage.
+    """
+    stage_samples: Dict[str, list[float]] = {
+        label: [] for _, _, label in _COLD_START_STAGE_PAIRS
+    }
+    for t in tasks:
+        stages: Dict[str, Any] = dict((t.context or {}).get("_cold_start_stages") or {})
+        if not stages:
+            continue
+        if t.vm_dispatched_at is not None:
+            stages["vm_dispatched_at"] = t.vm_dispatched_at
+        for src_key, dst_key, label in _COLD_START_STAGE_PAIRS:
+            if src_key not in stages or dst_key not in stages:
+                continue
+            t_src = _parse_stage_ts(stages[src_key])
+            t_dst = _parse_stage_ts(stages[dst_key])
+            if t_src is None or t_dst is None:
+                continue
+            delta_ms = (t_dst - t_src).total_seconds() * 1000
+            if 0 <= delta_ms < 300_000:  # sanity: cap at 5 min per stage
+                stage_samples[label].append(delta_ms)
+    if not any(stage_samples.values()):
+        return None
+    return {
+        label: round(float(statistics.median(stage_samples[label])), 2)
+        if stage_samples[label]
+        else None
+        for _, _, label in _COLD_START_STAGE_PAIRS
+    }
+
+
 async def compute_current_axes(
     session: AsyncSession, project_id: uuid.UUID
-) -> Dict[str, Optional[float]]:
-    """Compute the five efficiency axes from recent terminal tasks."""
+) -> Dict[str, Any]:
+    """Compute all efficiency axes (plus cold-start breakdown) from recent terminal tasks."""
     tasks = await _load_recent_tasks(session, project_id)
     return {
         AXIS_COST_PER_MERGED_PR: _compute_cost_per_merged_pr(tasks),
@@ -193,6 +298,8 @@ async def compute_current_axes(
         AXIS_VM_REUSE_RATE: _compute_vm_reuse_rate(tasks),
         AXIS_MEDIAN_API_CALLS_PER_TASK: _compute_median_api_calls_per_task(tasks),
         AXIS_MEDIAN_REVIEW_ITERATIONS: _compute_median_review_iterations(tasks),
+        AXIS_LLM_COST_PER_MERGED_PR: _compute_llm_cost_per_merged_pr(tasks),
+        "vm_cold_start_breakdown": _compute_cold_start_breakdown_p50(tasks),
     }
 
 
@@ -245,6 +352,13 @@ async def write_snapshot(
             if baseline.get("_schema_version") == 2:
                 baseline[AXIS_VM_COLD_START_P50_MS] = None
                 baseline["_schema_version"] = 3
+            # One-time migration: baselines captured before LLM token pricing was
+            # added (schema_version 3) may have been seeded with a VM-only cost
+            # value under the llm_cost_per_merged_pr key. Clear and re-seed so
+            # current-vs-baseline drift is apples-to-apples.
+            if baseline.get("_schema_version") == 3:
+                baseline[AXIS_LLM_COST_PER_MERGED_PR] = None
+                baseline["_schema_version"] = 4
             # Re-seed any individual axes that were cleared (e.g. by the migration
             # above) once a valid current value is available.
             for axis in ALL_AXES:
@@ -323,6 +437,7 @@ async def read_baseline_with_drift(
         "axes": axes,
         "baseline_captured_at": baseline.get("captured_at"),
         "last_snapshot_at": container.get("last_run_at") or latest.get("captured_at"),
+        "vm_cold_start_breakdown": latest.get("vm_cold_start_breakdown"),
     }
 
 

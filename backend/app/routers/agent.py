@@ -888,9 +888,12 @@ async def claim_task(
         _cold_start_anchor = task.vm_dispatched_at or task.vm_provisioned_at
         if _cold_start_anchor:
             claim_latency = (task.last_heartbeat - _cold_start_anchor).total_seconds()
+            _stgs = dict((task.context or {}).get("_cold_start_stages") or {})
+            _stgs["claim_at"] = task.last_heartbeat.isoformat()
             task.context = {
                 **(task.context or {}),
                 "claim_latency_secs": round(claim_latency, 1),
+                "_cold_start_stages": _stgs,
             }
             # Promote claim_latency to the dedicated vm_cold_start_ms column
             # for the efficiency direction (d-91d8dede). Guarded by IS NULL
@@ -932,9 +935,11 @@ async def claim_task(
             "project_name": project.name,
             "github_owner": project.github_owner,
             "github_repo": project.github_repo,
-            "is_self_repo": project.is_self_repo,
             "build_config": _build_cfg,
             "enable_fresh_reviewer": _build_cfg.get("enable_fresh_reviewer", False),
+            "enable_self_improvement": bool(
+                _build_cfg.get("enable_self_improvement", project.is_self_repo)
+            ),
         }
 
     task_type = task.first_payload.get("type", "")
@@ -3280,6 +3285,18 @@ async def get_viewport_failure_screenshot_upload_url(
     return {"upload_url": upload_url, "storage_uri": storage_uri}
 
 
+# Beacon prefix → _cold_start_stages key mapping for per-stage breakdown.
+# Prefixes mirror compute_startup_script.py beacon strings; checked on every
+# heartbeat that carries a status_message matching one of these prefixes.
+_COLD_START_BEACON_MAP: dict[str, str] = {
+    "PROVISION_PROGRESS: creds fetched": "beacon_a_at",
+    "PROVISION_PROGRESS: env file materialized": "beacon_b_at",
+    "PROVISION_PROGRESS: payload ready": "beacon_c_at",
+    "PROVISION_PROGRESS: reached systemctl phase": "beacon_d_at",
+    "Startup script completed": "startup_complete_at",
+}
+
+
 @router.post("/heartbeat")
 @limiter.limit("600/minute")
 async def agent_heartbeat(
@@ -3369,6 +3386,14 @@ async def agent_heartbeat(
                 token.get("vm_instance_id"),
                 msg[:300],
             )
+        # Stamp per-stage cold-start timestamps for breakdown telemetry.
+        for _beacon_prefix, _stage_key in _COLD_START_BEACON_MAP.items():
+            if msg.startswith(_beacon_prefix):
+                _stgs = dict((task.context or {}).get("_cold_start_stages") or {})
+                if _stage_key not in _stgs:
+                    _stgs[_stage_key] = _utcnow().isoformat()
+                    task.context = {**(task.context or {}), "_cold_start_stages": _stgs}
+                break
     # Heartbeat counter (R4-W2 H1+H2+H3+M10): increment on EVERY heartbeat
     # (hoisted out of the metrics-conditional block — metrics-less heartbeats
     # were never advancing the counter, biasing the audit-trail gate). ORM
