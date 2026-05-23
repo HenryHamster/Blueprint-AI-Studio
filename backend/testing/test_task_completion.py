@@ -4231,6 +4231,145 @@ class TestHandleInvestigationCompletion:
         assert memo.status == TaskStatus.QUEUED
         assert memo.created_by == "ORCHESTRATOR"
 
+    @pytest.mark.asyncio
+    async def test_false_positive_memo_source_finding_contains_verdict_reason(
+        self, db_session, mocker
+    ):
+        """False-positive memo payload source_finding carries the actual verdict_reason,
+        not just the generic topic — ensures memo agent writes real reasoning."""
+        from sqlmodel import select as _select
+
+        from app.models import (
+            RegressionCaseStatus,
+            RegressionRemediationCase,
+        )
+
+        mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        regression_class = "sr_catch_rate:correctness"
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class=regression_class,
+            status=RegressionCaseStatus.ACTIVE,
+            hit_count=1,
+        )
+        db_session.add(case)
+        await db_session.commit()
+        await db_session.refresh(case)
+
+        task = make_task(
+            project_id=project.id,
+            context={
+                "spawned_by": "pipeline_regression_dispatcher",
+                "regression_class": regression_class,
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        verdict_reason_text = (
+            "design_doc explicitly documents partial backend test coverage; "
+            "this is intentional, not a regression"
+        )
+        verdict_report = json.dumps(
+            {
+                "summary": "Step skipped per design doc",
+                "root_cause": "",
+                "affected_files": [],
+                "recommended_fix": "",
+                "severity": "low",
+                "confidence": "high",
+                "verdict": "not_a_regression",
+                "verdict_reason": verdict_reason_text,
+            }
+        )
+        await _handle_investigation_completion(
+            task, self._payload(verdict_report), db_session
+        )
+        await db_session.commit()
+
+        all_tasks = (
+            (
+                await db_session.execute(
+                    _select(Task).where(Task.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        memos = [
+            t
+            for t in all_tasks
+            if t.id != task.id
+            and (t.context or {}).get("memo_reasoning_kind")
+            == "regression_false_positive"
+        ]
+        assert len(memos) == 1
+        memo = memos[0]
+        source_finding = (memo.first_payload or {}).get("source_finding") or {}
+        assert "verdict_reason" in source_finding, (
+            "source_finding must carry verdict_reason so memo captures real reasoning"
+        )
+        assert "design_doc" in source_finding["verdict_reason"]
+        assert source_finding.get("regression_class") == regression_class
+
+    @pytest.mark.asyncio
+    async def test_unactionable_investigation_memo_source_finding_contains_root_cause(
+        self, db_session, mocker
+    ):
+        """Investigation-unactionable memo source_finding carries root_cause —
+        ensures memo captures real reasoning rather than a generic topic."""
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id, context={"direction_id": "dir-invest-1"}
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        root_cause_text = (
+            "Deadlock in the rollup coordinator: two workers acquire locks "
+            "in opposite order, creating a cycle"
+        )
+        await _handle_investigation_completion(
+            task,
+            self._payload(
+                self._report(
+                    root_cause=root_cause_text,
+                    recommended_fix="",
+                    confidence="high",
+                )
+            ),
+            db_session,
+        )
+        await db_session.commit()
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1
+        memo = children[0]
+        assert memo.first_payload["type"] == "memo"
+        source_finding = (memo.first_payload or {}).get("source_finding") or {}
+        assert "root_cause" in source_finding, (
+            "source_finding must carry root_cause so memo captures real reasoning"
+        )
+        assert "Deadlock" in source_finding["root_cause"]
+        assert source_finding.get("outcome") == "no_actionable_fix"
+
 
 # ── _clear_direction_diagnosis_flag ─────────────────────────────────────────
 

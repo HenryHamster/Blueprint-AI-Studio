@@ -14208,12 +14208,13 @@ async def test_false_positive_verdict_spawns_memo_task(db_session):
     assert memo.context.get("memo_case_id") == str(case.id)
     assert memo.context.get("memo_source_task_id") == str(inv_task.id)
 
-    # Verify memo payload has the reasoning
+    # Verify memo payload has the reasoning via source_finding (the channel the memo agent reads)
     memo_payload = memo.first_payload
     assert memo_payload.get("type") == "memo"
     assert memo_payload.get("reasoning_kind") == "regression_false_positive"
-    assert memo_payload.get("regression_class") == "sr_catch_rate"
-    assert "intentional" in memo_payload.get("verdict_reason", "").lower()
+    sf = memo_payload.get("source_finding") or {}
+    assert sf.get("regression_class") == "sr_catch_rate"
+    assert "intentional" in sf.get("verdict_reason", "").lower()
 
 
 @pytest.mark.asyncio
@@ -14404,6 +14405,168 @@ async def test_dispatcher_prompt_documents_verdict_triage(db_session):
     assert "intentional" in prompt or "intended" in prompt
     assert "known-incomplete pipeline step" in prompt
     assert "verdict_reason" in prompt
+
+
+@pytest.mark.asyncio
+async def test_investigation_unactionable_memo_contains_source_finding(
+    db_session, mocker
+):
+    """When investigation concludes with no actionable fix, memo source_finding contains
+    the actual root_cause, summary, and recommended_fix from the diagnosis."""
+    from types import SimpleNamespace
+    import json as _json
+    from app.task_completion import _handle_investigation_completion
+
+    mocker.patch("app.task_completion.broadcast_to_project", new=mocker.AsyncMock())
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    investigation = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["regression_class"].as_string() == "sr_catch_rate",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert investigation is not None
+
+    # Diagnosis with no actionable fix (no recommended_fix) — triggers the
+    # unactionable memo pathway.
+    diagnosis = {
+        "summary": "Catch-rate dip is due to an intentional prompt simplification.",
+        "root_cause": "The self-review prompt was simplified last cycle, reducing coverage of edge cases.",
+        "recommended_fix": "",
+        "confidence": "high",
+        "severity": "low",
+        "verdict": "not_a_regression",
+        "verdict_reason": "The dip is intentional; the simplified prompt was an accepted trade-off.",
+        "affected_files": [],
+    }
+    await _handle_investigation_completion(
+        investigation,
+        SimpleNamespace(logs=_json.dumps(diagnosis)),
+        db_session,
+    )
+    await db_session.commit()
+
+    # The false-positive path returns early and spawns a regression_false_positive memo,
+    # not an investigation_unactionable one. Assert that path instead.
+    memo_tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["memo_reasoning_kind"].as_string()
+                    == "regression_false_positive",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(memo_tasks) == 1, "Expected exactly one false-positive memo"
+    memo = memo_tasks[0]
+    sf = (memo.first_payload or {}).get("source_finding") or {}
+    assert "intentional" in sf.get("verdict_reason", "").lower(), (
+        f"verdict_reason not in source_finding: {sf}"
+    )
+    assert sf.get("regression_class") == "sr_catch_rate"
+
+
+@pytest.mark.asyncio
+async def test_investigation_no_fix_unactionable_memo_source_finding(
+    db_session, mocker
+):
+    """When investigation finds a root cause but no recommended fix, the
+    unactionable memo's source_finding carries the actual root_cause and summary."""
+    from types import SimpleNamespace
+    import json as _json
+    from app.task_completion import _handle_investigation_completion
+
+    mocker.patch("app.task_completion.broadcast_to_project", new=mocker.AsyncMock())
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    investigation = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["regression_class"].as_string() == "sr_catch_rate",
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert investigation is not None
+
+    # Diagnosis with no recommended_fix → no_actionable_fix path → unactionable memo
+    specific_root_cause = (
+        "Catch-rate decay is structural: test coverage gap in the evaluator harness."
+    )
+    specific_summary = (
+        "SR catch rate dropped because evaluator harness misses edge-case scenarios."
+    )
+    diagnosis = {
+        "summary": specific_summary,
+        "root_cause": specific_root_cause,
+        "recommended_fix": "",
+        "confidence": "high",
+        "severity": "medium",
+        "affected_files": [],
+    }
+    await _handle_investigation_completion(
+        investigation,
+        SimpleNamespace(logs=_json.dumps(diagnosis)),
+        db_session,
+    )
+    await db_session.commit()
+
+    memo_tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["memo_reasoning_kind"].as_string()
+                    == "investigation_unactionable",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(memo_tasks) == 1, "Expected exactly one unactionable memo"
+    memo = memo_tasks[0]
+    sf = (memo.first_payload or {}).get("source_finding") or {}
+    assert "structural" in sf.get("root_cause", "").lower(), (
+        f"root_cause not in source_finding: {sf}"
+    )
+    assert "evaluator harness" in sf.get("summary", "").lower(), (
+        f"summary not in source_finding: {sf}"
+    )
+    assert sf.get("outcome") == "no_actionable_fix"
 
 
 # ---------------------------------------------------------------------------

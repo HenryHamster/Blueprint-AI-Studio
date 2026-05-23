@@ -1055,13 +1055,24 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         .scalars()
         .all()
     )
-    # Build set of finding hashes already memoed to prevent duplicate memo spawns
-    # across research cycles for the same underlying finding.
-    _existing_memo_finding_hashes: set[str] = {
-        h
-        for t in recent_tasks_for_dedup
-        if (h := (t.context or {}).get("memo_source_finding_hash"))
-    }
+    # Bounded projecting query for memo dedup — avoids filtering the full 90-day
+    # task scan in Python by projecting only the JSONB field we need.
+    _memo_hash_rows = (
+        (
+            await session.execute(
+                select(Task.context["memo_source_finding_hash"].as_string())
+                .where(
+                    Task.project_id == task.project_id,
+                    Task.created_at >= ninety_days_ago,
+                    Task.context["memo_source_finding_hash"].as_string().isnot(None),
+                )
+                .limit(500)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    _existing_memo_finding_hashes: set[str] = {h for h in _memo_hash_rows if h}
     # Collect parent IDs for COMPLETED+pr_merged tasks to detect ghost merges
     # (code merged to staging branch but parent rollup PR to main failed)
     potential_ghost_parent_ids = {

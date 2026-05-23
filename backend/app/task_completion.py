@@ -3205,7 +3205,9 @@ async def _spawn_regression_false_positive_memo(
         return None
 
     # Prepare memo payload with reasoning
-    summary = (task.first_payload or {}).get("prompt", "")[:500] or "(no summary)"
+    investigation_summary = (task.first_payload or {}).get("prompt", "")[
+        :500
+    ] or "(no summary)"
     direction_id = (task.context or {}).get("direction_id")
     memo_topic = f"Regression {regression_class[:80]}: not a real regression"
     memo_payload = validate_internal_payload(
@@ -3213,11 +3215,14 @@ async def _spawn_regression_false_positive_memo(
             "type": "memo",
             "topic": memo_topic,
             "reasoning_kind": "regression_false_positive",
-            "regression_class": regression_class,
-            "verdict_reason": verdict_reason[:1000] or "(no reason provided)",
-            "investigation_summary": summary,
+            "source_task_id": str(task.id),
             **({"direction_id": direction_id} if direction_id else {}),
-            "case_id": str(case_id),
+            "source_finding": {
+                "regression_class": regression_class,
+                "verdict_reason": verdict_reason[:1000] or "(no reason provided)",
+                "investigation_summary": investigation_summary,
+                "case_id": str(case_id),
+            },
         },
         "task_completion:memo:regression_false_positive",
     )
@@ -3731,26 +3736,37 @@ async def _handle_investigation_completion(
         )
         # Dedup: skip if a memo for this investigation task already exists.
         _memo_window = _utcnow() - timedelta(days=30)
-        _dedup_result = await session.execute(
-            select(Task).where(
-                Task.project_id == task.project_id,
-                Task.created_at >= _memo_window,
+        _already_has_memo = (
+            await session.execute(
+                select(Task.id)
+                .where(
+                    Task.project_id == task.project_id,
+                    Task.created_at >= _memo_window,
+                    Task.context["memo_source_task_id"].as_string() == str(task.id),
+                    Task.context["memo_reasoning_kind"].as_string()
+                    == "investigation_unactionable",
+                )
+                .limit(1)
             )
-        )
-        _already_has_memo = any(
-            (t.context or {}).get("memo_source_task_id") == str(task.id)
-            and (t.context or {}).get("memo_reasoning_kind")
-            == "investigation_unactionable"
-            for t in _dedup_result.scalars().all()
-        )
+        ).first() is not None
         if not _already_has_memo:
             _memo_topic = (summary[:120] or f"Investigation: {_outcome_label}")[:200]
+            _inv_source_finding: Dict[str, Any] = {
+                "outcome": _outcome_label,
+                "summary": summary[:500],
+                "root_cause": root_cause[:2000],
+            }
+            if recommended_fix:
+                _inv_source_finding["recommended_fix"] = recommended_fix[:500]
+            if affected_paths:
+                _inv_source_finding["affected_paths"] = affected_paths[:10]
             _inv_memo_payload = validate_internal_payload(
                 {
                     "type": "memo",
                     "topic": _memo_topic,
                     "reasoning_kind": "investigation_unactionable",
                     "source_task_id": str(task.id),
+                    "source_finding": _inv_source_finding,
                     **({"direction_id": direction_id} if direction_id else {}),
                 },
                 "task_completion:memo:investigation_unactionable",
