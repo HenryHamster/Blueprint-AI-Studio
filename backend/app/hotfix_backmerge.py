@@ -186,7 +186,15 @@ async def open_backmerge_pr(
     hotfix_task_id_str = str(hotfix_task_id) if hotfix_task_id is not None else None
     trigger_desc = _describe_trigger(merged_pr_url, hotfix_task_id_str)
 
-    project = await session.get(Project, project_id)
+    # populate_existing=True forces a fresh SELECT instead of returning a
+    # possibly-expired identity-map hit. The branch-reconciliation service
+    # (lifecycle._branch_reconciliation_service) reuses one long-lived session
+    # across all projects, committing/rolling back per iteration — both expire
+    # identity-map instances. Without the refresh, a later `project.github_owner`
+    # read in _resolve_github_with_session lazy-loads under async and raises
+    # MissingGreenlet, crash-looping the reconciler (so main→automain never
+    # back-merges and the branches silently diverge).
+    project = await session.get(Project, project_id, populate_existing=True)
     if project is None:
         logger.warning(
             "[BACKMERGE] open_backmerge_pr: project %s not found",
@@ -319,8 +327,31 @@ async def open_backmerge_pr(
 
     msg = merge_result.get("message", "merge not completed")
 
-    # 6. Conflict (409) — raise an Alert AND spawn a conflict-resolution plan.
-    if merge_result.get("conflict"):
+    # 6. Conflict — raise an Alert AND spawn a conflict-resolution plan.
+    #    merge_pull_request flags an explicit 409 conflict, but a PR that is
+    #    ALREADY dirty/conflicting returns 405 "not mergeable" (so ``conflict``
+    #    is unset).  Without also consulting the PR's ``mergeable_state`` such a
+    #    genuinely-conflicting back-merge falls through to the generic "blocked"
+    #    path below and spins there forever — alerting every cycle but NEVER
+    #    spawning a resolver (observed on PR #5277).  So when the merge didn't
+    #    land and wasn't flagged a conflict, fetch the PR and treat
+    #    ``mergeable_state == "dirty"`` as a conflict too.
+    is_conflict = bool(merge_result.get("conflict"))
+    if not is_conflict:
+        try:
+            pr_detail = await github.get_pull_request(
+                token, owner, repo, pr_number, project_id=str(project_id)
+            )
+            if str(pr_detail.get("mergeable_state") or "").lower() == "dirty":
+                is_conflict = True
+        except Exception as exc:  # noqa: BLE001 — best-effort; fall through to blocked
+            logger.debug(
+                "[BACKMERGE] could not read mergeable_state for PR #%s: %s",
+                pr_number,
+                exc,
+            )
+
+    if is_conflict:
         logger.warning(
             "[BACKMERGE] back-merge PR #%s for project %s hit a merge "
             "conflict: %s",
