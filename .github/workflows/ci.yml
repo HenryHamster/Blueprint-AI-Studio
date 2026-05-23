@@ -1,13 +1,20 @@
 name: CI
 
-# Trigger on PR events only — branch-protection requires PR CI to pass before
-# merge, so the previous post-merge `push: branches: [main]` run was redundant
-# and ~50% of CI minutes were duplicate. Re-add the push trigger if integration
-# issues from merge-time semantic conflicts start slipping past PR CI.
+# Triggers: PR events (branch-protection gate) + push to MAIN only. The push
+# trigger was dropped earlier when the suite was ~15 min (post-merge run was a
+# redundant ~50% of CI minutes); now that the backend suite is sharded to ~4
+# min it's re-enabled, and main pushes are rare (promotions only) so the cost is
+# negligible. The main push run activates the per-shard baseline save + the
+# testmon-cache refresh (both gated on push+main) and gives a definitive
+# post-promotion green signal. NOT enabled on automain: that fires on every
+# rollup merge (frequent) and is already covered by the qualifier's candidate-CI
+# check before promotion.
 on:
   pull_request:
     branches: [main, automain]
     types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [main]
   workflow_dispatch:
 
 # Cancel superseded runs when a new commit lands on the same PR. Autonomous
