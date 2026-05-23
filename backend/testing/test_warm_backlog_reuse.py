@@ -42,13 +42,13 @@ async def _make_project(db_session, name="Backlog Reuse"):
 
 
 async def _make_backlog_task(db_session, project_id, **overrides):
-    defaults = dict(
-        project_id=project_id,
-        title="Queued backlog work",
-        payloads=[{"type": "create", "prompt": "do X", "base_branch": "automain"}],
-        status=TaskStatus.QUEUED,
-        context={"scope": "small"},
-    )
+    defaults = {
+        "project_id": project_id,
+        "title": "Queued backlog work",
+        "payloads": [{"type": "create", "prompt": "do X", "base_branch": "automain"}],
+        "status": TaskStatus.QUEUED,
+        "context": {"scope": "small"},
+    }
     defaults.update(overrides)
     task = Task(**defaults)
     db_session.add(task)
@@ -94,6 +94,9 @@ class _FlagGuard:
                 self._rc[key] = prior
         self._ss.warm_backlog_first_refusal.clear()
         self._ss.warm_backlog_first_refusal.update(self._prior_refusal)
+        # Reset circuit-breaker state so tests don't bleed into each other.
+        self._ss.warm_backlog_reuse_failure_events.clear()
+        self._ss.warm_backlog_reuse_suppressed_until = None
         return False
 
 
@@ -460,3 +463,63 @@ async def test_backlog_reused_task_lifts_efficiency_axes(
         assert axes[AXIS_VM_COLD_START_P50_MS] == 12000.0
         assert cold.vm_cold_start_ms == 12000
         assert backlog.vm_cold_start_ms is None
+
+
+# ---------------------------------------------------------------------------
+# Circuit-breaker tests
+# ---------------------------------------------------------------------------
+
+
+def test_backlog_reuse_circuit_breaker_suppresses_after_threshold():
+    """Injecting >= threshold failures trips the breaker and suppresses reuse."""
+    import app.shared_state as ss
+
+    ss.warm_backlog_reuse_failure_events.clear()
+    ss.warm_backlog_reuse_suppressed_until = None
+    threshold = ss.runtime_config.get("warm_backlog_reuse_failure_rate_threshold", 5)
+    try:
+        for _ in range(threshold):
+            ss.record_backlog_reuse_failure("task_failed")
+        assert ss.count_recent_backlog_reuse_failures() >= threshold
+        assert ss.is_warm_backlog_reuse_suppressed() is True
+        assert ss.warm_backlog_reuse_suppressed_until is not None
+    finally:
+        ss.warm_backlog_reuse_failure_events.clear()
+        ss.warm_backlog_reuse_suppressed_until = None
+
+
+def test_backlog_reuse_circuit_breaker_clears_after_cooldown():
+    """With an expired suppression deadline the breaker clears on the next check."""
+    from datetime import timedelta
+
+    import app.shared_state as ss
+    from app.time_utils import _utcnow
+
+    ss.warm_backlog_reuse_failure_events.clear()
+    # Set suppression deadline in the past so the breaker is "expired".
+    ss.warm_backlog_reuse_suppressed_until = _utcnow() - timedelta(seconds=1)
+    try:
+        # No recent failures — below threshold — so breaker should clear.
+        result = ss.is_warm_backlog_reuse_suppressed()
+        assert result is False
+        assert ss.warm_backlog_reuse_suppressed_until is None
+    finally:
+        ss.warm_backlog_reuse_failure_events.clear()
+        ss.warm_backlog_reuse_suppressed_until = None
+
+
+def test_backlog_reuse_finalize_error_records_failure():
+    """record_backlog_reuse_failure increments the event count (used from finalize error path)."""
+    import app.shared_state as ss
+
+    ss.warm_backlog_reuse_failure_events.clear()
+    ss.warm_backlog_reuse_suppressed_until = None
+    try:
+        assert ss.count_recent_backlog_reuse_failures() == 0
+        ss.record_backlog_reuse_failure("finalize_error")
+        assert ss.count_recent_backlog_reuse_failures() == 1
+        ss.record_backlog_reuse_failure("task_failed")
+        assert ss.count_recent_backlog_reuse_failures() == 2
+    finally:
+        ss.warm_backlog_reuse_failure_events.clear()
+        ss.warm_backlog_reuse_suppressed_until = None

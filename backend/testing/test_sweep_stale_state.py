@@ -206,4 +206,5 @@ class TestSweepSummary:
             "vm_last_heartbeat",
             "warm_pin_clear_events",
             "warm_backlog_first_refusal",
+            "warm_backlog_reuse_failure_events",
         }

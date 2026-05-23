@@ -3783,7 +3783,10 @@ async def next_role(
     # skipped and behavior is byte-for-byte the pre-existing chain-only path —
     # including, on no claim, the chain-fork exit / 204 so no idle VM is kept
     # alive when there is no genuine pending work to reuse it for.
-    if _shared_state.runtime_config.get("warm_backlog_reuse_enabled", False):
+    if (
+        _shared_state.runtime_config.get("warm_backlog_reuse_enabled", False)
+        and not _shared_state.is_warm_backlog_reuse_suppressed()
+    ):
         _project_claim = token.get("project_id")
         _project_uuid = None
         if _project_claim:
@@ -3803,12 +3806,16 @@ async def next_role(
                 session, _project_uuid, req.vm_instance_id
             )
             if backlog_task is not None:
-                result = await _finalize_warm_claim(
-                    session,
-                    backlog_task,
-                    req.vm_instance_id,
-                    origin="backlog_reuse",
-                )
+                try:
+                    result = await _finalize_warm_claim(
+                        session,
+                        backlog_task,
+                        req.vm_instance_id,
+                        origin="backlog_reuse",
+                    )
+                except Exception:
+                    _shared_state.record_backlog_reuse_failure("finalize_error")
+                    raise
                 logger.info(
                     f"[NEXT-ROLE] Warm-start claim (backlog_reuse): "
                     f"task={result['task_id']} vm={req.vm_instance_id} "

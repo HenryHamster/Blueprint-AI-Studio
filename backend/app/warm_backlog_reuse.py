@@ -3,7 +3,8 @@
 Extends the existing warm-VM continuity mechanism so an idle agent VM can
 claim the next eligible QUEUED task from its project's GENERAL backlog --
 not only a PR-chain follow-on pinned to its VM. Gated by the runtime config
-flag ``warm_backlog_reuse_enabled`` (default OFF), independent from
+flag ``warm_backlog_reuse_enabled`` (default ON, guarded by the
+is_warm_backlog_reuse_suppressed() circuit breaker), independent from
 ``warm_continuity_enabled``.
 
 This module owns the *eligibility* and *atomic selection* for a backlog

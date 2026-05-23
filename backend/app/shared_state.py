@@ -404,8 +404,18 @@ runtime_config: Dict = {
     # project's general backlog via /api/agent/next-role and run it warm —
     # not only a PR-chain-pinned follow-on. Independently switchable from
     # warm_continuity_enabled so it can be enabled, observed, and rolled back
-    # on its own. Defaults to False — feature ships dark.
-    "warm_backlog_reuse_enabled": False,
+    # on its own. Defaults to True — idle VMs claim eligible backlog work warm
+    # instead of tearing down and forcing a cold provision; guarded by the
+    # is_warm_backlog_reuse_suppressed() circuit breaker which auto-disables
+    # reuse when the backlog-origin failure rate is elevated.
+    "warm_backlog_reuse_enabled": True,
+    # Circuit-breaker thresholds for warm-backlog reuse. When backlog-origin
+    # claims result in FAILED tasks (or claim/finalize errors) exceeding the
+    # threshold within a 1h rolling window, backlog reuse is auto-suppressed
+    # for the cooldown before resuming. Mirrors warm_pin_clear_rate_threshold /
+    # warm_continuity_cooldown_seconds for the chain-continuity breaker.
+    "warm_backlog_reuse_failure_rate_threshold": 5,
+    "warm_backlog_reuse_cooldown_seconds": 1800,
     # Maximum seconds the agent waits in /api/agent/next-role polling before
     # falling through to the normal exit path. Bounded by the warm-handoff
     # window and the typical role transition cadence; tunable down for
@@ -690,6 +700,8 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "direction_lifetime_non_merge_threshold",
                     "warm_pin_clear_rate_threshold",
                     "warm_continuity_cooldown_seconds",
+                    "warm_backlog_reuse_failure_rate_threshold",
+                    "warm_backlog_reuse_cooldown_seconds",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))
@@ -1126,6 +1138,61 @@ def is_warm_continuity_suppressed() -> bool:
         )
         return True
     warm_continuity_suppressed_until = None
+    return False
+
+
+# --- Warm backlog-reuse circuit breaker (efficiency direction d-91d8dede) ---
+# Each entry: (timestamp, reason). Sustained failures → auto-suppression
+# for a bounded cooldown before the backlog-reuse path resumes.
+# Bounded deque; pruned by sweep_stale_in_memory_state.
+warm_backlog_reuse_failure_events: deque = deque(maxlen=200)
+
+# Auto-suppression deadline set by is_warm_backlog_reuse_suppressed() when the
+# failure rate exceeds warm_backlog_reuse_failure_rate_threshold. None = not suppressed.
+warm_backlog_reuse_suppressed_until: datetime | None = None
+
+
+def record_backlog_reuse_failure(reason: str = "task_failed") -> None:
+    """Record a backlog-reuse failure event (FAILED task or finalize error).
+
+    Called from the /next-role finalize-error path and from agent_status when
+    a FAILED task originated from a backlog_reuse warm claim.
+    """
+    warm_backlog_reuse_failure_events.append((_utcnow(), reason))
+
+
+def count_recent_backlog_reuse_failures(window_seconds: int = 3600) -> int:
+    """Count backlog-reuse failure events in the trailing window."""
+    cutoff = _utcnow() - timedelta(seconds=window_seconds)
+    return sum(1 for ts, _ in warm_backlog_reuse_failure_events if ts >= cutoff)
+
+
+def is_warm_backlog_reuse_suppressed() -> bool:
+    """True iff warm-backlog reuse is auto-suppressed by the failure circuit breaker.
+
+    Checks the recent failure rate against the configured threshold. When the
+    rate exceeds the threshold, sets a suppression window so callers fall back
+    to cold provisioning until the cooldown expires and the rate normalises.
+    """
+    global warm_backlog_reuse_suppressed_until
+    now = _utcnow()
+    if (
+        warm_backlog_reuse_suppressed_until is not None
+        and now < warm_backlog_reuse_suppressed_until
+    ):
+        return True
+    threshold = runtime_config.get("warm_backlog_reuse_failure_rate_threshold", 5)
+    recent_failures = count_recent_backlog_reuse_failures(3600)
+    if recent_failures >= threshold:
+        cooldown = runtime_config.get("warm_backlog_reuse_cooldown_seconds", 1800)
+        warm_backlog_reuse_suppressed_until = now + timedelta(seconds=cooldown)
+        logger.warning(
+            f"[BACKLOG_REUSE] Circuit breaker tripped: {recent_failures} failure events "
+            f"in last hour (threshold {threshold}). Suppressed until "
+            f"{warm_backlog_reuse_suppressed_until.isoformat()}."
+        )
+        return True
+    warm_backlog_reuse_suppressed_until = None
     return False
 
 
@@ -1676,6 +1743,17 @@ def sweep_stale_in_memory_state() -> Dict[str, int]:
         if deadline < now:
             del warm_backlog_first_refusal[pid]
             pruned["warm_backlog_first_refusal"] += 1
+
+    # Backlog reuse failure events: bounded deque (maxlen=200) auto-evicts;
+    # prune events older than 24h so count_recent_backlog_reuse_failures stays cheap.
+    backlog_failure_cutoff = now - timedelta(hours=24)
+    pruned["warm_backlog_reuse_failure_events"] = 0
+    while (
+        warm_backlog_reuse_failure_events
+        and warm_backlog_reuse_failure_events[0][0] < backlog_failure_cutoff
+    ):
+        warm_backlog_reuse_failure_events.popleft()
+        pruned["warm_backlog_reuse_failure_events"] += 1
 
     return pruned
 

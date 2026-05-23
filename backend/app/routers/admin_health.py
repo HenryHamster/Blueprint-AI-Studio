@@ -375,6 +375,34 @@ async def _compute_health_overview(
                 }
             )
 
+    # --- 4c. Warm-backlog reuse circuit breaker ---
+    if _shared_state.runtime_config.get("warm_backlog_reuse_enabled", False):
+        if _shared_state.is_warm_backlog_reuse_suppressed():
+            sup_until = _shared_state.warm_backlog_reuse_suppressed_until
+            failures = _shared_state.count_recent_backlog_reuse_failures(3600)
+            threshold = _shared_state.runtime_config.get(
+                "warm_backlog_reuse_failure_rate_threshold", 5
+            )
+            cooldown_min = (
+                _shared_state.runtime_config.get(
+                    "warm_backlog_reuse_cooldown_seconds", 1800
+                )
+                // 60
+            )
+            sup_str = sup_until.strftime("%H:%M UTC") if sup_until else "unknown"
+            actionable_issues.append(
+                {
+                    "severity": "warning",
+                    "title": "Warm-backlog reuse circuit breaker open — falling back to cold provisioning",
+                    "hint": (
+                        f"{failures} backlog-reuse failure events in last hour exceeded threshold ({threshold}). "
+                        f"Auto-resumes at {sup_str} (~{cooldown_min} min cooldown)."
+                    ),
+                    "task_ids": [],
+                    "category": "warm_backlog_reuse_circuit_breaker",
+                }
+            )
+
     # --- 5. External dependency health ---
     failed_deps = external_health.get("failed_deps", [])
     if failed_deps:
@@ -770,6 +798,8 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
 
     cb_suppressed = _shared_state.is_warm_continuity_suppressed()
     suppressed_until = _shared_state.warm_continuity_suppressed_until
+    backlog_cb_suppressed = _shared_state.is_warm_backlog_reuse_suppressed()
+    backlog_suppressed_until = _shared_state.warm_backlog_reuse_suppressed_until
     return {
         "active_vms": active_vms_out,
         "warm_pin_metrics": {
@@ -785,6 +815,18 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
             else None,
             "clear_rate_threshold": int(
                 _shared_state.runtime_config.get("warm_pin_clear_rate_threshold", 10)
+            ),
+            "backlog_reuse_circuit_breaker_suppressed": backlog_cb_suppressed,
+            "backlog_reuse_suppressed_until": backlog_suppressed_until.isoformat()
+            if backlog_suppressed_until
+            else None,
+            "backlog_reuse_failures_last_hour": _shared_state.count_recent_backlog_reuse_failures(
+                3600
+            ),
+            "backlog_reuse_failure_rate_threshold": int(
+                _shared_state.runtime_config.get(
+                    "warm_backlog_reuse_failure_rate_threshold", 5
+                )
             ),
         },
         "warm_continuity_enabled": bool(

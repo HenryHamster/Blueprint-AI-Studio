@@ -2189,6 +2189,14 @@ async def update_agent_status(
         if not _teardown_deferred:
             fire_and_forget_vm_delete(old_vm_id, reason="agent_completion")
 
+        # Backlog-reuse circuit breaker: if this FAILED task was originally
+        # claimed via the warm-backlog path, record a failure event so the
+        # circuit breaker can suppress backlog reuse if failures accumulate.
+        if payload.status == TaskStatus.FAILED:
+            _timing_ctx = (task.context or {}).get("_timing", {})
+            if _timing_ctx.get("warm_claim_origin") == "backlog_reuse":
+                _shared_state.record_backlog_reuse_failure("task_failed")
+
         # Open-PR handoff: if a previous attempt already pushed a branch and
         # opened a PR, retrying from scratch will collide with the agent's
         # stale-branch guard (agent/src/index.ts setupWorkspace) which throws
