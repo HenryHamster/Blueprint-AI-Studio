@@ -10557,3 +10557,116 @@ async def test_payload_too_large_writes_vision_bloat_marker(db_session, mocker):
     assert len(contributors) >= 1
     assert contributors[0]["key"] == "design_doc"
     assert contributors[0]["size"] == 250000
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Direction reasoning memo injection
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_direction_reasoning_memos_injected_into_research_payload(
+    db_session, mocker
+):
+    """Research task payload includes direction_reasoning_memos when memo tasks exist for the direction."""
+    direction_id = "d-memo-inject01"
+    direction = _active_direction(direction_id, "Improve coverage")
+    project = Project(
+        name="Memo Injection Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a completed memo task associated with this direction
+    memo_task = Task(
+        project_id=project.id,
+        title="Memo: investigation unactionable",
+        payloads=[{"type": "memo", "topic": "structural issue, no actionable fix"}],
+        context={
+            "memo_reasoning_kind": "investigation_unactionable",
+            "investigation_outcome": "structural",
+            "investigation_summary": "Root cause is structural — no targeted fix exists.",
+            "direction_id": direction_id,
+        },
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(memo_task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.autonomous_research._should_dispatch_self_audit", return_value=None
+    )
+    mocker.patch("app.autonomous_research._spawn_self_audit_task", return_value=False)
+    mocker.patch(
+        "app.anomaly_detection.check_anomaly_actions", return_value={"action": "none"}
+    )
+    mocker.patch("app.strategic_spawning._spawn_strategic_review", return_value=False)
+    mocker.patch("app.strategic_spawning._spawn_design_doc_update", return_value=False)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != memo_task.id,
+            Task.payloads[0]["type"].as_string() == "research",
+        )
+    )
+    research_task = result.scalars().first()
+    assert research_task is not None, "Research task should have been spawned"
+    payload = research_task.first_payload
+    memos = payload.get("direction_reasoning_memos")
+    assert memos is not None, "direction_reasoning_memos should be present in payload"
+    assert len(memos) == 1
+    assert memos[0]["kind"] == "investigation_unactionable"
+    assert memos[0]["outcome"] == "structural"
+    assert "structural" in memos[0]["summary"]
+
+
+@pytest.mark.asyncio
+async def test_direction_reasoning_memos_absent_when_no_memos(db_session, mocker):
+    """Research task payload omits direction_reasoning_memos when no memo tasks exist."""
+    direction_id = "d-memo-absent01"
+    direction = _active_direction(direction_id, "Improve coverage")
+    project = Project(
+        name="No Memo Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.autonomous_research._should_dispatch_self_audit", return_value=None
+    )
+    mocker.patch("app.autonomous_research._spawn_self_audit_task", return_value=False)
+    mocker.patch(
+        "app.anomaly_detection.check_anomaly_actions", return_value={"action": "none"}
+    )
+    mocker.patch("app.strategic_spawning._spawn_strategic_review", return_value=False)
+    mocker.patch("app.strategic_spawning._spawn_design_doc_update", return_value=False)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.payloads[0]["type"].as_string() == "research",
+        )
+    )
+    research_task = result.scalars().first()
+    assert research_task is not None, "Research task should have been spawned"
+    payload = research_task.first_payload
+    assert "direction_reasoning_memos" not in payload, (
+        "direction_reasoning_memos should not be present when no memos exist"
+    )

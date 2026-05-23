@@ -3807,6 +3807,29 @@ async def _handle_investigation_completion(
                 _outcome_label,
             )
 
+        # Persist verdict on the regression case so the next investigation
+        # receives it as context. Only runs for dispatcher-spawned tasks.
+        _spawned_by = (task.context or {}).get("spawned_by")
+        if _spawned_by == "pipeline_regression_dispatcher":
+            from app.models import RegressionRemediationCase  # noqa: PLC0415
+
+            _unactionable_regression_class = (task.context or {}).get(
+                "regression_class"
+            )
+            if _unactionable_regression_class:
+                _case_result = await session.execute(
+                    select(RegressionRemediationCase).where(
+                        RegressionRemediationCase.project_id == task.project_id,
+                        RegressionRemediationCase.regression_class
+                        == _unactionable_regression_class,
+                    )
+                )
+                _case_row = _case_result.scalar_one_or_none()
+                if _case_row is not None:
+                    _case_row.last_unactionable_verdict = _outcome_label
+                    _case_row.last_unactionable_summary = summary[:500] or None
+                    session.add(_case_row)
+
     session.add(task)
 
     if spawned_child is not None:

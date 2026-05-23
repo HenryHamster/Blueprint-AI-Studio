@@ -73,6 +73,7 @@ from app.dispatcher_formatters import (
     _format_fragile_recurrence_meta_prompt,
     _format_layer_concentration_prompt,
     _format_prior_attempt_context,
+    _format_prior_verdict_context,
     _format_recurrence_meta_prompt,
     _format_recurring_class_prompt,
     _format_reviewer_sla_stall_prompt,
@@ -4417,6 +4418,10 @@ async def _maybe_spawn(
         )
     if fast_tracking_failed_remediation:
         prompt += await _format_prior_failure_context(existing_case, session)
+    if existing_case is not None and (
+        existing_case.false_positive_reason or existing_case.last_unactionable_verdict
+    ):
+        prompt += _format_prior_verdict_context(existing_case)
 
     # Determine case-level escalation reason for operator visibility.
     if signal_name == "layer_concentration":

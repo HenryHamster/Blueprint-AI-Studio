@@ -71,6 +71,70 @@ from app.self_audit_dispatch import (  # noqa: E402 — re-export block follows 
 )
 
 
+async def _fetch_direction_reasoning_memos(
+    project_id,
+    direction_id: str,
+    session: AsyncSession,
+    *,
+    cap: int = 5,
+    days: int = 90,
+) -> list[dict]:
+    """Fetch recent COMPLETED memo tasks for a specific direction.
+
+    Returns a compact list so research agents can avoid re-proposing work
+    already documented as unactionable (investigation_unactionable,
+    direction_retirement, outcome_scaffolding, etc.).
+    """
+    from sqlalchemy import or_
+
+    cutoff = _utcnow() - timedelta(days=days)
+    rows = (
+        (
+            await session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                    Task.payloads[0]["type"].as_string() == "memo",
+                    Task.created_at >= cutoff,
+                    or_(
+                        Task.context["direction_id"].as_string() == direction_id,
+                        Task.context["memo_source_direction_id"].as_string()
+                        == direction_id,
+                    ),
+                )
+                .order_by(Task.created_at.desc())
+                .limit(cap)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    result = []
+    for t in rows:
+        ctx = t.context or {}
+        plan = t.plan_output if isinstance(t.plan_output, dict) else {}
+        memo = plan.get("memo") if isinstance(plan.get("memo"), dict) else {}
+        summary = str((memo or {}).get("summary") or "")
+        if not summary:
+            summary = (
+                ctx.get("investigation_summary")
+                or ctx.get("retirement_rationale")
+                or (t.first_payload or {}).get("topic")
+                or ""
+            )
+        result.append(
+            {
+                "task_id": str(t.id),
+                "kind": ctx.get("memo_reasoning_kind", ""),
+                "outcome": ctx.get("investigation_outcome", ""),
+                "summary": str(summary)[:400],
+            }
+        )
+    return result
+
+
 async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     """Inner implementation — always called under the per-project spawn lock."""
     from app.main import _maybe_create_circuit_breaker_alert
@@ -1158,6 +1222,12 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 research_payload["completion_suggestion"] = chosen_direction.get(
                     "completion_suggestion", ""
                 )
+            if current_dir_id:
+                _dir_memos = await _fetch_direction_reasoning_memos(
+                    project.id, current_dir_id, session
+                )
+                if _dir_memos:
+                    research_payload["direction_reasoning_memos"] = _dir_memos
         if chosen_direction is None:
             if anomalies:
                 research_payload["anomaly_signals"] = anomalies

@@ -1970,6 +1970,22 @@ class RegressionRemediationCase(SQLModel, table=True):
         default=None,
         sa_column=Column(String(40), nullable=True),
     )
+    # Outcome label from the most recent unactionable investigation
+    # (structural / no_actionable_fix / low_confidence / no_direction).
+    # Written by task_completion when investigation_unactionable memo fires.
+    # Persists as historical context: a later FALSE_POSITIVE verdict does
+    # NOT clear this field, so _format_prior_verdict_context may emit both
+    # the false-positive block and this unactionable block for the same case.
+    last_unactionable_verdict: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+    # Brief summary (≤500 chars) from the most recent unactionable investigation.
+    # Fed back to the next investigation prompt so it can skip already-ruled-out paths.
+    last_unactionable_summary: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False),

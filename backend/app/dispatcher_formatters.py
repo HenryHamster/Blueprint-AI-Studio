@@ -174,6 +174,56 @@ def _format_prior_attempt_context(
     return "\n".join(lines)
 
 
+def _format_prior_verdict_context(case: RegressionRemediationCase) -> str:
+    """Build a PRIOR INVESTIGATION VERDICT block to prepend to re-spawned investigations.
+
+    Fires when the case has either a stored false-positive reason or a prior
+    unactionable verdict, so the new investigation can skip already-ruled-out
+    paths and focus on whether anything has changed since the prior finding.
+
+    The block is intentionally framed as informational — the investigator must
+    re-verify the prior conclusion against current evidence and may escalate if
+    new facts warrant it.
+    """
+    parts: list[str] = []
+
+    fp_reason = case.false_positive_reason
+    unactionable_verdict = case.last_unactionable_verdict
+    unactionable_summary = case.last_unactionable_summary
+
+    if not fp_reason and not unactionable_verdict:
+        return ""
+
+    parts.append("")
+    parts.append("PRIOR INVESTIGATION VERDICT")
+    parts.append(
+        "A previous investigation of this regression class reached the following "
+        "conclusion. Treat this as context, not a hard constraint — if current "
+        "evidence shows the situation has changed, escalate accordingly."
+    )
+
+    if fp_reason:
+        parts.append("")
+        parts.append("Prior verdict: NOT A REGRESSION (false positive)")
+        parts.append(f"Reason: {fp_reason}")
+
+    if unactionable_verdict and unactionable_summary:
+        parts.append("")
+        parts.append(f"Prior verdict: UNACTIONABLE ({unactionable_verdict})")
+        parts.append(f"Summary: {unactionable_summary}")
+    elif unactionable_verdict:
+        parts.append("")
+        parts.append(f"Prior verdict: UNACTIONABLE ({unactionable_verdict})")
+
+    parts.append("")
+    parts.append(
+        "Verify whether the prior conclusion still holds given current evidence. "
+        "If the signal has shifted or new information is available, treat this as "
+        "a genuine recurrence requiring fresh investigation."
+    )
+    return "\n".join(parts)
+
+
 def _parse_dispatcher_dt(value: Any) -> datetime | None:
     if value is None:
         return None

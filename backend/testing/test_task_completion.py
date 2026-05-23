@@ -4232,6 +4232,90 @@ class TestHandleInvestigationCompletion:
         assert memo.created_by == "ORCHESTRATOR"
 
     @pytest.mark.asyncio
+    async def test_unactionable_writes_verdict_to_regression_case(
+        self, db_session, mocker
+    ):
+        """Unactionable investigation for a dispatcher-spawned task writes
+        last_unactionable_verdict and last_unactionable_summary to the case row."""
+        from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+        mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        regression_class = "sr_catch_rate:correctness"
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class=regression_class,
+            status=RegressionCaseStatus.ACTIVE,
+            hit_count=1,
+        )
+        db_session.add(case)
+        await db_session.commit()
+        await db_session.refresh(case)
+
+        task = make_task(
+            project_id=project.id,
+            context={
+                "spawned_by": "pipeline_regression_dispatcher",
+                "regression_class": regression_class,
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        # No recommended_fix → outcome = no_actionable_fix
+        await _handle_investigation_completion(
+            task,
+            self._payload(
+                self._report(
+                    summary="signal is intentional design behavior",
+                    recommended_fix="",
+                    confidence="high",
+                )
+            ),
+            db_session,
+        )
+        await db_session.commit()
+        await db_session.refresh(case)
+
+        assert case.last_unactionable_verdict == "no_actionable_fix"
+        assert case.last_unactionable_summary == "signal is intentional design behavior"
+
+    @pytest.mark.asyncio
+    async def test_unactionable_noop_when_case_row_absent(self, db_session, mocker):
+        """When no matching RegressionRemediationCase exists, the unactionable path
+        completes without raising (case update is silently skipped)."""
+        mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = make_task(
+            project_id=project.id,
+            context={
+                "spawned_by": "pipeline_regression_dispatcher",
+                "regression_class": "nonexistent_class",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        # Should not raise even though there's no matching case row.
+        await _handle_investigation_completion(
+            task,
+            self._payload(self._report(recommended_fix="", confidence="high")),
+            db_session,
+        )
+        await db_session.commit()
+        assert task.status == TaskStatus.COMPLETED
+
+    @pytest.mark.asyncio
     async def test_false_positive_memo_source_finding_contains_verdict_reason(
         self, db_session, mocker
     ):

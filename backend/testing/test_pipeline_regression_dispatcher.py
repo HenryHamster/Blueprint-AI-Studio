@@ -14408,6 +14408,88 @@ async def test_dispatcher_prompt_documents_verdict_triage(db_session):
 
 
 @pytest.mark.asyncio
+async def test_prior_fp_verdict_injected_into_prompt_on_rearm(db_session):
+    """When a FALSE_POSITIVE case re-arms (TTL lapsed) the spawned investigation
+    prompt includes the prior false-positive reason in a PRIOR INVESTIGATION
+    VERDICT block so the agent can verify whether the prior conclusion still holds."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Expired false-positive case with a stored reason.
+    prior_reason = "documented design — partial backend test run is intentional"
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.FALSE_POSITIVE,
+        false_positive_until_at=_utcnow() - timedelta(minutes=5),
+        false_positive_reason=prior_reason,
+        hit_count=1,
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    new_task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
+    prompt = (new_task.first_payload or {}).get("prompt", "")
+    assert "PRIOR INVESTIGATION VERDICT" in prompt
+    assert prior_reason in prompt
+    assert "NOT A REGRESSION" in prompt
+
+
+@pytest.mark.asyncio
+async def test_prior_unactionable_verdict_injected_into_prompt_on_respawn(db_session):
+    """When a case has last_unactionable_verdict set, the spawned investigation
+    prompt includes a PRIOR INVESTIGATION VERDICT block with the unactionable outcome."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        design_doc=_design_doc_with_sr_regression(category="correctness"),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_summary = "signal variance too small to be a real regression shift"
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        last_unactionable_verdict="no_actionable_fix",
+        last_unactionable_summary=prior_summary,
+        hit_count=3,
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    spawned = await run_once(db_session, project.id)
+    assert spawned == 1
+
+    new_task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .first()
+    )
+    prompt = (new_task.first_payload or {}).get("prompt", "")
+    assert "PRIOR INVESTIGATION VERDICT" in prompt
+    assert "no_actionable_fix" in prompt
+    assert prior_summary in prompt
+
+
+@pytest.mark.asyncio
 async def test_investigation_unactionable_memo_contains_source_finding(
     db_session, mocker
 ):
