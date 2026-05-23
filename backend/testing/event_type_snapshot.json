@@ -129,17 +129,26 @@
     {
       "name": "release_calcifying",
       "classification": "high_signal",
+      "message_type": "NOTE",
       "source_fn": "post_version_calcification_message"
     },
     {
       "name": "release_build_stalled",
       "classification": "high_signal",
+      "message_type": "NOTE",
       "source_fn": "post_version_build_stalled_message"
     },
     {
       "name": "release_stabilize_stalled",
       "classification": "high_signal",
+      "message_type": "NOTE",
       "source_fn": "post_version_stabilize_stalled_message"
+    },
+    {
+      "name": "release_ci_unresolved_stall",
+      "classification": "high_signal",
+      "message_type": "NOTE",
+      "source_fn": "post_version_ci_unresolved_stall_message"
     },
     {
       "name": "direction_burn_pause",
@@ -164,6 +173,12 @@
       "classification": "high_signal",
       "message_type": "NOTE",
       "source_fn": "post_version_promotion_readiness_message"
+    },
+    {
+      "name": "release_auto_merge_stalled",
+      "classification": "high_signal",
+      "message_type": "NOTE",
+      "source_fn": "post_version_auto_merge_stall_message"
     }
   ]
 }

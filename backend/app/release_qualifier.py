@@ -87,8 +87,10 @@ from app.models import (
 )
 from app.notification_dispatch import (
     post_event_message,
+    post_version_auto_merge_stall_message,
     post_version_build_stalled_message,
     post_version_calcification_message,
+    post_version_ci_unresolved_stall_message,
     post_version_promotion_readiness_message,
     post_version_stabilize_stalled_message,
 )
@@ -214,6 +216,12 @@ _MAX_QUALIFICATION_DURATION_SECONDS = 6 * 60 * 60
 # the issue is not transient and the version is genuinely stuck.
 _MIN_CALCIFICATION_ATTEMPTS = 3
 
+# Minimum consecutive qualifier infrastructure errors (FAILED/CANCELLED
+# required child tasks) before raising a dedicated infra-failure alert.
+# Mirrors _MIN_CALCIFICATION_ATTEMPTS: three consecutive infra failures
+# strongly suggest the qualifier pipeline itself (agent VM / clone) is broken.
+_MIN_INFRA_ERROR_STREAK = 3
+
 # Build-phase calcification thresholds — the backstop for the OTHER end of the
 # lifecycle from _check_version_calcification.  build→stabilize is entirely
 # agent-driven (the strategic agent must emit a version_phase_decision); there
@@ -235,6 +243,11 @@ _BUILD_STALL_MERGED_TASKS = 40
 # progressing stabilize phase.  EITHER trigger fires the alert.
 _STABILIZE_STALL_AGE_DAYS = 14
 _STABILIZE_STALL_MERGED_TASKS = 40
+
+# How long a promotion PR may await auto-merge before the stall alert fires.
+# main's required checks can legitimately take a while (queue, slow suites),
+# but 4 hours is generous; a genuinely-stuck PR should be visible by then.
+_AUTO_MERGE_STALL_SECONDS = 4 * 3600
 
 
 def _is_build_stalled(age_days: int, merged_count: int) -> bool:
@@ -273,14 +286,6 @@ async def _qualification_in_flight(
     be spawning).
     """
     qual = version.last_qualification or {}
-    if qual.get("status") == "promoting":
-        # A promotion PR is enrolled in the CI-merge pipeline (awaiting CI then
-        # merge).  Treat as in flight so a re-emitted qualify_request / reaper
-        # sweep does not spawn a duplicate qualification or a second promotion
-        # PR while the merge is pending.  The terminal transition is
-        # finalize_promotion_landed (→ promoted) or
-        # revert_promotion_after_ci_failure (→ stabilize).
-        return True
     if qual.get("status") != "pending":
         return False
 
@@ -374,13 +379,16 @@ def compute_composite(
     policy: dict[str, Any],
     *,
     smoketest_enabled: bool = True,
+    ci_state: str = "red",  # _CI_RED — defined later in module; use literal here
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
 
     Hard blockers — each forces ``confidence = 0.0`` and ``promote = False``.
     They are evaluated in this order, and ``blocker`` reports the first match:
-      * ``not ci_green``           — CI is not green on the candidate SHA
+      * ``not ci_green`` + ``ci_state == _CI_RED``  — confirmed failing build
         (``"ci_not_green"``).
+      * ``not ci_green`` + ``ci_state != _CI_RED``  — CI could not be evaluated
+        (pending, no check-runs, or I/O degraded) (``"ci_unresolved"``).
       * ``smoketest_score`` is None — the smoketest never produced a usable
         score, treated as a startup-suite failure
         (``"smoketest_startup_failed"``).  ONLY checked when
@@ -450,7 +458,10 @@ def compute_composite(
     # audit report itself was present (audit_score not None).
     blocker: str | None = None
     if not ci_green:
-        blocker = "ci_not_green"
+        # Distinguish a confirmed red build from an unresolved CI state (pending,
+        # no check-runs, or GitHub I/O degraded).  Only a real red build is a
+        # quality blocker; unresolved CI is a resolution/infrastructure concern.
+        blocker = "ci_not_green" if ci_state == _CI_RED else "ci_unresolved"
     elif smoketest_enabled and smoketest_score is None:
         # Only a hard blocker when the smoketest subsystem was actually
         # enabled — a disabled subsystem legitimately produces no score.
@@ -575,6 +586,219 @@ async def _resolve_github_with_session(
         )
         return None
     return token, owner, repo
+
+
+# ---------------------------------------------------------------------------
+# Qualifier-scoped CI resolution — the real-green-build gate.
+#
+# The qualifier must NOT treat the CI dimension as green unless a real,
+# completed, green build exists for the exact candidate commit.  Two project
+# realities make a naive check unreliable:
+#
+#   * CI (.github/workflows/ci.yml) runs only on ``pull_request`` events —
+#     there is no push trigger.  A freshly-merged ``automain`` HEAD commit
+#     therefore carries NO check-runs of its own; the check-runs that actually
+#     verified the change live on the head commit of the PR that introduced it.
+#   * the shared ``github.get_check_runs`` helper fails OPEN on an empty
+#     check-runs list (so the orchestrator's CI-wait does not hang on no-CI
+#     repos).  Inheriting that here would let a candidate score CI-green purely
+#     from the ABSENCE of any signal.
+#
+# This resolver scopes a stricter interpretation to the qualifier only — it
+# passes ``treat_missing_as_success=False`` so an empty check-runs list is
+# distinguishable, and resolves CI through the candidate's PR head when the
+# candidate carries no checks of its own.  The shared helper's global
+# fail-open behaviour is unchanged for every other caller.
+# ---------------------------------------------------------------------------
+
+# CI resolution states for a qualifier candidate commit.
+_CI_GREEN = "green"  # a real completed, all-passing build exists
+_CI_RED = "red"  # a completed build with at least one failure
+_CI_PENDING = "pending"  # checks in progress, or no check-runs found anywhere
+_CI_NO_CHECKS = "no_checks"  # the commit itself carries no check-runs
+
+
+def _classify_check_runs(result: dict[str, Any] | None) -> str:
+    """Map a strict ``get_check_runs`` result to a qualifier CI state."""
+    if not isinstance(result, dict):
+        return _CI_PENDING
+    status = result.get("status")
+    if status == "no_checks":
+        return _CI_NO_CHECKS
+    if status == "completed":
+        conclusion = result.get("conclusion")
+        if conclusion == "success":
+            return _CI_GREEN
+        if conclusion == "failure":
+            return _CI_RED
+        return _CI_PENDING
+    return _CI_PENDING
+
+
+async def _resolve_candidate_ci(
+    token: str,
+    owner: str,
+    repo: str,
+    candidate_sha: str,
+    *,
+    project_id: str | None = None,
+) -> dict[str, Any]:
+    """Resolve the *real* CI verdict for a release-qualifier candidate commit.
+
+    Resolution order:
+      1. Inspect check-runs on ``candidate_sha`` itself, in strict mode (an
+         empty list is NOT a pass).  A completed green/red build here is
+         authoritative — return it.  Checks still in progress → pending.
+      2. When the candidate carries no check-runs of its own, look up the PR(s)
+         that introduced it (``commits/{sha}/pulls``) and evaluate check-runs
+         on the PR head commit — that is where ``pull_request``-triggered CI
+         actually ran.
+
+    Returns ``{"state": str, "ci_green": bool, "resolved_sha": str | None,
+    "detail": str}`` — ``ci_green`` is True ONLY for the ``green`` state.
+    Never raises: any GitHub I/O failure degrades to the ``pending`` state.
+    """
+    if not candidate_sha:
+        return {
+            "state": _CI_PENDING,
+            "ci_green": False,
+            "resolved_sha": None,
+            "detail": "no candidate sha",
+        }
+
+    # --- Step 1: check-runs on the candidate commit itself -----------------
+    try:
+        direct = await github.get_check_runs_cached(
+            token,
+            owner,
+            repo,
+            candidate_sha,
+            project_id=project_id,
+            treat_missing_as_success=False,
+        )
+    except Exception as exc:  # noqa: BLE001 — CI fetch failure → not-green/pending
+        logger.warning(
+            "[RELEASE_QUALIFIER] CI check-runs fetch failed for %s/%s@%s: %s",
+            owner,
+            repo,
+            candidate_sha[:8],
+            exc,
+        )
+        return {
+            "state": _CI_PENDING,
+            "ci_green": False,
+            "resolved_sha": candidate_sha,
+            "detail": f"candidate check-runs fetch failed: {exc}",
+        }
+
+    direct_state = _classify_check_runs(direct)
+    if direct_state in (_CI_GREEN, _CI_RED):
+        return {
+            "state": direct_state,
+            "ci_green": direct_state == _CI_GREEN,
+            "resolved_sha": candidate_sha,
+            "detail": f"candidate commit check-runs: {direct_state}",
+        }
+    if direct_state == _CI_PENDING:
+        return {
+            "state": _CI_PENDING,
+            "ci_green": False,
+            "resolved_sha": candidate_sha,
+            "detail": "check-runs in progress on the candidate commit",
+        }
+
+    # --- Step 2: resolve through the PR that introduced the candidate ------
+    # direct_state == _CI_NO_CHECKS: the candidate has no check-runs of its own.
+    try:
+        prs = await github.list_pull_requests_for_commit(
+            token, owner, repo, candidate_sha, project_id=project_id
+        )
+    except Exception as exc:  # noqa: BLE001 — PR lookup failure → not-green/pending
+        logger.warning(
+            "[RELEASE_QUALIFIER] PR-for-commit lookup failed for %s/%s@%s: %s",
+            owner,
+            repo,
+            candidate_sha[:8],
+            exc,
+        )
+        return {
+            "state": _CI_PENDING,
+            "ci_green": False,
+            "resolved_sha": None,
+            "detail": f"pr-for-commit lookup failed: {exc}",
+        }
+
+    # Prefer merged PRs; fall back to every associated PR when none carry merged_at.
+    merged_prs = [pr for pr in prs if isinstance(pr, dict) and pr.get("merged_at")]
+    use_prs = merged_prs or [pr for pr in prs if isinstance(pr, dict)]
+    head_shas: list[str] = []
+    for pr in use_prs:
+        head = pr.get("head")
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        if head_sha and head_sha != candidate_sha and head_sha not in head_shas:
+            head_shas.append(head_sha)
+
+    if not head_shas:
+        return {
+            "state": _CI_PENDING,
+            "ci_green": False,
+            "resolved_sha": None,
+            "detail": "no check-runs on candidate and no PR head with CI",
+        }
+
+    # Exhaustive RED-preferring sweep: inspect every PR head before deciding.
+    # A red on ANY head must win over a green on another head regardless of the
+    # order GitHub returns them — return green only when at least one head is
+    # green AND no associated head is red.
+    first_red_sha: str | None = None
+    first_green_sha: str | None = None
+    for head_sha in head_shas:
+        try:
+            pr_checks = await github.get_check_runs_cached(
+                token,
+                owner,
+                repo,
+                head_sha,
+                project_id=project_id,
+                treat_missing_as_success=False,
+            )
+        except Exception as exc:  # noqa: BLE001 — keep trying remaining PR heads
+            logger.warning(
+                "[RELEASE_QUALIFIER] CI check-runs fetch failed for PR head "
+                "%s/%s@%s: %s",
+                owner,
+                repo,
+                head_sha[:8],
+                exc,
+            )
+            continue
+        pr_state = _classify_check_runs(pr_checks)
+        if pr_state == _CI_RED and first_red_sha is None:
+            first_red_sha = head_sha
+        elif pr_state == _CI_GREEN and first_green_sha is None:
+            first_green_sha = head_sha
+        # pending / no_checks — keep inspecting remaining heads.
+
+    if first_red_sha is not None:
+        return {
+            "state": _CI_RED,
+            "ci_green": False,
+            "resolved_sha": first_red_sha,
+            "detail": "PR head check-runs failed",
+        }
+    if first_green_sha is not None:
+        return {
+            "state": _CI_GREEN,
+            "ci_green": True,
+            "resolved_sha": first_green_sha,
+            "detail": "PR head check-runs passed",
+        }
+    return {
+        "state": _CI_PENDING,
+        "ci_green": False,
+        "resolved_sha": None,
+        "detail": "PR head check-runs still pending / absent",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -735,21 +959,20 @@ async def run_qualification(
         await _increment_qualification_attempts(session, version.id)
         return {"status": "sha_error"}
 
-    # 3. CI check on the candidate SHA (cheap, orchestrator-side).  Also done
-    #    before the row lock — it is read-only external I/O.
-    ci_green = False
-    try:
-        ci_result = await github.get_check_runs_cached(
-            token, owner, repo, candidate_sha, project_id=str(project_id)
-        )
-        ci_green = ci_result.get("conclusion") == "success"
-    except Exception as exc:  # noqa: BLE001 — CI fetch failure ⇒ treat as not-green
-        logger.warning(
-            "[RELEASE_QUALIFIER] CI check failed for %s@%s: %s",
-            repo,
-            candidate_sha[:8],
-            exc,
-        )
+    # 3. CI check on the candidate SHA (cheap, orchestrator-side).  Done before
+    #    the row lock — it is read-only external I/O.  This resolves CI through
+    #    the candidate's PR head when the candidate carries no check-runs of its
+    #    own (CI runs only on pull_request events), and never fails green purely
+    #    from the absence of a signal.  ``ci_green`` recorded here is only a
+    #    spawn-time snapshot — _finalize_qualification RE-RESOLVES CI and
+    #    applies it as the composite hard blocker, so a candidate whose checks
+    #    are merely pending now is not frozen not-green forever.
+    #    _resolve_candidate_ci never raises.
+    ci_resolution = await _resolve_candidate_ci(
+        token, owner, repo, candidate_sha, project_id=str(project_id)
+    )
+    ci_green = ci_resolution["ci_green"]
+    ci_state = ci_resolution["state"]
 
     # 4. Take the ReleaseVersion row lock (audit C3).  The strategic
     #    qualify_request path and the admin POST /qualify endpoint can both
@@ -826,6 +1049,17 @@ async def run_qualification(
         )
         return {"status": "already_dry_run"}
 
+    # Carry forward the infra-failure streak so _finalize_qualification can
+    # detect a persistently broken qualifier pipeline.  The streak is the count
+    # of consecutive infrastructure failures (FAILED/CANCELLED required child
+    # tasks) before the current pending run — it resets to 0 whenever a prior
+    # finalization wrote a non-infra_failure status.
+    prior_infra_streak: int = (
+        int(prior_qual.get("consecutive_infra_errors") or 0)
+        if prior_qual.get("status") == "infra_failure"
+        else 0
+    )
+
     # 5. Spawn the heavy children.
     started_at = _utcnow().isoformat()
     # The LTS branch is always "main" (deploy.yml deploys from main) — NOT
@@ -876,6 +1110,7 @@ async def run_qualification(
             "detail": str(exc)[:300],
             "candidate_sha": candidate_sha,
             "ci_green": ci_green,
+            "ci_state": ci_state,
             "started_at": started_at,
         }
         # Read-modify-write is safe here (unlike the no_credentials / sha_error
@@ -891,15 +1126,19 @@ async def run_qualification(
     # 6. Stamp the pending qualification record.  smoketest_task_id is None
     #    when the smoketest subsystem is disabled — maybe_finalize_qualification
     #    and the reaper sweep both treat a None smoketest id as "no smoketest
-    #    child to wait on".
+    #    child to wait on".  prior_infra_streak carries the infra-failure streak
+    #    from the previous infra_failure finalization (0 when the previous
+    #    finalization was a quality verdict / dry-run / non-infra outcome).
     version.last_qualification = {
         "status": "pending",
         "candidate_sha": candidate_sha,
         "ci_green": ci_green,
+        "ci_state": ci_state,
         "smoketest_enabled": smoketest_enabled,
         "started_at": started_at,
         "audit_task_id": audit_task_id,
         "smoketest_task_id": smoketest_task_id,
+        "prior_infra_streak": prior_infra_streak,
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
     # early returns, which run pre-lock and use the atomic
@@ -926,6 +1165,7 @@ async def run_qualification(
         "status": "spawned",
         "candidate_sha": candidate_sha,
         "ci_green": ci_green,
+        "ci_state": ci_state,
         "smoketest_enabled": smoketest_enabled,
         "audit_task_id": audit_task_id,
         "smoketest_task_id": smoketest_task_id,
@@ -1230,6 +1470,7 @@ def _score_smoketest(result: dict[str, Any] | None) -> float | None:
 # Human-readable rendering of the compute_composite() hard-blocker codes.
 _BLOCKER_LABELS: dict[str, str] = {
     "ci_not_green": "CI is not green on the candidate",
+    "ci_unresolved": "CI state could not be evaluated (pending, no check-runs, or GitHub I/O degraded)",
     "smoketest_startup_failed": "the smoketest startup suite failed",
     "audit_missing": "the release audit produced no usable report",
     "test_file_deleted": "the diff deleted a test file",
@@ -1344,7 +1585,19 @@ async def _record_qualification_verdict(
     before and the surrounding qualification/promotion is unaffected.
     """
     try:
-        sub_scores = base_record.get("sub_scores")
+        sub_scores = base_record.get("sub_scores") or {}
+        if not isinstance(sub_scores, dict):
+            sub_scores = {}
+        # Embed CI resolution provenance in sub_scores.
+        ci_resolution = base_record.get("ci_resolution")
+        if isinstance(ci_resolution, dict):
+            sub_scores = dict(sub_scores)  # make a copy to avoid mutating base_record
+            sub_scores["ci_resolution"] = {
+                "state": ci_resolution.get("state"),
+                "resolved_sha": ci_resolution.get("resolved_sha"),
+                "detail": ci_resolution.get("detail"),
+            }
+
         confidence = base_record.get("confidence")
         threshold = base_record.get("threshold")
         verdict = QualificationVerdict(
@@ -1357,7 +1610,7 @@ async def _record_qualification_verdict(
                 and not isinstance(confidence, bool)
                 else 0.0
             ),
-            sub_scores=sub_scores if isinstance(sub_scores, dict) else None,
+            sub_scores=sub_scores if sub_scores else None,
             blocker=base_record.get("blocker"),
             would_promote=bool(would_promote),
             promotion_enabled=bool(promotion_enabled),
@@ -1386,6 +1639,212 @@ async def _record_qualification_verdict(
         )
 
 
+async def _handle_infra_failure(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    qual: dict[str, Any],
+    infra_error: str,
+) -> dict[str, Any]:
+    """Finalize a qualifier run that ended due to an infrastructure failure.
+
+    Called when a required qualifier child (release_audit or qualifier
+    smoketest) terminated as FAILED or CANCELLED rather than COMPLETED —
+    indicating the qualifier pipeline itself broke (agent VM crash, timeout,
+    clone failure), NOT a quality finding about the release candidate.
+
+    Distinct from a quality verdict in three ways:
+      1. Does NOT write a ``QualificationVerdict`` history row — no quality
+         judgement was rendered so the verdict history stays clean.
+      2. Returns the version to ``stabilize`` for a clean re-qualification,
+         exactly like an error path (``missing_candidate_sha``), but with a
+         clearly labelled ``infra_failure`` status.
+      3. Posts a ``release_infra_failure`` operator notification that
+         explicitly names this as an infrastructure failure — not a quality
+         blocker — so the operator can distinguish pipeline noise from real
+         candidate problems.
+
+    Consecutive infra-failure backstop: after ``_MIN_INFRA_ERROR_STREAK``
+    consecutive infrastructure failures the regular calcification guard is
+    silent (it only triggers on ``not_promoted`` with a quality blocker).
+    This backstop raises a separate Alert so a persistently broken qualifier
+    pipeline surfaces to the operator.
+    """
+    finalized_at = _utcnow().isoformat()
+    # Consecutive infra-failure streak: one more than whatever the previous
+    # qualifying run reported (carried forward via prior_infra_streak stamped
+    # by run_qualification; resets to 0 when a non-infra finalization wrote
+    # a different status).
+    prior_streak = int(qual.get("prior_infra_streak") or 0)
+    current_streak = prior_streak + 1
+
+    record: dict[str, Any] = {
+        "candidate_sha": qual.get("candidate_sha"),
+        "ci_green": qual.get("ci_green"),
+        "smoketest_enabled": qual.get("smoketest_enabled", True),
+        "status": "infra_failure",
+        "error": infra_error,
+        "consecutive_infra_errors": current_streak,
+        "started_at": qual.get("started_at"),
+        "finalized_at": finalized_at,
+        "audit_task_id": qual.get("audit_task_id"),
+        "smoketest_task_id": qual.get("smoketest_task_id"),
+    }
+    version.last_qualification = record
+    flag_modified(version, "last_qualification")
+    release_version.set_version_phase(
+        version,
+        "stabilize",
+        reasoning=(
+            f"qualification v{version.version_number}: infrastructure failure "
+            f"({infra_error}) — not a quality finding, returning to stabilize"
+        ),
+    )
+    session.add(version)
+
+    # Consecutive infra-error backstop alert.  The calcification guard never
+    # fires for infra_failure records (it requires not_promoted + a quality
+    # blocker), so a persistently broken qualifier pipeline would be invisible
+    # without this sibling backstop.  Alert at multiples of the streak
+    # threshold so an intermittently broken pipeline does not spam the operator.
+    if (
+        current_streak >= _MIN_INFRA_ERROR_STREAK
+        and current_streak % _MIN_INFRA_ERROR_STREAK == 0
+    ):
+        session.add(
+            Alert(
+                project_id=version.project_id,
+                severity=AlertSeverity.WARNING,
+                title=(
+                    f"Release qualifier v{version.version_number} infrastructure "
+                    f"failure: {current_streak} consecutive errors"
+                ),
+                message=(
+                    f"The release qualifier for v{version.version_number} has "
+                    f"failed {current_streak} consecutive time(s) due to "
+                    f"infrastructure errors ({infra_error!r}) — the qualifier "
+                    f"agent VM or clone pipeline is broken. This is NOT a "
+                    f"quality finding about the release candidate. Inspect the "
+                    f"release_audit / qualifier-smoketest agent infrastructure "
+                    f"and re-queue to retry once the issue is resolved."
+                ),
+            )
+        )
+        logger.warning(
+            "[RELEASE_QUALIFIER] infra-failure backstop: v%d has %d consecutive "
+            "infrastructure errors (error=%s) — alert raised",
+            version.version_number,
+            current_streak,
+            infra_error,
+        )
+
+    await _notify_operator(
+        session,
+        version,
+        "release_infra_failure",
+        (
+            f"v{version.version_number} qualifier infrastructure failure — "
+            f"{infra_error.replace('_', ' ')} (agent VM / clone failure, "
+            f"not a quality finding). Returned to stabilize for "
+            f"re-qualification. Consecutive infra errors: {current_streak}."
+        ),
+        extra={
+            "error": infra_error,
+            "consecutive_infra_errors": current_streak,
+        },
+    )
+
+    logger.warning(
+        "[RELEASE_QUALIFIER] v%d infra failure: %s (streak=%d) — "
+        "no verdict recorded, version returned to stabilize",
+        version.version_number,
+        infra_error,
+        current_streak,
+    )
+    return {
+        "status": "infra_failure",
+        "error": infra_error,
+        "consecutive_infra_errors": current_streak,
+    }
+
+
+async def _resolve_ci_at_finalize(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+) -> tuple[bool, dict[str, Any]]:
+    """Re-resolve the candidate commit's CI verdict at finalize time.
+
+    ``run_qualification`` snapshots ``ci_green`` once, at spawn.  Reusing that
+    frozen boolean at finalize is a livelock: if the candidate's checks were
+    merely in progress when qualification started, ``ci_green`` was recorded
+    False, finalize would keep blocking on it, the version returns to stabilize
+    and the SAME commit is re-qualified and re-blocked indefinitely.  So
+    finalize re-evaluates CI here against the candidate commit rather than
+    trusting the spawn-time value — once the build completes green this
+    re-resolution lets the CI dimension pass, while a still-pending build
+    simply stays not-green WITHOUT a permanent dead-end.
+
+    Returns (ci_green, ci_resolution) where ci_green is True ONLY when a real
+    completed green build exists for the candidate, and ci_resolution contains
+    the full provenance (state, resolved_sha, detail).  Any credential-resolution
+    or GitHub I/O failure degrades gracefully to (False, degenerate_resolution)
+    for THIS finalize attempt — it never crashes the finalize.
+    """
+    degenerate_resolution = {
+        "state": _CI_PENDING,
+        "resolved_sha": None,
+        "detail": "unresolved",
+    }
+    if not candidate_sha:
+        return False, degenerate_resolution
+    try:
+        project = await session.get(Project, version.project_id)
+        if project is None:
+            logger.warning(
+                "[RELEASE_QUALIFIER] finalize CI re-resolution: project %s for "
+                "version v%d not found — treating CI as not-green",
+                version.project_id,
+                version.version_number,
+            )
+            return False, degenerate_resolution
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            logger.warning(
+                "[RELEASE_QUALIFIER] finalize CI re-resolution: no GitHub "
+                "credentials for version v%d — treating CI as not-green",
+                version.version_number,
+            )
+            return False, degenerate_resolution
+        token, owner, repo = resolved
+        ci_resolution = await _resolve_candidate_ci(
+            token, owner, repo, candidate_sha, project_id=str(version.project_id)
+        )
+        logger.info(
+            "[RELEASE_QUALIFIER] finalize CI re-resolution for v%d candidate "
+            "%s: state=%s ci_green=%s (%s)",
+            version.version_number,
+            candidate_sha[:8],
+            ci_resolution["state"],
+            ci_resolution["ci_green"],
+            ci_resolution["detail"],
+        )
+        # Extract only the provenance fields, excluding ci_green boolean.
+        resolution_provenance = {
+            "state": ci_resolution.get("state"),
+            "resolved_sha": ci_resolution.get("resolved_sha"),
+            "detail": ci_resolution.get("detail"),
+        }
+        return bool(ci_resolution["ci_green"]), resolution_provenance
+    except Exception as exc:  # noqa: BLE001 — finalize CI failure → not-green
+        logger.warning(
+            "[RELEASE_QUALIFIER] finalize CI re-resolution failed for version "
+            "v%d (treating CI as not-green for this attempt): %s",
+            version.version_number,
+            exc,
+        )
+        return False, degenerate_resolution
+
+
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -1397,7 +1856,9 @@ async def _finalize_qualification(
     smoketest subsystem was enabled for this run (audit H3) — for ``version``
     have reached a terminal state.
 
-    Reads the RELEASE_AUDIT_REPORT and (when the smoketest subsystem was
+    Re-resolves CI for the candidate commit (``_resolve_ci_at_finalize``)
+    rather than trusting the boolean frozen at spawn, reads the
+    RELEASE_AUDIT_REPORT and (when the smoketest subsystem was
     enabled) SMOKETEST_RESULT artifacts, computes the composite, then:
       * promote == True  and promotion_enabled ⇒ ``promote()``.
       * promote == True  but promotion_enabled is False ⇒ dry-run: log the
@@ -1418,7 +1879,6 @@ async def _finalize_qualification(
     """
     qual = dict(version.last_qualification or {})
     candidate_sha = qual.get("candidate_sha")
-    ci_green = bool(qual.get("ci_green"))
     audit_task_id = qual.get("audit_task_id")
     smoketest_task_id = qual.get("smoketest_task_id")
     # Audit H3: whether the qualifying run had the smoketest subsystem enabled.
@@ -1428,7 +1888,68 @@ async def _finalize_qualification(
     # the flag default to True (the old always-spawn behaviour).
     smoketest_enabled = bool(qual.get("smoketest_enabled", True))
 
+    # Re-resolve CI for the candidate commit NOW rather than reusing the
+    # boolean frozen at spawn — a candidate whose checks were merely pending
+    # when run_qualification ran recorded ci_green=False, and trusting that
+    # stale value would re-block the same commit forever.  Re-resolution lets a
+    # now-completed green build pass and keeps a still-pending build not-green
+    # without a permanent dead-end.  Graceful: a credential / GitHub failure
+    # degrades to not-green for this attempt (never crashes the finalize).
+    ci_green, ci_resolution = await _resolve_ci_at_finalize(
+        session, version, candidate_sha
+    )
+
     policy = _load_policy()
+
+    # --- Infra-failure detection: check required child terminal statuses ------
+    # A FAILED or CANCELLED required child means the qualifier pipeline itself
+    # broke (agent VM crash, timeout, clone failure) — NOT a quality finding.
+    # Route these to _handle_infra_failure BEFORE reading artifacts so the
+    # quality-verdict path only sees COMPLETED children.  A COMPLETED child
+    # whose artifact is absent or unparseable still routes through the normal
+    # compute_composite path (audit_missing quality blocker — the real report
+    # was expected but absent, which is a candidate-scoring concern, not infra).
+    if audit_task_id:
+        try:
+            _audit_task_obj = await session.get(Task, uuid.UUID(str(audit_task_id)))
+            if _audit_task_obj is not None and _audit_task_obj.status in (
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            ):
+                return await _handle_infra_failure(
+                    session,
+                    version,
+                    qual,
+                    f"audit_task_{_audit_task_obj.status.lower()}",
+                )
+        except (ValueError, TypeError):
+            logger.warning(
+                "[RELEASE_QUALIFIER] invalid audit_task_id %s on version v%d "
+                "(skipping infra-failure check)",
+                audit_task_id,
+                version.version_number,
+            )
+
+    if smoketest_enabled and smoketest_task_id:
+        try:
+            _smoke_task_obj = await session.get(Task, uuid.UUID(str(smoketest_task_id)))
+            if _smoke_task_obj is not None and _smoke_task_obj.status in (
+                TaskStatus.FAILED,
+                TaskStatus.CANCELLED,
+            ):
+                return await _handle_infra_failure(
+                    session,
+                    version,
+                    qual,
+                    f"smoketest_task_{_smoke_task_obj.status.lower()}",
+                )
+        except (ValueError, TypeError):
+            logger.warning(
+                "[RELEASE_QUALIFIER] invalid smoketest_task_id %s on version v%d "
+                "(skipping infra-failure check)",
+                smoketest_task_id,
+                version.version_number,
+            )
 
     # --- Read the release_audit report -------------------------------------
     audit_report: dict[str, Any] | None = None
@@ -1476,12 +1997,14 @@ async def _finalize_qualification(
         smoketest_score=smoketest_score,
         policy=policy,
         smoketest_enabled=smoketest_enabled,
+        ci_state=ci_resolution.get("state", _CI_RED),
     )
 
     finalized_at = _utcnow().isoformat()
     base_record: dict[str, Any] = {
         "candidate_sha": candidate_sha,
         "ci_green": ci_green,
+        "ci_resolution": ci_resolution,
         "smoketest_enabled": smoketest_enabled,
         "confidence": composite["confidence"],
         "sub_scores": composite["sub_scores"],
@@ -1955,6 +2478,14 @@ async def _finalize_locked_version(
     # --- Path 1: age-bound qualification timeout (reaper sweep only) --------
     # Checked first and child-state-independent (audit H2).
     if timeout_now is not None:
+        # Skip the qualification timeout when the version is already awaiting a
+        # promotion auto-merge.  Qualification completed and passed; the pending
+        # clock now belongs to the promotion PR on main CI, not to qualifier
+        # children.  The timeout backstop is only for qualifier children that
+        # never reach a terminal state.  The auto-merge stall check (separate
+        # lifecycle alert) handles the case where the PR is genuinely stuck.
+        if qual.get("promotion_pending"):
+            return None
         started_at = _parse_started_at(qual)
         timeout_clock = started_at
         if timeout_clock is None:
@@ -2222,6 +2753,11 @@ async def _check_version_calcification(
     if qual_status != "not_promoted" or not blocker:
         return False
 
+    # ci_unresolved is a resolution/infrastructure concern, not a quality
+    # regression — it must not trip the quality calcification alert.
+    if blocker == "ci_unresolved":
+        return False
+
     # Durable dedup: the version remembers the blocker it last alerted on.
     # Same blocker → already notified for this stall; skip.
     if version.calcification_alerted_blocker == blocker:
@@ -2269,6 +2805,88 @@ async def _check_version_calcification(
         version.version_number,
         attempts,
         blocker,
+        age_days,
+    )
+    return True
+
+
+async def _check_version_ci_unresolved_stall(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Post a deduplicated alert when CI state cannot be resolved repeatedly.
+
+    Fires when a version in the stabilize phase has accumulated
+    ``_MIN_CALCIFICATION_ATTEMPTS`` or more qualification attempts all
+    finalizing as not_promoted with blocker ``ci_unresolved`` — meaning CI
+    checks are pending, no check-runs exist for the candidate, or GitHub I/O
+    is degraded.  This is the infrastructure-path counterpart to
+    ``_check_version_calcification``, which explicitly skips ``ci_unresolved``
+    because it is not a quality regression about the release candidate.
+
+    Deduplication: uses the version's ``calcification_alerted_blocker`` column
+    (same durable anchor as calcification — no collision because calcification
+    never writes ``ci_unresolved`` to that field).  A new alert fires only when
+    the field is not already ``"ci_unresolved"``.  If CI later resolves (blocker
+    changes or the version is promoted/closed), the version leaves the
+    open+stabilize guard and subsequent sweeps are no-ops.
+
+    Does NOT commit the session — the caller must commit after a ``True`` return.
+    """
+    if version.status != "open" or version.phase != "stabilize":
+        return False
+
+    attempts = version.qualification_attempts or 0
+    if attempts < _MIN_CALCIFICATION_ATTEMPTS:
+        return False
+
+    qual = version.last_qualification or {}
+    if qual.get("status") != "not_promoted":
+        return False
+    if qual.get("blocker") != "ci_unresolved":
+        return False
+
+    # Durable dedup: already alerted for this ci_unresolved stall.
+    if version.calcification_alerted_blocker == "ci_unresolved":
+        return False
+
+    alert_title = f"Release v{version.version_number}: CI state unresolvable"
+
+    age_days: int = 0
+    ref_time = version.phase_changed_at or version.opened_at
+    if ref_time is not None:
+        age_days = max(0, (_utcnow() - ref_time).days)
+
+    session.add(
+        Alert(
+            project_id=version.project_id,
+            severity=AlertSeverity.WARNING,
+            title=alert_title,
+            message=(
+                f"Release v{version.version_number} has been stuck in the "
+                f"stabilize phase for {age_days} day(s) with {attempts} "
+                f"qualification attempt(s) unable to resolve CI state (checks "
+                f"pending, no check-runs, or GitHub I/O degraded). This is a "
+                f"CI infrastructure or configuration problem — investigate CI "
+                f"connectivity and check-run reporting, not the release candidate."
+            ),
+        )
+    )
+    await post_version_ci_unresolved_stall_message(
+        session,
+        version.project_id,
+        version_number=version.version_number,
+        version_id=str(version.id),
+        qualification_attempts=attempts,
+        age_days=age_days,
+    )
+    version.calcification_alerted_blocker = "ci_unresolved"
+    session.add(version)
+    logger.warning(
+        "[RELEASE_QUALIFIER] ci_unresolved stall alert for v%d: %d attempts "
+        "unable to resolve CI state over %d day(s)",
+        version.version_number,
+        attempts,
         age_days,
     )
     return True
@@ -2512,6 +3130,111 @@ async def _check_version_stabilize_stall(
     return True
 
 
+async def _check_version_auto_merge_stall(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> bool:
+    """Alert when a promotion PR awaiting auto-merge has been pending too long.
+
+    A version enters the promotion-pending state when ``promote()`` successfully
+    opened a release-vN → main PR and enabled auto-merge, but main's required CI
+    checks had not yet passed.  That is a healthy transient — the PR will merge
+    once CI completes.  But if the PR never merges (auto-merge not enabled,
+    a required check went red, or a required check never reports) the version
+    sits with ``last_qualification.status == "pending"`` indefinitely with no
+    visible alert.
+
+    This check fires once per auto-merge attempt after ``_AUTO_MERGE_STALL_SECONDS``
+    have elapsed without the PR merging.  Dedup anchor: ``alerted_at`` is stored
+    inside ``last_qualification["promotion_pending"]`` to avoid repeated alerts on
+    the same stall without requiring a schema migration.
+
+    Messaging is best-effort — failure never breaks the sweep.
+    Does NOT commit — caller commits on True return.
+    """
+    if version.status != "open":
+        return False
+
+    qual = version.last_qualification or {}
+    if qual.get("status") != "pending":
+        return False
+
+    pending = qual.get("promotion_pending")
+    if not pending:
+        return False
+
+    if pending.get("alerted_at"):
+        return False  # already alerted for this auto-merge attempt
+
+    enabled_at_str = pending.get("enabled_at")
+    if not enabled_at_str:
+        return False
+
+    try:
+        enabled_at = datetime.fromisoformat(enabled_at_str)
+    except (ValueError, TypeError):
+        return False
+
+    age_seconds = (_utcnow() - enabled_at).total_seconds()
+    if age_seconds < _AUTO_MERGE_STALL_SECONDS:
+        return False
+
+    pr_number = pending.get("pr_number")
+    pr_url = pending.get("pr_url") or ""
+    auto_merge_enabled = bool(pending.get("auto_merge_enabled"))
+    age_hours = int(age_seconds // 3600)
+
+    session.add(
+        Alert(
+            project_id=version.project_id,
+            severity=AlertSeverity.WARNING,
+            title=(f"Release v{version.version_number} promotion auto-merge stalled"),
+            message=(
+                f"Release v{version.version_number} passed qualification but "
+                f"promotion PR #{pr_number} has not merged after {age_hours}h "
+                f"(auto-merge "
+                f"{'enabled' if auto_merge_enabled else 'NOT confirmed enabled'}"
+                f"). Check the PR: {pr_url}"
+            ),
+        )
+    )
+    try:
+        await post_version_auto_merge_stall_message(
+            session,
+            version.project_id,
+            version_number=version.version_number,
+            version_id=str(version.id),
+            pr_number=pr_number,
+            pr_url=pr_url,
+            auto_merge_enabled=auto_merge_enabled,
+            age_hours=age_hours,
+        )
+    except Exception as exc:  # noqa: BLE001 — messaging must never break the sweep
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to post auto-merge-stall message for v%d "
+            "(non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+
+    # Record dedup anchor inside the qualification JSON — no schema migration needed.
+    new_qual = dict(qual)
+    new_qual["promotion_pending"] = dict(pending)
+    new_qual["promotion_pending"]["alerted_at"] = _utcnow().isoformat()
+    version.last_qualification = new_qual
+    session.add(version)
+
+    logger.warning(
+        "[RELEASE_QUALIFIER] auto-merge stall alert for v%d: PR #%s pending %dh "
+        "(auto-merge %s)",
+        version.version_number,
+        pr_number,
+        age_hours,
+        "enabled" if auto_merge_enabled else "NOT confirmed enabled",
+    )
+    return True
+
+
 async def _check_version_promotion_readiness(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -2587,84 +3310,159 @@ async def _check_version_promotion_readiness(
     return True
 
 
-async def _check_promoting_carrier_health(
-    session: AsyncSession, version: release_version.ReleaseVersion
+async def _reconcile_if_promotion_failed_landed(
+    version_id: uuid.UUID,
+    *,
+    session_factory=None,
 ) -> bool:
-    """Safety net for a version stuck in the ``"promoting"`` state.
+    """Reconcile an open version whose promotion-failure candidate is already on main.
 
-    The normal terminal transitions are ``finalize_promotion_landed`` (the
-    promotion PR merged) and ``revert_promotion_after_ci_failure`` (CI failed,
-    via ``handle_ci_completion``).  But the carrier task can also die on a path
-    that bypasses ``handle_ci_completion`` — e.g. the orchestrator marks it
-    FAILED when the PR is deleted.  Without this check the version would stay
-    ``"promoting"`` forever and ``_qualification_in_flight`` would block every
-    future qualification.
+    A version whose ``last_qualification.status == "promotion_failed"`` is kept
+    ``open`` so the next strategic cycle can retry.  But if the blocked PR later
+    lands (operator manually merges it, a previously-stalled auto-merge fires, a
+    transient CI block clears), nothing calls the idempotency check again — the
+    version stays ``open`` with a stale failure verdict, the next version is never
+    opened, and the release lifecycle wedges.
 
-    - carrier missing / FAILED / CANCELLED ⇒ revert the version to stabilize.
-    - carrier COMPLETED but version still ``"promoting"`` ⇒ the PR merged but
-      bookkeeping did not commit; retry ``finalize_promotion_landed``
-      (idempotent) rather than revert (main already advanced).
+    This helper fills that gap.  It is called from ``sweep_stuck_qualifications``
+    for every ``open`` version whose ``last_qualification.status`` is
+    ``"promotion_failed"`` and that has a ``candidate_sha``.  For each such version
+    it runs the same idempotency check ``promote()`` uses and, if the candidate is
+    reachable from ``main``, records the promotion as successful via
+    ``_record_promotion_success`` — which also opens the next version.
 
-    Returns True if it wrote a change (so the caller commits).
+    Lock + session pattern mirrors ``_finalize_in_dedicated_session``: a dedicated
+    session takes ``FOR UPDATE`` on the version row, releases the lock via an
+    intermediate commit BEFORE any GitHub I/O, then re-acquires it (inside
+    ``_record_promotion_success``) for the final write.
+
+    Returns ``True`` when the version was reconciled (promoted), ``False``
+    otherwise (candidate not on main, GitHub error, wrong status, etc.).
     """
-    if version.status != "open":
-        return False
-    qual = version.last_qualification or {}
-    if qual.get("status") != "promoting":
-        return False
-    task_id_raw = qual.get("promotion_task_id")
-    if not task_id_raw:
-        return False
-    try:
-        carrier = await session.get(Task, uuid.UUID(str(task_id_raw)))
-    except (ValueError, AttributeError):
-        return False
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            # Lock the version row — same serialization point as _finalize_locked_version.
+            version: release_version.ReleaseVersion | None = (
+                (
+                    await session.execute(
+                        select(release_version.ReleaseVersion)
+                        .where(release_version.ReleaseVersion.id == version_id)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if version is None:
+                return False
+            if version.status != "open":
+                return False
+            qual = version.last_qualification or {}
+            if qual.get("status") != "promotion_failed":
+                return False
+            candidate_sha: str | None = qual.get("candidate_sha")
+            if not candidate_sha:
+                return False
 
-    if carrier is None:
-        await revert_promotion_after_ci_failure(
-            session, version.id, reason="promotion carrier task missing"
-        )
-        return True
+            base_record = dict(qual)
+            project = await session.get(Project, version.project_id)
+            if project is None:
+                return False
 
-    if carrier.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-        await revert_promotion_after_ci_failure(
-            session,
-            version.id,
-            reason=f"promotion carrier {carrier.status.value} without a merge",
-        )
-        return True
-
-    if carrier.status == TaskStatus.COMPLETED:
-        # PR merged but finalize_promotion_landed never committed — retry it.
-        project = await session.get(Project, version.project_id)
-        token = owner = repo = merged_sha = None
-        resolved = (
-            await _resolve_github_with_session(session, project) if project else None
-        )
-        if resolved:
-            token, owner, repo = resolved
+            # Release the row lock before any GitHub I/O (mirrors promote()).
             try:
-                merged_sha = await github.get_branch_sha(token, owner, repo, "main")
-            except Exception:  # noqa: BLE001 — best-effort; finalize degrades to candidate
-                merged_sha = None
-        logger.warning(
-            "[RELEASE_QUALIFIER] v%d carrier %s COMPLETED but version still "
-            "'promoting' — retrying promotion bookkeeping",
-            version.version_number,
-            carrier.id,
-        )
-        await finalize_promotion_landed(
-            session,
-            version.id,
-            token=token,
-            owner=owner,
-            repo=repo,
-            merged_sha=merged_sha,
-            pr_url=qual.get("pr_url", ""),
-        )
-        return True
+                await session.commit()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reconcile: failed to release row lock "
+                    "for v%d before GitHub I/O — skipping",
+                    version.version_number,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "[RELEASE_QUALIFIER] reconcile: rollback failed for v%d "
+                        "after commit error",
+                        version.version_number,
+                    )
+                return False
 
-    return False
+            # Resolve credentials (unlocked — same as promote()).
+            resolved = await _resolve_github_with_session(session, project)
+            if resolved is None:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile: no GitHub credentials for "
+                    "v%d — skipping reconcile",
+                    version.version_number,
+                )
+                return False
+            token, owner, repo = resolved
+
+            # Idempotency check — is the candidate already on main?
+            if not await _candidate_already_on_main(
+                token, owner, repo, candidate_sha, version
+            ):
+                return False
+
+            logger.info(
+                "[RELEASE_QUALIFIER] reconcile: candidate %s for v%d is on "
+                "main despite promotion_failed record — reconciling as promoted",
+                candidate_sha[:8],
+                version.version_number,
+            )
+
+            # Resolve the real main HEAD SHA so promoted_sha points at the merge
+            # commit, not the candidate (which may be a parent of the merge commit).
+            promoted_sha: str | None = None
+            try:
+                promoted_sha = await github.get_branch_sha(
+                    token,
+                    owner,
+                    repo,
+                    "main",
+                    project_id=str(version.project_id),
+                )
+            except Exception as exc:  # noqa: BLE001 — fallback to candidate_sha
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile: could not resolve main HEAD "
+                    "SHA for v%d (%s) — using candidate_sha as promoted_sha",
+                    version.version_number,
+                    exc,
+                )
+
+            result = await _record_promotion_success(
+                session,
+                version,
+                candidate_sha,
+                base_record,
+                pr_url=_idempotent_pr_url(base_record),
+                token=token,
+                owner=owner,
+                repo=repo,
+                promoted_sha=promoted_sha,
+                already_landed=True,
+                lock_released=True,
+            )
+            await session.commit()
+            return result.get("status") == "promoted" and not result.get(
+                "already_promoted"
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] reconcile: unexpected error for version %s",
+                version_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reconcile: rollback failed for version %s "
+                    "after unexpected error",
+                    version_id,
+                )
+            return False
 
 
 async def sweep_stuck_qualifications(
@@ -2761,6 +3559,34 @@ async def sweep_stuck_qualifications(
             finalized,
         )
 
+    # Reconcile open versions whose promotion-failure candidate is already on
+    # main.  A promotion_failed version is kept open so the next strategic cycle
+    # can retry, but if the blocked PR later lands out-of-band (operator merge,
+    # a stalled auto-merge fires, a transient CI block clears) nothing calls the
+    # idempotency check again.  This loop fills that gap: for each open version
+    # with last_qualification.status=="promotion_failed" it checks whether the
+    # candidate is now reachable from main and, if so, records the promotion as
+    # successful and opens the next version.
+    for version_id in version_ids:
+        try:
+            reconciled = await _reconcile_if_promotion_failed_landed(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: reconcile check failed for version %s",
+                version_id,
+            )
+            continue
+        if reconciled:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep reconciled version %s "
+                "(promotion_failed candidate landed on main)",
+                version_id,
+            )
+
     # Lifecycle-stall checks: alert when an open version is stuck at either end
     # of the lifecycle — calcifying in stabilize (repeated hard-blocker
     # failures) or stalled in build (sitting too long without advancing).  The
@@ -2776,6 +3602,10 @@ async def sweep_stuck_qualifications(
                 if v is None:
                     continue
                 alerted = await _check_version_calcification(alert_session, v)
+                alerted = (
+                    await _check_version_ci_unresolved_stall(alert_session, v)
+                    or alerted
+                )
                 alerted = await _check_version_build_stall(alert_session, v) or alerted
                 alerted = (
                     await _check_version_stabilize_stall(alert_session, v) or alerted
@@ -2785,7 +3615,7 @@ async def sweep_stuck_qualifications(
                     or alerted
                 )
                 alerted = (
-                    await _check_promoting_carrier_health(alert_session, v) or alerted
+                    await _check_version_auto_merge_stall(alert_session, v) or alerted
                 )
                 if alerted:
                     await alert_session.commit()
@@ -3407,335 +4237,206 @@ async def promote(
             lock_released=True,
         )
 
-    # 2. Enroll the promotion PR into the existing CI-aware merge pipeline
-    #    instead of merging inline.  promote() runs inside the agent
-    #    status-report request path (maybe_finalize_qualification →
-    #    _process_post_commit, agent_status.py:955), so it MUST NOT block on the
-    #    promotion PR's CI.  main's ruleset requires CI/{Agent,Backend,Frontend};
-    #    opening the release-v{N} → main PR triggers a FRESH run of those checks,
-    #    and merging while they're pending is a "Repository rule violations" 422
-    #    that the old inline-merge code recorded as a hard promotion failure — so
-    #    a perfectly promotable version bounced back to stabilize purely on CI
-    #    timing (the "CI sub-gate" in v1's goal).
-    #
-    #    Instead, hand the PR to the orchestrator's CI-poll loop +
-    #    handle_ci_completion — the same battle-tested machinery that merges
-    #    every rollup PR (waits for CI, retries, escalates).  A synthetic
-    #    promotion-merge task enrolled with review_loop{ci_waiting,
-    #    review_approved} is polled until CI is green, then merged.
-    #    review_approved is pre-set because the release_audit IS the review.  On
-    #    that merge, handle_ci_completion calls finalize_promotion_landed (below)
-    #    to do the version bookkeeping; on CI failure it calls
-    #    revert_promotion_after_ci_failure instead of spawning a fix task.
-    return await _record_promotion_enrolled(
-        session,
-        version,
-        candidate_sha,
-        base_record,
-        pr_url=pr_url,
-        pr_number=pr_number,
-        release_branch=release_branch,
-    )
-
-
-async def _spawn_promotion_task(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    version_id: uuid.UUID,
-    pr_number: int,
-    pr_url: str,
-    release_branch: str,
-    candidate_sha: str,
-) -> Task:
-    """Create the synthetic, never-dispatched carrier task for a promotion PR.
-
-    The task sits in EVALUATING (no VM is ever provisioned) carrying a
-    ``review_loop`` so the orchestrator's CI-poll loop merges the PR through the
-    normal CI-aware pipeline (the same path every rollup PR rides).
-    ``review_approved`` is pre-set True — the ``release_audit`` already served as
-    the review.  ``is_promotion`` + ``release_version_id`` let
-    ``handle_ci_completion`` route the merge / CI-failure to
-    ``finalize_promotion_landed`` / ``revert_promotion_after_ci_failure``.
-    """
-    payload: dict[str, Any] = {
-        "type": "promotion_merge",
-        "branch": release_branch,
-        "base_branch": "main",
-        "pr_number": pr_number,
-    }
-    payload = validate_internal_payload(payload, "release_qualifier:promotion_merge")
-    now_iso = _utcnow().isoformat()
-    task = Task(
-        project_id=project_id,
-        title=f"Promotion: {release_branch} → main (PR #{pr_number})",
-        description=(
-            f"Carry the automain→main promotion PR #{pr_number} through the "
-            f"CI-aware merge pipeline (review pre-approved by the release audit)."
-        ),
-        payloads=[payload],
-        vm_instance_id=None,  # never dispatched — EVALUATING-only carrier
-        status=TaskStatus.EVALUATING,
-        created_by="ORCHESTRATOR",
-        context={
-            "is_promotion": True,
-            "release_version_id": str(version_id),
-            "candidate_sha": candidate_sha,
-            "promotion_pr_url": pr_url,
-            "review_loop": {
-                "ci_waiting": True,
-                "pr_number": pr_number,
-                "branch": release_branch,
-                "base_branch": "main",
-                "review_approved": True,
-                "ci_wait_started": now_iso,
-            },
-        },
-    )
-    session.add(task)
-    await session.flush()
-    session.add(
-        TaskHistory(
-            task_id=task.id,
-            action="SPAWNED",
-            details={
-                "spawned_by": "RELEASE_QUALIFIER",
-                "task_type": "promotion_merge",
-                "pr_number": pr_number,
-                "release_version_id": str(version_id),
-            },
-        )
-    )
-    return task
-
-
-async def _record_promotion_enrolled(
-    session: AsyncSession,
-    version: release_version.ReleaseVersion,
-    candidate_sha: str,
-    base_record: dict[str, Any],
-    *,
-    pr_url: str,
-    pr_number: int,
-    release_branch: str,
-) -> dict[str, Any]:
-    """Record that the promotion PR was enrolled into the CI-merge pipeline.
-
-    Re-locks the version (``promote()`` released the row lock for its GitHub
-    I/O), re-checks ``status == "open"`` (a concurrent finalize may have already
-    promoted), spawns the carrier task, and stamps
-    ``last_qualification.status = "promoting"``.  The "promoting" state stops
-    ``run_qualification`` / the reaper from re-spawning a duplicate qualification
-    while the merge is in flight (see ``_qualification_in_flight``).
-    """
-    locked = await _relock_version_for_promotion_write(
-        session, version, lock_released=True
-    )
-    if locked is None:
-        return {"status": "promotion_failed", "error": "version_vanished"}
-    version = locked
-    if version.status != "open":
-        # A concurrent finalize already advanced this version — nothing to do.
-        return {"status": "already_promoted"}
-    if (version.last_qualification or {}).get("status") == "promoting":
-        # A genuinely-overlapping finalize already enrolled this version's
-        # promotion PR.  promote() releases the row lock for its branch/PR
-        # GitHub I/O, so two callers can both pass the "pending" guard and reach
-        # here; the FOR UPDATE re-lock above serializes them, and the loser sees
-        # the winner's committed "promoting" record and bails — exactly one
-        # carrier task is ever enrolled.
-        return {"status": "already_enrolled"}
-
+    # 2. Merge the PR — merge_method="merge" preserves integration history.
+    #    merge_pull_request does NOT raise on 405/409; it returns merged=False.
     try:
-        promo_task = await _spawn_promotion_task(
-            session,
-            version.project_id,
-            version_id=version.id,
-            pr_number=pr_number,
-            pr_url=pr_url,
-            release_branch=release_branch,
-            candidate_sha=candidate_sha,
+        merge_result = await github.merge_pull_request(
+            token,
+            owner,
+            repo,
+            pr_number,
+            merge_method="merge",
+            project_id=str(version.project_id),
         )
-    except Exception as exc:  # noqa: BLE001 — enroll failure must not crash finalize
+    except Exception as exc:  # noqa: BLE001 — a 5xx raises HTTPException; treat as failure
         logger.warning(
-            "[RELEASE_QUALIFIER] failed to enroll promotion PR #%s for v%d: %s",
+            "[RELEASE_QUALIFIER] merge raised for promotion PR #%s (v%d): %s",
             pr_number,
             version.version_number,
             exc,
-            exc_info=True,
         )
         return await _record_promotion_failure(
             session,
             version,
             base_record,
-            "enroll_failed",
+            "merge_error",
             detail=str(exc)[:300],
             pr_url=pr_url,
-            lock_released=False,  # already re-locked above; row held by this txn
+            lock_released=True,
         )
 
-    record = {
-        **base_record,
-        "status": "promoting",
-        "candidate_sha": candidate_sha,
-        "pr_number": pr_number,
-        "pr_url": pr_url,
-        "promotion_task_id": str(promo_task.id),
-        "enrolled_at": _utcnow().isoformat(),
-    }
-    version.last_qualification = record
-    flag_modified(version, "last_qualification")
-    session.add(version)
+    if not merge_result.get("merged"):
+        # Concern 3 — disambiguate a merged=False result.  merge_pull_request
+        # collapses TWO different outcomes onto {"merged": False}: a genuine
+        # merge block (failing checks / required reviews / conflict) AND an
+        # already-merged PR (GitHub's merge endpoint returns 405 once a PR is
+        # already merged).  Recording an already-merged PR as merge_blocked
+        # would permanently diverge the DB from GitHub.
+        #
+        # _promotion_pr_landed asks the PR resource itself for its
+        # authoritative ``merged`` boolean — which flips synchronously on a
+        # merge and is NOT subject to the compare API's eventual-consistency
+        # lag that could make a genuinely-successful promotion look like a
+        # merge_blocked failure right after the merge.  It falls back to the
+        # ancestry check only when the PR state is indeterminate.
+        if await _promotion_pr_landed(
+            token, owner, repo, pr_number, candidate_sha, version
+        ):
+            logger.info(
+                "[RELEASE_QUALIFIER] promote: PR #%s for v%d returned "
+                "merged=False but the PR is in fact merged — recording success "
+                "(idempotent retry / eventual-consistency-safe)",
+                pr_number,
+                version.version_number,
+            )
+            await _delete_release_branch_best_effort(
+                token, owner, repo, release_branch, version
+            )
+            merged_sha_retry: str | None = None
+            try:
+                merged_sha_retry = await github.get_branch_sha(
+                    token, owner, repo, "main"
+                )
+            except Exception:  # noqa: BLE001 — best-effort; degrade to candidate
+                logger.warning(
+                    "[RELEASE_QUALIFIER] promote: could not re-resolve main "
+                    "HEAD after detecting an already-merged PR #%s for v%d — "
+                    "recording candidate_sha",
+                    pr_number,
+                    version.version_number,
+                )
+            return await _record_promotion_success(
+                session,
+                version,
+                candidate_sha,
+                base_record,
+                pr_url,
+                token=token,
+                owner=owner,
+                repo=repo,
+                promoted_sha=merged_sha_retry or candidate_sha,
+                already_landed=True,
+            )
+        # Distinguish a real merge conflict (GitHub 409 → conflict=True) from
+        # pending required checks (GitHub 405 → conflict=False/None).  A real
+        # conflict cannot self-heal and must fail immediately; a pending-CI
+        # block WILL clear once checks pass, so arrange for GitHub to complete
+        # the merge automatically rather than recording a spurious failure.
+        if merge_result.get("conflict"):
+            msg = merge_result.get("message", "merge not completed")
+            logger.warning(
+                "[RELEASE_QUALIFIER] promotion PR #%s for v%d did not merge "
+                "(real conflict): %s",
+                pr_number,
+                version.version_number,
+                msg,
+            )
+            return await _record_promotion_failure(
+                session,
+                version,
+                base_record,
+                "merge_blocked",
+                detail=str(msg)[:300],
+                pr_url=pr_url,
+                conflict=True,
+                lock_released=True,
+            )
+
+        # CI still pending (GitHub 405, no conflict) — arrange for GitHub to
+        # complete the merge once required checks pass.  Don't record a failure
+        # verdict; last_qualification stays "pending" so the reaper re-checks
+        # and _candidate_already_on_main records idempotent success when the
+        # auto-merge lands.
+        msg = merge_result.get("message", "merge not completed")
+        try:
+            am_result = await github.enable_auto_merge(
+                token,
+                owner,
+                repo,
+                pr_number,
+                merge_method="MERGE",
+                project_id=str(version.project_id),
+            )
+        except Exception as exc:  # noqa: BLE001
+            am_result = {"enabled": False, "message": str(exc)[:200]}
+        auto_merge_enabled = bool(am_result.get("enabled"))
+        logger.info(
+            "[RELEASE_QUALIFIER] promote: PR #%s for v%d pending CI — "
+            "auto-merge %s (%s). Qualification stays pending; reaper confirms "
+            "when auto-merge lands.",
+            pr_number,
+            version.version_number,
+            "enabled" if auto_merge_enabled else "not confirmed",
+            am_result.get("message", ""),
+        )
+        # Durably record the promotion sub-state so the reaper's qualification-
+        # timeout backstop can distinguish this version (qualification PASSED,
+        # waiting on the promotion PR's CI) from a version whose qualifier
+        # children never terminated.  Re-lock the version row first because the
+        # intermediate commit above released the lock.
+        locked = await _relock_version_for_promotion_write(
+            session, version, lock_released=True
+        )
+        if locked is not None and locked.status == "open":
+            q = dict(locked.last_qualification or {})
+            q["promotion_pending"] = {
+                "pr_number": pr_number,
+                "pr_url": pr_url,
+                "auto_merge_enabled": auto_merge_enabled,
+                "enabled_at": _utcnow().isoformat(),
+            }
+            locked.last_qualification = q
+            session.add(locked)
+        return {
+            "status": "pending_auto_merge",
+            "pr_number": pr_number,
+            "pr_url": pr_url,
+            "auto_merge_enabled": auto_merge_enabled,
+        }
+
+    # 3. Success — resolve the REAL merged commit.  merge_method="merge"
+    #    creates a NEW merge commit on main; candidate_sha is only one of its
+    #    parents, not main HEAD.  github.merge_pull_request does not return the
+    #    merge SHA, so re-resolve main HEAD — that commit IS the merge result.
+    #    A resolution failure here is non-fatal: the merge already landed, so
+    #    degrade to candidate_sha (a known parent) rather than fail a
+    #    successful promotion.
+    merged_sha: str | None = None
+    try:
+        merged_sha = await github.get_branch_sha(token, owner, repo, "main")
+    except Exception as exc:  # noqa: BLE001 — merge already succeeded; SHA read is best-effort
+        logger.warning(
+            "[RELEASE_QUALIFIER] promote: merged PR #%s for v%d but could not "
+            "resolve the new main HEAD (%s) — recording candidate_sha instead",
+            pr_number,
+            version.version_number,
+            exc,
+        )
+
+    # 4. Best-effort: delete the release branch now that the merge has landed
+    #    (audit R4-H2 — release-v{N} branches must not accumulate forever).
+    await _delete_release_branch_best_effort(
+        token, owner, repo, release_branch, version
+    )
+
     logger.info(
-        "[RELEASE_QUALIFIER] v%d promotion PR #%s enrolled in the CI-merge "
-        "pipeline (carrier task %s) — awaiting CI, then merge",
+        "[RELEASE_QUALIFIER] v%d promoted: automain → main merged via PR #%s "
+        "(merge commit=%s)",
         version.version_number,
         pr_number,
-        promo_task.id,
+        (merged_sha or candidate_sha)[:8],
     )
-    return {
-        "status": "promoting",
-        "pr_number": pr_number,
-        "promotion_task_id": str(promo_task.id),
-    }
-
-
-async def finalize_promotion_landed(
-    session: AsyncSession,
-    version_id: uuid.UUID | str,
-    *,
-    token: str | None,
-    owner: str | None,
-    repo: str | None,
-    merged_sha: str | None,
-    pr_url: str = "",
-) -> dict[str, Any]:
-    """Version bookkeeping after the promotion PR merges.
-
-    Called from ``handle_ci_completion`` when the carrier task's PR merges.
-    Loads + ``FOR UPDATE``-locks the version, then delegates to
-    ``_record_promotion_success`` (mark promoted, stamp SHAs, open v(N+1), tag).
-    Idempotent: a version no longer ``"open"`` is treated as already-handled
-    (a concurrent merge sweep or crash-retry).
-    """
-    try:
-        vid = uuid.UUID(str(version_id))
-    except (ValueError, AttributeError):
-        logger.warning(
-            "[RELEASE_QUALIFIER] finalize_promotion_landed: bad version_id %r",
-            version_id,
-        )
-        return {"status": "error", "error": "bad_version_id"}
-
-    locked = (
-        (
-            await session.execute(
-                select(release_version.ReleaseVersion)
-                .where(release_version.ReleaseVersion.id == vid)
-                .with_for_update()
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if locked is None:
-        return {"status": "error", "error": "version_not_found"}
-    if locked.status != "open":
-        return {"status": "already_finalized", "version_status": locked.status}
-
-    base_record = dict(locked.last_qualification or {})
-    candidate_sha = base_record.get("candidate_sha") or merged_sha or ""
-    release_branch = f"release-v{locked.version_number}"
-    result = await _record_promotion_success(
+    return await _record_promotion_success(
         session,
-        locked,
+        version,
         candidate_sha,
         base_record,
-        pr_url or base_record.get("pr_url", ""),
+        pr_url,
         token=token,
         owner=owner,
         repo=repo,
         promoted_sha=merged_sha or candidate_sha,
-        lock_released=False,  # we hold the FOR UPDATE lock taken just above
     )
-    # Best-effort: delete the release-v{N} branch now that the merge has landed
-    # (audit R4-H2 — release branches must not accumulate).  The carrier-driven
-    # merge via handle_ci_completion does not clean it up, so do it here.
-    if token and owner and repo and result.get("status") == "promoted":
-        await _delete_release_branch_best_effort(
-            token, owner, repo, release_branch, locked
-        )
-    return result
-
-
-async def revert_promotion_after_ci_failure(
-    session: AsyncSession,
-    version_id: uuid.UUID | str,
-    *,
-    reason: str,
-    red_build: bool = False,
-) -> dict[str, Any]:
-    """Send a ``"promoting"`` version back to stabilize after the promotion PR's
-    CI failed or the PR could not merge.
-
-    Called from ``handle_ci_completion`` (CI-failure branch) INSTEAD of spawning
-    a fix task — a red promotion candidate is a quality signal about the version,
-    not a PR to "fix".  ``red_build`` records ``ci_not_green`` vs the softer
-    ``ci_unresolved`` (so the readiness signal isn't polluted, mirroring the
-    candidate-CI vocabulary).  Idempotent: only acts on a version still
-    ``status == "open"`` whose ``last_qualification.status == "promoting"``.
-    """
-    try:
-        vid = uuid.UUID(str(version_id))
-    except (ValueError, AttributeError):
-        return {"status": "error", "error": "bad_version_id"}
-    locked = (
-        (
-            await session.execute(
-                select(release_version.ReleaseVersion)
-                .where(release_version.ReleaseVersion.id == vid)
-                .with_for_update()
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if locked is None:
-        return {"status": "error", "error": "version_not_found"}
-    if (
-        locked.status != "open"
-        or (locked.last_qualification or {}).get("status") != "promoting"
-    ):
-        return {"status": "noop", "version_status": locked.status}
-    base_record = dict(locked.last_qualification or {})
-    record = {
-        **base_record,
-        "status": "not_promoted",
-        "blocker": "ci_not_green" if red_build else "ci_unresolved",
-        "promotion_revert_reason": reason[:300],
-        "finalized_at": _utcnow().isoformat(),
-    }
-    locked.last_qualification = record
-    flag_modified(locked, "last_qualification")
-    release_version.set_version_phase(locked, "stabilize", reasoning=reason[:300])
-    session.add(locked)
-    await _notify_operator(
-        session,
-        locked,
-        "release_promotion_failed",
-        (
-            f"v{locked.version_number} promotion merge failed — {reason}. "
-            f"Returned to stabilize; the next strategic cycle works the blocker."
-        ),
-        extra={"error": "merge_blocked", "blocker": record["blocker"]},
-    )
-    logger.warning(
-        "[RELEASE_QUALIFIER] v%d promotion reverted to stabilize (%s): %s",
-        locked.version_number,
-        record["blocker"],
-        reason,
-    )
-    return {"status": "reverted", "blocker": record["blocker"]}
 
 
 async def _delete_release_branch_best_effort(
@@ -4044,8 +4745,7 @@ async def _record_promotion_success(
         _project = await session.get(Project, version.project_id)
         if _project is not None:
             _next_goal = (
-                parse_problem_model(_project.problem_model).intent.current_focus
-                or None
+                parse_problem_model(_project.problem_model).intent.current_focus or None
             )
     except Exception:
         logger.exception(
@@ -4152,6 +4852,36 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         "blocker": qual.get("blocker"),
         "started_at": qual.get("started_at"),
         "finalized_at": qual.get("finalized_at"),
+    }
+
+
+def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
+    """Return an operator-facing dict for a single QualificationVerdict row.
+
+    Serializes the ORM row into a stable, JSON-safe shape for the
+    qualification-verdict history endpoint.  Adds a human-readable ``outcome``
+    label alongside the raw ``terminal_status`` code so the UI can render
+    both without a second lookup.
+    """
+    return {
+        "id": str(verdict.id),
+        "release_version_id": str(verdict.release_version_id),
+        "candidate_sha": verdict.candidate_sha,
+        "confidence": verdict.confidence,
+        "sub_scores": verdict.sub_scores,
+        "blocker": verdict.blocker,
+        "would_promote": verdict.would_promote,
+        "promotion_enabled": verdict.promotion_enabled,
+        "terminal_status": verdict.terminal_status,
+        "outcome": _OUTCOME_LABELS.get(
+            verdict.terminal_status, verdict.terminal_status
+        ),
+        "threshold": verdict.threshold,
+        "started_at": verdict.started_at.isoformat() if verdict.started_at else None,
+        "finalized_at": verdict.finalized_at.isoformat()
+        if verdict.finalized_at
+        else None,
+        "created_at": verdict.created_at.isoformat(),
     }
 
 
@@ -4274,9 +5004,12 @@ async def compute_promotion_readiness(
             break
 
     # Blocker frequency across the window (only non-promote verdicts carry one).
+    # ci_unresolved is a resolution/infrastructure concern and must not be counted
+    # as a quality recurring blocker — it would pollute the readiness signal and
+    # misdirect the strategic agent toward a non-existent build problem.
     blocker_counts: dict[str, int] = {}
     for v in verdicts:
-        if v.blocker:
+        if v.blocker and v.blocker != "ci_unresolved":
             blocker_counts[v.blocker] = blocker_counts.get(v.blocker, 0) + 1
     recurring_blockers = {
         code: n

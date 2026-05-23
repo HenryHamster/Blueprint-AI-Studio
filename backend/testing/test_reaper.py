@@ -3543,8 +3543,9 @@ async def test_step9_sweep_finalizes_qualification_stuck_pending_after_reaper_ki
     the periodic loop so the next cycle catches it.
 
     After the cycle: last_qualification.status is no longer 'pending' (the
-    composite finalized — a FAILED audit yields no RELEASE_AUDIT_REPORT, so
-    the qualification is not promoted) and phase is back to 'stabilize'.
+    finalize routed a FAILED qualifier child to the infra-failure path — a
+    broken pipeline, not a quality verdict — yielding status 'infra_failure')
+    and phase is back to 'stabilize'.
     """
     from app import shared_state
 
@@ -3620,11 +3621,12 @@ async def test_step9_sweep_finalizes_qualification_stuck_pending_after_reaper_ki
             "reaper Step 9 sweep must finalize a version stuck 'pending' with "
             "both qualifier children terminal"
         )
-        # A FAILED audit posts no RELEASE_AUDIT_REPORT → not promoted; the
-        # version returns to stabilize for the next strategic cycle.
-        assert version.last_qualification.get("status") == "not_promoted"
+        # A FAILED audit child is a broken qualifier pipeline, not a quality
+        # finding → status 'infra_failure'; the version returns to stabilize
+        # for a clean re-qualification on the next strategic cycle.
+        assert version.last_qualification.get("status") == "infra_failure"
         assert version.phase == "stabilize", (
-            "finalize must send the un-promoted version back to 'stabilize'"
+            "finalize must send the infra-failed version back to 'stabilize'"
         )
         # The version stays open — a failed qualification only ever blocks.
         assert version.status == "open"
@@ -3783,7 +3785,7 @@ async def test_step9_sweep_skips_qualification_with_running_child(
         # same cycle — proves the skip above is a deliberate decision by a
         # working sweep, not the side effect of a silently-broken finalize.
         assert control_version.last_qualification is not None
-        assert control_version.last_qualification.get("status") == "not_promoted", (
+        assert control_version.last_qualification.get("status") == "infra_failure", (
             "Step 9 sweep must finalize a both-children-terminal version — if "
             "this fails the sweep's finalize path is broken and the "
             "running-child 'stays pending' assertion proves nothing"

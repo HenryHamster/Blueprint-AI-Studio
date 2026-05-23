@@ -10110,8 +10110,11 @@ async def test_failed_release_audit_last_child_triggers_finalization(
     assert qual.get("status") != "pending", (
         f"FAILED release_audit (last child) left version wedged: {qual}"
     )
-    # A failed/missing-artifact child degrades to a hard blocker → not_promoted.
-    assert qual.get("status") == "not_promoted"
+    # A FAILED required child is an infrastructure failure (qualifier pipeline
+    # broke), NOT a quality finding — it routes to infra_failure and returns
+    # the version to stabilize for a clean re-qualification.
+    assert qual.get("status") == "infra_failure"
+    assert qual.get("error") == "audit_task_failed"
     assert refetched.phase == "stabilize"
 
 
@@ -10156,9 +10159,11 @@ async def test_failed_qualifier_smoketest_no_artifact_triggers_finalization(
     assert qual.get("status") != "pending", (
         f"artifact-less FAILED qualifier-smoketest left version wedged: {qual}"
     )
-    assert qual.get("status") == "not_promoted"
-    # A smoketest that produced no usable result is a startup-suite hard blocker.
-    assert qual.get("blocker") == "smoketest_startup_failed"
+    # A FAILED required smoketest child is an infrastructure failure (VM crash /
+    # harness ERROR_LOG), NOT a quality verdict — it routes to infra_failure
+    # rather than recording a smoketest_startup_failed quality blocker.
+    assert qual.get("status") == "infra_failure"
+    assert qual.get("error") == "smoketest_task_failed"
 
 
 @pytest.mark.asyncio
@@ -10193,7 +10198,10 @@ async def test_cancelled_release_audit_last_child_triggers_finalization(
     assert qual.get("status") != "pending", (
         f"CANCELLED release_audit (last child) left version wedged: {qual}"
     )
-    assert qual.get("status") == "not_promoted"
+    # A CANCELLED required child is an infrastructure failure, NOT a quality
+    # finding — it routes to infra_failure (mirrors the FAILED case).
+    assert qual.get("status") == "infra_failure"
+    assert qual.get("error") == "audit_task_cancelled"
 
 
 @pytest.mark.asyncio
@@ -10257,6 +10265,24 @@ async def test_qualifier_smoketest_finalize_sees_own_artifact_via_endpoint(
     mocker.patch("app.main._ensure_vm_deleted", new_callable=AsyncMock)
     mocker.patch("app.main.fire_and_forget_vm_delete", return_value=None)
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # Finalize re-resolves CI for the candidate commit rather than trusting the
+    # spawn-time ci_green snapshot; with no GitHub credentials in this test that
+    # resolution degrades to not-green and would hard-block on ci_not_green.
+    # This test's subject is smoketest-artifact visibility (CI is assumed green,
+    # as the stored qualification records), so pin the re-resolution to green.
+    mocker.patch(
+        "app.release_qualifier._resolve_ci_at_finalize",
+        new=AsyncMock(
+            return_value=(
+                True,
+                {
+                    "state": "green",
+                    "resolved_sha": "deadbeef",
+                    "detail": "pinned-green",
+                },
+            )
+        ),
+    )
     # promotion_enabled defaults False (dark) — a confident candidate dry-runs.
 
     project = Project(
