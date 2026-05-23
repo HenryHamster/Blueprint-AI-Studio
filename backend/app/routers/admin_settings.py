@@ -1839,13 +1839,19 @@ async def repair_state(
 
     # 1. Tasks stuck in PROVISIONING/IN_PROGRESS with no heartbeat for 15+ min → FAILED
     fifteen_min_ago = _utcnow() - timedelta(minutes=15)
+    # Scope to tasks updated in the last 24 hours; active tasks older than that are
+    # extremely rare and would require manual intervention anyway.
+    recent_cutoff = _utcnow() - timedelta(hours=24)
     stuck_tasks = (
         (
             await session.execute(
-                select(Task).where(
+                select(Task)
+                .where(
                     Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
                     Task.vm_instance_id.isnot(None),
+                    Task.updated_at >= recent_cutoff,
                 )
+                .limit(500)
             )
         )
         .scalars()
@@ -1884,7 +1890,7 @@ async def repair_state(
     evaluating_tasks = (
         (
             await session.execute(
-                select(Task).where(Task.status == TaskStatus.EVALUATING)
+                select(Task).where(Task.status == TaskStatus.EVALUATING).limit(500)
             )
         )
         .scalars()
@@ -1929,13 +1935,15 @@ async def repair_state(
     orphan_children = (
         (
             await session.execute(
-                select(Task).where(
+                select(Task)
+                .where(
                     Task.parent_task_id.isnot(None),
                     ~select(ParentTask.id)
                     .where(ParentTask.id == Task.parent_task_id)
                     .correlate(Task)
                     .exists(),
                 )
+                .limit(500)
             )
         )
         .scalars()

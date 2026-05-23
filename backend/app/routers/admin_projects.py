@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select, delete
+from sqlalchemy import update
 from typing import Dict, Any, List
 import uuid
 from datetime import timedelta
@@ -379,12 +380,14 @@ async def delete_project_admin(
         TaskStatus.IN_PROGRESS,
         TaskStatus.EVALUATING,
     ]
+    # Bounded load: used for the existence check and per-task VM cleanup.
+    # The bulk UPDATE below covers all matching rows regardless of this cap.
     active_tasks = (
         (
             await session.execute(
-                select(Task).where(
-                    Task.project_id == project_id, Task.status.in_(ACTIVE_STATUSES)
-                )
+                select(Task)
+                .where(Task.project_id == project_id, Task.status.in_(ACTIVE_STATUSES))
+                .limit(1000)
             )
         )
         .scalars()
@@ -397,14 +400,23 @@ async def delete_project_admin(
             detail=f"Project has {len(active_tasks)} active task(s). Cancel them first, or pass ?force=true.",
         )
 
+    cancelled_count = 0
     if active_tasks and force:
-        # Force: cancel active tasks and delete their VMs
+        # Force: bulk-cancel all active tasks (covers rows beyond the 1000-row
+        # load window), then delete VMs for the loaded subset.
         from app.main import _ensure_vm_deleted
 
+        result = await session.execute(
+            update(Task)
+            .where(Task.project_id == project_id, Task.status.in_(ACTIVE_STATUSES))
+            .values(
+                status=TaskStatus.CANCELLED,
+                latest_status_message="Project force-deleted",
+            )
+            .execution_options(synchronize_session=False)
+        )
+        cancelled_count = result.rowcount
         for task in active_tasks:
-            task.status = TaskStatus.CANCELLED
-            task.latest_status_message = "Project force-deleted"
-            session.add(task)
             await _ensure_vm_deleted(task, reason="project_force_delete")
         await session.commit()
 
@@ -422,7 +434,7 @@ async def delete_project_admin(
 
     return {
         "message": f"Project {project_id} deleted",
-        "active_tasks_cancelled": len(active_tasks) if active_tasks else 0,
+        "active_tasks_cancelled": cancelled_count,
     }
 
 
@@ -579,23 +591,19 @@ async def get_autonomous_status(
 
     # Count autonomous RESEARCH tasks per project in the last hour (matches rate limit guard)
     user_pids = _user_project_ids(current_user["user_id"])
-    auto_tasks = (
-        (
-            await session.execute(
-                select(Task).where(
-                    Task.project_id.in_(user_pids),
-                    Task.created_by == "ORCHESTRATOR",
-                    Task.created_at >= one_hour_ago,
-                )
+    research_count_rows = (
+        await session.execute(
+            select(Task.project_id, func.count().label("cnt"))
+            .where(
+                Task.project_id.in_(user_pids),
+                Task.created_by == "ORCHESTRATOR",
+                Task.created_at >= one_hour_ago,
+                Task.payloads[0]["type"].astext == "research",
             )
+            .group_by(Task.project_id)
         )
-        .scalars()
-        .all()
-    )
-    tasks_per_project: dict = {}
-    for t in auto_tasks:
-        if (t.first_payload).get("type") == "research":
-            tasks_per_project[t.project_id] = tasks_per_project.get(t.project_id, 0) + 1
+    ).all()
+    tasks_per_project: dict = {row.project_id: row.cnt for row in research_count_rows}
 
     # Batch query: most recent autonomous task per project
     last_research_subq = (
