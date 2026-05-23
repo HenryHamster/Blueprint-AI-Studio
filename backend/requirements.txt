@@ -35,3 +35,6 @@ websockets==12.0
 PyYAML==6.0.1
 firebase-admin==6.4.0
 mypy==1.8.0
+# Suite sharding for parallel CI (matrix shards run `--splits N --group K`).
+# Deterministic split by collection order (no pytest-randomly installed).
+pytest-split==0.8.2
