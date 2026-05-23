@@ -41,6 +41,12 @@ _BACKGROUND_LOCK_ID: int = ctypes.c_int64(0xB1EB1EB1EB1EB1EB).value
 
 logger = logging.getLogger("blueprint")
 
+# Maximum crash episodes within the 10-minute episode window before spawning a
+# crash-investigation task for the service. Must be >= _ORPHAN_REAP_CRASH_STREAK_LIMIT
+# in reaper.py so a per-task quarantine fires BEFORE service-level investigations
+# are triggered — isolated reap failures should not appear here at all.
+_BACKGROUND_CRASH_EPISODE_THRESHOLD: int = 3
+
 
 async def _spawn_crash_investigations(
     *,
@@ -95,9 +101,7 @@ async def _spawn_crash_investigations(
     )
     spawned_count = 0
     async with AsyncSessionLocal() as session:
-        project_ids = (
-            (await session.execute(select(Project.id))).scalars().all()
-        )
+        project_ids = (await session.execute(select(Project.id))).scalars().all()
 
         for project_id in project_ids:
             pid_str = str(project_id)
@@ -472,15 +476,11 @@ async def lifespan(app):
             try:
                 async with AsyncSessionLocal() as scan_session:
                     project_ids = (
-                        (await scan_session.execute(select(Project.id)))
-                        .scalars()
-                        .all()
+                        (await scan_session.execute(select(Project.id))).scalars().all()
                     )
                     for project_id in project_ids:
                         try:
-                            changed = await run_recovery_once(
-                                scan_session, project_id
-                            )
+                            changed = await run_recovery_once(scan_session, project_id)
                             if changed:
                                 logger.info(
                                     "[RECOVERY_SCAN] project=%s changed=%d",
@@ -516,9 +516,7 @@ async def lifespan(app):
             try:
                 async with AsyncSessionLocal() as scan_session:
                     project_ids = (
-                        (await scan_session.execute(select(Project.id)))
-                        .scalars()
-                        .all()
+                        (await scan_session.execute(select(Project.id))).scalars().all()
                     )
                     for project_id in project_ids:
                         try:
@@ -566,9 +564,7 @@ async def lifespan(app):
             try:
                 async with AsyncSessionLocal() as scan_session:
                     project_ids = (
-                        (await scan_session.execute(select(Project.id)))
-                        .scalars()
-                        .all()
+                        (await scan_session.execute(select(Project.id))).scalars().all()
                     )
                     for project_id in project_ids:
                         try:
@@ -617,9 +613,7 @@ async def lifespan(app):
             try:
                 async with AsyncSessionLocal() as scan_session:
                     project_ids = (
-                        (await scan_session.execute(select(Project.id)))
-                        .scalars()
-                        .all()
+                        (await scan_session.execute(select(Project.id))).scalars().all()
                     )
                     for project_id in project_ids:
                         try:
@@ -778,11 +772,7 @@ async def lifespan(app):
                         try:
                             async with AsyncSessionLocal() as alert_session:
                                 project_ids = (
-                                    (
-                                        await alert_session.execute(
-                                            select(Project.id)
-                                        )
-                                    )
+                                    (await alert_session.execute(select(Project.id)))
                                     .scalars()
                                     .all()
                                 )
@@ -824,8 +814,10 @@ async def lifespan(app):
                         cutoff = now_ts - timedelta(seconds=600)
                         crash_timestamps[name] = [ts for ts in ts_list if ts >= cutoff]
                         # Spawn an investigate task when 3+ crashes occur in 10 min
-                        _CRASH_EPISODE_THRESHOLD = 3
-                        if len(crash_timestamps[name]) >= _CRASH_EPISODE_THRESHOLD:
+                        if (
+                            len(crash_timestamps[name])
+                            >= _BACKGROUND_CRASH_EPISODE_THRESHOLD
+                        ):
                             inflight = _inflight_crash_investigations.setdefault(
                                 name, {}
                             )

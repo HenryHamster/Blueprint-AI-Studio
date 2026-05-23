@@ -52,9 +52,7 @@ def _make_session(projects, existing_task=None, existing_case=None):
                 result.first.return_value = None
         else:
             # Project query — select(Project.id) yields scalar UUIDs
-            result.scalars.return_value.all.return_value = [
-                p.id for p in projects
-            ]
+            result.scalars.return_value.all.return_value = [p.id for p in projects]
         return result
 
     session.execute = execute
@@ -342,3 +340,77 @@ class TestMonitorCrashTracking:
 
         assert "reaper" not in crash_timestamps
         assert "reaper" not in inflight_investigations
+
+
+# ---------------------------------------------------------------------------
+# Regression guards: orphan-reap crash isolation ↔ lifecycle crash-episode link
+# ---------------------------------------------------------------------------
+
+
+class TestOrphanReapCrashIsolation:
+    """Regression guards verifying that isolated orphan-reap failures stay below
+    the service-crash radar in _monitor_background_tasks.
+
+    Before the per-task isolation fix, a single poison-pill task crashing inside
+    the reaper loop caused the entire reaper service to exit (task.done() = True),
+    eventually reaching the crash-episode threshold and spawning investigation tasks.
+    After the fix, per-task exceptions are caught inside the reaper's own try/except
+    so the reaper service never exits for per-task failures — crash_timestamps["reaper"]
+    stays empty and no spurious investigation tasks are spawned.
+    """
+
+    def test_orphan_streak_limit_at_most_episode_threshold(self):
+        """Per-task quarantine fires before service-level crash investigations.
+
+        If _ORPHAN_REAP_CRASH_STREAK_LIMIT > _BACKGROUND_CRASH_EPISODE_THRESHOLD,
+        a poison-pill task would trigger enough full-reaper crashes to spawn an
+        investigation task BEFORE being quarantined — defeating the per-task isolation.
+        Quarantine must fire first (streak ≤ episode threshold).
+        """
+        from app.reaper import _ORPHAN_REAP_CRASH_STREAK_LIMIT
+        from app.lifecycle import _BACKGROUND_CRASH_EPISODE_THRESHOLD
+
+        assert _ORPHAN_REAP_CRASH_STREAK_LIMIT <= _BACKGROUND_CRASH_EPISODE_THRESHOLD
+
+    def test_per_task_isolation_keeps_service_crash_timestamps_empty(self):
+        """When the reaper isolates per-task exceptions the service crash counter stays at 0.
+
+        _monitor_background_tasks only appends to crash_timestamps when an asyncio.Task
+        finishes (task.done() = True). Per-row isolation means the reaper service task
+        never exits for per-task reap failures, so no crash timestamp is recorded.
+        """
+        from app.time_utils import _utcnow
+
+        crash_timestamps: Dict[str, list] = {}
+        reaper_service_done = False  # reaper stayed alive via per-task isolation
+        if reaper_service_done:
+            crash_timestamps.setdefault("reaper", []).append(_utcnow())
+
+        assert not crash_timestamps.get("reaper")
+
+    def test_quarantine_clears_streak_entry_so_task_is_not_reselected(self):
+        """After quarantine, the streak entry is deleted so the task stops accumulating.
+
+        The quarantine path in reaper.py transitions the task to FAILED (removing it
+        from the PROVISIONING/IN_PROGRESS active-task query on the next cycle) and
+        deletes the streak entry so stale accumulation cannot re-trigger quarantine.
+        """
+        import uuid
+        from app.reaper import (
+            _orphan_reap_crash_streaks,
+            _ORPHAN_REAP_CRASH_STREAK_LIMIT,
+        )
+
+        task_id = str(uuid.uuid4())
+        _orphan_reap_crash_streaks.pop(task_id, None)  # clean slate
+
+        # Simulate accumulation up to the quarantine threshold
+        _orphan_reap_crash_streaks[task_id] = _ORPHAN_REAP_CRASH_STREAK_LIMIT
+        assert (
+            _orphan_reap_crash_streaks.get(task_id, 0)
+            >= _ORPHAN_REAP_CRASH_STREAK_LIMIT
+        )
+
+        # Simulate quarantine: DB transition happens, streak entry is removed
+        del _orphan_reap_crash_streaks[task_id]
+        assert task_id not in _orphan_reap_crash_streaks

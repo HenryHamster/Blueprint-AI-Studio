@@ -37,6 +37,8 @@ from app.reaper import (
     reaper_service,
     _copy_analysis_artifacts_to_previous,
     _reaper_skip_counts,
+    _orphan_reap_crash_streaks,
+    _ORPHAN_REAP_CRASH_STREAK_LIMIT,
     _heartbeat_stale_cutoff,
     _progress_stale_cutoff,
 )
@@ -4399,3 +4401,162 @@ async def test_step7_stalled_cycle_already_terminal_task_untouched(
         "task message must not be overwritten"
     )
     assert cycle.outcome == "stalled_phase1", "cycle must be declared stalled"
+
+
+# ── Orphan reap crash isolation & quarantine ─────────────────────────────
+
+
+@pytest.fixture()
+def clean_crash_streaks():
+    """Reset the per-task reap-crash streak tracker before and after each test."""
+    _orphan_reap_crash_streaks.clear()
+    yield _orphan_reap_crash_streaks
+    _orphan_reap_crash_streaks.clear()
+
+
+@pytest.mark.asyncio
+async def test_orphan_crash_sibling_reaped_when_poison_throws(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, clean_crash_streaks, mocker
+):
+    """A poison task that raises mid-reap is skipped; a sibling orphan in the same
+    batch is still reaped normally — per-task isolation prevents cascade failure."""
+    project = await _make_project(reaper_db)
+    poison = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-poison",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    healthy = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-healthy-sibling",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(poison)
+    reaper_db.add(healthy)
+    await reaper_db.commit()
+    poison_id = poison.id
+
+    # Inject a crash on the first session.get(Task, poison_id) call only.
+    # Subsequent calls (e.g. from the quarantine path's _qsession) succeed normally.
+    call_count: dict = {}
+    real_get = AsyncSession.get
+
+    async def patched_get(self, model, pk, **kwargs):
+        key = (model, pk)
+        call_count[key] = call_count.get(key, 0) + 1
+        if pk == poison_id and call_count[key] == 1:
+            raise RuntimeError("injected-poison-pill")
+        return await real_get(self, model, pk, **kwargs)
+
+    mocker.patch.object(AsyncSession, "get", patched_get)
+
+    import app.reaper as _reaper_mod
+
+    _cycles_before = _reaper_mod._reaper_cycles_completed_count
+    await _run_reaper_once()
+    await reaper_db.refresh(poison)
+    await reaper_db.refresh(healthy)
+
+    # The cycle must complete cleanly: the per-task crash + rollback expires the
+    # batch's ORM objects, and the post-commit loops (rollup/dependent-unblock)
+    # must not touch expired attributes (would raise MissingGreenlet and bubble
+    # to the cycle handler, stalling the liveness counter). A bumped counter
+    # proves the success path ran end-to-end, not the cycle-level except.
+    assert _reaper_mod._reaper_cycles_completed_count == _cycles_before + 1, (
+        "reaper cycle must complete cleanly despite the poison-task crash — "
+        "a stalled counter means the post-loop hit MissingGreenlet on an "
+        "expired ORM object and the cycle handler swallowed it"
+    )
+
+    assert poison.status == TaskStatus.IN_PROGRESS, (
+        "poison task must not be reaped this cycle (crash was caught and skipped)"
+    )
+    assert healthy.status == TaskStatus.QUEUED, (
+        "sibling healthy task must be reaped normally despite poison task crash"
+    )
+    assert healthy.attempt_count == 1
+    assert clean_crash_streaks.get(str(poison_id)) == 1, (
+        "crash streak must be incremented for the poison task"
+    )
+
+
+@pytest.mark.asyncio
+async def test_orphan_crash_quarantines_task_after_streak_threshold(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, clean_crash_streaks, mocker
+):
+    """A task that causes a reap crash on every cycle is quarantined (FAILED) after
+    _ORPHAN_REAP_CRASH_STREAK_LIMIT consecutive crashes, with an operator-visible Alert.
+    The streak counter is cleared on quarantine so it stops being re-selected."""
+    project = await _make_project(reaper_db)
+    poison = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-to-quarantine",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(poison)
+    await reaper_db.commit()
+    poison_id = poison.id
+
+    # Pre-seed streak to one below the threshold so this cycle triggers quarantine.
+    clean_crash_streaks[str(poison_id)] = _ORPHAN_REAP_CRASH_STREAK_LIMIT - 1
+
+    # Raise on the first session.get call per task id (main loop body); subsequent
+    # calls from the quarantine path's _qsession succeed so the FAILED write lands.
+    call_count: dict = {}
+    real_get = AsyncSession.get
+
+    async def patched_get(self, model, pk, **kwargs):
+        key = (model, pk)
+        call_count[key] = call_count.get(key, 0) + 1
+        if pk == poison_id and call_count[key] == 1:
+            raise RuntimeError("injected-poison-quarantine")
+        return await real_get(self, model, pk, **kwargs)
+
+    mocker.patch.object(AsyncSession, "get", patched_get)
+
+    import app.reaper as _reaper_mod
+
+    _cycles_before = _reaper_mod._reaper_cycles_completed_count
+    await _run_reaper_once()
+    await reaper_db.refresh(poison)
+
+    # Quarantine path also rolls back + expires the batch; the cycle must still
+    # complete cleanly (counter advances), proving the post-loop never reads an
+    # expired ORM attribute.
+    assert _reaper_mod._reaper_cycles_completed_count == _cycles_before + 1, (
+        "reaper cycle must complete cleanly through the quarantine path"
+    )
+
+    assert poison.status == TaskStatus.FAILED, (
+        "task must be quarantined (FAILED) after reaching the streak threshold"
+    )
+    assert "Quarantined" in (poison.latest_status_message or ""), (
+        "status message must mention 'Quarantined'"
+    )
+    assert "injected-poison-quarantine" in (poison.latest_status_message or ""), (
+        "status message must include the last error for operator triage"
+    )
+
+    alerts = (
+        (await reaper_db.execute(_select(Alert).where(Alert.task_id == poison_id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) >= 1, "quarantine must emit an operator-visible Alert"
+    assert (
+        "quarantine" in (alerts[0].title or "").lower()
+        or "quarantine" in (alerts[0].message or "").lower()
+    )
+
+    assert str(poison_id) not in clean_crash_streaks, (
+        "streak entry must be cleared after quarantine so the task stops being re-selected"
+    )
