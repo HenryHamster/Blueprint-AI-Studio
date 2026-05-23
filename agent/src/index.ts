@@ -2049,6 +2049,13 @@ export function resetLlmTelemetry(): void {
   _totalOutputTokens = 0;
 }
 
+/** Estimate token count from character count (4 chars ≈ 1 token).
+ *  Used for providers that run in plain-text output mode (e.g. Gemini CLI with
+ *  -o text) and don't emit structured token-usage blocks in their output. */
+export function estimateTokensFromChars(chars: number): number {
+  return Math.ceil(chars / 4);
+}
+
 // ── Divergence detection helpers ─────────────────────────────────────────────
 
 const _TOKEN_RE = /\w+/g;
@@ -4087,6 +4094,18 @@ echo ""
       void drainPendingThenResolve(code ?? 1);
     });
   });
+
+  // Text-mode providers (Gemini CLI with -o text) don't emit a structured usage
+  // block, so recordLlmTokens never fires inside the stream handler. Estimate
+  // token counts from char lengths (4 chars ≈ 1 token) so llm_cost_per_merged_pr
+  // can price Gemini tasks. Runs unconditionally here — before flags checks — so
+  // tokens are captured even on timeout or external kill.
+  if (runCommand.outputMode === 'text') {
+    recordLlmTokens(
+      estimateTokensFromChars(prompt.length),
+      estimateTokensFromChars(lastResultText.length),
+    );
+  }
 
   sendLog(ws, `\n--- ${runner.displayName} exited (code: ${exitCode}) ---\n`);
 

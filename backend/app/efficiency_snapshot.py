@@ -84,12 +84,10 @@ ALL_AXES: tuple[str, ...] = (
 #   OpenAI    — https://openai.com/api/pricing
 #   Gemini    — https://ai.google.dev/gemini-api/docs/pricing
 #
-# NOTE: Gemini tasks today carry llm_call_count but NOT total_input_tokens /
-# total_output_tokens because the Gemini CLI invocation path in agent/src/index.ts
-# runs with outputMode='text' (no JSONL parser, no usage block extraction).
-# The Gemini pricing entries below will fire correctly once the agent-side
-# telemetry gap is closed; until then Gemini tasks have zero token counts and
-# are correctly treated as "not priceable" by _compute_llm_cost_pricing_coverage.
+# Gemini tasks estimate token counts from prompt/result char lengths (4 chars ≈ 1 token)
+# since the Gemini CLI outputMode='text' path has no structured usage block. The estimates
+# are populated via recordLlmTokens() before any exit path in agent/src/index.ts so
+# timeout and kill cases are covered. Gemini pricing entries below price those estimates.
 LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
     # Anthropic
     ("anthropic", "claude-opus-4-7"): (15e-6, 75e-6),
@@ -101,7 +99,6 @@ LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
     ("openai", "gpt-5.4-mini"): (0.5e-6, 2e-6),
     ("openai", "gpt-5.3-codex"): (3e-6, 12e-6),
     # Gemini (ai.google.dev/gemini-api/docs/pricing, 2026-05)
-    # Token counts are zero today (agent telemetry gap — see note above).
     ("gemini", "gemini-2.5-pro"): (1.25e-6, 10e-6),
     ("gemini", "gemini-2.5-flash"): (0.30e-6, 2.5e-6),
     ("gemini", "gemini-2.5-flash-lite"): (0.10e-6, 0.40e-6),

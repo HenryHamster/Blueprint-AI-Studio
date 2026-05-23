@@ -281,6 +281,9 @@ SCOPE_PRESSURE_WARN_THRESHOLD = 0.7
 # SCOPE_PRESSURE_HARD_CAP_PERCENTAGE (90%) level.
 SCOPE_PRESSURE_HARD_CAP_PERCENTAGE = 90
 SCOPE_PRESSURE_HARD_CAP_REMAINING = 2
+# For large-scope tasks, allow slightly more remaining iterations (floor of 3)
+# so we don't slam to 2 remaining on a near-finished large refactor.
+SCOPE_PRESSURE_HARD_CAP_REMAINING_LARGE = 3
 
 _SCOPE_PRESSURE_HARD_CAP_PREFIX = (
     "🚫 SCOPE BUDGET EXHAUSTED: this PR has consumed {count}/{budget} "
@@ -1893,7 +1896,7 @@ async def _spawn_pipeline_task(
                 )
                 fix_prompt = early_prefix + (fix_prompt or "")
 
-    # Graduated scope-budget pressure cap: a medium-scope fix cycle's
+    # Graduated scope-budget pressure cap: a medium- or large-scope fix cycle's
     # remaining iterations are scaled down by how close the PR is to its
     # production file budget. Activation is at SCOPE_PRESSURE_WARN_THRESHOLD
     # (70%); the no-new-files prompt still only fires at
@@ -1914,15 +1917,22 @@ async def _spawn_pipeline_task(
         )
         if (
             _util_for_pressure
-            and _scope_for_pressure == "medium"
+            and _scope_for_pressure in ("medium", "large")
             and _util_for_pressure.get("percentage", 0)
             >= SCOPE_PRESSURE_WARN_THRESHOLD * 100
         ):
             util_pct = _util_for_pressure["percentage"]
             base_remaining = per_chain_cap - iteration
             if base_remaining > 0:
+                # Use a slightly higher hard cap floor for large scope to avoid
+                # slamming to 2 remaining iterations on a near-finished large refactor.
+                hard_cap_floor = (
+                    SCOPE_PRESSURE_HARD_CAP_REMAINING_LARGE
+                    if _scope_for_pressure == "large"
+                    else SCOPE_PRESSURE_HARD_CAP_REMAINING
+                )
                 graduated_remaining = max(
-                    SCOPE_PRESSURE_HARD_CAP_REMAINING,
+                    hard_cap_floor,
                     round(base_remaining * (1.0 - util_pct / 100)),
                 )
                 hard_cap_target = iteration + graduated_remaining

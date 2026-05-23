@@ -77,6 +77,28 @@ function getStaleness(dateStr: string): 'fresh' | 'stale' | 'very_stale' {
   return 'fresh';
 }
 
+interface FindingMetrics {
+  mergedCount: number;
+  activeCount: number;
+  prCount: number;
+  failedCount: number;
+  proposedCount: number;
+  staleCount: number;
+}
+
+function computeFindingMetrics(findings: EnrichedFinding[]): FindingMetrics {
+  let mergedCount = 0, activeCount = 0, prCount = 0, failedCount = 0, proposedCount = 0, staleCount = 0;
+  for (const f of findings) {
+    const status = f.outcome ? f.outcome.status : undefined;
+    if (status === 'COMPLETED') mergedCount++;
+    if (f.outcome && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(f.outcome.status)) activeCount++;
+    if (f.outcome?.prUrl) prCount++;
+    if (f.outcome && ['FAILED', 'CANCELLED'].includes(f.outcome.status)) failedCount++;
+    if (!f.outcome) { proposedCount++; if (getStaleness(f.taskCreatedAt) !== 'fresh') staleCount++; }
+  }
+  return { mergedCount, activeCount, prCount, failedCount, proposedCount, staleCount };
+}
+
 const INCLUDED_STATUSES = new Set(['COMPLETED', 'IN_PROGRESS', 'EVALUATING']);
 
 type SourceLink =
@@ -349,6 +371,11 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
     return new Set(filteredGroups.slice(0, 3).map(g => g.directionId ?? '_undirected'));
   }, [expandedGroups, filteredGroups]);
 
+  const groupMetrics = useMemo(
+    () => new Map(filteredGroups.map(g => [g.directionId ?? '_undirected', computeFindingMetrics(g.findings)])),
+    [filteredGroups]
+  );
+
   const toggleGroup = (id: string) => {
     const next = new Set(effectiveExpanded);
     if (next.has(id)) next.delete(id); else next.add(id);
@@ -433,12 +460,8 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
           {filteredGroups.map(group => {
             const groupKey = group.directionId ?? '_undirected';
             const isExpanded = effectiveExpanded.has(groupKey);
-            const mergedCount = group.findings.filter(f => f.outcome?.status === 'COMPLETED').length;
-            const activeCount = group.findings.filter(f => f.outcome && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(f.outcome.status)).length;
-            const prCount = group.findings.filter(f => f.outcome?.prUrl).length;
-            const failedCount = group.findings.filter(f => f.outcome && ['FAILED', 'CANCELLED'].includes(f.outcome.status)).length;
-            const proposedCount = group.findings.filter(f => !f.outcome).length;
-            const staleCount = group.findings.filter(f => !f.outcome && getStaleness(f.taskCreatedAt) !== 'fresh').length;
+            const { mergedCount, activeCount, prCount, failedCount, proposedCount, staleCount } =
+              groupMetrics.get(groupKey) ?? computeFindingMetrics(group.findings);
 
             return (
               <div key={groupKey} className="bg-neutral-900/50 border border-neutral-800 rounded-lg overflow-hidden">

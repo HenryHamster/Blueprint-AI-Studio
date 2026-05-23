@@ -1134,6 +1134,10 @@ class StrategicCycle(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
     )
 
+    __table_args__ = (
+        Index("ix_strategiccycle_project_created", "project_id", "created_at"),
+    )
+
     @property
     def completed_at(self) -> datetime | None:
         """Effective cycle completion time: phase2 if available, else phase1, else updated_at."""
@@ -1589,6 +1593,12 @@ class Artifact(SQLModel, table=True):
             "task_id",
             unique=True,
             postgresql_where=text("artifact_type = 'PULL_REQUEST'"),
+        ),
+        Index(
+            "ix_artifact_pr_url_trgm",
+            "pr_url",
+            postgresql_using="gin",
+            postgresql_ops={"pr_url": "gin_trgm_ops"},
         ),
     )
 

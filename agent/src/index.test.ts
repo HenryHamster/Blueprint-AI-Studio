@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, isViewportBootstrapFailure, isInfrastructureFailure, runViewportSuiteWithFallback, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, isViewportBootstrapFailure, isInfrastructureFailure, runViewportSuiteWithFallback, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -3794,6 +3794,47 @@ describe('LLM telemetry counters', () => {
       total_input_tokens: 0,
       total_output_tokens: 0,
     });
+  });
+});
+
+// ── Gemini text-mode token estimation ────────────────────────────────────────
+describe('Gemini text-mode token estimation', () => {
+  beforeEach(() => {
+    resetLlmTelemetry();
+  });
+
+  it('estimateTokensFromChars returns ceil(chars/4)', () => {
+    expect(estimateTokensFromChars(0)).toBe(0);
+    expect(estimateTokensFromChars(1)).toBe(1);
+    expect(estimateTokensFromChars(4)).toBe(1);
+    expect(estimateTokensFromChars(5)).toBe(2);
+    expect(estimateTokensFromChars(400)).toBe(100);
+    expect(estimateTokensFromChars(1000)).toBe(250);
+  });
+
+  it('lands estimated tokens in the same getLlmTelemetry() fields Claude uses', () => {
+    // Simulate what runProviderAgent does for outputMode='text': estimate from
+    // prompt.length and lastResultText.length, then call recordLlmTokens.
+    const promptChars = 2000;  // → 500 estimated input tokens
+    const resultChars = 800;   // → 200 estimated output tokens
+    recordLlmCallStart();
+    recordLlmTokens(estimateTokensFromChars(promptChars), estimateTokensFromChars(resultChars));
+    const telemetry = getLlmTelemetry();
+    expect(telemetry.total_input_tokens).toBe(500);
+    expect(telemetry.total_output_tokens).toBe(200);
+    expect(telemetry.llm_call_count).toBe(1);
+  });
+
+  it('records non-zero tokens on partial output (timeout/kill scenario)', () => {
+    // Even when the Gemini CLI is killed mid-run, lastResultText has partial
+    // output. Verify estimation still produces non-zero values.
+    const fullPromptChars = 5000;
+    const partialResultChars = 100;
+    recordLlmCallStart();
+    recordLlmTokens(estimateTokensFromChars(fullPromptChars), estimateTokensFromChars(partialResultChars));
+    const telemetry = getLlmTelemetry();
+    expect(telemetry.total_input_tokens).toBeGreaterThan(0);
+    expect(telemetry.total_output_tokens).toBeGreaterThan(0);
   });
 });
 

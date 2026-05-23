@@ -4241,6 +4241,55 @@ async def test_scope_pressure_inactive_below_warn_threshold(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_scope_pressure_large_scope_at_70_percent(db_session, mocker):
+    """Large-scope task at ≥70% utilization gets a graduated cap with hard_cap_remaining=3."""
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+    # Large scope has 20 file budget; 70% = 14 files. Use 15 files to exceed threshold.
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 705,
+                "branch": "feat/large-gc",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "scope": "large",
+            "_pr_changed_files": [f"backend/app/large_{i}.py" for i in range(15)]
+            + ["backend/testing/test_large.py"],
+            "review_loop": {"iteration": 0},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=705,
+        branch="feat/large-gc",
+        base_branch="main",
+        fix_prompt="Address review feedback",
+    )
+    assert created is True and result is not None
+    ctx = result.context or {}
+    # source iteration=0 → spawned iteration=1, base_cap=16, base_remaining=15, 75% util
+    # (15/20 non-test files = 75%) → round(15 * 0.25) = 4 remaining,
+    # no floor needed since 4 >= 3 → hard_cap = 1 + 4 = 5
+    assert ctx.get("_scope_budget_hard_cap") == 5
+    # No no-new-files prompt below 90%
+    payload = result.payloads[0] if result.payloads else {}
+    assert "SCOPE BUDGET EXHAUSTED" not in (payload.get("prompt") or "")
+
+
+@pytest.mark.asyncio
 async def test_prior_hard_cap_propagates_while_under_pressure(db_session, mocker):
     """A prior hard cap on the source task is carried forward to the spawn when
     current utilization is still ≥ warn threshold."""

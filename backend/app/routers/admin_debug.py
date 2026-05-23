@@ -929,13 +929,28 @@ async def reset_circuit_breaker(
 # ---------------------------------------------------------------------------
 
 
+_MAX_ACTIVE_TASKS_DEFAULT = 500
+_MAX_ACTIVE_TASKS_CEILING = 5000
+
+
 @router.get("/projects/{project_id}/diagnostics")
 async def get_project_diagnostics(
     project_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
+    max_active_tasks: int = Query(
+        _MAX_ACTIVE_TASKS_DEFAULT,
+        ge=1,
+        le=_MAX_ACTIVE_TASKS_CEILING,
+    ),
 ):
-    """Return a structured health snapshot for a single project's pipeline."""
+    """Return a structured health snapshot for a single project's pipeline.
+
+    ``max_active_tasks`` caps the number of active tasks fetched (default 500,
+    bounded to [1, 5000]). Tasks are ordered oldest-first so a truncated subset
+    still surfaces the genuinely stuck tasks. When the result is truncated the
+    response includes ``active_tasks_truncated: true``.
+    """
     from app.shared_state import get_circuit_breaker
     from app.compute import get_zone_health_summary
 
@@ -950,13 +965,19 @@ async def get_project_diagnostics(
         TaskStatus.EVALUATING,
     ]
     active_result = await session.execute(
-        select(Task).where(
+        select(Task)
+        .where(
             Task.project_id == project_id,
             Task.status.in_(active_statuses),
             Task.archived.is_(False),
         )
+        # Oldest-first so a truncated subset keeps the genuinely stuck tasks.
+        .order_by(Task.created_at.asc())
+        .limit(max_active_tasks + 1)
     )
-    active_tasks = active_result.scalars().all()
+    active_tasks_raw = active_result.scalars().all()
+    active_tasks_truncated = len(active_tasks_raw) > max_active_tasks
+    active_tasks = active_tasks_raw[:max_active_tasks]
 
     stuck_tasks = await _build_stuck_tasks(active_tasks, now, session)
 
@@ -986,6 +1007,8 @@ async def get_project_diagnostics(
         "needs_manual_intervention_count": sum(
             1 for e in direction_remediation if e["needs_manual_intervention"]
         ),
+        "active_tasks_truncated": active_tasks_truncated,
+        "active_tasks_cap": max_active_tasks,
     }
 
 

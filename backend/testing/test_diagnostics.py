@@ -16,9 +16,11 @@ from app.routers.admin_debug import (
     _build_stuck_tasks,
     _build_direction_remediation_state,
     get_global_diagnostics,
+    get_project_diagnostics,
     DIAGNOSTICS_TOP_N,
+    _MAX_ACTIVE_TASKS_DEFAULT,
 )
-from app.models import Project, Task, TaskStatus
+from app.models import Project, ProjectMember, Task, TaskStatus
 
 # The /diagnostics endpoint filters projects with func.jsonb_array_length(...),
 # which SQLite does not implement — these endpoint tests require real Postgres
@@ -940,3 +942,67 @@ class TestGlobalDiagnosticsPagination:
         assert result["total_stuck_count"] == stuck_n
         secs = [s["stuck_for_seconds"] for s in result["stuck_tasks"]]
         assert secs == sorted(secs, reverse=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Section 5 — GET /api/admin/projects/{id}/diagnostics (active-task cap)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestProjectDiagnosticsActiveTaskCap:
+    """The per-project diagnostics endpoint caps the active-task scan and reports
+    truncation. SQLite-compatible (no jsonb_array_length here)."""
+
+    async def _make_project_with_member(self, db_session, name, user_id):
+        project = Project(name=name, user_id=user_id)
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        db_session.add(
+            ProjectMember(project_id=project.id, user_id=user_id, role="owner")
+        )
+        await db_session.commit()
+        return project
+
+    @pytest.mark.asyncio
+    async def test_truncation_flagged_when_active_exceeds_cap(self, db_session):
+        user_id = "diag-cap-user"
+        project = await self._make_project_with_member(db_session, "diag-cap", user_id)
+        # 4 active tasks; cap at 2 → truncated, only 2 retained.
+        for i in range(4):
+            db_session.add(
+                _make_task(project.id, TaskStatus.QUEUED, created_ago_secs=300 + i * 60)
+            )
+        await db_session.commit()
+
+        result = await get_project_diagnostics(
+            project_id=project.id,
+            session=db_session,
+            current_user={"user_id": user_id},
+            max_active_tasks=2,
+        )
+
+        assert result["active_tasks_truncated"] is True
+        assert result["active_tasks_cap"] == 2
+
+    @pytest.mark.asyncio
+    async def test_no_truncation_when_active_within_cap(self, db_session):
+        user_id = "diag-nocap-user"
+        project = await self._make_project_with_member(
+            db_session, "diag-nocap", user_id
+        )
+        for _ in range(2):
+            db_session.add(
+                _make_task(project.id, TaskStatus.QUEUED, created_ago_secs=300)
+            )
+        await db_session.commit()
+
+        result = await get_project_diagnostics(
+            project_id=project.id,
+            session=db_session,
+            current_user={"user_id": user_id},
+            max_active_tasks=_MAX_ACTIVE_TASKS_DEFAULT,
+        )
+
+        assert result["active_tasks_truncated"] is False
+        assert result["active_tasks_cap"] == _MAX_ACTIVE_TASKS_DEFAULT
