@@ -239,7 +239,25 @@ async def get_task_duration_stats(
         if project_id:
             filters.append(Task.project_id == project_id)
         completed = (
-            (await session.execute(select(Task).where(*filters).limit(50000)))
+            (
+                await session.execute(
+                    select(Task)
+                    .options(
+                        load_only(
+                            Task.status_log,
+                            Task.created_at,
+                            Task.started_at,
+                            Task.payloads,
+                            Task.context,
+                            Task.vm_provisioned_at,
+                            Task.vm_started_at,
+                            Task.vm_stopped_at,
+                        )
+                    )
+                    .where(*filters)
+                    .limit(10000)
+                )
+            )
             .scalars()
             .all()
         )

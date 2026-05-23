@@ -739,6 +739,20 @@ class Task(SQLModel, table=True):
             "model",
             "created_at",
         ),
+        # Partial index for the orchestrator dispatch hot path
+        # (.where(Task.status == QUEUED, Task.requires_approval.is_(False))).
+        # Covers status, priority, created_at so the planner can satisfy the
+        # ORDER BY priority / created_at sort without a full QUEUED-queue scan.
+        # Postgres-only via alembic 0116 CONCURRENTLY DDL; the metadata Index
+        # registers the name + columns for test_model_indexes_covered_by_migrations.
+        Index(
+            "ix_task_queued_no_approval",
+            "status",
+            "priority",
+            "created_at",
+            postgresql_where=text("requires_approval = false"),
+            sqlite_where=text("requires_approval = 0"),
+        ),
         # Partial expression index on the leading payload's pr_number so the
         # review-pipeline per-PR iteration-cap query (review_pipeline.py) can
         # filter in SQL rather than loading every terminal Task row in the
@@ -809,6 +823,26 @@ class Task(SQLModel, table=True):
         # ``octet_length(payloads::text) < 200000`` is Postgres-specific syntax
         # that breaks SQLite-fixture tests using metadata.create_all.
         # See alembic 0063 / memory ``reference_strategic_payload_bloat.md``.
+        # Partial index for auto_remediation.py queries that filter
+        # Task.auto_remediation.is_(True) — keeps the scan tight to the small
+        # fraction of tasks with auto_remediation enabled.
+        Index(
+            "ix_task_auto_remediation_active",
+            "project_id",
+            "created_at",
+            postgresql_where=text("auto_remediation = true"),
+            sqlite_where=text("auto_remediation = 1"),
+        ),
+        # Partial index for services.py post_commit_pending queries (lines 2233,
+        # 2252) that filter Task.post_commit_pending.is_(True) — avoids a full
+        # table scan since only a small subset of tasks have this flag set.
+        Index(
+            "ix_task_post_commit_pending",
+            "project_id",
+            "status",
+            postgresql_where=text("post_commit_pending = true"),
+            sqlite_where=text("post_commit_pending = 1"),
+        ),
     )
 
     # Optimistic concurrency: ``version_id_col`` mapper arg was dropped in

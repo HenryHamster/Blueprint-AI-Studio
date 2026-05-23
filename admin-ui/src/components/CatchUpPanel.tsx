@@ -377,6 +377,10 @@ export interface CatchUpPanelProps {
   userEmail?: string | null;
 }
 
+function sortDesc<T>(entries: [string, T][], key: (v: T) => number): [string, T][] {
+  return entries.sort((a, b) => key(b[1]) - key(a[1]));
+}
+
 export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: _lastVisitTimestamp, refreshInterval, onSelectTask, needsAttentionCount = 0, onApprove, onRetry, onBulkApprove, onBulkRetry, wsRef, userEmail }: CatchUpPanelProps) {
   // Per-operator localStorage key for catch-up viewed timestamp.
   // Falls back to the legacy global key when unauthenticated or email unknown.
@@ -737,6 +741,22 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
   }, [digest?.pipeline_filter_funnel]);
 
   const history = useMemo(() => digest?.trend_history ?? [], [digest?.trend_history]);
+
+  const { frbcEntries, mrbcEntries, cmbcEntries, carTypeEntries, dropOffEntries } = useMemo(() => {
+    const rf = digest?.remediation_funnel;
+    const frbc = rf?.failed_remediations_by_class ?? {};
+    const mrbc = rf?.merged_remediations_by_trigger_class ?? {};
+    const cmbc = rf?.cumulative_merged_by_trigger_class ?? {};
+    const car = rf?.ci_auto_remediation;
+    const dropOff = rf?.diagnosis_drop_off_by_reason ?? {};
+    return {
+      frbcEntries: sortDesc(Object.entries(frbc).filter(([, v]) => v > 0), v => v),
+      mrbcEntries: sortDesc(Object.entries(mrbc).filter(([, v]) => v > 0), v => v),
+      cmbcEntries: sortDesc(Object.entries(cmbc).filter(([, v]) => v > 0), v => v),
+      carTypeEntries: sortDesc(Object.entries(car?.by_ci_failure_type ?? {}).filter(([, v]) => (v.spawned + v.merged + v.failed) > 0), v => v.spawned),
+      dropOffEntries: sortDesc(Object.entries(dropOff).filter(([, v]) => v > 0), v => v),
+    };
+  }, [digest?.remediation_funnel]);
 
   const trendFor = useCallback((cat: string): { arrow: string; color: string } => {
     if (history.length < 4) return { arrow: '–', color: 'text-neutral-500' };
@@ -2675,19 +2695,9 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                           const confColor: Record<string, string> = { high: 'text-emerald-400', medium: 'text-amber-400', low: 'text-neutral-400' };
                           const ibc = rf.investigations_by_confidence ?? {};
                           const rsbc = rf.remediation_success_by_confidence ?? {};
-                          const frbc = rf.failed_remediations_by_class ?? {};
-                          const mrbc = rf.merged_remediations_by_trigger_class ?? {};
-                          const cmbc = rf.cumulative_merged_by_trigger_class ?? {};
                           const car = rf.ci_auto_remediation;
-                          const dropOff = rf.diagnosis_drop_off_by_reason ?? {};
                           const ibcEntries = confOrder.filter(k => (ibc[k] ?? 0) > 0);
                           const rsbcEntries = confOrder.filter(k => { const v = rsbc[k]; return !!v && (v.merged + v.failed) > 0; });
-                          const sortDesc = <T,>(entries: [string, T][], key: (v: T) => number) => entries.sort((a, b) => key(b[1]) - key(a[1]));
-                          const frbcEntries = sortDesc(Object.entries(frbc).filter(([, v]) => v > 0), v => v);
-                          const mrbcEntries = sortDesc(Object.entries(mrbc).filter(([, v]) => v > 0), v => v);
-                          const cmbcEntries = sortDesc(Object.entries(cmbc).filter(([, v]) => v > 0), v => v);
-                          const carTypeEntries = sortDesc(Object.entries(car?.by_ci_failure_type ?? {}).filter(([, v]) => (v.spawned + v.merged + v.failed) > 0), v => v.spawned);
-                          const dropOffEntries = sortDesc(Object.entries(dropOff).filter(([, v]) => v > 0), v => v);
                           const hasCar = !!car && (car.spawned + car.merged + car.failed) > 0;
                           const dropOffTotal = dropOffEntries.reduce((acc, [, v]) => acc + v, 0);
                           const dropOffDominant = dropOffEntries[0]?.[0];

@@ -1,4 +1,4 @@
-import { useState, useEffect, type ReactNode } from 'react';
+import { useState, useEffect, useMemo, type ReactNode } from 'react';
 import { Copy, Check, ChevronDown, ChevronRight, ExternalLink, Hash } from 'lucide-react';
 import { getHeartbeatStatus, isSafeUrl, useElapsedTime, linkifyStatusMessage, ResearchFindings, FAILURE_CLASS_CONFIG, useDurationStats } from './TaskCard';
 import type { Task } from './TaskCard';
@@ -819,9 +819,11 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
       .catch(() => {});
   }, [task.project_id, provenanceDirectionId]);
 
-  const prArtifacts = (task.artifacts ?? []).filter(a => a.artifact_type === 'PULL_REQUEST' && a.pr_url && isSafeUrl(a.pr_url));
-  const commitArtifacts = (task.artifacts ?? []).filter(a => a.artifact_type === 'GIT_COMMIT');
-  const investigationArtifacts = (task.artifacts ?? []).filter(a => a.artifact_type === 'INVESTIGATION_REPORT');
+  const { prArtifacts, commitArtifacts, investigationArtifacts } = useMemo(() => ({
+    prArtifacts: (task.artifacts ?? []).filter(a => a.artifact_type === 'PULL_REQUEST' && a.pr_url && isSafeUrl(a.pr_url)),
+    commitArtifacts: (task.artifacts ?? []).filter(a => a.artifact_type === 'GIT_COMMIT'),
+    investigationArtifacts: (task.artifacts ?? []).filter(a => a.artifact_type === 'INVESTIGATION_REPORT'),
+  }), [task.artifacts]);
   // Group PR and commit artifacts by iteration for display
   const artifactIterations: { iteration: number; prs: typeof prArtifacts; commits: typeof commitArtifacts }[] = [];
   if (task.artifacts && task.artifacts.length > 0) {
