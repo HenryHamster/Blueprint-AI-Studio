@@ -15,6 +15,7 @@ paths do not share an in-flight dedup key — each enforces its own.
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import hashlib
 import logging
@@ -7755,7 +7756,11 @@ async def _auto_close_recovered_manual_intervention(
     """
     from app.models import Project
 
-    project = await session.get(Project, project_id)
+    # populate_existing: a caller that left a partial Project (e.g. via
+    # ``load_only(Project.id)``) in the session identity map would otherwise
+    # return that cached partial here, and the ``design_doc`` access below
+    # would fire a sync lazy-load in async context. See ``run_once``.
+    project = await session.get(Project, project_id, populate_existing=True)
     if project is None:
         return 0, 0
     design_doc = project.design_doc
@@ -9050,6 +9055,12 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
         from app.models import DispatcherCycleRecord
 
         try:
+            # The run_once body may have left the session needing a rollback
+            # (an evaluator raised mid-transaction); a stale failed transaction
+            # would make the INSERT below raise PendingRollbackError. Clearing
+            # it first lets the cycle record write on a clean transaction — the
+            # spawn commits above already flushed, so nothing is lost.
+            await session.rollback()
             session.add(
                 DispatcherCycleRecord(
                     project_id=project_id,
@@ -9062,14 +9073,14 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
                 )
             )
             await session.commit()
-        except Exception:  # noqa: BLE001
+        except Exception as rec_exc:  # noqa: BLE001
             logger.warning(
-                "[REGRESSION_DISPATCHER] cycle-record write failed", exc_info=True
+                "[REGRESSION_DISPATCHER] cycle-record write failed: %s",
+                rec_exc,
+                exc_info=True,
             )
-            try:
+            with contextlib.suppress(Exception):
                 await session.rollback()
-            except Exception:  # noqa: BLE001
-                pass
         # Periodic prune so DispatcherCycleRecord doesn't grow unboundedly.
         # Cheap when the index hits no expired rows; failures are swallowed.
         await _prune_old_dispatcher_cycle_records(session)

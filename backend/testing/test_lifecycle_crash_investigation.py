@@ -30,7 +30,11 @@ def _make_project(pid=None):
 def _make_session(projects, existing_task=None, existing_case=None):
     """Return a fake AsyncSession that returns `projects` for Project queries,
     `existing_task` for Task dedup queries, and `existing_case` for
-    RegressionRemediationCase queries."""
+    RegressionRemediationCase queries.
+
+    The Project query (`select(Project.id)`) yields scalar UUIDs, so the
+    mock returns each project's `.id` rather than the project object itself.
+    """
     session = AsyncMock()
     session.__aenter__ = AsyncMock(return_value=session)
     session.__aexit__ = AsyncMock(return_value=False)
@@ -47,8 +51,10 @@ def _make_session(projects, existing_task=None, existing_case=None):
             else:
                 result.first.return_value = None
         else:
-            # Project query
-            result.scalars.return_value.all.return_value = projects
+            # Project query — select(Project.id) yields scalar UUIDs
+            result.scalars.return_value.all.return_value = [
+                p.id for p in projects
+            ]
         return result
 
     session.execute = execute

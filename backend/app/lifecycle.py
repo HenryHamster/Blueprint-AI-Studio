@@ -17,7 +17,6 @@ from sqlalchemy import cast as _cast
 from sqlalchemy import func as _func
 from sqlalchemy import text as _text
 from sqlalchemy.dialects.postgresql import JSONB as _JSONB
-from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 import app.shared_state as _shared_state
@@ -96,21 +95,19 @@ async def _spawn_crash_investigations(
     )
     spawned_count = 0
     async with AsyncSessionLocal() as session:
-        projects = (
-            (await session.execute(select(Project).options(load_only(Project.id))))
-            .scalars()
-            .all()
+        project_ids = (
+            (await session.execute(select(Project.id))).scalars().all()
         )
 
-        for project in projects:
-            pid_str = str(project.id)
+        for project_id in project_ids:
+            pid_str = str(project_id)
             if pid_str in inflight:
                 continue
             # DB dedup: skip if an active crash investigation already exists for this service+project
             existing = (
                 await session.execute(
                     select(Task.id).where(
-                        Task.project_id == project.id,
+                        Task.project_id == project_id,
                         Task.status.in_(active_statuses),
                         Task.context.op("@>")(
                             _cast(
@@ -133,7 +130,7 @@ async def _spawn_crash_investigations(
                 (
                     await session.execute(
                         select(RegressionRemediationCase).where(
-                            RegressionRemediationCase.project_id == project.id,
+                            RegressionRemediationCase.project_id == project_id,
                             RegressionRemediationCase.regression_class
                             == regression_class,
                         )
@@ -160,7 +157,7 @@ async def _spawn_crash_investigations(
                 "lifecycle:crash_investigation",
             )
             new_task = Task(
-                project_id=project.id,
+                project_id=project_id,
                 title=f"Investigate repeated crash: {service_name} service",
                 description=(
                     f"Service '{service_name}' crashed {crash_count} times in 10 min. "
@@ -202,7 +199,7 @@ async def _spawn_crash_investigations(
             if existing_case is None:
                 session.add(
                     RegressionRemediationCase.create_for_spawn(
-                        project_id=project.id,
+                        project_id=project_id,
                         regression_class=regression_class,
                         signal_snapshot=signal_snapshot,
                         task_id=new_task.id,
@@ -474,29 +471,27 @@ async def lifespan(app):
             await asyncio.sleep(_SCAN_INTERVAL)
             try:
                 async with AsyncSessionLocal() as scan_session:
-                    projects = (
-                        (
-                            await scan_session.execute(
-                                select(Project).options(load_only(Project.id))
-                            )
-                        )
+                    project_ids = (
+                        (await scan_session.execute(select(Project.id)))
                         .scalars()
                         .all()
                     )
-                    for project in projects:
+                    for project_id in project_ids:
                         try:
-                            changed = await run_recovery_once(scan_session, project.id)
+                            changed = await run_recovery_once(
+                                scan_session, project_id
+                            )
                             if changed:
                                 logger.info(
                                     "[RECOVERY_SCAN] project=%s changed=%d",
-                                    project.id,
+                                    project_id,
                                     changed,
                                 )
                         except Exception as proj_exc:
                             await scan_session.rollback()
                             logger.warning(
                                 "[RECOVERY_SCAN] project=%s error=%s",
-                                project.id,
+                                project_id,
                                 proj_exc,
                             )
             except asyncio.CancelledError:
@@ -520,31 +515,27 @@ async def lifespan(app):
             await asyncio.sleep(_SCAN_INTERVAL)
             try:
                 async with AsyncSessionLocal() as scan_session:
-                    projects = (
-                        (
-                            await scan_session.execute(
-                                select(Project).options(load_only(Project.id))
-                            )
-                        )
+                    project_ids = (
+                        (await scan_session.execute(select(Project.id)))
                         .scalars()
                         .all()
                     )
-                    for project in projects:
+                    for project_id in project_ids:
                         try:
                             escalated = await run_watchdog_once(
-                                scan_session, project.id
+                                scan_session, project_id
                             )
                             if escalated:
                                 logger.info(
                                     "[REGRESSION_WATCHDOG] project=%s escalated=%d",
-                                    project.id,
+                                    project_id,
                                     escalated,
                                 )
                         except Exception as proj_exc:
                             await scan_session.rollback()
                             logger.warning(
                                 "[REGRESSION_WATCHDOG] project=%s error=%s",
-                                project.id,
+                                project_id,
                                 proj_exc,
                             )
             except asyncio.CancelledError:
@@ -574,31 +565,27 @@ async def lifespan(app):
             await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)
             try:
                 async with AsyncSessionLocal() as scan_session:
-                    projects = (
-                        (
-                            await scan_session.execute(
-                                select(Project).options(load_only(Project.id))
-                            )
-                        )
+                    project_ids = (
+                        (await scan_session.execute(select(Project.id)))
                         .scalars()
                         .all()
                     )
-                    for project in projects:
+                    for project_id in project_ids:
                         try:
                             written = await maybe_write_daily_snapshot(
-                                scan_session, project.id
+                                scan_session, project_id
                             )
                             if written is not None:
                                 await scan_session.commit()
                                 logger.info(
                                     "[EFFICIENCY_SNAPSHOT] project=%s wrote daily snapshot",
-                                    project.id,
+                                    project_id,
                                 )
                         except Exception as proj_exc:
                             await scan_session.rollback()
                             logger.warning(
                                 "[EFFICIENCY_SNAPSHOT] project=%s error=%s",
-                                project.id,
+                                project_id,
                                 proj_exc,
                             )
             except asyncio.CancelledError:
@@ -629,20 +616,15 @@ async def lifespan(app):
             await asyncio.sleep(_SCAN_INTERVAL)
             try:
                 async with AsyncSessionLocal() as scan_session:
-                    projects = (
-                        (
-                            await scan_session.execute(
-                                select(Project)
-                                .options(load_only(Project.id))
-                            )
-                        )
+                    project_ids = (
+                        (await scan_session.execute(select(Project.id)))
                         .scalars()
                         .all()
                     )
-                    for project in projects:
+                    for project_id in project_ids:
                         try:
                             result = await reconcile_main_into_automain(
-                                scan_session, project.id
+                                scan_session, project_id
                             )
                             await scan_session.commit()
                             if result.get("status") not in (
@@ -652,14 +634,14 @@ async def lifespan(app):
                             ):
                                 logger.info(
                                     "[BRANCH_RECONCILE] project=%s status=%s",
-                                    project.id,
+                                    project_id,
                                     result.get("status"),
                                 )
                         except Exception as proj_exc:
                             await scan_session.rollback()
                             logger.warning(
                                 "[BRANCH_RECONCILE] project=%s error=%s",
-                                project.id,
+                                project_id,
                                 proj_exc,
                             )
             except asyncio.CancelledError:
@@ -795,24 +777,22 @@ async def lifespan(app):
                         )
                         try:
                             async with AsyncSessionLocal() as alert_session:
-                                projects = (
+                                project_ids = (
                                     (
                                         await alert_session.execute(
-                                            select(Project).options(
-                                                load_only(Project.id)
-                                            )
+                                            select(Project.id)
                                         )
                                     )
                                     .scalars()
                                     .all()
                                 )
                                 alert_title = f"Background service crashed: {name}"
-                                for project in projects:
+                                for project_id in project_ids:
                                     existing = (
                                         (
                                             await alert_session.execute(
                                                 select(Alert).where(
-                                                    Alert.project_id == project.id,
+                                                    Alert.project_id == project_id,
                                                     Alert.title == alert_title,
                                                     Alert.dismissed_at.is_(None),
                                                 )
@@ -824,7 +804,7 @@ async def lifespan(app):
                                     if existing:
                                         continue
                                     alert = Alert(
-                                        project_id=project.id,
+                                        project_id=project_id,
                                         severity=AlertSeverity.ERROR,
                                         title=alert_title,
                                         message=f"Background service '{name}' crashed with: {cause_str[:300]}. Auto-restarting with backoff.",
@@ -900,20 +880,18 @@ async def lifespan(app):
                             tasks[name] = asyncio.create_task(factory())
                             try:
                                 async with AsyncSessionLocal() as alert_session:
-                                    projects = (
+                                    project_ids = (
                                         (
                                             await alert_session.execute(
-                                                select(Project).options(
-                                                    load_only(Project.id)
-                                                )
+                                                select(Project.id)
                                             )
                                         )
                                         .scalars()
                                         .all()
                                     )
-                                    for project in projects:
+                                    for project_id in project_ids:
                                         alert = Alert(
-                                            project_id=project.id,
+                                            project_id=project_id,
                                             severity=AlertSeverity.INFO,
                                             title=f"Background service restarted: {name}",
                                             message=f"Service '{name}' was automatically restarted (attempt #{state['attempts']}).",

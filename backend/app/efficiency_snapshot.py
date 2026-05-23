@@ -361,7 +361,11 @@ async def maybe_write_daily_snapshot(
     if now is None:
         now = _utcnow()
 
-    project = await session.get(Project, project_id)
+    # populate_existing: a caller that left a partial Project (e.g. via
+    # ``load_only(Project.id)``) in the session identity map would otherwise
+    # return that cached partial here, and the ``design_doc`` access below
+    # would fire a sync lazy-load in async context. See ``run_once``.
+    project = await session.get(Project, project_id, populate_existing=True)
     if project is None:
         return None
 
