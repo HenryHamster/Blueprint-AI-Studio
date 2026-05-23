@@ -1046,6 +1046,64 @@ async def _close_loop_regression_case_on_merge(
                 exc,
             )
 
+    # Verify the PR's merge commit is reachable from the integration branch before
+    # advancing the case.  A PR merged only into a rollup staging branch has NOT
+    # landed on the integration branch — advancing the case would suppress re-spawning
+    # while the regression is still live.  Fail-open (proceed) when credentials are
+    # unavailable, the API returns None, or any error occurs; skip ONLY on a definitive
+    # False (merge commit confirmed unreachable from the integration branch).
+    try:
+        from app.github import (
+            get_pull_request as _get_pull_request,
+            get_repo_installation_token as _get_installation_token,
+            is_ancestor_of as _is_ancestor_of,
+        )
+        from app.models import Project as _Project
+
+        _anc_project = await session.get(_Project, task.project_id)
+        if _anc_project and _anc_project.github_owner and _anc_project.github_repo:
+            _anc_token = await _get_installation_token(
+                _anc_project.github_owner, _anc_project.github_repo
+            )
+            if _anc_token:
+                _pr_data = await _get_pull_request(
+                    _anc_token,
+                    _anc_project.github_owner,
+                    _anc_project.github_repo,
+                    pr_number,
+                    project_id=str(task.project_id),
+                )
+                _merge_sha = (_pr_data or {}).get("merge_commit_sha")
+                if _merge_sha:
+                    _integration_branch = _runtime_config.get(
+                        "integration_branch", "main"
+                    )
+                    _is_anc = await _is_ancestor_of(
+                        _anc_token,
+                        _anc_project.github_owner,
+                        _anc_project.github_repo,
+                        _merge_sha,
+                        _integration_branch,
+                        project_id=str(task.project_id),
+                    )
+                    if _is_anc is False:
+                        logger.info(
+                            "[REGRESSION-CASE] Skipping mark_merged for PR #%s "
+                            "project=%s: merge commit %s not reachable from %s",
+                            pr_number,
+                            task.project_id,
+                            _merge_sha,
+                            _integration_branch,
+                        )
+                        return
+    except Exception as _exc_anc:
+        logger.warning(
+            "[REGRESSION-CASE] Ancestry check skipped for PR #%s project=%s: %s — proceeding",
+            pr_number,
+            task.project_id,
+            _exc_anc,
+        )
+
     case.mark_merged(
         pr_number,
         snapshot,

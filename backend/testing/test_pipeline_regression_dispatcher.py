@@ -2008,6 +2008,208 @@ async def test_mark_merged_fallback_when_signal_snapshot_missing(db_session, moc
 
 
 # ---------------------------------------------------------------------------
+# run_recovery_once git-ancestry verification tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_recovery_once_skips_close_when_pr_not_on_integration(
+    db_session, mocker
+):
+    """MERGED case stays MERGED when fix PR's merge commit is NOT an ancestor of the
+    integration branch.  Simulates a rollup child PR that merged to a staging branch
+    but whose rollup never landed on automain."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        github_owner="test-owner",
+        github_repo="test-repo",
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness",
+            prior=0.80,
+            current=0.80,  # signal recovered — so close would proceed absent ancestry guard
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a MERGED case directly with a known PR number (bypasses mark_merged).
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        last_remediation_pr_number=5678,
+        hit_count=1,
+        signal_snapshot_at_spawn={
+            "sr_catch_rate": 0.50,
+            "captured_at": "2000-01-01T00:00:00",
+        },
+        signal_snapshot_at_merge={
+            "captured_at": (_utcnow() - timedelta(minutes=20)).isoformat(),
+            "sr_catch_rate": 0.50,
+        },
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    # Ancestry check returns False: fix PR merged to staging branch, not integration.
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=mocker.AsyncMock(return_value="fake-token"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=mocker.AsyncMock(return_value={"merge_commit_sha": "abc123staging"}),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=mocker.AsyncMock(return_value=False),
+    )
+
+    changed = await run_recovery_once(db_session, project.id)
+
+    # Ancestry check returned False → case must NOT be closed.
+    assert changed == 0, (
+        "recovery must be skipped when fix is not on integration branch"
+    )
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.MERGED, (
+        "case must stay MERGED when fix PR merge commit is not an ancestor of the "
+        "integration branch"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_recovery_once_proceeds_when_ancestry_confirmed(db_session, mocker):
+    """MERGED case is closed normally when fix PR's merge commit IS a confirmed ancestor
+    of the integration branch (is_ancestor_of returns True)."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        github_owner="test-owner",
+        github_repo="test-repo",
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness",
+            prior=0.80,
+            current=0.80,  # signal recovered
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        last_remediation_pr_number=5679,
+        hit_count=1,
+        signal_snapshot_at_spawn={
+            "sr_catch_rate": 0.50,
+            "captured_at": "2000-01-01T00:00:00",
+        },
+        signal_snapshot_at_merge={
+            "captured_at": (_utcnow() - timedelta(minutes=20)).isoformat(),
+            "sr_catch_rate": 0.50,
+        },
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    # Ancestry check returns True: merge commit is on the integration branch.
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=mocker.AsyncMock(return_value="fake-token"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=mocker.AsyncMock(return_value={"merge_commit_sha": "abc123main"}),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=mocker.AsyncMock(return_value=True),
+    )
+
+    changed = await run_recovery_once(db_session, project.id)
+
+    assert changed == 1, (
+        "recovery must proceed when fix is confirmed on integration branch"
+    )
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED, (
+        "case must be CLOSED when fix PR merge commit is a confirmed ancestor"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_recovery_once_proceeds_when_ancestry_indeterminate(
+    db_session, mocker
+):
+    """MERGED case proceeds to close when ancestry check is indeterminate (None result,
+    missing merge_sha, or exception) — degrade-safe fail-open behavior."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+    project = make_project(
+        github_owner="test-owner",
+        github_repo="test-repo",
+        design_doc=_design_doc_with_sr_regression(
+            category="correctness",
+            prior=0.80,
+            current=0.80,  # signal recovered
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.MERGED,
+        last_remediation_pr_number=5680,
+        hit_count=1,
+        signal_snapshot_at_spawn={
+            "sr_catch_rate": 0.50,
+            "captured_at": "2000-01-01T00:00:00",
+        },
+        signal_snapshot_at_merge={
+            "captured_at": (_utcnow() - timedelta(minutes=20)).isoformat(),
+            "sr_catch_rate": 0.50,
+        },
+    )
+    db_session.add(case)
+    await db_session.commit()
+    await db_session.refresh(case)
+
+    # is_ancestor_of returns None (API indeterminate) → fail-open, proceed with close.
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=mocker.AsyncMock(return_value="fake-token"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=mocker.AsyncMock(return_value={"merge_commit_sha": "abc123unknown"}),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=mocker.AsyncMock(return_value=None),
+    )
+
+    changed = await run_recovery_once(db_session, project.id)
+
+    assert changed == 1, (
+        "recovery must proceed when ancestry check is indeterminate (None)"
+    )
+    await db_session.refresh(case)
+    assert case.status == RegressionCaseStatus.CLOSED, (
+        "case must be CLOSED when ancestry check returns None (fail-open)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Watchdog — run_watchdog_once tests
 # ---------------------------------------------------------------------------
 

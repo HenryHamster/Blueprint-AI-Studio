@@ -2056,6 +2056,7 @@ class RegressionRemediationCase(SQLModel, table=True):
         *,
         spawn_was_cross_layer: bool = False,
         spawn_layers_enumerated: List[str] | None = None,
+        merge_sha: str | None = None,
     ) -> None:
         """Transition ACTIVE → MERGED after remediation PR merges.
 
@@ -2081,6 +2082,10 @@ class RegressionRemediationCase(SQLModel, table=True):
         dispatcher's cross-layer escalation context at spawn time so the
         compliance metric can compare layers observed vs layers touched.
         Only written when truthy; absence means non-cross-layer or legacy entry.
+
+        ``merge_sha`` (optional) stores the git commit SHA for the merged PR so
+        the recovery scan can re-verify ancestry against the integration branch
+        without a redundant GitHub API call to re-fetch the PR.
         """
         if not signal_snapshot:
             signal_snapshot = dict(self.signal_snapshot_at_spawn or {})
@@ -2095,6 +2100,8 @@ class RegressionRemediationCase(SQLModel, table=True):
         }
         if ep_start is not None:
             log_entry["episode_investigate_started_at"] = ep_start.isoformat()
+        if merge_sha:
+            log_entry["fix_merge_sha"] = merge_sha
         if layers_targeted:
             log_entry["layers_targeted"] = list(layers_targeted)
         if recommended_unmodifiable_layers:

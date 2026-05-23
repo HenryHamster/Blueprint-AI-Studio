@@ -6363,6 +6363,73 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
             if state is None:
                 continue
             if not state["tripped"]:
+                # Verify the fix PR's merge commit is a confirmed ancestor of the
+                # integration branch before treating the case as recovered.  A rollup
+                # child PR merged only to a staging branch has NOT yet landed on the
+                # integration branch; closing the case would suppress re-spawning while
+                # the regression is still live.  Fail-open (proceed) when credentials
+                # are unavailable, the API returns None, or any error occurs; skip ONLY
+                # on a definitive False (commit confirmed unreachable from the branch).
+                _fix_pr_num = case.last_remediation_pr_number
+                if _fix_pr_num is not None:
+                    try:
+                        from app.github import (
+                            get_pull_request as _rr_get_pr,
+                            get_repo_installation_token as _rr_get_token,
+                            is_ancestor_of as _rr_is_ancestor,
+                        )
+                        from app.shared_state import (
+                            runtime_config as _rr_runtime_config,
+                        )
+
+                        if project.github_owner and project.github_repo:
+                            _rr_token = await _rr_get_token(
+                                project.github_owner, project.github_repo
+                            )
+                            if _rr_token:
+                                _rr_pr_data = await _rr_get_pr(
+                                    _rr_token,
+                                    project.github_owner,
+                                    project.github_repo,
+                                    _fix_pr_num,
+                                    project_id=str(project_id),
+                                )
+                                _rr_merge_sha = (_rr_pr_data or {}).get(
+                                    "merge_commit_sha"
+                                )
+                                if _rr_merge_sha:
+                                    _rr_branch = _rr_runtime_config.get(
+                                        "integration_branch", "main"
+                                    )
+                                    _rr_is_anc = await _rr_is_ancestor(
+                                        _rr_token,
+                                        project.github_owner,
+                                        project.github_repo,
+                                        _rr_merge_sha,
+                                        _rr_branch,
+                                        project_id=str(project_id),
+                                    )
+                                    if _rr_is_anc is False:
+                                        logger.info(
+                                            "[REGRESSION_DISPATCHER] Skipping close for "
+                                            "project=%s class=%s: fix PR #%s merge commit "
+                                            "%s not reachable from %s",
+                                            project_id,
+                                            case.regression_class,
+                                            _fix_pr_num,
+                                            _rr_merge_sha,
+                                            _rr_branch,
+                                        )
+                                        continue
+                    except Exception as _rr_exc:
+                        logger.warning(
+                            "[REGRESSION_DISPATCHER] Ancestry check skipped for "
+                            "project=%s class=%s PR #%s: %s — proceeding with close",
+                            project_id,
+                            case.regression_class,
+                            _fix_pr_num,
+                            _rr_exc,
+                        )
                 mismatch_entry = _compute_recovery_layer_mismatch(
                     case.fingerprint_to_fix_log, case.symptoms_by_layer, now
                 )

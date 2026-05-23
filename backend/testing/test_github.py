@@ -2833,3 +2833,87 @@ async def test_get_files_changed_between_refs_returns_none_on_api_error(mocker):
         "tok", "owner", "repo", "missing-ref", "head"
     )
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_is_ancestor_of_returns_true_when_ahead(mocker):
+    """Returns True when the compare API reports descendant_ref is ahead of ancestor_sha."""
+    from app.github import is_ancestor_of
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, {"status": "ahead"}),
+    )
+
+    result = await is_ancestor_of("tok", "owner", "repo", "abc123", "automain")
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_is_ancestor_of_returns_true_when_identical(mocker):
+    """Returns True when ancestor_sha and descendant_ref point at the same commit."""
+    from app.github import is_ancestor_of
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, {"status": "identical"}),
+    )
+
+    result = await is_ancestor_of("tok", "owner", "repo", "abc123", "automain")
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_is_ancestor_of_returns_false_when_not_merged_to_integration_branch(
+    mocker,
+):
+    """Returns False when fix PR merged only to a staging branch (not the integration branch).
+
+    A rollup child PR that merged to a staging branch has status 'behind' or 'diverged'
+    relative to the integration branch — the fix has NOT landed and recovery must NOT fire.
+    """
+    from app.github import is_ancestor_of
+
+    for not_ancestor_status in ("behind", "diverged"):
+        mocker.patch(
+            "httpx.AsyncClient.request",
+            return_value=MockResponse(200, {"status": not_ancestor_status}),
+        )
+        result = await is_ancestor_of("tok", "owner", "repo", "abc123", "automain")
+        assert result is False, f"expected False for status={not_ancestor_status!r}"
+
+
+@pytest.mark.asyncio
+async def test_is_ancestor_of_returns_none_on_api_error(mocker):
+    """Returns None (not False) on a non-200 API response — indeterminate result degrades safely.
+
+    An indeterminate result must NOT be treated as 'landed'; the regression case stays
+    eligible for re-spawn rather than being silently confirmed as fixed.
+    """
+    from app.github import is_ancestor_of
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(500, {}),
+    )
+
+    result = await is_ancestor_of("tok", "owner", "repo", "abc123", "automain")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_is_ancestor_of_returns_none_on_unparseable_response(mocker):
+    """Returns None when the compare API body cannot be parsed — degrades safely, not False."""
+    from app.github import is_ancestor_of
+
+    bad_response = MockResponse(200, None)
+    bad_response._json_data = None  # simulate json() returning None
+
+    def _raise():
+        raise ValueError("no JSON")
+
+    bad_response.json = _raise
+    mocker.patch("httpx.AsyncClient.request", return_value=bad_response)
+
+    result = await is_ancestor_of("tok", "owner", "repo", "abc123", "automain")
+    assert result is None

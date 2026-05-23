@@ -206,3 +206,41 @@ def test_mark_merged_records_episode_investigate_started_at_re_armed():
     entry = case.fingerprint_to_fix_log[-1]
     # Second episode should anchor on recovered_at, not the original investigate_spawned_at
     assert datetime.fromisoformat(entry["episode_investigate_started_at"]) == recovered
+
+
+# ---------------------------------------------------------------------------
+# RegressionRemediationCase.mark_merged — merge_sha ancestry audit trail
+# ---------------------------------------------------------------------------
+
+
+def test_mark_merged_stores_fix_merge_sha_when_provided():
+    """fix_merge_sha is recorded in the fix-log entry when a merge commit SHA is given."""
+    case = _make_regression_case(investigate_spawned_at=_T0)
+    case.mark_merged(
+        pr_number=42, signal_snapshot={"value": 0.9}, merge_sha="abc123def456"
+    )
+    entry = case.fingerprint_to_fix_log[-1]
+    assert entry.get("fix_merge_sha") == "abc123def456"
+
+
+def test_mark_merged_omits_fix_merge_sha_when_not_provided():
+    """fix_merge_sha key is absent from the fix-log entry when no SHA is passed (backward compat)."""
+    case = _make_regression_case(investigate_spawned_at=_T0)
+    case.mark_merged(pr_number=42, signal_snapshot={"value": 0.9})
+    entry = case.fingerprint_to_fix_log[-1]
+    assert "fix_merge_sha" not in entry
+
+
+def test_mark_merged_fix_merge_sha_coexists_with_other_fields():
+    """fix_merge_sha is stored alongside layers_targeted and episode anchor without conflict."""
+    case = _make_regression_case(investigate_spawned_at=_T0)
+    case.mark_merged(
+        pr_number=55,
+        signal_snapshot={"value": 0.7},
+        layers_targeted=["PROMPTS", "TESTS"],
+        merge_sha="deadbeef1234",
+    )
+    entry = case.fingerprint_to_fix_log[-1]
+    assert entry.get("fix_merge_sha") == "deadbeef1234"
+    assert entry.get("layers_targeted") == ["PROMPTS", "TESTS"]
+    assert "episode_investigate_started_at" in entry
