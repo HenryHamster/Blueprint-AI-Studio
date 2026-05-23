@@ -171,6 +171,8 @@ const DATE_RANGE_OPTIONS: { label: string; value: DateRange }[] = [
   { label: 'Last 7d', value: '7d' },
 ];
 
+const DATE_RANGE_SELECT_OPTIONS: { label: string; value: string }[] = DATE_RANGE_OPTIONS.map(o => ({ label: o.label, value: o.value }));
+
 export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, dateRange, onDateRangeChange, blockedFilter, onBlockedFilterChange, inputRef }: SearchFilterBarProps) {
   const [inputValue, setInputValue] = useState(searchQuery);
   const typeOptions = FILTER_TASK_TYPE_OPTIONS;
@@ -223,7 +225,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
       />
 
       <SingleSelectDropdown
-        options={DATE_RANGE_OPTIONS.map(o => ({ label: o.label, value: o.value }))}
+        options={DATE_RANGE_SELECT_OPTIONS}
         value={dateRange}
         onChange={v => onDateRangeChange(v as DateRange)}
         isActive={v => v !== 'all'}

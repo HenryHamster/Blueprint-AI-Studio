@@ -1,4 +1,4 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useRef, useEffect, useMemo, useCallback } from 'react';
 import { Archive, ArrowDownUp, ChevronLeft, ChevronRight, GripVertical } from 'lucide-react';
 import {
   SortableContext,
@@ -242,7 +242,7 @@ export function ColumnSelectCheckbox({ columnTasks, selectedTaskIds, onBulkToggl
   onBulkToggle: (taskIds: string[], selected: boolean) => void;
 }) {
   const checkboxRef = useRef<HTMLInputElement>(null);
-  const ids = columnTasks.map(t => t.id);
+  const ids = useMemo(() => columnTasks.map(t => t.id), [columnTasks]);
   const selectedCount = ids.filter(id => selectedTaskIds.has(id)).length;
   const allSelected = columnTasks.length > 0 && selectedCount === columnTasks.length;
   const someSelected = selectedCount > 0 && selectedCount < columnTasks.length;
@@ -347,12 +347,13 @@ export function KanbanColumn({
   onDirectionClick,
 }: KanbanColumnProps) {
   const isArchivable = ARCHIVABLE_COLUMNS.includes(col.id);
-  const taskIds = columnTasks.map(t => t.id);
-  const shiftClickHandler = onShiftSelect
-    ? (taskId: string) => onShiftSelect(taskId, taskIds)
-    : undefined;
+  const taskIds = useMemo(() => columnTasks.map(t => t.id), [columnTasks]);
+  const shiftClickHandler = useCallback((taskId: string) => {
+    onShiftSelect?.(taskId, taskIds);
+  }, [onShiftSelect, taskIds]);
+  const effectiveShiftClickHandler = onShiftSelect ? shiftClickHandler : undefined;
 
-  const taskProps = { selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery, onDirectionClick };
+  const taskProps = useMemo(() => ({ selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery, onDirectionClick }), [selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery, onDirectionClick]);
 
   let content: React.ReactNode;
 
@@ -387,7 +388,7 @@ export function KanbanColumn({
                       key={task.id}
                       task={task}
                       {...taskProps}
-                      onShiftClick={shiftClickHandler}
+                      onShiftClick={effectiveShiftClickHandler}
                       blockingCount={blockingMap[task.id]}
                       isTracked={trackedTaskIds?.has(task.id)}
                       colIdx={colIdx}
@@ -439,7 +440,7 @@ export function KanbanColumn({
                       key={task.id}
                       task={task}
                       {...taskProps}
-                      onShiftClick={shiftClickHandler}
+                      onShiftClick={effectiveShiftClickHandler}
                       blockingCount={blockingMap[task.id]}
                       isTracked={trackedTaskIds?.has(task.id)}
                       colIdx={colIdx}
@@ -468,7 +469,7 @@ export function KanbanColumn({
               selectionMode={selectionMode}
               selectedTaskIds={selectedTaskIds}
               onToggleTaskSelection={onToggleTaskSelection}
-              onShiftClick={shiftClickHandler}
+              onShiftClick={effectiveShiftClickHandler}
               onCtrlClick={onCtrlClick}
               compact={compact}
               blockingCount={blockingMap[task.id]}
@@ -543,7 +544,7 @@ export function KanbanColumn({
           {isArchivable && columnTasks.length > 0 && (
             // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
             <button
-              onClick={() => onArchiveColumn(columnTasks.map(t => t.id), col.label)}
+              onClick={() => onArchiveColumn(taskIds, col.label)}
               title={`Archive all ${col.label} tasks`}
               className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50 transition-colors"
             >
@@ -583,7 +584,7 @@ export function KanbanColumn({
               {isArchivable && columnTasks.length > 0 && (
                 <button
                   data-viewport-allow-small-target
-                  onClick={() => onArchiveColumn(columnTasks.map(t => t.id), col.label)}
+                  onClick={() => onArchiveColumn(taskIds, col.label)}
                   title={`Archive all ${col.label} tasks`}
                   className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50 transition-colors"
                 >

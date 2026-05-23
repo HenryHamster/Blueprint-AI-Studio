@@ -414,6 +414,14 @@ export function KanbanBoard({
     return result;
   }, [groupBy, columns, tasksByColumn]);
 
+  const taskIdsByColumn = useMemo(() => {
+    const result: Record<string, string[]> = {};
+    for (const col of columns) {
+      result[col.id] = (tasksByColumn[col.id] ?? []).map(t => t.id);
+    }
+    return result;
+  }, [columns, tasksByColumn]);
+
   return (
     <DndContext
       sensors={sensors}
@@ -454,10 +462,9 @@ export function KanbanBoard({
           if (col.id !== effectiveActiveColId) return null;
           const columnTasks = tasksByColumn[col.id] ?? [];
           const isArchivable = ARCHIVABLE_COLUMNS.includes(col.id);
-          const taskIds = columnTasks.map(t => t.id);
-          const columnTaskIds = taskIds;
+          const taskIds = taskIdsByColumn[col.id] ?? [];
           const shiftClickHandler = onShiftSelect
-            ? (taskId: string) => onShiftSelect(taskId, columnTaskIds)
+            ? (taskId: string) => onShiftSelect(taskId, taskIds)
             : undefined;
 
           let mobileContent: React.ReactNode;
@@ -618,7 +625,7 @@ export function KanbanBoard({
                   </span>
                   {isArchivable && columnTasks.length > 0 && (
                     <button
-                      onClick={() => onArchiveColumn(columnTasks.map(t => t.id), col.label)}
+                      onClick={() => onArchiveColumn(taskIds, col.label)}
                       title={`Archive all ${col.label} tasks`}
                       className="p-1 min-h-11 min-w-11 flex items-center justify-center rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50 transition-colors"
                     >

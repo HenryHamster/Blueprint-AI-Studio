@@ -1259,6 +1259,23 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   }, [digest?.direction_progress]);
   const productPct = digest?.overall_product_ratio != null ? Math.round(digest.overall_product_ratio * 100) : null;
 
+  const classSparkMap = useMemo(() => {
+    const trendHistory = digest?.trend_history ?? [];
+    return Object.fromEntries(
+      (digest?.failure_groups ?? []).map(g => [
+        g.failure_class,
+        trendHistory.map(p => ({ v: p.failed_by_class?.[g.failure_class] ?? 0 })),
+      ])
+    );
+  }, [digest?.trend_history, digest?.failure_groups]);
+
+  const taxSparkMap = useMemo(() => {
+    const trendHistory = digest?.trend_history ?? [];
+    return Object.fromEntries(
+      TAXONOMY_ORDER.map(k => [k, trendHistory.map(p => ({ v: p.failed_by_taxonomy?.[k] ?? 0 }))])
+    );
+  }, [digest?.trend_history]);
+
   return (
     <div className="flex-1 overflow-auto custom-scrollbar space-y-4">
       {/* Backend unreachable banner */}
@@ -1338,7 +1355,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             <section>
               <div className="flex flex-wrap gap-1.5">
                 {digest.failure_groups.map(g => {
-                  const classSpark = (digest.trend_history ?? []).map(p => ({ v: p.failed_by_class?.[g.failure_class] ?? 0 }));
+                  const classSpark = classSparkMap[g.failure_class] ?? [];
                   const classCost = digest.cost_by_failure_class?.[g.failure_class];
                   return <FailureClassPill key={g.failure_class} group={g} sparkData={classSpark} cost={classCost ?? undefined} />;
                 })}
@@ -1360,7 +1377,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
                   const base = TAXONOMY_COLORS[k] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
                   const cls = isDominant ? `${base} ring-1 ring-current` : base;
                   const stroke = TAXONOMY_STROKE[k] ?? '#a3a3a3';
-                  const taxSpark = (digest.trend_history ?? []).map(p => ({ v: p.failed_by_taxonomy?.[k] ?? 0 }));
+                  const taxSpark = taxSparkMap[k] ?? [];
                   const hasSpark = taxSpark.length >= 3;
                   return (
                     <span key={k} className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${cls}`} title={`${TAXONOMY_LABELS[k]}: ${cat.count} (${cat.percentage}%)${isDominant ? ' — dominant' : ''}`}>
@@ -2664,10 +2681,10 @@ function SuccessRateCard({ rate, trend, trendHistory, loading }: {
   trendHistory?: { success_rate: number | null; completed: number; failed: number }[];
   loading: boolean;
 }) {
+  const sparkPoints = useMemo(() => (trendHistory ?? []).map(p => ({ v: p.success_rate ?? 0 })), [trendHistory]);
   if (loading) return <Skeleton className="h-20" />;
   const TrendIcon = trend === 'improving' ? TrendingUp : trend === 'declining' ? TrendingDown : Minus;
   const trendColor = trend === 'improving' ? 'text-emerald-400' : trend === 'declining' ? 'text-red-400' : 'text-neutral-500';
-  const sparkPoints = (trendHistory ?? []).map(p => ({ v: p.success_rate ?? 0 }));
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Success Rate</p>
@@ -2731,9 +2748,9 @@ function CostCard({ totalCost, trendHistory, loading }: {
   trendHistory?: { period_cost_usd?: number | null }[];
   loading: boolean;
 }) {
+  const sparkPoints = useMemo(() => (trendHistory ?? []).map(p => ({ v: p.period_cost_usd ?? 0 })), [trendHistory]);
   if (loading) return <Skeleton className="h-20" />;
   const fill = SPARK_COLORS['blue'];
-  const sparkPoints = (trendHistory ?? []).map(p => ({ v: p.period_cost_usd ?? 0 }));
   const display = totalCost == null ? '--' : totalCost < 10 ? `$${totalCost.toFixed(2)}` : `$${Math.round(totalCost)}`;
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">

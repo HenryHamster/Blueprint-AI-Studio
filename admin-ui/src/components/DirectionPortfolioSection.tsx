@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { STAGE_DROPOUT_LABELS, TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import { StrategicAuditPanel } from './StrategicAuditPanel';
 import { apiFetch } from '../api';
@@ -87,6 +87,10 @@ function CostBreakdownPill({ direction: d }: { direction: DirectionProgress }) {
   const byType = d.cost_by_type ?? null;
   const spot = d.spot_cost_usd;
   const onDemand = d.on_demand_cost_usd;
+  const sortedByTypeEntries = useMemo(
+    () => (byType ? Object.entries(byType).sort((a, b) => b[1] - a[1]) : []),
+    [byType]
+  );
   const hasBreakdown =
     (byScope && Object.keys(byScope).length > 0) ||
     (byType && Object.keys(byType).length > 0) ||
@@ -119,7 +123,7 @@ function CostBreakdownPill({ direction: d }: { direction: DirectionProgress }) {
           {byType && Object.keys(byType).length > 0 && (
             <div>
               <p className="text-neutral-500 uppercase tracking-wide text-[9px] mb-0.5">By type</p>
-              {Object.entries(byType).sort((a, b) => b[1] - a[1]).map(([t, v]) => (
+              {sortedByTypeEntries.map(([t, v]) => (
                 <div key={t} className="flex justify-between"><span>{t}</span><span className="font-mono">${v.toFixed(2)}</span></div>
               ))}
             </div>
@@ -191,6 +195,10 @@ function CatchRateSparkline({ history, trend }: { history: number[]; trend?: str
 
 function DirectionSrPill({ entry }: { entry: DirectionSrEntry }) {
   const [open, setOpen] = useState(false);
+  const sortedCategoryEntries = useMemo(
+    () => Object.entries(entry.categories).sort(([, a], [, b]) => (b.miss_rate ?? 0) - (a.miss_rate ?? 0)),
+    [entry.categories]
+  );
   const catchPct = entry.overall_catch_rate != null ? Math.round(entry.overall_catch_rate * 100) : null;
   if (catchPct == null) return null;
   const catchColor = catchPct >= 70 ? 'text-emerald-400' : catchPct >= 50 ? 'text-amber-400' : 'text-red-400';
@@ -216,7 +224,7 @@ function DirectionSrPill({ entry }: { entry: DirectionSrEntry }) {
       {open && (
         // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
         <div className="mt-0.5 flex flex-col gap-0.5 pl-2 border-l border-neutral-800" onClick={e => e.stopPropagation()}>
-          {Object.entries(entry.categories).sort(([, a], [, b]) => (b.miss_rate ?? 0) - (a.miss_rate ?? 0)).map(([cat, s]) => (
+          {sortedCategoryEntries.map(([cat, s]) => (
             <div key={cat} className="text-neutral-400">
               <span className="text-neutral-300">{cat}</span>{' '}{s.miss_rate != null ? `${Math.round(s.miss_rate * 100)}%` : '–'} miss
               {(s.examples ?? []).map((ex, i) => <div key={i} className="pl-1.5 text-neutral-500 line-clamp-1">{ex.desc}</div>)}
@@ -250,6 +258,30 @@ export function DirectionPortfolioSection({
   calibrationFloor,
 }: DirectionPortfolioSectionProps) {
   const [srBreakdown, setSrBreakdown] = useState<Record<string, DirectionSrEntry>>({});
+
+  const taxonomyVisibleKeysByDir = useMemo(() => {
+    const result = new Map<string, Array<typeof TAXONOMY_ORDER[number]>>();
+    for (const d of directions) {
+      if (d.taxonomy_summary) {
+        result.set(d.direction_id, TAXONOMY_ORDER.filter(k => (d.taxonomy_summary?.[k] ?? 0) > 0));
+      }
+    }
+    return result;
+  }, [directions]);
+
+  const sortedStageDropoutsByDir = useMemo(() => {
+    const result = new Map<string, [string, number][]>();
+    for (const d of directions) {
+      if (d.stage_dropout && Object.values(d.stage_dropout).some(v => v)) {
+        result.set(
+          d.direction_id,
+          Object.entries(d.stage_dropout).filter(([, v]) => v).sort((a, b) => b[1] - a[1])
+        );
+      }
+    }
+    return result;
+  }, [directions]);
+
   useEffect(() => {
     if (!projectId) return;
     apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/direction-sr-breakdown`)
@@ -374,7 +406,7 @@ export function DirectionPortfolioSection({
                       </div>
                     );
                   })()}
-                  {d.taxonomy_summary && <div className="flex gap-1 mt-1 flex-wrap">{TAXONOMY_ORDER.map(k => { const v = d.taxonomy_summary?.[k] ?? 0; return v ? <span key={k} title={`${TAXONOMY_LABELS[k]}: ${v}`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[k]}`}>{TAXONOMY_LABELS[k]} {v}</span> : null; })}</div>}
+                  {taxonomyVisibleKeysByDir.has(d.direction_id) && <div className="flex gap-1 mt-1 flex-wrap">{(taxonomyVisibleKeysByDir.get(d.direction_id) ?? []).map(k => { const v = d.taxonomy_summary?.[k] ?? 0; return <span key={k} title={`${TAXONOMY_LABELS[k]}: ${v}`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[k]}`}>{TAXONOMY_LABELS[k]} {v}</span>; })}</div>}
                   {d.scope_breakdown && Object.keys(d.scope_breakdown).length > 0 && <div className="flex gap-1 mt-1 flex-wrap">{(['small', 'medium', 'large'] as const).map(sz => { const s = d.scope_breakdown?.[sz]; if (!s || (!s.merged && !s.failed)) return null; const total = s.merged + s.failed; const rate = total > 0 ? s.merged / total : 0; const color = rate >= 0.7 ? 'border-emerald-700 bg-emerald-900/40 text-emerald-300' : rate >= 0.4 ? 'border-amber-700 bg-amber-900/40 text-amber-300' : 'border-red-700 bg-red-900/40 text-red-300'; const subtypes = [[s.failed_code_error, 'code'], [s.failed_infra, 'infra'], [s.failed_scope_overflow, 'scope']].filter(([v]) => typeof v === 'number' && (v as number) > 0).map(([v, l]) => `${v} ${l}`).join(', '); const subtypeStr = subtypes ? ` (${subtypes})` : ''; return <span key={sz} title={`${sz}: ${s.merged} merged / ${s.failed} failed${subtypeStr} (${Math.round(rate * 100)}%)`} className={`text-[9px] leading-none px-1 py-0.5 rounded border ${color}`}>{sz[0].toUpperCase()} {s.merged}/{s.failed}</span>; })}</div>}
                   {d.review_quality && (d.review_quality.reviews_dismissed || d.review_quality.reviews_overridden || d.review_quality.user_issues_caught) ? (
                     <div className="flex gap-1 mt-1 flex-wrap">
@@ -383,7 +415,7 @@ export function DirectionPortfolioSection({
                       {d.review_quality.user_issues_caught ? <span title="Real issues caught by review" className="text-[9px] leading-none px-1 py-0.5 rounded border border-emerald-700 bg-emerald-900/40 text-emerald-300">{d.review_quality.user_issues_caught} caught</span> : null}
                     </div>
                   ) : null}
-                  {d.stage_dropout && Object.values(d.stage_dropout).some(v => v) && <div className="flex gap-1 mt-1 flex-wrap">{Object.entries(d.stage_dropout).filter(([, v]) => v).sort((a, b) => b[1] - a[1]).map(([stage, v]) => <span key={stage} title={`Failed at ${stage}: ${v}`} className="text-[9px] leading-none px-1 py-0.5 rounded border border-slate-600 bg-slate-800/60 text-slate-300">{STAGE_DROPOUT_LABELS[stage] ?? stage} {v}</span>)}</div>}
+                  {sortedStageDropoutsByDir.has(d.direction_id) && <div className="flex gap-1 mt-1 flex-wrap">{(sortedStageDropoutsByDir.get(d.direction_id) ?? []).map(([stage, v]) => <span key={stage} title={`Failed at ${stage}: ${v}`} className="text-[9px] leading-none px-1 py-0.5 rounded border border-slate-600 bg-slate-800/60 text-slate-300">{STAGE_DROPOUT_LABELS[stage] ?? stage} {v}</span>)}</div>}
                   {d.recent_failure_titles && d.recent_failure_titles.length > 0 && (
                     <ul className="mt-1 space-y-0.5">
                       {d.recent_failure_titles.slice(0, 3).map((t, i) => (

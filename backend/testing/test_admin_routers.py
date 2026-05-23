@@ -215,9 +215,59 @@ class TestProjectMembers:
 
         resp = await client.get(f"/api/admin/projects/{project.id}/members")
         assert resp.status_code == 200
-        members = resp.json()
+        data = resp.json()
+        assert data["total"] == 1
+        assert data["limit"] == 50
+        assert data["offset"] == 0
+        members = data["members"]
         assert len(members) == 1
         assert members[0]["role"] == "owner"
+
+    @pytest.mark.asyncio
+    async def test_list_members_pagination(self, client: AsyncClient, db_session):
+        """limit/offset paginate the member list while total reflects the full count."""
+        project = await _make_project(db_session)
+        for i in range(5):
+            db_session.add(
+                ProjectMember(
+                    project_id=project.id, user_id=f"member-uid-{i}", role="member"
+                )
+            )
+        await db_session.commit()
+
+        # 6 members total (owner + 5). First page of 2.
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/members?limit=2&offset=0"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 6
+        assert data["limit"] == 2
+        assert data["offset"] == 0
+        assert len(data["members"]) == 2
+
+        # Offset past the first page.
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/members?limit=2&offset=4"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 6
+        assert data["offset"] == 4
+        assert len(data["members"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_list_members_invalid_limit_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """limit outside 1..500 is rejected."""
+        project = await _make_project(db_session)
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/members?limit=501")
+        assert resp.status_code == 422
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/members?offset=-1")
+        assert resp.status_code == 422
 
     @pytest.mark.asyncio
     async def test_list_members_non_member_returns_404(

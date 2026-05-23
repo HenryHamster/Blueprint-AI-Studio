@@ -83,26 +83,42 @@ async def list_project_members(
     project_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
 ):
     """List members of a project. Any member/viewer can see."""
     await _get_user_project(project_id, current_user["user_id"], session)
+    total_result = await session.execute(
+        select(func.count())
+        .select_from(ProjectMember)
+        .where(ProjectMember.project_id == project_id)
+    )
+    total = total_result.scalar_one()
+
     result = await session.execute(
         select(ProjectMember, AllowedUser.email)
         .outerjoin(AllowedUser, AllowedUser.firebase_uid == ProjectMember.user_id)
         .where(ProjectMember.project_id == project_id)
         .order_by(ProjectMember.created_at.asc())
+        .limit(limit)
+        .offset(offset)
     )
     rows = result.all()
-    return [
-        {
-            "id": str(m.id),
-            "user_id": m.user_id,
-            "email": email,
-            "role": m.role,
-            "created_at": m.created_at.isoformat() if m.created_at else None,
-        }
-        for m, email in rows
-    ]
+    return {
+        "members": [
+            {
+                "id": str(m.id),
+                "user_id": m.user_id,
+                "email": email,
+                "role": m.role,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+            for m, email in rows
+        ],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.post("/projects/{project_id}/members", status_code=201)

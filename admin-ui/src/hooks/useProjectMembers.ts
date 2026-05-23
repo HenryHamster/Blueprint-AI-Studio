@@ -14,8 +14,11 @@ export function useProjectMembers() {
 
   const fetchProjectMembers = useCallback(async (projectId: string) => {
     try {
-      const res = await authGet(`${API_BASE_URL}/api/admin/projects/${projectId}/members`);
-      if (res.ok) setProjectMembers(await res.json());
+      const res = await authGet(`${API_BASE_URL}/api/admin/projects/${projectId}/members?limit=500`);
+      if (res.ok) {
+        const data = await res.json();
+        setProjectMembers(Array.isArray(data) ? data : data.members ?? []);
+      }
     } catch { /* ignore */ }
   }, []);
 

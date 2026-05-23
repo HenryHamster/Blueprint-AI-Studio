@@ -2459,7 +2459,7 @@ async def get_residual_fingerprints(
 
     result = await session.execute(
         select(Task)
-        .where(*filters)
+        .where(*filters, ~Task.context.has_key("failure_category"))
         .options(
             load_only(
                 Task.id,
@@ -2474,14 +2474,12 @@ async def get_residual_fingerprints(
                 Task.status_log,
             )
         )
-        .limit(2000)
+        .limit(500)
     )
     tasks = list(result.scalars().all())
 
     clusters: Dict[str, Dict[str, Any]] = {}
     for task in tasks:
-        if (task.context or {}).get("failure_category"):
-            continue
         if _cf(task) != "CODE_ERROR":
             continue
         msg = task.latest_status_message or ""
@@ -4761,6 +4759,7 @@ async def _compute_digest(
                 ),
             )
             .order_by(Artifact.created_at.asc())
+            .limit(500)
         )
         for a in artifacts_result.scalars().all():
             tid = str(a.task_id)
@@ -7008,12 +7007,22 @@ async def get_fix_loop_convergence(
                 Task.context,
             )
         )
+        .order_by(Task.created_at.desc())
     )
     if project_id is not None:
         stmt = stmt.where(Task.project_id == project_id)
 
-    result = await session.execute(stmt)
+    _LIMIT = 1000
+    result = await session.execute(stmt.limit(_LIMIT))
     tasks = result.scalars().all()
+    if len(tasks) >= _LIMIT:
+        logger.warning(
+            "get_fix_loop_convergence: query hit %d-row cap (hours=%d, project_id=%s); "
+            "results may be incomplete",
+            _LIMIT,
+            hours,
+            project_id,
+        )
 
     # Only consider tasks that have at least one fix-loop event recorded.
     tasks_with_history = [t for t in tasks if t.fix_loop_history]
@@ -7024,8 +7033,8 @@ async def get_fix_loop_convergence(
         if (t.context or {}).get("fix_loop_abandoned"):
             abandoned_ids.append(str(t.id))
     abandoned_ids_recent = abandoned_ids[
-        -25:
-    ]  # keep 25 most recent (insertion order ~ created_at)
+        :25
+    ]  # keep 25 most recent (DESC order: tasks are newest-first)
 
     loop_names = ("lint", "test", "check")
 
@@ -7453,6 +7462,8 @@ async def get_fix_loop_convergence_trend(
     """
     cutoff = datetime.utcnow() - timedelta(days=days)
 
+    _TREND_LIMIT = 10_000
+
     stmt = (
         select(Task)
         .where(
@@ -7468,12 +7479,19 @@ async def get_fix_loop_convergence_trend(
                 Task.created_at,
             )
         )
+        .limit(_TREND_LIMIT)
     )
     if project_id is not None:
         stmt = stmt.where(Task.project_id == project_id)
 
     result = await session.execute(stmt)
     tasks = result.scalars().all()
+    if len(tasks) >= _TREND_LIMIT:
+        logger.warning(
+            "[ANALYTICS] fix_loop_convergence_trend hit row cap (%d); results may be incomplete. "
+            "Consider reducing days= or adding a project_id filter.",
+            _TREND_LIMIT,
+        )
 
     loop_names = ("lint", "test", "check")
 

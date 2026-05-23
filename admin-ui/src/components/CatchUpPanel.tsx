@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { RefObject } from 'react';
 import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle, Loader2, Check, RotateCcw, DollarSign, Compass } from 'lucide-react';
 import { apiFetch, API_BASE_URL } from '../api';
@@ -613,13 +613,13 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
     setOpenDropdown(null);
   };
 
-  const restoreItem = (taskId: string) => {
+  const restoreItem = useCallback((taskId: string) => {
     const next = Object.fromEntries(
       Object.entries(dismissed).filter(([k]) => k !== taskId)
     ) as DismissedState;
     setDismissed(next);
     saveDismissed(next);
-  };
+  }, [dismissed]);
 
   const isHidden = useCallback((taskId: string): boolean => {
     const entry = dismissed[taskId];
@@ -642,6 +642,14 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
     [visibleItems]
   );
 
+  const handleBulkApproveAll = useCallback(() => {
+    handleBulkApprove(approvalItems.map(i => i.task_id));
+  }, [handleBulkApprove, approvalItems]);
+
+  const handleBulkRetryAll = useCallback(() => {
+    handleBulkRetry(failedItems.map(i => i.task_id));
+  }, [handleBulkRetry, failedItems]);
+
   const toggle = () => {
     const next = !collapsed;
     if (next) {
@@ -655,14 +663,21 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
     localStorage.setItem('blueprint-admin:catchUpPanelCollapsed', String(next));
   };
 
-  const toggleSnippet = (id: string) => {
+  const toggleSnippet = useCallback((id: string) => {
     setExpandedSnippets(prev => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
-  };
+  }, []);
+
+  const handleToggleShowDismissed = useCallback(() => setShowDismissed(v => !v), []);
+  const handleToggleActiveExpanded = useCallback(() => setActiveExpanded(v => !v), []);
+
+  const handleWindowChange = useCallback((e: React.MouseEvent<HTMLButtonElement>) => {
+    setActiveWindow(e.currentTarget.dataset.key as TimeWindow);
+  }, []);
 
   const hasActivity = digest && (
     digest.completed_count > 0 ||
@@ -780,7 +795,8 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
             {windowLabels.map(({ key, label }) => (
               <button
                 key={key}
-                onClick={() => setActiveWindow(key)}
+                onClick={handleWindowChange}
+                data-key={key}
                 aria-pressed={activeWindow === key}
                 className={`px-2 min-h-[44px] flex items-center rounded-full text-[10px] font-medium transition-colors ${
                   activeWindow === key
@@ -1289,7 +1305,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                       {onBulkApprove && approvalItems.length >= 2 && (
                         <button
                           className="text-[10px] font-semibold px-2 py-4 rounded border flex items-center gap-1 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border-emerald-500/20 normal-case tracking-normal"
-                          onClick={() => handleBulkApprove(approvalItems.map(i => i.task_id))}
+                          onClick={handleBulkApproveAll}
                         >
                           <Check className="w-3 h-3" />
                           Approve all ({approvalItems.length})
@@ -1298,7 +1314,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                       {onBulkRetry && failedItems.length >= 2 && (
                         <button
                           className="text-[10px] font-semibold px-2 py-4 rounded border flex items-center gap-1 bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border-blue-500/20 normal-case tracking-normal"
-                          onClick={() => handleBulkRetry(failedItems.map(i => i.task_id))}
+                          onClick={handleBulkRetryAll}
                         >
                           <RotateCcw className="w-3 h-3" />
                           Retry all ({failedItems.length})
@@ -1458,7 +1474,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                       <div className="mt-1">
                         <button
                           className="text-[10px] text-neutral-600 hover:text-neutral-400 transition-colors"
-                          onClick={() => setShowDismissed(v => !v)}
+                          onClick={handleToggleShowDismissed}
                         >
                           {showDismissed ? 'Hide dismissed' : `Show ${hiddenItems.length} dismissed`}
                         </button>
@@ -1496,7 +1512,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
               {digest.active_count > 0 && (
                 <div>
                   <button
-                    onClick={() => setActiveExpanded(v => !v)}
+                    onClick={handleToggleActiveExpanded}
                     aria-expanded={activeExpanded}
                     className="flex items-center gap-1.5 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors mb-1.5"
                   >

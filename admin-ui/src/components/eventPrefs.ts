@@ -1,0 +1,202 @@
+import { type TemporaryMutes, isEventTypeTemporarilyMuted } from './temporaryMutes';
+
+// Canonical set of escalation event types emitted by backend/app/notification_dispatch.py.
+// One source of truth: high-signal classification, error toast severity, and ContextBadges
+// all read from this set, so a new escalation type added here automatically gets surfaced
+// across all three behaviors. Keep in sync with notification_dispatch.py escalation emitters.
+//
+// EVENT TYPE INVARIANT: See backend/testing/event_type_snapshot.json for the canonical list
+// of all 21+ event_types emitted by the backend. The invariant test in
+// MessagesPanel.invariant.test.ts validates that every event_type appears in either
+// HIGH_SIGNAL_NOTE_EVENTS or ROUTINE_EVENT_LABELS below. When adding a new event_type:
+// 1. Update backend/testing/event_type_snapshot.json with (name, classification, source_fn)
+// 2. Update HIGH_SIGNAL_NOTE_EVENTS, ROUTINE_EVENT_LABELS, or ESCALATION_EVENT_TYPES below
+// 3. If escalation, add a badge label to ESCALATION_BADGE_LABELS
+// The invariant test will fail and tell you exactly what's missing.
+export const ESCALATION_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'auto_fix_escalated',
+  'residual_fix_escalated',
+  'residual_fix_audit_deferred',
+  'remediation_escalated',
+  'direction_burn_pause',
+  'direction_churn_pause',
+]);
+
+// Per-event-type label and Tailwind class for the ContextBadges escalation badge.
+// Adding a new entry to ESCALATION_EVENT_TYPES without a corresponding entry here
+// is caught by the invariant test in MessagesPanel.utils.test.ts.
+export const ESCALATION_BADGE_LABELS: Readonly<Record<string, string>> = {
+  auto_fix_escalated: 'Auto-fix Escalated',
+  residual_fix_escalated: 'Residual Fix Escalated',
+  residual_fix_audit_deferred: 'Audit Deferred',
+  remediation_escalated: 'Remediation Escalated',
+  direction_burn_pause: 'Burn Pause',
+  direction_churn_pause: 'Churn Pause',
+};
+
+// Badge labels for high-signal NOTE event types that are NOT escalations.
+// Every entry in HIGH_SIGNAL_NOTE_EVENTS that is not in ESCALATION_EVENT_TYPES
+// should have an entry here so ContextBadges can render a red/amber badge
+// without a separate else-if branch per type. The invariant test in
+// MessagesPanel.utils.test.ts guards against drift.
+export const HIGH_SIGNAL_NOTE_BADGE_LABELS: Readonly<Record<string, string>> = {
+  failure_alert: 'Failure Alert',
+  rollback_recommended: 'Rollback Recommended',
+  fix_loop_divergence_regressed: 'Fix Loop Diverged',
+  release_calcifying: 'Release Calcifying',
+  direction_outcome_stalled: 'Direction Stalled',
+  release_build_stalled: 'Build Stalled',
+  release_stabilize_stalled: 'Stabilize Stalled',
+  release_ci_unresolved_stall: 'CI Stall',
+  release_auto_merge_stalled: 'Auto-merge Stalled',
+  promotion_readiness_reached: 'Promotion Ready',
+};
+
+export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
+  'failure_alert', 'rollback_recommended', 'fix_loop_divergence_regressed',
+  'release_calcifying', 'direction_outcome_stalled', 'release_build_stalled',
+  'release_stabilize_stalled', 'release_ci_unresolved_stall', 'release_auto_merge_stalled',
+  'promotion_readiness_reached',
+  ...ESCALATION_EVENT_TYPES,
+]);
+
+export const CRITICAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
+  'failure_alert', 'rollback_recommended', 'fix_loop_divergence_regressed',
+  'release_calcifying', 'direction_outcome_stalled', 'release_build_stalled',
+  'release_stabilize_stalled', 'release_ci_unresolved_stall', 'release_auto_merge_stalled',
+  'promotion_readiness_reached',
+  ...ESCALATION_EVENT_TYPES,
+]);
+
+export const ROUTINE_EVENT_LABELS: Record<string, string> = {
+  pr_merged: 'PR merges',
+  direction_milestone: 'milestones',
+  cycle_summary: 'cycle summaries',
+  account_model_regression_quarantined: 'account quarantines',
+  account_model_regression_recovered: 'account recoveries',
+  auto_fix_spawned: 'auto-fix spawns',
+  auto_fix_result: 'auto-fix results',
+  residual_fix_spawned: 'residual fix spawns',
+  residual_fix_result: 'residual fix results',
+  residual_fix_unsuspended: 'residual unsuspensions',
+  residual_case_auto_resolved: 'auto-resolutions',
+  issue_implementation_spawned: 'issue spawns',
+  review_feedback: 'review feedback',
+  feedback_acknowledgment: 'feedback acks',
+};
+
+export type EventPref = 'mute' | 'routine' | 'surfaced';
+
+export const EVENT_PREFS_KEY = 'messages_panel_event_prefs';
+
+// Legacy global key for migration only
+const LEGACY_EVENT_PREFS_KEY = 'messages_panel_event_prefs';
+
+export function eventPrefsKey(userId: string | undefined, projectId: string | undefined): string {
+  return `messages_panel_event_prefs:${userId || 'anonymous'}:${projectId || 'default'}`;
+}
+
+export function loadEventPrefs(userId?: string | null, projectId?: string | null): Record<string, EventPref> {
+  try {
+    const key = eventPrefsKey(userId || undefined, projectId || undefined);
+    const stored = localStorage.getItem(key);
+    if (stored) return JSON.parse(stored);
+
+    // Migration: if no project-scoped key exists, try legacy global key
+    const legacy = localStorage.getItem(LEGACY_EVENT_PREFS_KEY);
+    if (legacy) return JSON.parse(legacy);
+
+    return {};
+  } catch {
+    return {};
+  }
+}
+
+export function saveEventPrefs(
+  userId: string | undefined | null,
+  projectId: string | undefined | null,
+  prefs: Record<string, EventPref>,
+): void {
+  try {
+    const key = eventPrefsKey(userId || undefined, projectId || undefined);
+    if (Object.keys(prefs).length === 0) {
+      localStorage.removeItem(key);
+    } else {
+      localStorage.setItem(key, JSON.stringify(prefs));
+    }
+  } catch { /* ignore */ }
+}
+
+export function classifySignalLevel(msg: {
+  message_type: string;
+  from_type: string;
+  context: Record<string, unknown>;
+}): 'high' | 'routine' {
+  if ((msg.from_type || '').toLowerCase() === 'user') return 'high';
+  if (['FEEDBACK', 'BLOCKER', 'BUG_REPORT'].includes(msg.message_type)) return 'high';
+  if (msg.message_type === 'NOTE') {
+    const et = msg.context.event_type as string | undefined;
+    if (et && HIGH_SIGNAL_NOTE_EVENTS.has(et)) return 'high';
+  }
+  return 'routine';
+}
+
+export function effectiveSignal(
+  msg: { message_type: string; from_type: string; context: Record<string, unknown> },
+  prefs: Record<string, EventPref>,
+  tempMutes?: TemporaryMutes,
+): 'high' | 'routine' | 'mute' {
+  const et = msg.context.event_type as string | undefined;
+  if (tempMutes && isEventTypeTemporarilyMuted(et, tempMutes)) return 'mute';
+  const pref = et ? prefs[et] : undefined;
+  if (pref === 'mute') return 'mute';
+  if (pref === 'routine') return 'routine';
+  if (pref === 'surfaced') return 'high';
+  return classifySignalLevel(msg);
+}
+
+export function getToastSeverity(msg: { message_type: string; from_type: string; context: Record<string, unknown> }): 'error' | 'info' {
+  const et = msg.context.event_type as string | undefined;
+  if (msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT') return 'error';
+  if (et && CRITICAL_NOTE_EVENTS.has(et)) return 'error';
+  return 'info';
+}
+
+export function isCriticalSeverity(msg: {
+  message_type: string;
+  context: Record<string, unknown>;
+}): boolean {
+  if (msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT') return true;
+  if (msg.message_type === 'NOTE') {
+    const et = msg.context.event_type as string | undefined;
+    if (et && CRITICAL_NOTE_EVENTS.has(et)) return true;
+  }
+  return false;
+}
+
+export function countHighSignalMessages(
+  messages: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown> }>,
+  prefs?: Record<string, EventPref>,
+  tempMutes?: TemporaryMutes,
+): number {
+  return messages.filter(m =>
+    m.status === 'open' && (prefs ? effectiveSignal(m, prefs, tempMutes) : classifySignalLevel(m)) === 'high'
+  ).length;
+}
+
+export function countNewSinceLastVisit(
+  messages: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown>; created_at?: string | null }>,
+  lastSeenTs: number | null,
+  prefs?: Record<string, EventPref>,
+  tempMutes?: TemporaryMutes,
+): number {
+  if (lastSeenTs === null) return 0;
+  return messages.filter(m => {
+    if (m.status !== 'open') return false;
+    const signal = prefs ? effectiveSignal(m, prefs, tempMutes) : classifySignalLevel(m);
+    if (signal !== 'high') return false;
+    if (!m.created_at) return false;
+    const ts = new Date(m.created_at.endsWith('Z') || m.created_at.includes('+') ? m.created_at : m.created_at + 'Z').getTime();
+    return !isNaN(ts) && ts > lastSeenTs;
+  }).length;
+}

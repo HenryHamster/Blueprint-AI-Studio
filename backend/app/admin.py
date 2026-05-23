@@ -2440,6 +2440,8 @@ async def modify_task(
             # Cycle detection: walk depends_on graph from each dep to see if we reach task.id
             task_id_str = str(task.id)
 
+            task_cache: dict[str, Task | None] = {}
+
             async def _has_path_to(
                 start_id: str, target_id: str, visited: set, depth: int = 0
             ) -> bool:
@@ -2450,7 +2452,9 @@ async def modify_task(
                 if start_id in visited:
                     return False
                 visited.add(start_id)
-                dep_task = await session.get(Task, uuid.UUID(start_id))
+                if start_id not in task_cache:
+                    task_cache[start_id] = await session.get(Task, uuid.UUID(start_id))
+                dep_task = task_cache[start_id]
                 if not dep_task:
                     return False
                 for d in dep_task.depends_on or []:
