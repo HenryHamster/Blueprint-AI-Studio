@@ -31,13 +31,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
 import uuid
 from fastapi import HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import DeploymentState, Project, Task
 
@@ -428,3 +429,29 @@ async def lock_project_for_strategic_transition(
             return None  # genuinely missing
         await asyncio.sleep(0.5 * (attempt + 1))
     return None  # row held past retry window — caller defers
+
+
+async def with_design_doc_locked(
+    session: AsyncSession,
+    project_id,
+    mutate_fn: Callable[[dict], None],
+) -> None:
+    """Atomic read-modify-write of project.design_doc under a project row lock.
+
+    Acquires SELECT FOR UPDATE (skip_locked=False — background callers wait
+    rather than silently skip), calls mutate_fn(doc) with a copy of the
+    current doc dict, then writes the result back. Caller is responsible for
+    committing the session.
+
+    This is the canonical helper for all design_doc mutations. Using it
+    consistently prevents concurrent writers from clobbering each other's
+    keys via stale read-modify-write races.
+    """
+    async with project_lock(session, project_id, skip_locked=False) as project:
+        if project is None:
+            return
+        doc = dict(project.design_doc or {})
+        mutate_fn(doc)
+        project.design_doc = doc
+        flag_modified(project, "design_doc")
+        session.add(project)
