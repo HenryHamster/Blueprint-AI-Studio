@@ -1204,7 +1204,7 @@ export function SettingsDropdown({
                       <div className="text-xs text-neutral-300">{guide.summary}</div>
                       <ol className="list-decimal list-inside mt-1.5 space-y-0.5 text-[11px] text-neutral-400">
                         {guide.steps.map((step, i) => (
-                          <li key={i}><span className="[&_code]:text-cyan-300 [&_code]:bg-neutral-900 [&_code]:px-1 [&_code]:rounded" dangerouslySetInnerHTML={{ __html: step.replace(/`([^`]+)`/g, '<code>$1</code>') }} /></li>
+                          <li key={i}>{step.split(/(`[^`]+`)/g).map((part, idx) => part.startsWith('`') && part.endsWith('`') ? <code key={idx} className="text-cyan-300 bg-neutral-900 px-1 rounded">{part.slice(1, -1)}</code> : <span key={idx}>{part}</span>)}</li>
                         ))}
                       </ol>
                     </div>

@@ -178,6 +178,10 @@ async def add_direction(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+    # Serialize directions writes: lock the row and re-read the array inside
+    # the lock so the cap check + append can't clobber a concurrent writer.
+    project = await lock_project_or_429(session, project.id)
+    await session.refresh(project, attribute_names=["directions"])
 
     if payload.category is not None and payload.category not in VALID_CATEGORIES:
         raise HTTPException(
@@ -246,6 +250,10 @@ async def replace_directions(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+    # Whole-array overwrite — lock the row so the commit can't race a
+    # concurrent writer and silently drop a just-added direction.
+    project = await lock_project_or_429(session, project.id)
+    await session.refresh(project, attribute_names=["directions"])
 
     normalized = []
     for d in payload:
@@ -320,6 +328,10 @@ async def remove_direction(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+    # Lock the row and re-read inside the lock so the removal + tombstone
+    # rewrite serializes against concurrent directions writers.
+    project = await lock_project_or_429(session, project.id)
+    await session.refresh(project, attribute_names=["directions"])
 
     original_directions = list(project.directions or [])
     removed = [d for d in original_directions if d.get("id") == direction_id]
@@ -388,6 +400,10 @@ async def reorder_directions(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+    # Whole-array reorder — lock the row and re-read inside the lock so the
+    # reordered array is built from the current set, not a stale pre-lock read.
+    project = await lock_project_or_429(session, project.id)
+    await session.refresh(project, attribute_names=["directions"])
 
     direction_ids = payload.get("direction_ids")
     if not isinstance(direction_ids, list):
@@ -422,6 +438,10 @@ async def update_direction(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+    # Lock the row and re-read inside the lock so the per-field edit + the
+    # reactivation cap check operate on the current array, not a stale read.
+    project = await lock_project_or_429(session, project.id)
+    await session.refresh(project, attribute_names=["directions"])
 
     # Validate inputs
     if "priority" in payload and payload["priority"] not in ("high", "medium", "low"):

@@ -801,16 +801,18 @@ async def _stamp_reviewer_recovery_count(
     )
     if recovery_count <= 0:
         return
-    proj = await session.get(Project, project_id)
-    if proj is None:
-        return
-    doc = dict(proj.design_doc or {})
-    trends = dict(doc.get("sr_catch_rate_trends") or {})
-    trends["reviewer_recovery_after_incomplete_sr_count"] = recovery_count
-    doc["sr_catch_rate_trends"] = trends
-    proj.design_doc = doc
-    flag_modified(proj, "design_doc")
-    session.add(proj)
+    from app.task_locking import project_lock
+
+    async with project_lock(session, project_id, skip_locked=True) as proj:
+        if proj is None:
+            return
+        doc = dict(proj.design_doc or {})
+        trends = dict(doc.get("sr_catch_rate_trends") or {})
+        trends["reviewer_recovery_after_incomplete_sr_count"] = recovery_count
+        doc["sr_catch_rate_trends"] = trends
+        proj.design_doc = doc
+        flag_modified(proj, "design_doc")
+        session.add(proj)
 
 
 @router.post("/claim")
@@ -1975,60 +1977,72 @@ async def claim_task(
             # Track reference counts + stale-ref check — fire-and-forget, must not fail claim response
             try:
                 now_iso = _utcnow().isoformat()
-                doc = dict(project_for_playbook.design_doc)
-                for short_key in playbook_entries:
-                    full_key = f"playbook/{short_key}"
-                    if full_key in doc and isinstance(doc[full_key], dict):
-                        entry = dict(doc[full_key])
-                        entry["reference_count"] = entry.get("reference_count", 0) + 1
-                        entry["last_referenced_at"] = now_iso
-                        outcomes = list(entry.get("recent_outcomes", []))
-                        outcomes.append(False)
-                        outcomes = outcomes[-10:]
-                        entry["recent_outcomes"] = outcomes
-                        # Auto-archive: if 10 entries and all False, mark stale
-                        if len(outcomes) >= 10 and not any(outcomes):
-                            entry["stale"] = True
-                            entry["effectiveness_score"] = 0.0
-                        doc[full_key] = entry
-                # Check file-path references against the repo root (config-driven; skipped when unset)
-                try:
-                    from app.playbook_learning import check_and_flag_stale_refs
+                from app.task_locking import project_lock as _pb_project_lock
 
-                    repo_root: str = (
-                        _shared_state.runtime_config.get("playbook_repo_root", "") or ""
-                    )
-                    if repo_root:
-                        doc = check_and_flag_stale_refs(doc, repo_root)
-                except Exception:  # noqa: BLE001 — stale-ref check is best-effort, never block claim
-                    logger.debug("[AGENT] Stale-ref check skipped (non-critical)")
-                # Time-decay maintenance: archive auto-generated playbook entries
-                # whose last_referenced_at is past the idle threshold. Piggybacks
-                # on the already-mutating doc/commit so no extra DB write.
-                try:
-                    from app.playbook_learning import retire_idle_auto_entries
+                async with _pb_project_lock(
+                    session, task.project_id, skip_locked=True
+                ) as _pb_proj:
+                    if _pb_proj is not None:
+                        doc = dict(_pb_proj.design_doc or {})
+                        for short_key in playbook_entries:
+                            full_key = f"playbook/{short_key}"
+                            if full_key in doc and isinstance(doc[full_key], dict):
+                                entry = dict(doc[full_key])
+                                entry["reference_count"] = (
+                                    entry.get("reference_count", 0) + 1
+                                )
+                                entry["last_referenced_at"] = now_iso
+                                outcomes = list(entry.get("recent_outcomes", []))
+                                outcomes.append(False)
+                                outcomes = outcomes[-10:]
+                                entry["recent_outcomes"] = outcomes
+                                # Auto-archive: if 10 entries and all False, mark stale
+                                if len(outcomes) >= 10 and not any(outcomes):
+                                    entry["stale"] = True
+                                    entry["effectiveness_score"] = 0.0
+                                doc[full_key] = entry
+                        # Check file-path references (config-driven; skipped when unset)
+                        try:
+                            from app.playbook_learning import check_and_flag_stale_refs
 
-                    idle_days = int(
-                        _shared_state.runtime_config.get("playbook_idle_auto_days", 30)
-                    )
-                    retire_idle_auto_entries(doc, idle_days=idle_days)
-                except Exception:  # noqa: BLE001 — best-effort, never block claim
-                    logger.debug(
-                        "[AGENT] Idle auto-entry retirement skipped (non-critical)"
-                    )
-                # Low-success-rate maintenance: archive auto-generated entries
-                # whose confirmed/followed rate has fallen below threshold.
-                try:
-                    from app.playbook_learning import retire_ineffective_patterns
+                            repo_root: str = (
+                                _shared_state.runtime_config.get(
+                                    "playbook_repo_root", ""
+                                )
+                                or ""
+                            )
+                            if repo_root:
+                                doc = check_and_flag_stale_refs(doc, repo_root)
+                        except Exception:  # noqa: BLE001 — best-effort, never block claim
+                            logger.debug(
+                                "[AGENT] Stale-ref check skipped (non-critical)"
+                            )
+                        try:
+                            from app.playbook_learning import retire_idle_auto_entries
 
-                    retire_ineffective_patterns(doc)
-                except Exception:  # noqa: BLE001 — best-effort, never block claim
-                    logger.debug(
-                        "[AGENT] Low-success-rate retirement skipped (non-critical)"
-                    )
-                project_for_playbook.design_doc = doc
-                flag_modified(project_for_playbook, "design_doc")
-                session.add(project_for_playbook)
+                            idle_days = int(
+                                _shared_state.runtime_config.get(
+                                    "playbook_idle_auto_days", 30
+                                )
+                            )
+                            retire_idle_auto_entries(doc, idle_days=idle_days)
+                        except Exception:  # noqa: BLE001 — best-effort, never block claim
+                            logger.debug(
+                                "[AGENT] Idle auto-entry retirement skipped (non-critical)"
+                            )
+                        try:
+                            from app.playbook_learning import (
+                                retire_ineffective_patterns,
+                            )
+
+                            retire_ineffective_patterns(doc)
+                        except Exception:  # noqa: BLE001 — best-effort, never block claim
+                            logger.debug(
+                                "[AGENT] Low-success-rate retirement skipped (non-critical)"
+                            )
+                        _pb_proj.design_doc = doc
+                        flag_modified(_pb_proj, "design_doc")
+                        session.add(_pb_proj)
                 # Store shown playbook keys in task context for outcome tracking at completion
                 task_ctx = dict(task.context or {})
                 task_ctx["_shown_playbook_keys"] = list(playbook_entries.keys())

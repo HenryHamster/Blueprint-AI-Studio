@@ -92,6 +92,7 @@ from app.task_completion import (
     _extract_json_array,
     _ensure_branch,
 )
+from app.task_locking import with_design_doc_locked
 from app.plan_completion import (
     _validate_plan_dependencies,
     _log_file_overlaps,
@@ -1419,24 +1420,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
         if finding_type == "design_doc_observation":
             # Append to design doc proposals for Phase 1 to review
-            obs_project = await session.get(Project, task.project_id)
-            if obs_project:
-                doc = dict(obs_project.design_doc or {})
+            _obs_entry = {
+                "id": f"pc-{uuid.uuid4().hex[:8]}",
+                "observation": finding.get("description", "")[:500],
+                "section": finding.get("section", "general"),
+                "proposed_by_task": str(task.id),
+                "proposed_at": _utcnow().isoformat(),
+                "status": "pending",
+            }
+
+            def _add_obs_proposal(doc: dict) -> None:
                 proposals = doc.get("proposed_changes", [])
-                proposals.append(
-                    {
-                        "id": f"pc-{uuid.uuid4().hex[:8]}",
-                        "observation": finding.get("description", "")[:500],
-                        "section": finding.get("section", "general"),
-                        "proposed_by_task": str(task.id),
-                        "proposed_at": _utcnow().isoformat(),
-                        "status": "pending",
-                    }
-                )
+                proposals.append(_obs_entry)
                 doc["proposed_changes"] = proposals[-30:]  # cap at 30 pending
-                obs_project.design_doc = doc
-                flag_modified(obs_project, "design_doc")
-                session.add(obs_project)
+
+            await with_design_doc_locked(session, task.project_id, _add_obs_proposal)
             type_filtered_count += 1
             continue  # Don't create a task
 
@@ -2490,23 +2488,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # giving a denominator for per-entry success rates used by the archival ranker.
     _shown_pb_keys = list((task.context or {}).get("_shown_playbook_keys") or [])
     if _shown_pb_keys and _impl_spawned > 0:
-        _pb_proj = await session.get(Project, task.project_id)
-        if _pb_proj and _pb_proj.design_doc:
-            _pb_doc = dict(_pb_proj.design_doc)
-            _pb_updated = False
+
+        def _credit_playbook_keys(doc: dict) -> None:
             for _pb_key in _shown_pb_keys:
                 _pb_full_key = f"playbook/{_pb_key}"
-                _pb_entry = _pb_doc.get(_pb_full_key)
+                _pb_entry = doc.get(_pb_full_key)
                 if isinstance(_pb_entry, dict):
                     _pb_entry = dict(_pb_entry)
                     _pb_entry["followed_count"] = _pb_entry.get("followed_count", 0) + 1
-                    _pb_doc[_pb_full_key] = _pb_entry
-                    _pb_updated = True
-            if _pb_updated:
-                _pb_proj.design_doc = _pb_doc
-                flag_modified(_pb_proj, "design_doc")
-                session.add(_pb_proj)
-                await session.commit()
+                    doc[_pb_full_key] = _pb_entry
+
+        await with_design_doc_locked(session, task.project_id, _credit_playbook_keys)
+        await session.commit()
 
 
 async def _record_research_task_failure(task: Task, session: AsyncSession) -> None:

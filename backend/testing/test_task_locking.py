@@ -24,6 +24,7 @@ from app.task_locking import (
     project_lock,
     task_lock,
     with_design_doc_locked,
+    with_directions_locked,
 )
 
 
@@ -788,3 +789,71 @@ async def test_with_design_doc_locked_serializes_concurrent_writers(db_session):
         doc = result.scalar_one().design_doc
     assert doc.get("key_a") == "v", f"key_a missing from {doc}"
     assert doc.get("key_b") == "v", f"key_b missing from {doc}"
+
+
+# ── with_directions_locked ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_with_directions_locked_in_place_mutation(db_session):
+    """A mutate_fn that edits the list in place and returns None must persist
+    the edit and preserve pre-existing entries."""
+    project = Project(name="dir-lock-inplace", user_id="user")
+    project.directions = [{"id": "d-1", "status": "active"}]
+    db_session.add(project)
+    await db_session.commit()
+
+    def _append(dirs: list) -> None:
+        dirs.append({"id": "d-2", "status": "proposed"})
+
+    await with_directions_locked(db_session, project.id, _append)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    ids = [d["id"] for d in project.directions]
+    assert ids == ["d-1", "d-2"], project.directions
+
+
+@pytest.mark.asyncio
+async def test_with_directions_locked_whole_array_overwrite(db_session):
+    """A mutate_fn returning a replacement list must overwrite the array."""
+    project = Project(name="dir-lock-replace", user_id="user")
+    project.directions = [{"id": "d-1"}, {"id": "d-2"}]
+    db_session.add(project)
+    await db_session.commit()
+
+    await with_directions_locked(db_session, project.id, lambda dirs: [{"id": "d-9"}])
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert project.directions == [{"id": "d-9"}]
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
+@pytest.mark.asyncio
+async def test_with_directions_locked_serializes_concurrent_appends(db_session):
+    """Two concurrent appends via with_directions_locked must both survive —
+    the second writer must see the first's committed append (no lost update)."""
+    project = Project(name="dir-lock-concurrent", user_id="user")
+    project.directions = []
+    db_session.add(project)
+    await db_session.commit()
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def append_dir(dir_id: str) -> None:
+        async with Session() as s:
+            await with_directions_locked(
+                s, project.id, lambda dirs: dirs.append({"id": dir_id})
+            )
+            await s.commit()
+
+    await asyncio.gather(append_dir("d-a"), append_dir("d-b"))
+
+    async with Session() as verify:
+        result = await verify.execute(select(Project).where(Project.id == project.id))
+        dirs = result.scalar_one().directions
+    ids = {d["id"] for d in dirs}
+    assert ids == {"d-a", "d-b"}, f"lost update: {dirs}"

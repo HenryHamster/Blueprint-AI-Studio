@@ -166,6 +166,12 @@ async def update_project(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+    # The directions branch below is a whole-array overwrite. Lock the row and
+    # re-read directions inside the lock so a concurrent autonomous writer's
+    # append isn't silently dropped by this operator replace.
+    if payload.directions is not None:
+        project = await lock_project_or_429(session, project.id)
+        await session.refresh(project, attribute_names=["directions"])
 
     if payload.name is not None:
         project.name = payload.name

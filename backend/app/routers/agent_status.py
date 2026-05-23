@@ -525,104 +525,107 @@ async def _check_recurring_failures(task: Task, session: AsyncSession) -> None:
         if len(common_keywords) < 2:
             continue
 
-        # Check if an existing auto-entry already covers these keywords
-        project = await session.get(Project, task.project_id)
-        if not project:
-            continue
+        # Acquire project row lock before the design_doc read-modify-write.
+        # skip_locked=True: best-effort, contention degrades gracefully.
+        from app.task_locking import project_lock
 
-        doc = dict(project.design_doc or {})
-        existing_auto_keys = [k for k in doc if k.startswith("playbook/auto-")]
+        async with project_lock(session, task.project_id, skip_locked=True) as project:
+            if project is None:
+                continue
 
-        # Infer scope: direction-scoped only when ALL tasks have a direction_id
-        # and they all share the same one.  Tasks without a direction_id must NOT
-        # be silently dropped — their presence means the pattern is universal.
-        all_have_direction = all(
-            (t.context or {}).get("direction_id") for t in tasks_in_class
-        )
-        task_direction_ids = {
-            (t.context or {}).get("direction_id")
-            for t in tasks_in_class
-            if (t.context or {}).get("direction_id")
-        }
-        if all_have_direction and len(task_direction_ids) == 1:
-            inferred_scope = "direction"
-            inferred_direction: str | None = next(iter(task_direction_ids))
-        else:
-            inferred_scope = "universal"
-            inferred_direction = None
+            doc = dict(project.design_doc or {})
+            existing_auto_keys = [k for k in doc if k.startswith("playbook/auto-")]
 
-        # Check duplicate: look for any existing entry whose keywords overlap significantly
-        already_covered = False
-        keyword_set = set(common_keywords)
-        for existing_key in existing_auto_keys:
-            entry = doc.get(existing_key, {})
-            entry_content = entry.get("content", "").lower()
-            overlap = sum(1 for kw in keyword_set if kw in entry_content)
-            if overlap >= max(2, len(keyword_set) // 2):
-                # Update the count in the existing entry
-                updated_entry = dict(entry)
-                updated_entry["content"] = (
-                    f"WARNING: {failure_class} failures have occurred {len(tasks_in_class)} times recently. "
-                    f"Common pattern: {', '.join(common_keywords)}. "
-                    f"Recent examples: {_truncate_examples(tasks_in_class[-2:])}. "
-                    f"Agents should check for this issue before starting work."
-                )
-                updated_entry["updated_at"] = _utcnow().isoformat()
-                updated_entry["applicable_types"] = _get_applicable_types(
-                    tasks_in_class
-                )
-                updated_entry["scope"] = inferred_scope
-                updated_entry["learned_from_direction"] = inferred_direction
-                doc[existing_key] = updated_entry
-                project.design_doc = doc
-                flag_modified(project, "design_doc")
-                session.add(project)
-                logger.info(
-                    f"[PLAYBOOK] Updated existing auto-entry {existing_key} for {failure_class} pattern"
-                )
-                already_covered = True
-                break
-
-        if already_covered:
-            continue
-
-        # Cap at 5 auto-generated entries
-        if len(existing_auto_keys) >= _AUTO_PLAYBOOK_CAP:
-            logger.info(
-                f"[PLAYBOOK] Auto-playbook cap ({_AUTO_PLAYBOOK_CAP}) reached for project {task.project_id}, skipping"
+            # Infer scope: direction-scoped only when ALL tasks have a direction_id
+            # and they all share the same one.  Tasks without a direction_id must NOT
+            # be silently dropped — their presence means the pattern is universal.
+            all_have_direction = all(
+                (t.context or {}).get("direction_id") for t in tasks_in_class
             )
-            continue
+            task_direction_ids = {
+                (t.context or {}).get("direction_id")
+                for t in tasks_in_class
+                if (t.context or {}).get("direction_id")
+            }
+            if all_have_direction and len(task_direction_ids) == 1:
+                inferred_scope = "direction"
+                inferred_direction: str | None = next(iter(task_direction_ids))
+            else:
+                inferred_scope = "universal"
+                inferred_direction = None
 
-        # Create a new auto-entry
-        short_hash = _hashlib.md5(
-            ",".join(sorted(common_keywords)).encode()
-        ).hexdigest()[:6]
-        entry_key = f"playbook/auto-{failure_class.lower()}-{short_hash}"
+            # Check duplicate: look for any existing entry whose keywords overlap significantly
+            already_covered = False
+            keyword_set = set(common_keywords)
+            for existing_key in existing_auto_keys:
+                entry = doc.get(existing_key, {})
+                entry_content = entry.get("content", "").lower()
+                overlap = sum(1 for kw in keyword_set if kw in entry_content)
+                if overlap >= max(2, len(keyword_set) // 2):
+                    # Update the count in the existing entry
+                    updated_entry = dict(entry)
+                    updated_entry["content"] = (
+                        f"WARNING: {failure_class} failures have occurred {len(tasks_in_class)} times recently. "
+                        f"Common pattern: {', '.join(common_keywords)}. "
+                        f"Recent examples: {_truncate_examples(tasks_in_class[-2:])}. "
+                        f"Agents should check for this issue before starting work."
+                    )
+                    updated_entry["updated_at"] = _utcnow().isoformat()
+                    updated_entry["applicable_types"] = _get_applicable_types(
+                        tasks_in_class
+                    )
+                    updated_entry["scope"] = inferred_scope
+                    updated_entry["learned_from_direction"] = inferred_direction
+                    doc[existing_key] = updated_entry
+                    project.design_doc = doc
+                    flag_modified(project, "design_doc")
+                    session.add(project)
+                    logger.info(
+                        f"[PLAYBOOK] Updated existing auto-entry {existing_key} for {failure_class} pattern"
+                    )
+                    already_covered = True
+                    break
 
-        applicable_types = _get_applicable_types(tasks_in_class)
-        content = (
-            f"WARNING: {failure_class} failures have occurred {len(tasks_in_class)} times recently. "
-            f"Common pattern: {', '.join(common_keywords)}. "
-            f"Recent examples: {_truncate_examples(tasks_in_class[-2:])}. "
-            f"Agents should check for this issue before starting work."
-        )
+            if already_covered:
+                continue
 
-        doc[entry_key] = {
-            "content": content,
-            "source_task_id": None,
-            "updated_at": _utcnow().isoformat(),
-            "confirmed_count": 0,
-            "applicable_types": applicable_types,
-            "scope": inferred_scope,
-            "learned_from_direction": inferred_direction,
-        }
-        project.design_doc = doc
-        flag_modified(project, "design_doc")
-        session.add(project)
-        logger.info(
-            f"[PLAYBOOK] Auto-created entry {entry_key} for {failure_class} pattern "
-            f"({len(tasks_in_class)} occurrences, keywords: {common_keywords})"
-        )
+            # Cap at 5 auto-generated entries
+            if len(existing_auto_keys) >= _AUTO_PLAYBOOK_CAP:
+                logger.info(
+                    f"[PLAYBOOK] Auto-playbook cap ({_AUTO_PLAYBOOK_CAP}) reached for project {task.project_id}, skipping"
+                )
+                continue
+
+            # Create a new auto-entry
+            short_hash = _hashlib.md5(
+                ",".join(sorted(common_keywords)).encode()
+            ).hexdigest()[:6]
+            entry_key = f"playbook/auto-{failure_class.lower()}-{short_hash}"
+
+            applicable_types = _get_applicable_types(tasks_in_class)
+            content = (
+                f"WARNING: {failure_class} failures have occurred {len(tasks_in_class)} times recently. "
+                f"Common pattern: {', '.join(common_keywords)}. "
+                f"Recent examples: {_truncate_examples(tasks_in_class[-2:])}. "
+                f"Agents should check for this issue before starting work."
+            )
+
+            doc[entry_key] = {
+                "content": content,
+                "source_task_id": None,
+                "updated_at": _utcnow().isoformat(),
+                "confirmed_count": 0,
+                "applicable_types": applicable_types,
+                "scope": inferred_scope,
+                "learned_from_direction": inferred_direction,
+            }
+            project.design_doc = doc
+            flag_modified(project, "design_doc")
+            session.add(project)
+            logger.info(
+                f"[PLAYBOOK] Auto-created entry {entry_key} for {failure_class} pattern "
+                f"({len(tasks_in_class)} occurrences, keywords: {common_keywords})"
+            )
 
 
 def _truncate_examples(tasks: list) -> str:
@@ -2736,8 +2739,10 @@ async def update_agent_status(
                         f"type={_task_type_str}"
                     )
                 # Increment confirmed_count and update effectiveness scoring for successful first attempts
-                if _ctx["_first_attempt_succeeded"] and _proj and _playbook_count > 0:
+                if _ctx["_first_attempt_succeeded"] and _playbook_count > 0:
                     try:
+                        from app.task_locking import project_lock as _proj_lock
+
                         _task_type = task.first_payload.get("type", "create")
                         _PLAYBOOK_DEFAULT_TYPES = {
                             "create",
@@ -2751,55 +2756,65 @@ async def update_agent_status(
                             "debug",
                             "docs",
                         }
-                        _doc = dict(_proj.design_doc or {})
-                        _confirmed_changed = False
-                        _now_iso = _utcnow().isoformat()
-                        # Keys shown to this task (stored at claim time for accurate outcome tracking)
-                        _shown_keys = {
-                            f"playbook/{k}"
-                            for k in (_ctx.get("_shown_playbook_keys") or [])
-                        }
-                        for _pk, _pv in list(_doc.items()):
-                            if _pk.startswith("playbook/") and isinstance(_pv, dict):
-                                _applicable = _pv.get("applicable_types")
-                                if _applicable is not None:
-                                    if _task_type not in _applicable:
-                                        continue
-                                elif _task_type not in _PLAYBOOK_DEFAULT_TYPES:
-                                    continue
-                                _entry = dict(_pv)
-                                _entry["confirmed_count"] = (
-                                    _entry.get("confirmed_count", 0) + 1
-                                )
-                                _entry["last_confirmed_at"] = _now_iso
-                                # Update rolling recent_outcomes only for entries shown to this task
-                                if _pk in _shown_keys:
-                                    _recent = list(_entry.get("recent_outcomes", []))
-                                    # Flip the most recent unconfirmed (False) outcome to True
-                                    _flipped = False
-                                    for _i in range(len(_recent) - 1, -1, -1):
-                                        if _recent[_i] is False:
-                                            _recent[_i] = True
-                                            _flipped = True
-                                            break
-                                    if not _flipped:
-                                        # No pending False; append True directly
-                                        _recent.append(True)
-                                        if len(_recent) > 10:
-                                            _recent = _recent[-10:]
-                                    _entry["recent_outcomes"] = _recent
-                                    _ref = _entry.get("reference_count", 0)
-                                    _conf = _entry.get("confirmed_count", 0)
-                                    if _conf > 0 or _ref > 0:
-                                        _entry["effectiveness_score"] = round(
-                                            _conf / max(_ref, 1), 4
+                        # Acquire project row lock before design_doc read-modify-write.
+                        # skip_locked=True: best-effort, contention degrades gracefully.
+                        async with _proj_lock(
+                            session, task.project_id, skip_locked=True
+                        ) as _proj_locked:
+                            if _proj_locked is not None:
+                                _doc = dict(_proj_locked.design_doc or {})
+                                _confirmed_changed = False
+                                _now_iso = _utcnow().isoformat()
+                                # Keys shown to this task (stored at claim time for accurate outcome tracking)
+                                _shown_keys = {
+                                    f"playbook/{k}"
+                                    for k in (_ctx.get("_shown_playbook_keys") or [])
+                                }
+                                for _pk, _pv in list(_doc.items()):
+                                    if _pk.startswith("playbook/") and isinstance(
+                                        _pv, dict
+                                    ):
+                                        _applicable = _pv.get("applicable_types")
+                                        if _applicable is not None:
+                                            if _task_type not in _applicable:
+                                                continue
+                                        elif _task_type not in _PLAYBOOK_DEFAULT_TYPES:
+                                            continue
+                                        _entry = dict(_pv)
+                                        _entry["confirmed_count"] = (
+                                            _entry.get("confirmed_count", 0) + 1
                                         )
-                                _doc[_pk] = _entry
-                                _confirmed_changed = True
-                        if _confirmed_changed:
-                            _proj.design_doc = _doc
-                            flag_modified(_proj, "design_doc")
-                            session.add(_proj)
+                                        _entry["last_confirmed_at"] = _now_iso
+                                        # Update rolling recent_outcomes only for entries shown to this task
+                                        if _pk in _shown_keys:
+                                            _recent = list(
+                                                _entry.get("recent_outcomes", [])
+                                            )
+                                            # Flip the most recent unconfirmed (False) outcome to True
+                                            _flipped = False
+                                            for _i in range(len(_recent) - 1, -1, -1):
+                                                if _recent[_i] is False:
+                                                    _recent[_i] = True
+                                                    _flipped = True
+                                                    break
+                                            if not _flipped:
+                                                # No pending False; append True directly
+                                                _recent.append(True)
+                                                if len(_recent) > 10:
+                                                    _recent = _recent[-10:]
+                                            _entry["recent_outcomes"] = _recent
+                                            _ref = _entry.get("reference_count", 0)
+                                            _conf = _entry.get("confirmed_count", 0)
+                                            if _conf > 0 or _ref > 0:
+                                                _entry["effectiveness_score"] = round(
+                                                    _conf / max(_ref, 1), 4
+                                                )
+                                        _doc[_pk] = _entry
+                                        _confirmed_changed = True
+                                if _confirmed_changed:
+                                    _proj_locked.design_doc = _doc
+                                    flag_modified(_proj_locked, "design_doc")
+                                    session.add(_proj_locked)
                     except Exception as _pce:
                         logger.warning(
                             f"[PLAYBOOK] Failed to increment confirmed_count for task {_task_id_str}: {_pce}"

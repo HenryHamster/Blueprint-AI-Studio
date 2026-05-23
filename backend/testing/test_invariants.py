@@ -1772,10 +1772,15 @@ class TestDesignDocLockInvariant:
         app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
 
         # Prefer rg for speed; fall back to pure-Python walk when not installed.
+        # rg pattern avoids lookaheads (Rust regex crate does not support them):
+        # ([^=]|$) excludes == comparisons without requiring PCRE2.
+        # Python re pattern uses the equivalent negative-lookahead form.
+        rg_pattern = r"\.design_doc\s*=([^=]|$)"
+        re_pattern = re.compile(r"\.design_doc\s*=(?!=)")
         matched_files: set[str] = set()
         try:
             result = subprocess.run(
-                ["rg", "--files-with-matches", r"project\.design_doc\s*=", app_dir],
+                ["rg", "--files-with-matches", rg_pattern, app_dir],
                 capture_output=True,
                 text=True,
             )
@@ -1787,12 +1792,11 @@ class TestDesignDocLockInvariant:
                     matched_files.add(os.path.relpath(line, app_dir))
         except FileNotFoundError:
             # rg not on PATH — scan with Python re
-            pattern = re.compile(r"project\.design_doc\s*=")
             for py_file in globmod.glob(
                 os.path.join(app_dir, "**", "*.py"), recursive=True
             ):
                 with open(py_file) as fh:
-                    if pattern.search(fh.read()):
+                    if re_pattern.search(fh.read()):
                         matched_files.add(os.path.relpath(py_file, app_dir))
 
         # Files allowlisted because they hold a project row lock at the call site
@@ -1808,13 +1812,13 @@ class TestDesignDocLockInvariant:
             "main.py",
             "notification_dispatch.py",
             "playbook_learning.py",
-            "research_completion.py",
             "research_direction_state.py",
             "task_completion.py",
             os.path.join("routers", "admin_notifications.py"),
             os.path.join("routers", "admin_onboard.py"),
             os.path.join("routers", "admin_project_config.py"),
             os.path.join("routers", "admin_projects.py"),
+            os.path.join("routers", "agent.py"),  # all writes under project_lock
             os.path.join("routers", "agent_status.py"),
         }
 
@@ -1823,6 +1827,96 @@ class TestDesignDocLockInvariant:
             "New direct project.design_doc = assignments found outside the allowlist:\n"
             + "".join(f"  {f}\n" for f in sorted(unlocked))
             + "\nRoute new design_doc writes through with_design_doc_locked() "
+            "(task_locking.py) or add the file to ALLOWLISTED_FILES in "
+            "testing/test_invariants.py if it already holds a project row lock."
+        )
+
+
+# ── Directions Lock Invariant ─────────────────────────────────────────────────
+
+
+class TestDirectionsLockInvariant:
+    """Tripwire: every project.directions assignment outside the canonical
+    helper (with_directions_locked in task_locking.py) must be explicitly
+    allowlisted. New files not in the allowlist will fail this test.
+
+    Unlike a literal ``project.directions =`` match, the pattern here is
+    variable-name-agnostic — it matches ``<anything>.directions =`` so a writer
+    can't evade the tripwire by aliasing the row to ``proj`` / ``p`` / etc.
+
+    To migrate a site: route it through with_directions_locked() (or hold a
+    project row lock — lock_project_or_429 / project_lock — and re-read the
+    array inside the lock) and remove the file from ALLOWLISTED_FILES when no
+    direct assignments remain.
+    """
+
+    def test_no_new_unlocked_directions_writes(self):
+        import glob as globmod
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+
+        # Variable-name-agnostic: match ``<receiver>.directions =`` for any
+        # receiver, excluding the ``==`` comparison operator. ``\.directions``
+        # requires a dotted attribute so bare local ``directions =`` is ignored.
+        rg_pattern = r"\.directions\s*=([^=]|$)"
+        re_pattern = re.compile(r"\.directions\s*=(?!=)")
+
+        matched_files: set[str] = set()
+        try:
+            result = subprocess.run(
+                ["rg", "--files-with-matches", rg_pattern, app_dir],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 2:
+                pytest.skip(f"rg error: {result.stderr.strip()}")
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line:
+                    matched_files.add(os.path.relpath(line, app_dir))
+        except FileNotFoundError:
+            for py_file in globmod.glob(
+                os.path.join(app_dir, "**", "*.py"), recursive=True
+            ):
+                with open(py_file) as fh:
+                    if re_pattern.search(fh.read()):
+                        matched_files.add(os.path.relpath(py_file, app_dir))
+
+        # Files allowlisted because they hold a project row lock at the
+        # directions-write call site (lock_project_or_429 / project_lock /
+        # lock_project_then_task / lock_project_for_strategic_transition) or
+        # contain the canonical helper itself (task_locking.py).
+        #
+        # The autonomous terminal-status writers (task_completion.py,
+        # research_completion.py, research_direction_state.py,
+        # direction_outcomes.py, anomaly_detection.py, rollup_management.py,
+        # direction_lifecycle.py, auto_remediation.py, strategic_completion.py,
+        # main.py) run inside _process_post_commit, which holds a Task row lock
+        # but only acquires the Project lock for strategic task types. Hoisting
+        # the project lock for all task types (canonical Project→Task order) is
+        # the follow-up that lets these route through with_directions_locked;
+        # until then they are allowlisted pending that coordinated migration.
+        ALLOWLISTED_FILES = {
+            "task_locking.py",  # canonical helper — the one intentional assignment
+            "anomaly_detection.py",
+            "auto_remediation.py",
+            "direction_lifecycle.py",
+            "direction_outcomes.py",
+            "main.py",
+            "research_completion.py",
+            "research_direction_state.py",
+            "rollup_management.py",
+            "strategic_completion.py",
+            "task_completion.py",
+            os.path.join("routers", "admin_projects.py"),
+            os.path.join("routers", "directions.py"),
+        }
+
+        unlocked = matched_files - ALLOWLISTED_FILES
+        assert not unlocked, (
+            "New direct <var>.directions = assignments found outside the allowlist:\n"
+            + "".join(f"  {f}\n" for f in sorted(unlocked))
+            + "\nRoute new directions writes through with_directions_locked() "
             "(task_locking.py) or add the file to ALLOWLISTED_FILES in "
             "testing/test_invariants.py if it already holds a project row lock."
         )
