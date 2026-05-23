@@ -24,10 +24,13 @@ from app.sr_blind_spots import (
     _REVIEWER_ORIGINS,
     is_skipped_sr_outcome as _is_skipped_sr_outcome_shared,
 )
+from app.playbook_learning import _categorize_review_issues
 
 logger = logging.getLogger(__name__)
 
 _SR_CODE_CHANGE_TYPES = {"create", "fix", "refactor", "migrate"}
+
+_SR_SEVERITY_WEIGHTS: Dict[str, int] = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
 
 # Alias preserved for the moved helpers; admin_digest keeps its own re-export too.
 _is_skipped_sr_outcome = _is_skipped_sr_outcome_shared
@@ -484,6 +487,173 @@ def _compute_edges_considered_metrics(
         "tasks_with_reviewer_edges_rate": round(n_with_reviewer / sample_size, 3),
         "reviewer_caught_count": reviewer_caught,
         "reviewer_caught_rate": round(reviewer_caught / sample_size, 3),
+    }
+
+
+def compute_sr_prediction_accuracy(
+    tasks_with_both: List[Task],
+) -> "Dict[str, Any] | None":
+    """Compute self-review prediction accuracy from tasks that have both
+    _self_review_outcome.check_results and _first_attempt_rejection_categories.
+    Returns None when sample size < 5.
+    """
+    if len(tasks_with_both) < 5:
+        return None
+    total_human = total_overlap = total_missed = total_false = total_sr_failed = 0
+    w_caught = w_missed = 0.0
+    self_flagged_task_count = 0
+    tasks_with_rejections = 0
+    for t in tasks_with_both:
+        ctx = t.context or {}
+        check_results = ctx.get("_self_review_outcome", {}).get("check_results") or {}
+        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+        sr_failed = _author_sr_failed_categories(check_results)
+        total_human += len(human_cats)
+        total_overlap += len(human_cats & sr_failed)
+        total_missed += len(human_cats - sr_failed)
+        total_false += len(sr_failed - human_cats)
+        total_sr_failed += len(sr_failed)
+        if human_cats:
+            tasks_with_rejections += 1
+            if human_cats & sr_failed:
+                self_flagged_task_count += 1
+        rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
+        cat_weights: Dict[str, int] = {}
+        cached_entry = ctx.get("_first_attempt_categorized_issues")
+        cached_buckets = (cached_entry or {}).get("buckets") if cached_entry else None
+        if cached_buckets:
+            for cat, issues in _categorize_review_issues(
+                rev_hist, cached=cached_buckets
+            ).items():
+                cat_weights[cat] = max(
+                    _SR_SEVERITY_WEIGHTS.get(i["severity"], 1) for i in issues
+                )
+        elif rev_hist:
+            for cat, issues in _categorize_review_issues(rev_hist).items():
+                cat_weights[cat] = max(
+                    _SR_SEVERITY_WEIGHTS.get(i["severity"], 1) for i in issues
+                )
+        for cat in human_cats:
+            w = cat_weights.get(cat, 1)
+            if cat in sr_failed:
+                w_caught += w
+            else:
+                w_missed += w
+    total_w = w_caught + w_missed
+    return {
+        "prediction_hit_rate": round(total_overlap / total_human, 3)
+        if total_human > 0
+        else None,
+        "miss_rate": round(total_missed / total_human, 3) if total_human > 0 else None,
+        "false_alarm_rate": round(total_false / total_sr_failed, 3)
+        if total_sr_failed > 0
+        else None,
+        "weighted_hit_rate": round(w_caught / total_w, 3) if total_w > 0 else None,
+        "weighted_miss_rate": round(w_missed / total_w, 3) if total_w > 0 else None,
+        "sample_size": len(tasks_with_both),
+        # Tasks where SR already flagged the issue but the agent submitted without fixing it.
+        "self_flagged_shipped_unfixed_task_count": self_flagged_task_count,
+        "self_flagged_shipped_unfixed_task_rate": round(
+            self_flagged_task_count / tasks_with_rejections, 3
+        )
+        if tasks_with_rejections > 0
+        else None,
+    }
+
+
+def compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]:
+    """Compute self-review effectiveness, prediction accuracy, and review accuracy
+    from a list of terminal tasks. Returns dict with three keys, each None when
+    sample sizes are too small.
+    """
+
+    def _fa_rate(tasks):
+        measured = [t for t in tasks if "_first_attempt_succeeded" in (t.context or {})]
+        if not measured:
+            return None
+        succ = sum(1 for t in measured if t.context["_first_attempt_succeeded"])
+        return round(succ / len(measured), 2)
+
+    tasks_with_sr = [
+        t for t in terminal_tasks if "_self_review_outcome" in (t.context or {})
+    ]
+    tasks_without_sr = [
+        t for t in terminal_tasks if "_self_review_outcome" not in (t.context or {})
+    ]
+    sr_clean = [
+        t
+        for t in tasks_with_sr
+        if not (t.context or {})
+        .get("_self_review_outcome", {})
+        .get("fixes_applied", False)
+    ]
+    sr_fixed = [
+        t
+        for t in tasks_with_sr
+        if (t.context or {}).get("_self_review_outcome", {}).get("fixes_applied", False)
+    ]
+
+    self_review_effectiveness: Dict[str, Any] | None = None
+    if len(tasks_with_sr) >= 3:
+        self_review_effectiveness = {
+            "with_self_review_approval_rate": _fa_rate(tasks_with_sr),
+            "without_self_review_approval_rate": _fa_rate(tasks_without_sr),
+            "clean_verdict_approval_rate": _fa_rate(sr_clean),
+            "fixed_verdict_approval_rate": _fa_rate(sr_fixed),
+            "sample_size": len(tasks_with_sr),
+            "sr_clean_count": len(sr_clean),
+            "sr_fixed_count": len(sr_fixed),
+        }
+
+    review_tasks = [
+        t
+        for t in terminal_tasks
+        if (t.first_payload or {}).get("type") == "review"
+        and (t.context or {}).get("blueprint_review_verdict") is not None
+    ]
+    review_accuracy: Dict[str, Any] | None = None
+    if len(review_tasks) >= 5:
+        total = len(review_tasks)
+        overrides = sum(
+            1 for t in review_tasks if (t.context or {}).get("user_overrode_review")
+        )
+        dismissals = sum(
+            1 for t in review_tasks if (t.context or {}).get("review_dismissed")
+        )
+        misses = sum(
+            1 for t in review_tasks if (t.context or {}).get("user_caught_issues")
+        )
+        approvals = sum(
+            1
+            for t in review_tasks
+            if (t.context or {}).get("blueprint_review_verdict") == "APPROVE"
+        )
+        review_accuracy = {
+            "total_reviews": total,
+            "overrides": overrides,
+            "dismissals": dismissals,
+            "misses": misses,
+            "total_approvals": approvals,
+            "precision": round(1 - (overrides + dismissals) / total, 2),
+            "recall": round(1 - misses / approvals, 2) if approvals > 0 else None,
+        }
+
+    tasks_with_both = [
+        t
+        for t in terminal_tasks
+        if (t.context or {}).get("_self_review_outcome", {}).get("check_results")
+        and "_first_attempt_rejection_categories" in (t.context or {})
+    ]
+    self_review_prediction_accuracy = compute_sr_prediction_accuracy(tasks_with_both)
+    fresh_reviewer_effectiveness = _compute_fresh_reviewer_effectiveness(terminal_tasks)
+    edges_considered_metrics = _compute_edges_considered_metrics(terminal_tasks)
+
+    return {
+        "self_review_effectiveness": self_review_effectiveness,
+        "self_review_prediction_accuracy": self_review_prediction_accuracy,
+        "review_accuracy": review_accuracy,
+        "fresh_reviewer_effectiveness": fresh_reviewer_effectiveness,
+        "edges_considered_metrics": edges_considered_metrics,
     }
 
 
@@ -1283,6 +1453,58 @@ def compute_failure_grouping(
         "analysis_overflow_summary": analysis_overflow_summary,
         "provision_waste_by_direction": provision_waste_by_direction,
     }
+
+
+def compute_recurring_error_clusters(
+    *,
+    failed_tasks: List[Task],
+    error_log_map: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Group failed tasks by normalized error fingerprint.
+
+    Pure function — no database calls. Returns up to 5 clusters with count >= 2,
+    sorted by count descending. Each cluster aggregates direction_ids and
+    task_types across the constituent failed tasks.
+    """
+    from app.anomaly_detection import _error_fingerprint
+
+    _clusters: Dict[str, Dict[str, Any]] = {}
+    for _t in failed_tasks:
+        _tid = str(_t.id)
+        _msg = error_log_map.get(_tid) or (_t.latest_status_message or "")
+        if not _msg:
+            continue
+        _fp = _error_fingerprint(_msg)
+        _entry = _clusters.get(_fp)
+        if _entry is None:
+            _entry = {
+                "fingerprint": _fp,
+                "count": 0,
+                "error_snippet": _msg[:200],
+                "direction_ids": set(),
+                "task_types": set(),
+                "first_task_id": _tid,
+            }
+            _clusters[_fp] = _entry
+        _entry["count"] += 1
+        _dir_id = (_t.context or {}).get("direction_id")
+        if _dir_id:
+            _entry["direction_ids"].add(str(_dir_id))
+        _ttype = (_t.first_payload or {}).get("type")
+        if _ttype:
+            _entry["task_types"].add(str(_ttype))
+    return [
+        {
+            "fingerprint": c["fingerprint"],
+            "count": c["count"],
+            "error_snippet": c["error_snippet"],
+            "direction_ids": sorted(c["direction_ids"]),
+            "task_types": sorted(c["task_types"]),
+            "first_task_id": c["first_task_id"],
+        }
+        for c in sorted(_clusters.values(), key=lambda x: x["count"], reverse=True)
+        if c["count"] >= 2
+    ][:5]
 
 
 def compute_digest_trend_history(

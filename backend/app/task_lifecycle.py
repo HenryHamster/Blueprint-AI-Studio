@@ -193,10 +193,16 @@ def _get_approval_gate_file_lists(project: Project) -> tuple[set, set]:
     """
     config = (project.approval_gate_config or {}) if project else {}
 
-    return (
-        set(config.get("infra_files", [])),
-        set(config.get("critical_files", [])),
-    )
+    # Infer the missing half when only one of infra/critical is configured.
+    # If only infra_files is set, any infra change must require approval (critical = infra).
+    # If only critical_files is set, infra must include all critical files (infra = critical).
+    infra = set(config.get("infra_files", []))
+    critical = set(config.get("critical_files", []))
+    if infra and not critical:
+        critical = set(infra)
+    if critical and not infra:
+        infra = set(critical)
+    return infra, critical
 
 
 async def _requeue_parent_task(parent: Task, session: AsyncSession):

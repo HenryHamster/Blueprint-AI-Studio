@@ -9035,7 +9035,7 @@ async def test_cache_first_attempt_classification_writes_buckets_and_method():
 
 def test_compute_sr_prediction_accuracy_uses_cached_categories():
     """When _first_attempt_categorized_issues is present, _categorize_review_issues is not called."""
-    from app.routers.admin_digest import _compute_sr_prediction_accuracy
+    from app.digest_metrics import compute_sr_prediction_accuracy
     from app.playbook_learning import _categorize_review_issues
     from app.models import Task, TaskStatus
     import uuid
@@ -9083,8 +9083,8 @@ def test_compute_sr_prediction_accuracy_uses_cached_categories():
             call_count["n"] += 1
         return original(review_history, cached=cached)
 
-    with patch("app.routers.admin_digest._categorize_review_issues", side_effect=spy):
-        result = _compute_sr_prediction_accuracy(tasks)
+    with patch("app.digest_metrics._categorize_review_issues", side_effect=spy):
+        result = compute_sr_prediction_accuracy(tasks)
 
     assert result is not None
     # The keyword scan should NOT have been called (cached path was taken for all 5 tasks).

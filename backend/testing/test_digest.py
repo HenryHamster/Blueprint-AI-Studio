@@ -25,8 +25,11 @@ from app.digest_metrics import (
     compute_digest_cost_economics,
     compute_digest_trend_history,
     compute_failure_grouping,
+    compute_recurring_error_clusters,
     compute_remediation_funnel,
+    compute_review_quality_metrics,
     compute_scope_mismatch_summary,
+    compute_sr_prediction_accuracy,
 )
 from app.sr_blind_spots import aggregate_sr_reviewer_disagreements
 from testing.factories import make_project, make_task, make_membership, _utcnow
@@ -16855,6 +16858,111 @@ def test_compute_failure_grouping_task_entry_fields():
 
 
 # ---------------------------------------------------------------------------
+# Unit tests for compute_recurring_error_clusters (pure function, no DB required)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_recurring_error_clusters_empty():
+    """Empty failed-task list returns an empty cluster list."""
+    assert compute_recurring_error_clusters(failed_tasks=[], error_log_map={}) == []
+
+
+def test_compute_recurring_error_clusters_excludes_singletons():
+    """Clusters with count < 2 are excluded."""
+    tasks = [
+        _make_failed_task(latest_status_message="TypeError: foo is undefined"),
+        _make_failed_task(latest_status_message="Rate limit exceeded"),
+        _make_failed_task(latest_status_message="SyntaxError: unexpected token"),
+    ]
+    result = compute_recurring_error_clusters(
+        failed_tasks=tasks,
+        error_log_map={},
+    )
+    assert result == []
+
+
+def test_compute_recurring_error_clusters_groups_by_fingerprint():
+    """Failures sharing a normalized fingerprint group into one cluster, aggregating directions/task_types."""
+    tasks = [
+        _make_failed_task(
+            payloads=[{"type": "create"}],
+            context={"direction_id": "dir-a"},
+            latest_status_message="Merge conflict on PR #1234",
+        ),
+        _make_failed_task(
+            payloads=[{"type": "fix"}],
+            context={"direction_id": "dir-a"},
+            latest_status_message="Merge conflict on PR #5678",
+        ),
+    ]
+    result = compute_recurring_error_clusters(
+        failed_tasks=tasks,
+        error_log_map={},
+    )
+    assert len(result) == 1
+    cluster = result[0]
+    assert cluster["count"] == 2
+    assert len(cluster["fingerprint"]) == 12
+    assert "Merge conflict" in cluster["error_snippet"]
+    assert cluster["direction_ids"] == ["dir-a"]
+    assert sorted(cluster["task_types"]) == ["create", "fix"]
+    assert cluster["first_task_id"] == str(tasks[0].id)
+
+
+def test_compute_recurring_error_clusters_error_log_map_overrides_status_message():
+    """When error_log_map has an entry for the task id, it takes precedence over latest_status_message."""
+    task_a = _make_failed_task(latest_status_message="stale")
+    task_b = _make_failed_task(latest_status_message="stale")
+    result = compute_recurring_error_clusters(
+        failed_tasks=[task_a, task_b],
+        error_log_map={
+            str(task_a.id): "Merge conflict on PR #1",
+            str(task_b.id): "Merge conflict on PR #2",
+        },
+    )
+    assert len(result) == 1
+    assert "Merge conflict" in result[0]["error_snippet"]
+
+
+def test_compute_recurring_error_clusters_sorted_by_count_descending_and_capped():
+    """Returned clusters are sorted by count descending and capped at 5."""
+    tasks = []
+    # Build 6 distinct clusters with counts 7,6,5,4,3,2 — all should make it past the >=2 gate,
+    # but only the top 5 should be returned (sorted desc).
+    for cluster_idx, count in enumerate([7, 6, 5, 4, 3, 2]):
+        for _ in range(count):
+            tasks.append(
+                _make_failed_task(
+                    latest_status_message=f"Cluster {cluster_idx} unique-marker error",
+                )
+            )
+    result = compute_recurring_error_clusters(
+        failed_tasks=tasks,
+        error_log_map={},
+    )
+    assert len(result) == 5
+    counts = [c["count"] for c in result]
+    assert counts == sorted(counts, reverse=True)
+    assert counts == [7, 6, 5, 4, 3]
+
+
+def test_compute_recurring_error_clusters_skips_tasks_with_no_message():
+    """Tasks with neither error_log_map entry nor latest_status_message are skipped."""
+    tasks = [
+        _make_failed_task(latest_status_message=""),
+        _make_failed_task(latest_status_message=""),
+        _make_failed_task(latest_status_message="Merge conflict on PR #1"),
+        _make_failed_task(latest_status_message="Merge conflict on PR #2"),
+    ]
+    result = compute_recurring_error_clusters(
+        failed_tasks=tasks,
+        error_log_map={},
+    )
+    assert len(result) == 1
+    assert result[0]["count"] == 2
+
+
+# ---------------------------------------------------------------------------
 # Unit tests for compute_digest_trend_history (pure function, no DB required)
 # ---------------------------------------------------------------------------
 
@@ -17286,3 +17394,154 @@ def test_compute_scope_mismatch_summary_top_directions_capped_at_three():
     )
     assert result is not None
     assert len(result["top_directions"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for compute_sr_prediction_accuracy (pure function, no DB required)
+# ---------------------------------------------------------------------------
+
+
+def _make_sr_task(check_results=None, rejection_categories=None, **kwargs):
+    """Minimal terminal Task carrying _self_review_outcome.check_results and
+    _first_attempt_rejection_categories for SR-prediction unit tests."""
+    ctx = {
+        "_self_review_outcome": {"check_results": check_results or {}},
+        "_first_attempt_rejection_categories": rejection_categories or {},
+    }
+    ctx.update(kwargs.pop("context", {}))
+    return make_task(status=TaskStatus.COMPLETED, context=ctx, **kwargs)
+
+
+def test_compute_sr_prediction_accuracy_under_sample_size_returns_none():
+    """Sample size <5 short-circuits to None regardless of content."""
+    tasks = [
+        _make_sr_task(
+            check_results={"correctness": {"passed": False}},
+            rejection_categories={"correctness": 1},
+        )
+        for _ in range(4)
+    ]
+    assert compute_sr_prediction_accuracy(tasks) is None
+
+
+def test_compute_sr_prediction_accuracy_perfect_match():
+    """Every SR-failed category matches human rejection → hit rate 1.0, miss 0.0."""
+    tasks = [
+        _make_sr_task(
+            check_results={"correctness": {"passed": False}},
+            rejection_categories={"correctness": 1},
+        )
+        for _ in range(5)
+    ]
+    result = compute_sr_prediction_accuracy(tasks)
+    assert result is not None
+    assert result["prediction_hit_rate"] == 1.0
+    assert result["miss_rate"] == 0.0
+    assert result["false_alarm_rate"] == 0.0
+    assert result["sample_size"] == 5
+    # SR flagged AND human rejected => "self_flagged shipped unfixed"
+    assert result["self_flagged_shipped_unfixed_task_count"] == 5
+    assert result["self_flagged_shipped_unfixed_task_rate"] == 1.0
+
+
+def test_compute_sr_prediction_accuracy_all_miss():
+    """SR passed everything but humans rejected → miss_rate 1.0, hit_rate 0.0."""
+    tasks = [
+        _make_sr_task(
+            check_results={"correctness": {"passed": True}},
+            rejection_categories={"correctness": 1},
+        )
+        for _ in range(5)
+    ]
+    result = compute_sr_prediction_accuracy(tasks)
+    assert result is not None
+    assert result["prediction_hit_rate"] == 0.0
+    assert result["miss_rate"] == 1.0
+    # No SR failures recorded so false_alarm_rate is None (divide-by-zero guard).
+    assert result["false_alarm_rate"] is None
+    assert result["self_flagged_shipped_unfixed_task_count"] == 0
+    assert result["self_flagged_shipped_unfixed_task_rate"] == 0.0
+
+
+def test_compute_sr_prediction_accuracy_reviewer_origin_excluded():
+    """Reviewer-stamped check_results entries do not count as author SR failures."""
+    tasks = [
+        _make_sr_task(
+            check_results={
+                "correctness": {
+                    "passed": False,
+                    "origin": "reviewer_recovery_after_incomplete_sr",
+                }
+            },
+            rejection_categories={"correctness": 1},
+        )
+        for _ in range(5)
+    ]
+    result = compute_sr_prediction_accuracy(tasks)
+    assert result is not None
+    # The reviewer-origin failure should NOT count as an author catch.
+    assert result["prediction_hit_rate"] == 0.0
+    assert result["miss_rate"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for compute_review_quality_metrics
+# ---------------------------------------------------------------------------
+
+
+def test_compute_review_quality_metrics_empty_returns_nones():
+    """Empty input → every metric is None / empty-ish per sample-size guards."""
+    result = compute_review_quality_metrics([])
+    assert result["self_review_effectiveness"] is None
+    assert result["self_review_prediction_accuracy"] is None
+    assert result["review_accuracy"] is None
+    # _compute_fresh_reviewer_effectiveness always returns a dict; we just check shape.
+    assert isinstance(result["fresh_reviewer_effectiveness"], dict)
+
+
+def test_compute_review_quality_metrics_self_review_effectiveness_shape():
+    """≥3 tasks with _self_review_outcome populates self_review_effectiveness."""
+    with_sr_clean = [
+        make_task(
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {"fixes_applied": False},
+                "_first_attempt_succeeded": True,
+            },
+        )
+        for _ in range(3)
+    ]
+    result = compute_review_quality_metrics(with_sr_clean)
+    eff = result["self_review_effectiveness"]
+    assert eff is not None
+    assert eff["sample_size"] == 3
+    assert eff["sr_clean_count"] == 3
+    assert eff["sr_fixed_count"] == 0
+    assert eff["with_self_review_approval_rate"] == 1.0
+    assert eff["clean_verdict_approval_rate"] == 1.0
+
+
+def test_compute_review_quality_metrics_review_accuracy_shape():
+    """≥5 review tasks with a verdict populates review_accuracy."""
+    review_tasks = []
+    for _ in range(5):
+        review_tasks.append(
+            make_task(
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "review"}],
+                context={
+                    "blueprint_review_verdict": "APPROVE",
+                    "user_caught_issues": False,
+                    "user_overrode_review": False,
+                    "review_dismissed": False,
+                },
+            )
+        )
+    result = compute_review_quality_metrics(review_tasks)
+    acc = result["review_accuracy"]
+    assert acc is not None
+    assert acc["total_reviews"] == 5
+    assert acc["total_approvals"] == 5
+    assert acc["overrides"] == 0
+    assert acc["precision"] == 1.0
+    assert acc["recall"] == 1.0

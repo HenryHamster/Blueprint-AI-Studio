@@ -128,8 +128,8 @@ async def test_get_approval_gate_file_lists_custom_config_overrides_self_repo():
 
 
 @pytest.mark.asyncio
-async def test_get_approval_gate_file_lists_partial_config():
-    """Partial config (only infra_files) still triggers custom mode."""
+async def test_get_approval_gate_file_lists_partial_config_infra_only():
+    """Partial config (only infra_files): critical_files defaults to infra_files."""
     project = Project(
         name="Partial Config",
         user_id="u1",
@@ -141,9 +141,28 @@ async def test_get_approval_gate_file_lists_partial_config():
 
     infra_files, critical_files = _get_approval_gate_file_lists(project)
 
-    # Should use custom mode (non-empty config found)
+    # critical_files inferred from infra_files so any infra touch requires approval
     assert infra_files == {"src/main.py"}
-    assert critical_files == set()
+    assert critical_files == {"src/main.py"}
+
+
+@pytest.mark.asyncio
+async def test_get_approval_gate_file_lists_partial_config_critical_only():
+    """Partial config (only critical_files): infra_files defaults to critical_files."""
+    project = Project(
+        name="Partial Config Critical Only",
+        user_id="u1",
+        is_self_repo=False,
+        approval_gate_config={
+            "critical_files": ["src/auth.py"],
+        },
+    )
+
+    infra_files, critical_files = _get_approval_gate_file_lists(project)
+
+    # infra_files inferred from critical_files
+    assert critical_files == {"src/auth.py"}
+    assert infra_files == {"src/auth.py"}
 
 
 @pytest.mark.asyncio
@@ -233,3 +252,43 @@ async def test_approval_gate_empty_config_returns_empty(approval_gate_db):
 
     assert len(infra_files) == 0
     assert len(critical_files) == 0
+
+
+@pytest.mark.asyncio
+async def test_partial_config_infra_only_sets_requires_approval_on_critical_touch(
+    approval_gate_db,
+):
+    """Integration: partial config (infra_files only) still gates merge when an infra
+    file is touched, because critical_files is inferred from infra_files.
+
+    Simulates the _process_post_commit → review-merge check:
+    1. Project config has only infra_files (no explicit critical_files).
+    2. A PR touches a file in infra_files.
+    3. Because critical_files == infra_files, touched_critical is non-empty.
+    4. The merge gate would set requires_approval=True.
+    """
+    project = Project(
+        name="Infra Only Config",
+        user_id="u1",
+        is_self_repo=False,
+        approval_gate_config={"infra_files": ["src/main.py", "src/db.py"]},
+    )
+    approval_gate_db.add(project)
+    await approval_gate_db.commit()
+    await approval_gate_db.refresh(project)
+
+    infra_files, critical_files = _get_approval_gate_file_lists(project)
+
+    # With partial config, critical_files must equal infra_files
+    assert critical_files == infra_files == {"src/main.py", "src/db.py"}
+
+    # Simulate what _process_post_commit does: derive touched_infra and touched_critical
+    pr_filenames = ["src/main.py", "src/utils.py"]  # one infra file touched
+    touched_infra = [f for f in pr_filenames if f in infra_files]
+    touched_critical = [f for f in touched_infra if f in critical_files]
+
+    # Verify that the merge gate would fire (non-empty touched_critical → requires_approval=True)
+    assert touched_infra == ["src/main.py"]
+    assert touched_critical == ["src/main.py"], (
+        "partial config must not silently disable the critical-file merge gate"
+    )
