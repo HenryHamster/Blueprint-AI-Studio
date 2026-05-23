@@ -1810,7 +1810,6 @@ class TestDesignDocLockInvariant:
             "playbook_learning.py",
             "research_completion.py",
             "research_direction_state.py",
-            "shared_state.py",
             "task_completion.py",
             os.path.join("routers", "admin_notifications.py"),
             os.path.join("routers", "admin_onboard.py"),

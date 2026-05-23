@@ -847,27 +847,20 @@ async def with_design_doc_locked(
 ) -> None:
     """Read-modify-write project.design_doc under a project row lock.
 
-    Acquires SELECT FOR UPDATE (skip_locked=False so background callers
-    wait rather than silently skip), calls mutate_fn(doc) with a copy of
-    the current doc dict, then writes the result back. Caller is responsible
-    for committing the session.
+    Thin wrapper over the canonical ``task_locking.with_design_doc_locked``
+    that additionally coerces ``project_id`` (which background callers pass
+    as a str) to ``UUID`` and silently no-ops on malformed input. The
+    lock/mutate/flag_modified logic lives in exactly one place — the
+    canonical helper — so the two never drift apart.
     """
-    from app.task_locking import project_lock
-    from sqlalchemy.orm.attributes import flag_modified
+    from app.task_locking import with_design_doc_locked as _canonical
     import uuid as _uuid
 
     try:
         pid = _uuid.UUID(str(project_id))
     except (TypeError, ValueError):
         return
-    async with project_lock(session, pid, skip_locked=False) as project:
-        if project is None:
-            return
-        doc = dict(project.design_doc or {})
-        mutate_fn(doc)
-        project.design_doc = doc
-        flag_modified(project, "design_doc")
-        session.add(project)
+    await _canonical(session, pid, mutate_fn)
 
 
 async def persist_anomaly_snapshot(
