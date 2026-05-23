@@ -181,7 +181,9 @@ async def lock_project_or_429(
     result = await session.execute(
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=True)
+        # FOR NO KEY UPDATE — see project_lock: serializes project-row writers
+        # without blocking FK child-row inserts (FOR KEY SHARE). PK never changes.
+        .with_for_update(skip_locked=True, key_share=True)
     )
     project = result.scalars().first()
     if project is not None:
@@ -272,7 +274,16 @@ async def project_lock(
     stmt = (
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=skip_locked)
+        # FOR NO KEY UPDATE (key_share=True), not FOR UPDATE: still serializes
+        # concurrent project-row writers (it conflicts with itself and FOR
+        # UPDATE), but does NOT conflict with the FOR KEY SHARE lock that every
+        # insert of a project-child row (ProjectMessage / Task / Alert ...) takes
+        # on the parent for its FK. Plain FOR UPDATE deadlocks across connections
+        # when a lock holder (or a chain it awaits) inserts such a child row — the
+        # release-qualifier infra-failure path hit exactly this (operator-message
+        # INSERT blocked on a held project lock). The project PK is never updated,
+        # so FOR NO KEY UPDATE is the correct, strictly-safer lock here.
+        .with_for_update(skip_locked=skip_locked, key_share=True)
     )
     try:
         result = await asyncio.wait_for(session.execute(stmt), timeout=timeout)
@@ -335,7 +346,9 @@ async def lock_project_then_task(
     project_stmt = (
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=skip_locked)
+        # FOR NO KEY UPDATE — see project_lock: serializes project-row writers
+        # without blocking FK child-row inserts (FOR KEY SHARE). PK never changes.
+        .with_for_update(skip_locked=skip_locked, key_share=True)
     )
     try:
         project_result = await asyncio.wait_for(
@@ -416,7 +429,9 @@ async def lock_project_for_strategic_transition(
         result = await session.execute(
             select(Project)
             .where(Project.id == project_id)
-            .with_for_update(skip_locked=True)
+            # FOR NO KEY UPDATE — see project_lock: serializes project-row writers
+            # without blocking FK child-row inserts (FOR KEY SHARE). PK never changes.
+            .with_for_update(skip_locked=True, key_share=True)
         )
         project = result.scalars().first()
         if project is not None:

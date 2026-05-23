@@ -407,7 +407,7 @@ async def finalize_pending_playbook_entries(
     _proj_row = await session.execute(
         select(Project)
         .where(Project.id == task.project_id)
-        .with_for_update(skip_locked=False)
+        .with_for_update(skip_locked=False, key_share=True)
     )
     project = _proj_row.scalar_one_or_none()
     if project is None or not project.design_doc:
@@ -1085,7 +1085,7 @@ async def _maybe_auto_playbook(
     _proj_row = await session.execute(
         select(Project)
         .where(Project.id == task.project_id)
-        .with_for_update(skip_locked=False)
+        .with_for_update(skip_locked=False, key_share=True)
     )
     project = _proj_row.scalar_one_or_none()
     if not project:
@@ -1615,7 +1615,7 @@ async def capture_success_pattern(
     _proj_row = await session.execute(
         select(Project)
         .where(Project.id == task.project_id)
-        .with_for_update(skip_locked=False)
+        .with_for_update(skip_locked=False, key_share=True)
     )
     project = _proj_row.scalar_one_or_none()
     if not project:
@@ -2054,7 +2054,7 @@ async def extract_review_feedback_to_playbook(
     _proj_row = await session.execute(
         select(Project)
         .where(Project.id == task.project_id)
-        .with_for_update(skip_locked=False)
+        .with_for_update(skip_locked=False, key_share=True)
     )
     project = _proj_row.scalar_one_or_none()
     if not project:
@@ -2396,7 +2396,7 @@ async def compute_review_effectiveness(
     _proj_row = await session.execute(
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=False)
+        .with_for_update(skip_locked=False, key_share=True)
     )
     project = _proj_row.scalar_one_or_none()
     if not project:
@@ -3926,7 +3926,7 @@ async def compute_sr_catch_rate_trends(
         _proj_row = await session.execute(
             select(Project)
             .where(Project.id == project_id)
-            .with_for_update(skip_locked=False)
+            .with_for_update(skip_locked=False, key_share=True)
         )
         _project = _proj_row.scalar_one_or_none()
         if _project is not None:
@@ -4140,7 +4140,7 @@ async def compute_sr_catch_rate_trends(
     _proj_row = await session.execute(
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=False)
+        .with_for_update(skip_locked=False, key_share=True)
     )
     project = _proj_row.scalar_one_or_none()
     if not project:
@@ -5518,7 +5518,7 @@ async def check_fix_loop_divergence_regression(
     _proj_row = await session.execute(
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=False)
+        .with_for_update(skip_locked=False, key_share=True)
     )
     project = _proj_row.scalar_one_or_none()
     if not project:
@@ -5879,7 +5879,7 @@ async def compute_fresh_reviewer_trend(
     _proj_row = await session.execute(
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=False)
+        .with_for_update(skip_locked=False, key_share=True)
     )
     project = _proj_row.scalar_one_or_none()
     if not project:
@@ -5968,7 +5968,7 @@ async def compute_sr_reviewer_disagreements(
     _proj_row = await session.execute(
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=False)
+        .with_for_update(skip_locked=False, key_share=True)
     )
     project = _proj_row.scalar_one_or_none()
     if project:
@@ -6131,7 +6131,7 @@ async def compute_edges_trend(
     _proj_row = await session.execute(
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=False)
+        .with_for_update(skip_locked=False, key_share=True)
     )
     project = _proj_row.scalar_one_or_none()
     if not project:
@@ -6373,7 +6373,7 @@ async def compute_sr_regression_risk_test_signal_trends(
     _proj_row = await session.execute(
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=False)
+        .with_for_update(skip_locked=False, key_share=True)
     )
     project = _proj_row.scalar_one_or_none()
     if not project:
@@ -6540,7 +6540,7 @@ async def compute_sr_false_attestation_trends(
     _proj_row = await session.execute(
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=False)
+        .with_for_update(skip_locked=False, key_share=True)
     )
     project = _proj_row.scalar_one_or_none()
     if not project:
