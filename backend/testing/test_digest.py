@@ -10395,6 +10395,83 @@ async def test_digest_sr_trends_full_fidelity_passthrough(
 
 
 @pytest.mark.asyncio
+async def test_digest_sr_trends_overall_verdict_passthrough(
+    client: AsyncClient, db_session
+):
+    """Digest explicitly promotes overall_trend_verdict/significant/data_sufficient."""
+    project = make_project()
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": "2026-05-01T00:00:00",
+            "categories": {},
+            "by_task_type": {},
+            "overall_hit_rate": 0.72,
+            "previous_overall_hit_rate": 0.65,
+            "overall_trend_verdict": "improving",
+            "overall_trend_significant": True,
+            "overall_trend_data_sufficient": True,
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    trends = response.json().get("self_review_prediction_accuracy_trends")
+    assert trends is not None
+    assert trends["overall_trend_verdict"] == "improving"
+    assert trends["overall_trend_significant"] is True
+    assert trends["overall_trend_data_sufficient"] is True
+
+    # Stable/not-significant case
+    project2 = make_project()
+    project2.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": "2026-05-01T00:00:00",
+            "categories": {},
+            "by_task_type": {},
+            "overall_hit_rate": 0.70,
+            "previous_overall_hit_rate": 0.71,
+            "overall_trend_verdict": "stable",
+            "overall_trend_significant": False,
+            "overall_trend_data_sufficient": True,
+        }
+    }
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project2)
+
+    response2 = await client.get(f"/api/admin/digest?project_id={project2.id}")
+    assert response2.status_code == 200
+    trends2 = response2.json().get("self_review_prediction_accuracy_trends")
+    assert trends2 is not None
+    assert trends2["overall_trend_verdict"] == "stable"
+    assert trends2["overall_trend_significant"] is False
+
+    # Absent (None) case — fields present but null
+    project3 = make_project()
+    project3.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": "2026-05-01T00:00:00",
+            "categories": {},
+            "by_task_type": {},
+        }
+    }
+    db_session.add(project3)
+    await db_session.commit()
+    await db_session.refresh(project3)
+
+    response3 = await client.get(f"/api/admin/digest?project_id={project3.id}")
+    assert response3.status_code == 200
+    trends3 = response3.json().get("self_review_prediction_accuracy_trends")
+    assert trends3 is not None
+    assert trends3["overall_trend_verdict"] is None
+    assert trends3["overall_trend_significant"] is None
+    assert trends3["overall_trend_data_sufficient"] is None
+
+
+@pytest.mark.asyncio
 async def test_digest_sr_trends_co_failure_pairs_passthrough(
     client: AsyncClient, db_session
 ):

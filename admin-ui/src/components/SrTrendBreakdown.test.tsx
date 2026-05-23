@@ -2129,3 +2129,34 @@ describe('SrTrendBreakdown is_stale badge', () => {
     expect(screen.getByTestId('sr-trend-stale-badge').textContent).toContain('[stale]');
   });
 });
+
+describe('SrTrendData overall verdict fields', () => {
+  it('SrTrendData accepts overall_hit_rate and overall_trend_verdict fields', () => {
+    const trends: SrTrendData = {
+      overall_hit_rate: 0.72,
+      previous_overall_hit_rate: 0.68,
+      overall_trend_verdict: 'improving',
+      overall_trend_significant: true,
+      categories: {
+        correctness: { miss_rate: 0.28, trend: 'stable' },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.getByTestId('sr-trend-breakdown')).toBeInTheDocument();
+  });
+
+  it('SrTrendData accepts null overall verdict when data is insufficient', () => {
+    const trends: SrTrendData = {
+      overall_hit_rate: 0.65,
+      previous_overall_hit_rate: null,
+      overall_trend_verdict: null,
+      overall_trend_significant: null,
+      data_sufficient: false,
+      categories: {
+        correctness: { miss_rate: 0.35, trend: 'stable' },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.getByTestId('sr-trend-insufficient-badge')).toBeInTheDocument();
+  });
+});

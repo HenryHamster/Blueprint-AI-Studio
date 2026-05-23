@@ -323,6 +323,12 @@ def _serialize_sr_catch_rate_trends(sr_trends: Dict[str, Any]) -> Dict[str, Any]
         "by_task_type": sr_trends.get("by_task_type") or {},
         "by_fix_iteration": sr_trends.get("by_fix_iteration") or {},
         "is_stale": is_stale,
+        # Significance-gated overall trend fields — computed by compute_sr_catch_rate_trends
+        # using the same two-proportion z-test as per-category trends. Explicitly promoted
+        # here so callers can rely on their presence rather than the setdefault passthrough.
+        "overall_trend_verdict": sr_trends.get("overall_trend_verdict"),
+        "overall_trend_significant": sr_trends.get("overall_trend_significant"),
+        "overall_trend_data_sufficient": sr_trends.get("overall_trend_data_sufficient"),
     }
     for key, value in sr_trends.items():
         serialized.setdefault(key, value)

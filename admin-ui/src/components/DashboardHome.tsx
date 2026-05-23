@@ -312,7 +312,7 @@ interface DigestData {
 }
 
 interface SrFixIterationBucket { hit_rate?: number | null; miss_rate?: number | null; sample_count?: number | null; }
-type SrTrendWithFixIterations = SrTrendData & { by_fix_iteration?: Record<string, SrFixIterationBucket> | null; fix_iteration_breakdown?: Record<string, SrFixIterationBucket> | null; iteration_breakdown?: Record<string, SrFixIterationBucket> | null; overall_hit_rate?: number | null; previous_overall_hit_rate?: number | null; };
+type SrTrendWithFixIterations = SrTrendData & { by_fix_iteration?: Record<string, SrFixIterationBucket> | null; fix_iteration_breakdown?: Record<string, SrFixIterationBucket> | null; iteration_breakdown?: Record<string, SrFixIterationBucket> | null; overall_hit_rate?: number | null; previous_overall_hit_rate?: number | null; overall_trend_verdict?: 'improving' | 'declining' | 'stable' | null; overall_trend_significant?: boolean | null; };
 
 // Per-direction SR catch-rate breakdown (endpoint: GET /projects/{id}/direction-sr-breakdown)
 // DirectionSrEntry is re-exported from SrTrendBreakdown (canonical model)
@@ -2786,20 +2786,35 @@ function SrCatchRateCard({ rate, trends, loading, onScrollToReviewQuality }: {
 
   const overallPrevRate = trends?.previous_overall_hit_rate ?? null;
   const delta = overallPrevRate != null ? rate - overallPrevRate : null;
+  const verdict = trends?.overall_trend_verdict ?? null;
+  const significant = trends?.overall_trend_significant ?? null;
 
   const pct = Math.round(rate * 100);
   const color = rate >= 0.7 ? 'text-emerald-400' : rate >= 0.4 ? 'text-amber-400' : 'text-red-400';
   const deltaPp = delta != null ? Math.round(delta * 100) : 0;
-  const deltaColor = delta != null && delta > 0.01 ? 'text-emerald-500' : delta != null && delta < -0.01 ? 'text-red-500' : 'text-neutral-500';
-  const deltaIcon = delta != null && delta > 0.01 ? '↑' : delta != null && delta < -0.01 ? '↓' : '→';
+  // Use backend significance-gated verdict when available; fall back to neutral when significance unknown
+  const improving = verdict === 'improving' || (verdict == null && significant !== false && delta != null && delta > 0.01);
+  const declining = verdict === 'declining' || (verdict == null && significant !== false && delta != null && delta < -0.01);
+  const deltaColor = improving ? 'text-emerald-500' : declining ? 'text-red-500' : 'text-neutral-500';
+  const deltaIcon = improving ? '↑' : declining ? '↓' : '→';
+  // De-emphasize delta when backend reports non-significant change
+  const deltaOpacity = (verdict === 'stable' || significant === false) ? 'opacity-50' : '';
 
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4 cursor-pointer hover:border-neutral-700/80 transition-colors" onClick={onScrollToReviewQuality}>
-      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">SR Catch Rate</p>
+      <div className="flex items-center justify-between mb-1">
+        <p className="text-[10px] text-neutral-500 uppercase tracking-wide">SR Catch Rate</p>
+        {trends?.is_stale && (
+          <span className="text-[9px] text-amber-400 font-mono" title={`Trend data is stale — last computed ${trends.computed_at ? new Date(trends.computed_at).toLocaleDateString() : 'unknown'}`}>stale</span>
+        )}
+        {trends?.data_sufficient === false && !trends?.is_stale && (
+          <span className="text-[9px] text-amber-500 font-mono" title="Insufficient reviewer-finding data — displayed numbers are frozen">frozen</span>
+        )}
+      </div>
       <div className="flex items-center gap-2">
         <p className={`text-2xl font-bold font-mono ${color}`}>{pct}%</p>
         {delta != null && (
-          <span className={`text-sm font-semibold ${deltaColor}`}>
+          <span className={`text-sm font-semibold ${deltaColor} ${deltaOpacity}`}>
             {deltaIcon} {deltaPp >= 0 ? '+' : ''}{deltaPp}pp
           </span>
         )}

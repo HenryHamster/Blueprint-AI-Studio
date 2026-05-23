@@ -1297,6 +1297,83 @@ describe('DashboardHome', () => {
     expect(card).not.toHaveTextContent('75%');
   });
 
+  describe('SR Catch Rate significance-gated verdict', () => {
+    const baseDigest = {
+      failed_count: 0,
+      pending_approval_count: 0,
+      completed_count: 0,
+      failure_groups: [],
+      direction_progress: [],
+      recent_completions: [],
+      self_review_prediction_accuracy: { prediction_hit_rate: 0.75 },
+    };
+    // Enough findings (10 >= MIN_SR_CATCH_FINDINGS=5) so the card renders the full view
+    const baseTrends = {
+      overall_hit_rate: 0.75,
+      computed_at: '2026-05-20T00:00:00Z',
+      categories: {
+        correctness: { current_hit_rate: 0.80, previous_hit_rate: 0.60, current_human_count: 10, previous_human_count: 8 },
+      },
+    };
+
+    it('shows stable indicator (→) and opacity-50 when overall_trend_verdict is stable', async () => {
+      setupApiMocks({
+        digest: { ...baseDigest, self_review_prediction_accuracy_trends: { ...baseTrends, previous_overall_hit_rate: 0.70, overall_trend_verdict: 'stable', overall_trend_significant: false } },
+        diagnostics: makeDiagnostics(),
+      });
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      const card = await screen.findByText('SR Catch Rate').then((el) => el.closest('div[class*="rounded-lg"]'));
+      expect(card).toHaveTextContent('75%');
+      expect(card).toHaveTextContent('→');
+      expect(card?.querySelector('.opacity-50')).not.toBeNull();
+    });
+
+    it('de-emphasizes delta with → when overall_trend_significant is false despite large raw delta', async () => {
+      setupApiMocks({
+        digest: { ...baseDigest, self_review_prediction_accuracy_trends: { ...baseTrends, previous_overall_hit_rate: 0.60, overall_trend_verdict: null, overall_trend_significant: false } },
+        diagnostics: makeDiagnostics(),
+      });
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      const card = await screen.findByText('SR Catch Rate').then((el) => el.closest('div[class*="rounded-lg"]'));
+      expect(card).toHaveTextContent('+15pp');
+      expect(card).toHaveTextContent('→');
+      expect(card?.querySelector('.opacity-50')).not.toBeNull();
+    });
+
+    it('shows declining indicator (↓) when overall_trend_verdict is declining', async () => {
+      setupApiMocks({
+        digest: { ...baseDigest, self_review_prediction_accuracy_trends: { ...baseTrends, previous_overall_hit_rate: 0.80, overall_trend_verdict: 'declining', overall_trend_significant: true } },
+        diagnostics: makeDiagnostics(),
+      });
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      const card = await screen.findByText('SR Catch Rate').then((el) => el.closest('div[class*="rounded-lg"]'));
+      expect(card).toHaveTextContent('↓');
+      expect(card).toHaveTextContent('-5pp');
+    });
+
+    it('shows stale badge when trend data is stale', async () => {
+      setupApiMocks({
+        digest: { ...baseDigest, self_review_prediction_accuracy_trends: { ...baseTrends, previous_overall_hit_rate: 0.70, is_stale: true } },
+        diagnostics: makeDiagnostics(),
+      });
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      const card = await screen.findByText('SR Catch Rate').then((el) => el.closest('div[class*="rounded-lg"]'));
+      expect(card).toHaveTextContent('stale');
+      expect(card).not.toHaveTextContent('frozen');
+    });
+
+    it('shows frozen badge when data_sufficient is false and not stale', async () => {
+      setupApiMocks({
+        digest: { ...baseDigest, self_review_prediction_accuracy_trends: { ...baseTrends, previous_overall_hit_rate: 0.70, is_stale: false, data_sufficient: false } },
+        diagnostics: makeDiagnostics(),
+      });
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      const card = await screen.findByText('SR Catch Rate').then((el) => el.closest('div[class*="rounded-lg"]'));
+      expect(card).toHaveTextContent('frozen');
+      expect(card).not.toHaveTextContent('stale');
+    });
+  });
+
   it('SR Unfixed Flags tile shows the self-flagged shipped-unfixed rate, not the catch hit rate', async () => {
     setupApiMocks({
       digest: {

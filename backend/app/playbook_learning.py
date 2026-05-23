@@ -4466,6 +4466,37 @@ async def compute_sr_catch_rate_trends(
         else None
     )
 
+    # Significance-gated overall trend verdict — mirrors the per-category treatment
+    # so the headline is as trustworthy as the per-category breakdown.
+    # Only labeled "improving"/"declining" when both windows have >= _MIN_SR_FINDINGS
+    # and the change passes the two-proportion z-test (_is_trend_significant).
+    _overall_data_sufficient = (
+        overall_hit_rate is not None
+        and previous_overall_hit_rate is not None
+        and current_total_humans >= _MIN_SR_FINDINGS
+        and previous_total_humans >= _MIN_SR_FINDINGS
+    )
+    if _overall_data_sufficient:
+        _overall_delta = overall_hit_rate - previous_overall_hit_rate
+        _overall_sig = _is_trend_significant(
+            overall_hit_rate,
+            current_total_humans,
+            previous_overall_hit_rate,
+            previous_total_humans,
+        )
+        if _overall_sig and _overall_delta >= _TREND_DELTA_THRESHOLD:
+            overall_trend_verdict: str = "improving"
+        elif _overall_sig and _overall_delta <= -_TREND_DELTA_THRESHOLD:
+            overall_trend_verdict = "declining"
+        else:
+            overall_trend_verdict = "stable"
+        overall_trend_significant: Optional[bool] = (
+            _overall_sig and abs(_overall_delta) >= _TREND_DELTA_THRESHOLD
+        )
+    else:
+        overall_trend_verdict = "stable"
+        overall_trend_significant = None
+
     # Prompt-version awareness: detect mixed-regime windows so the agent can
     # caveat calibration surfaces and avoid mistaking prompt rollouts for regressions.
     pv_counter = _collect_prompt_versions(current_window_tasks)
@@ -4495,6 +4526,9 @@ async def compute_sr_catch_rate_trends(
         "sr_skip_reason_distribution": sr_skip_dist if sr_skip_dist is not None else {},
         "overall_hit_rate": overall_hit_rate,
         "previous_overall_hit_rate": previous_overall_hit_rate,
+        "overall_trend_verdict": overall_trend_verdict,
+        "overall_trend_significant": overall_trend_significant,
+        "overall_trend_data_sufficient": _overall_data_sufficient,
         "current_finding_count": current_finding_count,
         "previous_finding_count": previous_finding_count,
     }

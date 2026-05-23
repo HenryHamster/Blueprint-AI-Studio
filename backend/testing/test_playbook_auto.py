@@ -9644,6 +9644,9 @@ async def test_compute_sr_catch_rate_trends_all_fields_always_present(
         "sr_skip_reason_distribution",
         "by_direction",
         "execution_evidence_miss_rates",
+        "overall_trend_verdict",
+        "overall_trend_significant",
+        "overall_trend_data_sufficient",
     ]
     for key in required_keys:
         assert key in result, f"missing required key: {key}"
@@ -13920,3 +13923,81 @@ async def test_compute_sr_catch_rate_trends_e2e_production_shaped(
     assert rr["previous_hit_rate"] == 1.0, (
         f"regression_risk previous_hit_rate wrong: {rr['previous_hit_rate']}"
     )
+
+
+@pytest.mark.asyncio
+async def test_overall_trend_verdict_improving_when_significant(
+    db_session: AsyncSession,
+):
+    """overall_trend_verdict='improving' with sufficient data and a significant delta."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(8):  # current: 8/8 hits → 1.0
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(8):  # previous: 1/8 hits → 0.125 (delta=0.875, z>1.28)
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"] if i == 0 else [],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    assert result["overall_trend_verdict"] == "improving"
+    assert result["overall_trend_significant"] is True
+    assert result["overall_trend_data_sufficient"] is True
+
+
+@pytest.mark.asyncio
+async def test_overall_trend_verdict_stable_when_not_significant(
+    db_session: AsyncSession,
+):
+    """overall_trend_verdict='stable' when delta is above threshold but not statistically
+    significant (z < _TREND_Z_MIN=1.28 with small sample sizes)."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for cnt, hit in [(3, True), (2, False)]:  # current: 3/5 = 0.6
+        for _ in range(cnt):
+            t = _make_sr_task(
+                project.id,
+                age_days=2,
+                human_cats={"correctness": 1},
+                sr_failed_cats=["correctness"] if hit else [],
+            )
+            db_session.add(t)
+            tasks.append(t)
+    for cnt, hit in [
+        (4, True),
+        (1, False),
+    ]:  # previous: 4/5 = 0.8; delta=0.2>0.05 but z≈0.69<1.28
+        for _ in range(cnt):
+            t = _make_sr_task(
+                project.id,
+                age_days=20,
+                human_cats={"correctness": 1},
+                sr_failed_cats=["correctness"] if hit else [],
+            )
+            db_session.add(t)
+            tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    assert result["overall_trend_verdict"] == "stable"
+    assert result["overall_trend_significant"] is False
+    assert result["overall_trend_data_sufficient"] is True

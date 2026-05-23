@@ -191,6 +191,14 @@ export interface SrTrendData {
   mixed_prompt_versions?: boolean | null;
   /** True when the current window's prompt version differs from the previous window's — cycle-over-cycle delta may reflect guidance change, not genuine catch-rate change. */
   prompt_version_changed?: boolean | null;
+  /** Aggregate SR catch rate for the current measurement window (hits / total reviewer-flagged findings). */
+  overall_hit_rate?: number | null;
+  /** Aggregate SR catch rate for the previous measurement window — used for cycle-over-cycle delta. */
+  previous_overall_hit_rate?: number | null;
+  /** Significance-gated overall trend verdict computed by the backend using the same two-proportion z-test as per-category trends. Null when insufficient data for either window. */
+  overall_trend_verdict?: 'improving' | 'declining' | 'stable' | null;
+  /** True when the overall delta passes the significance test; false = adequate data but within noise; null = insufficient data. */
+  overall_trend_significant?: boolean | null;
   categories?: Record<string, SrCategoryTrend> | null;
   by_task_type?: Record<string, Record<string, SrTaskTypeCategoryStats>> | null;
   by_scope?: Record<string, Record<string, SrTaskTypeCategoryStats>> | null;
