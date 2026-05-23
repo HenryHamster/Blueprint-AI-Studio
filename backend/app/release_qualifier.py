@@ -3628,6 +3628,12 @@ async def _reconcile_if_pending_auto_merge_landed(
             #    auto-merge, and leaving the version pending indefinitely would
             #    wedge the lifecycle.  Drive it to promotion_failed so the existing
             #    retry machinery applies on the next strategic cycle.
+            #
+            # 3. If the PR is still open, check whether its required CI is
+            #    conclusively red.  A red-CI PR will never auto-merge; leaving it
+            #    pending indefinitely would wedge the lifecycle in the same way.
+            #    Act ONLY on _CI_RED — never on _CI_PENDING / _CI_NO_CHECKS /
+            #    _CI_GREEN, so healthy in-flight promotions are never aborted.
             try:
                 pr_data = await github.get_pull_request(
                     token,
@@ -3655,6 +3661,54 @@ async def _reconcile_if_pending_auto_merge_landed(
                     )
                     await session.commit()
                     return True
+
+                if pr_data.get("state") == "open":
+                    pr_head_sha: str | None = (pr_data.get("head") or {}).get("sha")
+                    if pr_head_sha:
+                        try:
+                            check_result = await github.get_check_runs_cached(
+                                token,
+                                owner,
+                                repo,
+                                pr_head_sha,
+                                project_id=str(version.project_id),
+                                treat_missing_as_success=False,
+                            )
+                            ci_state = _classify_check_runs(check_result)
+                            if ci_state == _CI_RED:
+                                logger.warning(
+                                    "[RELEASE_QUALIFIER] reconcile pending_auto_merge: "
+                                    "PR #%s for v%d has conclusively failed CI — "
+                                    "driving to promotion_failed so retry machinery "
+                                    "applies",
+                                    pr_number,
+                                    version.version_number,
+                                )
+                                await _record_promotion_failure(
+                                    session,
+                                    version,
+                                    base_record,
+                                    "pr_ci_red",
+                                    detail=(
+                                        f"PR #{pr_number} CI is conclusively failed "
+                                        f"(sha={pr_head_sha[:8]}); auto-merge will "
+                                        "never fire"
+                                    ),
+                                    pr_url=pr_url,
+                                    lock_released=True,
+                                )
+                                await session.commit()
+                                return True
+                        except Exception as exc:  # noqa: BLE001 — CI fetch failure → leave pending
+                            logger.warning(
+                                "[RELEASE_QUALIFIER] reconcile pending_auto_merge: "
+                                "could not fetch CI for PR #%s head %s for v%d "
+                                "(%s) — leaving pending",
+                                pr_number,
+                                pr_head_sha[:8] if pr_head_sha else "unknown",
+                                version.version_number,
+                                exc,
+                            )
             except Exception as exc:  # noqa: BLE001 — PR state check must not abort sweep
                 logger.warning(
                     "[RELEASE_QUALIFIER] reconcile pending_auto_merge: could not "

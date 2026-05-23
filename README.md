@@ -129,6 +129,74 @@ When enabled, Blueprint continuously generates and dispatches tasks without manu
 
 Configure autonomous mode in the admin UI under Settings > Autonomous.
 
+## Documentation
+
+Comprehensive documentation is available in the `docs/` directory:
+
+- **[API_REFERENCE.md](docs/API_REFERENCE.md)** — Complete HTTP endpoint reference with request/response schemas
+- **[DATA_MODELS.md](docs/DATA_MODELS.md)** — Database schema, Pydantic DTOs, and data structure guide
+- **[BACKEND_MODULES.md](docs/BACKEND_MODULES.md)** — Python module reference for `backend/app/` with responsibilities and key functions
+- **[AGENT_HANDLERS.md](docs/AGENT_HANDLERS.md)** — TypeScript task handler implementations and workflows
+- **[FRONTEND_COMPONENTS.md](docs/FRONTEND_COMPONENTS.md)** — React component guide with props and usage patterns
+- **[CLAUDE.md](CLAUDE.md)** — Project-specific coding standards and file restrictions
+
+---
+
+## Development
+
+### Testing
+
+Run tests locally before committing:
+
+```bash
+# Backend (requires Docker for Postgres)
+bash scripts/test-backend.sh                    # Full suite
+bash scripts/test-backend.sh testing/test_foo.py  # Specific file
+
+# Frontend (linting + unit tests)
+cd admin-ui && npm run build && npx eslint .
+
+# Agent (TypeScript)
+cd agent && npx tsc --noEmit
+```
+
+Key test invariants:
+- Module size guardrails (`backend/testing/module_size_limits.json`) — request permission to bump limits via test assertion message
+- Schema revision (`EXPECTED_SCHEMA_REVISION` in `backend/app/main.py`) — must match latest Alembic migration
+- Database migrations are immutable — new migrations must chain from the latest `down_revision`
+
+### Adding Features
+
+1. **Create a branch** from `main`
+2. **Implement changes** following [CLAUDE.md](CLAUDE.md) patterns
+3. **Run tests** (`./check` or `bash scripts/test-backend.sh` — see CLAUDE.md for details)
+4. **Self-review** — check for correctness, security, test coverage
+5. **Push** and open a PR
+
+For substantial changes affecting multiple systems (backend + frontend + agent), open the PR to enable CI. See [Deploy.md](Deploy.md) for deployment.
+
+### Local Development
+
+```bash
+# Set up environment
+cp .env.example .env
+# Edit .env: set LOCAL_MODE=true, ANTHROPIC_API_KEY, ADMIN_API_KEY
+
+# Start services
+docker compose up -d db        # PostgreSQL
+cd backend && bash run_migrations.sh
+cd .. && npm install
+npm run dev                    # Starts launcher UI (3000) and admin UI (3001)
+
+# In another terminal, start backend
+cd backend
+uvicorn app.main:app --reload --port 8080
+```
+
+Local mode runs agents as subprocess instead of GCP VMs. Full CI suite runs on PR; `./check` is a quick smoke test.
+
+---
+
 ## Safety
 
 - VMs have no public IP — outbound only via Cloud NAT
@@ -138,3 +206,74 @@ Configure autonomous mode in the admin UI under Settings > Autonomous.
 - GitHub tokens refreshed before each push operation
 - Prompt injection scanning on PR content (100+ patterns)
 - Per-project circuit breaker to halt runaway failure loops
+
+---
+
+## Troubleshooting
+
+### Task fails with "clone_failed"
+
+- Repo is private and agent token lacks access — grant OAuth token in admin settings
+- Repo doesn't exist or URL is wrong — check `github_owner`/`github_repo` in task payload
+- Network issue (rare in production) — reaper will auto-retry up to 3 times
+
+### Task hangs (no logs after 5 minutes)
+
+- Agent VM hung or network partitioned — reaper kills VMs after 5-minute heartbeat timeout
+- Check agent logs in admin UI for the task — look for errors, timeouts, or blocked operations
+- In production, VMs auto-destruct after 1 hour as safety net
+
+### PR creation fails
+
+- Agent doesn't have permission to create PRs in this repo — check OAuth token scopes (need `pull_requests: read/write`)
+- PR title/body too long or contains unprintable characters — agent sanitizes before submission
+- Target branch doesn't exist — specify correct `base_branch` in task
+
+### Orchestrator won't start new tasks
+
+- Circuit breaker tripped due to repeated failures — check project status in admin UI
+- `MAX_CONCURRENT_VMS` limit reached — reduce concurrency or increase limit
+- Database unreachable — check `DATABASE_URL` connection string
+
+### Memory/CPU limits
+
+- Default GCP VM is `e2-standard-2` (2 vCPU, 8 GB RAM) — sufficient for most tasks
+- Very large repos or heavy analysis may require larger machine — set `MACHINE_TYPE` in `.env`
+- In local mode, agent runs as subprocess — limited by host machine resources
+
+---
+
+## Contributing
+
+Contributions are welcome. Please:
+
+1. **Read [CLAUDE.md](CLAUDE.md)** for coding standards and restrictions
+2. **Open an issue** for bugs or feature requests
+3. **Follow the test guidelines** — all code paths must have tests
+4. **Update documentation** when adding new features or APIs
+
+For significant architectural changes, open an issue to discuss approach first.
+
+---
+
+## License
+
+See [LICENSE](LICENSE) file.
+
+---
+
+## Support
+
+For issues, questions, or feedback:
+- **GitHub Issues** — bug reports, feature requests
+- **Discussions** — questions, ideas, architecture discussions
+- **Internal Slack** (if applicable) — for Blueprint team coordination
+
+---
+
+## Related Documentation
+
+- **Deployment** — See [Deploy.md](Deploy.md) for GCP Cloud Run + Terraform setup
+- **Database** — See [docs/db-operations.md](docs/db-operations.md) for manual DB queries and operations
+- **Concurrency** — See [docs/concurrency.md](docs/concurrency.md) for row-locking and async patterns
+- **Analysis** — See [docs/codebase-analysis.md](docs/codebase-analysis.md) for cross-cutting architecture overview
