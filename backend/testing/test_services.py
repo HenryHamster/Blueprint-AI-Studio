@@ -1710,3 +1710,61 @@ async def test_post_commit_sweep_bump_failure_does_not_poison_batch(svc_db, mock
         (bad_task.context or {}).get("_post_commit_pending_meta", {}).get("attempts")
     )
     assert bad_attempts == 4, f"bad task attempts should stay at 4, got {bad_attempts}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# stale_branch_prefixes (project-driven branch cleanup)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_stale_branch_prefixes_default_when_not_configured(svc_db):
+    """Project without build_config returns the default Blueprint prefixes."""
+    project = await _make_project(svc_db)
+    # Project has no build_config set
+    assert project.build_config is None
+    # Should return the Blueprint defaults
+    assert project.stale_branch_prefixes == ("blueprint/", "research/", "plan/")
+
+
+@pytest.mark.asyncio
+async def test_stale_branch_prefixes_custom_from_build_config(svc_db):
+    """Project with custom prefixes in build_config uses them."""
+    project = Project(
+        name="Custom Project",
+        user_id="user1",
+        build_config={"stale_branch_prefixes": ["feature/", "hotfix/"]},
+    )
+    svc_db.add(project)
+    await svc_db.commit()
+    await svc_db.refresh(project)
+    assert project.stale_branch_prefixes == ("feature/", "hotfix/")
+
+
+@pytest.mark.asyncio
+async def test_stale_branch_prefixes_empty_list_disables_cleanup(svc_db):
+    """Project with empty prefix list in build_config disables cleanup."""
+    project = Project(
+        name="No Cleanup Project",
+        user_id="user1",
+        build_config={"stale_branch_prefixes": []},
+    )
+    svc_db.add(project)
+    await svc_db.commit()
+    await svc_db.refresh(project)
+    # Empty list should be returned as-is (cleanup disabled for this project)
+    assert project.stale_branch_prefixes == ()
+
+
+@pytest.mark.asyncio
+async def test_stale_branch_prefixes_preserves_single_prefix(svc_db):
+    """Project with single custom prefix works correctly."""
+    project = Project(
+        name="Single Prefix Project",
+        user_id="user1",
+        build_config={"stale_branch_prefixes": ["task/"]},
+    )
+    svc_db.add(project)
+    await svc_db.commit()
+    await svc_db.refresh(project)
+    assert project.stale_branch_prefixes == ("task/",)

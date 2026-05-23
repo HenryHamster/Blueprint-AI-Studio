@@ -1,9 +1,9 @@
 """Tests for project-configurable approval gate file lists.
 
 Verifies that the approval gate can be configured per-project:
-- Without config, self-repo projects use Blueprint defaults
-- Without config, non-self-repo projects use empty lists
+- Without config, all projects (including self-repo) use empty lists
 - With config, projects can define their own sensitive file paths
+- is_self_repo is informational metadata; config drives the gate
 """
 
 import pytest
@@ -18,13 +18,50 @@ from app.models import Project
 
 
 @pytest.mark.asyncio
-async def test_get_approval_gate_file_lists_self_repo_defaults():
-    """Without approval_gate_config, self-repo projects use Blueprint defaults."""
+async def test_get_approval_gate_file_lists_self_repo_no_config_empty():
+    """Without approval_gate_config, self-repo projects return empty lists.
+
+    Blueprint defaults are seeded into approval_gate_config by a migration
+    for is_self_repo projects; code-level fallbacks have been removed.
+    """
     project = Project(name="Blueprint Self", user_id="u1", is_self_repo=True)
 
     infra_files, critical_files = _get_approval_gate_file_lists(project)
 
-    # Verify Blueprint defaults are returned
+    assert len(infra_files) == 0
+    assert len(critical_files) == 0
+
+
+@pytest.mark.asyncio
+async def test_get_approval_gate_file_lists_self_repo_seeded_config():
+    """Self-repo project with seeded approval_gate_config returns Blueprint defaults."""
+    project = Project(
+        name="Blueprint Self",
+        user_id="u1",
+        is_self_repo=True,
+        approval_gate_config={
+            "infra_files": [
+                "backend/app/main.py",
+                "backend/app/compute.py",
+                "backend/app/models.py",
+                "backend/app/database.py",
+                "backend/app/security.py",
+                "backend/app/auth.py",
+                "agent/src/index.ts",
+                "CLAUDE.md",
+                "backend/promotion_policy.yaml",
+            ],
+            "critical_files": [
+                "backend/app/security.py",
+                "backend/app/auth.py",
+                "CLAUDE.md",
+                "backend/promotion_policy.yaml",
+            ],
+        },
+    )
+
+    infra_files, critical_files = _get_approval_gate_file_lists(project)
+
     assert "backend/app/main.py" in infra_files
     assert "backend/app/models.py" in infra_files
     assert "backend/app/security.py" in infra_files
@@ -176,8 +213,12 @@ async def test_approval_gate_config_persisted_in_db(approval_gate_db):
 
 
 @pytest.mark.asyncio
-async def test_approval_gate_empty_config_uses_defaults(approval_gate_db):
-    """Empty approval_gate_config dict falls back to defaults for self-repo."""
+async def test_approval_gate_empty_config_returns_empty(approval_gate_db):
+    """Empty approval_gate_config dict returns empty sets for all projects.
+
+    Blueprint defaults are seeded into approval_gate_config by a migration
+    for is_self_repo projects; code-level fallbacks have been removed.
+    """
     project = Project(
         name="Self Repo Empty Config",
         user_id="u1",
@@ -190,6 +231,5 @@ async def test_approval_gate_empty_config_uses_defaults(approval_gate_db):
 
     infra_files, critical_files = _get_approval_gate_file_lists(project)
 
-    # Empty config should fall back to Blueprint defaults for self-repo
-    assert "backend/app/main.py" in infra_files
-    assert "backend/app/security.py" in critical_files
+    assert len(infra_files) == 0
+    assert len(critical_files) == 0

@@ -189,41 +189,14 @@ def _get_approval_gate_file_lists(project: Project) -> tuple[set, set]:
     """Get infra_files and critical_files for approval gate.
 
     Returns (infra_files_set, critical_files_set).
-    Uses project config if available, otherwise falls back to Blueprint defaults
-    for self-repo or empty sets for other projects.
+    Uses project.approval_gate_config when present; otherwise returns empty sets.
     """
     config = (project.approval_gate_config or {}) if project else {}
 
-    # Use project config if provided
-    if config.get("infra_files") or config.get("critical_files"):
-        return (
-            set(config.get("infra_files", [])),
-            set(config.get("critical_files", [])),
-        )
-
-    # Fall back to Blueprint defaults only for self-repo
-    if project and project.is_self_repo:
-        infra_files = {
-            "backend/app/main.py",
-            "backend/app/compute.py",
-            "backend/app/models.py",
-            "backend/app/database.py",
-            "backend/app/security.py",
-            "backend/app/auth.py",
-            "agent/src/index.ts",
-            "CLAUDE.md",
-            "backend/promotion_policy.yaml",
-        }
-        critical_files = {
-            "backend/app/security.py",
-            "backend/app/auth.py",
-            "CLAUDE.md",
-            "backend/promotion_policy.yaml",
-        }
-        return infra_files, critical_files
-
-    # No config and not self-repo: use empty lists
-    return set(), set()
+    return (
+        set(config.get("infra_files", [])),
+        set(config.get("critical_files", [])),
+    )
 
 
 async def _requeue_parent_task(parent: Task, session: AsyncSession):

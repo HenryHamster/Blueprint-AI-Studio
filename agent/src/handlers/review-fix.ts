@@ -638,9 +638,9 @@ export function buildBlueprintPrFooter(opts: {
 // Medium-scope priority hint based on which subsystem the PR touches. The
 // reviewer otherwise weights every checklist section equally, accumulating
 // off-target findings (e.g. SQL injection notes on agent-only TypeScript
-// changes) that drive extra fix iterations. Returns '' for mixed-subsystem
-// PRs so they keep full scrutiny.
-export function detectMediumScopeSubsystemHint(changedFiles: string): string {
+// changes) that drive extra fix iterations. Returns '' when no buildConfig
+// directories are configured, or when files don't match any configured dir.
+export function detectMediumScopeSubsystemHint(changedFiles: string, buildConfig?: BuildConfig): string {
   const paths = changedFiles
     .split('\n')
     .map(l => l.trim())
@@ -648,28 +648,47 @@ export function detectMediumScopeSubsystemHint(changedFiles: string): string {
     .map(l => l.split(/\s+/).pop() || '')
     .filter(Boolean);
   if (paths.length === 0) return '';
-  if (paths.every(p => p.startsWith('agent/'))) {
-    return 'This is a medium-scope change confined to agent/ (TypeScript agent code). The agent does not touch the database, so deprioritize SQL injection and database query checks. Focus on Correctness & Logic, Build & Type Safety, and TypeScript-specific concerns.\n\n';
-  }
-  if (paths.every(p => p.startsWith('admin-ui/'))) {
-    return 'This is a medium-scope change confined to admin-ui/ (frontend). Deprioritize backend-specific checks like SQL injection, server-side authorization, and database query review. Focus on Correctness & Logic, Build & Type Safety, XSS risks, and frontend-specific concerns.\n\n';
-  }
-  if (paths.every(p => p.startsWith('backend/'))) {
-    if (paths.every(p => p.startsWith('backend/testing/') || /(^|\/)test_[^/]+\.py$|(^|\/)conftest\.py$/.test(p))) {
-      return 'This is a medium-scope change confined to backend test files (backend/testing/). Deprioritize SQL injection, authorization, and input-validation checks — these tests do not handle real user input or production database connections. Focus on test quality: correct assertions, test isolation, fixture cleanup, and coverage of the intended behavior.\n\n';
+
+  const dirs = buildConfig?.directories;
+  if (!dirs?.length) return '';
+
+  // Match each path to the first configured directory whose path it starts with.
+  const matchedDirPaths = new Set<string>();
+  for (const p of paths) {
+    for (const d of dirs) {
+      const prefix = d.path.endsWith('/') ? d.path : d.path + '/';
+      if (p === d.path || p.startsWith(prefix)) {
+        matchedDirPaths.add(d.path);
+        break;
+      }
     }
-    return 'This is a medium-scope change confined to backend/. Apply full security scrutiny — review SQL injection, authorization checks, input validation, and server-side concerns thoroughly.\n\n';
   }
-  const topDirs = new Set(paths.map(p => p.split('/')[0]).filter(Boolean));
-  const subsystems = new Set<string>();
-  for (const d of topDirs) {
-    if (d === 'backend' || d === 'agent' || d === 'admin-ui') subsystems.add(d);
-  }
-  if (subsystems.size >= 2) {
-    const list = Array.from(subsystems).sort().join(', ');
+
+  if (matchedDirPaths.size === 0) return '';
+
+  if (matchedDirPaths.size >= 2) {
+    const list = Array.from(matchedDirPaths).sort().join(', ');
     return `This is a medium-scope cross-system change touching multiple subsystems (${list}). Prioritize interface consistency between subsystems over single-file style concerns: shared types, API contracts, payload shapes, and field names must match across boundaries. Verify both sides of every integration point are updated together — e.g., a backend response field has a corresponding frontend/agent reader, a new payload key is produced and consumed, schema changes are reflected in serializers and TypeScript types. Cross-file inconsistencies (mismatched names, missing updates on one side, divergent assumptions about shape/nullability) are higher severity than local style issues.\n\n`;
   }
-  return '';
+
+  const dirPath = Array.from(matchedDirPaths)[0];
+  const dir = dirs.find(d => d.path === dirPath);
+  if (!dir) return '';
+
+  if (dir.type === 'python') {
+    const dirPrefix = dir.path.endsWith('/') ? dir.path : dir.path + '/';
+    const matchedPaths = paths.filter(p => p === dir.path || p.startsWith(dirPrefix));
+    const isAllTests = matchedPaths.every(p =>
+      p.includes('/testing/') || /(^|\/)test_[^/]+\.py$|(^|\/)conftest\.py$/.test(p)
+    );
+    if (isAllTests) {
+      return `This is a medium-scope change confined to test files in ${dir.path}/. Deprioritize SQL injection, authorization, and input-validation checks — these tests do not handle real user input or production database connections. Focus on test quality: correct assertions, test isolation, fixture cleanup, and coverage of the intended behavior.\n\n`;
+    }
+    return `This is a medium-scope change confined to ${dir.path}/. Apply full security scrutiny — review SQL injection, authorization checks, input validation, and server-side concerns thoroughly.\n\n`;
+  }
+
+  // node or other types — deprioritize database/SQL checks
+  return `This is a medium-scope change confined to ${dir.path}/ (TypeScript/Node.js). This code does not directly access the database, so deprioritize SQL injection and database query checks. Focus on Correctness & Logic, Build & Type Safety, and TypeScript-specific concerns.\n\n`;
 }
 
 // Pre-install node_modules in every node-typed directory in the reviewer's
@@ -678,8 +697,9 @@ export function detectMediumScopeSubsystemHint(changedFiles: string): string {
 // reviewers to install before building, this is the belt to that suspenders.
 //
 // For repos with a configured BuildConfig, iterates buildConfig.directories.
-// For Blueprint's self-repo (is_self_repo=true → undefined buildConfig), uses
-// the same hardcoded admin-ui/agent/root list as the fallback prompt.
+// For projects with buildConfig.directories, iterates the configured node directories.
+// Otherwise scans the workspace root and immediate subdirectories for package.json and
+// installs in every directory it finds.
 function preinstallNodeDeps(
   workspace: string,
   buildConfig: BuildConfig | undefined,
@@ -860,7 +880,7 @@ export async function handleReview(
       : taskScope === 'large'
         ? REVIEW_LARGE_SCOPE_PREAMBLE
         : taskScope === 'medium'
-          ? detectMediumScopeSubsystemHint(changedFiles)
+          ? detectMediumScopeSubsystemHint(changedFiles, reviewBuildConfig)
           : '';
 
   // Read CLAUDE.md for codebase instructions

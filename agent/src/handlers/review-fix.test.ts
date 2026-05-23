@@ -110,6 +110,15 @@ import {
   formatTrajectorySection, formatDriftSection, verifyStepsOk, computeReviewPromptFingerprint,
 } from './review-fix.js';
 import { runCodeChangeTask } from './code-change.js';
+import { resolveBuildConfig } from '../build-config.js';
+
+const BLUEPRINT_CONFIG = {
+  directories: [
+    { path: 'agent', type: 'node' },
+    { path: 'admin-ui', type: 'node' },
+    { path: 'backend', type: 'python' },
+  ],
+};
 
 const statusRef = () => ({ value: '' });
 
@@ -446,37 +455,37 @@ describe('handleReview — scope overflow replaces scope-narrowed preamble', () 
 // ── detectMediumScopeSubsystemHint: subsystem-aware priority guidance ───────
 describe('detectMediumScopeSubsystemHint — medium-scope subsystem hint', () => {
   it('returns agent-focused hint when all changed files are under agent/', () => {
-    const hint = detectMediumScopeSubsystemHint('M\tagent/src/handlers/standard.ts\nM\tagent/src/prompt.ts');
+    const hint = detectMediumScopeSubsystemHint('M\tagent/src/handlers/standard.ts\nM\tagent/src/prompt.ts', BLUEPRINT_CONFIG);
     expect(hint).toContain('agent/');
     expect(hint).toContain('deprioritize SQL injection');
   });
 
-  it('returns admin-ui-focused hint when all changed files are under admin-ui/', () => {
-    const hint = detectMediumScopeSubsystemHint('M\tadmin-ui/src/App.tsx\nA\tadmin-ui/src/components/Foo.tsx');
+  it('returns node-type hint when all changed files are under admin-ui/', () => {
+    const hint = detectMediumScopeSubsystemHint('M\tadmin-ui/src/App.tsx\nA\tadmin-ui/src/components/Foo.tsx', BLUEPRINT_CONFIG);
     expect(hint).toContain('admin-ui/');
-    expect(hint).toContain('Deprioritize backend-specific checks');
+    expect(hint).toContain('deprioritize SQL injection');
   });
 
   it('keeps full security scrutiny for backend-only changes', () => {
-    const hint = detectMediumScopeSubsystemHint('M\tbackend/app/orchestrator.py\nM\tbackend/app/main.py');
+    const hint = detectMediumScopeSubsystemHint('M\tbackend/app/orchestrator.py\nM\tbackend/app/main.py', BLUEPRINT_CONFIG);
     expect(hint).toContain('backend/');
     expect(hint).toContain('full security scrutiny');
   });
 
   it('deprioritizes security for backend/testing-only changes', () => {
-    const hint = detectMediumScopeSubsystemHint('M\tbackend/testing/test_foo.py\nA\tbackend/testing/test_bar.py');
+    const hint = detectMediumScopeSubsystemHint('M\tbackend/testing/test_foo.py\nA\tbackend/testing/test_bar.py', BLUEPRINT_CONFIG);
     expect(hint).toContain('test');
     expect(hint).toContain('Deprioritize');
     expect(hint).not.toContain('full security scrutiny');
   });
 
   it('keeps full security scrutiny when backend changes include a non-test file', () => {
-    const hint = detectMediumScopeSubsystemHint('M\tbackend/testing/test_foo.py\nM\tbackend/app/main.py');
+    const hint = detectMediumScopeSubsystemHint('M\tbackend/testing/test_foo.py\nM\tbackend/app/main.py', BLUEPRINT_CONFIG);
     expect(hint).toContain('full security scrutiny');
   });
 
   it('returns cross-system guidance when changes span 2+ subsystems', () => {
-    const hint = detectMediumScopeSubsystemHint('M\tagent/src/index.ts\nM\tbackend/app/main.py');
+    const hint = detectMediumScopeSubsystemHint('M\tagent/src/index.ts\nM\tbackend/app/main.py', BLUEPRINT_CONFIG);
     expect(hint).toContain('cross-system');
     expect(hint).toContain('agent');
     expect(hint).toContain('backend');
@@ -484,20 +493,47 @@ describe('detectMediumScopeSubsystemHint — medium-scope subsystem hint', () =>
   });
 
   it('returns cross-system guidance for backend + admin-ui changes', () => {
-    const hint = detectMediumScopeSubsystemHint('M\tbackend/app/main.py\nM\tadmin-ui/src/App.tsx');
+    const hint = detectMediumScopeSubsystemHint('M\tbackend/app/main.py\nM\tadmin-ui/src/App.tsx', BLUEPRINT_CONFIG);
     expect(hint).toContain('cross-system');
     expect(hint).toContain('admin-ui');
     expect(hint).toContain('backend');
   });
 
   it('returns empty string for changed files placeholder / no files', () => {
-    expect(detectMediumScopeSubsystemHint('')).toBe('');
-    expect(detectMediumScopeSubsystemHint('(could not generate file list)')).toBe('');
+    expect(detectMediumScopeSubsystemHint('', BLUEPRINT_CONFIG)).toBe('');
+    expect(detectMediumScopeSubsystemHint('(could not generate file list)', BLUEPRINT_CONFIG)).toBe('');
+  });
+
+  it('returns empty string when no buildConfig is provided', () => {
+    expect(detectMediumScopeSubsystemHint('M\tagent/src/index.ts')).toBe('');
+    expect(detectMediumScopeSubsystemHint('M\tbackend/app/main.py')).toBe('');
+  });
+
+  it('returns node hint for a custom single-directory node project', () => {
+    const config = { directories: [{ path: 'src', type: 'node' }] };
+    const hint = detectMediumScopeSubsystemHint('M\tsrc/index.ts\nM\tsrc/utils.ts', config);
+    expect(hint).toContain('src/');
+    expect(hint).toContain('deprioritize SQL injection');
+  });
+
+  it('returns empty string for paths outside any configured directory', () => {
+    const config = { directories: [{ path: 'src', type: 'node' }] };
+    expect(detectMediumScopeSubsystemHint('M\tdocs/readme.md', config)).toBe('');
+  });
+
+  it('returns cross-system hint for two node directories', () => {
+    const config = { directories: [{ path: 'app', type: 'node' }, { path: 'lib', type: 'node' }] };
+    const hint = detectMediumScopeSubsystemHint('M\tapp/index.ts\nM\tlib/utils.ts', config);
+    expect(hint).toContain('cross-system');
+    expect(hint).toContain('app');
+    expect(hint).toContain('lib');
+    expect(hint).toContain('interface consistency');
   });
 });
 
 describe('handleReview — medium-scope subsystem hint integration', () => {
   it('injects agent-focused hint into the review prompt for medium-scope agent-only PRs', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce(BLUEPRINT_CONFIG as ReturnType<typeof resolveBuildConfig>);
     vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\tagent/src/handlers/review-fix.ts';
@@ -517,6 +553,7 @@ describe('handleReview — medium-scope subsystem hint integration', () => {
   });
 
   it('injects cross-system hint for multi-subsystem medium-scope PRs', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce(BLUEPRINT_CONFIG as ReturnType<typeof resolveBuildConfig>);
     vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\tagent/src/index.ts\nM\tbackend/app/main.py';

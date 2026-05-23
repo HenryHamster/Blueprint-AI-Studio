@@ -551,7 +551,7 @@ async def _run_stale_branch_cleanup():
                     token,
                     owner,
                     repo,
-                    prefixes=list(_STALE_BRANCH_PREFIXES),
+                    prefixes=list(project.stale_branch_prefixes),
                     max_branches=1000,
                 )
             except Exception as e:

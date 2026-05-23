@@ -310,6 +310,21 @@ class Project(SQLModel, table=True):
     def enable_self_improvement(self) -> bool:
         return bool((self.build_config or {}).get("enable_self_improvement", False))
 
+    @property
+    def stale_branch_prefixes(self) -> tuple[str, ...]:
+        """Branch name prefixes eligible for stale cleanup.
+
+        Reads from build_config.stale_branch_prefixes if set; otherwise returns
+        Blueprint's conventional prefixes (blueprint/, research/, plan/).
+        An empty list in build_config disables cleanup for this project.
+        """
+        from app.services import _STALE_BRANCH_PREFIXES
+
+        configured = (self.build_config or {}).get("stale_branch_prefixes")
+        if configured is not None:
+            return tuple(configured)
+        return _STALE_BRANCH_PREFIXES
+
     def append_routine_digest(self, event_type: str, summary: str) -> None:
         """Append a one-line digest entry for a routine event to running_update.
 
