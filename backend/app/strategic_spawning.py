@@ -1696,6 +1696,27 @@ async def _spawn_strategic_review(
             "for active directions. Defer new feature directions — do not propose "
             "net-new feature work while the version is stabilizing."
         )
+        # When the last qualification carried audit findings, the audit sub-score
+        # is the binding constraint — point the agent at the specific findings so
+        # it creates a TARGETED direction (recommended_mode='audit') rather than
+        # doing blind generic cleanup that may never touch the actual blockers.
+        _last_qual = _open_version.last_qualification or {}
+        _carried_findings = _last_qual.get("audit_findings")
+        if isinstance(_carried_findings, list) and _carried_findings:
+            _top = "; ".join(
+                f"[{f.get('severity', '?')}] {f.get('summary', '')}"
+                for f in _carried_findings[:5]
+                if isinstance(f, dict)
+            )
+            _stabilize_hint += (
+                f" The last qualification's audit flagged {len(_carried_findings)} "
+                f"finding(s) — full list in "
+                f"version_phase.last_qualification.audit_findings — and the audit "
+                f"sub-score is the binding constraint on promotion. Target these "
+                f"specifically: create or update a direction "
+                f"(recommended_mode='audit') to fix them rather than generic "
+                f"cleanup. Top findings: {_top}."
+            )
         prompt_suffix = (
             f"{prompt_suffix}\n{_stabilize_hint}" if prompt_suffix else _stabilize_hint
         )
