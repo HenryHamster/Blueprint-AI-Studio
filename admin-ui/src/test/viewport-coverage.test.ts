@@ -5,6 +5,7 @@ import {
   check375pxOverflow,
   checkBackendPatterns,
   checkBackendEslintPattern,
+  checkBackendExemptionMirror,
   checkEscapeHatchBudget,
 } from './viewport-checks.js';
 
@@ -101,6 +102,24 @@ ${missing.map(p => `  "${p}"`).join('\n')}
     // checkEscapeHatchBudget (ESLINT_VIEWPORT_PATTERN) so operators see counts
     // that exactly match what CI enforces.
     const violations = checkBackendEslintPattern();
+
+    const errorMessage =
+      violations.length > 0
+        ? `
+${violations.join('\n')}
+        `.trim()
+        : '';
+
+    expect(violations, errorMessage).toEqual([]);
+  });
+
+  it('python _EXEMPT_FROM_VIEWPORT_TEST mirror matches the JS canonical exemption set', () => {
+    // The operator Viewport Debt panel computes untested_count using
+    // _EXEMPT_FROM_VIEWPORT_TEST in backend/app/viewport_debt.py. If that
+    // list drifts from the JS EXEMPT_FROM_VIEWPORT_TEST set (the source of
+    // truth that CI uses), operators see a different untested count than
+    // the gate enforces — the exact bug fix #5752 / #5759 addressed.
+    const violations = checkBackendExemptionMirror();
 
     const errorMessage =
       violations.length > 0

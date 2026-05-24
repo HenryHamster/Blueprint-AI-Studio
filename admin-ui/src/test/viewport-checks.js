@@ -23,7 +23,10 @@ export const ESLINT_VIEWPORT_PATTERN = 'eslint-disable[^\\n]*viewport';
 // Single source of truth for viewport-test exemptions.
 // Components listed here are internal/utility and never rendered standalone on
 // an operator page — overflow is handled by the parent that composes them.
-const EXEMPT_FROM_VIEWPORT_TEST = new Set([
+// Keep in sync with the Python mirror in backend/app/viewport_debt.py
+// (_EXEMPT_FROM_VIEWPORT_TEST) so the operator Viewport Debt panel
+// "untested" count matches what the CI gate enforces.
+export const EXEMPT_FROM_VIEWPORT_TEST = new Set([
   // Internal decorator component for error isolation; not operator-facing.
   'ErrorBoundary',
   // Pure presentation: renders markdown blocks, used in help/documentation
@@ -169,7 +172,54 @@ export function checkBackendEslintPattern() {
 }
 
 /**
- * Invariant 6: per-component and total viewport escape-hatch debt stays within
+ * Invariant 6: the Python mirror of EXEMPT_FROM_VIEWPORT_TEST in
+ * backend/app/viewport_debt.py (_EXEMPT_FROM_VIEWPORT_TEST) must contain
+ * exactly the same component names as the JS canonical set. Drift here
+ * silently reintroduces the backend-vs-CI untested_count mismatch that
+ * motivated #5752 / #5759.
+ * Returns human-readable violation strings (empty = pass).
+ */
+export function checkBackendExemptionMirror() {
+  const src = fs.readFileSync(VIEWPORT_DEBT_PY, 'utf-8');
+  // Capture the frozenset literal body so we only parse what's intended as
+  // the exemption list (not random "ErrorBoundary" strings in comments).
+  const m = src.match(/_EXEMPT_FROM_VIEWPORT_TEST[^=]*=\s*frozenset\(\s*\[([\s\S]*?)\]\s*\)/);
+  if (!m) {
+    return [
+      `backend/app/viewport_debt.py: could not locate _EXEMPT_FROM_VIEWPORT_TEST frozenset literal.` +
+      ` Expected: _EXEMPT_FROM_VIEWPORT_TEST: frozenset[str] = frozenset([...]).` +
+      ` Keep its members in sync with EXEMPT_FROM_VIEWPORT_TEST in viewport-checks.js.`,
+    ];
+  }
+  const pyMembers = new Set(
+    Array.from(m[1].matchAll(/["']([A-Za-z_][A-Za-z0-9_]*)["']/g)).map(x => x[1])
+  );
+  const jsMembers = EXEMPT_FROM_VIEWPORT_TEST;
+
+  const violations = [];
+  for (const name of jsMembers) {
+    if (!pyMembers.has(name)) {
+      violations.push(
+        `"${name}" is in EXEMPT_FROM_VIEWPORT_TEST (viewport-checks.js) but missing from` +
+        ` _EXEMPT_FROM_VIEWPORT_TEST in backend/app/viewport_debt.py — add it there so the` +
+        ` Viewport Debt panel untested_count matches CI.`
+      );
+    }
+  }
+  for (const name of pyMembers) {
+    if (!jsMembers.has(name)) {
+      violations.push(
+        `"${name}" is in _EXEMPT_FROM_VIEWPORT_TEST (backend/app/viewport_debt.py) but missing` +
+        ` from EXEMPT_FROM_VIEWPORT_TEST in admin-ui/src/test/viewport-checks.js — add it there` +
+        ` so CI exempts the same components the backend panel does.`
+      );
+    }
+  }
+  return violations;
+}
+
+/**
+ * Invariant 7: per-component and total viewport escape-hatch debt stays within
  * the limits in viewport-escape-hatch-budget.json.
  * Returns human-readable violation strings (empty = pass).
  */

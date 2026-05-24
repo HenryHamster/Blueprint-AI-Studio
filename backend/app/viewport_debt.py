@@ -41,6 +41,20 @@ _DATA_SMALL_TARGET_RE = _re.compile(r"data-viewport-allow-small-target")
 _DATA_OVERFLOW_RE = _re.compile(r"data-viewport-allow-overflow")
 _DATA_TRUNCATION_RE = _re.compile(r"data-viewport-allow-truncation")
 
+# Mirror of EXEMPT_FROM_VIEWPORT_TEST in admin-ui/src/test/viewport-checks.js.
+# Components here are internal/utility and never rendered standalone on operator
+# pages — keep in sync so the Viewport Debt panel "untested" count matches CI.
+_EXEMPT_FROM_VIEWPORT_TEST: frozenset[str] = frozenset(
+    [
+        "ErrorBoundary",
+        "MarkdownContent",
+        "ColumnsPicker",
+        "Toasts",
+        "catchupRows",
+        "regressionPhaseChips",
+    ]
+)
+
 
 def _find_components_dir() -> Optional[_Path]:
     here = _Path(__file__).resolve().parent
@@ -125,11 +139,11 @@ def _scan_viewport_debt_rows() -> tuple[
         cap: Optional[int] = per_component_budget.get(stem)
         headroom: Optional[int] = (cap - total) if cap is not None else None
 
-        if not vp_test:
+        if not vp_test and stem not in _EXEMPT_FROM_VIEWPORT_TEST:
             untested_paths.append(rel_path)
 
         if total == 0:
-            if not vp_test:
+            if not vp_test and stem not in _EXEMPT_FROM_VIEWPORT_TEST:
                 untested_rows.append(
                     {
                         "component": rel_path,
