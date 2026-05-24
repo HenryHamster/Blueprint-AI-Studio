@@ -36,7 +36,11 @@ from app.models import (
 )
 from app.schemas import AgentStatusPayload
 from app.routers.agent import _has_local_cycle
-from app.shared_state import runtime_config as _runtime_config, DEFAULT_TASK_SCOPE
+from app.shared_state import (
+    runtime_config as _runtime_config,
+    DEFAULT_TASK_SCOPE,
+    derive_task_branch as _derive_task_branch,
+)
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project
 from app.payload_schemas import validate_internal_payload
@@ -54,25 +58,6 @@ from app.retry_budget import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Maps task type -> branch prefix used by the agent when naming work branches.
-# Convention: blueprint/{prefix}-{first-8-hex-of-task-uuid}
-# Deliberate subset of the canonical map in agent/src/index.ts /
-# backend/app/services.py: only the non-"task" prefixes these recovery paths
-# derive are listed. Other types (create, qa, fix, ...) fall back to "task" in
-# _derive_task_branch — and fix tasks reuse an existing branch, so they never
-# hit this fallback. Keep the listed prefixes in sync with the canonical map.
-_TASK_TYPE_BRANCH_PREFIX: Dict[str, str] = {
-    "docs": "docs",
-    "deps": "deps",
-    "migrate": "migrate",
-    "refactor": "refactor",
-}
-
-
-def _derive_task_branch(task_id: uuid.UUID, task_type: str | None) -> str:
-    prefix = _TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
-    return f"blueprint/{prefix}-{str(task_id).replace('-', '')[:8]}"
 
 
 class PostCommitLocked(Exception):

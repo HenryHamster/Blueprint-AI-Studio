@@ -23,6 +23,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
+from app.migration_path import is_migration_file
 from app.models import (
     Task,
     Artifact,
@@ -102,7 +103,7 @@ def _extract_rollup_migration_sources(diff: str) -> dict[str, str]:
             path = line[4:].strip()
             if path.startswith("b/"):
                 path = path[2:]
-            if "alembic/versions/" in path and path.endswith(".py"):
+            if is_migration_file(path) and path.endswith(".py"):
                 current = sources.setdefault(path, [])
             else:
                 current = None
@@ -112,7 +113,7 @@ def _extract_rollup_migration_sources(diff: str) -> dict[str, str]:
 
 
 def _touches_alembic_versions(filename: str) -> bool:
-    return "alembic/versions/" in filename and filename.endswith(".py")
+    return is_migration_file(filename) and filename.endswith(".py")
 
 
 async def _validate_rollup_migration_chain(

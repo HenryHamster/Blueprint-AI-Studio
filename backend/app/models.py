@@ -333,6 +333,19 @@ class Project(SQLModel, table=True):
             return tuple(configured)
         return _STALE_BRANCH_PREFIXES
 
+    @property
+    def alembic_versions_path(self) -> str:
+        """Directory prefix for Alembic migration files in this project.
+
+        Reads from build_config.alembic_versions_path if set; otherwise returns
+        Blueprint's conventional path ('backend/alembic/versions/').
+        """
+        from app.migration_path import _DEFAULT_ALEMBIC_VERSIONS_PATH
+
+        return (self.build_config or {}).get(
+            "alembic_versions_path", _DEFAULT_ALEMBIC_VERSIONS_PATH
+        )
+
     def append_routine_digest(self, event_type: str, summary: str) -> None:
         """Append a one-line digest entry for a routine event to running_update.
 

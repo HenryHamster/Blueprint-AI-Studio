@@ -29,6 +29,7 @@ from app.shared_state import (
     record_pipeline_event,
     external_health as _external_health,
     resolve_retry_budget,
+    derive_task_branch as _derive_task_branch,
 )
 from app.failure_classification import (
     classify_failure,
@@ -41,25 +42,6 @@ from app.retry_budget import append_failure_class_history
 from app.time_utils import _utcnow, set_retry_after, RETRY_AFTER_MAX_MINUTES
 
 logger = logging.getLogger(__name__)
-
-# Maps task type -> branch prefix used by the agent when naming work branches.
-# Convention: blueprint/{prefix}-{first-8-hex-of-task-uuid}
-# Deliberate subset of the canonical map in agent/src/index.ts /
-# backend/app/services.py: only the non-"task" prefixes these recovery paths
-# derive are listed. Other types (create, qa, fix, ...) fall back to "task" in
-# _derive_task_branch — and fix tasks reuse an existing branch, so they never
-# hit this fallback. Keep the listed prefixes in sync with the canonical map.
-_TASK_TYPE_BRANCH_PREFIX: Dict[str, str] = {
-    "docs": "docs",
-    "deps": "deps",
-    "migrate": "migrate",
-    "refactor": "refactor",
-}
-
-
-def _derive_task_branch(task_id: uuid.UUID, task_type: str | None) -> str:
-    prefix = _TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
-    return f"blueprint/{prefix}-{str(task_id).replace('-', '')[:8]}"
 
 
 async def _relock_orphan_task(
