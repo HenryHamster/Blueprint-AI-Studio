@@ -519,3 +519,38 @@ def test_taxonomy_infra_related_for_agent_reported_rate_limited():
     assert normalized == "RATE_LIMIT"
     t.context = {"failure_category": normalized}
     assert classify_failure_taxonomy(t) == TAXONOMY_INFRA_RELATED
+
+
+# ── parse_failed + rate-limit correlation ─────────────────────────────────────
+
+
+def test_normalize_agent_category_parse_failed_with_rate_limit_is_rate_limit(
+    monkeypatch,
+):
+    """parse_failed coinciding with an active rate-limit window must be reclassified
+    to RATE_LIMIT so it does not burn the code-error retry budget."""
+    monkeypatch.setattr(
+        "app.failure_classification._account_was_rate_limited",
+        lambda task, at_time=None: True,
+    )
+    monkeypatch.setattr(
+        "app.failure_classification._pool_was_rate_limited", lambda at_time=None: False
+    )
+    t = _task("")
+    assert normalize_agent_failure_category("parse_failed", t) == "RATE_LIMIT"
+
+
+def test_normalize_agent_category_parse_failed_without_rate_limit_is_code_error(
+    monkeypatch,
+):
+    """parse_failed with no active rate-limit window must remain CODE_ERROR —
+    a genuine malformed-output failure should not be silently reclassified."""
+    monkeypatch.setattr(
+        "app.failure_classification._account_was_rate_limited",
+        lambda task, at_time=None: False,
+    )
+    monkeypatch.setattr(
+        "app.failure_classification._pool_was_rate_limited", lambda at_time=None: False
+    )
+    t = _task("")
+    assert normalize_agent_failure_category("parse_failed", t) == "CODE_ERROR"
