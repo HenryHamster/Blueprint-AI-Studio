@@ -6419,16 +6419,18 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
                                         _rr_branch,
                                         project_id=str(project_id),
                                     )
-                                    if _rr_is_anc is False:
+                                    if _rr_is_anc is not True:
                                         logger.info(
                                             "[REGRESSION_DISPATCHER] Skipping close for "
                                             "project=%s class=%s: fix PR #%s merge commit "
-                                            "%s not reachable from %s",
+                                            "%s not confirmed ancestor of %s "
+                                            "(result=%s — indeterminate treated as not landed)",
                                             project_id,
                                             case.regression_class,
                                             _fix_pr_num,
                                             _rr_merge_sha,
                                             _rr_branch,
+                                            _rr_is_anc,
                                         )
                                         continue
                     except Exception as _rr_exc:

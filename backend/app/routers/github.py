@@ -36,7 +36,7 @@ from app.models import (
     UserIntegration,
 )
 from app.secrets_manager import store_user_secret
-from app.shared_state import limiter
+from app.shared_state import limiter, runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -639,8 +639,13 @@ async def github_webhook(
                 branch_whitelist = auto_remediation_config.get(
                     "branch_whitelist", ["main", "master"]
                 )
+                # Always include the configured integration branch so CI failures
+                # on the working trunk are self-healed without manual whitelist edits.
+                effective_whitelist = set(branch_whitelist) | {
+                    _runtime_config.get("integration_branch", "main")
+                }
 
-                if not enabled or head_branch not in branch_whitelist:
+                if not enabled or head_branch not in effective_whitelist:
                     return {"status": "ignored_auto_remediation_disabled"}
 
                 from app.auto_remediation import _handle_main_branch_ci_failure

@@ -1064,6 +1064,129 @@ async def test_reaper_account_cooldown_uses_failure_instant_not_sweep_time(
 
 
 @pytest.mark.asyncio
+async def test_reaper_terminal_persist_uses_failure_instant_not_sweep_time(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """The terminal-persist path must classify at the failure instant, not sweep time.
+
+    Regression guard for reaper.py:2184 — the terminal-fail branch calls
+    ``classify_failure_with_confidence`` with ``at_time=task.last_heartbeat or
+    task.started_at`` (the failure instant). The default ``at_time=None`` would make
+    the classifier resolve the cooldown check against ``_utcnow()`` (the later sweep
+    instant), so a rate-limited death whose cooldown lapsed between failure and sweep
+    gets mislabeled CODE_ERROR/AGENT_TIMEOUT instead of RATE_LIMIT.
+
+    A purely behavioural RATE_LIMIT assertion is infeasible here: every reaper-rewritten
+    terminal status message embeds the reap_reason ("No heartbeat for Ns ..."), and
+    "no heartbeat" matches the AGENT_TIMEOUT keyword bank, short-circuiting the terminal
+    classification *before* the account-state correlation that ``at_time`` feeds
+    (failure_classification.py:1867 vs :1929). So we assert the wiring contract directly:
+    the terminal classify call receives the failure instant. The spy still delegates to
+    the real classifier, and is the LAST ``classify_failure_with_confidence`` call in the
+    cycle, so its captured ``at_time`` reflects the terminal-persist invocation. If the
+    ``at_time`` argument at :2184 is dropped, the captured value becomes ``None`` and this
+    test fails.
+    """
+    import app.failure_classification as fc
+
+    real_cwc = fc.classify_failure_with_confidence
+    captured: dict = {}
+
+    def _spy(task, logs=None, at_time=None):
+        captured["at_time"] = at_time
+        return real_cwc(task, logs=logs, at_time=at_time)
+
+    mocker.patch.object(fc, "classify_failure_with_confidence", side_effect=_spy)
+
+    failure_instant = datetime.utcnow() - timedelta(minutes=10)
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-terminal-at-time",
+        status=TaskStatus.IN_PROGRESS,
+        # attempt_count=2 == CODE_ERROR budget → can_retry False → terminal-persist path.
+        attempt_count=2,
+        last_heartbeat=failure_instant,
+        # Plain code-style error → CODE_ERROR (budget=2) at the budget-decision call.
+        context={"last_error": "NameError: foo is not defined"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED, "task must reach the terminal-persist path"
+    assert "at_time" in captured, (
+        "classify_failure_with_confidence must run on the terminal-persist path"
+    )
+    # The fix: at_time is the failure instant, NOT None (which the classifier would
+    # resolve to the later sweep time _utcnow()).
+    assert captured["at_time"] is not None, (
+        "terminal-persist must pass the failure instant, not None (reaper.py:2184)"
+    )
+    assert captured["at_time"] == failure_instant, (
+        "terminal-persist at_time must equal the failure instant (last_heartbeat)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaper_terminal_persist_falls_back_to_started_at_when_no_heartbeat(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Terminal-persist falls back to started_at when last_heartbeat is None.
+
+    Regression guard for reaper.py:2187 — a never-claimed provision death has
+    last_heartbeat=None, so passing a bare ``task.last_heartbeat`` would hand the
+    classifier ``at_time=None`` (→ sweep time), the exact bug being fixed. The
+    ``or task.started_at`` fallback keeps the cooldown correlation anchored at the
+    failure instant, consistent with the agent_status.py call sites.
+    """
+    import app.failure_classification as fc
+
+    # Empty provision error + any_zone_available (fixture) keep is_infra False, so the
+    # task takes the task-specific provision path and terminal-fails on exhausted budget
+    # rather than being requeued as an infra-wide wait.
+    mocker.patch("app.reaper.get_provision_error", return_value="")
+    mocker.patch("app.reaper.get_vm_zone", return_value=None)
+
+    real_cwc = fc.classify_failure_with_confidence
+    captured: dict = {}
+
+    def _spy(task, logs=None, at_time=None):
+        captured["at_time"] = at_time
+        return real_cwc(task, logs=logs, at_time=at_time)
+
+    mocker.patch.object(fc, "classify_failure_with_confidence", side_effect=_spy)
+
+    started_at = datetime.utcnow() - timedelta(minutes=30)
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-terminal-no-hb",
+        status=TaskStatus.PROVISIONING,
+        # Past the 15-min absolute provision ceiling → reaped as absolute_timeout.
+        started_at=started_at,
+        last_heartbeat=None,
+        # Exhaust the provision retry budget so the task terminal-fails this cycle.
+        context={"provision_failures": 99, "provision_zone": "us-central1-a"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED, "task must reach the terminal-persist path"
+    assert captured.get("at_time") == started_at, (
+        "with last_heartbeat=None, terminal-persist must fall back to started_at "
+        "(reaper.py:2187), not pass None which resolves to sweep time"
+    )
+
+
+@pytest.mark.asyncio
 async def test_reaper_enrichment_block_records_failure_class_from_initial_classification(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):

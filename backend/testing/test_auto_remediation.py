@@ -474,6 +474,79 @@ async def test_check_run_success_ignored(client: AsyncClient, db_session: AsyncS
 
 
 @pytest.mark.asyncio
+async def test_integration_branch_triggers_auto_remediation(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """CI failure on the configured integration branch triggers auto-remediation
+    even when that branch is NOT in the stored branch_whitelist."""
+    await _create_project(db_session)
+    await db_session.commit()
+
+    payload_dict = _build_check_run_webhook_payload(
+        head_branch="automain", conclusion="failure"
+    )
+    payload_bytes = json.dumps(payload_dict).encode()
+    signature = _sign_webhook_payload(payload_bytes)
+
+    patched_runtime = {"integration_branch": "automain"}
+
+    with (
+        patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET),
+        patch("app.routers.github._runtime_config", patched_runtime),
+        patch("app.auto_remediation._handle_main_branch_ci_failure_inner", AsyncMock()),
+    ):
+        response = await client.post(
+            "/api/github/webhook",
+            content=payload_bytes,
+            headers={
+                "x-hub-signature-256": signature,
+                "x-github-event": "check_run",
+                "x-github-delivery": f"test-{uuid.uuid4()}",
+                "content-type": "application/json",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "auto_remediation_triggered"
+
+
+@pytest.mark.asyncio
+async def test_feature_branch_not_in_integration_branch_ignored(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """CI failure on an unrelated feature branch (not in whitelist, not the
+    integration branch) still returns ignored_auto_remediation_disabled."""
+    await _create_project(db_session)
+    await db_session.commit()
+
+    payload_dict = _build_check_run_webhook_payload(
+        head_branch="feature/unrelated", conclusion="failure"
+    )
+    payload_bytes = json.dumps(payload_dict).encode()
+    signature = _sign_webhook_payload(payload_bytes)
+
+    patched_runtime = {"integration_branch": "automain"}
+
+    with (
+        patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET),
+        patch("app.routers.github._runtime_config", patched_runtime),
+    ):
+        response = await client.post(
+            "/api/github/webhook",
+            content=payload_bytes,
+            headers={
+                "x-hub-signature-256": signature,
+                "x-github-event": "check_run",
+                "x-github-delivery": f"test-{uuid.uuid4()}",
+                "content-type": "application/json",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ignored_auto_remediation_disabled"
+
+
+@pytest.mark.asyncio
 async def test_completed_tasks_dont_count_concurrent(db_session: AsyncSession):
     """COMPLETED auto-remediation tasks don't count toward concurrent limit."""
     project = await _create_project(db_session)

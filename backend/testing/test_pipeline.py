@@ -1656,6 +1656,10 @@ def _patch_common_rollup_mocks(mocker):
     mocker.patch(
         "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
     )
+    # The rollup auto-merge path now runs an Alembic combined-chain guard that
+    # lists the rollup PR's files before merging. Default to "no files touched"
+    # so the guard is a no-op; tests exercising the guard override this.
+    mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
     # Match callers' PR head_sha ("abc123") so the pre-merge tip-check is a
     # no-op. Tests exercising the behind-state path override this mock.
     mocker.patch(
@@ -2417,8 +2421,12 @@ async def test_rollup_merge_success_clears_transient_counter_state(rollup_db, mo
     await _check_and_trigger_rollup(child, rollup_db)
     await rollup_db.refresh(parent)
 
-    assert parent.status == TaskStatus.COMPLETED
-    assert (parent.context or {}).get("pr_merged") is True
+    # Auto-merge into a non-integration parent branch lands the rollup but is
+    # not the final landing into the integration branch, so the parent stays
+    # EVALUATING and pr_merged is intentionally NOT set (see #5585). The merge
+    # success path must still scrub all transient deferral/retry counters.
+    assert parent.status == TaskStatus.EVALUATING
+    assert (parent.context or {}).get("pr_merged") is None
     # All transient keys must be gone.
     for key in (
         "_merge_deferred_count",
