@@ -569,11 +569,15 @@ async def _build_shipped_changes_manifest(
     result = await session.execute(stmt)
     completed_tasks = result.scalars().all()
 
-    # Filter to merged tasks and collect manifest entries (cap at 50)
+    # Filter to merged tasks and collect manifest entries (cap at 50).
+    # Only include root tasks (parent_task_id is None): rollup children merge to a
+    # rollup staging branch, not the integration branch, so they have not "shipped"
+    # until the rollup parent itself merges. Including children would tell the design
+    # doc agent that work shipped when it only reached staging.
     manifest_entries: list[dict] = []
     for t in completed_tasks:
         ctx = t.context or {}
-        if not ctx.get("pr_merged"):
+        if not ctx.get("pr_merged") or t.parent_task_id is not None:
             continue
         entry: dict = {
             "title": t.title,
@@ -748,7 +752,15 @@ async def _build_recent_interventions(
             if not updated_at or (since_naive and updated_at < since_naive):
                 continue
             finished += 1
-            if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
+            # Count only integration-landed merges: root tasks (parent_task_id is None)
+            # whose PR merged directly to the integration branch. Child tasks (rollup
+            # members) have pr_merged=True when their PR lands on the rollup staging
+            # branch — not on the integration branch — so they must not be counted here.
+            if (
+                t.status == TaskStatus.COMPLETED
+                and (t.context or {}).get("pr_merged")
+                and t.parent_task_id is None
+            ):
                 merged += 1
         rate = round(merged / finished, 3) if finished > 0 else None
         return {

@@ -2090,6 +2090,57 @@ async def test_build_shipped_manifest_cutoff_from_cycle_history(db_session):
     assert manifest == []
 
 
+@pytest.mark.asyncio
+async def test_build_shipped_manifest_excludes_rollup_children(db_session):
+    """Rollup child tasks (parent_task_id set) are excluded from the manifest.
+
+    A rollup child's PR merges to the rollup staging branch, not the integration
+    branch. Only the rollup parent (root task, parent_task_id=None) should appear
+    in the manifest once its own PR lands on the integration branch.
+    """
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Rollup parent — its PR landed on the integration branch
+    parent = Task(
+        project_id=project.id,
+        title="Rollup: ship feature X",
+        description="rollup",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "direction_id": "d-001"},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    # Rollup child — its PR merged to the staging branch only
+    child = Task(
+        project_id=project.id,
+        title="child: add helper",
+        description="child",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        parent_task_id=parent.id,
+        context={"pr_merged": True, "direction_id": "d-001"},
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    manifest = await _build_shipped_changes_manifest(project, db_session)
+
+    # Only the root task should appear; the child should be excluded
+    assert len(manifest) == 1
+    assert manifest[0]["direction_id"] == "d-001"
+    assert len(manifest[0]["tasks"]) == 1
+    assert manifest[0]["tasks"][0]["title"] == "Rollup: ship feature X"
+
+
 # ── predict_spawn_success: quality-score and momentum signals ─────────────────
 
 
@@ -4279,6 +4330,58 @@ async def test_on_automain_false_when_rollup_not_merged(db_session):
     assert len(merges) == 1
     assert merges[0]["pr_title"] == "Staged fix"
     assert merges[0]["on_automain"] is False
+
+
+@pytest.mark.asyncio
+async def test_rolling_rates_exclude_rollup_children(db_session):
+    """Rollup children (parent_task_id set) are not counted as merged in rolling_rates.
+
+    A rollup child's pr_merged=True means its PR landed on the rollup staging branch,
+    not the integration branch. Only the rollup parent (root task) should count
+    toward the merged counter in rolling_rates when it lands on integration.
+    """
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Rollup parent — merged to integration branch
+    parent = Task(
+        project_id=project.id,
+        title="Rollup parent",
+        description="rollup",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    # Two rollup children — each merged to staging only
+    for i in range(2):
+        child = Task(
+            project_id=project.id,
+            title=f"Child fix {i}",
+            description="child",
+            payloads=[{"type": "create"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            parent_task_id=parent.id,
+            context={"pr_merged": True},
+        )
+        db_session.add(child)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    rates = result["rolling_rates"]
+    # Only the root parent counts as a merged task; the two children are staging-only
+    assert rates["last_7d"]["merged"] == 1, (
+        f"Expected 1 integration-landed merge (root task only), "
+        f"got {rates['last_7d']['merged']}"
+    )
 
 
 # ── git-ancestry landing verification in _build_recent_interventions ──────────

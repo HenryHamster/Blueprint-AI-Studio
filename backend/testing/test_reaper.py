@@ -1128,6 +1128,72 @@ async def test_reaper_db_rl_cross_instance_silent_death_free_requeue(
 
 
 @pytest.mark.asyncio
+async def test_reaper_db_rl_pool_wide_accountless_silent_death_free_requeue(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Pool-wide cooldown (no account ID) → RATE_LIMIT free requeue without burning budget.
+
+    Regression guard for the accountless pool-wide branch in reaper.py (the `elif`
+    after db_account_was_rate_limited). Scenario: a task has no max_plan_account_id
+    (either never assigned or cleared), and the provider pool was fully blocked at
+    failure time. The reaper must classify it as RATE_LIMIT and requeue without
+    incrementing attempt_count, since the task had no actionable account to blacklist.
+    """
+    mocker.patch("app.max_plan_pool.disable_account_model", new_callable=AsyncMock)
+    mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
+    # In-memory caches both return False — pool-wide cooldown only in DB.
+    mocker.patch(
+        "app.failure_classification._account_was_rate_limited", return_value=False
+    )
+    mocker.patch(
+        "app.failure_classification._pool_was_rate_limited", return_value=False
+    )
+    # DB account check not called / returns False (no account ID on task).
+    mocker.patch(
+        "app.max_plan_pool.db_account_was_rate_limited",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+    # Pool-wide DB check returns True — this is the branch under test.
+    mocker.patch(
+        "app.max_plan_pool.db_pool_wide_rate_limit_cooldown",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "model": "sonnet"}],
+        vm_instance_id="vm-pool-rl-accountless",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={
+            # No max_plan_account_id — accountless task.
+            # No rate-limit keywords in last_error — purely pool-wide DB signal.
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    ctx = t.context or {}
+    assert t.status == TaskStatus.QUEUED, (
+        "pool-wide DB-correlated RL must requeue (not FAILED)"
+    )
+    assert t.attempt_count == 1, (
+        "pool-wide DB-correlated RL must not burn attempt budget"
+    )
+    # No account to blacklist — blacklisted_accounts should be absent or empty.
+    assert not ctx.get("blacklisted_accounts"), (
+        "accountless RL requeue must not create a spurious blacklisted_accounts entry"
+    )
+
+
+@pytest.mark.asyncio
 async def test_reaper_db_rl_verdict_persisted_stable_under_analytics(
     reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):
