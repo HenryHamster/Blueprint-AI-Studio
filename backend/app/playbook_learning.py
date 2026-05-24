@@ -3849,8 +3849,40 @@ async def compute_sr_catch_rate_trends(
     cycle_rows = (await session.execute(cycle_stmt)).scalars().all()
 
     if len(cycle_rows) >= 2:
+        # Targeted fetch scoped to the candidate cycle IDs — no date cap, no row
+        # cap — so each cycle's full task set is available for comparison,
+        # independent of the throughput-capped recency window in all_tasks.
+        _relevant_cycle_ids = [r.id for r in cycle_rows]
+        _dialect = session.bind.dialect.name if session.bind else "postgresql"
+        _cycle_where = [
+            Task.project_id == project_id,
+            Task.status.in_([TaskStatus.FAILED, TaskStatus.COMPLETED]),
+            Task.strategic_cycle_id.in_(_relevant_cycle_ids),
+        ]
+        if _dialect != "sqlite":
+            _cycle_where.append(Task.context.has_key("_self_review_outcome"))
+        _cycle_tasks = (
+            (
+                await session.execute(
+                    select(Task)
+                    .options(
+                        load_only(
+                            Task.id,
+                            Task.context,
+                            Task.created_at,
+                            Task.project_id,
+                            Task.strategic_cycle_id,
+                            Task.payloads,
+                        )
+                    )
+                    .where(*_cycle_where)
+                )
+            )
+            .scalars()
+            .all()
+        )
         task_by_cycle: dict[str, list] = {}
-        for t in all_tasks:
+        for t in _cycle_tasks:
             cid = getattr(t, "strategic_cycle_id", None)
             if cid:
                 task_by_cycle.setdefault(cid, []).append(t)

@@ -9398,6 +9398,72 @@ async def test_fallback_to_calendar_windows_when_no_completed_cycles(
 
 
 @pytest.mark.asyncio
+async def test_cycle_mode_fetches_full_cycle_independent_of_all_tasks(
+    db_session: AsyncSession,
+):
+    """Cycle-mode compares complete cycles even when all_tasks is empty.
+
+    Simulates a high-throughput scenario where the caller's recency-capped
+    all_tasks list no longer contains any previous-cycle tasks.  The targeted
+    per-cycle DB fetch inside compute_sr_catch_rate_trends must still recover
+    the full previous-cycle task set and produce the correct hit rate.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    c_cycle = _make_cycle(project.id, age_days=2)
+    p_cycle = _make_cycle(project.id, age_days=20)
+    db_session.add(c_cycle)
+    db_session.add(p_cycle)
+    await db_session.flush()
+
+    # Current cycle: 5 tasks, 3/5 hit.
+    for i in range(3):
+        t = _make_sr_task(
+            project.id,
+            age_days=1,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        t.strategic_cycle_id = c_cycle.id
+        db_session.add(t)
+    for i in range(2):
+        t = _make_sr_task(
+            project.id, age_days=1, human_cats={"correctness": 1}, sr_failed_cats=[]
+        )
+        t.strategic_cycle_id = c_cycle.id
+        db_session.add(t)
+    # Previous cycle: 5 tasks, 5/5 hit — would be evicted by a flat recency cap.
+    for i in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=19,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        t.strategic_cycle_id = p_cycle.id
+        db_session.add(t)
+    await db_session.flush()
+
+    # Pass all_tasks=[] to simulate the previous cycle being absent from the
+    # caller's recency-capped window.  The function must fetch cycle tasks itself.
+    result = await compute_sr_catch_rate_trends(project.id, db_session, [])
+
+    assert result is not None, "expected cycle-mode result even with empty all_tasks"
+    assert result["bucket_mode"] == "cycle"
+    assert result["current_cycle_id"] == c_cycle.id
+    assert result["previous_cycle_id"] == p_cycle.id
+    cat = result["categories"]["correctness"]
+    # Previous cycle must reflect all 5 tasks (5/5 hit), not a truncated tail.
+    assert cat["previous_hit_rate"] == 1.0, (
+        f"previous hit rate {cat['previous_hit_rate']} != 1.0 — "
+        "previous cycle was truncated by recency cap instead of fetched directly"
+    )
+    assert cat["current_hit_rate"] == round(3 / 5, 3)
+    assert cat["trend"] == "decreasing"
+
+
+@pytest.mark.asyncio
 async def test_regression_alert_dedup_tied_to_cycle_id(db_session: AsyncSession):
     """Second call with same cycle_id + regressing cats does NOT re-fire notification."""
     from app.playbook_learning import compute_sr_catch_rate_trends
