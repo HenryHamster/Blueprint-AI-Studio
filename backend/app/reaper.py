@@ -731,6 +731,7 @@ async def reaper_service():
     from app.max_plan_pool import (
         clear_task_llm_runtime_context,
         db_account_was_rate_limited,
+        db_pool_wide_rate_limit_cooldown,
         disable_account_model,
         get_task_llm_account_id,
         _extract_task_model,
@@ -1441,10 +1442,10 @@ async def reaper_service():
                         # agent_status.py already applies on the agent-reported path.
                         if not is_rate_limited and not is_spot_preemption:
                             _db_rl_acct = get_task_llm_account_id(fresh_task)
+                            _at_time_rl = (
+                                fresh_task.last_heartbeat or fresh_task.started_at
+                            )
                             if _db_rl_acct:
-                                _at_time_rl = (
-                                    fresh_task.last_heartbeat or fresh_task.started_at
-                                )
                                 if await db_account_was_rate_limited(
                                     _db_rl_acct, at_time=_at_time_rl
                                 ):
@@ -1455,6 +1456,15 @@ async def reaper_service():
                                         fresh_task.id,
                                         _db_rl_acct,
                                     )
+                            elif await db_pool_wide_rate_limit_cooldown(
+                                at_time=_at_time_rl
+                            ):
+                                is_rate_limited = True
+                                logger.info(
+                                    "[REAPER] Task %s (no account) reclassified RATE_LIMIT "
+                                    "via pool-wide DB state — pool was fully blocked at failure time",
+                                    fresh_task.id,
+                                )
 
                         # 2. Rate-limited account-disable I/O (called only when is_rate_limited
                         #    AND not is_spot_preemption; mirrors the original elif chain where

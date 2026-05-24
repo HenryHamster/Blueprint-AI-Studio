@@ -52,6 +52,7 @@ from app.max_plan_pool import (
     clear_rate_limit_state_on_success,
     clear_regression_on_success,
     db_account_was_rate_limited,
+    db_pool_wide_rate_limit_cooldown,
     disable_account_for_auth,
     disable_account_model,
     get_task_llm_account_id,
@@ -1035,7 +1036,7 @@ async def update_agent_status(
         _db_rl = (
             await db_account_was_rate_limited(_fc_acct_id, at_time=_fc_at_time)
             if _fc_acct_id
-            else False
+            else await db_pool_wide_rate_limit_cooldown(at_time=_fc_at_time)
         )
         normalized_failure_category = normalize_agent_failure_category(
             payload.failure_category,
@@ -2153,7 +2154,9 @@ async def update_agent_status(
                             _fc_acct_id2, at_time=_fc_at_time2
                         )
                         if _fc_acct_id2
-                        else False
+                        else await db_pool_wide_rate_limit_cooldown(
+                            at_time=_fc_at_time2
+                        )
                     )
                     ctx = dict(task.context or {})
                     ctx["failure_category"] = normalize_agent_failure_category(

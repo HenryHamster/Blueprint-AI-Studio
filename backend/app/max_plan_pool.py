@@ -1307,6 +1307,84 @@ async def db_account_was_rate_limited(
         return False
 
 
+def _db_account_runtime_ready(acct: Any) -> bool:
+    """DB-row equivalent of _account_runtime_ready (which operates on in-memory dicts).
+
+    Mirrors the in-memory readiness check so db_pool_wide_rate_limit_cooldown can
+    determine whether an enabled account is *potentially* usable (i.e., has runtime
+    credentials) from a DB row alone, without consulting the in-memory pool.
+
+    For Anthropic OAuth (the only currently-runnable v1 path) this is `oauth_token`.
+    Other provider/auth combinations are stored for future use; their runtime
+    readiness is in-memory-only state (set by ensure_runtime_credentials during pool
+    init), so from a DB row we cannot prove they're ready — treat them as not-ready
+    to stay consistent with the in-memory classifier's failure-open behavior.
+    """
+    try:
+        provider = getattr(acct.provider, "value", str(acct.provider or "")).lower()
+        auth_mode = getattr(acct.auth_mode, "value", str(acct.auth_mode or "")).lower()
+        if (
+            provider == LLMProviderName.ANTHROPIC.value
+            and auth_mode == LLMAuthMode.OAUTH.value
+        ):
+            return bool(acct.oauth_token)
+        return False
+    except Exception:
+        return False
+
+
+async def db_pool_wide_rate_limit_cooldown(at_time: datetime | None = None) -> bool:
+    """Return True if the pool is rate-limit blocked per DB state.
+
+    DB-backed cross-instance equivalent of pool_wide_rate_limit_cooldown. Use as a
+    fallback when the in-memory pool may not reflect the current state — e.g., when
+    a different Cloud Run instance recorded the cooldown, or when no account was
+    assigned to the failed task (accountless death) so per-account checks are skipped.
+
+    Mirrors the in-memory classifier's semantics rather than requiring every account
+    to be in cooldown. An enabled account is "potentially usable" iff it has runtime
+    credentials AND has no rate-limit entries in its persisted state — matching the
+    in-memory _account_state_for_model(model=None) path, which conservatively treats
+    any disabled_models entry as unavailable at model=None. The pool is classified as
+    rate-limit blocked iff no enabled account is potentially usable AND at least one
+    enabled account is in active rate-limit cooldown. This correctly handles the
+    mixed-state pool (e.g., one account rate-limited, another missing credentials):
+    if the only thing blocking the pool from being usable IS the cooldown, classify
+    the failure as RATE_LIMIT rather than burning retry budget as AGENT_TIMEOUT.
+
+    Returns False on any DB/parse error or when the pool has no enabled accounts.
+    Never raises.
+    """
+    try:
+        from sqlmodel import select as sql_select
+        from app.models import MaxPlanAccount
+
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                sql_select(MaxPlanAccount).where(MaxPlanAccount.enabled == True)  # noqa: E712
+            )
+            accounts = result.scalars().all()
+
+        if not accounts:
+            return False
+
+        any_in_cooldown = False
+        for acct in accounts:
+            disabled_models = (acct.rate_limit_state or {}).get("disabled_models") or {}
+            # Potentially-usable mirror of in-memory model=None path: must have
+            # credentials AND no rate-limit entries at all (expired or not).
+            if _db_account_runtime_ready(acct) and not disabled_models:
+                return False
+            if acct.is_in_rate_limit_cooldown(at_time=at_time):
+                any_in_cooldown = True
+        return any_in_cooldown
+    except Exception:
+        logger.debug(
+            "[MAX_PLAN_POOL] db_pool_wide_rate_limit_cooldown degraded to False"
+        )
+        return False
+
+
 def describe_pool_blockage(model: str | None, user_id: str | None = None) -> str:
     """Human-readable description of why no account can pick up a task.
     Used by reaper queued-age alerts to distinguish rate-limit cooldown from

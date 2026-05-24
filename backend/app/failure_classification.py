@@ -1698,8 +1698,15 @@ def _classify_failure_class(
     # Empty/whitespace-only combined log — agent crashed or never communicated.
     # Check account state FIRST: a silent death during a rate-limit cooldown
     # should classify as RATE_LIMIT, not AGENT_TIMEOUT, so no retry attempt is burned.
+    # Pool-wide check covers pre-assignment deaths (no account assigned yet) and
+    # cross-instance cases where db_rl_override carries the durable DB signal.
     if not combined.strip():
-        if _account_was_rate_limited(task, at_time=at_time):
+        if (
+            db_rl_override
+            or _account_was_rate_limited(task, at_time=at_time)
+            or _pool_was_rate_limited(at_time)
+        ):
+            _persist_correlation_reclassification_context(task)
             return RATE_LIMIT
         return AGENT_TIMEOUT
 

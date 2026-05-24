@@ -3012,3 +3012,48 @@ class TestReaperDbRlOverrideClassifyFailure:
 
         task = _task("", ctx={"failure_category": "test_failed"})
         assert classify_failure(task, db_rl_override=True) == CODE_ERROR
+
+
+class TestSilentDeathPoolWideCoverage:
+    """Empty-combined-log path (no status message, no failure_category) with pool-wide block.
+
+    Regression: the empty-combined early exit previously only checked
+    _account_was_rate_limited, so a pre-assignment death during a pool-wide
+    block returned AGENT_TIMEOUT instead of RATE_LIMIT.
+    """
+
+    def test_accountless_silent_death_pool_blocked_rate_limit(self, monkeypatch):
+        """No account assigned, empty log, pool blocked → RATE_LIMIT (not AGENT_TIMEOUT)."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+        )
+        # No failure_category, no account id, empty status message — pure silent death.
+        task = _task("", ctx={})
+        assert classify_failure(task) == RATE_LIMIT
+        assert task.context.get("rate_limit_correlation_reclassified") is True
+
+    def test_accountless_silent_death_pool_not_blocked_agent_timeout(self, monkeypatch):
+        """No account, empty log, pool not blocked → AGENT_TIMEOUT (no false positive)."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+        task = _task("", ctx={})
+        assert classify_failure(task) == AGENT_TIMEOUT
+
+    def test_db_rl_override_silent_death_no_failure_category(self, monkeypatch):
+        """Cross-instance: empty log, no failure_category, db_rl_override=True → RATE_LIMIT."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+        task = _task("", ctx={})
+        assert classify_failure(task, db_rl_override=True) == RATE_LIMIT
+        assert task.context.get("rate_limit_correlation_reclassified") is True

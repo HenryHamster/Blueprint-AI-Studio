@@ -765,3 +765,151 @@ async def test_db_account_was_rate_limited_db_error_degrades_to_false(monkeypatc
 
     result = await db_account_was_rate_limited("acct-id")
     assert result is False
+
+
+# ── db_pool_wide_rate_limit_cooldown: mixed-state pool classification ────────
+
+
+def _mock_db_pool(monkeypatch, accounts):
+    """Patch AsyncSessionLocal so db_pool_wide_rate_limit_cooldown sees `accounts`."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    mock_result = MagicMock()
+    mock_result.scalars.return_value.all.return_value = accounts
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(return_value=mock_result)
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        "app.max_plan_pool.AsyncSessionLocal", MagicMock(return_value=mock_session)
+    )
+
+
+@pytest.mark.asyncio
+async def test_db_pool_wide_cooldown_mixed_rate_limited_and_credentialless(monkeypatch):
+    """Mixed pool — one account rate-limited, another missing credentials — must
+    still be classified as RATE_LIMIT blocked. Mirrors the in-memory classifier:
+    if no enabled account is potentially usable AND at least one has an active
+    rate-limit entry, the failure is a rate-limit, not an AGENT_TIMEOUT."""
+    from datetime import datetime, timedelta
+    from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
+    from app.models import MaxPlanAccount
+
+    rl_at = datetime.utcnow() - timedelta(minutes=5)
+    rl_acct = MaxPlanAccount(
+        user_id="u",
+        name="rl",
+        oauth_token="tok-rl",  # has credentials
+        rate_limit_state={
+            "disabled_models": {
+                "claude-sonnet-4-6": {
+                    "at": rl_at.isoformat(),
+                    "hits": 1,
+                    "kind": "rate_limit",
+                }
+            }
+        },
+    )
+    no_creds_acct = MaxPlanAccount(
+        user_id="u",
+        name="no-creds",
+        oauth_token=None,  # missing runtime credentials
+        rate_limit_state=None,
+    )
+    _mock_db_pool(monkeypatch, [rl_acct, no_creds_acct])
+
+    assert await db_pool_wide_rate_limit_cooldown() is True
+
+
+@pytest.mark.asyncio
+async def test_db_pool_wide_cooldown_returns_false_when_account_potentially_usable(
+    monkeypatch,
+):
+    """A healthy enabled account with credentials and no rate-limit entries means
+    the pool is NOT pool-wide rate-limited — even if a sibling account is in
+    active cooldown. The healthy account can pick up the next task."""
+    from datetime import datetime, timedelta
+    from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
+    from app.models import MaxPlanAccount
+
+    rl_at = datetime.utcnow() - timedelta(minutes=5)
+    rl_acct = MaxPlanAccount(
+        user_id="u",
+        name="rl",
+        oauth_token="tok-rl",
+        rate_limit_state={
+            "disabled_models": {
+                "claude-sonnet-4-6": {
+                    "at": rl_at.isoformat(),
+                    "hits": 1,
+                    "kind": "rate_limit",
+                }
+            }
+        },
+    )
+    healthy_acct = MaxPlanAccount(
+        user_id="u",
+        name="healthy",
+        oauth_token="tok-healthy",
+        rate_limit_state=None,
+    )
+    _mock_db_pool(monkeypatch, [rl_acct, healthy_acct])
+
+    assert await db_pool_wide_rate_limit_cooldown() is False
+
+
+@pytest.mark.asyncio
+async def test_db_pool_wide_cooldown_returns_false_when_all_accounts_credentialless(
+    monkeypatch,
+):
+    """Pool with no usable accounts and no rate-limit entries is NOT a rate-limit
+    cooldown — it's a misconfiguration. Must return False so the failure path
+    doesn't burn retry budget as RATE_LIMIT when the real cause is missing creds."""
+    from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
+    from app.models import MaxPlanAccount
+
+    a = MaxPlanAccount(user_id="u", name="a", oauth_token=None, rate_limit_state=None)
+    b = MaxPlanAccount(user_id="u", name="b", oauth_token=None, rate_limit_state=None)
+    _mock_db_pool(monkeypatch, [a, b])
+
+    assert await db_pool_wide_rate_limit_cooldown() is False
+
+
+@pytest.mark.asyncio
+async def test_db_pool_wide_cooldown_returns_false_when_pool_empty(monkeypatch):
+    """No enabled accounts in DB → False, never raises."""
+    from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
+
+    _mock_db_pool(monkeypatch, [])
+    assert await db_pool_wide_rate_limit_cooldown() is False
+
+
+@pytest.mark.asyncio
+async def test_db_pool_wide_cooldown_returns_false_when_only_expired_entries(
+    monkeypatch,
+):
+    """All accounts have stale (expired) rate-limit entries but no active cooldown
+    and no usable accounts → the pool is "unavailable" but not actively rate-limited.
+    Must return False so the failure isn't misclassified as RATE_LIMIT."""
+    from datetime import datetime, timedelta
+    from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
+    from app.models import MaxPlanAccount
+
+    # hits=1 → 30-min window; 2h ago → expired
+    expired_at = datetime.utcnow() - timedelta(hours=2)
+    a = MaxPlanAccount(
+        user_id="u",
+        name="a",
+        oauth_token="tok-a",
+        rate_limit_state={
+            "disabled_models": {
+                "claude-sonnet-4-6": {
+                    "at": expired_at.isoformat(),
+                    "hits": 1,
+                    "kind": "rate_limit",
+                }
+            }
+        },
+    )
+    _mock_db_pool(monkeypatch, [a])
+    assert await db_pool_wide_rate_limit_cooldown() is False
