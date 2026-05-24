@@ -1416,6 +1416,16 @@ async def test_llm_cost_breakdown_endpoint_window_days_validation(
 @pytest.mark.asyncio
 async def test_read_baseline_with_drift_includes_reuse_funnel(db_session):
     """read_baseline_with_drift must include a reuse_funnel key with rolling counters."""
+    import app.warm_backlog_reuse as wbr
+
+    # The funnel counters are process-global rolling deques; clear them so
+    # events recorded by earlier tests in the same shard don't bleed in.
+    wbr._vms_with_eligible_backlog_events.clear()
+    wbr._teardown_defers_events.clear()
+    wbr._next_role_polls_during_defer_events.clear()
+    wbr._warm_claims_succeeded_events.clear()
+    wbr._claim_skipped_events.clear()
+
     project = make_project(design_doc={})
     db_session.add(project)
     await db_session.commit()
