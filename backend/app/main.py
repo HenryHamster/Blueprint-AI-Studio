@@ -2002,24 +2002,23 @@ async def prometheus_metrics(request: Request):
 app.state.limiter = limiter
 
 
-def _cors_aware_rate_limit_handler(request: Request, exc: RateLimitExceeded):
-    """Same as slowapi's default 429 handler, but also emits CORS headers.
+def _apply_cors_headers(resp: JSONResponse, request: Request) -> JSONResponse:
+    """Echo the request Origin onto an error response so the browser surfaces
+    the real status code instead of a phantom CORS failure.
 
-    Without this, a rate-limited response from a cross-origin caller lacks
-    Access-Control-Allow-Origin and the browser surfaces it as a CORS error
-    instead of a 429 — indistinguishable from a genuine CORS misconfiguration.
-    Frontend bursts (parallel initial-load fetches) are the typical trigger.
+    Starlette's CORSMiddleware only adds Access-Control-Allow-Origin to
+    responses produced by route handlers — exception-handler responses run
+    outside it. Cloud Run's frontend then injects a wildcard `*`, which is
+    incompatible with `allow_credentials=true` and the browser rejects it.
+    Authenticated callers thus see every 429/5xx as "No 'Access-Control-Allow-
+    Origin' header is present" rather than the real status. Echoing the
+    specific origin (or `*` when explicitly allowed) restores the actual
+    error to the client.
+
+    allowed_origins is defined further down in this module and mutated per
+    deployment via ALLOWED_ORIGINS env; resolve at call time.
     """
-    resp = JSONResponse(
-        status_code=429,
-        content={
-            "error": {"code": 429, "message": f"Rate limit exceeded: {exc.detail}"}
-        },
-        headers={"Retry-After": "5"},
-    )
     origin = request.headers.get("origin")
-    # allowed_origins is defined further down in this module and mutated per
-    # deployment via ALLOWED_ORIGINS env; resolve at call time.
     if origin and (origin in allowed_origins or "*" in allowed_origins):
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Access-Control-Allow-Credentials"] = "true"
@@ -2029,15 +2028,31 @@ def _cors_aware_rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return resp
 
 
+def _cors_aware_rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    """slowapi's default 429 handler + CORS headers via _apply_cors_headers.
+
+    Frontend bursts (parallel initial-load fetches) are the typical trigger.
+    """
+    resp = JSONResponse(
+        status_code=429,
+        content={
+            "error": {"code": 429, "message": f"Rate limit exceeded: {exc.detail}"}
+        },
+        headers={"Retry-After": "5"},
+    )
+    return _apply_cors_headers(resp, request)
+
+
 app.add_exception_handler(RateLimitExceeded, _cors_aware_rate_limit_handler)
 
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
+    resp = JSONResponse(
         status_code=exc.status_code,
         content={"error": {"code": exc.status_code, "message": exc.detail}},
     )
+    return _apply_cors_headers(resp, request)
 
 
 @app.exception_handler(RequestValidationError)
@@ -2050,12 +2065,13 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         if ctx:
             clean["ctx"] = {k: str(v) for k, v in ctx.items()}
         errors.append(clean)
-    return JSONResponse(
+    resp = JSONResponse(
         status_code=422,
         content={
             "error": {"code": 422, "message": "Validation Error", "details": errors}
         },
     )
+    return _apply_cors_headers(resp, request)
 
 
 @app.exception_handler(Exception)
@@ -2064,10 +2080,11 @@ async def generic_exception_handler(request: Request, exc: Exception):
         f"[UNHANDLED] {request.method} {request.url.path}: {type(exc).__name__}: {exc}",
         exc_info=True,
     )
-    return JSONResponse(
+    resp = JSONResponse(
         status_code=500,
         content={"detail": f"{type(exc).__name__}: {str(exc)[:200]}"},
     )
+    return _apply_cors_headers(resp, request)
 
 
 # Add CORS Middleware so the frontend can call these APIs
