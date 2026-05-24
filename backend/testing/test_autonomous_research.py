@@ -3081,6 +3081,89 @@ def test_no_hardcoded_main_base_branch_in_autonomous_spawns():
     )
 
 
+@pytest.mark.asyncio
+async def test_spawn_uses_project_integration_branch_column(db_session, monkeypatch):
+    """A project-level integration_branch column takes precedence over the global
+    runtime_config value.  Two projects with different values resolve independently.
+    """
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "integration_branch", "global-trunk"
+    )
+    project_a = Project(
+        name="Project A override",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-bca01")],
+        vision={"purpose": "test"},
+        integration_branch="project-a-main",
+    )
+    project_b = Project(
+        name="Project B override",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-bcb01")],
+        vision={"purpose": "test"},
+        integration_branch="project-b-main",
+    )
+    db_session.add(project_a)
+    db_session.add(project_b)
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    await _spawn_research_task(project_a, db_session)
+    await _spawn_research_task(project_b, db_session)
+
+    result_a = await db_session.execute(
+        select(Task).where(Task.project_id == project_a.id)
+    )
+    for t in result_a.scalars().all():
+        assert t.first_payload.get("base_branch") == "project-a-main", (
+            f"project_a task {t.id} used wrong branch: {t.first_payload.get('base_branch')}"
+        )
+
+    result_b = await db_session.execute(
+        select(Task).where(Task.project_id == project_b.id)
+    )
+    for t in result_b.scalars().all():
+        assert t.first_payload.get("base_branch") == "project-b-main", (
+            f"project_b task {t.id} used wrong branch: {t.first_payload.get('base_branch')}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_spawn_falls_back_to_global_when_no_build_config_override(
+    db_session, monkeypatch
+):
+    """When build_config has no integration_branch key, the global runtime_config
+    value is used — behavior is byte-for-byte identical to before this change.
+    """
+    monkeypatch.setitem(
+        _shared_state.runtime_config, "integration_branch", "global-branch"
+    )
+    project = Project(
+        name="No override project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-bcfb01")],
+        vision={"purpose": "test"},
+        build_config={"some_other_key": True},  # no integration_branch key
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    spawned = result.scalars().all()
+    assert spawned
+    for t in spawned:
+        assert t.first_payload.get("base_branch") == "global-branch", (
+            f"task {t.id} should use global fallback, got: {t.first_payload.get('base_branch')}"
+        )
+
+
 def test_auto_decompose_keeps_two_module_medium_finding_intact():
     """2-module medium findings pass through without decomposition.
 

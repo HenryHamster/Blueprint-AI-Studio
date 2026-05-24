@@ -27,7 +27,10 @@ from app.payload_schemas import (
     PayloadTooLargeError,
 )
 import app.shared_state as _shared_state
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import (
+    get_project_integration_branch as _get_project_integration_branch,
+    runtime_config as _runtime_config,
+)
 from app.max_plan_pool import _max_plan_pools, _account_available_for_model
 from app.time_utils import _utcnow
 from app.autonomous_research_diagnosis import _spawn_direction_diagnosis  # noqa: F401 — re-export for backwards compat
@@ -939,7 +942,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     # will break when that rollup cleans up.  Actual subresearch (spawned by
     # _handle_research_completion with parent_task_id set) correctly inherits
     # its parent's staging branch.
-    base_branch = _runtime_config.get("integration_branch", "main")
+    base_branch = _get_project_integration_branch(project)
 
     # Use per-type defaults
     research_model = _runtime_config.get("task_type_models", {}).get("research") or None
@@ -1525,7 +1528,7 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
         .scalars()
         .first()
     )
-    _integration_branch = _runtime_config.get("integration_branch", "main")
+    _integration_branch = _get_project_integration_branch(project)
     base_branch = (
         (recent_task.first_payload).get("base_branch", _integration_branch)
         if recent_task
@@ -1769,7 +1772,7 @@ async def _spawn_direction_hold_investigation(
             {
                 "type": "investigate",
                 "prompt": prompt,
-                "base_branch": _runtime_config.get("integration_branch", "main"),
+                "base_branch": _get_project_integration_branch(project),
             },
             "autonomous_research:direction_hold_investigation",
         )
@@ -1996,20 +1999,15 @@ async def _spawn_task_failure_investigation(
             return False
 
     direction: dict = {}
-    if direction_id:
-        project = await session.get(Project, task.project_id)
-        if project is not None:
-            direction = (
-                next(
-                    (
-                        d
-                        for d in (project.directions or [])
-                        if d.get("id") == direction_id
-                    ),
-                    {},
-                )
-                or {}
+    _project = await session.get(Project, task.project_id)
+    if direction_id and _project is not None:
+        direction = (
+            next(
+                (d for d in (_project.directions or []) if d.get("id") == direction_id),
+                {},
             )
+            or {}
+        )
 
     payload = task.first_payload or {}
     ttype = payload.get("type") or ""
@@ -2087,7 +2085,7 @@ async def _spawn_task_failure_investigation(
         {
             "type": "investigate",
             "prompt": prompt,
-            "base_branch": _runtime_config.get("integration_branch", "main"),
+            "base_branch": _get_project_integration_branch(_project),
         },
         "autonomous_research:task_failure_investigation",
     )
@@ -2206,6 +2204,8 @@ async def _spawn_review_convergence_investigation(
             )
             return None
 
+    _project = await session.get(Project, orig_task.project_id)
+
     history = (
         review_history
         or (orig_task.context or {}).get("review_loop", {}).get("review_history")
@@ -2247,7 +2247,7 @@ async def _spawn_review_convergence_investigation(
         {
             "type": "investigate",
             "prompt": prompt,
-            "base_branch": _runtime_config.get("integration_branch", "main"),
+            "base_branch": _get_project_integration_branch(_project),
         },
         "autonomous_research:review_convergence_investigation",
     )
@@ -2562,7 +2562,7 @@ async def _spawn_residual_fingerprint_remediation(
             {
                 "type": "create",
                 "prompt": prompt,
-                "base_branch": _runtime_config.get("integration_branch", "main"),
+                "base_branch": _get_project_integration_branch(project),
             },
             "autonomous_research:residual_fingerprint_remediation",
         )

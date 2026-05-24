@@ -4420,3 +4420,63 @@ async def test_on_automain_false_for_root_task_ancestry_api_exception(
     assert merges[0]["pr_title"] == "API-error root fix"
     # API exception → task absent from _automain_verified → fail-closed = False
     assert merges[0]["on_automain"] is False
+
+
+# ── Per-project integration_branch resolution (column-based) ─────────────────
+
+
+class TestGetProjectIntegrationBranch:
+    """get_project_integration_branch() — the canonical column-based resolver.
+
+    Per-project value lives on the project.integration_branch column; the
+    global runtime_config value is a deprecated transitional fallback.
+    """
+
+    def setup_method(self):
+        """Save and restore runtime_config around each test."""
+        self._prev_ib = _shared_state.runtime_config.get("integration_branch", "main")
+
+    def teardown_method(self):
+        _shared_state.runtime_config["integration_branch"] = self._prev_ib
+
+    def test_unset_column_returns_global_default(self):
+        """Project with integration_branch=None resolves to the global default."""
+        project = _make_project(integration_branch=None)
+        assert _shared_state.get_project_integration_branch(project) == "main"
+
+    def test_global_override_respected_when_no_column(self):
+        """When runtime_config is changed and project has no column value, it is used."""
+        _shared_state.runtime_config["integration_branch"] = "develop"
+        project = _make_project(integration_branch=None)
+        assert _shared_state.get_project_integration_branch(project) == "develop"
+
+    def test_column_override_used(self):
+        """Project with integration_branch column set uses that value."""
+        project = _make_project(integration_branch="feature-trunk")
+        assert _shared_state.get_project_integration_branch(project) == "feature-trunk"
+
+    def test_column_override_ignores_global(self):
+        """Column value wins even when the global fallback differs."""
+        _shared_state.runtime_config["integration_branch"] = "develop"
+        project = _make_project(integration_branch="my-branch")
+        assert _shared_state.get_project_integration_branch(project) == "my-branch"
+
+    def test_two_projects_resolve_independently(self):
+        """Two projects with different column values each get their own value."""
+        project_a = _make_project(integration_branch="trunk-a")
+        project_b = _make_project(integration_branch="trunk-b")
+        assert _shared_state.get_project_integration_branch(project_a) == "trunk-a"
+        assert _shared_state.get_project_integration_branch(project_b) == "trunk-b"
+
+    def test_project_with_override_and_project_without_are_independent(self):
+        """A project with a column value and one without resolve to different values."""
+        _shared_state.runtime_config["integration_branch"] = "global-trunk"
+        project_with = _make_project(integration_branch="custom-trunk")
+        project_without = _make_project(integration_branch=None)
+        assert (
+            _shared_state.get_project_integration_branch(project_with) == "custom-trunk"
+        )
+        assert (
+            _shared_state.get_project_integration_branch(project_without)
+            == "global-trunk"
+        )
