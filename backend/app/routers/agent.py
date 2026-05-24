@@ -3839,45 +3839,64 @@ async def next_role(
     # skipped and behavior is byte-for-byte the pre-existing chain-only path —
     # including, on no claim, the chain-fork exit / 204 so no idle VM is kept
     # alive when there is no genuine pending work to reuse it for.
-    if (
-        _shared_state.runtime_config.get("warm_backlog_reuse_enabled", False)
-        and not _shared_state.is_warm_backlog_reuse_suppressed()
-    ):
-        _project_claim = token.get("project_id")
-        _project_uuid = None
-        if _project_claim:
-            try:
-                _project_uuid = uuid.UUID(str(_project_claim))
-            except (ValueError, TypeError):
-                _project_uuid = None
-        if _project_uuid is not None:
-            # Refresh the project's first-refusal window so the orchestrator
-            # holds off cold-provisioning eligible backlog tasks while this VM
-            # polls — biasing the race toward reuse. The SKIP-LOCKED claim
-            # below still guarantees no double-provision if both race.
-            _shared_state.register_backlog_first_refusal(str(_project_uuid))
-            from app.warm_backlog_reuse import select_backlog_reuse_candidate
-
-            backlog_task = await select_backlog_reuse_candidate(
-                session, _project_uuid, req.vm_instance_id
+    if _shared_state.runtime_config.get("warm_backlog_reuse_enabled", False):
+        if _shared_state.is_warm_backlog_reuse_suppressed():
+            from app.warm_backlog_reuse import (
+                record_claim_skipped as _record_claim_skipped,
             )
-            if backlog_task is not None:
+
+            _record_claim_skipped("circuit_breaker_tripped")
+        else:
+            _project_claim = token.get("project_id")
+            _project_uuid = None
+            if _project_claim:
                 try:
-                    result = await _finalize_warm_claim(
-                        session,
-                        backlog_task,
-                        req.vm_instance_id,
-                        origin="backlog_reuse",
-                    )
-                except Exception:
-                    _shared_state.record_backlog_reuse_failure("finalize_error")
-                    raise
-                logger.info(
-                    f"[NEXT-ROLE] Warm-start claim (backlog_reuse): "
-                    f"task={result['task_id']} vm={req.vm_instance_id} "
-                    f"project={_project_uuid}"
+                    _project_uuid = uuid.UUID(str(_project_claim))
+                except (ValueError, TypeError):
+                    _project_uuid = None
+            if _project_uuid is not None:
+                from app.warm_backlog_reuse import (
+                    record_next_role_poll_during_defer as _record_next_role_poll,
+                    record_warm_claim_succeeded as _record_warm_claim_succeeded,
+                    select_backlog_reuse_candidate,
                 )
-                return result
+
+                # Record poll if we're inside a teardown-defer window the
+                # agent_status completion handler already registered. Check
+                # BEFORE refreshing so only pre-existing windows count.
+                if _shared_state.is_backlog_first_refusal_active(str(_project_uuid)):
+                    _record_next_role_poll()
+
+                # Refresh the project's first-refusal window so the orchestrator
+                # holds off cold-provisioning eligible backlog tasks while this VM
+                # polls — biasing the race toward reuse. The SKIP-LOCKED claim
+                # below still guarantees no double-provision if both race.
+                _shared_state.register_backlog_first_refusal(str(_project_uuid))
+
+                backlog_task = await select_backlog_reuse_candidate(
+                    session, _project_uuid, req.vm_instance_id
+                )
+                if backlog_task is not None:
+                    try:
+                        result = await _finalize_warm_claim(
+                            session,
+                            backlog_task,
+                            req.vm_instance_id,
+                            origin="backlog_reuse",
+                        )
+                    except Exception:
+                        _shared_state.record_backlog_reuse_failure("finalize_error")
+                        raise
+                    _record_warm_claim_succeeded()
+                    logger.info(
+                        f"[NEXT-ROLE] Warm-start claim (backlog_reuse): "
+                        f"task={result['task_id']} vm={req.vm_instance_id} "
+                        f"project={_project_uuid}"
+                    )
+                    return result
+                # select_backlog_reuse_candidate records the skip reason
+                # (no_eligible vs lost_claim_race) itself — it is the only
+                # caller that can tell the two None cases apart.
 
     # No matching warm-pinned task. Check whether another VM owns an
     # IN_PROGRESS task for this PR — if so, the warm chain has already

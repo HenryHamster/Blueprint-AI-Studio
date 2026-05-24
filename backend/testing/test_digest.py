@@ -15254,7 +15254,7 @@ async def test_viewport_debt_coverage_summary_in_response(
     }
 
     with patch(
-        "app.routers.admin_digest._scan_viewport_debt_rows",
+        "app.viewport_debt._scan_viewport_debt_rows",
         return_value=(top_rows, [], expected_summary),
     ):
         response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
@@ -15310,7 +15310,7 @@ async def test_viewport_debt_coverage_summary_counts_full_set(
     }
 
     with patch(
-        "app.routers.admin_digest._scan_viewport_debt_rows",
+        "app.viewport_debt._scan_viewport_debt_rows",
         return_value=(top_rows, [], expected_summary),
     ):
         response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
@@ -15367,7 +15367,7 @@ async def test_viewport_debt_counts_assertion_type_regressions(
     ]
 
     with patch(
-        "app.routers.admin_digest._scan_viewport_debt_rows",
+        "app.viewport_debt._scan_viewport_debt_rows",
         return_value=(
             fake_rows,
             [],
@@ -15447,7 +15447,7 @@ async def test_viewport_debt_returns_per_assertion_type_breakdown(
     ]
 
     with patch(
-        "app.routers.admin_digest._scan_viewport_debt_rows",
+        "app.viewport_debt._scan_viewport_debt_rows",
         return_value=(
             fake_rows,
             [],
@@ -17582,3 +17582,90 @@ def test_compute_review_quality_metrics_review_accuracy_shape():
     assert acc["overrides"] == 0
     assert acc["precision"] == 1.0
     assert acc["recall"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# /api/admin/projects/{id}/warm-reuse-funnel tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_warm_reuse_funnel_empty(client: AsyncClient, db_session):
+    """Endpoint returns all-zero counters when no funnel events have been recorded."""
+    import app.warm_backlog_reuse as wbr
+
+    # Reset counters so prior test runs don't bleed over.
+    wbr._vms_with_eligible_backlog_events.clear()
+    wbr._teardown_defers_events.clear()
+    wbr._next_role_polls_during_defer_events.clear()
+    wbr._warm_claims_succeeded_events.clear()
+    wbr._claim_skipped_events.clear()
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/warm-reuse-funnel")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["completed_vms_with_eligible_backlog"] == 0
+    assert data["teardown_defers_scheduled"] == 0
+    assert data["next_role_polls_during_defer"] == 0
+    assert data["warm_claims_succeeded"] == 0
+    assert data["claim_skipped_total"] == 0
+    assert data["claim_skipped_by_reason"] == {}
+    assert data["window_hours"] == 24
+
+
+@pytest.mark.asyncio
+async def test_warm_reuse_funnel_counts_after_records(client: AsyncClient, db_session):
+    """Counter functions increment correctly and are reflected in the endpoint."""
+    import app.warm_backlog_reuse as wbr
+
+    wbr._vms_with_eligible_backlog_events.clear()
+    wbr._teardown_defers_events.clear()
+    wbr._next_role_polls_during_defer_events.clear()
+    wbr._warm_claims_succeeded_events.clear()
+    wbr._claim_skipped_events.clear()
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    wbr.record_vm_with_eligible_backlog()
+    wbr.record_vm_with_eligible_backlog()
+    wbr.record_teardown_defer()
+    wbr.record_next_role_poll_during_defer()
+    wbr.record_warm_claim_succeeded()
+    wbr.record_claim_skipped("no_eligible")
+    wbr.record_claim_skipped("lost_claim_race")
+    wbr.record_claim_skipped("no_eligible")
+
+    response = await client.get(f"/api/admin/projects/{project.id}/warm-reuse-funnel")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["completed_vms_with_eligible_backlog"] == 2
+    assert data["teardown_defers_scheduled"] == 1
+    assert data["next_role_polls_during_defer"] == 1
+    assert data["warm_claims_succeeded"] == 1
+    assert data["claim_skipped_total"] == 3
+    assert data["claim_skipped_by_reason"]["no_eligible"] == 2
+    assert data["claim_skipped_by_reason"]["lost_claim_race"] == 1
+
+
+@pytest.mark.asyncio
+async def test_warm_reuse_funnel_requires_auth(unauthenticated_client: AsyncClient):
+    """Unauthenticated requests are rejected."""
+    import uuid
+
+    fake_id = uuid.uuid4()
+    response = await unauthenticated_client.get(
+        f"/api/admin/projects/{fake_id}/warm-reuse-funnel"
+    )
+    assert response.status_code in (401, 403)

@@ -188,6 +188,8 @@ async def get_settings(
         ),
         # automain/LTS release-qualifier control flags — kept in sync with the
         # _apply_settings write path and the runtime_config_json persistence.
+        # DEPRECATED: use per-project integration_branch via /projects/{id}/integration-branch.
+        # This global key remains as a transitional fallback for one release cycle.
         "integration_branch": _runtime_config.get("integration_branch", "main"),
         "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
         "smoketest_enabled": bool(_runtime_config.get("smoketest_enabled", False)),
@@ -428,6 +430,8 @@ async def _apply_settings(
         _runtime_config["ci_backstop_timeout_minutes"] = val
     # automain/LTS — release-qualifier control flags (Phase 0/1). Persisted to
     # runtime_config_json below and synced back into runtime_config every ~15s.
+    # DEPRECATED: integration_branch in global settings is a transitional fallback only.
+    # Per-project values are managed via PATCH /projects/{id}/integration-branch.
     if "integration_branch" in payload:
         val = str(payload["integration_branch"] or "").strip()
         _branch_pattern = re.compile(r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$")
@@ -1496,6 +1500,7 @@ async def _apply_settings(
                             "throttle_seconds": 30,
                         },
                     ),
+                    # DEPRECATED global fallback — per-project values use Project.integration_branch
                     "integration_branch": _runtime_config.get(
                         "integration_branch", "main"
                     ),

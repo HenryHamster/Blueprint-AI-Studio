@@ -1728,7 +1728,10 @@ async def _check_anomaly_proposals(project, session):
                 f"Investigate and reduce {anomaly_key} task failures — {details}"[:500]
             )
 
-        if _is_direction_duplicate(proposal_text, proj_directions, rejected_proposals):
+        is_dup, _override = _is_direction_duplicate(
+            proposal_text, proj_directions, rejected_proposals
+        )
+        if is_dup:
             logger.info(
                 f"[ANOMALY] Skipping proposal for {anomaly_key} — overlaps with existing direction"
             )

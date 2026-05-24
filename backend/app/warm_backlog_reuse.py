@@ -15,6 +15,8 @@ one claim-finalize routine.
 
 import logging
 import uuid
+from collections import deque
+from datetime import timedelta
 from typing import Optional
 
 from sqlalchemy import or_, select
@@ -210,11 +212,17 @@ async def select_backlog_reuse_candidate(
     Pass ``in_progress_files`` to reuse an already-computed IN_PROGRESS file
     set (see ``_eligible_backlog_ids``) when this claim follows an eligibility
     gate in the same flow, so the file-conflict scan is not run twice.
+
+    Records the funnel skip reason for the two None-returning cases, which the
+    caller cannot distinguish on its own: ``no_eligible`` when no backlog task
+    qualifies, ``lost_claim_race`` when one or more qualified but a concurrent
+    claimer won the SKIP-LOCKED row.
     """
     eligible = await _eligible_backlog_ids(
         session, project_id, vm_instance_id, in_progress_files=in_progress_files
     )
     if not eligible:
+        record_claim_skipped("no_eligible")
         return None
     result = await session.execute(
         select(Task)
@@ -232,4 +240,78 @@ async def select_backlog_reuse_candidate(
         claimed.id if claimed is not None else None,
         len(eligible),
     )
+    if claimed is None:
+        record_claim_skipped("lost_claim_race")
     return claimed
+
+
+# ---------------------------------------------------------------------------
+# Funnel observability counters
+# ---------------------------------------------------------------------------
+# Rolling deques for each funnel stage. Each entry is a UTC datetime (or a
+# (datetime, reason) tuple for claim_skipped). Bounded by maxlen so they
+# never grow without bound on a long-lived instance.
+
+_vms_with_eligible_backlog_events: deque = deque(maxlen=500)
+_teardown_defers_events: deque = deque(maxlen=500)
+_next_role_polls_during_defer_events: deque = deque(maxlen=500)
+_warm_claims_succeeded_events: deque = deque(maxlen=500)
+_claim_skipped_events: deque = deque(maxlen=500)  # (datetime, reason)
+
+
+def record_vm_with_eligible_backlog() -> None:
+    """Stage 1: a COMPLETION event found ≥1 eligible QUEUED backlog task."""
+    _vms_with_eligible_backlog_events.append(_utcnow())
+
+
+def record_teardown_defer() -> None:
+    """Stage 2: VM teardown was deferred for the warm-backlog reuse window."""
+    _teardown_defers_events.append(_utcnow())
+
+
+def record_next_role_poll_during_defer() -> None:
+    """Stage 3: a /next-role poll arrived inside the teardown-defer window."""
+    _next_role_polls_during_defer_events.append(_utcnow())
+
+
+def record_warm_claim_succeeded() -> None:
+    """Stage 4: a /next-role poll claimed a backlog task (vm_warm_start=True)."""
+    _warm_claims_succeeded_events.append(_utcnow())
+
+
+def record_claim_skipped(reason: str) -> None:
+    """Stage 4 miss: poll arrived but did not claim.
+
+    reason should be one of: "no_eligible", "lost_claim_race",
+    "circuit_breaker_tripped".
+    """
+    _claim_skipped_events.append((_utcnow(), reason))
+
+
+def get_reuse_funnel_snapshot(window_hours: int = 24) -> dict:
+    """Return rolling funnel counts for the warm-reuse claim pipeline.
+
+    All counts cover the trailing ``window_hours`` (default 24h).
+    """
+    cutoff = _utcnow() - timedelta(hours=window_hours)
+    skipped_by_reason: dict = {}
+    for ts, reason in _claim_skipped_events:
+        if ts >= cutoff:
+            skipped_by_reason[reason] = skipped_by_reason.get(reason, 0) + 1
+    return {
+        "window_hours": window_hours,
+        "completed_vms_with_eligible_backlog": sum(
+            1 for ts in _vms_with_eligible_backlog_events if ts >= cutoff
+        ),
+        "teardown_defers_scheduled": sum(
+            1 for ts in _teardown_defers_events if ts >= cutoff
+        ),
+        "next_role_polls_during_defer": sum(
+            1 for ts in _next_role_polls_during_defer_events if ts >= cutoff
+        ),
+        "warm_claims_succeeded": sum(
+            1 for ts in _warm_claims_succeeded_events if ts >= cutoff
+        ),
+        "claim_skipped_by_reason": skipped_by_reason,
+        "claim_skipped_total": sum(skipped_by_reason.values()),
+    }

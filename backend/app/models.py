@@ -305,6 +305,14 @@ class Project(SQLModel, table=True):
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
+    # Per-project trunk branch for autonomous task spawning.
+    # NULL means "use the global runtime_config fallback then 'main'".
+    # Blueprint's own repo uses 'automain'; most other projects use 'main'.
+    # See shared_state.get_project_integration_branch for the full fallback chain.
+    integration_branch: str | None = Field(
+        default=None,
+        sa_column=Column(String, nullable=True),
+    )
 
     @property
     def enable_self_improvement(self) -> bool:

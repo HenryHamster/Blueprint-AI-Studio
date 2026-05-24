@@ -28,7 +28,10 @@ from app.models import (
 )
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 import app.shared_state as _shared_state
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import (
+    get_project_integration_branch,
+    runtime_config as _runtime_config,
+)
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -818,7 +821,7 @@ async def _build_recent_interventions(
     _gh_token_ss: str | None = None
     _gh_owner_ss: str | None = None
     _gh_repo_ss: str | None = None
-    _integration_branch_ss = _runtime_config.get("integration_branch", "main")
+    _integration_branch_ss = get_project_integration_branch(project)
     _automain_verified: dict[uuid.UUID, bool] = {}
 
     try:
@@ -1396,7 +1399,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
             "problem_model": _agent_view_problem_model(project.problem_model),
             "open_messages": open_msgs,
             "shipped_changes_manifest": shipped_changes_manifest,
-            "base_branch": _runtime_config.get("integration_branch", "main"),
+            "base_branch": get_project_integration_branch(project),
             **({"model": doc_model} if doc_model else {}),
             **({"effort": doc_effort} if doc_effort else {}),
         },
@@ -1750,7 +1753,7 @@ async def _spawn_strategic_review(
     # gated on integration_branch, not project.is_self_repo.  Best-effort.
     _open_version = None
     _version_phase_block: dict | None = None
-    _integration_branch = _runtime_config.get("integration_branch", "main")
+    _integration_branch = get_project_integration_branch(project)
     if _integration_branch != "main":
         try:
             from app.release_version import (
@@ -2096,7 +2099,7 @@ async def _spawn_strategic_review(
                 if _efficiency_snapshot
                 else {}
             ),
-            "base_branch": _runtime_config.get("integration_branch", "main"),
+            "base_branch": get_project_integration_branch(project),
             **({"model": review_model} if review_model else {}),
             **({"effort": review_effort} if review_effort else {}),
         },

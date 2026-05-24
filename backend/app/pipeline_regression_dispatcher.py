@@ -59,7 +59,10 @@ from app.regression_dispatcher_metrics import (  # noqa: F401
     compute_untargeted_layers,
 )
 import app.shared_state as _shared_state
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import (
+    runtime_config as _runtime_config,
+    get_project_integration_branch as _get_project_integration_branch,
+)
 from app.time_utils import _to_naive_utc, _utcnow
 from app.dispatcher_formatters import (
     _CROSS_CASE_FINGERPRINT_LOOKBACK,
@@ -3812,6 +3815,9 @@ async def _escalate_stale_observation_alerts(
     ``signal_snapshot_at_spawn`` so downstream consumers can dismiss the alert when the
     case closes. Returns the number of new investigate tasks spawned.
     """
+    from app.models import Project as _EscProject  # noqa: PLC0415
+
+    _esc_project = await session.get(_EscProject, project_id)
     monitored_titles = set(_OBSERVATION_ONLY_ALERT_TITLES) | {_LONE_CHECKER_ALERT_TITLE}
     now = _utcnow()
 
@@ -3876,7 +3882,7 @@ async def _escalate_stale_observation_alerts(
             {
                 "type": "investigate",
                 "prompt": prompt,
-                "base_branch": _runtime_config.get("integration_branch", "main"),
+                "base_branch": _get_project_integration_branch(_esc_project),
                 "effort": "low",
             },
             "pipeline_regression_dispatcher:observation_alert_sla_escalation",
@@ -4444,10 +4450,13 @@ async def _maybe_spawn(
     else:
         case_escalation_reason = None
 
+    from app.models import Project as _SpawnProject  # noqa: PLC0415
+
+    _spawn_project = await session.get(_SpawnProject, project_id)
     payload_dict: dict[str, Any] = {
         "type": "investigate",
         "prompt": prompt,
-        "base_branch": _runtime_config.get("integration_branch", "main"),
+        "base_branch": _get_project_integration_branch(_spawn_project),
         "effort": "low",
     }
     if is_cross_layer:
@@ -6384,9 +6393,6 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
                             get_repo_installation_token as _rr_get_token,
                             is_ancestor_of as _rr_is_ancestor,
                         )
-                        from app.shared_state import (
-                            runtime_config as _rr_runtime_config,
-                        )
 
                         if project.github_owner and project.github_repo:
                             _rr_token = await _rr_get_token(
@@ -6404,8 +6410,8 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
                                     "merge_commit_sha"
                                 )
                                 if _rr_merge_sha:
-                                    _rr_branch = _rr_runtime_config.get(
-                                        "integration_branch", "main"
+                                    _rr_branch = _get_project_integration_branch(
+                                        project
                                     )
                                     _rr_is_anc = await _rr_is_ancestor(
                                         _rr_token,
@@ -7406,9 +7412,7 @@ async def _auto_close_recovered_manual_intervention(
                     {
                         "type": "investigate",
                         "prompt": _followup_prompt,
-                        "base_branch": _runtime_config.get(
-                            "integration_branch", "main"
-                        ),
+                        "base_branch": _get_project_integration_branch(project),
                         "effort": "low",
                     },
                     "pipeline_regression_dispatcher:marginal_followup",
@@ -7505,11 +7509,13 @@ async def _run_compliance_followup_once(
     that a fix that correctly documented an unmodifiable layer is not penalized.
     Gated by runtime config and a per-case cooldown column.
     """
+    from app.models import Project as _ComplianceProject  # noqa: PLC0415
     from app.regression_layer_classifier import ALL_LAYERS
 
     if not bool(_runtime_config.get("regression_compliance_followup_enabled", True)):
         return 0
 
+    _compliance_project = await session.get(_ComplianceProject, project_id)
     cooldown_hours = int(
         _runtime_config.get("regression_compliance_followup_cooldown_hours", 72) or 72
     )
@@ -7592,7 +7598,7 @@ async def _run_compliance_followup_once(
             {
                 "type": "investigate",
                 "prompt": _prompt,
-                "base_branch": _runtime_config.get("integration_branch", "main"),
+                "base_branch": _get_project_integration_branch(_compliance_project),
                 "effort": "low",
             },
             "pipeline_regression_dispatcher:compliance_followup",

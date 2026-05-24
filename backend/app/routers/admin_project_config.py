@@ -7,6 +7,7 @@ with module-level defaults, then persists partial updates back into
 ``Project.design_doc``.
 """
 
+import re
 import uuid
 import logging
 from typing import Dict, Any
@@ -24,6 +25,7 @@ from app.models import Task, TaskStatus, _utcnow
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
 from app.task_locking import lock_project_or_429
+from app.shared_state import get_project_integration_branch
 
 logger = logging.getLogger(__name__)
 
@@ -442,6 +444,72 @@ async def update_auto_review_config(
 
     config = {**_AUTO_REVIEW_DEFAULTS, **stored}
     return {"project_id": str(project_id), "config": config}
+
+
+# ---------------------------------------------------------------------------
+# Integration-branch config endpoints
+# ---------------------------------------------------------------------------
+
+_VALID_BRANCH_RE = re.compile(r"^[a-zA-Z0-9._/\-]+$")
+
+
+@router.get("/projects/{project_id}/integration-branch")
+async def get_integration_branch_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the per-project integration branch (trunk for autonomous spawns)."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    return {
+        "project_id": str(project_id),
+        "integration_branch": get_project_integration_branch(project),
+        "is_default": project.integration_branch is None,
+    }
+
+
+@router.patch("/projects/{project_id}/integration-branch")
+async def update_integration_branch_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Set the per-project integration branch. Pass null to revert to global default."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if "integration_branch" not in body:
+        raise HTTPException(
+            status_code=422, detail="Request body must include 'integration_branch'"
+        )
+
+    branch = body["integration_branch"]
+    if branch is not None:
+        if not isinstance(branch, str) or not branch.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="'integration_branch' must be a non-empty string or null",
+            )
+        if not _VALID_BRANCH_RE.match(branch):
+            raise HTTPException(
+                status_code=422,
+                detail="'integration_branch' contains invalid characters",
+            )
+
+    project = await lock_project_or_429(session, project_id)
+    project.integration_branch = branch
+    session.add(project)
+    await session.commit()
+
+    return {
+        "project_id": str(project_id),
+        "integration_branch": get_project_integration_branch(project),
+        "is_default": project.integration_branch is None,
+    }
 
 
 # ---------------------------------------------------------------------------

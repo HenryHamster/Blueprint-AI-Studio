@@ -21,6 +21,7 @@ from app.efficiency_snapshot import (
     _compute_llm_cost_pricing_coverage,
     _last_run_due,
     compute_current_axes,
+    compute_llm_cost_breakdown,
     maybe_write_daily_snapshot,
     read_baseline_with_drift,
     write_snapshot,
@@ -1161,3 +1162,285 @@ def test_llm_cost_pricing_coverage_empty_window():
     assert result["unpriced_tasks"] == 0
     assert result["coverage_fraction"] is None
     assert result["unpriced_combos"] == []
+
+
+def test_compute_llm_cost_breakdown_priced_and_unpriced():
+    """Mixed priced/unpriced tasks across two providers and one unknown model."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    # Anthropic sonnet (priced): 1000 in @ 3e-6, 500 out @ 15e-6 = 0.0105
+    anthropic_a = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+            "llm_call_count": 5,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # Same model again to verify aggregation.
+    anthropic_b = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 1000,
+            "llm_call_count": 7,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # OpenAI gpt-5.4 (priced): 1000 in @ 5e-6, 200 out @ 25e-6 = 0.010
+    openai_a = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 3,
+        },
+        provider="openai",
+        model="gpt-5.4",
+    )
+    # Unknown model (unpriced): contributes to task counts but zero cost.
+    unpriced = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 500,
+            "total_output_tokens": 100,
+        },
+        provider="fakeprovider",
+        model="mystery-model",
+    )
+    # Skipped: no provider/model.
+    no_meta = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 100,
+            "total_output_tokens": 50,
+        },
+    )
+
+    result = compute_llm_cost_breakdown(
+        [anthropic_a, anthropic_b, openai_a, unpriced, no_meta]
+    )
+
+    by_provider = {entry["provider"]: entry for entry in result["by_provider"]}
+    assert set(by_provider) == {"anthropic", "openai", "fakeprovider"}
+    assert by_provider["anthropic"]["task_count"] == 2
+    assert by_provider["anthropic"]["total_input_tokens"] == 3000
+    assert by_provider["anthropic"]["total_output_tokens"] == 1500
+    # 3000 * 3e-6 + 1500 * 15e-6 = 0.009 + 0.0225 = 0.0315
+    assert by_provider["anthropic"]["total_cost_usd"] == round(0.0315, 6)
+    assert by_provider["anthropic"]["llm_call_count"] == 12
+
+    # 1000 * 5e-6 + 200 * 25e-6 = 0.005 + 0.005 = 0.010
+    assert by_provider["openai"]["total_cost_usd"] == round(0.010, 6)
+    assert by_provider["fakeprovider"]["total_cost_usd"] == 0.0
+
+    by_model = {(e["provider"], e["model"]): e for e in result["by_model"]}
+    assert by_model[("anthropic", "claude-sonnet-4-6")]["priced"] is True
+    assert by_model[("fakeprovider", "mystery-model")]["priced"] is False
+
+    # Priced shares sum to ~1.0 (within float tolerance) across by_provider.
+    share_sum = sum(e["share_of_total_cost"] or 0.0 for e in result["by_provider"])
+    assert abs(share_sum - 1.0) < 1e-6
+
+    totals = result["totals"]
+    assert totals["task_count"] == 4
+    assert totals["priced_task_count"] == 3
+    assert totals["unpriced_task_count"] == 1
+    assert totals["unpriced_coverage_fraction"] == round(3 / 4, 4)
+    assert totals["total_cost_usd"] == round(0.0315 + 0.010, 6)
+
+    assert "fakeprovider:mystery-model" in result["unpriced_combos"]
+
+
+def test_compute_llm_cost_breakdown_empty():
+    """No tasks -> empty buckets, zeroed totals, coverage_fraction=None."""
+    result = compute_llm_cost_breakdown([])
+    assert result["by_provider"] == []
+    assert result["by_model"] == []
+    assert result["unpriced_combos"] == []
+    totals = result["totals"]
+    assert totals["task_count"] == 0
+    assert totals["priced_task_count"] == 0
+    assert totals["unpriced_task_count"] == 0
+    assert totals["total_cost_usd"] == 0.0
+    assert totals["unpriced_coverage_fraction"] is None
+
+
+def test_compute_llm_cost_breakdown_skips_missing_fields():
+    """Tasks missing provider/model/tokens or with non-numeric tokens are skipped."""
+    import uuid
+
+    project_id = uuid.uuid4()
+    missing_provider = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 100,
+            "total_output_tokens": 50,
+        },
+        model="claude-sonnet-4-6",
+    )
+    missing_tokens = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={"llm_call_count": 1},
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    null_summary = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary=None,
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    valid = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 100,
+            "total_output_tokens": 50,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    result = compute_llm_cost_breakdown(
+        [missing_provider, missing_tokens, null_summary, valid]
+    )
+    assert result["totals"]["task_count"] == 1
+    assert len(result["by_model"]) == 1
+    assert result["by_model"][0]["provider"] == "anthropic"
+
+
+@pytest.mark.asyncio
+async def test_llm_cost_breakdown_endpoint_returns_rollup(
+    client: AsyncClient, db_session
+):
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            api_call_summary={
+                "total_input_tokens": 1000,
+                "total_output_tokens": 500,
+            },
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+    )
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            api_call_summary={
+                "total_input_tokens": 200,
+                "total_output_tokens": 100,
+            },
+            provider="fakeprovider",
+            model="mystery-model",
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/llm-cost-breakdown")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["window_days"] == 7
+    assert "generated_at" in data
+    assert "by_provider" in data and "by_model" in data
+    assert "totals" in data and "unpriced_combos" in data
+
+    providers = {e["provider"] for e in data["by_provider"]}
+    assert providers == {"anthropic", "fakeprovider"}
+    assert data["totals"]["task_count"] == 2
+    assert data["totals"]["priced_task_count"] == 1
+    assert data["totals"]["unpriced_task_count"] == 1
+    assert "fakeprovider:mystery-model" in data["unpriced_combos"]
+
+
+@pytest.mark.asyncio
+async def test_llm_cost_breakdown_endpoint_requires_membership(
+    client: AsyncClient, db_session
+):
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    # No membership.
+    resp = await client.get(f"/api/admin/projects/{project.id}/llm-cost-breakdown")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_llm_cost_breakdown_endpoint_window_days_validation(
+    client: AsyncClient, db_session
+):
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    # window_days=0 violates ge=1
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/llm-cost-breakdown?window_days=0"
+    )
+    assert resp.status_code == 422
+    # window_days=91 violates le=90
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/llm-cost-breakdown?window_days=91"
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_read_baseline_with_drift_includes_reuse_funnel(db_session):
+    """read_baseline_with_drift must include a reuse_funnel key with rolling counters."""
+    import app.warm_backlog_reuse as wbr
+
+    # The funnel counters are process-global rolling deques; clear them so
+    # events recorded by earlier tests in the same shard don't bleed in.
+    wbr._vms_with_eligible_backlog_events.clear()
+    wbr._teardown_defers_events.clear()
+    wbr._next_role_polls_during_defer_events.clear()
+    wbr._warm_claims_succeeded_events.clear()
+    wbr._claim_skipped_events.clear()
+
+    project = make_project(design_doc={})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    result = await read_baseline_with_drift(db_session, project.id)
+    assert "reuse_funnel" in result
+    funnel = result["reuse_funnel"]
+    assert "window_hours" in funnel
+    assert "completed_vms_with_eligible_backlog" in funnel
+    assert "teardown_defers_scheduled" in funnel
+    assert "next_role_polls_during_defer" in funnel
+    assert "warm_claims_succeeded" in funnel
+    assert "claim_skipped_by_reason" in funnel
+    assert "claim_skipped_total" in funnel
+    # On a fresh instance all counters start at zero.
+    assert funnel["completed_vms_with_eligible_backlog"] == 0
+    assert funnel["warm_claims_succeeded"] == 0

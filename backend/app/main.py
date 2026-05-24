@@ -71,7 +71,10 @@ from app.routers.agent_status import router as agent_status_router
 from app.routers.admin_onboard import router as admin_onboard_router
 from app.shared_state import limiter
 import app.shared_state as _shared_state
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import (
+    runtime_config as _runtime_config,
+    get_project_integration_branch as _get_project_integration_branch,
+)
 from app import orchestrator as _orch
 from app.lifecycle import lifespan
 from app.time_utils import _utcnow
@@ -121,7 +124,7 @@ from app.strategic_constants import (
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0123"
+EXPECTED_SCHEMA_REVISION = "0124"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -2747,9 +2750,10 @@ async def strategic_operation(
         _rejected_proposals = list(
             (project.vision or {}).get("rejected_proposals") or []
         )
-        if _is_direction_duplicate(
+        is_dup, _override = _is_direction_duplicate(
             text, directions, _rejected_proposals, distinction=distinction or None
-        ):
+        )
+        if is_dup:
             if distinction:
                 logger.warning(
                     "[STRATEGIC_DEDUP_DISAGREEMENT] API path: direction rejected as duplicate but agent claimed "
@@ -3316,7 +3320,7 @@ async def strategic_operation(
             "type": spawn_type,
             "prompt": prompt,
             "title": title,
-            "base_branch": _runtime_config.get("integration_branch", "main"),
+            "base_branch": _get_project_integration_branch(project),
         }
         if direction_id:
             spawn_payload["direction_id"] = direction_id

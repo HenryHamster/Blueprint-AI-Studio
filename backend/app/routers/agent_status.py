@@ -2193,9 +2193,15 @@ async def update_agent_status(
 
                 if await has_eligible_backlog_task(session, task.project_id, old_vm_id):
                     from app.main import schedule_deferred_backlog_teardown
+                    from app.warm_backlog_reuse import (
+                        record_teardown_defer,
+                        record_vm_with_eligible_backlog,
+                    )
 
+                    record_vm_with_eligible_backlog()
                     _shared_state.register_backlog_first_refusal(str(task.project_id))
                     schedule_deferred_backlog_teardown(old_vm_id)
+                    record_teardown_defer()
                     _teardown_deferred = True
                     logger.info(
                         f"[BACKLOG-REUSE] Deferring teardown of VM {old_vm_id} "

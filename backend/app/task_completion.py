@@ -61,6 +61,7 @@ from app.research_context import _build_research_context
 from app.routers.agent import get_github_token_for_task
 from app.shared_state import (
     clear_direction_hold,
+    get_project_integration_branch,
     runtime_config as _runtime_config,
     scope_to_effort,
 )
@@ -1112,7 +1113,7 @@ async def _maybe_spawn_followup_investigation(
         {
             "type": "investigate",
             "prompt": prompt,
-            "base_branch": _runtime_config.get("integration_branch", "main"),
+            "base_branch": get_project_integration_branch(project),
         },
         "task_completion:remediation_failure_followup",
     )
@@ -1378,7 +1379,7 @@ async def _maybe_spawn_low_confidence_followup(
                 {
                     "type": "investigate",
                     "prompt": prompt,
-                    "base_branch": _runtime_config.get("integration_branch", "main"),
+                    "base_branch": get_project_integration_branch(project),
                 },
                 "task_completion:low_confidence_followup",
             )
@@ -1575,7 +1576,7 @@ async def _maybe_spawn_reinvestigation_after_failure(
                 {
                     "type": "investigate",
                     "prompt": prompt,
-                    "base_branch": _runtime_config.get("integration_branch", "main"),
+                    "base_branch": get_project_integration_branch(project),
                 },
                 "task_completion:investigation_failure_followup",
             )
@@ -4105,10 +4106,11 @@ async def _spawn_investigation_remediation(
         # serializing one PR per layer.
         scope = "large"
 
+    project = await session.get(Project, task.project_id)
     payload_dict: Dict[str, Any] = {
         "type": "create",
         "prompt": full_prompt,
-        "base_branch": _runtime_config.get("integration_branch", "main"),
+        "base_branch": get_project_integration_branch(project),
         "effort": scope_to_effort(scope),
     }
     if create_suffix:
