@@ -15,6 +15,7 @@ import random
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
@@ -70,6 +71,7 @@ from app.broadcast import broadcast_to_project
 from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX
 from app.time_utils import _utcnow
 from app.self_audit_dispatch import _record_auto_clear_note
+from app.task_locking import with_design_doc_locked, with_directions_locked
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +83,41 @@ _ON_DEMAND_RATE_PER_SEC = 0.067 / 3600
 # buildBlueprintPrFooter) and this Python helper so either side can update
 # the same block without leaving duplicates.
 BLUEPRINT_PR_META_MARKER = "<!-- blueprint:meta -->"
+
+
+async def _persist_direction_field_update(
+    session: AsyncSession,
+    project: Project,
+    direction: Dict[str, Any],
+) -> None:
+    """Serialize one mutated direction dict back into ``project.directions``.
+
+    The caller has already applied every field mutation to ``direction`` — an
+    element of a directions list that was loaded *outside* any lock. Writing the
+    whole stale list back (the legacy ``project.directions = directions``
+    pattern) loses a concurrent same-project completion's write to a *different*
+    direction. This helper instead re-acquires the project row lock via
+    ``with_directions_locked``, re-reads the directions list fresh under that
+    lock, and overwrites only the entry whose ``id`` matches — every other
+    direction is left exactly as the fresh read found it.
+
+    ``session.expire`` is required because the app runs ``expire_on_commit=False``:
+    without it, ``with_directions_locked``'s ``SELECT ... FOR UPDATE`` returns the
+    already-cached (stale) Project instance rather than the freshly-committed row
+    data, defeating the lock. Expiring the attribute forces a fresh load inside
+    the lock.
+    """
+    dir_id = direction.get("id")
+    session.expire(project, ["directions"])
+
+    def _apply(fresh_dirs: List[Dict[str, Any]]):
+        target = next((d for d in fresh_dirs if d.get("id") == dir_id), None)
+        if target is not None:
+            target.clear()
+            target.update(direction)
+        return None
+
+    await with_directions_locked(session, project.id, _apply)
 
 
 def _estimated_task_cost_usd(task: Task) -> Optional[float]:
@@ -237,102 +274,122 @@ async def _record_remediation_outcome(
     # direction_id alone is sufficient to stamp the outcome.
     if not direction_id:
         return False
-    project = await session.get(Project, task.project_id)
-    if not project:
-        return False
-    directions = list(project.directions or [])
-    target = next((d for d in directions if d.get("id") == direction_id), None)
-    if target is None:
-        # Direction was retired or removed before the remediation task reached a
-        # terminal state. Stamp the outcome on the task itself so the fix
-        # outcome is not silently discarded — operators and the diagnosis
-        # pipeline can still find what happened via task.context.
-        _stamp_orphan_remediation_outcome(
-            task,
-            merged=merged,
-            direction_id=str(direction_id),
-        )
-        return False
-    fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint")
-    prior_fingerprint = target.get("last_remediation_fingerprint")
-    prior_attempts = int(target.get("remediation_attempts") or 0)
-    if fingerprint and prior_fingerprint and str(fingerprint) != str(prior_fingerprint):
-        target["remediation_attempts"] = 1
-    else:
-        target["remediation_attempts"] = prior_attempts + 1
-    now_iso = _utcnow().isoformat()
-    target["last_remediation_result"] = "merged" if merged else "failed"
-    target["last_remediation_at"] = now_iso
-    if diagnosis_task_id:
-        target["last_remediation_diagnosis_task_id"] = str(diagnosis_task_id)
-    target["last_remediation_task_id"] = str(task.id)
-    if fingerprint:
-        target["last_remediation_fingerprint"] = str(fingerprint)
-    history_entry: Dict[str, Any] = {
-        "task_id": str(task.id),
-        "result": "merged" if merged else "failed",
-        "timestamp": now_iso,
-        "prompt_snippet": ((task.first_payload or {}).get("prompt", "") or "")[:200],
-    }
-    if fingerprint:
-        history_entry["fingerprint"] = str(fingerprint)
-    trigger_failure_class = ctx.get("trigger_failure_class")
-    if trigger_failure_class:
-        history_entry["trigger_failure_class"] = trigger_failure_class
-    ci_failure_type = ctx.get("ci_failure_type")
-    if ci_failure_type:
-        history_entry["ci_failure_type"] = ci_failure_type
-    if merged:
-        target.pop("last_remediation_failure_class", None)
-        target.pop("last_remediation_error_summary", None)
-        if fingerprint:
-            try:
-                _propagate_remediation_success_to_siblings(
-                    project=project,
-                    directions=directions,
-                    fingerprint=str(fingerprint),
-                    successful_direction_id=str(direction_id),
-                    task=task,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    f"[DIAGNOSIS] Failed to propagate remediation success to siblings "
-                    f"for direction {direction_id}: {exc!r}"
-                )
-    else:
-        from app.failure_classification import classify_failure  # noqa: PLC0415
+    # Serialize the read-modify-write of project.directions through the
+    # canonical row lock: the mutate_fn re-locates the target direction inside
+    # the lock against the freshly-loaded list and applies all mutations there,
+    # so a concurrent same-project completion mutating a *different* direction is
+    # not clobbered. Sibling propagation also runs inside the lock against the
+    # fresh list (``find_directions_sharing_fingerprint`` only reads
+    # ``project.directions``, so a lightweight shim suffices).
+    recorded = {"v": False}
 
-        target["last_remediation_failure_class"] = classify_failure(
-            task, at_time=task.last_heartbeat or task.started_at
-        )
-        target["last_remediation_error_summary"] = (task.latest_status_message or "")[
-            :200
-        ]
-        history_entry["failure_class"] = target["last_remediation_failure_class"]
-        history_entry["error_summary"] = target["last_remediation_error_summary"]
+    def _mutate(directions: List[Dict[str, Any]]):
+        target = next((d for d in directions if d.get("id") == direction_id), None)
+        if target is None:
+            # Direction was retired or removed before the remediation task
+            # reached a terminal state. Stamp the outcome on the task itself so
+            # the fix outcome is not silently discarded — operators and the
+            # diagnosis pipeline can still find what happened via task.context.
+            _stamp_orphan_remediation_outcome(
+                task,
+                merged=merged,
+                direction_id=str(direction_id),
+            )
+            return None
+        proj_shim = SimpleNamespace(directions=directions)
+        fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint")
+        prior_fingerprint = target.get("last_remediation_fingerprint")
+        prior_attempts = int(target.get("remediation_attempts") or 0)
+        if (
+            fingerprint
+            and prior_fingerprint
+            and str(fingerprint) != str(prior_fingerprint)
+        ):
+            target["remediation_attempts"] = 1
+        else:
+            target["remediation_attempts"] = prior_attempts + 1
+        now_iso = _utcnow().isoformat()
+        target["last_remediation_result"] = "merged" if merged else "failed"
+        target["last_remediation_at"] = now_iso
+        if diagnosis_task_id:
+            target["last_remediation_diagnosis_task_id"] = str(diagnosis_task_id)
+        target["last_remediation_task_id"] = str(task.id)
         if fingerprint:
-            try:
-                _propagate_remediation_failure_to_siblings(
-                    project=project,
-                    directions=directions,
-                    fingerprint=str(fingerprint),
-                    failed_direction_id=str(direction_id),
-                    task=task,
-                    failure_class=target["last_remediation_failure_class"],
-                    error_summary=target["last_remediation_error_summary"],
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    f"[DIAGNOSIS] Failed to propagate remediation failure to siblings "
-                    f"for direction {direction_id}: {exc!r}"
-                )
-    history_list = list(target.get("remediation_history") or [])
-    history_list.append(history_entry)
-    target["remediation_history"] = history_list[-_REMEDIATION_HISTORY_MAX:]
-    project.directions = directions
-    flag_modified(project, "directions")
-    session.add(project)
-    return True
+            target["last_remediation_fingerprint"] = str(fingerprint)
+        history_entry: Dict[str, Any] = {
+            "task_id": str(task.id),
+            "result": "merged" if merged else "failed",
+            "timestamp": now_iso,
+            "prompt_snippet": ((task.first_payload or {}).get("prompt", "") or "")[
+                :200
+            ],
+        }
+        if fingerprint:
+            history_entry["fingerprint"] = str(fingerprint)
+        trigger_failure_class = ctx.get("trigger_failure_class")
+        if trigger_failure_class:
+            history_entry["trigger_failure_class"] = trigger_failure_class
+        ci_failure_type = ctx.get("ci_failure_type")
+        if ci_failure_type:
+            history_entry["ci_failure_type"] = ci_failure_type
+        if merged:
+            target.pop("last_remediation_failure_class", None)
+            target.pop("last_remediation_error_summary", None)
+            if fingerprint:
+                try:
+                    _propagate_remediation_success_to_siblings(
+                        project=proj_shim,
+                        directions=directions,
+                        fingerprint=str(fingerprint),
+                        successful_direction_id=str(direction_id),
+                        task=task,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"[DIAGNOSIS] Failed to propagate remediation success to "
+                        f"siblings for direction {direction_id}: {exc!r}"
+                    )
+        else:
+            from app.failure_classification import classify_failure  # noqa: PLC0415
+
+            target["last_remediation_failure_class"] = classify_failure(
+                task, at_time=task.last_heartbeat or task.started_at
+            )
+            target["last_remediation_error_summary"] = (
+                task.latest_status_message or ""
+            )[:200]
+            history_entry["failure_class"] = target["last_remediation_failure_class"]
+            history_entry["error_summary"] = target["last_remediation_error_summary"]
+            if fingerprint:
+                try:
+                    _propagate_remediation_failure_to_siblings(
+                        project=proj_shim,
+                        directions=directions,
+                        fingerprint=str(fingerprint),
+                        failed_direction_id=str(direction_id),
+                        task=task,
+                        failure_class=target["last_remediation_failure_class"],
+                        error_summary=target["last_remediation_error_summary"],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"[DIAGNOSIS] Failed to propagate remediation failure to "
+                        f"siblings for direction {direction_id}: {exc!r}"
+                    )
+        history_list = list(target.get("remediation_history") or [])
+        history_list.append(history_entry)
+        target["remediation_history"] = history_list[-_REMEDIATION_HISTORY_MAX:]
+        recorded["v"] = True
+        return None
+
+    # expire_on_commit=False leaves a stale directions snapshot in the identity
+    # map; drop it so with_directions_locked re-reads the row fresh under the
+    # lock (see _persist_direction_field_update docstring).
+    project = await session.get(Project, task.project_id)
+    if project is not None:
+        session.expire(project, ["directions"])
+    await with_directions_locked(session, task.project_id, _mutate)
+    return recorded["v"]
 
 
 def _propagate_remediation_success_to_siblings(
@@ -544,11 +601,20 @@ async def _record_project_remediation_outcome(
     # un-pause logic as the linked path so unlinked CI fixes don't leave
     # siblings stuck.
     if fingerprint:
-        directions = list(project.directions or [])
-        try:
+        # Serialize the sibling-directions write through the canonical row lock
+        # so a concurrent same-project completion mutating a different direction
+        # is not clobbered. Drop the cached directions snapshot first
+        # (expire_on_commit=False) so the helper reads the row fresh under the
+        # lock; the remediation_tracking write above is left pending and flushed
+        # within the same transaction. remediation_tracking itself has no
+        # canonical helper and is left as a plain write (out of scope here).
+        session.expire(project, ["directions"])
+
+        def _propagate(directions: List[Dict[str, Any]]):
+            proj_shim = SimpleNamespace(directions=directions)
             if merged:
                 _propagate_remediation_success_to_siblings(
-                    project=project,
+                    project=proj_shim,
                     directions=directions,
                     fingerprint=str(fingerprint),
                     successful_direction_id=None,
@@ -556,7 +622,7 @@ async def _record_project_remediation_outcome(
                 )
             else:
                 _propagate_remediation_failure_to_siblings(
-                    project=project,
+                    project=proj_shim,
                     directions=directions,
                     fingerprint=str(fingerprint),
                     failed_direction_id=None,
@@ -564,8 +630,10 @@ async def _record_project_remediation_outcome(
                     failure_class=failure_class,
                     error_summary=error_summary,
                 )
-            project.directions = directions
-            flag_modified(project, "directions")
+            return None
+
+        try:
+            await with_directions_locked(session, task.project_id, _propagate)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 f"[DIAGNOSIS] Failed to propagate unlinked remediation outcome "
@@ -693,27 +761,6 @@ async def _record_regression_signal_if_matching(
     direction_id = ctx.get("direction_id")
     if not direction_id or ctx.get("diagnosis_task_id"):
         return
-    project = await session.get(Project, task.project_id)
-    if project is None:
-        return
-    directions = list(project.directions or [])
-    target = next((d for d in directions if d.get("id") == direction_id), None)
-    if target is None:
-        return
-    monitor_started_at = target.get("remediation_monitor_started_at")
-    last_rem_fp = target.get("last_remediation_fingerprint")
-    if not monitor_started_at or not last_rem_fp:
-        return
-    from app.direction_lifecycle import _REMEDIATION_MONITOR_EXPIRY_DAYS  # noqa: PLC0415
-
-    try:
-        age_days = (
-            _utcnow() - datetime.fromisoformat(monitor_started_at)
-        ).total_seconds() / 86400
-        if age_days > _REMEDIATION_MONITOR_EXPIRY_DAYS:
-            return
-    except (TypeError, ValueError):
-        return
     if not (task.latest_status_message or "").strip():
         return
     # Must mirror the stage-aware fingerprint that production paths persist
@@ -725,22 +772,55 @@ async def _record_regression_signal_if_matching(
         task_fp = _task_error_fingerprint(task)
     except Exception:
         return
-    if not task_fp or str(task_fp) != str(last_rem_fp):
+    if not task_fp:
         return
-    target["remediation_regression_signal"] = True
-    target["remediation_regression_count"] = (
-        int(target.get("remediation_regression_count") or 0) + 1
-    )
-    target["remediation_regression_last_task_id"] = str(task.id)
-    target["remediation_regression_last_at"] = _utcnow().isoformat()
-    project.directions = directions
-    flag_modified(project, "directions")
-    session.add(project)
-    logger.info(
-        f"[DIAGNOSIS] Regression signal on direction {direction_id}: "
-        f"task {task.id} failed with fingerprint matching last remediation "
-        f"(count={target['remediation_regression_count']})"
-    )
+    from app.direction_lifecycle import _REMEDIATION_MONITOR_EXPIRY_DAYS  # noqa: PLC0415
+
+    # Serialize the regression-signal stamp through the canonical row lock so a
+    # concurrent same-project completion mutating a different direction is not
+    # clobbered. All target-dependent guards run inside the lock against the
+    # freshly-loaded directions list; the task-only guards above stay outside.
+    applied = {"count": None}
+
+    def _mutate(directions: List[Dict[str, Any]]):
+        target = next((d for d in directions if d.get("id") == direction_id), None)
+        if target is None:
+            return None
+        monitor_started_at = target.get("remediation_monitor_started_at")
+        last_rem_fp = target.get("last_remediation_fingerprint")
+        if not monitor_started_at or not last_rem_fp:
+            return None
+        try:
+            age_days = (
+                _utcnow() - datetime.fromisoformat(monitor_started_at)
+            ).total_seconds() / 86400
+            if age_days > _REMEDIATION_MONITOR_EXPIRY_DAYS:
+                return None
+        except (TypeError, ValueError):
+            return None
+        if str(task_fp) != str(last_rem_fp):
+            return None
+        target["remediation_regression_signal"] = True
+        target["remediation_regression_count"] = (
+            int(target.get("remediation_regression_count") or 0) + 1
+        )
+        target["remediation_regression_last_task_id"] = str(task.id)
+        target["remediation_regression_last_at"] = _utcnow().isoformat()
+        applied["count"] = target["remediation_regression_count"]
+        return None
+
+    # expire_on_commit=False leaves a stale directions snapshot in the identity
+    # map; drop it so with_directions_locked re-reads the row fresh under the lock.
+    project = await session.get(Project, task.project_id)
+    if project is not None:
+        session.expire(project, ["directions"])
+    await with_directions_locked(session, task.project_id, _mutate)
+    if applied["count"] is not None:
+        logger.info(
+            f"[DIAGNOSIS] Regression signal on direction {direction_id}: "
+            f"task {task.id} failed with fingerprint matching last remediation "
+            f"(count={applied['count']})"
+        )
 
 
 # Maximum follow-up investigations the failure-driven trigger will spawn
@@ -950,9 +1030,7 @@ async def _maybe_spawn_followup_investigation(
     )
     if shared_id is not None:
         _append_followup_dedup_note(target, fingerprint, shared_id)
-        project.directions = directions
-        flag_modified(project, "directions")
-        session.add(project)
+        await _persist_direction_field_update(session, project, target)
         logger.info(
             f"[DIAGNOSIS] Skip follow-up for direction {direction_id}: shares "
             f"fingerprint {str(fingerprint)[:40]} with investigate task {shared_id}"
@@ -979,7 +1057,6 @@ async def _maybe_spawn_followup_investigation(
         await _maybe_escalate_exhausted_followups(
             project=project,
             direction=target,
-            directions=directions,
             fp_key=fp_key,
             session=session,
         )
@@ -1157,9 +1234,7 @@ async def _maybe_spawn_followup_investigation(
     target["followup_investigation_attempts_by_fingerprint"] = attempts_by_fp
     target[DIAGNOSIS_IN_PROGRESS_KEY] = True
     target[DIAGNOSIS_STARTED_AT_KEY] = now.isoformat()
-    project.directions = directions
-    flag_modified(project, "directions")
-    session.add(project)
+    await _persist_direction_field_update(session, project, target)
     logger.info(
         f"[DIAGNOSIS] Spawned follow-up investigation {new_task.id} after "
         f"remediation task {task.id} failed (direction={direction_id}, "
@@ -1194,7 +1269,6 @@ async def _maybe_escalate_exhausted_followups(
     *,
     project: Project,
     direction: Dict[str, Any],
-    directions: List[Dict[str, Any]],
     fp_key: str,
     session: AsyncSession,
 ) -> None:
@@ -1205,15 +1279,16 @@ async def _maybe_escalate_exhausted_followups(
     and nobody is told. Mirror the auto-pause escalation path in direction_lifecycle
     so operators get a BLOCKER notification the moment the full diagnosis→remediation
     →follow-up chain has been exhausted.
+
+    All mutations target the single ``direction`` dict; the write is serialized
+    once at the end through ``_persist_direction_field_update`` so a concurrent
+    same-project completion mutating a different direction is not clobbered.
     """
     if direction.get("needs_manual_intervention"):
         return
     if not _followup_history_all_failed(direction, fp_key):
         return
     direction["needs_manual_intervention"] = True
-    project.directions = directions
-    flag_modified(project, "directions")
-    session.add(project)
     logger.warning(
         f"[DIAGNOSIS] Direction {direction.get('id')} flagged needs_manual_intervention: "
         f"follow-up cap exhausted for fingerprint {fp_key[:40]} with all prior "
@@ -1230,9 +1305,6 @@ async def _maybe_escalate_exhausted_followups(
         )
         direction.pop("escalation_notification_pending", None)
         direction.pop("escalation_notification_retries", None)
-        project.directions = directions
-        flag_modified(project, "directions")
-        session.add(project)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             f"[NOTIFY] Failed to post follow-up cap escalation for direction "
@@ -1242,9 +1314,6 @@ async def _maybe_escalate_exhausted_followups(
         direction["escalation_notification_retries"] = int(
             direction.get("escalation_notification_retries", 0)
         )
-        project.directions = directions
-        flag_modified(project, "directions")
-        session.add(project)
         from app.models import Alert, AlertSeverity  # noqa: PLC0415
 
         session.add(
@@ -1260,6 +1329,7 @@ async def _maybe_escalate_exhausted_followups(
                 ),
             )
         )
+    await _persist_direction_field_update(session, project, direction)
 
 
 async def _maybe_spawn_low_confidence_followup(
@@ -1320,11 +1390,9 @@ async def _maybe_spawn_low_confidence_followup(
         or _project_active_followup_count(project, fp_key, now=now)
         >= _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT
     ):
-        directions = list(project.directions or [])
         await _maybe_escalate_exhausted_followups(
             project=project,
             direction=direction,
-            directions=directions,
             fp_key=fp_key,
             session=session,
         )
@@ -1470,6 +1538,7 @@ async def _maybe_spawn_reinvestigation_after_failure(
     )
     if shared_id is not None:
         _append_followup_dedup_note(direction, fingerprint, shared_id)
+        await _persist_direction_field_update(session, project, direction)
         logger.info(
             f"[DIAGNOSIS] Skip reinvestigation for direction {direction_id}: "
             f"shares fingerprint {str(fingerprint)[:40]} with investigate "
@@ -1493,11 +1562,9 @@ async def _maybe_spawn_reinvestigation_after_failure(
             f"(direction={len(active_ts)}, "
             f"cap={_FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT})"
         )
-        directions = list(project.directions or [])
         await _maybe_escalate_exhausted_followups(
             project=project,
             direction=direction,
-            directions=directions,
             fp_key=fp_key,
             session=session,
         )
@@ -1657,9 +1724,7 @@ async def _handle_investigation_terminal_failure(
         target.pop(DIAGNOSIS_STARTED_AT_KEY, None)
         target.pop(DIAGNOSIS_TASK_ID_KEY, None)
         target["diagnosis_completed_at"] = _utcnow().isoformat()
-        project.directions = directions_list
-        flag_modified(project, "directions")
-        session.add(project)
+        await _persist_direction_field_update(session, project, target)
         if had_flag:
             logger.info(
                 f"[DIAGNOSIS] Cleared diagnosis_in_progress on direction "
@@ -1711,8 +1776,7 @@ async def _handle_investigation_terminal_failure(
                 _stamp_remediation_spawn_on_direction(target, partial_spawn)
                 target["last_diagnosis_outcome"] = "partial_remediation_spawned"
                 clear_direction_hold(str(direction_id))
-                flag_modified(project, "directions")
-                session.add(project)
+                await _persist_direction_field_update(session, project, target)
                 logger.info(
                     f"[DIAGNOSIS] Spawned partial-diagnosis remediation "
                     f"{partial_spawn.id} for direction {direction_id} from "
@@ -1728,8 +1792,7 @@ async def _handle_investigation_terminal_failure(
             session=session,
         )
         if spawned is not None:
-            flag_modified(project, "directions")
-            session.add(project)
+            await _persist_direction_field_update(session, project, target)
     except Exception as exc:
         logger.warning(
             f"[DIAGNOSIS] Failed to handle investigation terminal failure for "
@@ -2891,8 +2954,11 @@ async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSes
 
     upserted = 0
     project = await session.get(Project, task.project_id)
-    directions = list(project.directions or []) if project else []
-    directions_changed = False
+    # Collect (mode, system_id, consecutive_ship_count) for findings that may
+    # propagate to directions; the actual directions read-modify-write is
+    # serialized once, after the loop, through the canonical row lock so a
+    # concurrent same-project completion is not clobbered.
+    propagation_inputs: List[tuple] = []
     for finding in normalized:
         system_id = finding["system_id"]
         mode = finding["recommended_mode"]
@@ -2951,29 +3017,40 @@ async def _handle_self_audit_completion(task: Task, logs: str, session: AsyncSes
                 )
             )
         upserted += 1
-        now = _utcnow()
-        if mode in _SELF_AUDIT_PROPAGATED_MODES:
-            for d in directions:
-                if d.get("status") != "active" or d.get("system_id") != system_id:
-                    continue
-                if _is_recent_strategic_mode_lock(d, mode, now):
-                    continue
-                d["recommended_mode"] = mode
-                d[RECOMMENDED_MODE_META_KEY] = {
-                    "mode": mode,
-                    "source": RECOMMENDED_MODE_SOURCE_SELF_AUDIT,
-                    "source_task_id": str(task.id),
-                    "set_at": now.isoformat(),
-                }
-                directions_changed = True
-        elif mode == "ship" and _maybe_auto_clear_direction_mode(
-            directions, system_id, consecutive_ship_count, str(task.id), now
-        ):
-            directions_changed = True
-    if project and directions_changed:
-        project.directions = directions
-        flag_modified(project, "directions")
-        session.add(project)
+        if mode in _SELF_AUDIT_PROPAGATED_MODES or mode == "ship":
+            propagation_inputs.append((mode, system_id, consecutive_ship_count))
+
+    if project and propagation_inputs:
+
+        def _propagate_modes(directions: List[Dict[str, Any]]):
+            for mode_, system_id_, csc_ in propagation_inputs:
+                now_ = _utcnow()
+                if mode_ in _SELF_AUDIT_PROPAGATED_MODES:
+                    for d in directions:
+                        if (
+                            d.get("status") != "active"
+                            or d.get("system_id") != system_id_
+                        ):
+                            continue
+                        if _is_recent_strategic_mode_lock(d, mode_, now_):
+                            continue
+                        d["recommended_mode"] = mode_
+                        d[RECOMMENDED_MODE_META_KEY] = {
+                            "mode": mode_,
+                            "source": RECOMMENDED_MODE_SOURCE_SELF_AUDIT,
+                            "source_task_id": str(task.id),
+                            "set_at": now_.isoformat(),
+                        }
+                elif mode_ == "ship":
+                    _maybe_auto_clear_direction_mode(
+                        directions, system_id_, csc_, str(task.id), now_
+                    )
+            return None
+
+        # Drop the cached directions snapshot (expire_on_commit=False) so the
+        # helper reads the row fresh under the lock.
+        session.expire(project, ["directions"])
+        await with_directions_locked(session, task.project_id, _propagate_modes)
 
     summary = f"Self audit ingested {upserted} system(s)"
     if dropped:
@@ -3764,9 +3841,7 @@ async def _handle_investigation_completion(
                 f"{direction_id}: {ctx_exc!r}"
             )
 
-        project.directions = directions_list
-        flag_modified(project, "directions")
-        session.add(project)
+        await _persist_direction_field_update(session, project, direction)
 
     spawned_followup: Optional[Task] = None
     if (
@@ -3783,8 +3858,7 @@ async def _handle_investigation_completion(
             session=session,
         )
         if spawned_followup is not None:
-            flag_modified(project, "directions")
-            session.add(project)
+            await _persist_direction_field_update(session, project, direction)
 
     if direction is not None and project is not None:
         if spawned_child is not None:
@@ -3800,8 +3874,7 @@ async def _handle_investigation_completion(
         else:
             outcome = "no_direction"
         direction["last_diagnosis_outcome"] = outcome
-        flag_modified(project, "directions")
-        session.add(project)
+        await _persist_direction_field_update(session, project, direction)
 
     # Spawn a terminal memo for unactionable outcomes so the investigator's
     # reasoning becomes a citable artifact. Only fires when neither a
@@ -3986,25 +4059,32 @@ async def _clear_direction_diagnosis_flag(
     direction_id = (task.context or {}).get("direction_id")
     if not direction_id:
         return
+
+    # Serialize the single-direction write through the canonical row lock so a
+    # concurrent same-project completion mutating a different direction is not
+    # clobbered. The find-and-mutate runs inside the lock against the freshly
+    # loaded directions list.
+    def _mutate(directions: List[Dict[str, Any]]):
+        target = next((d for d in directions if d.get("id") == direction_id), None)
+        if target is None:
+            return None
+        target.pop(DIAGNOSIS_IN_PROGRESS_KEY, None)
+        target.pop(DIAGNOSIS_STARTED_AT_KEY, None)
+        target.pop(DIAGNOSIS_TASK_ID_KEY, None)
+        target["diagnosis_completed_at"] = _utcnow().isoformat()
+        target["last_diagnosis_task_id"] = str(task.id)
+        if outcome:
+            target["last_diagnosis_outcome"] = outcome
+        if summary:
+            target["diagnosis_summary"] = summary[:STRATEGIC_RATIONALE_MAX]
+        return None
+
+    # expire_on_commit=False leaves a stale directions snapshot in the identity
+    # map; drop it so with_directions_locked re-reads the row fresh under the lock.
     project = await session.get(Project, task.project_id)
-    if project is None:
-        return
-    directions_list = list(project.directions or [])
-    target = next((d for d in directions_list if d.get("id") == direction_id), None)
-    if target is None:
-        return
-    target.pop(DIAGNOSIS_IN_PROGRESS_KEY, None)
-    target.pop(DIAGNOSIS_STARTED_AT_KEY, None)
-    target.pop(DIAGNOSIS_TASK_ID_KEY, None)
-    target["diagnosis_completed_at"] = _utcnow().isoformat()
-    target["last_diagnosis_task_id"] = str(task.id)
-    if outcome:
-        target["last_diagnosis_outcome"] = outcome
-    if summary:
-        target["diagnosis_summary"] = summary[:STRATEGIC_RATIONALE_MAX]
-    project.directions = directions_list
-    flag_modified(project, "directions")
-    session.add(project)
+    if project is not None:
+        session.expire(project, ["directions"])
+    await with_directions_locked(session, task.project_id, _mutate)
 
 
 def _calculate_remediation_scope(
@@ -4377,26 +4457,37 @@ async def confirm_applied_playbook_entries(task: Task, session: AsyncSession) ->
     entry_ids = (task.context or {}).get("playbook_applied_entry_ids") or []
     if not entry_ids:
         return
-    project = await session.get(Project, task.project_id)
-    if not project or not project.design_doc:
-        return
-    doc = dict(project.design_doc)
-    confirmed = 0
     now_iso = _utcnow().isoformat()
-    for entry_id in entry_ids:
-        full_key = (
-            entry_id if entry_id.startswith("playbook/") else f"playbook/{entry_id}"
+
+    # Serialize the design_doc read-modify-write through the canonical row lock
+    # so a concurrent same-project completion bumping a different design_doc key
+    # is not clobbered. The mutate_fn bumps confirmed_count on live playbook
+    # entries inside the lock against the freshly-loaded doc.
+    confirmed = {"v": 0}
+
+    def _mutate(doc: Dict[str, Any]) -> None:
+        for entry_id in entry_ids:
+            full_key = (
+                entry_id if entry_id.startswith("playbook/") else f"playbook/{entry_id}"
+            )
+            entry = doc.get(full_key)
+            if not isinstance(entry, dict):
+                continue
+            entry = dict(entry)
+            entry["confirmed_count"] = entry.get("confirmed_count", 0) + 1
+            entry["last_confirmed_at"] = now_iso
+            doc[full_key] = entry
+            confirmed["v"] += 1
+
+    # expire_on_commit=False means a Project already identity-mapped by the
+    # surrounding completion flow carries a stale design_doc; expire it so the
+    # lock's SELECT FOR UPDATE re-reads the freshly-committed row (canonical
+    # pattern documented at the top of this module, ~L103-110).
+    project = await session.get(Project, task.project_id)
+    if project is not None:
+        session.expire(project, ["design_doc"])
+    await with_design_doc_locked(session, task.project_id, _mutate)
+    if confirmed["v"]:
+        logger.info(
+            "[PLAYBOOK] Confirmed %d entries for task %s", confirmed["v"], task.id
         )
-        entry = doc.get(full_key)
-        if not isinstance(entry, dict):
-            continue
-        entry = dict(entry)
-        entry["confirmed_count"] = entry.get("confirmed_count", 0) + 1
-        entry["last_confirmed_at"] = now_iso
-        doc[full_key] = entry
-        confirmed += 1
-    if confirmed:
-        project.design_doc = doc
-        flag_modified(project, "design_doc")
-        session.add(project)
-        logger.info("[PLAYBOOK] Confirmed %d entries for task %s", confirmed, task.id)

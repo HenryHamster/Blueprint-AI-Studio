@@ -1928,9 +1928,71 @@ def _load_lock_baseline() -> dict:
 _LOCK_BASELINE = _load_lock_baseline()
 
 
+def _ast_count_attr_assignments(app_dir: str, attr_name: str) -> dict[str, int]:
+    """Return per-file counts of AST-level attribute assignments for attr_name.
+
+    Parses each backend/app/**/*.py file with ast.parse and counts ast.Assign /
+    ast.AugAssign nodes whose target (or any element of a tuple target) is an
+    ast.Attribute with .attr == attr_name.  Receiver name is ignored so aliases
+    like proj / p / _proj are all caught.  Assignments inside docstrings,
+    comments, or string literals are naturally excluded by the AST.
+    """
+    import ast
+    import glob as globmod
+
+    counts: dict[str, int] = {}
+    for py_file in globmod.glob(os.path.join(app_dir, "**", "*.py"), recursive=True):
+        with open(py_file) as fh:
+            source = fh.read()
+        try:
+            tree = ast.parse(source, filename=py_file)
+        except SyntaxError:
+            continue
+        count = 0
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AugAssign)):
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                for target in targets:
+                    for t in ast.walk(target):
+                        if isinstance(t, ast.Attribute) and t.attr == attr_name:
+                            count += 1
+        if count > 0:
+            rel = os.path.relpath(py_file, app_dir)
+            counts[rel] = count
+    return counts
+
+
+def _check_lock_invariant(attr_name: str, baseline_key: str, helper_name: str) -> None:
+    """Shared implementation for all three column-lock invariant tests."""
+    app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+    baseline: dict[str, int] = _LOCK_BASELINE[baseline_key]
+    file_counts = _ast_count_attr_assignments(app_dir, attr_name)
+
+    violations: list[str] = []
+    for rel, count in sorted(file_counts.items()):
+        allowed = baseline.get(rel, 0)
+        if count > allowed:
+            violations.append(f"  {rel}: {count} assignments (baseline: {allowed})")
+
+    assert not violations, (
+        f"project.{attr_name} assignment counts exceed their per-file baseline:\n"
+        + "\n".join(violations)
+        + f"\n\nRoute new {attr_name} writes through {helper_name}() "
+        "(task_locking.py). Counts may only be lowered (after migrating a site "
+        "to the canonical helper), never raised. To record a legitimate decrease, "
+        "lower the count in backend/testing/lock_assignment_baseline.json. "
+        "Do NOT increase counts — that widens the tripwire hole."
+    )
+
+
 class TestDesignDocLockInvariant:
-    """Tripwire: direct project.design_doc assignments must not increase above
-    their per-file baseline recorded in lock_assignment_baseline.json.
+    """Tripwire: direct <var>.design_doc attribute assignments must not increase
+    above their per-file baseline recorded in lock_assignment_baseline.json.
+
+    Uses AST-based scanning so docstrings, comments, and string literals are
+    excluded from the count (unlike a regex scan which would match them).
 
     The baseline is a ratchet — counts may only decrease as write sites are
     migrated to with_design_doc_locked() (task_locking.py). Adding a new
@@ -1943,69 +2005,19 @@ class TestDesignDocLockInvariant:
     """
 
     def test_no_new_unlocked_design_doc_writes(self):
-        import glob as globmod
-
-        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
-        baseline: dict[str, int] = _LOCK_BASELINE["design_doc"]
-
-        # Prefer rg for speed; fall back to pure-Python walk when not installed.
-        # rg pattern avoids lookaheads (Rust regex crate does not support them):
-        # ([^=]|$) excludes == comparisons without requiring PCRE2.
-        # Python re pattern uses the equivalent negative-lookahead form.
-        rg_pattern = r"\.design_doc\s*=([^=]|$)"
-        re_pattern = re.compile(r"\.design_doc\s*=(?!=)")
-        file_counts: dict[str, int] = {}
-        try:
-            result = subprocess.run(
-                ["rg", "-c", rg_pattern, app_dir],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 2:
-                pytest.skip(f"rg error: {result.stderr.strip()}")
-            for line in result.stdout.splitlines():
-                line = line.strip()
-                if line and ":" in line:
-                    path, _, count_str = line.rpartition(":")
-                    rel = os.path.relpath(path, app_dir)
-                    file_counts[rel] = int(count_str)
-        except FileNotFoundError:
-            # rg not on PATH — scan with Python re
-            for py_file in globmod.glob(
-                os.path.join(app_dir, "**", "*.py"), recursive=True
-            ):
-                with open(py_file) as fh:
-                    content = fh.read()
-                count = len(re_pattern.findall(content))
-                if count > 0:
-                    file_counts[os.path.relpath(py_file, app_dir)] = count
-
-        violations: list[str] = []
-        for rel, count in sorted(file_counts.items()):
-            allowed = baseline.get(rel, 0)
-            if count > allowed:
-                violations.append(f"  {rel}: {count} assignments (baseline: {allowed})")
-
-        assert not violations, (
-            "project.design_doc assignment counts exceed their per-file baseline:\n"
-            + "\n".join(violations)
-            + "\n\nRoute new design_doc writes through with_design_doc_locked() "
-            "(task_locking.py). To record a legitimate decrease after migrating "
-            "a site, lower its count in backend/testing/lock_assignment_baseline.json. "
-            "Do NOT increase counts — that widens the tripwire hole."
-        )
+        _check_lock_invariant("design_doc", "design_doc", "with_design_doc_locked")
 
 
 # ── Directions Lock Invariant ─────────────────────────────────────────────────
 
 
 class TestDirectionsLockInvariant:
-    """Tripwire: direct <var>.directions assignments must not increase above
-    their per-file baseline recorded in lock_assignment_baseline.json.
+    """Tripwire: direct <var>.directions attribute assignments must not increase
+    above their per-file baseline recorded in lock_assignment_baseline.json.
 
-    The pattern is variable-name-agnostic — it matches ``<anything>.directions =``
-    so a writer can't evade the tripwire by aliasing the project row to ``proj`` /
-    ``p`` / etc.
+    Uses AST-based scanning (receiver-name-agnostic: matches any receiver so
+    aliases like proj / p / _proj are all caught).  Assignments inside
+    docstrings, comments, or string literals are naturally excluded.
 
     The baseline is a ratchet — counts may only decrease as write sites are
     migrated to with_directions_locked() (task_locking.py). Adding a new
@@ -2018,53 +2030,29 @@ class TestDirectionsLockInvariant:
     """
 
     def test_no_new_unlocked_directions_writes(self):
-        import glob as globmod
+        _check_lock_invariant("directions", "directions", "with_directions_locked")
 
-        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
-        baseline: dict[str, int] = _LOCK_BASELINE["directions"]
 
-        # Variable-name-agnostic: match ``<receiver>.directions =`` for any
-        # receiver, excluding the ``==`` comparison operator. ``\.directions``
-        # requires a dotted attribute so bare local ``directions =`` is ignored.
-        rg_pattern = r"\.directions\s*=([^=]|$)"
-        re_pattern = re.compile(r"\.directions\s*=(?!=)")
+# ── Vision Lock Invariant ─────────────────────────────────────────────────────
 
-        file_counts: dict[str, int] = {}
-        try:
-            result = subprocess.run(
-                ["rg", "-c", rg_pattern, app_dir],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode == 2:
-                pytest.skip(f"rg error: {result.stderr.strip()}")
-            for line in result.stdout.splitlines():
-                line = line.strip()
-                if line and ":" in line:
-                    path, _, count_str = line.rpartition(":")
-                    rel = os.path.relpath(path, app_dir)
-                    file_counts[rel] = int(count_str)
-        except FileNotFoundError:
-            for py_file in globmod.glob(
-                os.path.join(app_dir, "**", "*.py"), recursive=True
-            ):
-                with open(py_file) as fh:
-                    content = fh.read()
-                count = len(re_pattern.findall(content))
-                if count > 0:
-                    file_counts[os.path.relpath(py_file, app_dir)] = count
 
-        violations: list[str] = []
-        for rel, count in sorted(file_counts.items()):
-            allowed = baseline.get(rel, 0)
-            if count > allowed:
-                violations.append(f"  {rel}: {count} assignments (baseline: {allowed})")
+class TestVisionLockInvariant:
+    """Tripwire: direct <var>.vision attribute assignments must not increase
+    above their per-file baseline recorded in lock_assignment_baseline.json.
 
-        assert not violations, (
-            "project.directions assignment counts exceed their per-file baseline:\n"
-            + "\n".join(violations)
-            + "\n\nRoute new directions writes through with_directions_locked() "
-            "(task_locking.py). To record a legitimate decrease after migrating "
-            "a site, lower its count in backend/testing/lock_assignment_baseline.json. "
-            "Do NOT increase counts — that widens the tripwire hole."
-        )
+    Uses AST-based scanning (receiver-name-agnostic: matches any receiver so
+    aliases like proj / p / _proj are all caught).  Assignments inside
+    docstrings, comments, or string literals are naturally excluded.
+
+    The baseline is a ratchet — counts may only decrease as write sites are
+    migrated to with_vision_locked() (task_locking.py). Adding a new
+    assignment to any file (even an already-baselined one) raises the count
+    above its baseline and fails this test.
+
+    To migrate a site: route it through with_vision_locked() and lower
+    the count in lock_assignment_baseline.json. Remove the entry when count
+    reaches 0.
+    """
+
+    def test_no_new_unlocked_vision_writes(self):
+        _check_lock_invariant("vision", "vision", "with_vision_locked")

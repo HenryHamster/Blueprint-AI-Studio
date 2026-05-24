@@ -10,7 +10,9 @@ Covers:
 - _ensure_branch: retry/backoff, token refresh, exists-verification, terminal failure
 """
 
+import asyncio
 import json
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,6 +20,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import sessionmaker
 
 from app.task_completion import (
     _parse_plan_output,
@@ -49,9 +53,14 @@ from app.task_completion import (
     _synthesize_memo_from_source_finding,
 )
 from app.strategic_constants import STRATEGIC_RATIONALE_MAX
-from app.models import Alert, AlertSeverity, Task, TaskStatus
+from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
+from app.task_completion import confirm_applied_playbook_entries
 from sqlalchemy import select as _sa_select
 from testing.factories import make_project, make_task
+
+_USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
 
 
 # ── _compute_first_attempt_succeeded ────────────────────────────────────────
@@ -6069,7 +6078,6 @@ class TestEscalateExhaustedFollowupsAlert:
         await _maybe_escalate_exhausted_followups(
             project=project,
             direction=project.directions[0],
-            directions=list(project.directions),
             fp_key="fp-stuck",
             session=db_session,
         )
@@ -6120,7 +6128,6 @@ class TestEscalateExhaustedFollowupsAlert:
         await _maybe_escalate_exhausted_followups(
             project=project,
             direction=project.directions[0],
-            directions=list(project.directions),
             fp_key="fp-ok",
             session=db_session,
         )
@@ -6836,3 +6843,198 @@ class TestCrossLayerRemediationPrompt:
         prompt = task.first_payload["prompt"]
         assert "CROSS-LAYER REMEDIATION" not in prompt
         assert "recommended_unmodifiable_layers" not in prompt
+
+
+@pytest.mark.skipif(
+    not _USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL"
+)
+class TestCompletionHandlerDirectionsConcurrency:
+    """Regression for the lost-update class fixed by routing completion-handler
+    project.directions / project.design_doc writes through the canonical row
+    locks (with_directions_locked / with_design_doc_locked).
+
+    Two concurrent completions of the SAME project, each mutating a DIFFERENT
+    direction (or a different JSON column), must BOTH persist — before the fix,
+    each handler loaded the project unlocked and wrote back a stale whole-array
+    snapshot, silently dropping the peer's update.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_remediation_outcomes_on_different_directions_both_persist(
+        self, db_session
+    ):
+        project = make_project(
+            directions=[
+                {"id": "dir-a", "status": "active"},
+                {"id": "dir-b", "status": "active"},
+            ]
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        pid = project.id
+
+        Session = sessionmaker(
+            bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+        )
+
+        async def record(direction_id: str) -> None:
+            async with Session() as s:
+                task = make_task(
+                    project_id=pid,
+                    context={
+                        "diagnosis_task_id": f"diag-{direction_id}",
+                        "direction_id": direction_id,
+                    },
+                )
+                s.add(task)
+                await s.commit()
+                await s.refresh(task)
+                ok = await _record_remediation_outcome(task, merged=True, session=s)
+                assert ok is True
+                await s.commit()
+
+        await asyncio.gather(record("dir-a"), record("dir-b"))
+
+        async with Session() as v:
+            proj = (
+                await v.execute(_sa_select(Project).where(Project.id == pid))
+            ).scalar_one()
+            by = {d["id"]: d for d in proj.directions}
+        assert by["dir-a"].get("last_remediation_result") == "merged", (
+            f"dir-a lost update: {by}"
+        )
+        assert by["dir-b"].get("last_remediation_result") == "merged", (
+            f"dir-b lost update: {by}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_directions_and_design_doc_writes_both_persist(
+        self, db_session
+    ):
+        """A directions write (remediation outcome) and a design_doc write
+        (playbook confirmation) racing on the same project must both survive —
+        the two columns are serialized through separate canonical helpers."""
+        from app.task_locking import with_design_doc_locked
+
+        project = make_project(
+            directions=[{"id": "dir-a", "status": "active"}],
+        )
+        project.design_doc = {
+            "playbook/pb-1": {"value": "x", "confirmed_count": 0},
+        }
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        pid = project.id
+
+        Session = sessionmaker(
+            bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+        )
+
+        async def record_direction() -> None:
+            async with Session() as s:
+                task = make_task(
+                    project_id=pid,
+                    context={
+                        "diagnosis_task_id": "diag-a",
+                        "direction_id": "dir-a",
+                    },
+                )
+                s.add(task)
+                await s.commit()
+                await s.refresh(task)
+                await _record_remediation_outcome(task, merged=True, session=s)
+                await s.commit()
+
+        def _add_pb2(doc: dict) -> None:
+            doc["playbook/pb-2"] = {"value": "y", "confirmed_count": 7}
+
+        async def confirm_playbook() -> None:
+            async with Session() as s:
+                # Pre-load the Project so it is identity-mapped in this session
+                # with the current design_doc cached. Under expire_on_commit=False
+                # this mirrors the production completion flow, where the Project
+                # is already loaded before confirm_applied_playbook_entries runs.
+                await s.get(Project, pid)
+                task = make_task(
+                    project_id=pid,
+                    context={"playbook_applied_entry_ids": ["pb-1"]},
+                )
+                s.add(task)
+                await s.commit()
+                await s.refresh(task)
+                # A concurrent same-project design_doc write lands on a DIFFERENT
+                # key (pb-2) from a separate session, AFTER this session cached
+                # the doc. Without the session.expire(project, ['design_doc'])
+                # inside confirm_applied_playbook_entries, its SELECT FOR UPDATE
+                # returns this session's stale identity-mapped instance, so the
+                # confirmed_count bump writes back a doc that never saw pb-2 and
+                # clobbers it. The expire forces a fresh load under the lock.
+                async with Session() as other:
+                    await with_design_doc_locked(other, pid, _add_pb2)
+                    await other.commit()
+                await confirm_applied_playbook_entries(task, session=s)
+                await s.commit()
+
+        await asyncio.gather(record_direction(), confirm_playbook())
+
+        async with Session() as v:
+            proj = (
+                await v.execute(_sa_select(Project).where(Project.id == pid))
+            ).scalar_one()
+            assert proj.directions[0].get("last_remediation_result") == "merged", (
+                f"directions write lost: {proj.directions}"
+            )
+            assert proj.design_doc["playbook/pb-1"]["confirmed_count"] == 1, (
+                f"design_doc write lost: {proj.design_doc}"
+            )
+            # The concurrent pb-2 write must survive — its loss is the exact
+            # stale-identity-map clobber the expire guards against.
+            assert "playbook/pb-2" in proj.design_doc, (
+                f"concurrent design_doc key clobbered (missing expire): {proj.design_doc}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_diagnosis_flag_clears_on_different_directions_both_persist(
+        self, db_session
+    ):
+        """Two _clear_direction_diagnosis_flag calls on different directions of
+        the same project must both clear their own direction (no lost update)."""
+        project = make_project(
+            directions=[
+                {"id": "dir-a", "status": "active", "diagnosis_in_progress": True},
+                {"id": "dir-b", "status": "active", "diagnosis_in_progress": True},
+            ]
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        pid = project.id
+
+        Session = sessionmaker(
+            bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+        )
+
+        async def clear(direction_id: str) -> None:
+            async with Session() as s:
+                task = make_task(project_id=pid, context={"direction_id": direction_id})
+                s.add(task)
+                await s.commit()
+                await s.refresh(task)
+                await _clear_direction_diagnosis_flag(
+                    task, s, summary=None, outcome="done"
+                )
+                await s.commit()
+
+        await asyncio.gather(clear("dir-a"), clear("dir-b"))
+
+        async with Session() as v:
+            proj = (
+                await v.execute(_sa_select(Project).where(Project.id == pid))
+            ).scalar_one()
+            by = {d["id"]: d for d in proj.directions}
+        assert by["dir-a"].get("diagnosis_in_progress") is None, by
+        assert by["dir-b"].get("diagnosis_in_progress") is None, by
+        assert by["dir-a"].get("last_diagnosis_outcome") == "done", by
+        assert by["dir-b"].get("last_diagnosis_outcome") == "done", by

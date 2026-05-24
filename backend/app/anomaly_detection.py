@@ -1695,75 +1695,96 @@ async def _check_anomaly_proposals(project, session):
 
     Creates at most 1 proposal per call. Proposals require human approval (status='proposed').
     """
+    from app.task_locking import with_directions_locked
+
     proj_key = str(project.id)
-    proj_anomalies = _shared_state.persistent_anomalies.get(proj_key, {})
-    if not proj_anomalies:
-        return
-
-    proj_directions = list(project.directions or [])
-    rejected_proposals = [d for d in proj_directions if d.get("status") == "rejected"]
-    pending_count = sum(1 for d in proj_directions if d.get("status") == "proposed")
-    max_proposals = 10
-
-    if pending_count >= max_proposals:
+    if not _shared_state.persistent_anomalies.get(proj_key, {}):
         return
 
     now_iso = _utcnow().isoformat()
-    for anomaly_key, info in sorted(
-        ((k, v) for k, v in proj_anomalies.items() if isinstance(v, dict)),
-        key=lambda x: x[1].get("occurrence_count", 0),
-        reverse=True,
-    ):
-        if info.get("occurrence_count", 0) < 3:
-            continue
 
-        # Build proposal text based on the anomaly key pattern
-        details = info.get("latest_details", "")
-        if anomaly_key.startswith("Direction_"):
-            # Direction-level anomaly (declining merge rate / high failure)
-            proposal_text = f"Investigate {anomaly_key} anomaly — {details}"[:500]
-        else:
-            # Failure class anomaly (e.g. CODE_ERROR, PROVISION_FAILURE)
-            proposal_text = (
-                f"Investigate and reduce {anomaly_key} task failures — {details}"[:500]
-            )
+    # Mutable cell: records the anomaly_key whose occurrence_count needs reset
+    # after the lock is released (avoids doing _shared_state mutation inside lock).
+    _applied: dict = {}
 
-        is_dup, _override = _is_direction_duplicate(
-            proposal_text, proj_directions, rejected_proposals
+    def _mutate(dirs: list) -> None:
+        # Compute the candidate snapshot INSIDE the lock closure so the read of
+        # _shared_state.persistent_anomalies is consistent with the serialized
+        # write window. Reading it before the lock let two gather'd coroutines
+        # interleave at the lock's await point and capture a sibling's
+        # transiently-zeroed occurrence_count, dropping one of the proposals.
+        proj_anomalies = _shared_state.persistent_anomalies.get(proj_key, {})
+        candidates = sorted(
+            ((k, v) for k, v in proj_anomalies.items() if isinstance(v, dict)),
+            key=lambda x: x[1].get("occurrence_count", 0),
+            reverse=True,
         )
-        if is_dup:
+
+        rejected_proposals = [d for d in dirs if d.get("status") == "rejected"]
+        pending_count = sum(1 for d in dirs if d.get("status") == "proposed")
+        if pending_count >= 10:
+            return
+
+        for anomaly_key, info in candidates:
+            if info.get("occurrence_count", 0) < 3:
+                continue
+
+            # Build proposal text based on the anomaly key pattern
+            details = info.get("latest_details", "")
+            if anomaly_key.startswith("Direction_"):
+                proposal_text = f"Investigate {anomaly_key} anomaly — {details}"[:500]
+            else:
+                proposal_text = (
+                    f"Investigate and reduce {anomaly_key} task failures — {details}"[
+                        :500
+                    ]
+                )
+
+            is_dup, _override = _is_direction_duplicate(
+                proposal_text, dirs, rejected_proposals
+            )
+            if is_dup:
+                logger.info(
+                    f"[ANOMALY] Skipping proposal for {anomaly_key} — overlaps with existing direction"
+                )
+                continue
+
+            new_direction = {
+                "id": f"d-{uuid.uuid4().hex[:8]}",
+                "text": proposal_text,
+                "priority": "high" if info["severity"] == "high" else "medium",
+                "paths": [],
+                "added_at": now_iso,
+                "status": "proposed",
+                "proposed_by": "ANOMALY_DETECTOR",
+                "proposal_rationale": (
+                    f"Anomaly '{anomaly_key}' detected {info['occurrence_count']} times "
+                    f"since {info['first_seen']}. Severity: {info['severity']}."
+                )[:500],
+                "proposed_at": now_iso,
+            }
+            dirs.append(new_direction)
+            _applied["anomaly_key"] = anomaly_key
             logger.info(
-                f"[ANOMALY] Skipping proposal for {anomaly_key} — overlaps with existing direction"
+                f"[ANOMALY] Created direction proposal for persistent anomaly: {anomaly_key}"
             )
-            continue
+            # Cap at 1 anomaly-driven proposal per cycle
+            break
 
-        new_direction = {
-            "id": f"d-{uuid.uuid4().hex[:8]}",
-            "text": proposal_text,
-            "priority": "high" if info["severity"] == "high" else "medium",
-            "paths": [],
-            "added_at": now_iso,
-            "status": "proposed",
-            "proposed_by": "ANOMALY_DETECTOR",
-            "proposal_rationale": (
-                f"Anomaly '{anomaly_key}' detected {info['occurrence_count']} times "
-                f"since {info['first_seen']}. Severity: {info['severity']}."
-            )[:500],
-            "proposed_at": now_iso,
-        }
-        proj_directions.append(new_direction)
-        project.directions = proj_directions
-        flag_modified(project, "directions")
-        session.add(project)
-        logger.info(
-            f"[ANOMALY] Created direction proposal for persistent anomaly: {anomaly_key}"
-        )
+    # Expire the cached directions attribute so the FOR NO KEY UPDATE re-SELECT
+    # inside with_directions_locked loads the array fresh from the locked row —
+    # otherwise a stale identity-mapped value could whole-array-overwrite a
+    # sibling completion's concurrently-committed append (canonical pattern,
+    # mirrors direction_outcomes / research_direction_state).
+    session.expire(project, ["directions"])
+    await with_directions_locked(session, project.id, _mutate)
 
-        # Reset occurrence count so we don't re-propose until it recurs
-        info["occurrence_count"] = 0
-
-        # Cap at 1 anomaly-driven proposal per cycle
-        break
+    if _applied:
+        # Reset occurrence count outside the lock so we don't re-propose until it recurs
+        anomaly_key = _applied["anomaly_key"]
+        info = _shared_state.persistent_anomalies.get(proj_key, {}).get(anomaly_key)
+        if info is not None:
+            info["occurrence_count"] = 0
 
 
 async def _expire_stale_proposals(session) -> int:

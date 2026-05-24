@@ -52,13 +52,24 @@ def _make_session(tasks: list, project, all_tasks_72h: list | None = None):
     return session
 
 
-def _make_proposal_session():
-    """Build a mock AsyncSession for _check_anomaly_proposals (no execute calls needed).
+def _make_proposal_session(project=None):
+    """Build a mock AsyncSession for _check_anomaly_proposals.
 
-    Uses MagicMock for session.add since it's synchronous in SQLAlchemy.
+    _check_anomaly_proposals serializes its directions write through
+    with_directions_locked -> project_lock, which issues a SELECT FOR UPDATE
+    and re-loads the project row inside the lock. Wire session.execute to
+    return the in-memory `project` from scalar_one_or_none so the mutate
+    closure operates on (and the assertions can observe) that same object.
+    session.add / session.expire are synchronous in SQLAlchemy, so use
+    MagicMock to avoid un-awaited-coroutine warnings.
     """
     session = AsyncMock()
     session.add = MagicMock()
+    session.expire = MagicMock()
+    if project is not None:
+        result = MagicMock()
+        result.scalar_one_or_none = MagicMock(return_value=project)
+        session.execute = AsyncMock(return_value=result)
     return session
 
 
@@ -207,7 +218,7 @@ async def test_proposal_created_after_3_occurrences():
 
     project = make_project(directions=[])
     project.id = project_id
-    session = _make_proposal_session()
+    session = _make_proposal_session(project)
 
     await _check_anomaly_proposals(project, session)
 
@@ -245,7 +256,7 @@ async def test_no_proposal_below_3_occurrences():
 
     project = make_project(directions=[])
     project.id = project_id
-    session = _make_proposal_session()
+    session = _make_proposal_session(project)
 
     await _check_anomaly_proposals(project, session)
 
@@ -278,7 +289,7 @@ async def test_max_one_proposal_per_cycle():
 
     project = make_project(directions=[])
     project.id = project_id
-    session = _make_proposal_session()
+    session = _make_proposal_session(project)
 
     await _check_anomaly_proposals(project, session)
 
@@ -310,7 +321,7 @@ async def test_proposal_respects_10_pending_cap():
     ]
     project = make_project(directions=existing)
     project.id = project_id
-    session = _make_proposal_session()
+    session = _make_proposal_session(project)
 
     await _check_anomaly_proposals(project, session)
 
@@ -345,7 +356,7 @@ async def test_duplicate_proposal_skipped():
     ]
     project = make_project(directions=existing)
     project.id = project_id
-    session = _make_proposal_session()
+    session = _make_proposal_session(project)
 
     await _check_anomaly_proposals(project, session)
 
@@ -372,7 +383,7 @@ async def test_proposal_has_correct_fields():
 
     project = make_project(directions=[])
     project.id = project_id
-    session = _make_proposal_session()
+    session = _make_proposal_session(project)
 
     await _check_anomaly_proposals(project, session)
 
@@ -394,7 +405,7 @@ async def test_no_anomalies_no_proposals():
     project_id = uuid.uuid4()
     project = make_project(directions=[])
     project.id = project_id
-    session = _make_proposal_session()
+    session = _make_proposal_session(project)
 
     await _check_anomaly_proposals(project, session)
 
@@ -433,7 +444,7 @@ async def test_end_to_end_3_cycles_generates_proposal():
 
     # Now check for proposals
     project.id = project_id
-    session = _make_proposal_session()
+    session = _make_proposal_session(project)
     await _check_anomaly_proposals(project, session)
 
     assert len(project.directions) == 1
@@ -515,7 +526,7 @@ async def test_direction_anomaly_proposal_after_3_occurrences():
 
     project = make_project(directions=[])
     project.id = project_id
-    session = _make_proposal_session()
+    session = _make_proposal_session(project)
 
     await _check_anomaly_proposals(project, session)
 

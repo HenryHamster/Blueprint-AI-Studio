@@ -27,6 +27,7 @@ from app.failure_classification import (
 )
 from app.models import Project, Task, TaskStatus
 from app.review_pipeline import _is_test_file
+from app.task_locking import with_design_doc_locked, with_directions_locked
 
 
 def _is_cascade_cancelled(task: Task) -> bool:
@@ -134,14 +135,11 @@ def _longest_chain_length(deps_map: dict[str, list[str]]) -> int:
     return max((depth(n, frozenset()) for n in nodes), default=0)
 
 
-def _update_cochange_index(
-    project: Project, merged_files_lists: list[list[str]]
-) -> None:
-    """Update the co-change affinity index in project.design_doc.
+def _apply_cochange_to_doc(doc: dict, merged_files_lists: list[list[str]]) -> None:
+    """Apply co-change affinity index updates to a design_doc dict in place.
 
-    For each merged PR's file list, records which files changed together.
-    Scores decay on each call so stale associations fade over time.
-    Keeps top-5 affinities per file, capped at 200 files total.
+    Core logic extracted from _update_cochange_index so it can be called
+    inside with_design_doc_locked (which passes the doc dict directly).
     """
     if not merged_files_lists:
         return
@@ -151,8 +149,7 @@ def _update_cochange_index(
     MAX_FILES = 200
     MIN_SCORE = 0.3
 
-    design_doc = dict(project.design_doc or {})
-    raw_index = design_doc.get("cochange_index") or {}
+    raw_index = doc.get("cochange_index") or {}
     index: dict[str, dict[str, float]] = {k: dict(v) for k, v in raw_index.items()}
 
     # Decay all existing scores
@@ -194,8 +191,23 @@ def _update_cochange_index(
         )[:MAX_FILES]
         index = {f: index[f] for f in top_files}
 
-    design_doc["cochange_index"] = index
-    project.design_doc = design_doc
+    doc["cochange_index"] = index
+
+
+def _update_cochange_index(
+    project: Project, merged_files_lists: list[list[str]]
+) -> None:
+    """Update the co-change affinity index in project.design_doc.
+
+    For each merged PR's file list, records which files changed together.
+    Scores decay on each call so stale associations fade over time.
+    Keeps top-5 affinities per file, capped at 200 files total.
+    """
+    if not merged_files_lists:
+        return
+    doc = dict(project.design_doc or {})
+    _apply_cochange_to_doc(doc, merged_files_lists)
+    project.design_doc = doc
     flag_modified(project, "design_doc")
 
 
@@ -215,15 +227,27 @@ async def _update_direction_research_outcomes(
     project = await session.get(Project, project_id)
     if not project:
         return
-    directions = list(project.directions or [])
     merged_files_lists: list[list[str]] = []
-    d = next((x for x in directions if x.get("id") == direction_id), None)
+    # Snapshot read for early-exit guards and computation base; the actual
+    # write is serialized via with_directions_locked below.
+    d = next(
+        (x for x in (project.directions or []) if x.get("id") == direction_id), None
+    )
     if d is None:
         return
-    history = d.get("research_history", [])
-    entry = next((e for e in history if e.get("task_id") == research_task_id), None)
-    if entry is None:
+    entry_snap = next(
+        (
+            e
+            for e in d.get("research_history", [])
+            if e.get("task_id") == research_task_id
+        ),
+        None,
+    )
+    if entry_snap is None:
         return
+    # Work on a mutable copy; all stat writes accumulate here and are then
+    # applied to the freshly-locked directions row inside with_directions_locked.
+    entry = dict(entry_snap)
     try:
         research_task_uuid = uuid.UUID(entry.get("task_id", ""))
     except (ValueError, AttributeError):
@@ -903,6 +927,7 @@ async def _update_direction_research_outcomes(
         }
 
     # Maintain research_context: promote proposed findings based on outcomes
+    new_context: str | None = None
     ctx = d.get("research_context", "")
     if ctx:
         parsed = _parse_research_context(ctx)
@@ -973,14 +998,50 @@ async def _update_direction_research_outcomes(
                 parts.append(f"- {item}")
             parts.append("")
         updated_ctx = "\n".join(parts).strip() + "\n"
-        d["research_context"] = updated_ctx[:8000]
+        new_context = updated_ctx[:8000]
+
+    # Serialize the directions write via row-lock so two concurrent research
+    # completions for different directions of the same project don't clobber
+    # each other's research_history entries via stale whole-array overwrites.
+    session.expire(project, ["directions"])
+
+    def _apply_direction_outcomes(dirs: list) -> None:
+        target_d = next((x for x in dirs if x.get("id") == direction_id), None)
+        if target_d is None:
+            return
+        target_entry = next(
+            (
+                e
+                for e in target_d.get("research_history", [])
+                if e.get("task_id") == research_task_id
+            ),
+            None,
+        )
+        if target_entry is None:
+            return
+        target_entry.update(entry)
+        if new_context is not None:
+            target_d["research_context"] = new_context
+
+    # Both the directions write and the design_doc cochange-index write target
+    # the same project row and hold its FOR NO KEY UPDATE lock until the session
+    # commits, so we issue them under a SINGLE commit. This preserves the
+    # original single-transaction atomicity (a crash can't persist the
+    # directions write without the cochange-index write) while keeping the
+    # lost-update protection of the row lock.
+    await with_directions_locked(session, project_id, _apply_direction_outcomes)
 
     if merged_files_lists:
-        _update_cochange_index(project, merged_files_lists)
-    project.directions = directions
-    flag_modified(project, "directions")
-    session.add(project)
+        session.expire(project, ["design_doc"])
+        await with_design_doc_locked(
+            session,
+            project_id,
+            lambda doc: _apply_cochange_to_doc(doc, merged_files_lists),
+        )
+
     await session.commit()
+
+    await session.refresh(project)
     _refresh_pipeline_scope_merge_rates(project)
 
 

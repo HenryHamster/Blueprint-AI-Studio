@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import (
@@ -36,6 +35,7 @@ from app.research_context import (
     extract_diagnosis_from_context,
 )
 from app.shared_state import DEFAULT_TASK_SCOPE
+from app.task_locking import with_design_doc_locked, with_directions_locked
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -62,22 +62,22 @@ def _append_evicted_findings(direction: dict, new_entries: list) -> None:
     direction["history_aggregate"] = agg
 
 
-def _append_archived_diagnosis(
-    project: Project, direction: dict, direction_id: str
-) -> None:
+def _append_archived_diagnosis(doc: dict, direction: dict, direction_id: str) -> None:
     """Archive a direction's diagnosis when it is completed/retired.
 
     Extracts the diagnosis summary from the direction's research_context and appends
-    it to project.design_doc['retired_diagnoses_archive']. Maintains FIFO list capped
-    at _ARCHIVED_DIAGNOSES_CAP entries, each truncated to _DIAGNOSIS_MAX_CHARS.
+    it to doc['retired_diagnoses_archive']. Maintains FIFO list capped at
+    _ARCHIVED_DIAGNOSES_CAP entries, each truncated to _DIAGNOSIS_MAX_CHARS.
+
+    Operates on the doc dict in place so it can be called inside
+    with_design_doc_locked (which passes the freshly-locked dict).
     """
     research_context = direction.get("research_context", "")
     diagnosis = extract_diagnosis_from_context(research_context)
     if not diagnosis or not diagnosis.strip():
         return
     diagnosis = diagnosis.strip()[:_DIAGNOSIS_MAX_CHARS]
-    design_doc = dict(project.design_doc or {})
-    archive = list(design_doc.get("retired_diagnoses_archive") or [])
+    archive = list(doc.get("retired_diagnoses_archive") or [])
     archive.append(
         {
             "direction_id": direction_id,
@@ -87,8 +87,7 @@ def _append_archived_diagnosis(
     )
     if len(archive) > _ARCHIVED_DIAGNOSES_CAP:
         archive = archive[-_ARCHIVED_DIAGNOSES_CAP:]
-    design_doc["retired_diagnoses_archive"] = archive
-    project.design_doc = design_doc
+    doc["retired_diagnoses_archive"] = archive
 
 
 def _compute_saturation(history: list) -> bool:
@@ -214,6 +213,7 @@ async def apply_post_spawn_state(
         project = await session.get(Project, task.project_id)
         if project:
             directions = list(project.directions or [])
+            _pending_archived_diagnoses: list[tuple] = []
             now_iso = _utcnow().isoformat()
             for d in directions:
                 if d.get("id") in direction_ids_with_findings:
@@ -487,8 +487,9 @@ async def apply_post_spawn_state(
                                 f"Auto-completed: direction saturated with {total_merged} "
                                 f"total PRs merged across {total_cycles} cycles"
                             )
-                            # Archive this direction's diagnosis before it ages out
-                            _append_archived_diagnosis(project, d, did)
+                            # Capture diagnosis info for deferred design_doc write
+                            # inside with_design_doc_locked (after the directions commit).
+                            _pending_archived_diagnoses.append((dict(d), did))
                             alert = Alert(
                                 project_id=task.project_id,
                                 severity=AlertSeverity.INFO,
@@ -517,50 +518,72 @@ async def apply_post_spawn_state(
                                     f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}"
                                 )
 
-            project.directions = directions
-            flag_modified(project, "directions")
-            session.add(project)
-
-            # If this is a sub-research task (depth > 0), also annotate the parent direction's
-            # most recent research_history entry with a note about sub-research findings.
+            # Also apply sub-research annotation directly on the in-memory
+            # `directions` list before the locked write so both updates land
+            # in a single atomic transaction.
             if (
                 research_depth > 0
                 and parent_research_task_id
                 and direction_ids_with_findings
             ):
-                parent_project = await session.get(Project, task.project_id)
-                if parent_project and parent_project.directions:
-                    parent_dirs = list(parent_project.directions)
-                    for d in parent_dirs:
-                        did = d.get("id")
-                        if did not in direction_ids_with_findings:
-                            continue
-                        history = d.get("research_history", [])
-                        if history:
-                            last_entry = history[-1]
-                            sub_notes = last_entry.get("sub_research_notes", [])
-                            sub_notes.append(
-                                {
-                                    "sub_task_id": str(task.id),
-                                    "depth": research_depth,
-                                    "tasks_created": len(child_tasks),
-                                    "finding_titles": [
-                                        f.get("title", "")
-                                        for _, f, _ in deduplicated[:3]
-                                    ],
-                                    "insights": [
-                                        i["summary"][:150] for i in insights[:2]
-                                    ],  # up to 2 insights, capped
-                                }
-                            )
-                            last_entry["sub_research_notes"] = sub_notes[
-                                -5:
-                            ]  # keep last 5
-                            history[-1] = last_entry
-                            d["research_history"] = history
-                    parent_project.directions = parent_dirs
-                    flag_modified(parent_project, "directions")
-                    session.add(parent_project)
+                for d in directions:
+                    did = d.get("id")
+                    if did not in direction_ids_with_findings:
+                        continue
+                    history = d.get("research_history", [])
+                    if history:
+                        last_entry = history[-1]
+                        sub_notes = last_entry.get("sub_research_notes", [])
+                        sub_notes.append(
+                            {
+                                "sub_task_id": str(task.id),
+                                "depth": research_depth,
+                                "tasks_created": len(child_tasks),
+                                "finding_titles": [
+                                    f.get("title", "") for _, f, _ in deduplicated[:3]
+                                ],
+                                "insights": [
+                                    i["summary"][:150] for i in insights[:2]
+                                ],  # up to 2 insights, capped
+                            }
+                        )
+                        last_entry["sub_research_notes"] = sub_notes[-5:]  # keep last 5
+                        history[-1] = last_entry
+                        d["research_history"] = history
+
+            # Serialize the directions write via row-lock so concurrent research
+            # completions for different directions of the same project don't
+            # clobber each other's entries via stale whole-array overwrites.
+            _dir_mutations = {
+                d["id"]: dict(d)
+                for d in directions
+                if d.get("id") in direction_ids_with_findings
+            }
+            session.expire(project, ["directions"])
+
+            def _apply_main_directions(dirs: list) -> None:
+                for fresh_d in dirs:
+                    snap = _dir_mutations.get(fresh_d.get("id"))
+                    if snap is not None:
+                        fresh_d.update(snap)
+
+            await with_directions_locked(
+                session, task.project_id, _apply_main_directions
+            )
+            await session.commit()
+
+            # Serialize design_doc writes for archived diagnoses captured above.
+            if _pending_archived_diagnoses:
+                session.expire(project, ["design_doc"])
+
+                def _apply_archived_diagnoses(doc: dict) -> None:
+                    for _d_snap, _did in _pending_archived_diagnoses:
+                        _append_archived_diagnosis(doc, _d_snap, _did)
+
+                await with_design_doc_locked(
+                    session, task.project_id, _apply_archived_diagnoses
+                )
+                await session.commit()
 
     # Process direction notes — append to the target direction's notes list
     if direction_notes:
@@ -570,43 +593,50 @@ async def apply_post_spawn_state(
             STRATEGIC_RATIONALE_MAX,
         )
 
-        note_project = await session.get(Project, task.project_id)
-        if note_project:
-            note_directions = list(note_project.directions or [])
-            changed = False
-            for note_finding in direction_notes:
-                target_id = note_finding.get("direction_id")
-                raw_note = (
-                    note_finding.get("description") or note_finding.get("prompt") or ""
+        _notes_to_apply: list[tuple[str, dict]] = []
+        for note_finding in direction_notes:
+            target_id = note_finding.get("direction_id")
+            raw_note = (
+                note_finding.get("description") or note_finding.get("prompt") or ""
+            )
+            if len(raw_note) > STRATEGIC_RATIONALE_MAX:
+                logger.warning(
+                    f"[RESEARCH] Task {task.id}: truncating direction note {len(raw_note)}→{STRATEGIC_RATIONALE_MAX} chars for direction {target_id}"
                 )
-                if len(raw_note) > STRATEGIC_RATIONALE_MAX:
-                    logger.warning(
-                        f"[RESEARCH] Task {task.id}: truncating direction note {len(raw_note)}→{STRATEGIC_RATIONALE_MAX} chars for direction {target_id}"
-                    )
-                note_text = raw_note[:STRATEGIC_RATIONALE_MAX]
-                if not note_text or not target_id:
-                    continue
-                for d in note_directions:
-                    if d.get("id") == target_id:
-                        notes = d.get("notes", [])
-                        notes.append(
-                            {
-                                "text": note_text,
-                                "added_at": _utcnow().isoformat(),
-                                "added_by_task": str(task.id),
-                            }
-                        )
-                        if len(notes) > STRATEGIC_NOTES_HISTORY_MAX:
-                            logger.warning(
-                                f"[RESEARCH] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {target_id}"
-                            )
-                        d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
-                        changed = True
-                        break
-            if changed:
-                note_project.directions = note_directions
-                flag_modified(note_project, "directions")
-                session.add(note_project)
+            note_text = raw_note[:STRATEGIC_RATIONALE_MAX]
+            if not note_text or not target_id:
+                continue
+            _notes_to_apply.append(
+                (
+                    target_id,
+                    {
+                        "text": note_text,
+                        "added_at": _utcnow().isoformat(),
+                        "added_by_task": str(task.id),
+                    },
+                )
+            )
+
+        if _notes_to_apply:
+            _note_project = await session.get(Project, task.project_id)
+            if _note_project:
+                session.expire(_note_project, ["directions"])
+
+                def _apply_notes(dirs: list) -> None:
+                    for _target_id, _note_entry in _notes_to_apply:
+                        for _d in dirs:
+                            if _d.get("id") == _target_id:
+                                _notes = list(_d.get("notes") or [])
+                                _notes.append(_note_entry)
+                                if len(_notes) > STRATEGIC_NOTES_HISTORY_MAX:
+                                    logger.warning(
+                                        f"[RESEARCH] Task {task.id}: dropping {len(_notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {_target_id}"
+                                    )
+                                _d["notes"] = _notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                                break
+
+                await with_directions_locked(session, task.project_id, _apply_notes)
+                await session.commit()
 
     # Process direction proposals — add to Project.directions with status='proposed'
     proposals_created = 0
@@ -616,15 +646,17 @@ async def apply_post_spawn_state(
 
         proposal_project = await session.get(Project, task.project_id)
         if proposal_project:
-            proj_directions = list(proposal_project.directions or [])
+            # Use snapshot for dedup check (best-effort; write is locked below)
+            proj_directions_snap = list(proposal_project.directions or [])
             rejected_proposals = [
-                d for d in proj_directions if d.get("status") == "rejected"
+                d for d in proj_directions_snap if d.get("status") == "rejected"
             ]
             pending_count = sum(
-                1 for d in proj_directions if d.get("status") == "proposed"
+                1 for d in proj_directions_snap if d.get("status") == "proposed"
             )
             max_proposals = 10
             now_iso = _utcnow().isoformat()
+            _new_proposals: list[dict] = []
             for proposal in direction_proposals[:5]:  # max 5 per research call
                 if pending_count >= max_proposals:
                     logger.info(
@@ -637,7 +669,7 @@ async def apply_post_spawn_state(
                 if not proposal_text.strip():
                     continue
                 is_dup, _override = _is_direction_duplicate(
-                    proposal_text, proj_directions, rejected_proposals
+                    proposal_text, proj_directions_snap, rejected_proposals
                 )
                 if is_dup:
                     logger.info(
@@ -657,13 +689,21 @@ async def apply_post_spawn_state(
                     "proposal_rationale": (proposal.get("description") or "")[:500],
                     "proposed_at": now_iso,
                 }
-                proj_directions.append(new_direction)
+                _new_proposals.append(new_direction)
+                proj_directions_snap.append(new_direction)
                 pending_count += 1
                 proposals_created += 1
             if proposals_created:
-                proposal_project.directions = proj_directions
-                flag_modified(proposal_project, "directions")
-                session.add(proposal_project)
+                session.expire(proposal_project, ["directions"])
+
+                def _apply_proposals(dirs: list) -> None:
+                    existing_ids = {d.get("id") for d in dirs}
+                    dirs.extend(
+                        _np for _np in _new_proposals if _np["id"] not in existing_ids
+                    )
+
+                await with_directions_locked(session, task.project_id, _apply_proposals)
+                await session.commit()
                 logger.info(
                     f"[RESEARCH] Created {proposals_created} direction proposals from task {task.id}"
                 )
@@ -759,22 +799,20 @@ async def apply_post_spawn_state(
         )
         project = await session.get(Project, task.project_id)
         if project and str(direction_id) != "?" and direction_id != "crosscutting":
-            directions = list(project.directions or [])
-            for d in directions:
-                if d.get("id") == direction_id:
-                    d.setdefault("notes", [])
-                    d["notes"] = (d["notes"] or [])[-4:] + [
-                        {
-                            "t": datetime.now(timezone.utc)
-                            .replace(tzinfo=None)
-                            .isoformat(),
-                            "msg": note,
-                        }
-                    ]
-                    break
-            project.directions = directions
-            flag_modified(project, "directions")
-            session.add(project)
+            _zero_note_entry = {
+                "t": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+                "msg": note,
+            }
+            session.expire(project, ["directions"])
+
+            def _apply_zero_note(dirs: list) -> None:
+                for _d in dirs:
+                    if _d.get("id") == direction_id:
+                        _d.setdefault("notes", [])
+                        _d["notes"] = (_d["notes"] or [])[-4:] + [_zero_note_entry]
+                        break
+
+            await with_directions_locked(session, task.project_id, _apply_zero_note)
         elif project:
             msg = ProjectMessage(
                 project_id=task.project_id,

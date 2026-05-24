@@ -1438,6 +1438,12 @@ async def test_merged_preserves_recovery_attempts_for_future_backoff(
         result="merged",
         pr_number=77,
     )
+    # Each auto-fix result is a separate task completion that commits before the
+    # next one runs (see agent_status.py post_remediation_result_message ->
+    # session.commit()). Commit here so the canonical expire-before-lock read in
+    # post_auto_fix_result_message picks up this write rather than reloading the
+    # pre-call row.
+    await db_session.commit()
     ar = (project.design_doc or {}).get("_auto_remediation", {})
     assert "main" not in ar.get("branch_failure_counts", {})
     assert "main" not in ar.get("suspended_branches", [])
@@ -1464,6 +1470,9 @@ async def test_merged_preserves_recovery_attempts_for_future_backoff(
                 branch="main",
                 result="failed",
             )
+            # Commit between completions so each failure increment persists and
+            # the next call's expire-before-lock read accumulates it.
+            await db_session.commit()
 
     ar = (project.design_doc or {}).get("_auto_remediation", {})
     assert "main" in ar.get("suspended_branches", [])
