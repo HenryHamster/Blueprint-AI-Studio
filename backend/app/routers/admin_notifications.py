@@ -31,7 +31,7 @@ from app.shared_state import limiter
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
 from app.task_locking import lock_project_or_429
 from app import notification_dispatch as _nd
-from app.playbook_learning import (
+from app.playbook_capacity import (
     _archive_least_useful_entry,
     _playbook_size_bytes,
     _PLAYBOOK_CAPACITY_BYTES,

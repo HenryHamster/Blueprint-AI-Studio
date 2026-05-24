@@ -258,16 +258,15 @@ async def verify_agent_token(
     # check so we can compare token_vm against task.vm_instance_id (the
     # cache alone doesn't carry that field).
 
-    # Fast path: recently verified as active (TTL cache)
+    # Advisory cache: keep recent-active bookkeeping for eviction/telemetry,
+    # but never skip the DB proof step. A warmed cache cannot prove the task
+    # still exists, is still active, or is still assigned to this VM.
     cached_expiry = _agent_active_cache.get(task_id)
-    if (
-        cached_expiry
-        and time.time() < cached_expiry
-        and task_id not in _terminated_task_ids
-    ):
-        return payload
+    if cached_expiry and cached_expiry <= time.time():
+        _agent_active_cache.pop(task_id, None)
 
-    # Slow path: DB check (runs at most once per AGENT_CACHE_TTL per task)
+    # DB proof path: required before every authenticated request so fail-closed
+    # behavior applies even when an earlier call warmed the cache.
     # Use app.dependency_overrides to respect test session overrides
     try:
         app = request.app
@@ -275,8 +274,7 @@ async def verify_agent_token(
         async for session in session_factory():
             task = await session.get(Task, uuid.UUID(task_id))
             if task is None:
-                # Task not found in DB — fail open (may not be committed yet, or test scenario)
-                break
+                raise HTTPException(status_code=401, detail="Task is no longer active")
             # Audit W3/E10: project_id authz when the token carries it.
             token_project = payload.get("project_id")
             if token_project and str(task.project_id) != token_project:
@@ -306,10 +304,11 @@ async def verify_agent_token(
                 _enforce_terminal_freshness()
     except HTTPException:
         raise
-    except Exception as e:  # noqa: BLE001 — fail open on DB errors so agents aren't blocked by transient DB issues
+    except Exception as e:
         logger.warning(
-            f"[AUTH] DB check failed for task {task_id}, allowing request: {e}"
+            f"[AUTH] DB check failed for task {task_id}, rejecting request: {e}"
         )
+        raise HTTPException(status_code=503, detail="agent_auth_db_unavailable") from e
 
     now = time.time()
     _agent_active_cache[task_id] = now + _AGENT_CACHE_TTL

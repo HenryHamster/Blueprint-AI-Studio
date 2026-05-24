@@ -38,6 +38,10 @@ from app.models import (
     CLOSE_REASON_RECOVERED_MARGINAL,
     CLOSE_REASON_RECOVERED_UNATTENDED,
     DeploymentState,
+    ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT,
+    ESCALATION_REASON_ESCALATED_CROSS_LAYER,
+    ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION,
+    ESCALATION_REASON_ESCALATED_RECURRENCE,
     ESCALATION_REASON_STALE_ACTIVE,
     ESCALATION_REASON_STALE_MERGED,
     RegressionCaseStatus,
@@ -111,12 +115,6 @@ from app.pipeline_health import (
 
 logger = logging.getLogger(__name__)
 
-# Meta-investigation escalation reason constants (case-level audit trail).
-# Complement the four manual-intervention reasons defined in app.models.
-ESCALATION_REASON_ESCALATED_CROSS_LAYER = "escalated_cross_layer"
-ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION = "escalated_layer_concentration"
-ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT = "escalated_cross_case_fingerprint"
-ESCALATION_REASON_ESCALATED_RECURRENCE = "escalated_recurrence"
 ESCALATION_REASON_FRAGILE_RECURRENCE_META = "fragile_recurrence_meta"
 ESCALATION_REASON_RECURRING_CLASS_META = "recurring_class_meta"
 
@@ -205,6 +203,9 @@ _SR_BLIND_SPOT_THEME_FLOOR = 5
 # SR false-positive signal thresholds. _SR_FP_RATE_FLOOR moved to dispatcher_formatters.py.
 # The sample floor guards against noise from very small windows.
 _SR_FP_MIN_SAMPLE = 5
+
+# _LAYER_DEFENSE_LEDGER_LOOKBACK_DAYS is imported from regression_dispatcher_metrics
+# above; that module is the single source of truth.
 
 # Layer-concentration meta-signal thresholds.
 # A canonical layer trips the signal when it absorbs fixes across at least

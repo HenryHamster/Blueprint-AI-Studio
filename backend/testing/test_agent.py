@@ -7,6 +7,8 @@ import pytest
 from datetime import datetime, timedelta
 from httpx import AsyncClient
 from sqlalchemy import select
+from app.database import get_session
+from app.main import app
 from app.models import (
     Artifact,
     ArtifactType,
@@ -106,16 +108,14 @@ async def test_agent_claim_unauthorized(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_agent_claim_not_found(client: AsyncClient):
-    """
-    Tests that claiming a task with an invalid VM ID returns 404.
-    """
+async def test_agent_claim_missing_task_row_returns_401(client: AsyncClient):
+    """Claim auth fails closed when the JWT points at a missing task row."""
     token = create_agent_token(
         "00000000-0000-0000-0000-000000000000", "non-existent-vm"
     )
     headers = {"x-agent-token": token}
     resp = await client.post("/api/agent/claim", headers=headers)
-    assert resp.status_code == 404
+    assert resp.status_code == 401
 
 
 @pytest.mark.smoketest
@@ -932,6 +932,165 @@ async def test_agent_token_rejected_for_terminated_task(
 
     # Clean up to avoid polluting other tests
     _terminated_task_ids.pop(task_id_str, None)
+
+
+def _agent_auth_body(endpoint: str, task_id: str, vm_instance_id: str) -> dict:
+    if endpoint == "status":
+        return {"task_id": task_id, "status": "COMPLETED"}
+    if endpoint == "heartbeat":
+        return {"task_id": task_id, "status_message": "still running"}
+    if endpoint == "vm-heartbeat":
+        return {"vm_instance_id": vm_instance_id}
+    if endpoint == "next-role":
+        return {
+            "vm_instance_id": vm_instance_id,
+            "prior_task_id": task_id,
+            "prior_pr_number": 123,
+        }
+    raise AssertionError(f"unknown endpoint: {endpoint}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint",
+    ["status", "heartbeat", "vm-heartbeat", "next-role"],
+)
+@pytest.mark.parametrize(
+    "prewarm_cache", [False, True], ids=["cold_cache", "warm_cache"]
+)
+async def test_agent_token_rejected_when_task_row_missing(
+    client: AsyncClient, db_session, endpoint: str, prewarm_cache: bool
+):
+    """Missing task rows must fail closed even when the active-task cache is warm."""
+    from app.routers.agent import _agent_active_cache, _terminated_task_ids
+
+    project = Project(name="Missing Row Auth Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-missing-row",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+    vm_instance_id = "agent-vm-missing-row"
+    token = create_agent_token(task_id, vm_instance_id)
+
+    _terminated_task_ids.pop(task_id, None)
+    _agent_active_cache.pop(task_id, None)
+    if prewarm_cache:
+        _agent_active_cache[task_id] = 9999999999.0
+
+    await db_session.delete(task)
+    await db_session.commit()
+
+    class _MissingRowSession:
+        async def get(self, *_args, **_kwargs):
+            return None
+
+        async def execute(self, *_args, **_kwargs):
+            raise AssertionError(
+                "agent handler should not execute when auth cannot prove task is active"
+            )
+
+    async def _override_missing_row_session():
+        yield _MissingRowSession()
+
+    previous_override = app.dependency_overrides.get(get_session)
+    app.dependency_overrides[get_session] = _override_missing_row_session
+    try:
+        resp = await client.post(
+            f"/api/agent/{endpoint}",
+            json=_agent_auth_body(endpoint, task_id, vm_instance_id),
+            headers={"x-agent-token": token},
+        )
+    finally:
+        if previous_override is None:
+            app.dependency_overrides.pop(get_session, None)
+        else:
+            app.dependency_overrides[get_session] = previous_override
+        _agent_active_cache.pop(task_id, None)
+        _terminated_task_ids.pop(task_id, None)
+
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint",
+    ["status", "heartbeat", "vm-heartbeat", "next-role"],
+)
+@pytest.mark.parametrize(
+    "prewarm_cache", [False, True], ids=["cold_cache", "warm_cache"]
+)
+async def test_agent_token_rejected_on_db_error(
+    client: AsyncClient, db_session, endpoint: str, prewarm_cache: bool
+):
+    """DB auth errors must reject writes even when the active-task cache is warm."""
+    from app.routers.agent import _agent_active_cache, _terminated_task_ids
+
+    project = Project(name="DB Error Auth Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-db-error",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+    vm_instance_id = "agent-vm-db-error"
+    token = create_agent_token(task_id, vm_instance_id)
+
+    _terminated_task_ids.pop(task_id, None)
+    _agent_active_cache.pop(task_id, None)
+    if prewarm_cache:
+        _agent_active_cache[task_id] = 9999999999.0
+
+    class _FailingSession:
+        async def get(self, *_args, **_kwargs):
+            raise RuntimeError("simulated DB failure")
+
+        async def execute(self, *_args, **_kwargs):
+            raise AssertionError(
+                "agent handler should not execute when auth DB lookup fails"
+            )
+
+    async def _override_failing_session():
+        yield _FailingSession()
+
+    previous_override = app.dependency_overrides.get(get_session)
+    app.dependency_overrides[get_session] = _override_failing_session
+    try:
+        resp = await client.post(
+            f"/api/agent/{endpoint}",
+            json=_agent_auth_body(endpoint, task_id, vm_instance_id),
+            headers={"x-agent-token": token},
+        )
+    finally:
+        if previous_override is None:
+            app.dependency_overrides.pop(get_session, None)
+        else:
+            app.dependency_overrides[get_session] = previous_override
+        _agent_active_cache.pop(task_id, None)
+        _terminated_task_ids.pop(task_id, None)
+
+    assert resp.status_code == 503
+    detail = resp.json().get("detail") or resp.json().get("error", {}).get("message")
+    assert detail == "agent_auth_db_unavailable"
 
 
 @pytest.mark.asyncio

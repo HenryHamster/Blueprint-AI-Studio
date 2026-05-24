@@ -494,6 +494,20 @@ def get_project_integration_branch(project) -> str:
     return runtime_config.get("integration_branch", "main")
 
 
+def get_project_broadcast_limit(project) -> int:
+    """Return the broadcast alert limit for a project.
+
+    Fallback chain:
+      1. project.design_doc['_broadcast_limit'] (per-project override via admin endpoint)
+      2. runtime_config["project_broadcast_limit"] (global default)
+      3. 1000
+    """
+    per_project = (getattr(project, "design_doc", None) or {}).get("_broadcast_limit")
+    if per_project is not None:
+        return int(per_project)
+    return runtime_config.get("project_broadcast_limit", 1000)
+
+
 # Canonical task-type → branch-prefix map for blueprint/{prefix}-{8hex} names.
 # Python single source of truth; agent/src/index.ts (TASK_TYPE_BRANCH_PREFIX) is
 # the necessary cross-language mirror — update both together. Types absent here

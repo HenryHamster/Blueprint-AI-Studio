@@ -170,6 +170,8 @@ export interface HeaderBarProps {
   onUpdateIssueImplementationConfig: (config: IssueImplementationConfig) => Promise<void>;
   autoReviewConfig: AutoReviewConfig | null;
   onUpdateAutoReviewConfig: (patch: Partial<AutoReviewConfig>) => Promise<void>;
+  integrationBranchData: { integration_branch: string; is_default: boolean } | null;
+  onUpdateIntegrationBranch: (branch: string | null) => Promise<void>;
 }
 
 
@@ -534,6 +536,8 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateIssueImplementationConfig={props.onUpdateIssueImplementationConfig}
           autoReviewConfig={props.autoReviewConfig}
           onUpdateAutoReviewConfig={props.onUpdateAutoReviewConfig}
+          integrationBranchData={props.integrationBranchData}
+          onUpdateIntegrationBranch={props.onUpdateIntegrationBranch}
         />
 
         {/* More secondary buttons — desktop only */}

@@ -24,7 +24,7 @@ from app.database import get_session
 from app.models import Task, TaskStatus, _utcnow
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
-from app.task_locking import lock_project_or_429
+from app.task_locking import lock_project_or_429, with_design_doc_locked
 from app.shared_state import get_project_integration_branch
 
 logger = logging.getLogger(__name__)
@@ -509,6 +509,70 @@ async def update_integration_branch_config(
         "project_id": str(project_id),
         "integration_branch": get_project_integration_branch(project),
         "is_default": project.integration_branch is None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Broadcast-limit config endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/projects/{project_id}/broadcast-limit")
+async def get_broadcast_limit_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the per-project broadcast limit (None means use the global default)."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    stored = (project.design_doc or {}).get("_broadcast_limit")
+    return {
+        "project_id": str(project_id),
+        "broadcast_limit": stored,
+        "is_default": stored is None,
+    }
+
+
+@router.patch("/projects/{project_id}/broadcast-limit")
+async def update_broadcast_limit_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Set the per-project broadcast limit. Pass null to revert to the global default."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if "broadcast_limit" not in body:
+        raise HTTPException(
+            status_code=422, detail="Request body must include 'broadcast_limit'"
+        )
+
+    value = body["broadcast_limit"]
+    if value is not None:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise HTTPException(
+                status_code=422,
+                detail="'broadcast_limit' must be a non-negative integer or null",
+            )
+
+    def _apply(doc: dict) -> None:
+        if value is None:
+            doc.pop("_broadcast_limit", None)
+        else:
+            doc["_broadcast_limit"] = value
+
+    await with_design_doc_locked(session, project_id, _apply)
+    await session.commit()
+
+    return {
+        "project_id": str(project_id),
+        "broadcast_limit": value,
+        "is_default": value is None,
     }
 
 

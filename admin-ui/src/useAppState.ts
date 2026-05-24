@@ -1065,6 +1065,40 @@ export function useAppState() {
     }
   };
 
+  // ── Integration branch config (project-scoped) ───────────────────────────
+  const [integrationBranchData, setIntegrationBranchData] = useState<{ integration_branch: string; is_default: boolean } | null>(null);
+
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setIntegrationBranchData(null);
+      return;
+    }
+    authGet(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/integration-branch`)
+      .then(res => res.ok ? res.json() : null)
+      .then(data => { if (data?.integration_branch !== undefined) setIntegrationBranchData({ integration_branch: data.integration_branch, is_default: data.is_default }); })
+      .catch(() => {});
+  }, [selectedProjectId]);
+
+  const handleUpdateIntegrationBranch = async (branch: string | null) => {
+    if (!selectedProjectId) return;
+    const prev = integrationBranchData;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/integration-branch`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify({ integration_branch: branch }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setIntegrationBranchData({ integration_branch: data.integration_branch, is_default: data.is_default });
+      addToast('Integration branch saved', 'success');
+    } catch {
+      setIntegrationBranchData(prev);
+      addToast('Failed to save integration branch', 'error');
+      throw new Error('Failed to save integration branch');
+    }
+  };
+
   return {
     // Auth
     user, authLoading, userRole, accessDenied, error, setError,
@@ -1131,6 +1165,7 @@ export function useAppState() {
     autoRemediationConfig, autoRemediationStats, handleUpdateAutoRemediationConfig,
     issueImplementationConfig, handleUpdateIssueImplementationConfig,
     autoReviewConfig, handleUpdateAutoReviewConfig,
+    integrationBranchData, handleUpdateIntegrationBranch,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountProvider, setNewAccountProvider,
     newAccountAuthMode, setNewAccountAuthMode, newAccountToken, setNewAccountToken,

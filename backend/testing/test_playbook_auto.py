@@ -939,7 +939,7 @@ def _make_doc_with_size(
 
 def test_archive_least_useful_entry_removes_and_archives():
     """_archive_least_useful_entry moves the entry with lowest confirmed_count to playbook_archive."""
-    from app.playbook_learning import _archive_least_useful_entry
+    from app.playbook_capacity import _archive_least_useful_entry
 
     doc = {
         "playbook/a": {
@@ -971,7 +971,7 @@ def test_archive_least_useful_entry_removes_and_archives():
 
 def test_archive_prefers_stale_entries():
     """_archive_least_useful_entry archives stale_file_refs entries first."""
-    from app.playbook_learning import _archive_least_useful_entry
+    from app.playbook_capacity import _archive_least_useful_entry
 
     doc = {
         "playbook/a": {
@@ -995,7 +995,7 @@ def test_archive_prefers_stale_entries():
 
 def test_archive_prefers_older_entries_within_same_tier():
     """_archive_least_useful_entry archives the oldest entry when stale and confirmed_count tie."""
-    from app.playbook_learning import _archive_least_useful_entry
+    from app.playbook_capacity import _archive_least_useful_entry
 
     old_date = (_utcnow() - timedelta(days=60)).isoformat()
     recent_date = _utcnow().isoformat()
@@ -1024,7 +1024,7 @@ def test_archive_caps_playbook_archive_length():
     Without this cap the archive grows monotonically — a single project
     observed 517 entries / 351 KB of archive, which bloated the design_doc
     payload past the agent budget and caused silent pre-claim death."""
-    from app.playbook_learning import (
+    from app.playbook_capacity import (
         _archive_least_useful_entry,
         _PLAYBOOK_ARCHIVE_MAX_DEFAULT,
     )
@@ -1061,7 +1061,7 @@ def test_archive_caps_playbook_archive_length():
 
 def test_archive_cap_respects_runtime_config_override():
     """Operators can tune playbook_archive_max via runtime_config."""
-    from app.playbook_learning import _archive_least_useful_entry
+    from app.playbook_capacity import _archive_least_useful_entry
     from app.shared_state import runtime_config
 
     runtime_config["playbook_archive_max"] = 3
@@ -1090,7 +1090,7 @@ def test_archive_uses_rate_over_raw_count_when_enough_observations():
     low-performer is higher (closer to 0) than the score of the well-confirmed
     entry that lacks follow tracking (effectiveness = -confirmed).
     """
-    from app.playbook_learning import _archive_least_useful_entry
+    from app.playbook_capacity import _archive_least_useful_entry
 
     doc = {
         # Many raw confirmations but no follow tracking (old-style entry)
@@ -1517,7 +1517,7 @@ def test_count_idle_auto_retired_within_window():
 
 def test_maybe_archive_for_capacity_triggers_at_threshold():
     """maybe_archive_for_capacity archives when combined size exceeds 30KB."""
-    from app.playbook_learning import (
+    from app.playbook_capacity import (
         maybe_archive_for_capacity,
         _PLAYBOOK_CAPACITY_BYTES,
     )
@@ -1534,13 +1534,13 @@ def test_maybe_archive_for_capacity_triggers_at_threshold():
             "updated_at": _utcnow().isoformat(),
         }
 
-    from app.playbook_learning import _playbook_size_bytes
+    from app.playbook_capacity import _playbook_size_bytes
 
     current_size = _playbook_size_bytes(doc)
 
     # If already over capacity, archiving should trigger and loop until under cap
     if current_size >= _PLAYBOOK_CAPACITY_BYTES:
-        from app.playbook_learning import _playbook_size_bytes
+        from app.playbook_capacity import _playbook_size_bytes
 
         keys_before = {k for k in doc if k.startswith("playbook/")}
         result = maybe_archive_for_capacity(doc, 0)
@@ -1554,7 +1554,7 @@ def test_maybe_archive_for_capacity_triggers_at_threshold():
 
 def test_maybe_archive_for_capacity_no_op_when_under_limit():
     """maybe_archive_for_capacity is a no-op when total size is below threshold."""
-    from app.playbook_learning import maybe_archive_for_capacity
+    from app.playbook_capacity import maybe_archive_for_capacity
 
     doc = {
         "playbook/tiny": {
@@ -1570,7 +1570,7 @@ def test_maybe_archive_for_capacity_no_op_when_under_limit():
 
 def test_maybe_archive_for_capacity_loops_multiple_times_for_large_estimate():
     """Loop evicts multiple entries when a single eviction is insufficient for the estimate."""
-    from app.playbook_learning import (
+    from app.playbook_capacity import (
         maybe_archive_for_capacity,
         _PLAYBOOK_CAPACITY_BYTES,
         _playbook_size_bytes,
@@ -1607,7 +1607,7 @@ def test_maybe_archive_for_capacity_loops_multiple_times_for_large_estimate():
 
 def test_maybe_archive_for_capacity_exits_gracefully_when_no_evictable_entries():
     """Loop exits without archiving when there are no playbook/* entries to evict."""
-    from app.playbook_learning import (
+    from app.playbook_capacity import (
         maybe_archive_for_capacity,
         _PLAYBOOK_CAPACITY_BYTES,
     )
@@ -1635,11 +1635,11 @@ def test_maybe_archive_for_capacity_evicted_entry_triggers_resurrection_cooldown
     """An entry evicted via capacity management retains _archived_at, which blocks
     _is_auto_playbook_suppressed from re-creating it within the cooldown window.
     """
-    from app.playbook_learning import (
+    from app.playbook_capacity import (
         maybe_archive_for_capacity,
-        _is_auto_playbook_suppressed,
         _PLAYBOOK_CAPACITY_BYTES,
     )
+    from app.playbook_learning import _is_auto_playbook_suppressed
 
     victim_key = "playbook/auto-test-pattern"
     # Two large entries so the playbook is over capacity; the older one (victim) evicts first.
@@ -1677,7 +1677,8 @@ def test_maybe_archive_for_capacity_evicted_entry_triggers_resurrection_cooldown
 @pytest.mark.asyncio
 async def test_capture_success_archives_when_over_capacity(db_session: AsyncSession):
     """capture_success_pattern archives the least-useful entry when total size exceeds 30KB."""
-    from app.playbook_learning import capture_success_pattern, _PLAYBOOK_CAPACITY_BYTES
+    from app.playbook_learning import capture_success_pattern
+    from app.playbook_capacity import _PLAYBOOK_CAPACITY_BYTES
 
     # Build a design_doc clearly over capacity: 35 entries × ~1050 bytes ≈ 35.6 KB
     big_content = "x" * 900
@@ -1711,7 +1712,7 @@ async def test_capture_success_archives_when_over_capacity(db_session: AsyncSess
         db_session, project.id, task_type="create", scope="small"
     )
 
-    from app.playbook_learning import _playbook_size_bytes
+    from app.playbook_capacity import _playbook_size_bytes
 
     size_before = _playbook_size_bytes(project.design_doc)
     assert size_before > _PLAYBOOK_CAPACITY_BYTES, (
@@ -3365,7 +3366,7 @@ async def test_extract_review_feedback_marks_unobserved_entry_potentially_stale(
 
 def test_mark_stale_review_entries_ignores_non_review_and_fresh():
     """Stale-marker only touches review-extracted entries past the 60-day threshold."""
-    from app.playbook_learning import _mark_stale_review_entries
+    from app.playbook_capacity import _mark_stale_review_entries
 
     now = _utcnow()
     doc = {

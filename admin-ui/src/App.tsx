@@ -588,6 +588,8 @@ export default function App() {
         onUpdateIssueImplementationConfig={s.handleUpdateIssueImplementationConfig}
         autoReviewConfig={s.autoReviewConfig}
         onUpdateAutoReviewConfig={s.handleUpdateAutoReviewConfig}
+        integrationBranchData={s.integrationBranchData}
+        onUpdateIntegrationBranch={s.handleUpdateIntegrationBranch}
       />
 
       <div

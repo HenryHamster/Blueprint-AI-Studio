@@ -1,10 +1,10 @@
 {
   "_doc": "Loose upper bounds to catch runaway file growth. Read by test_invariants.py and updated by agents via POST /api/agent/annotate (annotation_type='size_breach'). Per feedback_guardrails_not_straitjackets.md: never ratchet down \u2014 only bump when work justifies it.",
   "backend": {
-    "main.py": 3800,
+    "main.py": 3900,
     "task_completion.py": 4580,
     "task_lifecycle.py": 5750,
-    "orchestrator.py": 5050,
+    "orchestrator.py": 4750,
     "admin.py": 3000,
     "compute.py": 2500,
     "github.py": 2800,
@@ -27,7 +27,9 @@
     "regression_layer_classifier.py": 520,
     "regression_dispatcher_metrics.py": 800,
     "pipeline_regression_dispatcher.py": 9200,
-    "release_qualifier.py": 5900
+    "release_qualifier.py": 5900,
+    "playbook_learning.py": 7100,
+    "playbook_capacity.py": 200
   },
   "frontend": {
     "useAppState.ts": 3000,
