@@ -774,7 +774,7 @@ def normalize_agent_failure_category(
     label_lower = label.lower()
     mapped = _AGENT_CATEGORY_TO_CLASS.get(label_lower)
     if mapped:
-        if mapped == CODE_ERROR and label_lower in _GENERIC_AGENT_CODE_LABELS:
+        if mapped == CODE_ERROR and label_lower in _ALL_GENERIC_CODE_ERROR_LABELS:
             combined = (task.latest_status_message or "").lower()
             override = _text_provider_failure_override(task, combined)
             if override:

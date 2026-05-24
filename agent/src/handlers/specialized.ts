@@ -3,7 +3,7 @@ import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName, readHandlerOutput,
   persistAndPostStatus, git, runClaudeCode, sendHeartbeatSync,
-  setCurrentPromptFingerprint, listOpenPullRequestsForBranch,
+  setCurrentPromptFingerprint, listOpenPullRequestsForBranch, matchesRateLimit,
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
@@ -487,7 +487,7 @@ ${DEFAULT_TOOL_GUIDANCE}`;
     await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
       logs: sanitize(allOutput.slice(-10_000)),
-      failure_category: 'claude_code_failed',
+      failure_category: matchesRateLimit(allOutput) ? 'rate_limited' : 'claude_code_failed',
     });
   }
 }
@@ -598,10 +598,11 @@ IMPORTANT: Always write /tmp/debug_report_${taskId}.json even if you cannot dete
       repo_url: `https://github.com/${owner}/${repo}`,
     });
   } else {
+    const debugLogs = sanitize(allOutput.slice(-10_000));
     await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-      logs: sanitize(allOutput.slice(-10_000)),
-      failure_category: 'claude_code_failed',
+      logs: debugLogs,
+      failure_category: matchesRateLimit(allOutput) ? 'rate_limited' : 'claude_code_failed',
     });
   }
 }
@@ -841,18 +842,20 @@ IMPORTANT:
       // message previously hid both modes.
       const tail = (allOutput || '').slice(-2000);
       const lastResultTail = (lastResultText || '').slice(-500);
+      const logsBlob =
+        `Failed to read investigation report from /tmp/investigation_report_${taskId}.json; ` +
+        `no JSON object with root_cause found in transcript ` +
+        `(exitCode=${exitCode}, allOutput=${(allOutput || '').length}b, ` +
+        `lastResultText=${(lastResultText || '').length}b)\n` +
+        `--- lastResultText tail ---\n${lastResultTail}\n` +
+        `--- allOutput tail ---\n${tail}`;
+      const rateLimitDetected = matchesRateLimit((allOutput || '') + '\n' + (lastResultText || ''));
       await persistAndPostStatus(taskId, {
         task_id: taskId,
         status: 'FAILED',
         artifact_type: 'ERROR_LOG',
-        logs:
-          `Failed to read investigation report from /tmp/investigation_report_${taskId}.json; ` +
-          `no JSON object with root_cause found in transcript ` +
-          `(exitCode=${exitCode}, allOutput=${(allOutput || '').length}b, ` +
-          `lastResultText=${(lastResultText || '').length}b)\n` +
-          `--- lastResultText tail ---\n${lastResultTail}\n` +
-          `--- allOutput tail ---\n${tail}`,
-        failure_category: 'parse_failed',
+        logs: logsBlob,
+        failure_category: rateLimitDetected ? 'rate_limited' : 'parse_failed',
       });
       return;
     }

@@ -2692,6 +2692,28 @@ class TestParseFailedCorrelation:
         assert result == CODE_ERROR
         assert "rate_limit_correlation_reclassified" not in task.context
 
+    def test_parse_failed_reclassifies_via_weekly_limit_text_in_status_message(
+        self, monkeypatch
+    ):
+        """normalize_agent_failure_category returns RATE_LIMIT for parse_failed when
+        latest_status_message contains a verbatim weekly-limit phrase — the text-override
+        branch now covers _ALL_GENERIC_CODE_ERROR_LABELS (including parse_failed)."""
+        import app.max_plan_pool as pool_mod
+
+        # Ensure account/pool correlation paths don't fire so the TEXT override is
+        # the sole reclassification mechanism.
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+
+        weekly_limit_msg = (
+            "You've hit your weekly limit · resets 9pm (UTC)\nNo output produced."
+        )
+        task = _task(weekly_limit_msg)
+        result = normalize_agent_failure_category("parse_failed", task)
+        assert result == RATE_LIMIT
+
     def test_classify_failure_class_parse_failed_pool_rate_limited(self, monkeypatch):
         """classify_failure fast-path via agent_category=parse_failed during pool block."""
         import app.max_plan_pool as pool_mod
