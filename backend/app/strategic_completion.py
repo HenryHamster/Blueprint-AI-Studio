@@ -623,6 +623,7 @@ async def _spawn_retirement_memos(
         return 0
     from app.payload_schemas import validate_internal_payload
     from app.plan_completion import TASK_PRIORITY_MAP
+    from app.task_completion import _apply_synthesized_memo
 
     ninety_days_ago = _utcnow() - timedelta(days=90)
     existing_rows = (
@@ -686,11 +687,27 @@ async def _spawn_retirement_memos(
             priority=TASK_PRIORITY_MAP.get("low", 0),
         )
         session.add(memo_task)
+        # Synthesize the memo artifact at spawn time when rationale is available
+        # so the task is immediately COMPLETED and citable without provisioning a VM.
+        synthesized = False
+        if rationale:
+            parts = [f"Retirement rationale: {rationale}"]
+            if direction_text:
+                parts.insert(0, f"Direction: {direction_text}")
+            synth_memo = {
+                "summary": rationale[:200],
+                "reasoning": "\n\n".join(parts),
+                "citations": [f"direction:{did}", f"task:{task.id}"],
+                "tags": ["direction-retirement"],
+            }
+            _apply_synthesized_memo(memo_task, synth_memo, session)
+            synthesized = True
         spawned += 1
         logger.info(
-            "[STRATEGIC] Spawned retirement memo task %s for direction %s",
+            "[STRATEGIC] Spawned retirement memo task %s for direction %s (synthesized=%s)",
             memo_task.id,
             did,
+            synthesized,
         )
     return spawned
 
@@ -1597,7 +1614,11 @@ async def _handle_strategic_completion(
         dirs_retired = (task.context or {}).get("_strategic_dirs_retired", 0)
         created_ids = list((task.context or {}).get("_strategic_created_ids", []))
         retired_ids = list((task.context or {}).get("_strategic_retired_ids", []))
-        retired_rationales: Dict[str, str] = {}
+        # Collect rationales regardless of cycle_id so synthesized memos always
+        # have the retirement reason available at spawn time.
+        retired_rationales: Dict[str, str] = _collect_rationales(
+            project, retired_ids, _RETIRED_NOTE_PREFIX
+        )
         if cycle_id:
             _vision_updated = (task.context or {}).get(
                 "_strategic_vision_set", False
@@ -1607,9 +1628,7 @@ async def _handle_strategic_completion(
             created_rationales = _collect_rationales(
                 project, created_ids, _CREATED_NOTE_PREFIX
             )
-            retired_rationales = _collect_rationales(
-                project, retired_ids, _RETIRED_NOTE_PREFIX
-            )
+            # retired_rationales already populated above (outside cycle_id guard)
             created_predictions = _collect_creation_predictions(project, created_ids)
             retired_final_metrics = _collect_retirement_metrics(project, retired_ids)
             # Audit W2: cycle outcome lives on the StrategicCycle row;

@@ -5900,7 +5900,17 @@ async def test_spawn_retirement_memo_api_path(db_session, mocker):
     memo = retirement_memos[0]
     assert memo.context.get("memo_source_direction_id") == direction_id
     assert "Build the feature X" in (memo.payloads[0].get("topic") or "")
-    assert memo.status == TaskStatus.QUEUED
+    # Memo with rationale is synthesized at spawn time → immediately COMPLETED
+    assert memo.status == TaskStatus.COMPLETED
+    assert isinstance(memo.plan_output, dict) and "memo" in memo.plan_output
+    from app.models import Artifact, ArtifactType
+
+    artifacts = (
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == memo.id)))
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1 and artifacts[0].artifact_type == ArtifactType.MEMO
 
 
 @pytest.mark.asyncio
@@ -5983,8 +5993,18 @@ async def test_spawn_retirement_memo_fallback_path(db_session, mocker):
     )
     memo = retirement_memos[0]
     assert memo.context.get("memo_source_direction_id") == direction_id
-    assert memo.status == TaskStatus.QUEUED
     assert (memo.payloads[0].get("topic") or "").startswith("Direction retired:")
+    # Memo with rationale is synthesized at spawn time → immediately COMPLETED
+    assert memo.status == TaskStatus.COMPLETED
+    assert isinstance(memo.plan_output, dict) and "memo" in memo.plan_output
+    from app.models import Artifact, ArtifactType
+
+    artifacts = (
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == memo.id)))
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1 and artifacts[0].artifact_type == ArtifactType.MEMO
 
 
 @pytest.mark.asyncio
