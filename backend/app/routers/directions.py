@@ -543,6 +543,7 @@ async def update_direction(
     from app.strategic_completion import (  # noqa: PLC0415
         _VALID_RECOMMENDED_MODES,
         _normalize_recommended_mode,
+        _reset_scaffolding_state_on_outcome_change,
     )
 
     if "recommended_mode" in payload and payload["recommended_mode"] is not None:
@@ -652,6 +653,8 @@ async def update_direction(
                     d["cost_budget_usd"] = float(payload["cost_budget_usd"])
             if "success_evidence" in payload or "retirement_condition" in payload:
                 context = d.get("context") or {}
+                _old_se = context.get("success_evidence")
+                _old_rc = context.get("retirement_condition")
                 if "success_evidence" in payload:
                     if payload["success_evidence"] is None:
                         context.pop("success_evidence", None)
@@ -664,6 +667,11 @@ async def update_direction(
                         context["retirement_condition"] = payload[
                             "retirement_condition"
                         ]
+                if (
+                    context.get("success_evidence") != _old_se
+                    or context.get("retirement_condition") != _old_rc
+                ):
+                    _reset_scaffolding_state_on_outcome_change(d)
                 d["context"] = context
             if "recommended_mode" in payload:
                 if payload["recommended_mode"] is None:

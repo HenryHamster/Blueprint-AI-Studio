@@ -1170,10 +1170,80 @@ def record_outcome_progress_snapshot(direction: dict) -> None:
     if len(snaps) > cap:
         snaps = snaps[-cap:]
     direction["outcome_progress_history"] = snaps
-    if _check_direction_completion(direction) is not None or direction.get(
-        "possibly_complete"
+    # Latch ``outcome_progress_ever_met`` only when the completion heuristic
+    # trips with evidence accumulated UNDER the current outcome. Both
+    # `_check_direction_completion` and the lifecycle-derived
+    # `possibly_complete` flag are independent of success_evidence /
+    # retirement_condition — they fire purely on cumulative cycle counts and
+    # PR-merge totals. Without a post-reset gate, a direction that was 'complete'
+    # under an old goal would have this flag re-latched on the very next
+    # snapshot after the outcome is redefined, permanently exempting it from
+    # future scaffolding detection. We require post-reset cycle / merge deltas
+    # that meet the heuristic's own gates (>=4 cycles, >=3 merges) before
+    # treating completion as meaningful under the new outcome.
+    reset_cycle = direction.get("outcome_progress_reset_at_cycle")
+    reset_merged = direction.get("outcome_progress_reset_at_merged")
+    if reset_cycle is None:
+        latch_eligible = True
+    else:
+        post_cycles = total_cycles - int(reset_cycle)
+        post_merged = total_merged - int(reset_merged or 0)
+        latch_eligible = post_cycles >= 4 and post_merged >= 3
+    if latch_eligible and (
+        _check_direction_completion(direction) is not None
+        or direction.get("possibly_complete")
     ):
         direction["outcome_progress_ever_met"] = True
+
+
+# Fields that encode either past outcome progress / completion state or the
+# advisory scaffolding-flag ladder. ALL of these must be cleared when the
+# direction's success_evidence or retirement_condition is redefined — they
+# were judged against the OLD outcome and would otherwise surface stale
+# evidence into strategic_analysis / strategic_spawning until the next
+# lifecycle sweep clears them, or permanently exempt the direction from
+# future scaffolding detection.
+_OUTCOME_RESET_FIELDS: tuple[str, ...] = (
+    "outcome_progress_ever_met",
+    "outcome_progress_history",
+    "evidence_progress",
+    "outcome_scaffolding_flagged",
+    "outcome_scaffolding_flagged_at",
+    "outcome_scaffolding_flagged_cycles",
+    "outcome_scaffolding_evidence",
+    "possibly_complete",
+    "completion_suggestion",
+)
+
+
+def _reset_scaffolding_state_on_outcome_change(direction: dict) -> bool:
+    """Clear outcome-progress + scaffolding-flag state on outcome redefinition.
+
+    Pops every field listed in ``_OUTCOME_RESET_FIELDS`` so future cycles judge
+    the direction against the NEW goal rather than stale progress, stale
+    completion state, or stale scaffolding-flag evidence. Also stamps a
+    post-reset baseline (``outcome_progress_reset_at_cycle`` /
+    ``outcome_progress_reset_at_merged``) that ``record_outcome_progress_snapshot``
+    consults to keep ``outcome_progress_ever_met`` from re-latching on the very
+    next snapshot — the completion heuristic is independent of the redefined
+    outcome, so we require fresh post-reset cycles and merges before treating
+    its verdict as meaningful under the new goal. Returns True if any tracked
+    field was actually removed (caller may persist on truthy result).
+    """
+    cleared = False
+    for _field in _OUTCOME_RESET_FIELDS:
+        if _field in direction:
+            direction.pop(_field)
+            cleared = True
+    history = direction.get("research_history") or []
+    agg = direction.get("history_aggregate") or {}
+    total_cycles = len(history) + (agg.get("total_cycles") or 0)
+    total_merged = sum(e.get("prs_merged", 0) for e in history) + (
+        agg.get("total_prs_merged") or 0
+    )
+    direction["outcome_progress_reset_at_cycle"] = total_cycles
+    direction["outcome_progress_reset_at_merged"] = total_merged
+    return cleared
 
 
 def _evidence_progress_suppresses_scaffolding(
@@ -2485,6 +2555,8 @@ async def _handle_strategic_completion(
                         # Persist context-structured fields (same cap as CREATE path)
                         _DIR_FIELD_MAX = 500
                         ctx = d.get("context") or {}
+                        _old_se = ctx.get("success_evidence")
+                        _old_rc = ctx.get("retirement_condition")
                         for _ctx_field in (
                             "success_evidence",
                             "retirement_condition",
@@ -2496,6 +2568,11 @@ async def _handle_strategic_completion(
                                     ctx[_ctx_field] = val[:_DIR_FIELD_MAX]
                                 else:
                                     ctx.pop(_ctx_field, None)
+                        if (
+                            ctx.get("success_evidence") != _old_se
+                            or ctx.get("retirement_condition") != _old_rc
+                        ):
+                            _reset_scaffolding_state_on_outcome_change(d)
                         d["context"] = ctx
                         # Record rationale as a note
                         if rationale:

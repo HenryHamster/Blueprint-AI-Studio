@@ -39,6 +39,7 @@ from app.strategic_completion import (
     record_outcome_progress_snapshot,
     _check_outcome_scaffolding,
     _apply_evidence_progress_verdicts,
+    _reset_scaffolding_state_on_outcome_change,
     EVIDENCE_PROGRESS_CONTEXT_KEY,
     _CREATED_NOTE_PREFIX,
     _RETIRED_NOTE_PREFIX,
@@ -4544,6 +4545,89 @@ async def test_strategic_http_update_direction_superseded_persists_superseded_by
 
 
 @pytest.mark.asyncio
+async def test_strategic_http_update_direction_clears_scaffolding_state_on_outcome_change(
+    client, db_session, mocker
+):
+    """HTTP update_direction resets stale scaffolding state when outcome fields change."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="SCAFFOLD-HTTP",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-http-scaffold",
+                "text": "Track outcome change resets",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "context": {
+                    "success_evidence": "Existing goal",
+                    "retirement_condition": "Existing exit",
+                },
+                "outcome_progress_ever_met": True,
+                "outcome_progress_history": [{"progress": 4, "cycle_index": 9}],
+                "evidence_progress": {
+                    "status": "advancing",
+                    "rationale": "stale evidence",
+                },
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-scaffold-http",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-scaffold-http", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-http-scaffold",
+                "changes": {"success_evidence": "New goal: zero P0 incidents"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(project)
+    target = next(
+        d for d in (project.directions or []) if d.get("id") == "d-http-scaffold"
+    )
+    assert target["context"]["success_evidence"] == "New goal: zero P0 incidents"
+    assert target["context"]["retirement_condition"] == "Existing exit"
+    assert "outcome_progress_ever_met" not in target
+    assert "outcome_progress_history" not in target
+    assert "evidence_progress" not in target
+
+
+@pytest.mark.asyncio
 async def test_strategic_http_update_direction_superseded_stamps_completed_at_and_appears_in_summary(
     client, db_session, mocker
 ):
@@ -4619,12 +4703,10 @@ async def test_strategic_http_update_direction_superseded_stamps_completed_at_an
         d for d in (project.directions or []) if d.get("id") == "d-http-sup-window"
     )
     assert target.get("status") == "superseded"
-    # The fix: completed_at must be stamped so the time-window filter can include it.
     assert target.get("completed_at"), (
         "HTTP update_direction -> status=superseded must stamp completed_at"
     )
 
-    # End-to-end: direction must appear in the retired summary (90-day window).
     summary = _build_retired_directions_summary(project, window_days=90)
     summary_ids = [e.get("id") for e in summary]
     assert "d-http-sup-window" in summary_ids, (
@@ -7038,3 +7120,168 @@ async def test_retire_op_sets_retired_status_and_appears_in_summary(db_session, 
         f"strategically-retired direction should appear in _build_retired_directions_summary; "
         f"got ids={summary_ids}"
     )
+
+
+# ── _reset_scaffolding_state_on_outcome_change ───────────────────────────────
+
+
+class TestResetScaffoldingStateOnOutcomeChange:
+    def test_clears_all_three_fields_and_returns_true(self):
+        d = {
+            "outcome_progress_ever_met": True,
+            "outcome_progress_history": [{"progress": 5}],
+            "evidence_progress": {"status": "advancing"},
+        }
+        result = _reset_scaffolding_state_on_outcome_change(d)
+        assert result is True
+        assert "outcome_progress_ever_met" not in d
+        assert "outcome_progress_history" not in d
+        assert "evidence_progress" not in d
+
+    def test_returns_false_when_no_fields_present(self):
+        d = {"text": "some direction", "status": "active"}
+        result = _reset_scaffolding_state_on_outcome_change(d)
+        assert result is False
+        # Even when nothing was cleared, the reset baseline must be stamped so a
+        # subsequent snapshot can't re-latch based on pre-reset history.
+        assert d["outcome_progress_reset_at_cycle"] == 0
+        assert d["outcome_progress_reset_at_merged"] == 0
+
+    def test_clears_only_fields_that_are_present(self):
+        d = {"outcome_progress_ever_met": True, "text": "direction"}
+        _reset_scaffolding_state_on_outcome_change(d)
+        assert "outcome_progress_ever_met" not in d
+        assert d["text"] == "direction"
+
+    def test_does_not_touch_unrelated_fields(self):
+        d = {
+            "outcome_progress_ever_met": True,
+            "research_history": [{"prs_merged": 2}],
+            "context": {"success_evidence": "x"},
+        }
+        _reset_scaffolding_state_on_outcome_change(d)
+        assert "research_history" in d
+        assert "context" in d
+
+    def test_clears_scaffolding_flag_fields(self):
+        """Reset must also clear the advisory scaffolding-flag ladder so a
+        strategic cycle running before the next lifecycle sweep cannot reason
+        from stale scaffolding evidence judged against the OLD outcome."""
+        d = {
+            "outcome_scaffolding_flagged": True,
+            "outcome_scaffolding_flagged_at": "2026-01-01T00:00:00+00:00",
+            "outcome_scaffolding_flagged_cycles": 3,
+            "outcome_scaffolding_evidence": {"reason": "stalled-under-old-goal"},
+            "possibly_complete": True,
+            "completion_suggestion": "old-goal complete",
+        }
+        result = _reset_scaffolding_state_on_outcome_change(d)
+        assert result is True
+        for f in (
+            "outcome_scaffolding_flagged",
+            "outcome_scaffolding_flagged_at",
+            "outcome_scaffolding_flagged_cycles",
+            "outcome_scaffolding_evidence",
+            "possibly_complete",
+            "completion_suggestion",
+        ):
+            assert f not in d, f"reset failed to clear {f!r}"
+
+    def test_stamps_post_reset_baseline_from_history(self):
+        d = {
+            "research_history": [
+                {"prs_merged": 2},
+                {"prs_merged": 1},
+            ],
+            "history_aggregate": {"total_cycles": 5, "total_prs_merged": 4},
+            "outcome_progress_ever_met": True,
+        }
+        _reset_scaffolding_state_on_outcome_change(d)
+        # 2 visible history entries + 5 aggregated cycles = 7
+        assert d["outcome_progress_reset_at_cycle"] == 7
+        # 3 merged in history + 4 aggregated merged = 7
+        assert d["outcome_progress_reset_at_merged"] == 7
+
+
+class TestRecordOutcomeProgressSnapshotPostReset:
+    """After an outcome reset, the cumulative completion heuristic must NOT
+    immediately re-latch ``outcome_progress_ever_met`` — fresh post-reset
+    evidence is required before treating completion as meaningful under the
+    redefined outcome."""
+
+    def _direction_meeting_completion_heuristic(self):
+        # _check_direction_completion requires len(history)>=4, total_merged>=3,
+        # and last 2 cycles low-yield (created<=2 AND merged<=1).
+        return {
+            "research_history": [
+                {"prs_merged": 2, "tasks_created": 2},
+                {"prs_merged": 2, "tasks_created": 2},
+                {"prs_merged": 1, "tasks_created": 1},
+                {"prs_merged": 0, "tasks_created": 0},
+            ],
+            "context": {"success_evidence": "new-goal"},
+        }
+
+    def test_heuristic_does_not_re_latch_immediately_after_reset(self):
+        from app.strategic_completion import record_outcome_progress_snapshot
+
+        d = self._direction_meeting_completion_heuristic()
+        # Confirm the cumulative heuristic does fire on this fixture pre-reset.
+        from app.strategic_completion import _check_direction_completion
+
+        assert _check_direction_completion(d) is not None
+        # Simulate the operator/strategic-agent redefining the outcome.
+        _reset_scaffolding_state_on_outcome_change(d)
+        assert "outcome_progress_ever_met" not in d
+        # The very next snapshot must NOT re-set the latch even though the
+        # cumulative heuristic still trips — that heuristic is independent of
+        # the newly defined outcome.
+        record_outcome_progress_snapshot(d)
+        assert d.get("outcome_progress_ever_met") is not True, (
+            "snapshot re-latched ever_met immediately after reset — the "
+            "cumulative completion heuristic is independent of the new outcome "
+            "and must not drive the latch until post-reset cycles/merges "
+            "accumulate"
+        )
+
+    def test_possibly_complete_alone_does_not_re_latch_after_reset(self):
+        """Lifecycle sets ``possibly_complete`` from the same cumulative
+        heuristic. Even if it gets re-set after our reset, the snapshot latch
+        must still gate on post-reset baselines."""
+        from app.strategic_completion import record_outcome_progress_snapshot
+
+        d = self._direction_meeting_completion_heuristic()
+        _reset_scaffolding_state_on_outcome_change(d)
+        # Simulate lifecycle re-setting possibly_complete on the next sweep
+        # using the same (now stale-under-new-outcome) heuristic.
+        d["possibly_complete"] = True
+        record_outcome_progress_snapshot(d)
+        assert d.get("outcome_progress_ever_met") is not True
+
+    def test_latches_once_enough_post_reset_evidence_accumulates(self):
+        from app.strategic_completion import record_outcome_progress_snapshot
+
+        d = self._direction_meeting_completion_heuristic()
+        _reset_scaffolding_state_on_outcome_change(d)
+        # Accumulate >=4 post-reset cycles AND >=3 post-reset merges, keeping
+        # the recent-window low-yield gate satisfied.
+        d["research_history"].extend(
+            [
+                {"prs_merged": 2, "tasks_created": 2},
+                {"prs_merged": 2, "tasks_created": 2},
+                {"prs_merged": 1, "tasks_created": 1},
+                {"prs_merged": 0, "tasks_created": 0},
+            ]
+        )
+        record_outcome_progress_snapshot(d)
+        assert d.get("outcome_progress_ever_met") is True
+
+    def test_no_reset_baseline_preserves_legacy_latch_behavior(self):
+        """Directions that never had an outcome reset (no baseline stamped)
+        must continue to latch on the heuristic the same as before."""
+        from app.strategic_completion import record_outcome_progress_snapshot
+
+        d = self._direction_meeting_completion_heuristic()
+        # No _reset_scaffolding_state_on_outcome_change call → no baseline.
+        record_outcome_progress_snapshot(d)
+        assert d.get("outcome_progress_ever_met") is True

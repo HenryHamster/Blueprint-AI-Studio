@@ -6897,3 +6897,77 @@ async def test_get_directions_includes_context_fields_when_set(
     ctx = target["context"]
     assert ctx.get("success_evidence") == "All tests passing"
     assert ctx.get("retirement_condition") == "Zero failures for 4 weeks"
+
+
+@pytest.mark.asyncio
+async def test_update_direction_clears_scaffolding_state_on_outcome_change(
+    client: AsyncClient, db_session, mocker
+):
+    """PATCH clears stale outcome-progress state when success_evidence changes."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Scaffolding direction")
+    direction_id = direction["id"]
+
+    # Inject stale scaffolding state directly into the DB
+    result = await db_session.execute(
+        select(Project).where(Project.id == uuid.UUID(project_id))
+    )
+    project = result.scalar_one()
+    d = next(x for x in project.directions if x.get("id") == direction_id)
+    d["outcome_progress_ever_met"] = True
+    d["outcome_progress_history"] = [{"progress": 7, "cycle_index": 10}]
+    d["evidence_progress"] = {"status": "advancing", "rationale": "stale"}
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    # PATCH with a new success_evidence — should trigger scaffolding reset
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"success_evidence": "New goal: zero P0 incidents"},
+    )
+    assert resp.status_code == 200, resp.text
+    updated = resp.json()["direction"]
+    assert "outcome_progress_ever_met" not in updated
+    assert "outcome_progress_history" not in updated
+    assert "evidence_progress" not in updated
+
+
+@pytest.mark.asyncio
+async def test_update_direction_preserves_scaffolding_state_when_outcome_unchanged(
+    client: AsyncClient, db_session, mocker
+):
+    """PATCH leaves outcome-progress state intact when outcome fields do not change."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Stable direction")
+    direction_id = direction["id"]
+
+    # Set success_evidence via API first so it has a known value
+    await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"success_evidence": "Existing goal"},
+    )
+
+    # Inject progress state into the DB
+    result = await db_session.execute(
+        select(Project).where(Project.id == uuid.UUID(project_id))
+    )
+    project = result.scalar_one()
+    d = next(x for x in project.directions if x.get("id") == direction_id)
+    d["outcome_progress_ever_met"] = True
+    from sqlalchemy.orm.attributes import flag_modified as _fm
+
+    _fm(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    # PATCH with the same success_evidence — outcome is unchanged, state must survive
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"success_evidence": "Existing goal"},
+    )
+    assert resp.status_code == 200, resp.text
+    updated = resp.json()["direction"]
+    assert updated.get("outcome_progress_ever_met") is True

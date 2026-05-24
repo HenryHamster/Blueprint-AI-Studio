@@ -2191,6 +2191,7 @@ from app.strategic_completion import (
     _find_matching_direction,
     _is_direction_duplicate,
     _normalize_recommended_mode,
+    _reset_scaffolding_state_on_outcome_change,
 )
 
 
@@ -2971,33 +2972,37 @@ async def strategic_operation(
                         d["recommended_mode"] = mode
                 # Handle success_evidence and retirement_condition in context
                 _DIR_FIELD_MAX = 500
-                if "success_evidence" in changes:
-                    ctx = d.get("context", {})
-                    se = changes["success_evidence"]
-                    if se is None or se == "":
-                        # Clear success_evidence
-                        ctx.pop("success_evidence", None)
-                    else:
-                        ctx["success_evidence"] = _cap_str(
-                            se,
-                            _DIR_FIELD_MAX,
-                            "changes.success_evidence",
-                            warnings,
-                        )
-                    d["context"] = ctx
-                if "retirement_condition" in changes:
-                    ctx = d.get("context", {})
-                    rc = changes["retirement_condition"]
-                    if rc is None or rc == "":
-                        # Clear retirement_condition
-                        ctx.pop("retirement_condition", None)
-                    else:
-                        ctx["retirement_condition"] = _cap_str(
-                            rc,
-                            _DIR_FIELD_MAX,
-                            "changes.retirement_condition",
-                            warnings,
-                        )
+                if "success_evidence" in changes or "retirement_condition" in changes:
+                    ctx = dict(d.get("context") or {})
+                    old_success_evidence = ctx.get("success_evidence")
+                    old_retirement_condition = ctx.get("retirement_condition")
+                    if "success_evidence" in changes:
+                        se = changes["success_evidence"]
+                        if se is None or se == "":
+                            ctx.pop("success_evidence", None)
+                        else:
+                            ctx["success_evidence"] = _cap_str(
+                                se,
+                                _DIR_FIELD_MAX,
+                                "changes.success_evidence",
+                                warnings,
+                            )
+                    if "retirement_condition" in changes:
+                        rc = changes["retirement_condition"]
+                        if rc is None or rc == "":
+                            ctx.pop("retirement_condition", None)
+                        else:
+                            ctx["retirement_condition"] = _cap_str(
+                                rc,
+                                _DIR_FIELD_MAX,
+                                "changes.retirement_condition",
+                                warnings,
+                            )
+                    if (
+                        ctx.get("success_evidence") != old_success_evidence
+                        or ctx.get("retirement_condition") != old_retirement_condition
+                    ):
+                        _reset_scaffolding_state_on_outcome_change(d)
                     d["context"] = ctx
                 if rationale:
                     notes = d.get("notes", [])
