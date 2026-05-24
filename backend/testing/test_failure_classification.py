@@ -644,6 +644,52 @@ class TestClassifyFailureRateLimit:
         Claude phrases may disable the account."""
         assert classify_failure(_task("HTTP 429 from upstream service")) == CODE_ERROR
 
+    def test_rate_limit_event_in_agent_output_preempts_handler_code_error(self):
+        """Regression (2026-05-24, task da68cb17 + 4 siblings): when the agent
+        is rate-limited mid-stream by the Claude Code CLI, it emits a structured
+        ``{"type":"rate_limit_event",...}`` line then dies before producing the
+        downstream handler's expected output (memo / audit / investigate JSON).
+        The handler then reports its own ``exitCode=1, "couldn't extract JSON"``
+        error and writes a generic CODE_ERROR ``failure_category``. Without this
+        check, that CODE_ERROR fast-path won — burning all 3 retries on the same
+        rate-limited account because the RATE_LIMIT requeue handler
+        (agent_status.py) never ran. 5 tasks terminal-failed this way when 3
+        Claude accounts weekly-burned simultaneously."""
+        # Exact shape from da68cb17's status_message tail.
+        msg = (
+            "[CODE_ERROR] Retries exhausted (3/3). Memo handler could not extract "
+            "a JSON object with all required keys (summary, reasoning, citations, "
+            "tags). exitCode=1, allOutput=3238b, lastResultText=55b\n"
+            "--- allOutput tail ---\n"
+            'ude/projects/-tmp-workspace/memory/"},"fast_mode_state":"off"}\n'
+            '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected",'
+            '"reset_at":"2026-05-24T11:00:00Z"}}\n'
+        )
+        # The downstream memo handler stamped a generic CODE_ERROR label — this
+        # is the exact bug. The fast-path would return CODE_ERROR and the
+        # RATE_LIMIT requeue handler in agent_status.py would never run.
+        task = _task(msg, ctx={"failure_category": "agent_self_failed"})
+        assert classify_failure(task) == RATE_LIMIT, (
+            "rate_limit_event in agent output must preempt the handler's "
+            "downstream CODE_ERROR label — otherwise the rate-limit requeue "
+            "handler never runs and the task burns its retry budget against "
+            "the same dead account."
+        )
+
+    def test_rate_limit_event_in_logs_also_preempts(self):
+        """rate_limit_event may arrive via the logs argument rather than status
+        message (e.g. when the orchestrator captures stdout separately) — both
+        sources are scanned."""
+        logs = (
+            'some other agent log...\n'
+            '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}\n'
+        )
+        task = _task(
+            "Memo handler exited 1 with no JSON object",
+            ctx={"failure_category": "agent_self_failed"},
+        )
+        assert classify_failure(task, logs=logs) == RATE_LIMIT
+
     def test_gemini_daily_quota_exhaustion_not_misclassified_as_provision(self):
         """Regression: Gemini CLI quota-exhaustion was being misclassified as
         PROVISION_FAILURE because the provision bank contained a bare 'quota'

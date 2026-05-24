@@ -1581,6 +1581,23 @@ def _classify_failure_class(
     if _status_msg_raw[:8].lower().startswith("blocker:"):
         return BLOCKED_PRECONDITION
 
+    # Authoritative LLM rate-limit signal from the Claude Code CLI: the agent
+    # emits a structured ``{"type":"rate_limit_event", ...}`` line in its output
+    # when the provider rate-limits the request. Preempts the agent_category
+    # fast path because a downstream task handler (memo, audit, investigate,
+    # …) can preempt-write its own CODE_ERROR label when the agent dies
+    # mid-stream — e.g. the memo handler reports
+    # ``exitCode=1, "couldn't extract JSON"`` because the agent never produced
+    # the required output. Without this check, that CODE_ERROR label takes the
+    # fast path → no account blacklist → retry hits the same dead account →
+    # 3 strikes → terminal FAIL. Incident 2026-05-24: 5 tasks terminal-failed
+    # this way when 3 Claude accounts weekly-burned at once.
+    _classify_combined_lower = (
+        (task.latest_status_message or "").lower() + " " + (logs or "").lower()
+    )
+    if '"type":"rate_limit_event"' in _classify_combined_lower:
+        return RATE_LIMIT
+
     # Fast path: agent already reported a structured category — prefer it over regex.
     # Accept both the legacy lowercase labels (pre-normalization writes) and the
     # canonical uppercase names written by normalize_agent_failure_category().
