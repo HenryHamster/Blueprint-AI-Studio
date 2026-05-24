@@ -37,12 +37,14 @@ from app.models import (
 from app.routers.agent_status import _check_daily_cost_ceiling
 from app.services import (
     _derive_task_branch,
-    _persist_circuit_breakers,
-    _persist_zone_health,
     _recover_orphaned_tasks,
     _run_auto_archive_cycle,
     _sweep_post_commit_pending,
     gcp_cleanup_service,
+)
+from app.state_persistence import (
+    _persist_circuit_breakers,
+    _persist_zone_health,
 )
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler as _SQLiteTypeCompiler
 
