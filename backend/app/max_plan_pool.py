@@ -87,6 +87,36 @@ def get_task_llm_auth_mode(task_or_ctx: Any) -> str | None:
     return None
 
 
+def get_task_llm_model(task_or_ctx: Any) -> str | None:
+    ctx = _task_context(task_or_ctx)
+    raw = ctx.get("llm_model")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def get_task_rate_limit_scope(task_or_ctx: Any) -> dict[str, Any]:
+    """Return the candidate-pool scope for rate-limit correlation."""
+    providers: list[str] | None = None
+    provider = get_task_llm_provider(task_or_ctx)
+    if provider:
+        providers = [provider]
+
+    user_id: str | None = None
+    account_id = get_task_llm_account_id(task_or_ctx)
+    if account_id:
+        acct = _account_by_id.get(str(account_id))
+        raw_user_id = acct.get("user_id") if acct else None
+        if isinstance(raw_user_id, str) and raw_user_id.strip():
+            user_id = raw_user_id.strip()
+
+    return {
+        "providers": providers,
+        "model": get_task_llm_model(task_or_ctx),
+        "user_id": user_id,
+    }
+
+
 def clear_task_llm_runtime_context(context: Mapping[str, Any] | None) -> dict[str, Any]:
     new_ctx = dict(context or {})
     for key in TASK_RUNTIME_CONTEXT_KEYS:

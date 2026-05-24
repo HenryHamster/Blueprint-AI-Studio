@@ -58,6 +58,7 @@ from app.max_plan_pool import (
     get_task_llm_account_id,
     get_task_llm_auth_mode,
     get_task_llm_execution_mode,
+    get_task_rate_limit_scope,
     get_task_llm_provider,
     record_completion_event,
     record_task_outcome,
@@ -1033,10 +1034,16 @@ async def update_agent_status(
 
         _fc_at_time = task.last_heartbeat or task.started_at
         _fc_acct_id = get_task_llm_account_id(task)
+        _fc_scope = get_task_rate_limit_scope(task)
         _db_rl = (
             await db_account_was_rate_limited(_fc_acct_id, at_time=_fc_at_time)
             if _fc_acct_id
-            else await db_pool_wide_rate_limit_cooldown(at_time=_fc_at_time)
+            else await db_pool_wide_rate_limit_cooldown(
+                at_time=_fc_at_time,
+                providers=_fc_scope.get("providers"),
+                model=_fc_scope.get("model"),
+                user_id=_fc_scope.get("user_id"),
+            )
         )
         normalized_failure_category = normalize_agent_failure_category(
             payload.failure_category,
@@ -2149,13 +2156,17 @@ async def update_agent_status(
 
                     _fc_at_time2 = task.last_heartbeat or task.started_at
                     _fc_acct_id2 = get_task_llm_account_id(task)
+                    _fc_scope2 = get_task_rate_limit_scope(task)
                     _db_rl2 = (
                         await db_account_was_rate_limited(
                             _fc_acct_id2, at_time=_fc_at_time2
                         )
                         if _fc_acct_id2
                         else await db_pool_wide_rate_limit_cooldown(
-                            at_time=_fc_at_time2
+                            at_time=_fc_at_time2,
+                            providers=_fc_scope2.get("providers"),
+                            model=_fc_scope2.get("model"),
+                            user_id=_fc_scope2.get("user_id"),
                         )
                     )
                     ctx = dict(task.context or {})

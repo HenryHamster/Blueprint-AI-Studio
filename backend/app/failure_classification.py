@@ -637,38 +637,20 @@ def _pool_was_rate_limited(
     """
     try:
         from app.max_plan_pool import (
-            _account_by_id,
-            get_task_llm_account_id,
-            get_task_llm_provider,
+            get_task_rate_limit_scope,
             pool_wide_rate_limit_cooldown,
         )
 
         norm_time = at_time
         if norm_time is not None and getattr(norm_time, "tzinfo", None) is not None:
             norm_time = norm_time.replace(tzinfo=None)
-
-        providers: list[str] | None = None
-        model: str | None = None
-        user_id: str | None = None
-
-        if task is not None:
-            provider = get_task_llm_provider(task)
-            if provider:
-                providers = [provider]
-            ctx = task.context or {}
-            raw_model = ctx.get("llm_model")
-            model = str(raw_model) if raw_model else None
-            account_id = get_task_llm_account_id(task)
-            if account_id:
-                acct = _account_by_id.get(str(account_id))
-                if acct:
-                    user_id = acct.get("user_id")
+        scope = get_task_rate_limit_scope(task) if task is not None else {}
 
         result = pool_wide_rate_limit_cooldown(
             at_time=norm_time,
-            providers=providers,
-            model=model,
-            user_id=user_id,
+            providers=scope.get("providers"),
+            model=scope.get("model"),
+            user_id=scope.get("user_id"),
         )
         if not result:
             logger.debug(
