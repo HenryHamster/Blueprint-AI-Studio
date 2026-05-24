@@ -3961,7 +3961,11 @@ echo ""
                   sendLog(ws, preview + '\n');
                   if (preview) statusRef.value = preview.slice(0, 100);
                   if (eventType === 'item.completed') {
-                    lastResultText = preview;
+                    // Use full item.text (not the 200-char preview) so long JSON
+                    // artifacts like memo objects are not silently truncated.
+                    lastResultText = (item != null && typeof item.text === 'string')
+                      ? item.text
+                      : preview;
                   }
                 }
               } else if (itemType === 'reasoning') {
