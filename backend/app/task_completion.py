@@ -89,6 +89,8 @@ async def _persist_direction_field_update(
     session: AsyncSession,
     project: Project,
     direction: Dict[str, Any],
+    *,
+    deleted_keys: frozenset = frozenset(),
 ) -> None:
     """Serialize one mutated direction dict back into ``project.directions``.
 
@@ -98,8 +100,14 @@ async def _persist_direction_field_update(
     pattern) loses a concurrent same-project completion's write to a *different*
     direction. This helper instead re-acquires the project row lock via
     ``with_directions_locked``, re-reads the directions list fresh under that
-    lock, and overwrites only the entry whose ``id`` matches — every other
-    direction is left exactly as the fresh read found it.
+    lock, and merges only the field delta onto the matching entry — every other
+    direction, and every field not touched by the caller, is left exactly as the
+    fresh read found it.
+
+    ``deleted_keys`` must enumerate any keys that the caller explicitly removed
+    from ``direction`` (via ``pop``). Because we no longer clear the fresh entry
+    before merging, those keys would otherwise survive in the DB from a previous
+    write. Callers that only add/update fields may omit this parameter.
 
     ``session.expire`` is required because the app runs ``expire_on_commit=False``:
     without it, ``with_directions_locked``'s ``SELECT ... FOR UPDATE`` returns the
@@ -113,8 +121,9 @@ async def _persist_direction_field_update(
     def _apply(fresh_dirs: List[Dict[str, Any]]):
         target = next((d for d in fresh_dirs if d.get("id") == dir_id), None)
         if target is not None:
-            target.clear()
             target.update(direction)
+            for k in deleted_keys:
+                target.pop(k, None)
         return None
 
     await with_directions_locked(session, project.id, _apply)
@@ -829,6 +838,14 @@ async def _record_regression_signal_if_matching(
 # root cause genuinely can't be diagnosed from code signals alone.
 _FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT = 2
 
+# Keys removed from a direction when a diagnosis completes or fails — passed
+# as deleted_keys to _persist_direction_field_update so the delta-merge helper
+# removes them from the freshly-loaded DB entry rather than relying on the old
+# target.clear() whole-snapshot replacement.
+_DIAGNOSIS_FLAGS_CLEARED_KEYS: frozenset = frozenset(
+    {DIAGNOSIS_IN_PROGRESS_KEY, DIAGNOSIS_STARTED_AT_KEY, DIAGNOSIS_TASK_ID_KEY}
+)
+
 # Retain this many recent remediation attempts per direction so follow-up
 # investigations can summarize what was already tried.
 _REMEDIATION_HISTORY_MAX = 5
@@ -1294,6 +1311,7 @@ async def _maybe_escalate_exhausted_followups(
         f"follow-up cap exhausted for fingerprint {fp_key[:40]} with all prior "
         f"remediations failed"
     )
+    _notify_keys_cleared: set = set()
     try:
         from app.notification_dispatch import post_remediation_escalation_message  # noqa: PLC0415
         from app.direction_lifecycle import _build_escalation_args  # noqa: PLC0415
@@ -1305,6 +1323,10 @@ async def _maybe_escalate_exhausted_followups(
         )
         direction.pop("escalation_notification_pending", None)
         direction.pop("escalation_notification_retries", None)
+        _notify_keys_cleared = {
+            "escalation_notification_pending",
+            "escalation_notification_retries",
+        }
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             f"[NOTIFY] Failed to post follow-up cap escalation for direction "
@@ -1329,7 +1351,9 @@ async def _maybe_escalate_exhausted_followups(
                 ),
             )
         )
-    await _persist_direction_field_update(session, project, direction)
+    await _persist_direction_field_update(
+        session, project, direction, deleted_keys=frozenset(_notify_keys_cleared)
+    )
 
 
 async def _maybe_spawn_low_confidence_followup(
@@ -1724,7 +1748,9 @@ async def _handle_investigation_terminal_failure(
         target.pop(DIAGNOSIS_STARTED_AT_KEY, None)
         target.pop(DIAGNOSIS_TASK_ID_KEY, None)
         target["diagnosis_completed_at"] = _utcnow().isoformat()
-        await _persist_direction_field_update(session, project, target)
+        await _persist_direction_field_update(
+            session, project, target, deleted_keys=_DIAGNOSIS_FLAGS_CLEARED_KEYS
+        )
         if had_flag:
             logger.info(
                 f"[DIAGNOSIS] Cleared diagnosis_in_progress on direction "
@@ -1776,7 +1802,12 @@ async def _handle_investigation_terminal_failure(
                 _stamp_remediation_spawn_on_direction(target, partial_spawn)
                 target["last_diagnosis_outcome"] = "partial_remediation_spawned"
                 clear_direction_hold(str(direction_id))
-                await _persist_direction_field_update(session, project, target)
+                await _persist_direction_field_update(
+                    session,
+                    project,
+                    target,
+                    deleted_keys=_DIAGNOSIS_FLAGS_CLEARED_KEYS,
+                )
                 logger.info(
                     f"[DIAGNOSIS] Spawned partial-diagnosis remediation "
                     f"{partial_spawn.id} for direction {direction_id} from "
@@ -3841,7 +3872,9 @@ async def _handle_investigation_completion(
                 f"{direction_id}: {ctx_exc!r}"
             )
 
-        await _persist_direction_field_update(session, project, direction)
+        await _persist_direction_field_update(
+            session, project, direction, deleted_keys=_DIAGNOSIS_FLAGS_CLEARED_KEYS
+        )
 
     spawned_followup: Optional[Task] = None
     if (
@@ -3874,7 +3907,16 @@ async def _handle_investigation_completion(
         else:
             outcome = "no_direction"
         direction["last_diagnosis_outcome"] = outcome
-        await _persist_direction_field_update(session, project, direction)
+        await _persist_direction_field_update(
+            session,
+            project,
+            direction,
+            deleted_keys=(
+                frozenset()
+                if spawned_followup is not None
+                else _DIAGNOSIS_FLAGS_CLEARED_KEYS
+            ),
+        )
 
     # Spawn a terminal memo for unactionable outcomes so the investigator's
     # reasoning becomes a citable artifact. Only fires when neither a

@@ -45,6 +45,7 @@ from app.task_completion import (
     _calculate_remediation_scope,
     _record_regression_signal_if_matching,
     _maybe_escalate_exhausted_followups,
+    _persist_direction_field_update,
     build_blueprint_pr_footer,
     build_blueprint_pr_merge_summary_comment,
     patch_pr_body_with_blueprint_meta,
@@ -7038,3 +7039,59 @@ class TestCompletionHandlerDirectionsConcurrency:
         assert by["dir-b"].get("diagnosis_in_progress") is None, by
         assert by["dir-a"].get("last_diagnosis_outcome") == "done", by
         assert by["dir-b"].get("last_diagnosis_outcome") == "done", by
+
+    @pytest.mark.asyncio
+    async def test_concurrent_field_updates_on_same_direction_both_persist(
+        self, db_session
+    ):
+        """Two sessions each updating a DIFFERENT field on the SAME direction must
+        both survive — the delta-merge in _persist_direction_field_update must not
+        overwrite the peer's write with a stale whole-snapshot replacement.
+
+        Before the fix, _apply did target.clear(); target.update(direction) inside
+        the lock.  Even though each session re-read the fresh row, the second
+        committer's .clear() wiped out the first committer's field.  After the fix
+        the helper does target.update(direction) (no clear), so concurrent writes
+        to different keys are both preserved.
+        """
+        project = make_project(
+            directions=[{"id": "dir-shared", "status": "active", "existing": "keep"}]
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        pid = project.id
+
+        Session = sessionmaker(
+            bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+        )
+
+        async def write_field_a() -> None:
+            async with Session() as s:
+                proj = await s.get(Project, pid)
+                dirs = list(proj.directions or [])
+                target = next(d for d in dirs if d["id"] == "dir-shared")
+                target["field_a"] = "value_a"
+                await _persist_direction_field_update(s, proj, target)
+                await s.commit()
+
+        async def write_field_b() -> None:
+            async with Session() as s:
+                proj = await s.get(Project, pid)
+                dirs = list(proj.directions or [])
+                target = next(d for d in dirs if d["id"] == "dir-shared")
+                target["field_b"] = "value_b"
+                await _persist_direction_field_update(s, proj, target)
+                await s.commit()
+
+        await asyncio.gather(write_field_a(), write_field_b())
+
+        async with Session() as v:
+            proj = (
+                await v.execute(_sa_select(Project).where(Project.id == pid))
+            ).scalar_one()
+            d = next(x for x in proj.directions if x["id"] == "dir-shared")
+
+        assert d.get("field_a") == "value_a", f"field_a lost: {d}"
+        assert d.get("field_b") == "value_b", f"field_b lost: {d}"
+        assert d.get("existing") == "keep", f"pre-existing field clobbered: {d}"

@@ -57,8 +57,10 @@ def _build_retired_directions_summary(
         if status not in retired_statuses and not is_expired_with_disposition:
             continue
 
-        # Time-window filter: use retired_at, auto_completed_at, or last history entry
-        retired_at = d.get("retired_at") or d.get("auto_completed_at")
+        # Time-window filter: use the timestamp each writer already produces.
+        # Writers: retire op -> retired_at, saturation/code-failure/scaffolding -> completed_at,
+        # proposal expiry -> expired_at. Fall back to last history entry timestamp.
+        retired_at = d.get("retired_at") or d.get("completed_at") or d.get("expired_at")
         if not retired_at:
             history_list = d.get("research_history") or []
             retired_at = history_list[-1].get("timestamp") if history_list else None

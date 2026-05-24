@@ -4543,6 +4543,95 @@ async def test_strategic_http_update_direction_superseded_persists_superseded_by
     }
 
 
+@pytest.mark.asyncio
+async def test_strategic_http_update_direction_superseded_stamps_completed_at_and_appears_in_summary(
+    client, db_session, mocker
+):
+    """HTTP update_direction with status=superseded must stamp completed_at so
+    _build_retired_directions_summary's 90-day time-window filter includes it."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+    from app.strategic_analysis import _build_retired_directions_summary
+
+    project = Project(
+        name="SUP-HTTP-COMPLETED-AT",
+        user_id="u-completed-at",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-http-sup-window",
+                "text": "HTTP direction to be superseded",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-sup-window",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-sup-window", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-http-sup-window",
+                "rationale": "superseded via HTTP path",
+                "changes": {
+                    "status": "superseded",
+                    "superseded_by": {
+                        "direction_id": "d-http-successor",
+                        "set_at": "2026-01-01T00:00:00",
+                    },
+                },
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(project)
+    target = next(
+        d for d in (project.directions or []) if d.get("id") == "d-http-sup-window"
+    )
+    assert target.get("status") == "superseded"
+    # The fix: completed_at must be stamped so the time-window filter can include it.
+    assert target.get("completed_at"), (
+        "HTTP update_direction -> status=superseded must stamp completed_at"
+    )
+
+    # End-to-end: direction must appear in the retired summary (90-day window).
+    summary = _build_retired_directions_summary(project, window_days=90)
+    summary_ids = [e.get("id") for e in summary]
+    assert "d-http-sup-window" in summary_ids, (
+        f"superseded direction (via HTTP) should appear in retired summary; got ids={summary_ids}"
+    )
+
+
 # ── _strategic_dedup_rejections persistence ───────────────────────────────────
 
 

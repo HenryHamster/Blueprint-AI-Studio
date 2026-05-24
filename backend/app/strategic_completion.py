@@ -2404,6 +2404,7 @@ async def _handle_strategic_completion(
                             else:
                                 d["status"] = changes["status"]
                                 if changes["status"] == "superseded":
+                                    d["completed_at"] = _utcnow().isoformat()
                                     superseded_by = changes.get("superseded_by")
                                     if not superseded_by:
                                         succ_id = (

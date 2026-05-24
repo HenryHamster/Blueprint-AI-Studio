@@ -2737,3 +2737,86 @@ def test_retired_approaches_block_respects_max_entries_across_directions():
     # Should have at most 3 entries
     entry_count = block.count("\n- ") + (1 if block.startswith("- ") else 0)
     assert entry_count <= 3
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: time-window filter uses fields that writers actually produce
+# ---------------------------------------------------------------------------
+
+
+def test_retired_at_field_excludes_old_direction():
+    """Direction with retired_at 91 days ago is excluded from the window."""
+    directions = [
+        {
+            "id": "dir-old-retired",
+            "text": "Old retired direction",
+            "status": "retired",
+            "retired_at": _old_iso(),
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project)
+    assert result == [], (
+        "direction with retired_at beyond the window should be excluded"
+    )
+
+
+def test_completed_at_used_for_completed_direction():
+    """completed_at is used for completed directions; old ones are excluded, recent ones included."""
+    recent_dir = {
+        "id": "dir-recent-completed",
+        "text": "Recent completed direction",
+        "status": "completed",
+        "completed_at": _recent_iso(5),
+    }
+    old_dir = {
+        "id": "dir-old-completed",
+        "text": "Old completed direction",
+        "status": "completed",
+        "completed_at": _old_iso(),
+    }
+    project = _make_project(directions=[recent_dir, old_dir])
+    result = _build_retired_directions_summary(project)
+    ids = [r["id"] for r in result]
+    assert "dir-recent-completed" in ids, (
+        "recent completed direction should be included"
+    )
+    assert "dir-old-completed" not in ids, (
+        "completed direction older than window should be excluded"
+    )
+
+
+def test_expired_at_used_for_expired_direction():
+    """expired_at is used for expired directions; old ones are excluded."""
+    directions = [
+        {
+            "id": "dir-old-expired",
+            "text": "Old expired direction",
+            "status": "expired",
+            "auto_completed_reason": "Proposal deadline passed",
+            "expired_at": _old_iso(),
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project)
+    assert result == [], (
+        "expired direction with expired_at beyond the window should be excluded"
+    )
+
+
+def test_superseded_direction_with_completed_at_included():
+    """superseded direction with a recent completed_at is included in the window."""
+    directions = [
+        {
+            "id": "dir-superseded",
+            "text": "Superseded direction",
+            "status": "superseded",
+            "completed_at": _recent_iso(3),
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project)
+    ids = [r["id"] for r in result]
+    assert "dir-superseded" in ids, (
+        "superseded direction with recent completed_at should be included"
+    )
