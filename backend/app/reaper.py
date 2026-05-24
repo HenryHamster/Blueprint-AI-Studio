@@ -125,6 +125,18 @@ _ORPHAN_REAP_CRASH_STREAK_LIMIT = 3
 _reaper_cycles_completed_count: int = 0
 _reaper_last_cycle_completed_at: datetime | None = None
 
+# Cycle-level circuit breaker. After N consecutive whole-cycle exceptions the
+# reaper enters HALTED state, stops cycling, and posts an ERROR alert. Resets
+# automatically on process restart (in-memory); tunable via runtime_config key
+# "reaper_cycle_halt_threshold".
+_REAPER_CYCLE_HALT_THRESHOLD: int = 5
+_reaper_halt_state: dict = {
+    "halted": False,
+    "halt_timestamp": None,
+    "last_error": None,
+    "crash_count": 0,
+}
+
 
 def get_reaper_stats() -> dict:
     """Snapshot of reaper liveness for /metrics and admin observability.
@@ -143,7 +155,42 @@ def get_reaper_stats() -> dict:
     return {
         "cycles_completed_total": _reaper_cycles_completed_count,
         "last_cycle_age_seconds": age_seconds,
+        "halted": _reaper_halt_state["halted"],
+        "halt_timestamp": _reaper_halt_state["halt_timestamp"].isoformat()
+        if _reaper_halt_state["halt_timestamp"]
+        else None,
+        "halt_crash_count": _reaper_halt_state["crash_count"],
     }
+
+
+def is_reaper_halted() -> bool:
+    """Liveness probe: True iff the reaper has self-halted after a crash-loop."""
+    return _reaper_halt_state["halted"]
+
+
+async def _post_reaper_halt_alert(crash_count: int, last_error: str) -> None:
+    """Post an ERROR-severity alert to every project when the reaper self-halts."""
+    try:
+        from app.models import Alert, AlertSeverity
+
+        async with AsyncSessionLocal() as s:
+            proj_ids = (await s.execute(select(Project.id))).scalars().all()
+            for pid in proj_ids:
+                s.add(
+                    Alert(
+                        project_id=pid,
+                        severity=AlertSeverity.ERROR,
+                        title="Reaper service HALTED after crash-loop",
+                        message=(
+                            f"Reaper crash-looped {crash_count}× and self-halted. "
+                            f"Last error: {last_error[:300]}. "
+                            "No new reap cycles until process restart or operator reset."
+                        ),
+                    )
+                )
+            await s.commit()
+    except Exception:
+        logger.exception("[REAPER] Failed to post halt alert")
 
 
 # Per-(provider, model) regression scan cadence. The reaper itself fires every
@@ -662,6 +709,13 @@ async def reaper_service():
 
     consecutive_errors = 0
     while True:
+        if _reaper_halt_state["halted"]:
+            try:
+                await asyncio.sleep(300)
+            except asyncio.CancelledError:
+                logger.info("[REAPER] Service shutting down (halted).")
+                break
+            continue
         try:
             async with AsyncSessionLocal() as session:
                 # Step 1: Read active tasks WITHOUT locks (avoids blocking heartbeat writes)
@@ -3396,6 +3450,30 @@ async def reaper_service():
                 await session.rollback()
             except Exception:
                 logger.exception("[REAPER] Rollback after reaper error failed")
+            _halt_threshold = _runtime_config.get(
+                "reaper_cycle_halt_threshold", _REAPER_CYCLE_HALT_THRESHOLD
+            )
+            if (
+                consecutive_errors >= _halt_threshold
+                and not _reaper_halt_state["halted"]
+            ):
+                _reaper_halt_state.update(
+                    {
+                        "halted": True,
+                        "halt_timestamp": _utcnow(),
+                        "last_error": str(e)[:500],
+                        "crash_count": consecutive_errors,
+                    }
+                )
+                logger.error(
+                    "[REAPER] HALTED after %d consecutive cycle crashes — last error: %s",
+                    consecutive_errors,
+                    e,
+                )
+                with contextlib.suppress(Exception):
+                    asyncio.get_running_loop().create_task(  # noqa: RUF006
+                        _post_reaper_halt_alert(consecutive_errors, str(e)[:500])
+                    )
 
         # Sleep before next cycle; use exponential backoff on consecutive errors
         sleep_seconds = min(60 * (2**consecutive_errors), 300)

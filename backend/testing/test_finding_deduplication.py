@@ -3,6 +3,7 @@
 import hashlib
 import uuid
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 
 from app.finding_deduplication import (
@@ -1013,6 +1014,36 @@ def test_retired_approach_missing_category_treated_as_mixed():
     )
     assert outcome.retired_approach_count == 1
     assert outcome.deduplicated == []
+
+
+def test_build_dedup_state_passes_at_time_to_classify_failure():
+    """build_dedup_state must pass at_time=last_heartbeat so rate-limit correlation
+    uses the failure instant rather than sweep time, preventing RATE_LIMIT→CODE_ERROR
+    flips when analytics paths run hours after the cooldown has lifted."""
+    heartbeat = datetime.utcnow() - timedelta(hours=6)
+    t = _make_task(
+        status=TaskStatus.FAILED,
+        context={"finding_hash": "rl1"},
+        created_at=heartbeat,
+    )
+    t.last_heartbeat = heartbeat
+
+    with patch("app.finding_deduplication.classify_failure") as mock_cf:
+        mock_cf.return_value = "RATE_LIMIT"
+        build_dedup_state([t], failed_parent_ids=set())
+    mock_cf.assert_called_once_with(t, at_time=heartbeat)
+
+
+def test_build_dedup_state_rate_limit_excluded_from_hashes():
+    """A FAILED task classified as RATE_LIMIT (infra class) must not block respawn."""
+    t = _make_task(
+        status=TaskStatus.FAILED,
+        context={"finding_hash": "rl2", "failure_category": "rate_limited"},
+    )
+    hashes, failed, prior = build_dedup_state([t], failed_parent_ids=set())
+    assert "rl2" not in hashes
+    assert failed["rl2"] == TaskStatus.FAILED
+    assert prior["rl2"] is t
 
 
 def test_extract_archived_diagnoses_from_design_doc():

@@ -3105,9 +3105,17 @@ def compute_sr_catch_rate_by_direction(
                     rate_history = rate_history[-5:]
                 if prev_miss_rate is not None and weighted_miss_rate is not None:
                     delta = weighted_miss_rate - prev_miss_rate
-                    if delta >= _TREND_DELTA_THRESHOLD:
+                    # Convert miss rates to hit rates for significance test
+                    curr_hit_rate = 1 - weighted_miss_rate
+                    prev_hit_rate = 1 - prev_miss_rate
+                    prev_sample_count = prev_entry.get("sample_count", 0)
+                    # Apply two-proportion z-test; trend requires both significance AND delta
+                    is_sig = _is_trend_significant(
+                        curr_hit_rate, count, prev_hit_rate, prev_sample_count
+                    )
+                    if is_sig and delta >= _TREND_DELTA_THRESHOLD:
                         dir_trend = "increasing"
-                    elif delta <= -_TREND_DELTA_THRESHOLD:
+                    elif is_sig and delta <= -_TREND_DELTA_THRESHOLD:
                         dir_trend = "decreasing"
                     else:
                         dir_trend = "stable"

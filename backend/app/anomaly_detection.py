@@ -98,7 +98,9 @@ def _task_error_fingerprint(task) -> "str | None":
         from app.failure_classification import classify_failure  # noqa: PLC0415
         from app.failure_stage import _derive_failure_stage  # noqa: PLC0415
 
-        cls = classify_failure(task) or ""
+        cls = (
+            classify_failure(task, at_time=task.last_heartbeat or task.started_at) or ""
+        )
         stage = _derive_failure_stage(cls, msg)
     except Exception:
         stage = None
@@ -289,12 +291,12 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     # Group by failure class
     recent_by_class: dict = {}
     for t in recent_failures:
-        cls = classify_failure(t)
+        cls = classify_failure(t, at_time=t.last_heartbeat or t.started_at)
         recent_by_class.setdefault(cls, []).append(t)
 
     prior_by_class: dict = {}
     for t in prior_failures:
-        cls = classify_failure(t)
+        cls = classify_failure(t, at_time=t.last_heartbeat or t.started_at)
         prior_by_class[cls] = prior_by_class.get(cls, 0) + 1
 
     for cls, tasks in recent_by_class.items():
@@ -1162,7 +1164,11 @@ async def seed_task_results_from_db(
     seeded = 0
     for task in rows:
         success = task.status == TaskStatus.COMPLETED
-        failure_class = "" if success else classify_failure(task)
+        failure_class = (
+            ""
+            if success
+            else classify_failure(task, at_time=task.last_heartbeat or task.started_at)
+        )
         task_type = task.first_payload.get("type", "")
         ts_iso = task.vm_stopped_at.isoformat()
         deque_ref.append(

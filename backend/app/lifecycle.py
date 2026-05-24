@@ -746,6 +746,45 @@ async def lifespan(app):
                             orch_task.cancel()
                 except Exception as wd_exc:
                     logger.warning(f"[MONITOR] Watchdog check failed: {wd_exc}")
+                # Liveness watchdog for reaper: analogous to the orchestrator probe.
+                # When halted the reaper is intentionally sleeping — cancelling and
+                # restarting it only produces another halted reaper (module-level
+                # halt state persists across asyncio.Task restarts within the same
+                # process). Skip the cancel so the monitor loop doesn't compound
+                # alert noise while the operator investigates. When NOT halted but
+                # stale, cancel so the restart path re-spawns a fresh cycle.
+                try:
+                    from app.reaper import (
+                        is_reaper_halted as _is_reaper_halted,
+                        _reaper_last_cycle_completed_at as _reaper_last_cycle,
+                    )
+
+                    reaper_task = tasks.get("reaper")
+                    _reaper_stall_threshold = 300.0  # 5 missed 60s cycles
+                    if reaper_task is not None and not reaper_task.done():
+                        if _is_reaper_halted():
+                            pass  # halted intentionally — do not cancel; operator reset required
+                        elif _reaper_last_cycle is not None:
+                            reaper_age = (
+                                _utcnow() - _reaper_last_cycle
+                            ).total_seconds()
+                            if reaper_age > _reaper_stall_threshold:
+                                reaper_reason = (
+                                    f"no cycle completion in {int(reaper_age)}s"
+                                )
+                                logger.error(
+                                    "[MONITOR] Reaper appears hung — %s. "
+                                    "Cancelling task so restart path re-spawns it.",
+                                    reaper_reason,
+                                )
+                                cancel_reasons["reaper"] = (
+                                    f"watchdog cancelled: {reaper_reason}"
+                                )
+                                reaper_task.cancel()
+                except Exception as reaper_wd_exc:
+                    logger.warning(
+                        "[MONITOR] Reaper watchdog check failed: %s", reaper_wd_exc
+                    )
                 for name, t in list(tasks.items()):
                     if t.done():
                         exc = t.exception() if not t.cancelled() else None

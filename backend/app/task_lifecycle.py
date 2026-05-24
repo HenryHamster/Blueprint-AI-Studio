@@ -1156,7 +1156,9 @@ async def _close_loop_regression_case_on_failure(
     if case is None:
         return
     try:
-        case.last_failure_class = classify_failure(task)
+        case.last_failure_class = classify_failure(
+            task, at_time=task.last_heartbeat or task.started_at
+        )
     except Exception as exc:
         logger.warning(
             "classify_failure raised while capturing last_failure_class for case %s: %s",
@@ -4177,7 +4179,9 @@ async def _process_post_commit(
                     from app.failure_classification import persist_failure_category
                     from app.routers.agent_status import record_task_result
 
-                    _fc_handler = classify_failure(task)
+                    _fc_handler = classify_failure(
+                        task, at_time=task.last_heartbeat or task.started_at
+                    )
                     persist_failure_category(task, _fc_handler)
                     record_task_result(
                         success=False,

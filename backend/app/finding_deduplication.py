@@ -173,7 +173,9 @@ def build_dedup_state(
         ):
             continue
         if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-            failure_class = classify_failure(t)
+            failure_class = classify_failure(
+                t, at_time=t.last_heartbeat or t.started_at
+            )
             # Exclude transient infra failures (task never ran, should be retried).
             if failure_class in INFRA_CLASSES:
                 continue

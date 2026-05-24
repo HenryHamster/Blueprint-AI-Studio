@@ -41,6 +41,10 @@ from app.reaper import (
     _ORPHAN_REAP_CRASH_STREAK_LIMIT,
     _heartbeat_stale_cutoff,
     _progress_stale_cutoff,
+    _reaper_halt_state,
+    _REAPER_CYCLE_HALT_THRESHOLD,
+    get_reaper_stats,
+    is_reaper_halted,
 )
 from app.shared_state import runtime_config as _runtime_config
 
@@ -4682,4 +4686,169 @@ async def test_orphan_crash_quarantines_task_after_streak_threshold(
 
     assert str(poison_id) not in clean_crash_streaks, (
         "streak entry must be cleared after quarantine so the task stops being re-selected"
+    )
+
+
+# ── Cycle-level halt circuit breaker ─────────────────────────────────────────
+
+
+class _FailingSessionCM:
+    """Async context manager whose __aenter__ always raises (simulates cycle crash)."""
+
+    def __call__(self):
+        return self
+
+    async def __aenter__(self):
+        raise RuntimeError("injected-cycle-crash")
+
+    async def __aexit__(self, *_):
+        pass
+
+
+@pytest.fixture()
+def clean_halt_state():
+    """Reset _reaper_halt_state to the clean baseline before and after each test."""
+    import app.reaper as _reaper_mod
+
+    _reaper_mod._reaper_halt_state.update(
+        {"halted": False, "halt_timestamp": None, "last_error": None, "crash_count": 0}
+    )
+    yield _reaper_mod._reaper_halt_state
+    _reaper_mod._reaper_halt_state.update(
+        {"halted": False, "halt_timestamp": None, "last_error": None, "crash_count": 0}
+    )
+
+
+@pytest.mark.asyncio
+async def test_cycle_halt_state_recorded_after_n_consecutive_crashes(
+    reaper_side_effects, clean_halt_state, mocker
+):
+    """After _REAPER_CYCLE_HALT_THRESHOLD consecutive whole-cycle exceptions the
+    reaper records HALTED state and get_reaper_stats()/is_reaper_halted() reflect it."""
+    mocker.patch("app.reaper.AsyncSessionLocal", _FailingSessionCM())
+    mocker.patch("app.reaper._post_reaper_halt_alert", new_callable=AsyncMock)
+
+    async def _sleep_until_halted(secs):
+        if _reaper_halt_state["halted"]:
+            raise _StopLoop()
+
+    mocker.patch("asyncio.sleep", side_effect=_sleep_until_halted)
+
+    await _run_reaper_once()
+
+    assert _reaper_halt_state["halted"] is True, (
+        "halt state must be set after N crashes"
+    )
+    assert _reaper_halt_state["crash_count"] == _REAPER_CYCLE_HALT_THRESHOLD
+    assert "injected-cycle-crash" in (_reaper_halt_state["last_error"] or "")
+    assert _reaper_halt_state["halt_timestamp"] is not None
+
+    stats = get_reaper_stats()
+    assert stats["halted"] is True, "get_reaper_stats must surface halt flag"
+    assert stats["halt_crash_count"] == _REAPER_CYCLE_HALT_THRESHOLD
+    assert is_reaper_halted() is True
+
+
+@pytest.mark.asyncio
+async def test_cycle_halt_skips_further_cycle_attempts(
+    reaper_side_effects, clean_halt_state, mocker
+):
+    """Once the reaper is halted, subsequent loop iterations skip the cycle body
+    entirely (the halt branch sleeps 300s and continues)."""
+    import app.reaper as _reaper_mod
+
+    _reaper_mod._reaper_halt_state.update(
+        {
+            "halted": True,
+            "halt_timestamp": datetime.utcnow(),
+            "last_error": "pre-halted",
+            "crash_count": _REAPER_CYCLE_HALT_THRESHOLD,
+        }
+    )
+
+    session_factory_mock = mocker.patch("app.reaper.AsyncSessionLocal")
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop())
+
+    await _run_reaper_once()
+
+    assert session_factory_mock.call_count == 0, (
+        "halted reaper must not enter the cycle body (AsyncSessionLocal not called)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cycle_halt_alert_posted_exactly_once(
+    reaper_side_effects, clean_halt_state, mocker
+):
+    """_post_reaper_halt_alert is called exactly once — right when the threshold is crossed."""
+    mocker.patch("app.reaper.AsyncSessionLocal", _FailingSessionCM())
+    halt_alert = mocker.patch(
+        "app.reaper._post_reaper_halt_alert", new_callable=AsyncMock
+    )
+
+    # Allow error-backoff sleeps; stop once halted (halt-branch sleep fires)
+    async def _sleep_until_halted(secs):
+        if _reaper_halt_state["halted"]:
+            raise _StopLoop()
+
+    mocker.patch("asyncio.sleep", side_effect=_sleep_until_halted)
+
+    await _run_reaper_once()
+
+    # The alert task is created via asyncio.get_running_loop().create_task(...) so
+    # it may not have awaited yet; we check the mock was called once.
+    assert halt_alert.call_count == 1, (
+        "_post_reaper_halt_alert must be called exactly once when halt is triggered"
+    )
+    call_args = halt_alert.call_args
+    assert call_args[0][0] == _REAPER_CYCLE_HALT_THRESHOLD  # crash_count
+    assert "injected-cycle-crash" in call_args[0][1]  # last_error
+
+
+@pytest.mark.asyncio
+async def test_per_task_crash_does_not_trigger_cycle_halt(
+    reaper_db,
+    stop_after_one_cycle,
+    reaper_side_effects,
+    clean_halt_state,
+    clean_crash_streaks,
+    mocker,
+):
+    """A crash inside the per-task isolation block completes the cycle cleanly
+    (consecutive_errors stays 0) so the cycle-level halt is never triggered."""
+    project = await _make_project(reaper_db)
+    orphan = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-per-task-crash",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(orphan)
+    await reaper_db.commit()
+    orphan_id = orphan.id
+
+    call_count: dict = {}
+    real_get = AsyncSession.get
+
+    async def _crash_on_first_get(self, model, pk, **kwargs):
+        key = (model, pk)
+        call_count[key] = call_count.get(key, 0) + 1
+        if pk == orphan_id and call_count[key] == 1:
+            raise RuntimeError("per-task-isolated-crash")
+        return await real_get(self, model, pk, **kwargs)
+
+    mocker.patch.object(AsyncSession, "get", _crash_on_first_get)
+
+    import app.reaper as _reaper_mod
+
+    cycles_before = _reaper_mod._reaper_cycles_completed_count
+    await _run_reaper_once()
+
+    assert _reaper_halt_state["halted"] is False, (
+        "per-task crash must not trigger the cycle-level halt circuit breaker"
+    )
+    assert _reaper_mod._reaper_cycles_completed_count == cycles_before + 1, (
+        "cycle must complete cleanly: per-task crash is isolated, not a cycle-level error"
     )

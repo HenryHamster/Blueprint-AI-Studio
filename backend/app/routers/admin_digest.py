@@ -1677,6 +1677,10 @@ async def _compute_digest(
                     Task.title,
                     Task.created_at,
                     Task.started_at,
+                    # at_time correlation in compute_failure_grouping /
+                    # compute_digest_trend_history reads last_heartbeat; load it
+                    # here so the access doesn't trigger an async lazy-load.
+                    Task.last_heartbeat,
                     Task.context,
                     Task.latest_status_message,
                     Task.attempt_count,
@@ -1717,6 +1721,10 @@ async def _compute_digest(
                     Task.title,
                     Task.created_at,
                     Task.started_at,
+                    # at_time correlation in compute_failure_grouping /
+                    # compute_digest_trend_history reads last_heartbeat; load it
+                    # here so the access doesn't trigger an async lazy-load.
+                    Task.last_heartbeat,
                     Task.payloads,
                     Task.context,
                     Task.status_log,

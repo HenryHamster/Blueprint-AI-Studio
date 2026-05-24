@@ -1943,3 +1943,65 @@ def get_dispatcher_cycles(
         if r.get("cycle_started_at", "") >= cutoff
         and (project_id is None or r.get("project_id") == project_id)
     ]
+
+
+# --- Reaper Cycle-Level Halt State Access ---
+# The authoritative halt state lives in reaper._reaper_halt_state (module-local
+# to avoid a circular import — reaper.py already imports from shared_state.py).
+# These helpers provide cross-module access via lazy imports so admin routers
+# and the metrics endpoint can read and reset the halt state without importing
+# reaper.py directly.
+
+
+def get_reaper_halt_state() -> Dict[str, Any]:
+    """Snapshot of the reaper's cycle-level circuit breaker state.
+
+    Lazily imports from app.reaper to avoid circular imports at module load.
+    Returns a safe default dict when the reaper module is not yet imported.
+    """
+    try:
+        import app.reaper as _reaper_mod  # noqa: PLC0415
+
+        state = _reaper_mod._reaper_halt_state
+        ts = state.get("halt_timestamp")
+        return {
+            "halted": bool(state.get("halted")),
+            "halt_timestamp": ts.isoformat() if ts else None,
+            "last_error": state.get("last_error"),
+            "crash_count": state.get("crash_count", 0),
+        }
+    except Exception:  # noqa: BLE001
+        return {
+            "halted": False,
+            "halt_timestamp": None,
+            "last_error": None,
+            "crash_count": 0,
+        }
+
+
+def reset_reaper_halt_state() -> bool:
+    """Reset the reaper cycle-level circuit breaker (operator manual reset).
+
+    Clears the in-memory halt state so the reaper service resumes on its next
+    iteration.  Returns True if the reaper was halted and is now cleared,
+    False if it was not halted.
+    """
+    try:
+        import app.reaper as _reaper_mod  # noqa: PLC0415
+
+        state = _reaper_mod._reaper_halt_state
+        if not state.get("halted"):
+            return False
+        state.update(
+            {
+                "halted": False,
+                "halt_timestamp": None,
+                "last_error": None,
+                "crash_count": 0,
+            }
+        )
+        logger.info("[REAPER] Halt state cleared by operator reset.")
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[REAPER] reset_reaper_halt_state failed: {e}")
+        return False
