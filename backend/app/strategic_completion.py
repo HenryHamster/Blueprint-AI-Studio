@@ -2522,7 +2522,8 @@ async def _handle_strategic_completion(
                     continue
                 for d in directions:
                     if d.get("id") == dir_id:
-                        d["status"] = "expired"
+                        d["status"] = "retired"
+                        d["retired_at"] = _utcnow().isoformat()
                         if rationale:
                             notes = d.get("notes", [])
                             notes.append(

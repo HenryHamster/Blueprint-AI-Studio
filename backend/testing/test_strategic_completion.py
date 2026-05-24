@@ -6871,3 +6871,81 @@ async def test_retirement_memo_dedup_guard(db_session, mocker):
     assert len(retirement_memos) == 1, (
         f"dedup guard should prevent second memo; got {len(retirement_memos)}"
     )
+
+
+@pytest.mark.asyncio
+async def test_retire_op_sets_retired_status_and_appears_in_summary(db_session, mocker):
+    """Regression: retire op must stamp status='retired' (not 'expired') and
+    retired_at, so _build_retired_directions_summary includes the direction."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+    from app.strategic_analysis import _build_retired_directions_summary
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    direction_id = "d-retire-status-fix"
+    direction = {
+        "id": direction_id,
+        "text": "Improve CI pipeline speed to reduce developer wait time",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+    project = Project(
+        name="RetireStatusFix",
+        user_id="u-retire-status",
+        vision={"purpose": "test", "revision": 0},
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "retire",
+                    "direction_id": direction_id,
+                    "rationale": "CI speed goal fully met",
+                }
+            ],
+        }
+    )
+    sr_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(sr_task)
+    await db_session.commit()
+    await db_session.refresh(sr_task)
+
+    await _handle_strategic_completion(sr_task, logs, db_session)
+    await db_session.refresh(project)
+
+    retired = [d for d in (project.directions or []) if d.get("id") == direction_id]
+    assert len(retired) == 1, "direction should still exist after retire op"
+    d = retired[0]
+
+    # Core fix: status must be 'retired', not 'expired'
+    assert d["status"] == "retired", (
+        f"retire op should set status='retired', got {d['status']!r}"
+    )
+    # Timestamp must be stamped so the time-window filter in
+    # _build_retired_directions_summary can include this direction
+    assert d.get("retired_at"), "retire op should stamp retired_at timestamp"
+
+    # End-to-end: direction must appear in the retired summary
+    summary = _build_retired_directions_summary(project, window_days=90)
+    summary_ids = [e.get("id") for e in summary]
+    assert direction_id in summary_ids, (
+        f"strategically-retired direction should appear in _build_retired_directions_summary; "
+        f"got ids={summary_ids}"
+    )
