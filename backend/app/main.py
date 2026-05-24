@@ -2189,7 +2189,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
 
 from app.strategic_completion import (
     _find_matching_direction,
-    _is_direction_duplicate,
+    _find_recent_rejected_proposal,
     _normalize_recommended_mode,
     _reset_scaffolding_state_on_outcome_change,
 )
@@ -2741,59 +2741,47 @@ async def strategic_operation(
             data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
         )
         raw_dedup_reasoning = data.get("dedup_reasoning")
-        distinction = (
-            str(raw_dedup_reasoning.get("distinction") or "").strip()
-            if isinstance(raw_dedup_reasoning, dict)
-            else ""
-        )
         directions = list(project.directions or [])
-        # Dedup: skip if semantically similar direction already exists
-        _rejected_proposals = list(
-            (project.vision or {}).get("rejected_proposals") or []
+        rejected_match = _find_recent_rejected_proposal(
+            text,
+            [d for d in directions if d.get("status") == "rejected"],
         )
-        is_dup, _override = _is_direction_duplicate(
-            text, directions, _rejected_proposals, distinction=distinction or None
-        )
-        if is_dup:
-            if distinction:
-                logger.warning(
-                    "[STRATEGIC_DEDUP_DISAGREEMENT] API path: direction rejected as duplicate but agent claimed "
-                    "distinction='%s'; matched text='%s'; project=%s",
-                    distinction[:200],
-                    text[:60],
-                    project.id,
-                )
-            matched = _find_matching_direction(text, directions)
-            if matched:
-                logger.info(
-                    "[STRATEGIC] API path: rejecting semantic duplicate direction '%s' for project %s — "
-                    "matched existing direction '%s' (status=%s)",
-                    text[:60],
-                    project.id,
-                    (matched.get("text") or "")[:60],
-                    matched.get("status"),
-                )
+        if rejected_match:
+            logger.info(
+                "[STRATEGIC] API path: direction '%s' matches recently rejected proposal '%s' (rejected_at=%s) — hard-blocking; project=%s",
+                text[:60],
+                (rejected_match.get("text") or "")[:60],
+                rejected_match.get("rejected_at"),
+                project.id,
+            )
             ctx = task.context or {}
-            dedup_rejections = list(ctx.get("_strategic_dedup_rejections") or [])
-            rejection_record: dict = {
-                "rejected_text": text,
-                "matched_direction_id": matched.get("id") if matched else None,
-                "rejected_at": _utcnow().isoformat(),
-            }
-            if distinction:
-                rejection_record["dedup_reasoning"] = distinction[:500]
-            dedup_rejections.append(rejection_record)
-            task.context = {
-                **ctx,
-                "_strategic_api_called": True,
-                "_strategic_dedup_rejections": dedup_rejections,
-            }
+            task.context = {**ctx, "_strategic_api_called": True}
             flag_modified(task, "context")
             session.add(task)
             await session.commit()
             return JSONResponse(
-                content=_resp({"status": "skipped", "reason": "semantic_duplicate"}),
+                content=_resp(
+                    {
+                        "status": "skipped",
+                        "reason": "Direction matches a recently rejected proposal",
+                    }
+                ),
                 status_code=409,
+            )
+        # Advisory dedup (see strategic_completion._is_direction_duplicate): the
+        # strategic agent owns its direction set, so a proposal that resembles an
+        # existing direction is surfaced (log + a note on the created direction),
+        # not hard-blocked. Hard dedup is retained only on the automated/loop-prone
+        # creators. The old 409 "semantic_duplicate" rejection path is gone.
+        matched = _find_matching_direction(text, directions)
+        if matched:
+            logger.info(
+                "[STRATEGIC] API path: direction '%s' resembles existing '%s' (status=%s) — "
+                "creating anyway (advisory; agent-owned set); project=%s",
+                text[:60],
+                (matched.get("text") or "")[:60],
+                matched.get("status"),
+                project.id,
             )
         success_evidence = str(data.get("success_evidence", "")).strip()
         retirement_condition = str(data.get("retirement_condition", "")).strip()
@@ -2825,14 +2813,31 @@ async def strategic_operation(
             "text": text,
             "status": "active",
             "priority": priority,
-            "notes": [
-                {
-                    "text": f"Created by strategic review: {rationale}",
-                    "added_at": _utcnow().isoformat(),
-                }
-            ]
-            if rationale
-            else [],
+            "notes": (
+                [
+                    {
+                        "text": f"Created by strategic review: {rationale}",
+                        "added_at": _utcnow().isoformat(),
+                    }
+                ]
+                if rationale
+                else []
+            )
+            + (
+                [
+                    {
+                        "text": (
+                            "Advisory: resembles existing direction "
+                            f"'{(matched.get('text') or '')[:80]}' "
+                            f"(status={matched.get('status')}) — created on the "
+                            "agent's judgment; retire one if redundant."
+                        ),
+                        "added_at": _utcnow().isoformat(),
+                    }
+                ]
+                if matched
+                else []
+            ),
             "research_history": [],
             "context": {
                 "success_evidence": success_evidence[:_DIR_FIELD_MAX],

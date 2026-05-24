@@ -845,9 +845,7 @@ class TestIsDirectionDuplicate:
     def test_duplicate_with_existing_direction(self):
         proposal = "improve caching layer performance database queries"
         existing = [{"text": "improve caching layer performance database queries"}]
-        is_dup, override = _is_direction_duplicate(proposal, existing, [])
-        assert is_dup is True
-        assert override is None
+        assert _is_direction_duplicate(proposal, existing, []) is True
 
     def test_not_duplicate_when_overlap_below_threshold(self):
         # Only 3 shared non-stopword words
@@ -856,9 +854,7 @@ class TestIsDirectionDuplicate:
         # Words after stopwords: {improve, database, query, performance}
         # Existing after stopwords: {improve, database, query, latency, optimization}
         # Overlap: improve, database, query = 3 < 4 threshold
-        is_dup, override = _is_direction_duplicate(proposal, existing, [])
-        assert is_dup is False
-        assert override is None
+        assert _is_direction_duplicate(proposal, existing, []) is False
 
     def test_duplicate_with_recent_rejected_proposal(self):
         recent = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
@@ -869,9 +865,7 @@ class TestIsDirectionDuplicate:
                 "rejected_at": recent,
             }
         ]
-        is_dup, override = _is_direction_duplicate(proposal, [], rejected)
-        assert is_dup is True
-        assert override is None
+        assert _is_direction_duplicate(proposal, [], rejected) is True
 
     def test_old_rejected_proposal_ignored(self):
         old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
@@ -882,47 +876,35 @@ class TestIsDirectionDuplicate:
                 "rejected_at": old,
             }
         ]
-        is_dup, override = _is_direction_duplicate(proposal, [], rejected)
-        assert is_dup is False
-        assert override is None
+        assert _is_direction_duplicate(proposal, [], rejected) is False
 
     def test_stopwords_filtered_from_proposal(self):
         # After filtering stopwords from "feat fix refactor add update improve",
         # fewer than 2 non-stopword tokens remain → returns False immediately
         proposal = "feat fix refactor add update improve"
         existing = [{"text": "feat fix refactor add update improve"}]
-        is_dup, override = _is_direction_duplicate(proposal, existing, [])
-        assert is_dup is False
-        assert override is None
+        assert _is_direction_duplicate(proposal, existing, []) is False
 
     def test_requires_at_least_2_non_stopword_tokens(self):
         # Only one non-stopword word
         proposal = "improve"
         existing = [{"text": "improve performance database caching queries"}]
-        is_dup, override = _is_direction_duplicate(proposal, existing, [])
-        assert is_dup is False
-        assert override is None
+        assert _is_direction_duplicate(proposal, existing, []) is False
 
     def test_no_match_against_empty_lists(self):
         proposal = "refactor authentication middleware pipeline"
-        is_dup, override = _is_direction_duplicate(proposal, [], [])
-        assert is_dup is False
-        assert override is None
+        assert _is_direction_duplicate(proposal, [], []) is False
 
     def test_exactly_4_shared_words_triggers_duplicate(self):
         proposal = "cache database query performance results"
         existing = [{"text": "cache database query performance improvements"}]
         # Shared non-stopword words: cache, database, query, performance = 4
-        is_dup, override = _is_direction_duplicate(proposal, existing, [])
-        assert is_dup is True
-        assert override is None
+        assert _is_direction_duplicate(proposal, existing, []) is True
 
     def test_case_insensitive_matching(self):
         proposal = "Cache Database Query Performance Results"
         existing = [{"text": "cache database query performance improvements"}]
-        is_dup, override = _is_direction_duplicate(proposal, existing, [])
-        assert is_dup is True
-        assert override is None
+        assert _is_direction_duplicate(proposal, existing, []) is True
 
     def test_retired_direction_3_word_overlap_no_longer_triggers_duplicate(self):
         # 3-word overlap against an expired direction no longer triggers (threshold = 4 for all)
@@ -932,9 +914,7 @@ class TestIsDirectionDuplicate:
             {"text": "cache database query latency optimization", "status": "expired"}
         ]
         # Non-stopword overlap: cache, database, query = 3 < threshold 4 → False
-        is_dup, override = _is_direction_duplicate(proposal, existing, [])
-        assert is_dup is False
-        assert override is None
+        assert _is_direction_duplicate(proposal, existing, []) is False
 
     def test_active_direction_still_requires_4_words(self):
         # Same 3-word overlap against an active direction should NOT be flagged (threshold 4)
@@ -943,9 +923,7 @@ class TestIsDirectionDuplicate:
             {"text": "cache database query latency optimization", "status": "active"}
         ]
         # Non-stopword overlap: cache, database, query = 3 < threshold 4 for active → False
-        is_dup, override = _is_direction_duplicate(proposal, existing, [])
-        assert is_dup is False
-        assert override is None
+        assert _is_direction_duplicate(proposal, existing, []) is False
 
     def test_superseded_direction_4_word_overlap_triggers_duplicate(self):
         # 4-word overlap against a superseded direction still triggers (threshold = 4)
@@ -957,9 +935,7 @@ class TestIsDirectionDuplicate:
             }
         ]
         # Overlap: migrate, authentication, service, token = 4 >= threshold 4 → True
-        is_dup, override = _is_direction_duplicate(proposal, existing, [])
-        assert is_dup is True
-        assert override is None
+        assert _is_direction_duplicate(proposal, existing, []) is True
 
     def test_retired_threshold_2_words_does_not_trigger(self):
         # Only 2 shared non-stopword words even against a retired direction → False
@@ -968,9 +944,7 @@ class TestIsDirectionDuplicate:
             {"text": "caching performance strategy deployment", "status": "expired"}
         ]
         # Overlap: caching, performance = 2 < threshold 4 → False
-        is_dup, override = _is_direction_duplicate(proposal, existing, [])
-        assert is_dup is False
-        assert override is None
+        assert _is_direction_duplicate(proposal, existing, []) is False
 
     def test_retired_direction_4_word_overlap_still_blocked(self):
         # 4-word overlap against a retired direction still blocks (threshold = 4)
@@ -982,261 +956,7 @@ class TestIsDirectionDuplicate:
             }
         ]
         # Overlap: migrate, authentication, service, oauth, token = 5 >= 4 → True
-        is_dup, override = _is_direction_duplicate(proposal, existing, [])
-        assert is_dup is True
-        assert override is None
-
-    def test_distinction_bypasses_retired_direction_match(self):
-        # Well-formed distinction overrides a 4-word overlap against a retired direction
-        proposal = "migrate authentication service oauth token"
-        existing = [
-            {
-                "text": "migrate authentication service oauth2 token system",
-                "status": "expired",
-            }
-        ]
-        distinction = (
-            "This focuses on the refresh-token rotation path, not initial login"
-        )
-        is_dup, override = _is_direction_duplicate(
-            proposal, existing, [], distinction=distinction
-        )
-        assert is_dup is False
-        assert override is None
-
-    def test_distinction_bypasses_completed_direction_match(self):
-        # Regression (2026-05-24): a direction that auto-completed on saturation
-        # is terminal, so a well-formed distinction must override the overlap —
-        # exactly like a retired one. Before the fix, "completed" was missing from
-        # the override-eligible set, so the dedup treated completed directions as
-        # live competitors and silently blocked every re-scoped successor
-        # (decomposition could not re-spawn after it saturated).
-        proposal = "migrate authentication service oauth token"
-        existing = [
-            {
-                "text": "migrate authentication service oauth2 token system",
-                "status": "completed",
-            }
-        ]
-        distinction = (
-            "This focuses on the refresh-token rotation path, not initial login"
-        )
-        is_dup, override = _is_direction_duplicate(
-            proposal, existing, [], distinction=distinction
-        )
-        assert is_dup is False
-        assert override is None
-
-    def test_distinction_does_not_bypass_active_direction_match_without_category(self):
-        # Distinction has no effect on active-direction matches when categories not specified
-        proposal = "migrate authentication service oauth token"
-        existing = [
-            {
-                "text": "migrate authentication service oauth2 token system",
-                "status": "active",
-            }
-        ]
-        distinction = (
-            "This focuses on the refresh-token rotation path, not initial login"
-        )
-        is_dup, override = _is_direction_duplicate(
-            proposal, existing, [], distinction=distinction
-        )
-        assert is_dup is True
-        assert override is None
-
-    def test_distinction_bypasses_active_same_category_direction(self):
-        # Well-formed distinction OVERRIDES a 4-word overlap against an active direction
-        # of the SAME category
-        proposal = "migrate authentication service oauth token"
-        existing = [
-            {
-                "id": "d-auth1",
-                "text": "migrate authentication service oauth2 token system",
-                "status": "active",
-                "category": "structural",
-            }
-        ]
-        distinction = (
-            "This focuses on the refresh-token rotation path, not initial login"
-        )
-        is_dup, override = _is_direction_duplicate(
-            proposal,
-            existing,
-            [],
-            distinction=distinction,
-            proposal_category="structural",
-        )
-        assert is_dup is False
-        assert override is not None
-        assert override["id"] == "d-auth1"
-
-    def test_distinction_does_not_bypass_active_cross_category_direction(self):
-        # Distinction does NOT override when categories differ (even if distinction is well-formed)
-        proposal = "migrate authentication service oauth token"
-        existing = [
-            {
-                "text": "migrate authentication service oauth2 token system",
-                "status": "active",
-                "category": "product",
-            }
-        ]
-        distinction = (
-            "This focuses on the refresh-token rotation path, not initial login"
-        )
-        is_dup, override = _is_direction_duplicate(
-            proposal,
-            existing,
-            [],
-            distinction=distinction,
-            proposal_category="structural",
-        )
-        assert is_dup is True
-        assert override is None
-
-    def test_distinction_too_short_does_not_bypass(self):
-        # A trivially short distinction (< 20 chars) does not override the check
-        proposal = "migrate authentication service oauth token"
-        existing = [
-            {
-                "text": "migrate authentication service oauth2 token system",
-                "status": "retired",
-            }
-        ]
-        distinction = "different"  # only 9 chars, not well-formed
-        is_dup, override = _is_direction_duplicate(
-            proposal, existing, [], distinction=distinction
-        )
-        assert is_dup is True
-        assert override is None
-
-    def test_distinction_bypasses_retired_but_not_rejected_proposal(self):
-        # distinction bypasses a retired-direction match, but rejected proposals always block
-        from datetime import datetime, timezone, timedelta
-
-        recent = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
-        proposal = "migrate authentication service oauth token"
-        rejected = [
-            {
-                "text": "migrate authentication service oauth token identical",
-                "rejected_at": recent,
-            }
-        ]
-        distinction = (
-            "This focuses on the refresh-token rotation path, not initial login"
-        )
-        # Match is against a rejected proposal, not a retired direction → still True
-        is_dup, override = _is_direction_duplicate(
-            proposal, [], rejected, distinction=distinction
-        )
-        assert is_dup is True
-        assert override is None
-
-    def test_same_category_active_with_distinction_allowed(self):
-        # Test case (a): same-category active + distinction → allowed
-        # Note: need 4+ overlapping non-stopwords to trigger the duplicate check
-        proposal = "migrate authentication service oauth token rotation mechanism"
-        existing = [
-            {
-                "id": "d-auth1",
-                "text": "migrate authentication service oauth token refresh",
-                "status": "active",
-                "category": "structural",
-            }
-        ]
-        distinction = "This targets token refresh rotation, not the initial oauth flow"
-        is_dup, override = _is_direction_duplicate(
-            proposal,
-            existing,
-            [],
-            distinction=distinction,
-            proposal_category="structural",
-        )
-        assert is_dup is False
-        assert override is not None
-        assert override["id"] == "d-auth1"
-
-    def test_same_category_active_no_distinction_blocked(self):
-        # Test case (b): same-category active + no distinction → blocked
-        proposal = "migrate authentication service oauth token rotation"
-        existing = [
-            {
-                "id": "d-auth1",
-                "text": "migrate authentication service oauth token system",
-                "status": "active",
-                "category": "structural",
-            }
-        ]
-        is_dup, override = _is_direction_duplicate(
-            proposal, existing, [], distinction=None, proposal_category="structural"
-        )
-        assert is_dup is True
-        assert override is None
-
-    def test_cross_category_active_still_blocks(self):
-        # Test case (c): cross-category active → still blocked (keep current behavior)
-        # Different categories do NOT allow distinction override
-        proposal = "migrate authentication service oauth token rotation"
-        existing = [
-            {
-                "id": "d-auth1",
-                "text": "migrate authentication service oauth token system",
-                "status": "active",
-                "category": "product",
-            }
-        ]
-        is_dup, override = _is_direction_duplicate(
-            proposal, existing, [], distinction=None, proposal_category="structural"
-        )
-        # Different categories still block
-        assert is_dup is True
-        assert override is None
-
-    def test_mixed_category_does_not_match_same_category(self):
-        # Mixed category should not be treated as matching any specific category
-        proposal = "migrate authentication service oauth token rotation"
-        existing = [
-            {
-                "id": "d-auth1",
-                "text": "migrate authentication service oauth token system",
-                "status": "active",
-                "category": "mixed",
-            }
-        ]
-        distinction = "This targets token rotation specifically"
-        is_dup, override = _is_direction_duplicate(
-            proposal,
-            existing,
-            [],
-            distinction=distinction,
-            proposal_category="structural",
-        )
-        # mixed category does not match structural, so distinction doesn't override
-        assert is_dup is True
-        assert override is None
-
-    def test_retired_direction_preserved_behavior(self):
-        # Test case (d): retired direction case (preserve current behavior)
-        proposal = "migrate authentication service oauth token rotation"
-        existing = [
-            {
-                "id": "d-auth1",
-                "text": "migrate authentication service oauth token system",
-                "status": "retired",
-                "category": "structural",
-            }
-        ]
-        distinction = "This targets token rotation specifically"
-        is_dup, override = _is_direction_duplicate(
-            proposal,
-            existing,
-            [],
-            distinction=distinction,
-            proposal_category="structural",
-        )
-        # Retired direction with distinction should still allow (distinction bypasses retired)
-        assert is_dup is False
-        assert override is None
+        assert _is_direction_duplicate(proposal, existing, []) is True
 
 
 # ── _record_strategic_task_failure ───────────────────────────────────────────
@@ -3427,12 +3147,11 @@ async def test_absent_dedup_reasoning_no_error_on_create(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_dedup_rejected_with_dedup_reasoning_emits_warning_fallback(
-    db_session, mocker, caplog
-):
-    """When a duplicate is rejected AND dedup_reasoning.distinction was supplied, a structured warning is logged."""
+async def test_dedup_overlap_creates_advisory_fallback(db_session, mocker):
+    """Advisory dedup: a near-duplicate of an active direction is no longer
+    hard-blocked on the strategic-agent fallback path — the direction IS created
+    and carries an advisory note flagging the resemblance."""
     import json
-    import logging
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
 
@@ -3485,15 +3204,20 @@ async def test_dedup_rejected_with_dedup_reasoning_emits_warning_fallback(
             ],
         }
     )
-    with caplog.at_level(logging.WARNING, logger="app.strategic_completion"):
-        await _handle_strategic_completion(task, logs, db_session)
+    await _handle_strategic_completion(task, logs, db_session)
 
     await db_session.refresh(project)
-    dirs = [d for d in (project.directions or []) if d.get("id") != "d-existing1"]
-    assert len(dirs) == 0, "Duplicate should have been rejected"
-    assert any("STRATEGIC_DEDUP_DISAGREEMENT" in r.message for r in caplog.records), (
-        "Warning with STRATEGIC_DEDUP_DISAGREEMENT should have been emitted"
+    new_dirs = [d for d in (project.directions or []) if d.get("id") != "d-existing1"]
+    assert len(new_dirs) == 1, (
+        "Near-duplicate should be created (advisory, not blocked)"
     )
+    created = new_dirs[0]
+    assert created.get("status") == "active"
+    notes = created.get("notes") or []
+    assert any(
+        (n.get("text") or "").startswith("Advisory: resembles existing direction")
+        for n in notes
+    ), "Created direction should carry an advisory-resemblance note"
 
 
 @pytest.mark.asyncio
@@ -3570,10 +3294,11 @@ async def test_dedup_reasoning_fields_capped_at_max_length(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_semantic_dedup_blocks_paraphrased_active_direction_fallback(
+async def test_semantic_dedup_creates_advisory_paraphrased_active_direction_fallback(
     db_session, mocker
 ):
-    """Fallback path: paraphrased active direction is blocked by semantic dedup."""
+    """Fallback path: a paraphrase of an active direction is created (advisory),
+    not blocked — the agent owns its direction set."""
     import json
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
@@ -3628,7 +3353,14 @@ async def test_semantic_dedup_blocks_paraphrased_active_direction_fallback(
 
     await db_session.refresh(project)
     new_dirs = [d for d in (project.directions or []) if d.get("id") != "d-active1"]
-    assert len(new_dirs) == 0, "Paraphrased duplicate should have been blocked"
+    assert len(new_dirs) == 1, "Paraphrased near-duplicate should be created (advisory)"
+    created = new_dirs[0]
+    assert created.get("status") == "active"
+    notes = created.get("notes") or []
+    assert any(
+        (n.get("text") or "").startswith("Advisory: resembles existing direction")
+        for n in notes
+    ), "Created direction should carry an advisory-resemblance note"
 
 
 @pytest.mark.asyncio
@@ -3696,10 +3428,11 @@ async def test_semantic_dedup_allows_3word_overlap_retired_direction_fallback(
 
 
 @pytest.mark.asyncio
-async def test_semantic_dedup_blocks_4word_overlap_retired_direction_fallback(
+async def test_semantic_dedup_creates_advisory_4word_overlap_retired_direction_fallback(
     db_session, mocker
 ):
-    """Fallback path: 4-word overlap with a retired direction is still blocked."""
+    """Fallback path: a 4-word overlap with a retired direction is created
+    (advisory) on the strategic-agent path — no longer hard-blocked."""
     import json
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
@@ -3754,14 +3487,22 @@ async def test_semantic_dedup_blocks_4word_overlap_retired_direction_fallback(
 
     await db_session.refresh(project)
     new_dirs = [d for d in (project.directions or []) if d.get("id") != "d-ret2"]
-    assert len(new_dirs) == 0, (
-        "4-word overlap with retired direction should still be blocked"
+    assert len(new_dirs) == 1, (
+        "4-word overlap with retired direction should be created (advisory)"
     )
+    created = new_dirs[0]
+    assert created.get("status") == "active"
+    notes = created.get("notes") or []
+    assert any(
+        (n.get("text") or "").startswith("Advisory: resembles existing direction")
+        for n in notes
+    ), "Created direction should carry an advisory-resemblance note"
 
 
 @pytest.mark.asyncio
-async def test_distinction_allows_retire_then_replace_fallback(db_session, mocker):
-    """Fallback path: distinct replacement proposal for a retired direction is created when distinction is well-formed."""
+async def test_replace_retired_direction_creates_advisory_fallback(db_session, mocker):
+    """Fallback path: a replacement proposal that overlaps a retired direction is
+    created (advisory) — no distinction field is required anymore."""
     import json
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
@@ -3797,7 +3538,7 @@ async def test_distinction_allows_retire_then_replace_fallback(db_session, mocke
     await db_session.commit()
     await db_session.refresh(task)
 
-    # 4-word overlap with expired direction, but carries a well-formed distinction
+    # 4-word overlap with the expired direction — created on the agent's judgment.
     logs = json.dumps(
         {
             "vision": {"purpose": "test", "revision": 2},
@@ -3808,10 +3549,6 @@ async def test_distinction_allows_retire_then_replace_fallback(db_session, mocke
                     "priority": "medium",
                     "success_evidence": "Refresh token rotation fully implemented",
                     "retirement_condition": "Token rotation live for 3 cycles",
-                    "dedup_reasoning": {
-                        "closest_directions": ["d-ret3"],
-                        "distinction": "Prior direction covered initial login flow; this specifically targets refresh-token rotation which was not implemented",
-                    },
                 }
             ],
         }
@@ -3821,15 +3558,21 @@ async def test_distinction_allows_retire_then_replace_fallback(db_session, mocke
     await db_session.refresh(project)
     new_dirs = [d for d in (project.directions or []) if d.get("id") != "d-ret3"]
     assert len(new_dirs) == 1, (
-        "Direction with well-formed distinction against a retired direction should be created"
+        "Replacement direction overlapping a retired one should be created (advisory)"
     )
+    created = new_dirs[0]
+    assert created.get("status") == "active"
+    notes = created.get("notes") or []
+    assert any(
+        (n.get("text") or "").startswith("Advisory: resembles existing direction")
+        for n in notes
+    ), "Created direction should carry an advisory-resemblance note"
 
 
 @pytest.mark.asyncio
-async def test_distinction_does_not_bypass_active_direction_fallback(
-    db_session, mocker
-):
-    """Fallback path: distinction does not bypass a match against an active direction — still blocked."""
+async def test_active_direction_overlap_creates_advisory_fallback(db_session, mocker):
+    """Fallback path: a near-duplicate of an ACTIVE direction is created (advisory)
+    on the strategic-agent path — the old hard block is gone."""
     import json
     from unittest.mock import AsyncMock
     from app.strategic_completion import _handle_strategic_completion
@@ -3875,9 +3618,6 @@ async def test_distinction_does_not_bypass_active_direction_fallback(
                     "priority": "medium",
                     "success_evidence": "Refresh token rotation implemented",
                     "retirement_condition": "Rotation live for 3 cycles",
-                    "dedup_reasoning": {
-                        "distinction": "This targets refresh-token rotation specifically, not the initial OAuth2 migration",
-                    },
                 }
             ],
         }
@@ -3886,9 +3626,16 @@ async def test_distinction_does_not_bypass_active_direction_fallback(
 
     await db_session.refresh(project)
     new_dirs = [d for d in (project.directions or []) if d.get("id") != "d-active2"]
-    assert len(new_dirs) == 0, (
-        "Distinction does not bypass active direction match — should still be blocked"
+    assert len(new_dirs) == 1, (
+        "Near-duplicate of an active direction should be created (advisory)"
     )
+    created = new_dirs[0]
+    assert created.get("status") == "active"
+    notes = created.get("notes") or []
+    assert any(
+        (n.get("text") or "").startswith("Advisory: resembles existing direction")
+        for n in notes
+    ), "Created direction should carry an advisory-resemblance note"
 
 
 @pytest.mark.asyncio
@@ -4718,11 +4465,13 @@ async def test_strategic_http_update_direction_superseded_stamps_completed_at_an
 
 
 @pytest.mark.asyncio
-async def test_strategic_http_create_direction_dedup_persists_rejection_record(
+async def test_strategic_http_create_direction_dedup_creates_advisory(
     client, db_session, mocker
 ):
-    """HTTP create_direction on a semantic duplicate appends a structured record to
-    task.context['_strategic_dedup_rejections'] and still returns 409."""
+    """HTTP create_direction on a near-duplicate of an active direction now CREATES
+    the direction (advisory): returns 200, the directions list grows, and the new
+    direction carries an advisory-resemblance note. The old 409 + rejection record
+    is gone."""
     from app.auth import create_agent_token
     from app.models import TaskStatus
     from app import strategic_cycle
@@ -4784,26 +4533,125 @@ async def test_strategic_http_create_direction_dedup_persists_rejection_record(
         },
         headers={"x-agent-token": token},
     )
-    assert resp.status_code == 409, resp.text
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("status") == "ok"
+    assert body.get("op") == "create_direction"
+    new_id = body.get("direction_id")
+    assert new_id
+
+    await db_session.refresh(project)
+    assert len(project.directions or []) == 2, (
+        "Directions list should have grown by one"
+    )
+    created = next(d for d in project.directions if d.get("id") == new_id)
+    assert created.get("status") == "active"
+    notes = created.get("notes") or []
+    assert any(
+        (n.get("text") or "").startswith("Advisory: resembles existing direction")
+        for n in notes
+    ), "Created direction should carry an advisory-resemblance note"
 
     await db_session.refresh(task)
     ctx = task.context or {}
-    rejections = ctx.get("_strategic_dedup_rejections")
-    assert isinstance(rejections, list) and len(rejections) == 1, (
-        f"Expected 1 rejection record, got: {rejections}"
+    assert "_strategic_dedup_rejections" not in ctx, (
+        "The old rejection-record path should be gone"
     )
-    record = rejections[0]
-    assert record.get("matched_direction_id") == "d-exist"
-    assert existing_text in record.get("rejected_text", "")
-    assert record.get("dedup_reasoning") == "slightly different framing"
-    assert "rejected_at" in record
 
 
 @pytest.mark.asyncio
-async def test_api_path_distinction_allows_create_after_retirement(
+async def test_strategic_http_create_direction_blocks_recent_rejection(
     client, db_session, mocker
 ):
-    """HTTP create_direction with a well-formed distinction against a retired direction succeeds (200, not 409)."""
+    """HTTP create_direction still hard-blocks proposals that match a direction
+    rejected within the last 30 days, even though active/retired overlaps are now
+    advisory-only."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    rejected_text = "Migrate authentication service to OAuth2 tokens"
+    project = Project(
+        name="DEDUP-HTTP-REJECTED",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-rejected",
+                "text": rejected_text,
+                "status": "rejected",
+                "priority": "medium",
+                "rejected_at": (_utcnow() - timedelta(days=10)).isoformat(),
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-dedup-rejected",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-dedup-rejected", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {
+                "text": rejected_text,
+                "priority": "medium",
+                "rationale": "retrying the old idea",
+                "success_evidence": "All tasks pass",
+                "retirement_condition": "No open tasks",
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 409, resp.text
+    body = resp.json()
+    assert body.get("status") == "skipped"
+    assert "recently rejected proposal" in (body.get("reason") or "").lower()
+
+    await db_session.refresh(project)
+    assert len(project.directions or []) == 1, (
+        "Recently rejected proposal should not be recreated"
+    )
+    assert all(d.get("status") != "active" for d in (project.directions or [])), (
+        "Rejected overlap should not create an active direction"
+    )
+
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_strategic_api_called") is True, (
+        "Rejected-proposal 409 must still mark the strategic HTTP API as used so "
+        "the legacy/fallback completion path skips text-log direction_operations parsing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_api_path_overlap_retired_direction_creates_advisory(
+    client, db_session, mocker
+):
+    """HTTP create_direction overlapping a retired direction succeeds (200) and
+    carries an advisory-resemblance note — no distinction field required."""
     from app.auth import create_agent_token
     from app.models import TaskStatus
     from app import strategic_cycle
@@ -4859,10 +4707,6 @@ async def test_api_path_distinction_allows_create_after_retirement(
                 "rationale": "replacement direction targeting token refresh specifically",
                 "success_evidence": "Refresh token rotation fully implemented",
                 "retirement_condition": "Rotation stable for 3 cycles",
-                "dedup_reasoning": {
-                    "closest_directions": ["d-retired"],
-                    "distinction": "Prior direction covered initial OAuth2 login; this specifically targets refresh-token rotation not covered previously",
-                },
             },
         },
         headers={"x-agent-token": token},
@@ -4873,13 +4717,94 @@ async def test_api_path_distinction_allows_create_after_retirement(
     body = resp.json()
     assert body.get("status") == "ok"
     assert body.get("op") == "create_direction"
+    new_id = body.get("direction_id")
+    assert new_id
+
+    await db_session.refresh(project)
+    assert len(project.directions or []) == 2, (
+        "Directions list should have grown by one"
+    )
+    created = next(d for d in project.directions if d.get("id") == new_id)
+    assert created.get("status") == "active"
+    notes = created.get("notes") or []
+    assert any(
+        (n.get("text") or "").startswith("Advisory: resembles existing direction")
+        for n in notes
+    ), "Created direction should carry an advisory-resemblance note"
 
 
 @pytest.mark.asyncio
-async def test_api_path_active_direction_still_blocks_despite_distinction(
+async def test_fallback_create_direction_blocks_recent_rejection(db_session, mocker):
+    """Fallback direction_operations parsing must also respect recent rejected
+    proposals instead of recreating them."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    rejected_text = "Migrate authentication service to OAuth2 tokens"
+    project = Project(
+        name="DEDUP-FALLBACK-REJECTED",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-rejected-fallback",
+                "text": rejected_text,
+                "status": "rejected",
+                "priority": "medium",
+                "rejected_at": (_utcnow() - timedelta(days=10)).isoformat(),
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": rejected_text,
+                    "priority": "medium",
+                    "rationale": "retrying the old idea",
+                    "success_evidence": "All tasks pass",
+                    "retirement_condition": "No open tasks",
+                }
+            ],
+        }
+    )
+    sr_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(sr_task)
+    await db_session.commit()
+    await db_session.refresh(sr_task)
+
+    await _handle_strategic_completion(sr_task, logs, db_session)
+
+    await db_session.refresh(project)
+    assert len(project.directions or []) == 1, (
+        "Fallback path should not recreate a recently rejected proposal"
+    )
+    assert project.directions[0].get("status") == "rejected"
+
+
+@pytest.mark.asyncio
+async def test_api_path_active_direction_overlap_creates_advisory(
     client, db_session, mocker
 ):
-    """HTTP create_direction against an active direction is still rejected 409 even with a distinction."""
+    """HTTP create_direction overlapping an ACTIVE direction now creates the
+    direction (advisory, 200) instead of the old 409 hard block."""
     from app.auth import create_agent_token
     from app.models import TaskStatus
     from app import strategic_cycle
@@ -4935,16 +4860,29 @@ async def test_api_path_active_direction_still_blocks_despite_distinction(
                 "rationale": "near-duplicate of active direction",
                 "success_evidence": "Refresh token rotation implemented",
                 "retirement_condition": "Rotation stable for 3 cycles",
-                "dedup_reasoning": {
-                    "distinction": "This targets refresh-token rotation specifically, not the initial OAuth2 migration",
-                },
             },
         },
         headers={"x-agent-token": token},
     )
-    assert resp.status_code == 409, (
-        f"Expected 409 but got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 200, (
+        f"Expected 200 but got {resp.status_code}: {resp.text}"
     )
+    body = resp.json()
+    assert body.get("status") == "ok"
+    new_id = body.get("direction_id")
+    assert new_id
+
+    await db_session.refresh(project)
+    assert len(project.directions or []) == 2, (
+        "Directions list should have grown by one"
+    )
+    created = next(d for d in project.directions if d.get("id") == new_id)
+    assert created.get("status") == "active"
+    notes = created.get("notes") or []
+    assert any(
+        (n.get("text") or "").startswith("Advisory: resembles existing direction")
+        for n in notes
+    ), "Created direction should carry an advisory-resemblance note"
 
 
 # ── _build_outcome_evaluation: evidence block ─────────────────────────────────

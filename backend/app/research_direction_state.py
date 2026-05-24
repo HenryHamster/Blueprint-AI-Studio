@@ -672,7 +672,7 @@ async def apply_post_spawn_state(
                 )[:500]
                 if not proposal_text.strip():
                     continue
-                is_dup, _override = _is_direction_duplicate(
+                is_dup = _is_direction_duplicate(
                     proposal_text, proj_directions_snap, rejected_proposals
                 )
                 if is_dup:

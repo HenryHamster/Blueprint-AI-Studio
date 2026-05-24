@@ -1740,9 +1740,7 @@ async def _check_anomaly_proposals(project, session):
                     ]
                 )
 
-            is_dup, _override = _is_direction_duplicate(
-                proposal_text, dirs, rejected_proposals
-            )
+            is_dup = _is_direction_duplicate(proposal_text, dirs, rejected_proposals)
             if is_dup:
                 logger.info(
                     f"[ANOMALY] Skipping proposal for {anomaly_key} — overlaps with existing direction"

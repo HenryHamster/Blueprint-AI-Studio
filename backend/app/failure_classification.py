@@ -1645,10 +1645,30 @@ def _classify_failure_class(
     if _status_msg_raw[:8].lower().startswith("blocker:"):
         return BLOCKED_PRECONDITION
 
+    # Authoritative LLM rate-limit signal from the Claude Code CLI: the agent
+    # emits a structured ``{"type":"rate_limit_event", ...}`` line in its output
+    # when the provider rate-limits the request. Must run before both the
+    # persisted failure_class short-circuit and the agent_category fast path
+    # because a downstream task handler (memo, audit, investigate, …) can
+    # preempt-write its own CODE_ERROR verdict when the agent dies mid-stream
+    # — e.g. the memo handler reports
+    # ``exitCode=1, "couldn't extract JSON"`` because the agent never produced
+    # the required output. Without this check, that generic CODE_ERROR verdict
+    # takes the short-circuit / fast path → no account blacklist → retry hits
+    # the same dead account →
+    # 3 strikes → terminal FAIL. Incident 2026-05-24: 5 tasks terminal-failed
+    # this way when 3 Claude accounts weekly-burned at once.
+    _classify_combined_lower = (
+        (task.latest_status_message or "").lower() + " " + (logs or "").lower()
+    )
+    if '"type":"rate_limit_event"' in _classify_combined_lower:
+        return RATE_LIMIT
+
     # Short-circuit: if reaper/agent_status already persisted the authoritative
     # verdict at the failure instant via persist_authoritative_verdict(), return
-    # it without re-running rate-limit correlation. Prevents RATE_LIMIT→CODE_ERROR
-    # flips when analytics paths call classify_failure() hours after the cooldown lifted.
+    # it without re-running stateful rate-limit correlation. The structured
+    # rate_limit_event check above is still safe to run here because it is a
+    # deterministic signal embedded in the task output, not a cooldown lookup.
     persisted_class = (task.context or {}).get("failure_class")
     if isinstance(persisted_class, str) and persisted_class:
         return persisted_class

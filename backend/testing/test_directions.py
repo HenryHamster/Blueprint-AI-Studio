@@ -3372,8 +3372,11 @@ async def test_strategic_api_create_direction_respects_cap(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_strategic_api_create_direction_skips_duplicate(db_session, mocker):
-    """POST /api/agent/strategic with op=create_direction returns 409 for duplicate text."""
+async def test_strategic_api_create_direction_advisory_on_duplicate(db_session, mocker):
+    """POST /api/agent/strategic with op=create_direction CREATES a near-duplicate
+    (advisory) rather than hard-blocking it — the strategic agent owns its set, so
+    overlap is surfaced via an advisory note, not a 409. (The old 409 "skipped"
+    behavior was removed when dedup became advisory for the agent path.)"""
     from httpx import AsyncClient, ASGITransport
     from app.main import app
     from app.database import get_session
@@ -3440,14 +3443,27 @@ async def test_strategic_api_create_direction_skips_duplicate(db_session, mocker
                     },
                 },
             )
-        assert resp.status_code == 409, resp.text
+        assert resp.status_code == 200, resp.text
         body = resp.json()
-        assert body["status"] == "skipped"
-        assert "duplicate" in body.get("reason", "").lower()
+        assert body["status"] == "ok"
+        assert body["op"] == "create_direction"
+
+        # The near-duplicate is created (advisory), carrying a resemblance note;
+        # no 409 / rejection record.
+        await db_session.refresh(project)
+        new_dirs = [d for d in (project.directions or []) if d.get("id") != "d-dup001"]
+        assert len(new_dirs) == 1, "Near-duplicate should be created (advisory)"
+        created = new_dirs[0]
+        assert created.get("status") == "active"
+        notes = created.get("notes") or []
+        assert any(
+            (n.get("text") or "").startswith("Advisory: resembles existing direction")
+            for n in notes
+        ), "Created direction should carry an advisory-resemblance note"
 
         await db_session.refresh(task)
         assert task.context is not None
-        assert task.context.get("_strategic_api_called") is True
+        assert "_strategic_dedup_rejections" not in task.context
     finally:
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(verify_agent_token, None)

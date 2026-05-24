@@ -28,7 +28,6 @@ from app.models import (
     Task,
     TaskStatus,
 )
-from app.research_direction_state import RETIRED_DIRECTION_STATUSES
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -1343,10 +1342,6 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
     }
 
 
-_MIN_DISTINCTION_CHARS = (
-    20  # well-formed distinction must be at least this many characters
-)
-
 _DIRECTION_DEDUP_STOPWORDS = frozenset(
     {
         "the",
@@ -1384,55 +1379,31 @@ def _is_direction_duplicate(
     proposal_text: str,
     existing_directions: list,
     rejected_proposals: list,
-    *,
-    distinction: str | None = None,
-    proposal_category: str | None = None,
-) -> tuple[bool, dict | None]:
-    """Return (is_duplicate, override_matched_direction) for proposal_text.
+) -> bool:
+    """Return True if proposal_text overlaps with an existing or recently rejected direction.
 
-    All directions (active and terminal) use the same overlap threshold of 4 shared
-    non-stopword tokens. When a well-formed distinction is supplied:
-      - If matching direction is terminal-status (retired/expired/superseded/completed),
-        distinction overrides the block.
-      - If matching direction is ACTIVE and same category as proposal, distinction
-        overrides the block. Returns override_matched_direction with the matched direction
-        so the caller can record an audit entry.
-      - Cross-category active matches with distinction still block (no override).
-    Matches against recently-rejected proposals always block regardless of distinction.
+    A near-duplicate is a 4+ shared non-stopword token overlap against any existing
+    direction (any status) or a proposal rejected within the last 30 days.
+
+    This is now an **anti-loop guard for the automated/programmatic direction
+    creators only** — the starvation fallback, anomaly auto-proposals, and
+    research-finding extraction, which can otherwise re-emit near-identical
+    directions every cycle. The *strategic agent's own* proposals are no longer
+    hard-blocked: those call sites treat overlap as advisory (the agent owns its
+    direction set and can retire a true duplicate next cycle). That is why the old
+    distinction-override / terminal-status escape hatch was removed — it existed
+    only to let the agent argue past this guard, and the agent now bypasses it
+    entirely rather than fighting it (and edge-casing on which statuses the
+    override covered was itself a recurring silent-block bug).
     """
     words = set(proposal_text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS
     if len(words) < 2:
-        return False, None
-    has_well_formed_distinction = bool(
-        distinction and len(distinction.strip()) >= _MIN_DISTINCTION_CHARS
-    )
-    # Normalize categories: "mixed" matches nothing, non-mixed categories match if identical
-    proposal_cat_for_matching = (
-        proposal_category
-        if proposal_category and proposal_category != "mixed"
-        else None
-    )
+        return False
     for d in existing_directions:
         existing_text = (d.get("text") or "").lower()
         existing_words = set(existing_text.split()) - _DIRECTION_DEDUP_STOPWORDS
         if len(words & existing_words) >= 4:
-            # Check distinction override possibilities
-            if has_well_formed_distinction:
-                # Override for retired directions
-                if d.get("status") in RETIRED_DIRECTION_STATUSES:
-                    continue  # distinction overrides match against retired direction
-                # Override for active same-category directions
-                if d.get("status") == "active" and proposal_cat_for_matching:
-                    existing_cat = d.get("category")
-                    existing_cat_for_matching = (
-                        existing_cat
-                        if existing_cat and existing_cat != "mixed"
-                        else None
-                    )
-                    if proposal_cat_for_matching == existing_cat_for_matching:
-                        # Same category, distinction overrides — return override info
-                        return False, d
-            return True, None
+            return True
     cutoff = (_utcnow() - timedelta(days=30)).isoformat()
     for entry in rejected_proposals:
         if entry.get("rejected_at", "") < cutoff:
@@ -1441,8 +1412,8 @@ def _is_direction_duplicate(
             set((entry.get("text") or "").lower().split()) - _DIRECTION_DEDUP_STOPWORDS
         )
         if len(words & rejected_words) >= 4:
-            return True, None
-    return False, None
+            return True
+    return False
 
 
 def _find_matching_direction(
@@ -1464,6 +1435,33 @@ def _find_matching_direction(
         existing_words = set(existing_text.split()) - _DIRECTION_DEDUP_STOPWORDS
         if len(words & existing_words) >= 4:
             return d
+    return None
+
+
+def _find_recent_rejected_proposal(
+    proposal_text: str, rejected_proposals: list
+) -> dict | None:
+    """Return a recent rejected proposal that overlaps with proposal_text.
+
+    Uses the same tokenization/threshold as `_is_direction_duplicate`, but only
+    scans rejections from the last 30 days so strategic-agent create paths can
+    hard-block recent operator/user rejections while keeping older overlaps
+    advisory-only.
+    """
+    words = set(proposal_text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS
+    if len(words) < 2:
+        return None
+    text_lower = proposal_text.lower().strip()
+    cutoff = (_utcnow() - timedelta(days=30)).isoformat()
+    for entry in rejected_proposals:
+        if entry.get("rejected_at", "") < cutoff:
+            continue
+        rejected_text = (entry.get("text") or "").lower().strip()
+        if rejected_text == text_lower:
+            return entry
+        rejected_words = set(rejected_text.split()) - _DIRECTION_DEDUP_STOPWORDS
+        if len(words & rejected_words) >= 4:
+            return entry
     return None
 
 
@@ -1532,11 +1530,10 @@ async def _check_direction_starvation(
                 rejected_proposals = list(
                     (vision or {}).get("rejected_proposals") or []
                 )
-                is_dup, _override = _is_direction_duplicate(
+                is_dup = _is_direction_duplicate(
                     fallback_text,
                     directions,
                     rejected_proposals,
-                    proposal_category=fallback_category,
                 )
                 if is_dup:
                     logger.warning(
@@ -2234,77 +2231,35 @@ async def _handle_strategic_completion(
                         f"[STRATEGIC] Task {task.id}: truncating direction text {len(text)}→{STRATEGIC_DIRECTION_TEXT_MAX} chars"
                     )
                 text = text[:STRATEGIC_DIRECTION_TEXT_MAX]
-                # Dedup: skip if a semantically similar direction already exists
                 raw_dedup_reasoning = op_entry.get("dedup_reasoning")
-                distinction = (
-                    str(raw_dedup_reasoning.get("distinction") or "").strip()
-                    if isinstance(raw_dedup_reasoning, dict)
-                    else ""
-                )
-                _rejected_proposals = list(
-                    (project.vision or {}).get("rejected_proposals") or []
-                )
-                raw_category = op_entry.get("category")
-                proposal_category = (
-                    raw_category
-                    if raw_category in ("product", "structural", "mixed")
-                    else None
-                )
-                is_duplicate, override_matched = _is_direction_duplicate(
+                rejected_match = _find_recent_rejected_proposal(
                     text,
-                    directions,
-                    _rejected_proposals,
-                    distinction=distinction or None,
-                    proposal_category=proposal_category,
+                    [d for d in directions if d.get("status") == "rejected"],
                 )
-                if is_duplicate:
-                    if distinction:
-                        logger.warning(
-                            "[STRATEGIC_DEDUP_DISAGREEMENT] Fallback path: direction rejected as duplicate but "
-                            "agent claimed distinction='%s'; matched text='%s'; project=%s",
-                            distinction[:200],
-                            text[:60],
-                            project.id,
-                        )
-                    matched = _find_matching_direction(text, directions)
-                    if matched:
-                        logger.info(
-                            "[STRATEGIC] Skipping semantic duplicate direction '%s' for project %s — "
-                            "matched existing direction '%s' (status=%s)",
-                            text[:60],
-                            project.id,
-                            (matched.get("text") or "")[:60],
-                            matched.get("status"),
-                        )
-                    else:
-                        logger.info(
-                            f"[STRATEGIC] Skipping duplicate direction '{text[:60]}' for project {project.id}"
-                        )
-                    continue
-                # Record audit entry if distinction override occurred for active same-category direction
-                if override_matched and distinction:
-                    overrides = list(
-                        project.vision.get("_direction_distinction_overrides") or []
-                    )
-                    overrides.append(
-                        {
-                            "proposal_text": text[:200],
-                            "matched_direction_id": override_matched.get("id"),
-                            "matched_direction_text": override_matched.get("text", "")[
-                                :200
-                            ],
-                            "distinction": distinction[:500],
-                            "matched_category": override_matched.get("category"),
-                            "timestamp": _utcnow().isoformat(),
-                        }
-                    )
-                    project.vision["_direction_distinction_overrides"] = overrides
-                    flag_modified(project, "vision")
+                if rejected_match:
                     logger.info(
-                        "[STRATEGIC] Direction distinction override: proposed '%s' overrides active "
-                        "same-category direction '%s' via distinction",
+                        "[STRATEGIC] Skipping direction '%s' because it matches recently rejected proposal '%s' (rejected_at=%s); project=%s",
                         text[:60],
-                        override_matched.get("text", "")[:60],
+                        (rejected_match.get("text") or "")[:60],
+                        rejected_match.get("rejected_at"),
+                        project.id,
+                    )
+                    continue
+                # Advisory dedup: the strategic agent owns its direction set, so a
+                # proposal that resembles an existing direction is no longer
+                # hard-blocked — we surface the resemblance (log + a note on the
+                # created direction) and trust the agent's judgment (it can retire
+                # a true duplicate next cycle). Hard dedup is retained only on the
+                # automated/loop-prone creators.
+                matched = _find_matching_direction(text, directions)
+                if matched:
+                    logger.info(
+                        "[STRATEGIC] Direction '%s' resembles existing '%s' (status=%s) — "
+                        "creating anyway (advisory; agent-owned set); project=%s",
+                        text[:60],
+                        (matched.get("text") or "")[:60],
+                        matched.get("status"),
+                        project.id,
                     )
                 success_evidence = str(op_entry.get("success_evidence", "")).strip()
                 retirement_condition = str(
@@ -2328,14 +2283,31 @@ async def _handle_strategic_completion(
                     "text": text,
                     "status": "active",
                     "priority": priority,
-                    "notes": [
-                        {
-                            "text": f"Created by strategic review: {rationale}",
-                            "added_at": _utcnow().isoformat(),
-                        }
-                    ]
-                    if rationale
-                    else [],
+                    "notes": (
+                        [
+                            {
+                                "text": f"Created by strategic review: {rationale}",
+                                "added_at": _utcnow().isoformat(),
+                            }
+                        ]
+                        if rationale
+                        else []
+                    )
+                    + (
+                        [
+                            {
+                                "text": (
+                                    "Advisory: resembles existing direction "
+                                    f"'{(matched.get('text') or '')[:80]}' "
+                                    f"(status={matched.get('status')}) — created on the "
+                                    "agent's judgment; retire one if redundant."
+                                ),
+                                "added_at": _utcnow().isoformat(),
+                            }
+                        ]
+                        if matched
+                        else []
+                    ),
                     "research_history": [],
                     "context": {
                         "success_evidence": success_evidence[:_DIR_FIELD_MAX],
@@ -2365,6 +2337,7 @@ async def _handle_strategic_completion(
                     new_dir["source"] = str(op_entry["source"])[:64]
                 if op_entry.get("paths"):
                     new_dir["paths"] = op_entry["paths"]
+                raw_category = op_entry.get("category")
                 if raw_category in ("product", "structural", "mixed"):
                     new_dir["category"] = raw_category
                 if op_entry.get("system_id"):
