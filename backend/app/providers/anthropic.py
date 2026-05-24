@@ -25,6 +25,24 @@ _RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "5-hour limit reached",
     "api error: rate limit reached",
     "this request would exceed your account's rate limit",
+    # Weekly (7-day / "seven_day") plan cap. The Claude CLI emits this as plain
+    # text ("You've hit your weekly limit · resets …") in addition to the
+    # structured rate_limit_event(seven_day). Without these the weekly message
+    # fell through to UNKNOWN — so the account was never disabled and the task
+    # burned its general retry budget and terminal-FAILED instead of being held
+    # + rerouted. Also listed in _QUOTA_EXHAUSTED_PATTERNS so it earns the flat
+    # 24h cooldown (the weekly reset is ~a day out, not a 5-hour throttle).
+    "you've hit your weekly limit",
+    "weekly limit reached",
+)
+
+# Weekly / 7-day caps resolve on a ~24h clock, not within the short exponential
+# backoff used for 5-hour throttles — route them to the flat quota_exhausted
+# cooldown so a rate-limited account stays disabled until it can actually serve
+# again (the structured seven_day event also supplies an exact retry hint).
+_QUOTA_EXHAUSTED_PATTERNS: tuple[str, ...] = (
+    "you've hit your weekly limit",
+    "weekly limit reached",
 )
 
 _DEFAULT_TIER_MODELS = {
@@ -78,6 +96,13 @@ class AnthropicProvider(LLMProvider):
     def rate_limit_patterns(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
         self.ensure_supported_auth_mode(auth_mode)
         return _RATE_LIMIT_PATTERNS
+
+    def quota_exhausted_patterns(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
+        # Weekly (7-day) caps are clock-resolving quota walls — classify them as
+        # quota_exhausted so disable_account_model applies the flat 24h cooldown
+        # instead of the 5-hour exponential backoff.
+        self.ensure_supported_auth_mode(auth_mode)
+        return _QUOTA_EXHAUSTED_PATTERNS
 
     def required_metadata_fields(self, auth_mode: LLMAuthMode) -> tuple[str, ...]:
         self.ensure_supported_auth_mode(auth_mode)
