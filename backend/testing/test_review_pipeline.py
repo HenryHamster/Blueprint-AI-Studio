@@ -6978,3 +6978,48 @@ async def test_only_one_failure_does_not_halt(db_session, mocker):
     ) != "BLOCKED_PRECONDITION"
     await db_session.refresh(original_task)
     assert original_task.requires_approval is False
+
+
+# ---------------------------------------------------------------------------
+# build_ci_failure_fix_prompt() — conflict-aware CI-failure fix prompt.
+#
+# Regression guard for PR #5587 (2026-05-23): the CI-failure fix prompt in
+# task_lifecycle.py used to say "Fix only the build/lint/test errors ... don't
+# change logic, just fix CI failures" with no rebase step, so a PR that was
+# ALSO conflicting never got its conflict resolved — the fix chased CI while
+# the conflict outlived the global iteration cap and the PR auto-closed.
+# ---------------------------------------------------------------------------
+
+from app.review_pipeline import build_ci_failure_fix_prompt
+
+
+def test_ci_failure_fix_prompt_is_conflict_aware():
+    prompt = build_ci_failure_fix_prompt(
+        pr_number=5587,
+        base_branch="automain",
+        ci_errors="FAILED testing/test_foo.py::test_bar\nProcess completed with exit code 1.",
+    )
+    # Must instruct a rebase against base BEFORE chasing CI, and conflict resolution.
+    assert "git rebase origin/automain" in prompt
+    assert "conflict" in prompt.lower()
+    # Must carry the PR + base + CI errors through.
+    assert "#5587" in prompt
+    assert "test_foo.py::test_bar" in prompt
+    # Must NOT reintroduce the misdirecting language that caused #5587.
+    assert "don't change logic, just fix CI failures" not in prompt
+    assert "Fix only the build/lint/test errors" not in prompt
+
+
+def test_ci_failure_fix_prompt_check_runs_hint_optional():
+    with_owner = build_ci_failure_fix_prompt(
+        pr_number=1,
+        base_branch="main",
+        ci_errors="boom",
+        owner="acme",
+        repo="widgets",
+    )
+    assert "acme/widgets" in with_owner
+    without_owner = build_ci_failure_fix_prompt(
+        pr_number=1, base_branch="main", ci_errors="boom"
+    )
+    assert "check-runs" not in without_owner
