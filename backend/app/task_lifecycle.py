@@ -4415,7 +4415,12 @@ async def _process_post_commit(
                     await session.commit()
                     return {"status": "accepted"}
 
-                # Early exit: skip if PR is already merged or closed
+                # Early exit: skip only when PR is genuinely merged/done.
+                # A non-merged 'closed' state may be a transient self-close
+                # from the orchestrator's mergeability-reset loop
+                # (close+reopen to force GitHub to recompute mergeable=None).
+                # Gating on merged==True only prevents silently dropping the
+                # re-review handoff during that brief closed window.
                 try:
                     (
                         gh_token_check,
@@ -4425,19 +4430,25 @@ async def _process_post_commit(
                     pr_data_check = await get_pull_request(
                         gh_token_check, owner_check, repo_check, pr_number
                     )
-                    if pr_data_check.get("state") == "closed" or pr_data_check.get(
-                        "merged"
-                    ):
-                        merged_label = (
-                            "merged" if pr_data_check.get("merged") else "closed"
-                        )
+                    if pr_data_check.get("merged"):
                         logger.info(
-                            f"[REVIEW PIPELINE] PR #{pr_number} already {merged_label} — skipping fix re-review for task {task.id}"
+                            f"[REVIEW PIPELINE] PR #{pr_number} already merged — skipping fix re-review for task {task.id}"
                         )
-                        task.latest_status_message = f"PR #{pr_number} already {merged_label} — re-review skipped"
+                        task.latest_status_message = (
+                            f"PR #{pr_number} already merged — re-review skipped"
+                        )
                         session.add(task)
                         await session.commit()
                         return {"status": "accepted"}
+                    if pr_data_check.get("state") == "closed":
+                        # PR is closed but not merged — could be a transient
+                        # mergeability-reset. Proceed with re-review so the
+                        # handoff is preserved; the review/merge gate will
+                        # handle a genuinely abandoned PR gracefully.
+                        logger.info(
+                            f"[REVIEW PIPELINE] PR #{pr_number} is closed (not merged) for task {task.id} — "
+                            f"may be a transient mergeability-reset; proceeding with re-review"
+                        )
                 except Exception as e:
                     logger.info(
                         f"[REVIEW PIPELINE] Could not check PR #{pr_number} state: {e} — proceeding"

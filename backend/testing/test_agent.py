@@ -11536,3 +11536,101 @@ async def test_requeue_parent_task_uses_vm_stopped_at_for_rate_limit_correlation
     assert parent_ctx.get("_requeue_count", 0) <= 1, (
         "parent requeue count must be ≤1 after first requeue"
     )
+
+
+@pytest.mark.asyncio
+async def test_fix_task_transient_close_pr_preserves_re_review(db_session, mocker):
+    """Fix task completing while its PR is transiently closed (not merged) must
+    still spawn the re-review — not silently skip it.
+
+    Regression for: the orchestrator's mergeability-reset loop (close+reopen to
+    force GitHub to recompute mergeable=None) transiently closes the PR. If a fix
+    task completes during that brief window, the old early-exit fired on
+    state=='closed' and dropped the re-review handoff, leaving the parent task
+    polling 'CI passed — waiting for review approval' forever.
+
+    The fix gates the skip on merged==True only; a non-merged closed state must
+    proceed with the normal re-review path.
+    """
+    from app.task_lifecycle import _process_post_commit
+    from app.schemas import AgentStatusPayload
+    from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession as _AS
+    from unittest.mock import MagicMock
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("gh-tok", "owner", "repo")),
+    )
+    # PR is closed but NOT merged — simulates the brief mergeability-reset window
+    # where the orchestrator's close+reopen cycle transiently closes the PR.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "closed", "merged": False}),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new=AsyncMock(
+            return_value={
+                "blocked": False,
+                "summary": "clean",
+                "findings": [],
+                "report": "",
+            }
+        ),
+    )
+    fake_review_task = MagicMock()
+    fake_review_task.id = uuid.uuid4()
+    spawn_mock = AsyncMock(return_value=(fake_review_task, True))
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", spawn_mock)
+
+    project = Project(name="Transient Close Re-Review", user_id="u-transient-close")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "build feature X"}],
+        vm_instance_id=None,
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(original_task)
+    await db_session.commit()
+    await db_session.refresh(original_task)
+
+    fix_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "pr_number": 555, "branch": "feat/transient-close"}],
+        vm_instance_id="agent-vm-transient-close",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "review_loop": {
+                "pr_number": 555,
+                "branch": "feat/transient-close",
+                "base_branch": "main",
+                "original_task_id": str(original_task.id),
+                "iteration": 2,
+                "fix_reason": "code_review",
+            }
+        },
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+    await db_session.refresh(fix_task)
+
+    payload = AgentStatusPayload(
+        task_id=fix_task.id,
+        status=TaskStatus.COMPLETED,
+    )
+
+    _factory = async_sessionmaker(db_session.bind, class_=_AS, expire_on_commit=False)
+    await _process_post_commit(fix_task.id, payload, _session_factory=_factory)
+
+    # The re-review MUST have been spawned — not silently dropped.
+    spawn_mock.assert_awaited_once()
+    call_args = spawn_mock.await_args
+    assert call_args.args[1] == "review", (
+        f"Expected re-review spawn with type='review', got {call_args.args[1]!r} — "
+        f"a transiently-closed PR must not be treated as abandoned"
+    )
