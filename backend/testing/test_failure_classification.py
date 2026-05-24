@@ -2930,3 +2930,74 @@ class TestPersistAuthoritativeVerdictShortCircuit:
         task = _task("", ctx={"failure_category": "incomplete"})
         # No persist_authoritative_verdict call — re-derives from pool state.
         assert classify_failure(task) == RATE_LIMIT
+
+
+class TestReaperDbRlOverrideClassifyFailure:
+    """Reaper path: silent death + DB-confirmed rate-limit the in-memory cache
+    never saw → RATE_LIMIT.  Exercises classify_failure / classify_failure_with_confidence
+    with db_rl_override=True and the full persist→analytics-stable sequence."""
+
+    def test_classify_failure_db_rl_override_reclassifies_generic(self, monkeypatch):
+        """In-memory pool empty (cross-instance); reaper passes db_rl_override=True
+        after db_account_was_rate_limited confirmed cooldown → RATE_LIMIT."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+
+        task = _task("", ctx={"failure_category": "claude_code_failed"})
+        assert classify_failure(task) == CODE_ERROR, "baseline without override"
+        assert classify_failure(task, db_rl_override=True) == RATE_LIMIT
+
+    def test_classify_failure_with_confidence_db_rl_override(self, monkeypatch):
+        """classify_failure_with_confidence passes db_rl_override through; result is RATE_LIMIT."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+
+        task = _task("", ctx={"failure_category": "incomplete"})
+        result = classify_failure_with_confidence(task, db_rl_override=True)
+        assert result.failure_class == RATE_LIMIT
+
+    def test_db_rl_override_then_persist_analytics_stable(self, monkeypatch):
+        """Full reaper sequence: classify with db_rl_override=True → persist verdict →
+        analytics classify_failure (no override, expired cooldown) → still RATE_LIMIT."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+
+        task = _task("", ctx={"failure_category": "claude_code_failed"})
+
+        # Step 1: reaper classifies at failure instant with DB-confirmed RL.
+        reaper_class = classify_failure(task, db_rl_override=True)
+        assert reaper_class == RATE_LIMIT
+
+        # Step 2: reaper persists the authoritative verdict.
+        persist_authoritative_verdict(task, reaper_class)
+
+        # Step 3: analytics path (digest, anomaly detection) calls classify_failure
+        # hours later with no override and no active cooldown — must not flip to CODE_ERROR.
+        assert classify_failure(task) == RATE_LIMIT, (
+            "analytics path must return persisted RATE_LIMIT, not re-derive CODE_ERROR"
+        )
+
+    def test_db_rl_override_does_not_override_authoritative_labels(self, monkeypatch):
+        """Authoritative labels (test_failed) are not upgraded to RATE_LIMIT even
+        when db_rl_override=True, matching normalize_agent_failure_category behaviour."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+
+        task = _task("", ctx={"failure_category": "test_failed"})
+        assert classify_failure(task, db_rl_override=True) == CODE_ERROR

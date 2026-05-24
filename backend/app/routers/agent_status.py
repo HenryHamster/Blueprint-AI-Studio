@@ -1051,6 +1051,10 @@ async def update_agent_status(
         # to distinguish "agent printed a diff but never shipped" (incomplete)
         # from real build/test failures.
         ctx["agent_failure_category_raw"] = payload.failure_category.strip().lower()
+        # Persist authoritative verdict so analytics paths that call
+        # classify_failure() hours later short-circuit to this value and
+        # cannot flip RATE_LIMIT→CODE_ERROR once the cooldown lifts.
+        ctx["failure_class"] = normalized_failure_category
         task.context = ctx
     if payload.scope_gate_triggered:
         ctx = dict(task.context or {})

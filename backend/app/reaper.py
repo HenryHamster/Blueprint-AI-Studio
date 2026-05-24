@@ -32,8 +32,10 @@ from app.shared_state import (
 )
 from app.failure_classification import (
     classify_failure,
+    persist_authoritative_verdict,
     persist_failure_category,
     INFRA_CLASSES,
+    RATE_LIMIT,
 )
 from app.retry_budget import append_failure_class_history
 from app.time_utils import _utcnow, set_retry_after, RETRY_AFTER_MAX_MINUTES
@@ -712,6 +714,7 @@ async def reaper_service():
     # Deferred imports to avoid circular dependency with app.main
     from app.max_plan_pool import (
         clear_task_llm_runtime_context,
+        db_account_was_rate_limited,
         disable_account_model,
         get_task_llm_account_id,
         _extract_task_model,
@@ -1383,6 +1386,32 @@ async def reaper_service():
                                         f"[REAPER] get_vm_status failed for {fresh_task.vm_instance_id}: {e}"
                                     )
 
+                        # 1.5. Durable DB rate-limit check (cross-instance fallback).
+                        # The in-memory classify_failure above consults only
+                        # _account_was_rate_limited (same-process cache). When the
+                        # cooldown was recorded on a different Cloud Run instance or
+                        # before a restart, the cache is empty and the task would be
+                        # silently misclassified CODE_ERROR. Augment the flag with
+                        # durable DB state before the account-disable I/O step so all
+                        # reaper deaths get the same cross-instance treatment that
+                        # agent_status.py already applies on the agent-reported path.
+                        if not is_rate_limited and not is_spot_preemption:
+                            _db_rl_acct = get_task_llm_account_id(fresh_task)
+                            if _db_rl_acct:
+                                _at_time_rl = (
+                                    fresh_task.last_heartbeat or fresh_task.started_at
+                                )
+                                if await db_account_was_rate_limited(
+                                    _db_rl_acct, at_time=_at_time_rl
+                                ):
+                                    is_rate_limited = True
+                                    logger.info(
+                                        "[REAPER] Task %s reclassified RATE_LIMIT via "
+                                        "durable DB state (account=%s) — in-memory cache missed",
+                                        fresh_task.id,
+                                        _db_rl_acct,
+                                    )
+
                         # 2. Rate-limited account-disable I/O (called only when is_rate_limited
                         #    AND not is_spot_preemption; mirrors the original elif chain where
                         #    the rate-limited branch was skipped if spot preempt fired first).
@@ -1611,6 +1640,7 @@ async def reaper_service():
                             # don't carry provision budget into the next dispatch.
                             rl_ctx.pop("provision_failures", None)
                             task.context = rl_ctx
+                            persist_authoritative_verdict(task, RATE_LIMIT)
                             session.add(task)
                             await broadcast_to_project(
                                 str(task.project_id),
@@ -1759,6 +1789,7 @@ async def reaper_service():
                                 and not combined_logs.strip()
                             ):
                                 reap_failure_class = "AGENT_TIMEOUT"
+                            persist_authoritative_verdict(task, reap_failure_class)
                             task_scope = (task.context or {}).get("scope")
                             class_budget = resolve_retry_budget(
                                 reap_failure_class, task_scope

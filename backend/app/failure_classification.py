@@ -778,7 +778,7 @@ def normalize_agent_failure_category(
     shows no cooldown (cross-instance case). Defaults to False (no override).
     """
     if not raw:
-        return classify_failure(task, at_time=at_time)
+        return classify_failure(task, at_time=at_time, db_rl_override=db_rl_override)
     label = raw.strip()
     label_lower = label.lower()
     mapped = _AGENT_CATEGORY_TO_CLASS.get(label_lower)
@@ -809,7 +809,7 @@ def normalize_agent_failure_category(
         raw,
         getattr(task, "id", "?"),
     )
-    return classify_failure(task, at_time=at_time)
+    return classify_failure(task, at_time=at_time, db_rl_override=db_rl_override)
 
 
 # AGENT_TIMEOUT sub-types — finer breakdown of the catch-all timeout class so
@@ -1544,10 +1544,15 @@ def get_account_failure_class_counts(
 
 
 def classify_failure_with_confidence(
-    task: "Task", logs: str | None = None, at_time: "datetime | None" = None
+    task: "Task",
+    logs: str | None = None,
+    at_time: "datetime | None" = None,
+    db_rl_override: bool = False,
 ) -> FailureClassification:
     """Classify a failure and return a cheap rule-derived confidence score."""
-    failure_class = _classify_failure_class(task, logs, at_time=at_time)
+    failure_class = _classify_failure_class(
+        task, logs, at_time=at_time, db_rl_override=db_rl_override
+    )
     agent_category = (task.context or {}).get("failure_category")
     combined = (
         (task.latest_status_message or "").lower() + " " + (logs or "").lower()
@@ -1621,7 +1626,10 @@ def persist_authoritative_verdict(task: "Task", failure_class: str) -> None:
 
 
 def _classify_failure_class(
-    task: "Task", logs: str | None = None, at_time: "datetime | None" = None
+    task: "Task",
+    logs: str | None = None,
+    at_time: "datetime | None" = None,
+    db_rl_override: bool = False,
 ) -> str:
     """Classify a task failure for deployment monitoring.
     Returns: CODE_ERROR, PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API,
@@ -1669,7 +1677,8 @@ def _classify_failure_class(
                 if any(kw in combined for kw in _VIEWPORT_PATTERNS):
                     return VIEWPORT_REGRESSION
                 if agent_lower in _ALL_GENERIC_CODE_ERROR_LABELS and (
-                    _account_was_rate_limited(task, at_time=at_time)
+                    db_rl_override
+                    or _account_was_rate_limited(task, at_time=at_time)
                     or _pool_was_rate_limited(at_time)
                 ):
                     _persist_correlation_reclassification_context(task)
@@ -1957,8 +1966,10 @@ def _classify_failure_class(
     # are most likely throttling-induced; classifying as RATE_LIMIT avoids burning a
     # retry attempt. Pool-wide check fires even when no account was assigned (pre-
     # assignment death) or when the assigned account itself was not flagged.
-    if _account_was_rate_limited(task, at_time=at_time) or _pool_was_rate_limited(
-        at_time
+    if (
+        db_rl_override
+        or _account_was_rate_limited(task, at_time=at_time)
+        or _pool_was_rate_limited(at_time)
     ):
         _persist_correlation_reclassification_context(task)
         return RATE_LIMIT
@@ -1972,10 +1983,15 @@ def _classify_failure_class(
 
 
 def classify_failure(
-    task: "Task", logs: str | None = None, at_time: "datetime | None" = None
+    task: "Task",
+    logs: str | None = None,
+    at_time: "datetime | None" = None,
+    db_rl_override: bool = False,
 ) -> str:
     """Backward-compatible shim that returns only the failure class string."""
-    return classify_failure_with_confidence(task, logs, at_time=at_time).failure_class
+    return classify_failure_with_confidence(
+        task, logs, at_time=at_time, db_rl_override=db_rl_override
+    ).failure_class
 
 
 # ---------------------------------------------------------------------------

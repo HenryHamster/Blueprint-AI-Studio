@@ -1068,6 +1068,128 @@ async def test_reaper_account_cooldown_uses_failure_instant_not_sweep_time(
 
 
 @pytest.mark.asyncio
+async def test_reaper_db_rl_cross_instance_silent_death_free_requeue(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Silent death + DB-recorded cooldown (in-memory cache missed) → RATE_LIMIT free requeue.
+
+    Regression guard for the durable DB rate-limit correlation path in the REAPER.
+    Scenario: a pool-wide rate-limit block was recorded on a different Cloud Run instance
+    (or before a restart), so _account_was_rate_limited returns False (cache miss).
+    db_account_was_rate_limited queries durable DB state and returns True.
+    Expected: RATE_LIMIT free-requeue (attempt not burned), account blacklisted, verdict persisted.
+    This exercises the durable DB fallback at reaper.py:1398-1413.
+    """
+    disable_mock = mocker.patch(
+        "app.max_plan_pool.disable_account_model", new_callable=AsyncMock
+    )
+    mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
+    # In-memory cache returns False (cross-instance miss); no RL keyword in last_error either.
+    mocker.patch(
+        "app.failure_classification._account_was_rate_limited", return_value=False
+    )
+    mocker.patch(
+        "app.failure_classification._pool_was_rate_limited", return_value=False
+    )
+    # Durable DB state records the cooldown — this is the path under test.
+    mocker.patch(
+        "app.max_plan_pool.db_account_was_rate_limited",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    account_id = "acct-db-rl-cross-instance"
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "model": "sonnet"}],
+        vm_instance_id="vm-db-rl-silent",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={
+            "max_plan_account_id": account_id,
+            # No rate-limit keywords — correlation driven purely by DB state.
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    ctx = t.context or {}
+    assert t.status == TaskStatus.QUEUED, "DB-correlated RL must requeue"
+    assert t.attempt_count == 1, "DB-correlated RL must not burn attempt budget"
+    assert account_id in (ctx.get("blacklisted_accounts") or [])
+    assert "max_plan_account_id" not in ctx
+    disable_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reaper_db_rl_verdict_persisted_stable_under_analytics(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """DB-correlated rate-limit reap persists the verdict so analytics cannot flip it.
+
+    After the reaper classifies a silent death as RATE_LIMIT via durable DB state,
+    persist_authoritative_verdict writes 'RATE_LIMIT' to task.context['failure_class'].
+    Analytics paths that call classify_failure() hours later (after the cooldown lifts,
+    with _account_was_rate_limited returning False) must short-circuit to the persisted
+    verdict rather than re-running correlation and returning CODE_ERROR/AGENT_TIMEOUT.
+    """
+    mocker.patch("app.max_plan_pool.disable_account_model", new_callable=AsyncMock)
+    mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
+    # Simulate cooldown lifted by sweep time — in-memory check returns False.
+    mocker.patch(
+        "app.failure_classification._account_was_rate_limited", return_value=False
+    )
+    mocker.patch(
+        "app.failure_classification._pool_was_rate_limited", return_value=False
+    )
+    # DB check returns True at the failure instant.
+    mocker.patch(
+        "app.max_plan_pool.db_account_was_rate_limited",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    account_id = "acct-db-rl-persist"
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "model": "sonnet"}],
+        vm_instance_id="vm-db-rl-persist",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"max_plan_account_id": account_id},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    # The reaper must persist the verdict via persist_authoritative_verdict.
+    ctx = t.context or {}
+    assert ctx.get("failure_class") == "RATE_LIMIT", (
+        "reaper must persist RATE_LIMIT verdict so analytics cannot flip it to CODE_ERROR"
+    )
+
+    # Analytics path: classify_failure called later with in-memory checks both False
+    # (simulating a healthy pool after the cooldown lifted). The persisted verdict
+    # short-circuits the classifier before rate-limit correlation runs.
+    from app.failure_classification import classify_failure
+
+    analytics_class = classify_failure(t)
+    assert analytics_class == "RATE_LIMIT", (
+        "analytics re-classification must return persisted RATE_LIMIT, "
+        "not CODE_ERROR/AGENT_TIMEOUT after cooldown lifts"
+    )
+
+
+@pytest.mark.asyncio
 async def test_reaper_terminal_persist_uses_failure_instant_not_sweep_time(
     reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):
@@ -1096,9 +1218,9 @@ async def test_reaper_terminal_persist_uses_failure_instant_not_sweep_time(
     real_cwc = fc.classify_failure_with_confidence
     captured: dict = {}
 
-    def _spy(task, logs=None, at_time=None):
+    def _spy(task, logs=None, at_time=None, db_rl_override=False):
         captured["at_time"] = at_time
-        return real_cwc(task, logs=logs, at_time=at_time)
+        return real_cwc(task, logs=logs, at_time=at_time, db_rl_override=db_rl_override)
 
     mocker.patch.object(fc, "classify_failure_with_confidence", side_effect=_spy)
 
@@ -1158,9 +1280,9 @@ async def test_reaper_terminal_persist_falls_back_to_started_at_when_no_heartbea
     real_cwc = fc.classify_failure_with_confidence
     captured: dict = {}
 
-    def _spy(task, logs=None, at_time=None):
+    def _spy(task, logs=None, at_time=None, db_rl_override=False):
         captured["at_time"] = at_time
-        return real_cwc(task, logs=logs, at_time=at_time)
+        return real_cwc(task, logs=logs, at_time=at_time, db_rl_override=db_rl_override)
 
     mocker.patch.object(fc, "classify_failure_with_confidence", side_effect=_spy)
 

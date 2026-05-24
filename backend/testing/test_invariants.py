@@ -212,26 +212,20 @@ class TestSchemaRevisionSync:
         """
         import glob as globmod
 
-        from app.migration_chain import parse_revision_identifiers
+        from app.migration_chain import find_filename_revision_mismatches
 
         migrations_dir = os.path.join(
             os.path.dirname(__file__), "..", "alembic", "versions"
         )
         files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
-        mismatches: list[str] = []
+        sources: dict[str, str] = {}
         for path in files:
-            filename_rev = os.path.basename(path).split("_")[0]
             with open(path) as f:
-                content = f.read()
-            internal_rev, _ = parse_revision_identifiers(content)
-            if internal_rev is None:
-                mismatches.append(f"{os.path.basename(path)}: no revision field found")
-                continue
-            if internal_rev != filename_rev:
-                mismatches.append(
-                    f"{os.path.basename(path)}: filename says {filename_rev}, "
-                    f"internal revision says {internal_rev}"
-                )
+                sources[os.path.basename(path)] = f.read()
+        # Consume the shared helper the rollup auto-merge guard also uses, so
+        # the CI invariant and the runtime guard reason about filename-vs-
+        # revision desync with identical parsing.
+        mismatches = find_filename_revision_mismatches(sources)
         assert not mismatches, "Migration revision mismatches:\n  " + "\n  ".join(
             mismatches
         )

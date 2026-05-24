@@ -3817,6 +3817,42 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     ])).toBe(0);
   });
 
+  it('generates migration chain guard block in ./check when alembic/versions changed', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-123',
+      workBranch: 'blueprint/test-task-123',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+    });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+    // Guard is inside the backend block and gated on alembic/versions
+    expect(checkScript).toContain('backend/alembic/versions/');
+    expect(checkScript).toContain('python3 backend/app/migration_chain.py');
+    expect(checkScript).toContain('backend migration chain');
+  });
+
+  it('migration chain guard is absent from buildConfig-driven check (non-blueprint repos)', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-123',
+      workBranch: 'blueprint/test-task-123',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+      buildConfig: {
+        directories: [{ path: 'src', type: 'node' }],
+      },
+    });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+    expect(checkScript).not.toContain('python3 backend/app/migration_chain.py');
+  });
+
   it('generates ./pr script with SR section injection for new PR path', async () => {
     const { writeCodeChangeHelpers } = await import('./prompt.js');
     writeCodeChangeHelpers({

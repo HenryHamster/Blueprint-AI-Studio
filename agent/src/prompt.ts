@@ -852,6 +852,11 @@ if touches backend/; then
     # the rest is CI's job.
     run "backend pytest" bash -c 'bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200'
   fi
+  # Fast migration-chain guard: no DB, no Docker, sub-second. Runs only
+  # when at least one alembic/versions/ file was added or changed.
+  if printf '%s\\n' "$CHANGED" | grep -q '^backend/alembic/versions/.*\\.py$'; then
+    run "backend migration chain" bash -c 'python3 backend/app/migration_chain.py 2>&1'
+  fi
 fi
 `;
   // When the project supplies a build_config with directories, generate

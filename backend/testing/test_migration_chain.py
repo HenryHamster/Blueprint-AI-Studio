@@ -5,8 +5,10 @@ from unittest.mock import patch
 
 from app.migration_chain import (
     build_migration_chain,
+    find_filename_revision_mismatches,
     find_heads,
     find_roots,
+    main,
     parse_revision_identifiers,
     validate_added_migrations,
 )
@@ -110,6 +112,52 @@ def test_validate_unparseable_blocks():
     assert reason is not None and "parse" in reason.lower()
 
 
+# ── Filename/revision desync ─────────────────────────────────────────────────
+
+
+def test_find_filename_revision_mismatches_clean_set():
+    sources = {
+        "backend/alembic/versions/0124_a.py": _migration_src("0124", "0123"),
+        "backend/alembic/versions/0125_b.py": _migration_src("0125", "0124"),
+    }
+    assert find_filename_revision_mismatches(sources) == []
+
+
+def test_find_filename_revision_mismatches_detects_desync():
+    # File renamed to 0125_ but in-file revision left at 0124.
+    sources = {"backend/alembic/versions/0125_x.py": _migration_src("0124", "0123")}
+    mismatches = find_filename_revision_mismatches(sources)
+    assert len(mismatches) == 1
+    assert "0125_x.py" in mismatches[0]
+    assert "0125" in mismatches[0] and "0124" in mismatches[0]
+
+
+def test_find_filename_revision_mismatches_skips_non_numeric_keys():
+    # Bare names without a numeric NNNN prefix (used by build_migration_chain
+    # callers) must not be flagged even though revision != name.
+    sources = {
+        "a.py": _migration_src("0124", "0123"),
+        "b.py": _migration_src("0125", "0124"),
+    }
+    assert find_filename_revision_mismatches(sources) == []
+
+
+def test_validate_filename_revision_desync_blocks():
+    sources = {"backend/alembic/versions/0125_x.py": _migration_src("0124", "0123")}
+    reason = validate_added_migrations(sources)
+    assert reason is not None
+    assert "0125_x.py" in reason
+    assert "0125" in reason and "0124" in reason
+
+
+def test_validate_unparseable_takes_precedence_over_filename_check():
+    # A numeric-prefix file with no revision must report the unparseable reason,
+    # not the filename-mismatch reason (unparseable guard runs first).
+    sources = {"backend/alembic/versions/0125_x.py": "# corrupt, no revision"}
+    reason = validate_added_migrations(sources)
+    assert reason is not None and "parse" in reason.lower()
+
+
 # ── Diff extraction ─────────────────────────────────────────────────────────
 
 
@@ -207,6 +255,22 @@ async def test_guard_two_heads_blocks():
     assert status == "block" and "head" in reason.lower()
 
 
+async def test_guard_filename_revision_desync_blocks():
+    # File 0125_x.py declares revision 0124 -> desync must BLOCK auto-merge.
+    diff = _added_file_diff("backend/alembic/versions/0125_x.py", "0124", "0123")
+    with (
+        patch(
+            "app.github.get_pr_files",
+            return_value=_files("backend/alembic/versions/0125_x.py"),
+        ),
+        patch("app.github.get_pull_request_diff", return_value=diff),
+    ):
+        status, reason = await _validate_rollup_migration_chain("t", "o", "r", 1)
+    assert status == "block"
+    assert "0125_x.py" in reason
+    assert "0125" in reason and "0124" in reason
+
+
 async def test_guard_empty_diff_defers_failsafe():
     with (
         patch(
@@ -223,3 +287,47 @@ async def test_guard_pr_files_error_defers_failsafe():
     with patch("app.github.get_pr_files", side_effect=RuntimeError("github down")):
         status, reason = await _validate_rollup_migration_chain("t", "o", "r", 1)
     assert status == "defer" and "github down" in reason
+
+
+# ── main() standalone guard ──────────────────────────────────────────────────
+
+
+def _write_migration(
+    tmp_path, filename: str, revision: str, down_revision: str | None
+) -> None:
+    (tmp_path / filename).write_text(_migration_src(revision, down_revision))
+
+
+def test_main_clean_single_head_chain_passes(tmp_path, capsys):
+    _write_migration(tmp_path, "0001_root.py", "0001", None)
+    _write_migration(tmp_path, "0002_next.py", "0002", "0001")
+    result = main(str(tmp_path))
+    assert result == 0
+    out = capsys.readouterr().out
+    assert "OK" in out
+
+
+def test_main_filename_revision_mismatch_fails(tmp_path, capsys):
+    # File is named 0001_... but contains revision = '9999'
+    (tmp_path / "0001_root.py").write_text(_migration_src("9999", None))
+    result = main(str(tmp_path))
+    assert result == 1
+    out = capsys.readouterr().out
+    assert "0001_root.py" in out
+    assert "9999" in out
+
+
+def test_main_two_heads_fails(tmp_path, capsys):
+    # Both 0002 and 0003 chain off 0001 -> two heads
+    _write_migration(tmp_path, "0001_root.py", "0001", None)
+    _write_migration(tmp_path, "0002_a.py", "0002", "0001")
+    _write_migration(tmp_path, "0003_b.py", "0003", "0001")
+    result = main(str(tmp_path))
+    assert result == 1
+    out = capsys.readouterr().out
+    assert "head" in out.lower()
+
+
+def test_main_empty_dir_passes(tmp_path, capsys):
+    result = main(str(tmp_path))
+    assert result == 0

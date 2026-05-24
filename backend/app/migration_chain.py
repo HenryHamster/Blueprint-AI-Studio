@@ -6,7 +6,10 @@ the same in-file ``revision`` / ``down_revision`` parsing rather than two
 divergent re-implementations. Pure string/regex logic — no DB, no I/O.
 """
 
+import glob
+import os
 import re
+import sys
 
 # Mirrors the parsing used by the migration-chain invariant test. Alembic
 # orders migrations by these in-file values, not by filename.
@@ -73,6 +76,113 @@ def find_roots(chain: dict[str, str | None]) -> list[str]:
     return [r for r, d in chain.items() if d is None or d not in chain]
 
 
+def main(versions_dir: str | None = None) -> int:
+    """Validate the full migration chain in *versions_dir*.
+
+    Checks that every ``[0-9]*.py`` file's filename prefix matches its
+    in-file ``revision`` identifier and that the combined chain has exactly
+    one head. Prints a clear, actionable message on failure. Stdlib-only —
+    no FastAPI, no DB, sub-second.
+    """
+    if versions_dir is None:
+        versions_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "alembic",
+            "versions",
+        )
+
+    files = glob.glob(os.path.join(versions_dir, "[0-9]*.py"))
+    if not files:
+        print(f"[migration-chain] no migration files found in {versions_dir}")
+        return 0
+
+    errors: list[str] = []
+    sources: dict[str, str] = {}
+
+    for path in files:
+        basename = os.path.basename(path)
+        filename_rev = basename.split("_")[0]
+        with open(path) as f:
+            content = f.read()
+        sources[basename] = content
+        internal_rev, _ = parse_revision_identifiers(content)
+        if internal_rev is None:
+            errors.append(
+                f"  {basename}: no revision field found — add `revision = '...'`"
+            )
+        elif internal_rev != filename_rev:
+            errors.append(
+                f"  {basename}: filename prefix is '{filename_rev}' but"
+                f" in-file revision is '{internal_rev}' — they must match"
+            )
+
+    chain, duplicates, _unparseable = build_migration_chain(sources)
+
+    for rev in sorted(set(duplicates)):
+        errors.append(f"  duplicate revision '{rev}' declared by more than one file")
+
+    heads = find_heads(chain)
+    if len(heads) != 1:
+        errors.append(
+            f"  chain has {len(heads)} head(s) ({', '.join(sorted(heads))})"
+            " — expected exactly 1; run `alembic heads` for details"
+        )
+
+    if errors:
+        print("[migration-chain] FAILED — migration chain has errors:")
+        for msg in errors:
+            print(msg)
+        return 1
+
+    print(f"[migration-chain] OK — {len(files)} migration(s), single head")
+    return 0
+
+
+def _filename_revision_prefix(identifier: str) -> str | None:
+    """Extract the ``NNNN`` numeric revision prefix from a migration filename.
+
+    Mirrors the CI invariant test: take the basename, split on the first
+    underscore, and return the leading segment only when it is all digits.
+    Returns ``None`` for identifiers that are not migration-style filenames
+    (bare names like ``a.py`` or paths with no numeric prefix) so callers that
+    key sources by arbitrary identifiers see no spurious mismatches.
+    """
+    prefix = os.path.basename(identifier).split("_")[0]
+    return prefix if prefix.isdigit() else None
+
+
+def find_filename_revision_mismatches(sources: dict[str, str]) -> list[str]:
+    """Identifiers whose filename ``NNNN`` prefix disagrees with their revision.
+
+    Only keys with a migration-style numeric filename prefix (see
+    ``_filename_revision_prefix``) are checked; bare names like ``a.py`` are
+    skipped. For each checked key, compares the filename prefix to the in-file
+    ``revision`` parsed from the source. A numeric-prefix file with no parseable
+    revision is also reported (its filename claims a revision the file does not
+    declare). Returns human-readable strings; empty when every filename matches.
+
+    Shared by ``validate_added_migrations`` (the rollup auto-merge guard) and
+    the ``test_migration_filenames_match_internal_revision`` invariant test so
+    both reason about filename-vs-revision desync with identical parsing.
+    """
+    mismatches: list[str] = []
+    for identifier, source in sources.items():
+        filename_rev = _filename_revision_prefix(identifier)
+        if filename_rev is None:
+            continue
+        basename = os.path.basename(identifier)
+        revision, _ = parse_revision_identifiers(source)
+        if revision is None:
+            mismatches.append(f"{basename}: no revision field found")
+        elif revision != filename_rev:
+            mismatches.append(
+                f"{basename}: filename says {filename_rev}, "
+                f"internal revision says {revision}"
+            )
+    return mismatches
+
+
 def validate_added_migrations(sources: dict[str, str]) -> str | None:
     """Validate that the migrations a rollup adds form one linear extension.
 
@@ -80,7 +190,8 @@ def validate_added_migrations(sources: dict[str, str]) -> str | None:
     single-head chain, so a combined-chain regression is introduced solely by
     the migrations a rollup adds. Returns ``None`` when ``sources`` is empty or
     valid; otherwise a human-readable reason the combined chain would be
-    invalid (unparseable file, duplicate revision id, or multiple heads).
+    invalid (unparseable file, filename/revision desync, duplicate revision id,
+    or multiple heads).
     """
     if not sources:
         return None
@@ -89,6 +200,12 @@ def validate_added_migrations(sources: dict[str, str]) -> str | None:
         return (
             "could not parse a revision identifier from migration file(s): "
             + ", ".join(sorted(unparseable))
+        )
+    mismatches = find_filename_revision_mismatches(sources)
+    if mismatches:
+        return (
+            "migration filename prefix does not match its in-file revision: "
+            + "; ".join(sorted(mismatches))
         )
     if duplicates:
         return (
@@ -108,3 +225,8 @@ def validate_added_migrations(sources: dict[str, str]) -> str | None:
             f"({', '.join(sorted(roots))}); expected a single linear chain"
         )
     return None
+
+
+if __name__ == "__main__":
+    _dir = sys.argv[1] if len(sys.argv) > 1 else None
+    sys.exit(main(_dir))
