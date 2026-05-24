@@ -67,13 +67,8 @@ export function ProjectMembers({ members, myRole, onAdd, onUpdateRole, onRemove 
   };
 
   return (
-    // Dense admin-only UI: invite form, role selects, and per-row remove
-    // controls are intentionally below the 44px touch-target heuristic so the
-    // member list stays scannable on desktop. Mirrors the eslint exemption
-    // already on the trash button below.
     <div
       className="bg-neutral-900 border border-neutral-800 rounded-xl overflow-hidden"
-      data-viewport-allow-small-target
     >
       <div className="px-4 py-3 border-b border-neutral-800">
         <h3 className="text-sm font-semibold text-neutral-100">Project Members</h3>
@@ -105,6 +100,7 @@ export function ProjectMembers({ members, myRole, onAdd, onUpdateRole, onRemove 
               value={newRole}
               onChange={e => setNewRole(e.target.value as 'member' | 'viewer')}
               className="bg-neutral-800 border border-neutral-700 rounded px-2.5 py-1.5 text-xs text-neutral-200 focus:outline-none focus:border-cyan-500/50"
+              data-viewport-allow-small-target
             >
               <option value="member">Member</option>
               <option value="viewer">Viewer</option>
@@ -113,7 +109,7 @@ export function ProjectMembers({ members, myRole, onAdd, onUpdateRole, onRemove 
           <button
             onClick={handleAdd}
             disabled={!newEmail.trim() || loading === 'add'}
-            className="px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs rounded font-medium transition-colors flex items-center gap-1.5"
+            className="min-h-[44px] px-3 py-1.5 bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs rounded font-medium transition-colors flex items-center gap-1.5"
           >
             {loading === 'add' ? <Loader2 className="w-3 h-3 animate-spin" /> : <Plus className="w-3 h-3" />}
             Add
@@ -151,6 +147,7 @@ export function ProjectMembers({ members, myRole, onAdd, onUpdateRole, onRemove 
                       onChange={e => handleRoleChange(m, e.target.value)}
                       disabled={loading === m.id}
                       className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium ${badge.bg} ${badge.text} border ${badge.border} bg-transparent cursor-pointer focus:outline-none`}
+                      data-viewport-allow-small-target
                     >
                       <option value="member">member</option>
                       <option value="viewer">viewer</option>
@@ -168,12 +165,12 @@ export function ProjectMembers({ members, myRole, onAdd, onUpdateRole, onRemove 
 
                   {/* Remove button — owner can remove non-owners */}
                   {isOwner && !isRoleOwner ? (
-                    // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                     <button
                       onClick={() => handleRemove(m)}
                       disabled={loading === m.id}
                       className="p-1 rounded text-neutral-500 hover:text-red-400 hover:bg-red-500/10 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
                       title="Remove member"
+                      data-viewport-allow-small-target
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                     </button>

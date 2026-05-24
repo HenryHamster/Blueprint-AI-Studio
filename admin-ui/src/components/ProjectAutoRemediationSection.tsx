@@ -245,12 +245,10 @@ export function ProjectAutoRemediationSection({
 
       {/* Save button */}
       <div className="flex justify-end pt-2">
-        {/* reason: dense-UI Save button (text-xs py-2) — operator-density convention for settings panels */}
         <button
-          data-viewport-allow-small-target
           onClick={handleSave}
           disabled={saving}
-          className="bg-neutral-700 hover:bg-neutral-600 text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50"
+          className="inline-flex items-center justify-center min-h-[44px] bg-neutral-700 hover:bg-neutral-600 text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50"
         >
           {saving ? 'Saving...' : 'Save Auto-Remediation Config'}
         </button>

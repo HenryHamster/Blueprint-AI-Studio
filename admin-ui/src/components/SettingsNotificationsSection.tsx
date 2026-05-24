@@ -226,12 +226,10 @@ export function SettingsNotificationsSection({
       {/* Send test notification */}
       {isAdmin && (
         <div>
-          {/* reason: test notification button; text-xs py-2 is operator-density convention for settings panels */}
           <button
-            data-viewport-allow-small-target
             disabled={!webhookUrl || testStatus === 'sending'}
             onClick={handleSendTest}
-            className="flex items-center gap-2 bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 disabled:cursor-not-allowed text-neutral-300 text-xs py-2 px-4 rounded-lg transition-colors border border-neutral-700"
+            className="flex items-center gap-2 min-h-[44px] bg-neutral-800 hover:bg-neutral-700 disabled:opacity-30 disabled:cursor-not-allowed text-neutral-300 text-xs py-2 px-4 rounded-lg transition-colors border border-neutral-700"
           >
             <Send className="w-3.5 h-3.5" />
             {testStatus === 'sending' ? 'Sending...' : 'Send Test Notification'}
