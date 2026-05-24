@@ -879,8 +879,12 @@ async def bulk_action_tasks(
                                 base_branch = (task.first_payload).get(
                                     "base_branch", "main"
                                 )
-                                if base_branch == "main" and _runtime_config.get(
-                                    "smoketest_enabled"
+                                _promotion_target = str(
+                                    _runtime_config.get("promotion_target", "main")
+                                )
+                                if (
+                                    base_branch == _promotion_target
+                                    and _runtime_config.get("smoketest_enabled")
                                 ):
                                     try:
                                         type_model = (
@@ -2184,7 +2188,10 @@ async def modify_task(
                         # Post-merge cleanup: branches + smoketest (mirrors webhook merge path)
                         await _cleanup_branches(task, session)
                         base_branch = (task.first_payload).get("base_branch", "main")
-                        if base_branch == "main" and _runtime_config.get(
+                        _promotion_target = str(
+                            _runtime_config.get("promotion_target", "main")
+                        )
+                        if base_branch == _promotion_target and _runtime_config.get(
                             "smoketest_enabled"
                         ):
                             try:

@@ -4027,6 +4027,27 @@ def test_no_hardcoded_main_base_branch_in_task_lifecycle():
     )
 
 
+def test_smoketest_and_hotfix_gates_use_promotion_target():
+    """Static guard: the post-rollup smoketest spawn gate and hotfix back-merge
+    gate in task_lifecycle.py must key off promotion_target, not the literal
+    string 'main'.  Using a hardcoded == "main" comparison means those gates
+    never fire for repos whose deploy branch is not literally named 'main'.
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "app" / "task_lifecycle.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'and base_branch == "main"' not in src, (
+        "Smoketest / hotfix back-merge gate hardcodes base_branch == 'main'; "
+        "use _runtime_config.get('promotion_target', 'main') instead"
+    )
+    assert '"promotion_target"' in src, (
+        "task_lifecycle.py must reference 'promotion_target' for the "
+        "smoketest / hotfix gate — none found"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # _close_loop_regression_case_on_merge — synchronous layer classification
 # ══════════════════════════════════════════════════════════════════════════════

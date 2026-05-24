@@ -3905,9 +3905,9 @@ async def _candidate_already_on_main(
     (b) hit a 405 "already merged" and misclassify a SUCCESSFUL promotion as a
     failure — leaving the DB and GitHub permanently divergent.
 
-    This wraps ``github.is_ancestor_of(candidate_sha, "main")``.  It answers
-    the question that covers BOTH retry sub-cases uniformly: "has this exact
-    candidate commit already landed on main?".
+    This wraps ``github.is_ancestor_of(candidate_sha, promotion_target)``.  It
+    answers the question covering BOTH retry sub-cases uniformly: "has this
+    exact candidate commit already landed on the promotion target?".
 
     Returns ``False`` (NOT True) when the ancestry check could not be made
     (``is_ancestor_of`` returned ``None`` — API error, ref missing): a

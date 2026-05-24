@@ -2683,9 +2683,12 @@ async def _process_post_commit(
                         _integration_branch = _runtime_config.get(
                             "integration_branch", "main"
                         )
+                        _promotion_target = _runtime_config.get(
+                            "promotion_target", "main"
+                        )
                         is_ci_gated_merge = base_branch in (
                             _integration_branch,
-                            "main",
+                            _promotion_target,
                         )
                         ci_status = (
                             await get_check_runs_cached(
@@ -3036,18 +3039,22 @@ async def _process_post_commit(
                                         await session.commit()
                                         # Clean up branches (staging + feature)
                                         await _cleanup_branches(orig, session)
-                                        # Spawn a smoketest after rollup merges to main.
-                                        # After Phase 1 (automain/LTS), normal rollups target
-                                        # `automain`; only promotion PRs (automain → main) still
-                                        # merge to `main`. So base_branch == "main" here means a
-                                        # PROMOTION just landed — this smoketest acts as a
-                                        # post-promotion production health-check, not a routine
-                                        # integration check.
+                                        # Spawn a smoketest after rollup merges to the
+                                        # promotion target. After Phase 1 (automain/LTS),
+                                        # normal rollups target `automain`; only promotion
+                                        # PRs (automain → promotion_target) still merge to
+                                        # the promotion branch. So base_branch ==
+                                        # promotion_target here means a PROMOTION just
+                                        # landed — this smoketest acts as a post-promotion
+                                        # production health-check, not a routine check.
                                         # Supported runtime_config keys for smoketest:
                                         #   health_check_urls: list[str] — live URLs to probe with HTTP GET after local tests
                                         if (
                                             is_rollup_merge
-                                            and base_branch == "main"
+                                            and base_branch
+                                            == _runtime_config.get(
+                                                "promotion_target", "main"
+                                            )
                                             and _runtime_config.get("smoketest_enabled")
                                         ):
                                             try:
@@ -3133,15 +3140,19 @@ async def _process_post_commit(
                                                     f"[SMOKETEST] Failed to spawn smoketest after rollup merge: {e}",
                                                     exc_info=True,
                                                 )
-                                        # Back-merge: when a HOTFIX merges to main, open a
-                                        # main -> automain PR so the branches don't diverge.
-                                        # A hotfix is a `plan` task with base_branch="main" and
-                                        # hotfix:true in its payload.  A missed back-merge makes
-                                        # the next automain -> main promotion conflict.
-                                        # (automain/LTS plan Phase 5)
+                                        # Back-merge: when a HOTFIX merges to the
+                                        # promotion target, open a promotion_target ->
+                                        # integration_branch PR so branches don't diverge.
+                                        # A hotfix is a `plan` task with
+                                        # base_branch=promotion_target and hotfix:true.
+                                        # A missed back-merge makes the next promotion
+                                        # conflict. (automain/LTS plan Phase 5)
                                         if (
                                             is_rollup_merge
-                                            and base_branch == "main"
+                                            and base_branch
+                                            == _runtime_config.get(
+                                                "promotion_target", "main"
+                                            )
                                             and bool(orig.first_payload.get("hotfix"))
                                         ):
                                             try:
