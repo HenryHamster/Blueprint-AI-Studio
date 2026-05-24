@@ -123,6 +123,20 @@ describe('resolveLastCatchUpViewed', () => {
 });
 
 describe('windowToHours', () => {
+  // Lock the clock: the implementation calls Date.now() internally, and the
+  // 'recent timestamp' test computes `Date.now() - 2h` then expects ceil to
+  // round to 2. Without a fake clock even 1ms of wall-time drift between the
+  // two Date.now() calls makes elapsed = 2.0000…n h → Math.ceil = 3, so the
+  // test only passed when both calls landed in the same ms (fast laptop) and
+  // flaked on CI (run 26354374578 — "expected 3 to be 2").
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-04-24T12:00:00Z'));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it('returns 24 for last_visit when lastViewed is null', () => {
     expect(windowToHours('last_visit', null)).toBe(24);
   });
