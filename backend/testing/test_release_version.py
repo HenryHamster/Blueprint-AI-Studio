@@ -680,3 +680,46 @@ async def test_ensure_initial_release_version_noop_when_history_exists(db_sessio
     )
     assert result is None
     assert await rv.current_open_version(db_session, project.id) is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_initial_release_version_noop_when_branch_equals_promotion_target(
+    db_session,
+):
+    """When integration_branch equals a non-'main' promotion_target the check is
+    still degenerate — no row is created and None is returned."""
+    project = await _make_project(db_session)
+    result = await rv.ensure_initial_release_version(
+        db_session,
+        project.id,
+        integration_branch="deploy",
+        base_sha="abc123",
+        promotion_target="deploy",
+    )
+    await db_session.commit()
+
+    assert result is None
+    assert await rv.current_open_version(db_session, project.id) is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_initial_release_version_creates_when_promotion_target_differs(
+    db_session,
+):
+    """When promotion_target is not 'main' but integration_branch differs from it,
+    version 1 is bootstrapped normally."""
+    project = await _make_project(db_session)
+    version = await rv.ensure_initial_release_version(
+        db_session,
+        project.id,
+        integration_branch="automain",
+        base_sha="deadbeef",
+        promotion_target="deploy",
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert version is not None
+    assert version.version_number == 1
+    assert version.phase == "stabilize"
+    assert version.status == "open"

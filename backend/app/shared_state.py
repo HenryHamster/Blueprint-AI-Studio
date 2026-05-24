@@ -7,6 +7,7 @@ endpoints need to read or mutate autonomous-loop / runtime-config state.
 import os
 import asyncio
 import logging
+import uuid
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Any, Dict
@@ -483,6 +484,25 @@ def get_project_integration_branch(project) -> str:
         return per_project
     # DEPRECATED: global runtime_config fallback — remove after per-project column is stable
     return runtime_config.get("integration_branch", "main")
+
+
+# Canonical task-type → branch-prefix map for blueprint/{prefix}-{8hex} names.
+# Python single source of truth; agent/src/index.ts (TASK_TYPE_BRANCH_PREFIX) is
+# the necessary cross-language mirror — update both together. Types absent here
+# fall back to the "task" prefix in derive_task_branch.
+TASK_TYPE_BRANCH_PREFIX: dict[str, str] = {
+    "fix": "fix",
+    "refactor": "refactor",
+    "docs": "docs",
+    "deps": "deps",
+    "migrate": "migrate",
+}
+
+
+def derive_task_branch(task_id: uuid.UUID, task_type: str | None) -> str:
+    """Return the canonical blueprint branch name for a task."""
+    prefix = TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
+    return f"blueprint/{prefix}-{str(task_id).replace('-', '')[:8]}"
 
 
 def _migrate_legacy_provider_config(config: Dict[str, Any]) -> Dict[str, Any]:

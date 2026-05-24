@@ -1392,7 +1392,7 @@ export function validateBranchName(branch: string, label: string): string {
 
 // Canonical task-type → branch-prefix mapping.
 // Convention: blueprint/{prefix}-{first-8-hex-of-task-uuid}
-// Mirrors backend/app/services.py _TASK_TYPE_BRANCH_PREFIX; keep in sync.
+// Mirrors backend/app/shared_state.py TASK_TYPE_BRANCH_PREFIX (Python single source); keep in sync.
 // Types absent from this map default to the 'task' prefix.
 export const TASK_TYPE_BRANCH_PREFIX: Record<string, string> = {
   fix: 'fix',

@@ -289,25 +289,10 @@ def _extract_branch_short_id(branch_name: str) -> str | None:
     return m.group(1) if m else None
 
 
-# Maps task type -> branch prefix used by the agent when naming work branches.
-# Convention: blueprint/{prefix}-{first-8-hex-of-task-uuid}
-# Full mirror of the canonical map in agent/src/index.ts (TASK_TYPE_BRANCH_PREFIX);
-# keep in sync. Types absent here fall back to the "task" prefix in
-# _derive_task_branch. The reaper/rollup/task_lifecycle copies carry a deliberate
-# *subset* of these entries (see the note above each) — not a strict mirror.
-_TASK_TYPE_BRANCH_PREFIX: dict[str, str] = {
-    "fix": "fix",
-    "refactor": "refactor",
-    "docs": "docs",
-    "deps": "deps",
-    "migrate": "migrate",
-}
-
-
-def _derive_task_branch(task_id: uuid.UUID, task_type: str | None) -> str:
-    """Return the canonical blueprint branch name for a task."""
-    prefix = _TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
-    return f"blueprint/{prefix}-{str(task_id).replace('-', '')[:8]}"
+# Canonical branch-derivation helpers live in shared_state to avoid drift across
+# the four backend modules that derive blueprint/{prefix}-{8hex} branch names.
+_TASK_TYPE_BRANCH_PREFIX = _shared_state.TASK_TYPE_BRANCH_PREFIX
+_derive_task_branch = _shared_state.derive_task_branch
 
 
 def _pr_possibly_open(ctx: dict | None) -> bool:
