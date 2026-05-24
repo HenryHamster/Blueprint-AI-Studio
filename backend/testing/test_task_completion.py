@@ -46,6 +46,7 @@ from app.task_completion import (
     patch_pr_body_with_blueprint_meta,
     BLUEPRINT_PR_META_MARKER,
     BLUEPRINT_PR_MERGE_SUMMARY_MARKER,
+    _synthesize_memo_from_source_finding,
 )
 from app.strategic_constants import STRATEGIC_RATIONALE_MAX
 from app.models import Alert, AlertSeverity, Task, TaskStatus
@@ -4019,7 +4020,7 @@ class TestHandleInvestigationCompletion:
         assert memo.context["memo_source_task_id"] == str(task.id)
         assert memo.context["memo_reasoning_kind"] == "investigation_unactionable"
         assert memo.context["direction_id"] == "dir-invest-1"
-        assert memo.status == TaskStatus.QUEUED
+        assert memo.status == TaskStatus.COMPLETED
         assert memo.created_by == "ORCHESTRATOR"
 
     @pytest.mark.asyncio
@@ -4228,7 +4229,7 @@ class TestHandleInvestigationCompletion:
         assert memo.first_payload["reasoning_kind"] == "investigation_unactionable"
         assert memo.context["investigation_outcome"] == "no_direction"
         assert memo.context["memo_source_task_id"] == str(task.id)
-        assert memo.status == TaskStatus.QUEUED
+        assert memo.status == TaskStatus.COMPLETED
         assert memo.created_by == "ORCHESTRATOR"
 
     @pytest.mark.asyncio
@@ -4453,6 +4454,68 @@ class TestHandleInvestigationCompletion:
         )
         assert "Deadlock" in source_finding["root_cause"]
         assert source_finding.get("outcome") == "no_actionable_fix"
+
+
+# ── _synthesize_memo_from_source_finding ────────────────────────────────────
+
+
+class TestSynthesizeMemoFromSourceFinding:
+    """Pure-function tests for the backend-side memo synthesis helper."""
+
+    def test_regression_false_positive_full_data(self):
+        sf = {
+            "verdict_reason": "design_doc says this is intentional",
+            "investigation_summary": "trace confirms the behavior",
+            "regression_class": "sr_catch_rate:correctness",
+        }
+        result = _synthesize_memo_from_source_finding(
+            "regression_false_positive", sf, "task-1"
+        )
+        assert result is not None
+        assert "design_doc" in result["summary"]
+        assert "trace confirms" in result["reasoning"]
+        assert "task:task-1" in result["citations"]
+        assert "regression-false-positive" in result["tags"]
+        assert "sr_catch_rate:correctness" in result["tags"]
+
+    def test_regression_false_positive_missing_verdict_reason_returns_none(self):
+        assert (
+            _synthesize_memo_from_source_finding("regression_false_positive", {}, "t")
+            is None
+        )
+
+    def test_investigation_unactionable_with_root_cause(self):
+        sf = {
+            "root_cause": "workers acquire locks in opposite order",
+            "summary": "deadlock in rollup coordinator",
+            "recommended_fix": "fix lock order",
+            "outcome": "structural",
+        }
+        result = _synthesize_memo_from_source_finding(
+            "investigation_unactionable", sf, "task-2"
+        )
+        assert result is not None
+        assert "workers acquire locks" in result["reasoning"]
+        assert "fix lock order" in result["reasoning"]
+        assert "investigation-unactionable" in result["tags"]
+        assert "structural" in result["tags"]
+        assert "task:task-2" in result["citations"]
+
+    def test_investigation_unactionable_missing_root_cause_and_summary_returns_none(
+        self,
+    ):
+        assert (
+            _synthesize_memo_from_source_finding(
+                "investigation_unactionable", {"outcome": "x"}, "t"
+            )
+            is None
+        )
+
+    def test_unknown_reasoning_kind_returns_none(self):
+        assert (
+            _synthesize_memo_from_source_finding("deferred_finding", {"body": "x"}, "t")
+            is None
+        )
 
 
 # ── _clear_direction_diagnosis_flag ─────────────────────────────────────────

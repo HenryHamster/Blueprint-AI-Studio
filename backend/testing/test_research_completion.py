@@ -1085,3 +1085,67 @@ class TestTrimFindingForMemo:
 
         out = _trim_finding_for_memo({"title": "Only title"})
         assert out == {"title": "Only title"}
+
+
+class TestSynthesizeDeferredFindingMemo:
+    """_synthesize_deferred_finding_memo: backend-side synthesis for deferred-finding memos."""
+
+    def _fn(self):
+        from app.research_completion import _synthesize_deferred_finding_memo
+
+        return _synthesize_deferred_finding_memo
+
+    def test_full_data_returns_memo(self):
+        result = self._fn()(
+            {
+                "title": "Fix auth edge case",
+                "description": "Token refresh fails on expiry",
+            },
+            "low_actionability",
+            "task-abc",
+        )
+        assert result is not None
+        assert result["summary"] == "Fix auth edge case"
+        assert "Fix auth edge case" in result["reasoning"]
+        assert "low_actionability" in result["reasoning"]
+        assert "Token refresh fails" in result["reasoning"]
+        assert "task:task-abc" in result["citations"]
+        assert "deferred-finding" in result["tags"]
+        assert "low_actionability" in result["tags"]
+
+    def test_degradation_gate_drop_reason(self):
+        result = self._fn()(
+            {"title": "Perf improvement", "description": "Cache miss rate high"},
+            "degradation_gate",
+            "task-xyz",
+        )
+        assert result is not None
+        assert "degradation_gate" in result["tags"]
+        assert "degradation_gate" in result["reasoning"]
+
+    def test_no_title_uses_description_as_summary(self):
+        result = self._fn()(
+            {"description": "Something useful"},
+            "low_actionability",
+            "task-1",
+        )
+        assert result is not None
+        assert result["summary"] == "Something useful"
+
+    def test_no_title_and_no_description_returns_none(self):
+        assert self._fn()({}, "low_actionability", "task-1") is None
+
+    def test_empty_strings_return_none(self):
+        assert (
+            self._fn()({"title": "", "description": ""}, "low_actionability", "t")
+            is None
+        )
+
+    def test_summary_truncated_to_200(self):
+        result = self._fn()(
+            {"title": "x" * 300},
+            "low_actionability",
+            "t",
+        )
+        assert result is not None
+        assert len(result["summary"]) == 200

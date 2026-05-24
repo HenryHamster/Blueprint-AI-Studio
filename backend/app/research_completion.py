@@ -91,6 +91,7 @@ from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/call
 from app.task_completion import (
     _extract_json_array,
     _ensure_branch,
+    _apply_synthesized_memo,
 )
 from app.task_locking import with_design_doc_locked
 from app.plan_completion import (
@@ -147,6 +148,32 @@ def _trim_finding_for_memo(finding: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(related, list) and related:
         trimmed["related_files"] = [str(f) for f in related[:20]]
     return trimmed
+
+
+def _synthesize_deferred_finding_memo(
+    sf: Dict[str, Any],
+    drop_reason: str,
+    source_task_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Synthesize a memo dict for a deferred finding without a model call.
+
+    Returns None when the finding has no title or description (insufficient data).
+    The backend already holds the full finding at spawn time, so no VM is needed.
+    """
+    title = str(sf.get("title") or "").strip()
+    description = str(sf.get("description") or "").strip()
+    if not title and not description:
+        return None
+    parts = [f"Dropped finding: {title}"] if title else []
+    parts.append(f"Reason: {drop_reason}")
+    if description:
+        parts.append(f"Description: {description}")
+    return {
+        "summary": (title or description)[:200],
+        "reasoning": "\n\n".join(parts),
+        "citations": [f"task:{source_task_id}"] if source_task_id else [],
+        "tags": ["deferred-finding", drop_reason],
+    }
 
 
 def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:
@@ -2313,6 +2340,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             priority=TASK_PRIORITY_MAP.get("low", 0),
         )
         session.add(_memo_task)
+        _synth = _synthesize_deferred_finding_memo(
+            _memo_payload.get("source_finding") or {},
+            _drop_reason,
+            str(task.id),
+        )
+        if _synth:
+            _apply_synthesized_memo(_memo_task, _synth, session)
         _spawned_memo_ids.append(str(_memo_task.id))
     if _spawned_memo_ids:
         logger.info(
