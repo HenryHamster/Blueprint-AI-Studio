@@ -1195,7 +1195,16 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
     }
 
 
-_RETIRED_DIRECTION_STATUSES = frozenset({"expired", "retired", "superseded"})
+# Terminal direction statuses whose match a well-formed distinction may override.
+# "completed" belongs here: a direction that auto-completes on saturation
+# (research_direction_state sets status="completed") is just as terminal as a
+# retired one, so a re-scoped successor with a real distinction must be allowed.
+# Omitting it made the dedup treat completed directions as live competitors and
+# silently blocked every successor regardless of wording — the reason
+# decomposition could not re-spawn after it saturated (2026-05-24).
+_RETIRED_DIRECTION_STATUSES = frozenset(
+    {"expired", "retired", "superseded", "completed"}
+)
 
 _MIN_DISTINCTION_CHARS = (
     20  # well-formed distinction must be at least this many characters
@@ -1243,11 +1252,12 @@ def _is_direction_duplicate(
 ) -> bool:
     """Return True if proposal_text overlaps with an existing or recently rejected direction.
 
-    All directions (active and retired) use the same overlap threshold of 4 shared
+    All directions (active and terminal) use the same overlap threshold of 4 shared
     non-stopword tokens. When a well-formed distinction is supplied and the only
-    matching directions are retired-status, the distinction overrides the block and
-    this function returns False. Matches against active directions and recently-rejected
-    proposals always block regardless of distinction.
+    matching directions are terminal-status (retired/expired/superseded/completed),
+    the distinction overrides the block and this function returns False. Matches
+    against active directions and recently-rejected proposals always block regardless
+    of distinction.
     """
     words = set(proposal_text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS
     if len(words) < 2:
