@@ -1248,24 +1248,51 @@ def account_in_rate_limit_cooldown(account_id: str | None) -> bool:
     return False
 
 
-def pool_wide_rate_limit_cooldown(at_time: datetime | None = None) -> bool:
-    """Return True if every account in the pool is in rate-limit cooldown.
+def pool_wide_rate_limit_cooldown(
+    at_time: datetime | None = None,
+    *,
+    user_id: str | None = None,
+    providers: list[str] | None = None,
+    model: str | None = None,
+) -> bool:
+    """Return True if every eligible account is in rate-limit cooldown.
 
-    Fires when NO account is healthy or probing and at least one account has an
-    active rate-limit entry. Returns False when the pool is empty (no accounts
-    configured) or when any account is healthy/probing. Safe to call from
-    synchronous contexts — individual dict reads are atomic in CPython.
+    Scoped to the candidate set the task could actually dispatch to:
+    - user_id: only that user's pool (omit → global pool, backward-compatible)
+    - providers: only accounts on those providers
+    - model: use model-specific state check; omitting falls back to the
+      conservative model=None path (any disabled entry → unavailable)
+
+    Returns False when the eligible pool is empty or any account is healthy/probing.
+    Safe to call from synchronous contexts — individual dict reads are atomic in CPython.
     """
-    accts = _all_accounts()
+    accts: list[dict] = _max_plan_pools.get(user_id, []) if user_id else _all_accounts()
+    if providers:
+        norm_providers = {
+            _normalize_provider_name(p) or LLMProviderName.ANTHROPIC.value
+            for p in providers
+        }
+        accts = [
+            a
+            for a in accts
+            if (
+                _normalize_provider_name(a.get("provider"))
+                or LLMProviderName.ANTHROPIC.value
+            )
+            in norm_providers
+        ]
     if not accts:
         return False
     now = at_time if at_time is not None else _utcnow()
     for acct in accts:
-        if _account_state_for_model(acct, None, now=now) in ("healthy", "probing"):
+        if _account_state_for_model(acct, model, now=now) in ("healthy", "probing"):
             return False
     # All accounts unavailable — confirm at least one has an active rate-limit entry.
+    norm_model = _normalize_rl_model(model) if model else None
     for acct in accts:
-        for info in (acct.get("disabled_models") or {}).values():
+        dm = acct.get("disabled_models") or {}
+        infos = [dm[norm_model]] if (norm_model and norm_model in dm) else dm.values()
+        for info in infos:
             at_dt = info.get("at")
             if at_dt is not None and (
                 now - at_dt
@@ -1333,26 +1360,34 @@ def _db_account_runtime_ready(acct: Any) -> bool:
         return False
 
 
-async def db_pool_wide_rate_limit_cooldown(at_time: datetime | None = None) -> bool:
-    """Return True if the pool is rate-limit blocked per DB state.
+async def db_pool_wide_rate_limit_cooldown(
+    at_time: datetime | None = None,
+    *,
+    user_id: str | None = None,
+    providers: list[str] | None = None,
+    model: str | None = None,
+) -> bool:
+    """Return True if the eligible pool is rate-limit blocked per DB state.
 
     DB-backed cross-instance equivalent of pool_wide_rate_limit_cooldown. Use as a
     fallback when the in-memory pool may not reflect the current state — e.g., when
     a different Cloud Run instance recorded the cooldown, or when no account was
     assigned to the failed task (accountless death) so per-account checks are skipped.
 
-    Mirrors the in-memory classifier's semantics rather than requiring every account
-    to be in cooldown. An enabled account is "potentially usable" iff it has runtime
-    credentials AND has no rate-limit entries in its persisted state — matching the
-    in-memory _account_state_for_model(model=None) path, which conservatively treats
-    any disabled_models entry as unavailable at model=None. The pool is classified as
-    rate-limit blocked iff no enabled account is potentially usable AND at least one
-    enabled account is in active rate-limit cooldown. This correctly handles the
-    mixed-state pool (e.g., one account rate-limited, another missing credentials):
-    if the only thing blocking the pool from being usable IS the cooldown, classify
+    Scoped to the candidate set the task could actually dispatch to:
+    - user_id: filter to that user's accounts
+    - providers: filter to accounts on those providers
+    - model: when set, "potentially usable" means credentials present AND the
+      specific model has no active cooldown (vs. the conservative no-disabled-models
+      check used when model is omitted)
+
+    The pool is classified as rate-limit blocked iff no eligible account is potentially
+    usable AND at least one eligible account is in active rate-limit cooldown. This
+    correctly handles the mixed-state pool (e.g., one account rate-limited, another
+    missing credentials): if the only thing blocking the pool IS the cooldown, classify
     the failure as RATE_LIMIT rather than burning retry budget as AGENT_TIMEOUT.
 
-    Returns False on any DB/parse error or when the pool has no enabled accounts.
+    Returns False on any DB/parse error or when the eligible pool has no accounts.
     Never raises.
     """
     try:
@@ -1360,21 +1395,52 @@ async def db_pool_wide_rate_limit_cooldown(at_time: datetime | None = None) -> b
         from app.models import MaxPlanAccount
 
         async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                sql_select(MaxPlanAccount).where(MaxPlanAccount.enabled == True)  # noqa: E712
-            )
+            stmt = sql_select(MaxPlanAccount).where(MaxPlanAccount.enabled == True)  # noqa: E712
+            if user_id is not None:
+                stmt = stmt.where(MaxPlanAccount.user_id == user_id)
+            result = await session.execute(stmt)
             accounts = result.scalars().all()
 
         if not accounts:
             return False
 
+        # Optional provider filter (post-query — provider is an enum, easier to
+        # normalise in Python than in SQL for the multi-provider case).
+        if providers:
+            norm_providers = {
+                _normalize_provider_name(p) or LLMProviderName.ANTHROPIC.value
+                for p in providers
+            }
+            accounts = [
+                a
+                for a in accounts
+                if (
+                    _normalize_provider_name(a.provider)
+                    or LLMProviderName.ANTHROPIC.value
+                )
+                in norm_providers
+            ]
+        if not accounts:
+            return False
+
+        norm_model = _normalize_rl_model(model) if model else None
         any_in_cooldown = False
         for acct in accounts:
             disabled_models = (acct.rate_limit_state or {}).get("disabled_models") or {}
-            # Potentially-usable mirror of in-memory model=None path: must have
-            # credentials AND no rate-limit entries at all (expired or not).
-            if _db_account_runtime_ready(acct) and not disabled_models:
-                return False
+            if _db_account_runtime_ready(acct):
+                if norm_model:
+                    # Model-scoped: potentially usable if the specific model has no
+                    # active cooldown (more accurate than "no disabled_models at all").
+                    if (
+                        norm_model not in disabled_models
+                        or not acct.is_in_rate_limit_cooldown(at_time=at_time)
+                    ):
+                        return False
+                else:
+                    # Conservative model=None path: must have credentials AND no
+                    # rate-limit entries at all (expired or not).
+                    if not disabled_models:
+                        return False
             if acct.is_in_rate_limit_cooldown(at_time=at_time):
                 any_in_cooldown = True
         return any_in_cooldown

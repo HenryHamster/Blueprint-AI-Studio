@@ -849,11 +849,14 @@ class TestSuccessRateTiebreaking:
                 {"at": now - timedelta(hours=i + 1), "success": False} for i in range(5)
             ],
         )
-        key = lambda a: (
-            _compute_health_score(a, now),
-            _compute_success_rate_7d(a, now) or 0.0,
-            -a.get("active_tasks", 0),
-        )
+
+        def key(a):
+            return (
+                _compute_health_score(a, now),
+                _compute_success_rate_7d(a, now) or 0.0,
+                -a.get("active_tasks", 0),
+            )
+
         assert key(hi) > key(lo)
 
     def test_low_sample_below_min_treated_same_as_no_data(self):
@@ -898,11 +901,14 @@ class TestSuccessRateTiebreaking:
         assert _compute_success_rate_7d(busy, now) == _compute_success_rate_7d(
             idle, now
         )
-        key = lambda a: (
-            _compute_health_score(a, now),
-            _compute_success_rate_7d(a, now) or 0.0,
-            -a.get("active_tasks", 0),
-        )
+
+        def key(a):
+            return (
+                _compute_health_score(a, now),
+                _compute_success_rate_7d(a, now) or 0.0,
+                -a.get("active_tasks", 0),
+            )
+
         assert key(idle) > key(busy)
 
 
@@ -1985,3 +1991,192 @@ class TestScanRegressionsDedupe:
         assert ev["sample_size"] == 5
         # Quarantine state must be persisted in-memory.
         assert acct["disabled_models"]["claude-r"]["kind"] == "regression"
+
+
+# ── pool_wide_rate_limit_cooldown: user/provider/model scoping ───────────────
+
+
+class TestPoolWideRateLimitCooldownScoping:
+    """pool_wide_rate_limit_cooldown must restrict its verdict to the candidate
+    set the task could actually dispatch to, so unrelated users or providers
+    cannot mask a full-pool blockage or cause false RATE_LIMIT verdicts."""
+
+    def setup_method(self):
+        _max_plan_pools.clear()
+        _account_by_id.clear()
+
+    def teardown_method(self):
+        _max_plan_pools.clear()
+        _account_by_id.clear()
+
+    def _add(self, user_id: str, acct_id: str, provider: str = "anthropic", **kw):
+        a = _acct(id=acct_id, user_id=user_id, provider=provider, **kw)
+        _max_plan_pools.setdefault(user_id, []).append(a)
+        _account_by_id[acct_id] = a
+        return a
+
+    def test_unrelated_user_healthy_account_does_not_prevent_true(self):
+        """A healthy account belonging to a *different* user must not prevent
+        pool_wide_rate_limit_cooldown from returning True for user A's pool."""
+        from app.max_plan_pool import pool_wide_rate_limit_cooldown
+
+        now = datetime.utcnow()
+        # User A: single account rate-limited
+        self._add(
+            "user-a",
+            "a1",
+            disabled_models={OPUS: {"hits": 1, "at": now - timedelta(minutes=5)}},
+        )
+        # User B: healthy account (different user)
+        self._add("user-b", "b1")
+
+        assert pool_wide_rate_limit_cooldown(user_id="user-a") is True
+
+    def test_unrelated_provider_healthy_account_does_not_prevent_true(self):
+        """A healthy account on a *different* provider must not prevent a True
+        verdict when all anthropic accounts are rate-limited."""
+        from app.max_plan_pool import pool_wide_rate_limit_cooldown
+
+        now = datetime.utcnow()
+        self._add(
+            "user-a",
+            "a-ant",
+            provider="anthropic",
+            disabled_models={OPUS: {"hits": 1, "at": now - timedelta(minutes=5)}},
+        )
+        # Healthy gemini account for the same user
+        self._add("user-a", "a-gem", provider="gemini")
+
+        assert (
+            pool_wide_rate_limit_cooldown(user_id="user-a", providers=["anthropic"])
+            is True
+        )
+
+    def test_healthy_account_in_scope_returns_false(self):
+        """If the scoped pool has at least one healthy account, return False."""
+        from app.max_plan_pool import pool_wide_rate_limit_cooldown
+
+        now = datetime.utcnow()
+        self._add(
+            "user-a",
+            "a1",
+            disabled_models={OPUS: {"hits": 1, "at": now - timedelta(minutes=5)}},
+        )
+        self._add("user-a", "a2")  # healthy
+
+        assert pool_wide_rate_limit_cooldown(user_id="user-a") is False
+
+    def test_model_scoping_unblocked_model_returns_false(self):
+        """When model is specified, an account disabled only for a *different*
+        model is still healthy for the requested model, so return False."""
+        from app.max_plan_pool import pool_wide_rate_limit_cooldown
+
+        now = datetime.utcnow()
+        # Account disabled for claude-sonnet only, not for Opus
+        self._add(
+            "user-a",
+            "a1",
+            disabled_models={
+                "claude-sonnet-4-6": {"hits": 1, "at": now - timedelta(minutes=5)}
+            },
+        )
+        assert pool_wide_rate_limit_cooldown(user_id="user-a", model=OPUS) is False
+
+    def test_empty_scoped_pool_returns_false(self):
+        """When the scoped pool is empty (user has no accounts), return False."""
+        from app.max_plan_pool import pool_wide_rate_limit_cooldown
+
+        self._add("user-b", "b1")  # different user
+        assert pool_wide_rate_limit_cooldown(user_id="user-a") is False
+
+
+# ── db_pool_wide_rate_limit_cooldown: user/provider/model scoping ─────────────
+
+
+class TestDbPoolWideRateLimitCooldownScoping:
+    """db_pool_wide_rate_limit_cooldown must restrict its verdict to the eligible
+    pool, so unrelated-user or unrelated-provider accounts do not skew the result."""
+
+    @pytest.mark.asyncio
+    async def test_user_filter_isolates_verdict(self, monkeypatch):
+        """When user_id is passed, only that user's accounts are considered.
+        A healthy account for user-b must not prevent True for user-a's pool."""
+        from datetime import datetime, timedelta
+        from unittest.mock import AsyncMock, MagicMock
+        from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
+        from app.models import MaxPlanAccount
+
+        rl_at = datetime.utcnow() - timedelta(minutes=5)
+        a_acct = MaxPlanAccount(
+            user_id="user-a",
+            name="a",
+            oauth_token="tok",
+            rate_limit_state={
+                "disabled_models": {OPUS: {"at": rl_at.isoformat(), "hits": 1}}
+            },
+        )
+        b_acct = MaxPlanAccount(
+            user_id="user-b",
+            name="b",
+            oauth_token="tok-b",
+            rate_limit_state=None,
+        )
+
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = [a_acct]
+        mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(return_value=mock_result)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(
+            "app.max_plan_pool.AsyncSessionLocal", MagicMock(return_value=mock_session)
+        )
+        _ = b_acct  # user-b account not returned by filtered query
+
+        result = await db_pool_wide_rate_limit_cooldown(user_id="user-a")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_provider_filter_excludes_healthy_unrelated_provider(
+        self, monkeypatch
+    ):
+        """When providers filter is set, a healthy account on a different provider
+        must not prevent a True verdict for the filtered provider pool."""
+        from datetime import datetime, timedelta
+        from unittest.mock import AsyncMock, MagicMock
+        from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
+        from app.models import MaxPlanAccount, LLMProviderName
+
+        rl_at = datetime.utcnow() - timedelta(minutes=5)
+        ant_acct = MaxPlanAccount(
+            user_id="u",
+            name="ant",
+            oauth_token="tok",
+            provider=LLMProviderName.ANTHROPIC,
+            rate_limit_state={
+                "disabled_models": {OPUS: {"at": rl_at.isoformat(), "hits": 1}}
+            },
+        )
+        # A healthy gemini account that should be excluded by the providers filter
+        gem_acct = MaxPlanAccount(
+            user_id="u",
+            name="gem",
+            oauth_token=None,
+            provider=LLMProviderName.GEMINI
+            if hasattr(LLMProviderName, "GEMINI")
+            else LLMProviderName.ANTHROPIC,
+            rate_limit_state=None,
+        )
+
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = [ant_acct, gem_acct]
+        mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(return_value=mock_result)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        monkeypatch.setattr(
+            "app.max_plan_pool.AsyncSessionLocal", MagicMock(return_value=mock_session)
+        )
+
+        result = await db_pool_wide_rate_limit_cooldown(providers=["anthropic"])
+        assert result is True
