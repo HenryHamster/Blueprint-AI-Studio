@@ -2470,3 +2470,76 @@ async def test_refactor_high_risk_child_excluded_from_approval_gate(cleanup_db, 
     assert parent.requires_approval is False
     mock_spawn.assert_awaited_once()
     assert mock_spawn.await_args.args[1] == "review"
+
+
+# ===========================================================================
+# ROOT CAUSE 4: malformed pr_url in rollup child → force-merge instead of stall
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_malformed_pr_url_artifact_force_merges_in_rollup(cleanup_db, mocker):
+    """A child COMPLETED task whose PULL_REQUEST artifact carries a malformed
+    pr_url (e.g. a /commit/<sha> URL) must NOT cause the rollup to hang.
+
+    ROOT CAUSE 4 fix: the except clause in the unmerged-respawn loop now sets
+    c.context['pr_merged'] = True so the next cycle can progress, mirroring the
+    no-PR-artifact branch.
+    """
+    from datetime import datetime, timedelta, timezone
+    from app.rollup_management import _check_and_trigger_rollup
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+
+    project = await _make_project(cleanup_db)
+
+    # Parent in EVALUATING — the rollup entry point.
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={
+            "research_branch": "research/test-stg",
+            "parent_base": "main",
+        },
+        plan_output="some plan",
+    )
+
+    # Child COMPLETED but pr_merged not set (the "unmerged" state).
+    # updated_at must be > 10 min ago to pass the stale threshold check.
+    stale_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=15)
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+        updated_at=stale_time,
+    )
+    cleanup_db.add(child)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(child)
+
+    # Malformed pr_url — production incident used a /commit/<sha> URL.
+    bogus_url = "https://github.com/HenryHamster/BlueprintAIStudio/commit/b8932d1"
+    artifact = Artifact(
+        task_id=child.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url=bogus_url,
+    )
+    cleanup_db.add(artifact)
+    await cleanup_db.commit()
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(child)
+    assert (child.context or {}).get("pr_merged") is True, (
+        "Malformed pr_url must force-set pr_merged=True so rollup progresses"
+    )

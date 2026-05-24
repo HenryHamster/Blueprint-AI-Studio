@@ -13,6 +13,7 @@ import contextlib
 import json
 import logging
 import random
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
@@ -1103,6 +1104,15 @@ async def update_agent_status(
     # IntegrityError; we catch it and treat as the dedup-skip path.
     if payload.artifact_type:
         if payload.artifact_type == ArtifactType.PULL_REQUEST:
+            _PR_URL_RE = r"^https://github\.com/[^/\s]+/[^/\s]+/pull/\d+$"
+            if payload.pr_url and not re.match(_PR_URL_RE, payload.pr_url):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "pr_url must match https://github.com/<owner>/<repo>/pull/<number>; "
+                        f"got: {payload.pr_url!r}"
+                    ),
+                )
             existing = (
                 (
                     await session.execute(

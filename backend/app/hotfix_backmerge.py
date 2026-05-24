@@ -59,7 +59,7 @@ import logging
 import uuid
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import github
@@ -457,13 +457,38 @@ async def _handle_conflict(
         duplicate plan is created, so a persistent conflict yields one of each
         instead of one per cycle.
 
-    Concurrency note: the dedup reads committed state, so two genuinely
-    concurrent callers — the promotion-conflict hook and the periodic
-    reconciler ticking in the same instant — can each pass the check before
-    either commits and both spawn.  Accepted as benign: the window is tiny and
-    both resolution plans run the same ``git merge origin/main``, so a
-    duplicate is redundant, never destructive.
+    Concurrency note: two concurrent callers — the promotion-conflict hook and
+    the periodic reconciler ticking in the same instant — can each pass the
+    read-committed dedup check before either commits.  A transaction-scoped
+    PostgreSQL advisory lock serializes them: the first caller acquires the
+    lock and proceeds; the second fails to acquire it and returns immediately,
+    yielding exactly one plan task.  Non-PostgreSQL backends (SQLite in local
+    tests) do not support ``pg_try_advisory_xact_lock``; the except path falls
+    through to the existing read-committed dedup as a safe fallback.
     """
+    # Serialize concurrent _handle_conflict calls for the same project.
+    try:
+        lock_acquired = (
+            await session.execute(
+                text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"),
+                {"key": f"blueprint:backmerge_conflict_resolution:{project_id}"},
+            )
+        ).scalar()
+    except Exception as _lock_err:
+        # Non-PostgreSQL backend — fall through to read-committed dedup.
+        lock_acquired = True
+        logger.debug(
+            "[BACKMERGE] advisory lock unavailable (%s) — using read-committed dedup",
+            _lock_err,
+        )
+    if not lock_acquired:
+        logger.info(
+            "[BACKMERGE] advisory lock not acquired for project %s — "
+            "concurrent caller is mid-spawn; returning without spawning",
+            project_id,
+        )
+        return
+
     already_open = await _resolution_plan_already_open(session, project_id)
 
     if periodic and already_open:

@@ -1106,9 +1106,16 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 try:
                     pr_number = int(pr_art.pr_url.rstrip("/").split("/")[-1])
                 except (ValueError, IndexError):
+                    # Malformed pr_url (e.g. /commit/<sha>) — cannot parse a PR number.
+                    # Force-set pr_merged so the next rollup cycle progresses instead of
+                    # hanging forever. ROOT CAUSE 2/3 fixes upstream make this rare.
                     logger.warning(
-                        f"[ROLLUP] Could not parse PR number from {pr_art.pr_url} for child {str(c.id)[:8]}"
+                        f"[ROLLUP] malformed pr_url {pr_art.pr_url!r} for child "
+                        f"{str(c.id)[:8]} — cannot parse PR number; "
+                        f"force-setting pr_merged=True so rollup progresses"
                     )
+                    c.context = {**(c.context or {}), "pr_merged": True}
+                    session.add(c)
                     continue
 
                 # Circuit-breaker: once a child's review has been respawned

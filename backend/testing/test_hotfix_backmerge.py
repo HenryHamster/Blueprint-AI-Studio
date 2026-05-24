@@ -366,6 +366,77 @@ async def test_open_backmerge_pr_conflict_no_duplicate_plan(db_session, mocker):
     assert len(alerts) == 2
 
 
+@pytest.mark.asyncio
+async def test_advisory_lock_prevents_concurrent_duplicate_plan(db_session, mocker):
+    """Advisory lock prevents a duplicate plan when two concurrent callers both
+    pass the _resolution_plan_already_open check before either commits.
+
+    Simulates the production race: promotion-conflict hook + periodic reconciler
+    fire in the same instant, both see no open plan, but the advisory lock
+    serializes them — exactly one plan is spawned.
+    """
+    project = await _make_project(db_session)
+    mocker.patch.dict(
+        "app.shared_state.runtime_config", {"integration_branch": "automain"}
+    )
+
+    # Both callers "see" no open plan — simulates the race where neither has committed yet.
+    mocker.patch(
+        "app.hotfix_backmerge._resolution_plan_already_open",
+        new=AsyncMock(return_value=False),
+    )
+
+    # Lock mock: first call acquires it, second does not.
+    lock_call_count = {"n": 0}
+    real_execute = db_session.execute
+
+    async def mock_execute(stmt, params=None, **kwargs):
+        if "pg_try_advisory_xact_lock" in str(stmt):
+            lock_call_count["n"] += 1
+            from unittest.mock import MagicMock
+
+            result = MagicMock()
+            result.scalar.return_value = lock_call_count["n"] == 1
+            return result
+        if params is not None:
+            return await real_execute(stmt, params, **kwargs)
+        return await real_execute(stmt, **kwargs)
+
+    mocker.patch.object(db_session, "execute", side_effect=mock_execute)
+
+    # First call (e.g. promotion-conflict hook) — acquires lock, spawns plan.
+    await hb._handle_conflict(
+        db_session,
+        project.id,
+        55,
+        "http://pr/55",
+        None,
+        "hook",
+        message="conflict",
+        periodic=False,
+    )
+    await db_session.flush()
+
+    # Second call (e.g. periodic reconciler) — lock fails, returns immediately.
+    await hb._handle_conflict(
+        db_session,
+        project.id,
+        55,
+        "http://pr/55",
+        None,
+        "reconciler",
+        message="conflict",
+        periodic=False,
+    )
+    await db_session.commit()
+
+    tasks = await _tasks_for(db_session, project.id)
+    plans = [t for t in tasks if (t.first_payload or {}).get("type") == "plan"]
+    assert len(plans) == 1, (
+        f"Advisory lock must prevent duplicate plan spawn — got {len(plans)} plans"
+    )
+
+
 async def test_open_backmerge_pr_conflict_respawns_after_plan_terminal(
     db_session, mocker
 ):

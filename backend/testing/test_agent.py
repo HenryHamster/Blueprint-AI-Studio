@@ -6514,6 +6514,71 @@ async def test_agent_status_pr_artifact_stores_enriched_context(
 
 
 @pytest.mark.asyncio
+async def test_agent_status_malformed_pr_url_returns_400(
+    client: AsyncClient, db_session, mocker
+):
+    """POSTing a PULL_REQUEST artifact with a malformed pr_url (e.g. a /commit/<sha>
+    URL) must return HTTP 400 and must NOT persist an Artifact row."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Malformed PR URL Test", user_id="test-user-malformed-pr")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do thing"}],
+        vm_instance_id="agent-vm-malformed-pr",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-malformed-pr")
+    headers = {"x-agent-token": token}
+
+    bogus_pr_url = "https://github.com/HenryHamster/BlueprintAIStudio/commit/b8932d1"
+    payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "PULL_REQUEST",
+        "pr_url": bogus_pr_url,
+        "logs": "Task complete.",
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 400
+    assert "pull" in resp.text.lower() or "pr_url" in resp.text.lower()
+
+    # No Artifact row must have been created.
+    from sqlmodel import select as sql_select
+    from app.models import Artifact, ArtifactType
+
+    artifacts = (
+        (
+            await db_session.execute(
+                sql_select(Artifact).where(
+                    Artifact.task_id == task.id,
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert artifacts == [], "Malformed pr_url must not persist an Artifact row"
+
+    # A valid URL must still be accepted.
+    valid_pr_url = "https://github.com/HenryHamster/BlueprintAIStudio/pull/5699"
+    payload["pr_url"] = valid_pr_url
+    resp2 = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp2.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_agent_status_failed_artifact_stores_diff_summary_and_test_failure(
     client: AsyncClient, db_session, mocker
 ):

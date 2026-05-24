@@ -3630,6 +3630,30 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     expect(doneScript).toContain('# No regressing categories for this task type');
   });
 
+  it('generates ./done script with PR URL shape validation', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-123',
+      workBranch: 'blueprint/test-task-123',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+
+    // The regex variable must be present and reject non-pull URLs.
+    expect(doneScript).toContain("PR_URL_RE='^https://github");
+    expect(doneScript).toContain('/pull/');
+    // Validation must exit non-zero on mismatch.
+    expect(doneScript).toContain('grep -qE "$PR_URL_RE"');
+    expect(doneScript).toContain('canonical pull URL');
+    // Reference to co-located validation in code-change.ts.
+    expect(doneScript).toContain('code-change.ts');
+  });
+
   it('generates ./done with regressing-category reasoning gate when regressingCategories is set', async () => {
     const { writeCodeChangeHelpers } = await import('./prompt.js');
     writeCodeChangeHelpers({
