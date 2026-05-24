@@ -598,6 +598,55 @@ async def test_cumulative_confirmed_finding_count_and_trend_in_direction_stats(
 
 
 @pytest.mark.asyncio
+async def test_outcome_scaffolding_flag_surfaces_in_direction_stats(db_session):
+    """outcome_scaffolding_flagged and _evidence appear in stat_entry for flagged direction, absent for unflagged."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-scaff-flagged",
+                "status": "active",
+                "text": "Flagged scaffolding direction",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+                "outcome_scaffolding_flagged": True,
+                "outcome_scaffolding_evidence": {"reason": "no progress", "cycles": 5},
+            },
+            {
+                "id": "d-scaff-clean",
+                "status": "active",
+                "text": "Clean direction",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            },
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    by_id = {s["id"]: s for s in payload["directions_summary"]}
+
+    flagged = by_id["d-scaff-flagged"]
+    assert flagged.get("outcome_scaffolding_flagged") is True
+    assert flagged.get("outcome_scaffolding_evidence") == {
+        "reason": "no progress",
+        "cycles": 5,
+    }
+
+    clean = by_id["d-scaff-clean"]
+    assert "outcome_scaffolding_flagged" not in clean
+    assert "outcome_scaffolding_evidence" not in clean
+
+
+@pytest.mark.asyncio
 async def test_confirmed_finding_trend_declining_in_direction_stats(db_session):
     """confirmed_finding_trend is declining when second half avg < first half avg * 0.7."""
     project = _make_project(

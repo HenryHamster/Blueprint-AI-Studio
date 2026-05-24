@@ -891,6 +891,38 @@ def test_cumulative_confirmed_finding_count_and_trend():
     assert d["confirmed_finding_trend"] == "improving"
 
 
+def test_outcome_scaffolding_flag_surfaces_in_outcome():
+    """outcome_scaffolding_flagged and _evidence appear for flagged direction, absent for unflagged."""
+    directions = [
+        {
+            "id": "dir-flagged",
+            "status": "active",
+            "research_history": [],
+            "outcome_scaffolding_flagged": True,
+            "outcome_scaffolding_evidence": {"reason": "no progress", "cycles": 5},
+        },
+        {
+            "id": "dir-clean",
+            "status": "active",
+            "research_history": [],
+        },
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project, [])
+    by_id = {d["id"]: d for d in result["directions"]}
+
+    flagged = by_id["dir-flagged"]
+    assert flagged.get("outcome_scaffolding_flagged") is True
+    assert flagged.get("outcome_scaffolding_evidence") == {
+        "reason": "no progress",
+        "cycles": 5,
+    }
+
+    clean = by_id["dir-clean"]
+    assert "outcome_scaffolding_flagged" not in clean
+    assert "outcome_scaffolding_evidence" not in clean
+
+
 def test_confirmed_finding_trend_declining():
     """Verify declining trend detection."""
     directions = [
