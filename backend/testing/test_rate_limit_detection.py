@@ -45,6 +45,12 @@ VERBATIM_POSITIVES = [
     "Claude AI usage limit reached, please try again after 2pm",
     "You're out of extra usage · resets 11:30am (Asia/Colombo)",
     "5-hour limit reached - resets 9pm",
+    # Weekly (7-day) plan cap — plain-text form the CLI emits alongside the
+    # structured seven_day event. Regression guard: these previously fell
+    # through to UNKNOWN, so the account was never disabled and the task
+    # terminal-FAILED instead of being held + rerouted.
+    "You've hit your weekly limit · resets 9pm (UTC)",
+    "Weekly limit reached",
     # Anthropic API 429
     "API Error: Rate limit reached",
     "This request would exceed your account's rate limit. Please try again later.",
@@ -56,6 +62,41 @@ def test_verbatim_claude_rate_limit_messages_classify_as_rate_limit(msg):
     assert classify_failure(_task(msg)) == "RATE_LIMIT", (
         f"Expected RATE_LIMIT for verbatim Claude message: {msg!r}"
     )
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "You've hit your weekly limit · resets 9pm (UTC)",
+        "Weekly limit reached",
+    ],
+)
+def test_weekly_limit_routes_to_quota_exhausted_kind(msg):
+    """A weekly (7-day) cap is a clock-resolving quota wall, so it must classify
+    with kind='quota_exhausted' → disable_account_model applies the flat 24h
+    cooldown rather than the 5-hour exponential backoff (which would re-cycle the
+    task against a still-exhausted account every ~4h)."""
+    from app.providers.anthropic import AnthropicProvider
+    from app.providers.base import LLMAuthMode
+
+    sig = AnthropicProvider().classify_rate_limit_signal(LLMAuthMode.OAUTH, msg.lower())
+    assert sig is not None, f"weekly-limit message not recognized as rate limit: {msg!r}"
+    assert sig.kind == "quota_exhausted", (
+        f"weekly-limit message should be quota_exhausted (24h cooldown), got {sig.kind!r}"
+    )
+
+
+def test_five_hour_limit_stays_short_cooldown_kind():
+    """Guard the boundary: a 5-hour throttle must NOT be quota_exhausted — it
+    resolves on the short exponential backoff, not a flat 24h hold."""
+    from app.providers.anthropic import AnthropicProvider
+    from app.providers.base import LLMAuthMode
+
+    sig = AnthropicProvider().classify_rate_limit_signal(
+        LLMAuthMode.OAUTH, "5-hour limit reached - resets 9pm"
+    )
+    assert sig is not None
+    assert sig.kind == "rate_limit"
 
 
 def test_pattern_list_is_all_lowercase():
@@ -519,3 +560,38 @@ def test_taxonomy_infra_related_for_agent_reported_rate_limited():
     assert normalized == "RATE_LIMIT"
     t.context = {"failure_category": normalized}
     assert classify_failure_taxonomy(t) == TAXONOMY_INFRA_RELATED
+
+
+# ── parse_failed + rate-limit correlation ─────────────────────────────────────
+
+
+def test_normalize_agent_category_parse_failed_with_rate_limit_is_rate_limit(
+    monkeypatch,
+):
+    """parse_failed coinciding with an active rate-limit window must be reclassified
+    to RATE_LIMIT so it does not burn the code-error retry budget."""
+    monkeypatch.setattr(
+        "app.failure_classification._account_was_rate_limited",
+        lambda task, at_time=None: True,
+    )
+    monkeypatch.setattr(
+        "app.failure_classification._pool_was_rate_limited", lambda at_time=None: False
+    )
+    t = _task("")
+    assert normalize_agent_failure_category("parse_failed", t) == "RATE_LIMIT"
+
+
+def test_normalize_agent_category_parse_failed_without_rate_limit_is_code_error(
+    monkeypatch,
+):
+    """parse_failed with no active rate-limit window must remain CODE_ERROR —
+    a genuine malformed-output failure should not be silently reclassified."""
+    monkeypatch.setattr(
+        "app.failure_classification._account_was_rate_limited",
+        lambda task, at_time=None: False,
+    )
+    monkeypatch.setattr(
+        "app.failure_classification._pool_was_rate_limited", lambda at_time=None: False
+    )
+    t = _task("")
+    assert normalize_agent_failure_category("parse_failed", t) == "CODE_ERROR"

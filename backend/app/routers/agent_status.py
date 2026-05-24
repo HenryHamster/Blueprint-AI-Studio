@@ -45,6 +45,7 @@ from app.max_plan_pool import (
     apply_task_llm_runtime_context,
     release_max_plan_account,
     _account_available_for_model,
+    _cooldown_seconds_for_info,
     _max_plan_pools,
     _extract_task_model,
     clear_rate_limit_state_on_success,
@@ -2038,12 +2039,18 @@ async def update_agent_status(
                                         info = dm[model]
                                         disabled_at = info.get("at")
                                         if disabled_at:
-                                            hits = info.get("hits", 1)
-                                            cooldown_min = min(
-                                                30 * (2 ** (hits - 1)), 240
+                                            # Canonical cooldown — honors
+                                            # quota_exhausted (flat 24h, e.g. a
+                                            # weekly cap) and server retry hints,
+                                            # instead of recomputing only the
+                                            # 5-hour exponential. Without this a
+                                            # weekly-capped task re-cycled every
+                                            # ~4h against a still-exhausted account.
+                                            cooldown_secs = _cooldown_seconds_for_info(
+                                                info
                                             )
                                             recovery_dt = disabled_at + timedelta(
-                                                minutes=cooldown_min
+                                                seconds=cooldown_secs
                                             )
                                             if (
                                                 earliest_recovery is None
