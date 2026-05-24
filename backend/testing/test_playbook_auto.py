@@ -7429,12 +7429,18 @@ async def test_compute_sr_catch_rate_trends_by_scope_rate_history_and_trend(
 
     project = await _make_project(db_session)
     # Seed existing by_scope: small/test-coverage had hit_rate=0.8 last window.
+    # sample_count must be >= _MIN_SR_FINDINGS so the two-proportion z-test
+    # gate added by the significance-gating change can fire a directional verdict.
     doc = dict(project.design_doc or {})
     doc["sr_catch_rate_trends"] = {
         "computed_at": (_utcnow() - timedelta(days=15)).isoformat(),
         "by_scope": {
             "small": {
-                "test-coverage": {"hit_rate": 0.8, "rate_history": [0.8]},
+                "test-coverage": {
+                    "hit_rate": 0.8,
+                    "rate_history": [0.8],
+                    "sample_count": 5,
+                },
             }
         },
         "categories": {},
@@ -8998,6 +9004,351 @@ async def test_compute_sr_catch_rate_trends_by_severity_persisted_to_design_doc(
     assert "CRITICAL" in stored["by_severity"]
     assert "MAJOR" in stored["by_severity"]
     assert "MINOR" in stored["by_severity"]
+
+
+# ---------------------------------------------------------------------------
+# Significance-gate tests for FP and severity sub-trends
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_severity_small_sample_swing_suppressed_no_alert(
+    db_session: AsyncSession,
+):
+    """Small CRITICAL bucket (n=2) suppresses directional verdict even with large delta.
+
+    Without the z-test gate a miss-rate jump of 1.0 would label 'regressing' and
+    fire a spurious alert.  With the gate (n < _MIN_SR_FINDINGS=5 → stable) no
+    alert should fire and the trend label must be 'stable'.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    review_crit = {
+        "description": "Unhandled exception bypasses guard",
+        "severity": "CRITICAL",
+    }
+
+    # Current window — 5 base tasks (meets finding-count gate, no severity samples)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Current window — 2 tasks with CRITICAL review issue; SR misses error-handling
+    # → CRITICAL human_count=2, hit=0, miss_rate=1.0
+    for _ in range(2):
+        t = _make_sr_task_with_review(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            review_issues=[review_crit],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window — 5 base tasks
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window — 2 tasks with CRITICAL; SR catches error-handling
+    # → CRITICAL human_count=2, hit=2, miss_rate=0.0
+    for _ in range(2):
+        t = _make_sr_task_with_review(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness", "error-handling"],
+            review_issues=[review_crit],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ) as mock_dispatch,
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
+        result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    # n=2 < _MIN_SR_FINDINGS → must be suppressed to 'stable'
+    assert result["by_severity"]["CRITICAL"]["trend"] == "stable"
+    # No spurious alert
+    mock_post.assert_not_called()
+    mock_dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_severity_large_sample_swing_fires_alert(
+    db_session: AsyncSession,
+):
+    """Sufficient CRITICAL bucket (n=10) with large delta correctly fires a regression alert.
+
+    This is the positive-control counterpart: the same logical scenario as the
+    small-sample test but with n=10 ≥ _MIN_SR_FINDINGS and a z-score >> 1.28.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    review_crit = {
+        "description": "Unhandled exception bypasses guard",
+        "severity": "CRITICAL",
+    }
+
+    # Current: 5 base tasks + 10 CRITICAL tasks where SR misses error-handling
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(10):
+        t = _make_sr_task_with_review(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            review_issues=[review_crit],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous: 5 base tasks + 10 CRITICAL tasks where SR catches error-handling
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(10):
+        t = _make_sr_task_with_review(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness", "error-handling"],
+            review_issues=[review_crit],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ) as mock_dispatch,
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
+        result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    # n=10 ≥ 5, delta=1.0 → z >> 1.28 → must fire
+    assert result["by_severity"]["CRITICAL"]["trend"] == "regressing"
+    mock_post.assert_called_once()
+    payload = (
+        mock_dispatch.call_args.kwargs.get("payload") or mock_dispatch.call_args.args[2]
+        if mock_dispatch.called
+        else {}
+    )
+    assert mock_dispatch.called
+    sevs = payload.get("regressing_severities", [])
+    assert any(s["severity"] == "CRITICAL" for s in sevs)
+
+
+@pytest.mark.asyncio
+async def test_fp_trend_small_sample_suppressed_no_alert(
+    db_session: AsyncSession,
+):
+    """Small SR-failed bucket (n=3) suppresses fp_trend directional verdict.
+
+    A jump from fp_rate=0.0 to fp_rate=1.0 exceeds the raw 5pp threshold but
+    the z-test gate (n < _MIN_SR_FINDINGS=5) must suppress it to 'stable' and
+    prevent a spurious alert.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # Current window:
+    # 5 base tasks (meet main finding gate); SR correctly flags correctness.
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # 3 tasks where SR also flags "error-handling" but humans never flag it → FP
+    # sr_failed_count["error-handling"]=3, fp_count["error-handling"]=3, fp_rate=1.0
+    for _ in range(3):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness", "error-handling"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window:
+    # 5 base tasks
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # 3 tasks where SR flags "error-handling" AND humans also flag it → NOT FP
+    # sr_failed_count["error-handling"]=3, fp_count["error-handling"]=0, fp_rate=0.0
+    for _ in range(3):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1, "error-handling": 1},
+            sr_failed_cats=["correctness", "error-handling"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ) as mock_dispatch,
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
+        result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    # error-handling FP: sr_failed_count=3 < 5 → must be 'stable', no alert
+    eh = result["categories"].get("error-handling") or {}
+    assert eh.get("fp_trend") == "stable"
+    mock_post.assert_not_called()
+    mock_dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fp_trend_large_sample_fires_alert(
+    db_session: AsyncSession,
+):
+    """Sufficient SR-failed bucket (n=8) with large FP-rate jump fires an alert.
+
+    Positive control: n=8 ≥ _MIN_SR_FINDINGS with fp_rate jump 0→1 produces
+    z >> 1.28 → fp_trend='increasing' and alert fires.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # Current window: 5 base + 8 FP tasks
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(8):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness", "error-handling"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window: 5 base + 8 tasks where error-handling is confirmed (not FP)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(8):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1, "error-handling": 1},
+            sr_failed_cats=["correctness", "error-handling"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ) as mock_dispatch,
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
+        result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    # n=8 ≥ 5, delta=1.0 → z >> 1.28 → fp_trend must be 'increasing'
+    eh = result["categories"].get("error-handling") or {}
+    assert eh.get("fp_trend") == "increasing"
+    mock_post.assert_called_once()
+    assert mock_dispatch.called
 
 
 # ---------------------------------------------------------------------------
@@ -10717,7 +11068,13 @@ def test_compute_sr_quality_by_fingerprint_groups_metrics_and_gates_low_sr_sampl
 
 @pytest.mark.parametrize(
     "origin",
-    ["reviewer", "reviewer_disagreement", "reviewer_recovery_after_incomplete_sr"],
+    [
+        "reviewer",
+        "reviewer_disagreement",
+        "reviewer_recovery_after_incomplete_sr",
+        "lone_checker_recovery",
+        "operator_requested_recovery",
+    ],
 )
 def test_compute_sr_quality_by_fingerprint_excludes_reviewer_origin(origin):
     """Reviewer-stamped passed=False entries must not inflate sr_catch_rate.
@@ -10768,7 +11125,13 @@ def test_compute_sr_quality_by_fingerprint_excludes_reviewer_origin(origin):
 
 @pytest.mark.parametrize(
     "origin",
-    ["reviewer", "reviewer_disagreement", "reviewer_recovery_after_incomplete_sr"],
+    [
+        "reviewer",
+        "reviewer_disagreement",
+        "reviewer_recovery_after_incomplete_sr",
+        "lone_checker_recovery",
+        "operator_requested_recovery",
+    ],
 )
 def test_compute_cat_fp_stats_excludes_reviewer_origin_from_sr_failed(origin):
     """A reviewer-stamped failure must NOT count toward the author SR's TP/FP totals."""
@@ -10819,7 +11182,13 @@ def test_compute_cat_fp_stats_legacy_no_origin_still_counts():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "origin",
-    ["reviewer", "reviewer_disagreement", "reviewer_recovery_after_incomplete_sr"],
+    [
+        "reviewer",
+        "reviewer_disagreement",
+        "reviewer_recovery_after_incomplete_sr",
+        "lone_checker_recovery",
+        "operator_requested_recovery",
+    ],
 )
 async def test_compute_fresh_reviewer_trend_added_value_excludes_reviewer_origin(
     db_session: AsyncSession, origin
@@ -13258,6 +13627,67 @@ def test_stats_for_tasks_lone_checker_recovery_excluded_from_sr_failed_author():
     )
     _, cat_stats, _, _, _, _ = _stats_for_tasks([t])
     # lone_checker_recovery is not an author SR failure, so fp_count must be 0.
+    security = cat_stats.get("security", {})
+    assert security.get("fp_count", 0) == 0
+
+
+def test_stats_for_tasks_operator_requested_recovery_is_reviewer_save():
+    """operator_requested_recovery origin counts as reviewer_save, not sr_alone."""
+    import uuid as _uuid
+    from app.playbook_learning import _stats_for_tasks
+
+    project_id = _uuid.uuid4()
+    check_results = {
+        "security": {
+            "passed": False,
+            "origin": "operator_requested_recovery",
+            "issue": "operator-requested re-review caught this",
+        }
+    }
+    ctx = {
+        "_self_review_outcome": {"check_results": check_results},
+        "_first_attempt_rejection_categories": {"security": 1},
+    }
+    t = Task(
+        project_id=project_id,
+        title="operator requested recovery task",
+        payloads=[{"type": "create", "prompt": "p"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    _, cat_stats, _, _, _, _ = _stats_for_tasks([t])
+    assert "security" in cat_stats
+    assert cat_stats["security"]["reviewer_save_hit_count"] == 1
+    assert cat_stats["security"]["sr_alone_hit_count"] == 0
+
+
+def test_stats_for_tasks_operator_requested_recovery_excluded_from_sr_failed_author():
+    """operator_requested_recovery findings are not counted as author SR false positives."""
+    import uuid as _uuid
+    from app.playbook_learning import _stats_for_tasks
+
+    project_id = _uuid.uuid4()
+    # SR passed (operator-requested reviewer flagged security), human did NOT reject.
+    check_results = {
+        "security": {
+            "passed": False,
+            "origin": "operator_requested_recovery",
+            "issue": "operator-requested re-review only",
+        }
+    }
+    ctx = {
+        "_self_review_outcome": {"check_results": check_results},
+        "_first_attempt_rejection_categories": {},
+    }
+    t = Task(
+        project_id=project_id,
+        title="operator requested recovery no human rejection",
+        payloads=[{"type": "create", "prompt": "p"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    _, cat_stats, _, _, _, _ = _stats_for_tasks([t])
+    # operator_requested_recovery is not an author SR failure, so fp_count must be 0.
     security = cat_stats.get("security", {})
     assert security.get("fp_count", 0) == 0
 

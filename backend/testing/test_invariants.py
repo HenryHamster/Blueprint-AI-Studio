@@ -1490,6 +1490,133 @@ class TestSrCategoryParityHelper:
         assert any("security" in msg for msg in issues)
 
 
+# ── Reviewer-origin set parity (cross-language) ───────────────────────────────
+# The agent (agent/src/handlers/standard.ts) stamps an `origin` on every
+# self-review check_results entry. The author's own entries use origin "sr" (and
+# edges use "author"); every OTHER origin is a fresh-reviewer/recovery save. The
+# backend's canonical set of non-author origins is _REVIEWER_ORIGINS in
+# backend/app/sr_blind_spots.py — catch-rate attribution buckets these as
+# reviewer saves, never author SR hits. If a future agent-side origin is added
+# without updating _REVIEWER_ORIGINS, catches would silently be miscounted as
+# author self-review hits; this test fails to prevent that drift.
+
+# Author-side origins emitted by standard.ts that must be EXCLUDED from the
+# reviewer-origin set.
+AGENT_AUTHOR_ORIGINS = frozenset({"sr", "author"})
+
+
+def _resolve_standard_ts_path() -> "str | None":
+    """Locate ``agent/src/handlers/standard.ts`` across test environments.
+
+    Search order mirrors _resolve_prompt_ts_path: env override, the Docker
+    volume-mount target, then the host filesystem relative to this test file.
+    Returns the first existing path or ``None`` if none resolve.
+    """
+    env_override = os.getenv("AGENT_STANDARD_TS")
+    candidates = []
+    if env_override:
+        candidates.append(env_override)
+    candidates.append("/agent/src/handlers/standard.ts")
+    candidates.append(
+        os.path.normpath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "agent",
+                "src",
+                "handlers",
+                "standard.ts",
+            )
+        )
+    )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _parse_origin_literals_from_standard(source_text: str) -> "frozenset[str]":
+    """Extract every ``origin`` string literal assigned in standard.ts.
+
+    Matches both ``entry.origin = 'x'`` / ``sr.reviewer_recovery_origin = 'x'``
+    and object-literal ``origin: 'x'`` forms. Comment lines reuse the same
+    literals so including them does not change the resulting set.
+    """
+    return frozenset(re.findall(r"origin\s*[:=]\s*'([^']+)'", source_text))
+
+
+class TestReviewerOriginParity:
+    """Pin the backend canonical reviewer-origin set to the exact set of
+    non-author origins the agent stamps in standard.ts. Guards against silent
+    drift back into miscounting recovery catches as author self-review hits.
+    """
+
+    def test_reviewer_origins_is_single_canonical_set(self):
+        """playbook_learning must reference the same frozenset as sr_blind_spots.
+
+        The two membership sets used to diverge (one omitted lone_checker_recovery,
+        the other operator_requested_recovery). They are now one canonical object.
+        """
+        from app.sr_blind_spots import _REVIEWER_ORIGINS as canonical
+        from app.playbook_learning import _REVIEWER_ORIGINS as via_playbook
+
+        assert via_playbook is canonical
+
+    def test_reviewer_origins_matches_expected_five(self):
+        """The canonical set is exactly the five non-author origins."""
+        from app.sr_blind_spots import _REVIEWER_ORIGINS
+
+        assert _REVIEWER_ORIGINS == frozenset(
+            {
+                "reviewer",
+                "reviewer_disagreement",
+                "reviewer_recovery_after_incomplete_sr",
+                "lone_checker_recovery",
+                "operator_requested_recovery",
+            }
+        )
+
+    def test_reviewer_origins_match_agent_source(self):
+        """Parsed standard.ts origins minus author origins must equal _REVIEWER_ORIGINS.
+
+        Skipped when agent/src/handlers/standard.ts is not available (CI Docker
+        context builds from ./backend only). Locally and via scripts/test-backend.sh
+        (which mounts agent/src) this fires and prevents drift.
+
+        If this fails: standard.ts emits a non-author origin that is not in
+        _REVIEWER_ORIGINS (backend/app/sr_blind_spots.py), or vice versa. Catches
+        with the missing origin would be misattributed to the author's self-review.
+        """
+        standard_path = _resolve_standard_ts_path()
+        if standard_path is None:
+            pytest.skip(
+                "agent/src/handlers/standard.ts not available in this test "
+                "environment (CI docker context is ./backend; run locally or via "
+                "scripts/test-backend.sh from a checkout for enforcement)"
+            )
+        from app.sr_blind_spots import _REVIEWER_ORIGINS
+
+        with open(standard_path) as f:
+            source_text = f.read()
+        all_origins = _parse_origin_literals_from_standard(source_text)
+        # Sanity: the author origins we subtract must actually appear in the source.
+        assert AGENT_AUTHOR_ORIGINS <= all_origins, (
+            "Expected author origins {sr, author} not found in standard.ts — "
+            "the origin-tagging block may have moved or been renamed."
+        )
+        agent_reviewer_origins = all_origins - AGENT_AUTHOR_ORIGINS
+        assert agent_reviewer_origins == _REVIEWER_ORIGINS, (
+            "Reviewer-origin set drift between agent and backend:\n"
+            f"  in standard.ts but not _REVIEWER_ORIGINS: "
+            f"{sorted(agent_reviewer_origins - _REVIEWER_ORIGINS)}\n"
+            f"  in _REVIEWER_ORIGINS but not standard.ts: "
+            f"{sorted(_REVIEWER_ORIGINS - agent_reviewer_origins)}\n"
+            "Update _REVIEWER_ORIGINS in backend/app/sr_blind_spots.py to match "
+            "the non-author origins emitted by standard.ts."
+        )
+
+
 # ── edges_considered Schema Invariants ────────────────────────────────────────
 # MUST stay in sync with EDGES_CONSIDERED_GUIDANCE in agent/src/prompt.ts and
 # the entry-reading code in admin_digest._compute_edges_considered_metrics /

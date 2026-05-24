@@ -43,12 +43,6 @@ from app.models import (
 )
 from app.sr_blind_spots import _REVIEWER_ORIGINS
 
-# lone_checker_recovery is set by the fresh-reviewer pass when it runs because SR
-# is the sole checker for a category.  Extend the reviewer-origin set locally so
-# catch-rate attribution treats these findings as reviewer saves, not author SR hits.
-_LONE_CHECKER_RECOVERY_ORIGIN = "lone_checker_recovery"
-_ALL_REVIEWER_ORIGINS = _REVIEWER_ORIGINS | frozenset({_LONE_CHECKER_RECOVERY_ORIGIN})
-
 # In-app Alert row title prefixes for SR catch-rate alerts. The router that
 # powers AlertsBanner returns Alert rows verbatim; we use these prefixes both
 # to format new rows and to find/dismiss prior matching rows on clear-transition.
@@ -2733,7 +2727,7 @@ def _stats_for_tasks(
         entry: dict[str, Any] | None,
     ) -> Literal["sr_alone", "reviewer_save"]:
         origin = entry.get("origin") if isinstance(entry, dict) else None
-        if isinstance(origin, str) and origin in _ALL_REVIEWER_ORIGINS:
+        if isinstance(origin, str) and origin in _REVIEWER_ORIGINS:
             return "reviewer_save"
         return "sr_alone"
 
@@ -2758,7 +2752,7 @@ def _stats_for_tasks(
         sr_failed_author = {
             c
             for c in sr_failed
-            if (check_results.get(c) or {}).get("origin") not in _ALL_REVIEWER_ORIGINS
+            if (check_results.get(c) or {}).get("origin") not in _REVIEWER_ORIGINS
         }
         rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
         cat_weights: dict[str, int] = {}
@@ -3266,7 +3260,7 @@ def _compute_cat_fp_stats(
             for c, r in check_results.items()
             if isinstance(r, dict)
             and not r.get("passed", True)
-            and r.get("origin") not in _ALL_REVIEWER_ORIGINS
+            and r.get("origin") not in _REVIEWER_ORIGINS
         }
         if not sr_failed:
             continue
@@ -3336,7 +3330,7 @@ def _compute_cat_severity_calibration(
                 continue
             if cr.get("passed", True):
                 continue
-            if cr.get("origin") in _ALL_REVIEWER_ORIGINS:
+            if cr.get("origin") in _REVIEWER_ORIGINS:
                 continue
             agent_sev = (cr.get("severity") or "").upper()
             if agent_sev not in _sw:
@@ -3415,7 +3409,7 @@ def compute_sr_quality_by_fingerprint(
             for cat, result in check_results.items()
             if isinstance(result, dict)
             and not result.get("passed", True)
-            and result.get("origin") not in _ALL_REVIEWER_ORIGINS
+            and result.get("origin") not in _REVIEWER_ORIGINS
         }
         reviewer_cats = {
             finding.get("category")
@@ -4084,9 +4078,16 @@ async def compute_sr_catch_rate_trends(
         )
         if current_fp_rate is not None and previous_fp_rate is not None:
             fp_delta = current_fp_rate - previous_fp_rate
-            if fp_delta >= _TREND_DELTA_THRESHOLD:
+            _fp_sig = (
+                curr_sr_failed >= _MIN_SR_FINDINGS
+                and prev_sr_failed >= _MIN_SR_FINDINGS
+                and _is_trend_significant(
+                    current_fp_rate, curr_sr_failed, previous_fp_rate, prev_sr_failed
+                )
+            )
+            if _fp_sig and fp_delta >= _TREND_DELTA_THRESHOLD:
                 fp_trend = "increasing"
-            elif fp_delta <= -_TREND_DELTA_THRESHOLD:
+            elif _fp_sig and fp_delta <= -_TREND_DELTA_THRESHOLD:
                 fp_trend = "decreasing"
             else:
                 fp_trend = "stable"
@@ -4458,11 +4459,20 @@ async def compute_sr_catch_rate_trends(
                 scope_rate_history.append(hit_rate)
                 scope_rate_history = scope_rate_history[-5:]
             prev_scope_hit_rate = prev_scope_entry.get("hit_rate")
+            _prev_scope_sample = int(prev_scope_entry.get("sample_count") or 0)
             if prev_scope_hit_rate is not None:
                 s_delta = hit_rate - prev_scope_hit_rate
-                if s_delta >= _TREND_DELTA_THRESHOLD:
+                _scope_n_curr = stats["human_count"]
+                _scope_sig = (
+                    _scope_n_curr >= _MIN_SR_FINDINGS
+                    and _prev_scope_sample >= _MIN_SR_FINDINGS
+                    and _is_trend_significant(
+                        hit_rate, _scope_n_curr, prev_scope_hit_rate, _prev_scope_sample
+                    )
+                )
+                if _scope_sig and s_delta >= _TREND_DELTA_THRESHOLD:
                     scope_trend: str = "increasing"
-                elif s_delta <= -_TREND_DELTA_THRESHOLD:
+                elif _scope_sig and s_delta <= -_TREND_DELTA_THRESHOLD:
                     scope_trend = "decreasing"
                 else:
                     scope_trend = "stable"
@@ -4496,11 +4506,20 @@ async def compute_sr_catch_rate_trends(
         if curr_miss is not None and prev_miss is not None:
             sev_delta = curr_miss - prev_miss
             thr = _SR_SEVERITY_DELTA_THRESHOLDS[sev]
+            _sev_n_curr = curr_s["human_count"]
+            _sev_n_prev = prev_s["human_count"]
+            _sev_sig = (
+                _sev_n_curr >= _MIN_SR_FINDINGS
+                and _sev_n_prev >= _MIN_SR_FINDINGS
+                and _is_trend_significant(
+                    curr_miss, _sev_n_curr, prev_miss, _sev_n_prev
+                )
+            )
             sev_trend = (
                 "regressing"
-                if sev_delta >= thr
+                if _sev_sig and sev_delta >= thr
                 else "improving"
-                if sev_delta <= -thr
+                if _sev_sig and sev_delta <= -thr
                 else "stable"
             )
         else:
@@ -5801,7 +5820,7 @@ async def compute_fresh_reviewer_trend(
                 for c, r in check_results.items()
                 if isinstance(r, dict)
                 and not r.get("passed", True)
-                and r.get("origin") not in _ALL_REVIEWER_ORIGINS
+                and r.get("origin") not in _REVIEWER_ORIGINS
             }
             for finding in findings:
                 cat = finding.get("category") if isinstance(finding, dict) else None
@@ -6776,7 +6795,7 @@ def get_sr_alert_drilldown_tasks(
             for c, r in check_results.items()
             if isinstance(r, dict)
             and not r.get("passed", True)
-            and r.get("origin") not in _ALL_REVIEWER_ORIGINS
+            and r.get("origin") not in _REVIEWER_ORIGINS
         }
         human_cats = set(ctx.get("_first_attempt_rejection_categories") or [])
         missed_in_target = (human_cats & target_cats) - sr_failed

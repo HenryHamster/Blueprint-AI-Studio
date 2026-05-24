@@ -641,11 +641,19 @@ def aggregate_sr_scope_drift_vs_expansion(
     }
 
 
+# Canonical set of every NON-author origin the agent stamps on a fresh-reviewer
+# /recovery check_results entry (see agent/src/handlers/standard.ts). Findings
+# with these origins are reviewer SAVES, never author self-review hits, and must
+# be excluded from author SR false-positive attribution. The author's own
+# entries use origin "sr" (and edges use "author"). test_invariants.py pins this
+# set to the exact origins emitted by standard.ts to guard against silent drift.
 _REVIEWER_ORIGINS = frozenset(
     (
         "reviewer",
         "reviewer_disagreement",
         "reviewer_recovery_after_incomplete_sr",
+        "lone_checker_recovery",
+        "operator_requested_recovery",
     )
 )
 
