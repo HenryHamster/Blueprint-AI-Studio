@@ -1362,11 +1362,11 @@ status: advancing | stalled | met
 rationale: 1 sentence — the observable evidence behind this verdict
 \`\`\`
 
-- **advancing** — landing real progress toward \`success_evidence\` (suppresses the advisory scaffolding flag — the agent confirms genuine movement).
+- **advancing** — landing real progress toward \`success_evidence\` (suppresses the advisory scaffolding flag — the agent confirms genuine movement). Look for increasing cumulative confirmed findings or an "improving" trend across recent cycles.
 - **met** — \`success_evidence\` is satisfied; the direction is effectively done (suppresses the flag; consider retiring it).
-- **stalled** — still shipping merges but NOT advancing \`success_evidence\` (outcome-less scaffolding; reinforces the flag).
+- **stalled** — still shipping merges but NOT advancing \`success_evidence\` (outcome-less scaffolding; reinforces the flag). Flat or declining cumulative confirmed findings, or "declining" trend despite ongoing work, signals stalled progress.
 
-A deterministic detector already flags stalled scaffolding on its own, so this verdict is OPTIONAL precision-tuning — only assess directions you have a genuine read on, and skip the section if none qualify. The Executor persists these via \`./strategic set-evidence-progress\`.
+Each direction in the "Direction outcomes" section above lists its cumulative confirmed-finding count and recent trend (improving/stable/declining) — use these signals when assessing whether a direction is advancing. A deterministic detector already flags stalled scaffolding on its own, so this verdict is OPTIONAL precision-tuning — only assess directions you have a genuine read on, and skip the section if none qualify. The Executor persists these via \`./strategic set-evidence-progress\`.
 
 ## 4. Running update document (for the user)
 Write the full refined running_update as markdown to \`/tmp/running_update_${p.taskId}.md\` (also show it as a code block in your analysis for auditability — the file is the authoritative handoff to the Executor). This is the document the user sees as "project current state" — rewrite, don't append. Under 400 words. Follow the section guidance above.
@@ -1865,6 +1865,16 @@ ${hotspotsSection}
           const lifetime = d.lifetime as Record<string, number> | undefined;
           if (lifetime) {
             lines.push(`Lifetime: ${lifetime.cycles || 0} total cycles, ${lifetime.merged || 0} total merged`);
+          }
+
+          const confirmedFindingCount = typeof d.confirmed_finding_count === 'number' ? d.confirmed_finding_count : null;
+          const confirmedFindingTrend = typeof d.confirmed_finding_trend === 'string' ? d.confirmed_finding_trend : null;
+          if (confirmedFindingCount !== null) {
+            let countLine = `Cumulative confirmed findings: ${confirmedFindingCount}`;
+            if (confirmedFindingTrend) {
+              countLine += ` (${confirmedFindingTrend})`;
+            }
+            lines.push(countLine);
           }
 
           const confirmed = Array.isArray(d.confirmed) ? d.confirmed as string[] : [];

@@ -555,6 +555,191 @@ async def test_success_evidence_absent_when_not_in_context(db_session):
 
 
 @pytest.mark.asyncio
+async def test_cumulative_confirmed_finding_count_and_trend_in_direction_stats(
+    db_session,
+):
+    """confirmed_finding_count and confirmed_finding_trend from outcome_progress_history reach direction stats."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-cf01",
+                "status": "active",
+                "text": "Direction with findings trend",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+                "outcome_progress_history": [
+                    {"progress": 1},
+                    {"progress": 2},
+                    {"progress": 3},
+                    {"progress": 5},
+                    {"progress": 8},
+                ],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-cf01")
+
+    assert "confirmed_finding_count" in d_stat
+    assert d_stat["confirmed_finding_count"] == 8
+    assert "confirmed_finding_trend" in d_stat
+    assert d_stat["confirmed_finding_trend"] == "improving"
+
+
+@pytest.mark.asyncio
+async def test_confirmed_finding_trend_declining_in_direction_stats(db_session):
+    """confirmed_finding_trend is declining when second half avg < first half avg * 0.7."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-cf02",
+                "status": "active",
+                "text": "Direction with declining findings",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+                "outcome_progress_history": [
+                    {"progress": 10},
+                    {"progress": 9},
+                    {"progress": 2},
+                    {"progress": 1},
+                ],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-cf02")
+
+    assert d_stat["confirmed_finding_count"] == 1
+    assert d_stat["confirmed_finding_trend"] == "declining"
+
+
+@pytest.mark.asyncio
+async def test_confirmed_finding_trend_stable_in_direction_stats(db_session):
+    """confirmed_finding_trend is stable when within the 0.7-1.3 range."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-cf03",
+                "status": "active",
+                "text": "Direction with stable findings",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+                "outcome_progress_history": [
+                    {"progress": 5},
+                    {"progress": 5},
+                    {"progress": 6},
+                    {"progress": 5},
+                ],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-cf03")
+
+    assert d_stat["confirmed_finding_count"] == 5
+    assert d_stat["confirmed_finding_trend"] == "stable"
+
+
+@pytest.mark.asyncio
+async def test_confirmed_finding_count_no_history_in_direction_stats(db_session):
+    """confirmed_finding_count is omitted when outcome_progress_history is empty."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-cf04",
+                "status": "active",
+                "text": "Direction without findings history",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-cf04")
+
+    assert "confirmed_finding_count" not in d_stat
+    assert "confirmed_finding_trend" not in d_stat
+
+
+@pytest.mark.asyncio
+async def test_confirmed_finding_trend_single_snapshot_in_direction_stats(db_session):
+    """confirmed_finding_count is present but trend is omitted with only one snapshot."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-cf05",
+                "status": "active",
+                "text": "Direction with single findings snapshot",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+                "outcome_progress_history": [{"progress": 5}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-cf05")
+
+    assert "confirmed_finding_count" in d_stat
+    assert d_stat["confirmed_finding_count"] == 5
+    assert "confirmed_finding_trend" not in d_stat
+
+
+@pytest.mark.asyncio
 async def test_operator_rejection_rate_uses_history_aggregate(db_session):
     """operator_rejection_rate aggregates from both research_history and history_aggregate."""
     project = _make_project(

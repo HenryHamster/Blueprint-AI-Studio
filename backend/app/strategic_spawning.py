@@ -1596,6 +1596,12 @@ async def _spawn_strategic_review(
             stat_entry["recent_findings_grade_distribution"] = _agg_grade
         if recent_failures:
             stat_entry["recent_failures"] = recent_failures[:5]
+        # Surface cumulative confirmed-finding count and trend from
+        # outcome_progress_history (eviction-robust signal used by scaffolding
+        # detector). Shared helper keeps thresholds in sync with strategic_analysis.
+        from app.strategic_completion import outcome_progress_summary_fields
+
+        stat_entry.update(outcome_progress_summary_fields(d))
         if d.get("system_id"):
             stat_entry["system_id"] = d["system_id"]
         if d.get("status") == "paused":

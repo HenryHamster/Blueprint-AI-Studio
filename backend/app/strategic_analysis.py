@@ -336,6 +336,12 @@ def _build_outcome_evaluation(
             outcome["proposed"] = proposed[:10]
         if failed_approaches:
             outcome["failed_approaches"] = failed_approaches[:10]
+        # Surface cumulative confirmed-finding count and trend from
+        # outcome_progress_history (eviction-robust signal used by scaffolding
+        # detector). Shared helper keeps thresholds in sync with strategic_spawning.
+        from app.strategic_completion import outcome_progress_summary_fields
+
+        outcome.update(outcome_progress_summary_fields(d))
         # Include recent diagnosis if available
         diagnosis_summary = (d.get("diagnosis_summary") or "").strip()
         if diagnosis_summary:

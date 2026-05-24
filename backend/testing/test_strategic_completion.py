@@ -4869,6 +4869,164 @@ class TestBuildOutcomeEvaluationEvidence:
         assert ev is not None
         assert len(ev) <= 5
 
+    # ── confirmed_finding_count and confirmed_finding_trend ───────────────────
+
+    def test_confirmed_finding_count_from_outcome_progress_history(self):
+        # outcome_progress_history contains cumulative confirmed-finding counts
+        # from the eviction-robust signal; the count should be the latest value.
+        project = self._make_project(
+            outcome_progress_history=[
+                {"progress": 2},
+                {"progress": 3},
+                {"progress": 5},
+            ]
+        )
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert direction.get("confirmed_finding_count") == 5
+
+    def test_confirmed_finding_count_omitted_when_no_history(self):
+        # No outcome_progress_history → confirmed_finding_count should not be present.
+        project = self._make_project()
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert "confirmed_finding_count" not in direction
+
+    def test_confirmed_finding_count_omitted_when_history_empty(self):
+        # Empty outcome_progress_history → confirmed_finding_count should not be present.
+        project = self._make_project(outcome_progress_history=[])
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert "confirmed_finding_count" not in direction
+
+    def test_confirmed_finding_trend_improving(self):
+        # Trend is improving when second half avg > first half avg * 1.3.
+        # [1, 1, 5, 5, 5, 5] -> first_avg = 1, second_avg = 5, 5 > 1.3 -> improving
+        project = self._make_project(
+            outcome_progress_history=[
+                {"progress": 1},
+                {"progress": 1},
+                {"progress": 5},
+                {"progress": 5},
+                {"progress": 5},
+                {"progress": 5},
+            ]
+        )
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert direction.get("confirmed_finding_trend") == "improving"
+
+    def test_confirmed_finding_trend_declining(self):
+        # Trend is declining when second half avg < first half avg * 0.7.
+        # [10, 10, 2, 2, 2, 2] -> first_avg = 10, second_avg = 2, 2 < 7 -> declining
+        project = self._make_project(
+            outcome_progress_history=[
+                {"progress": 10},
+                {"progress": 10},
+                {"progress": 2},
+                {"progress": 2},
+                {"progress": 2},
+                {"progress": 2},
+            ]
+        )
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert direction.get("confirmed_finding_trend") == "declining"
+
+    def test_confirmed_finding_trend_stable(self):
+        # Trend is stable when between 0.7 and 1.3 thresholds.
+        # [5, 5, 5, 5, 5, 5] -> both halves same -> stable
+        project = self._make_project(
+            outcome_progress_history=[
+                {"progress": 5},
+                {"progress": 5},
+                {"progress": 5},
+                {"progress": 5},
+                {"progress": 5},
+                {"progress": 5},
+            ]
+        )
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert direction.get("confirmed_finding_trend") == "stable"
+
+    def test_confirmed_finding_trend_omitted_with_single_snapshot(self):
+        # Trend requires at least 2 snapshots to compute.
+        project = self._make_project(outcome_progress_history=[{"progress": 3}])
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert direction.get("confirmed_finding_count") == 3
+        assert "confirmed_finding_trend" not in direction
+
+    def test_confirmed_finding_trend_handles_odd_length_history(self):
+        # Odd-length history: [1, 1, 1, 7, 7, 7, 7] -> first_avg = 1, second_avg ≈ 6.67
+        # 6.67 > 1.3 -> improving
+        project = self._make_project(
+            outcome_progress_history=[
+                {"progress": 1},
+                {"progress": 1},
+                {"progress": 1},
+                {"progress": 7},
+                {"progress": 7},
+                {"progress": 7},
+                {"progress": 7},
+            ]
+        )
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert direction.get("confirmed_finding_trend") == "improving"
+
+    def test_confirmed_finding_trend_with_zero_progress(self):
+        # All zeros: first_avg = 0, second_avg = 0 -> stable (within 0.7-1.3 range)
+        project = self._make_project(
+            outcome_progress_history=[
+                {"progress": 0},
+                {"progress": 0},
+                {"progress": 0},
+                {"progress": 0},
+            ]
+        )
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert direction.get("confirmed_finding_count") == 0
+        assert direction.get("confirmed_finding_trend") == "stable"
+
+    def test_confirmed_finding_count_handles_none_progress_values(self):
+        # Some snapshots may have None or missing progress field; treat as 0.
+        project = self._make_project(
+            outcome_progress_history=[
+                {"progress": 2},
+                {"progress": None},
+                {"progress": 5},
+            ]
+        )
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        # Latest progress should be 5, not None
+        assert direction.get("confirmed_finding_count") == 5
+
+    def test_confirmed_finding_fields_coexist_with_evidence(self):
+        # Both evidence and confirmed-finding fields should appear together.
+        evidence = [
+            {
+                "title": "Finding A",
+                "claims": ["c1"],
+                "source_refs": [{"ref": "backend/foo.py"}],
+            }
+        ]
+        project = self._make_project(
+            recent_findings_evidence=evidence,
+            outcome_progress_history=[
+                {"progress": 2},
+                {"progress": 5},
+            ],
+        )
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert "evidence" in direction
+        assert direction.get("confirmed_finding_count") == 5
+        assert direction.get("confirmed_finding_trend") == "improving"
+
 
 class TestFormatFindingsForPrompt:
     """format_findings_for_prompt: compact prompt block from query_findings_index rows."""
@@ -5757,6 +5915,70 @@ class TestComputeOutcomeProgressSignal:
         assert _compute_outcome_progress_signal({}) == 0
         assert _compute_outcome_progress_signal({"research_context": ""}) == 0
 
+    def test_includes_evicted_confirmed_count(self):
+        # Evicted CONFIRMED findings must be counted even though they are no longer
+        # in the visible list. 1 visible confirmed + 2 evicted-confirmed = 3.
+        # The eviction summary's "(2 confirmed)" sub-count — not the raw
+        # established total — is what the signal credits.
+        ctx = (
+            "## Established Findings\n"
+            "- Finding A\n"
+            "## Eviction Summary\n"
+            "2 established (2 confirmed), 1 failed evicted\n"
+        )
+        d = {"research_context": ctx}
+        assert _compute_outcome_progress_signal(d) == 3
+
+    def test_evicted_proposed_or_failed_do_not_inflate_signal(self):
+        # A saturated direction that evicts only proposed/failed (churn) entries
+        # must NOT appear to advance: the established total is high but the
+        # confirmed sub-count is 0, so only the visible confirmed finding counts.
+        # This is the false-negative the confirmed-only filter guards against.
+        ctx = (
+            "## Established Findings\n"
+            "- Finding A\n"
+            "## Eviction Summary\n"
+            "5 established (0 confirmed), 1 failed evicted\n"
+        )
+        d = {"research_context": ctx}
+        assert (
+            _compute_outcome_progress_signal(d) == 1
+        )  # 1 visible + 0 confirmed-evicted
+
+    def test_legacy_eviction_summary_credits_zero_confirmed(self):
+        # Pre-existing summaries written before the "(N confirmed)" sub-count
+        # parse to 0 confirmed — a safe undercount, never an over-count.
+        ctx = (
+            "## Established Findings\n"
+            "- Finding A\n"
+            "## Eviction Summary\n"
+            "2 established evicted, 0 failed evicted\n"
+        )
+        d = {"research_context": ctx}
+        assert _compute_outcome_progress_signal(d) == 1  # only the visible finding
+
+    def test_signal_grows_as_confirmed_eviction_count_increases(self):
+        # Simulate two consecutive cycles where the visible confirmed count is
+        # pinned at 1 (research_context at cap) but the confirmed-eviction counter
+        # grows because each new confirmed finding evicts an old confirmed one.
+        ctx_cycle1 = (
+            "## Established Findings\n"
+            "- Finding B\n"
+            "## Eviction Summary\n"
+            "1 established (1 confirmed) evicted, 0 failed evicted\n"
+        )
+        ctx_cycle2 = (
+            "## Established Findings\n"
+            "- Finding C\n"
+            "## Eviction Summary\n"
+            "2 established (2 confirmed) evicted, 0 failed evicted\n"
+        )
+        sig1 = _compute_outcome_progress_signal({"research_context": ctx_cycle1})
+        sig2 = _compute_outcome_progress_signal({"research_context": ctx_cycle2})
+        assert sig1 == 2  # 1 visible + 1 confirmed-evicted
+        assert sig2 == 3  # 1 visible + 2 confirmed-evicted
+        assert sig2 > sig1  # cumulative grows even though visible count is flat
+
 
 class TestRecordOutcomeProgressSnapshot:
     def test_appends_snapshot_with_expected_fields(self):
@@ -5967,6 +6189,26 @@ class TestCheckOutcomeScaffolding:
         d = _scaffolding_direction(
             [5, 5, 5, 5, 5, 5],
             evidence_progress={"status": "advancing"},
+        )
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_not_flagged_when_evicted_count_grows_across_window(self):
+        # Saturated-but-advancing direction: the research_context visible count is
+        # pinned at the cap (5 entries), but each cycle a new confirmed finding
+        # evicts an old one so the cumulative (visible + evicted) signal grows.
+        # The snapshots reflect the cumulative count from _compute_outcome_progress_signal,
+        # so the detector sees a growing window and correctly returns None.
+        # Under the old visible-only signal the window would have been [5,5,5,5,5,5]
+        # and the direction would have been wrongly flagged as stalled scaffolding.
+        ctx = (
+            "## Established Findings\n"
+            + "".join(f"- Finding {i}\n" for i in range(5))
+            + "\n## Eviction Summary\n"
+            "5 established (5 confirmed) evicted, 0 failed evicted\n"
+        )
+        d = _scaffolding_direction(
+            [5, 6, 7, 8, 9, 10],
+            research_context=ctx,
         )
         assert _check_outcome_scaffolding(d) is None
 

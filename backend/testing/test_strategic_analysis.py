@@ -866,6 +866,114 @@ def test_confirmed_and_proposed_findings():
     assert any("Finding proposed" in c for c in d["proposed"])
 
 
+def test_cumulative_confirmed_finding_count_and_trend():
+    """Verify outcome includes cumulative confirmed-finding count and trend."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [],
+            "outcome_progress_history": [
+                {"progress": 1},
+                {"progress": 2},
+                {"progress": 3},
+                {"progress": 5},  # improving trend
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    d = result["directions"][0]
+
+    assert "confirmed_finding_count" in d
+    assert d["confirmed_finding_count"] == 5
+    assert "confirmed_finding_trend" in d
+    assert d["confirmed_finding_trend"] == "improving"
+
+
+def test_confirmed_finding_trend_declining():
+    """Verify declining trend detection."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [],
+            "outcome_progress_history": [
+                {"progress": 10},
+                {"progress": 9},
+                {"progress": 5},
+                {"progress": 4},  # declining trend
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    d = result["directions"][0]
+
+    assert d["confirmed_finding_trend"] == "declining"
+
+
+def test_confirmed_finding_trend_stable():
+    """Verify stable trend detection."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [],
+            "outcome_progress_history": [
+                {"progress": 5},
+                {"progress": 5},
+                {"progress": 5},
+                {"progress": 6},  # stable trend (6 is not > 5*1.3 and not < 5*0.7)
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    d = result["directions"][0]
+
+    assert d["confirmed_finding_trend"] == "stable"
+
+
+def test_confirmed_finding_count_no_history():
+    """Verify missing outcome_progress_history doesn't add the field."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [],
+            # No outcome_progress_history
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    d = result["directions"][0]
+
+    assert "confirmed_finding_count" not in d
+    assert "confirmed_finding_trend" not in d
+
+
+def test_confirmed_finding_trend_single_snapshot():
+    """Verify trend not added with single snapshot."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [],
+            "outcome_progress_history": [
+                {"progress": 5},
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    d = result["directions"][0]
+
+    assert "confirmed_finding_count" in d
+    assert d["confirmed_finding_count"] == 5
+    assert "confirmed_finding_trend" not in d  # no trend with only 1 snapshot
+
+
 # ---------------------------------------------------------------------------
 # difficulty_index
 # ---------------------------------------------------------------------------

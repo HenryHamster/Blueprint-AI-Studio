@@ -50,6 +50,7 @@ def _parse_eviction_counts(summary_text: Optional[str]) -> dict:
     """Parse counts and failed titles from an eviction summary body."""
     result: dict = {
         "established": 0,
+        "established_confirmed": 0,
         "failed": 0,
         "open_questions": 0,
         "failed_titles": [],
@@ -68,6 +69,13 @@ def _parse_eviction_counts(summary_text: Optional[str]) -> dict:
             m = re.search(r"(\d+) established", line)
             if m:
                 result["established"] = int(m.group(1))
+            # Confirmed sub-count: established evictions that were neither
+            # (proposed) nor (failed:) at eviction time. Legacy summaries
+            # written before this sub-count existed parse to 0 (a safe
+            # undercount, never an over-count).
+            m = re.search(r"(\d+) confirmed", line)
+            if m:
+                result["established_confirmed"] = int(m.group(1))
             m = re.search(r"(\d+) failed", line)
             if m:
                 result["failed"] = int(m.group(1))
@@ -101,12 +109,29 @@ def _format_evicted_failed(entry: str, max_len: int = 60) -> str:
 
 
 def _format_eviction_body(
-    established: int, failed: int, open_questions: int, failed_titles: list
+    established: int,
+    failed: int,
+    open_questions: int,
+    failed_titles: list,
+    established_confirmed: int = 0,
 ) -> str:
-    """Format the eviction summary body content (without the ## header line)."""
+    """Format the eviction summary body content (without the ## header line).
+
+    ``established_confirmed`` is the subset of evicted established entries that
+    were confirmed (neither ``(proposed)`` nor ``(failed:)``) at eviction time.
+    It is emitted as a parenthetical on the established count so the
+    outcome-progress proxy can credit only durable evictions, mirroring the
+    visible-count exclusion. Omitted when zero so legacy/empty summaries stay
+    compact.
+    """
     count_parts = []
     if established > 0:
-        count_parts.append(f"{established} established")
+        if established_confirmed > 0:
+            count_parts.append(
+                f"{established} established ({established_confirmed} confirmed)"
+            )
+        else:
+            count_parts.append(f"{established} established")
     if failed > 0:
         count_parts.append(f"{failed} failed")
     if open_questions > 0:
@@ -309,6 +334,7 @@ def _build_research_context(
                 prior_eviction["failed"],
                 prior_eviction["open_questions"],
                 prior_eviction["failed_titles"],
+                prior_eviction["established_confirmed"],
             )
             return _format_doc(parsed, eviction_body[:EVICTION_MAX])[:TOTAL_MAX]
         return doc
@@ -339,6 +365,16 @@ def _build_research_context(
     new_established = len(before["established"]) - len(parsed["established"])
     new_failed = len(before["failed"]) - len(parsed["failed"])
     new_oq = len(before["open_questions"]) - len(parsed["open_questions"])
+
+    # Confirmed sub-count: of the evicted established entries, how many were
+    # durable (neither proposed nor failed). The outcome-progress proxy credits
+    # only these, matching the visible-count exclusion so a saturated direction
+    # that evicts only churn (proposed/failed) entries does not appear to advance.
+    new_established_confirmed = sum(
+        1
+        for e in before["established"][:new_established]
+        if "(proposed)" not in e and "(failed:" not in e
+    )
 
     evicted_failed_titles = (
         [_format_evicted_failed(e) for e in before["failed"][:new_failed]]
@@ -376,12 +412,19 @@ def _build_research_context(
 
     # Merge with prior eviction summary
     total_established = prior_eviction["established"] + new_established
+    total_established_confirmed = (
+        prior_eviction["established_confirmed"] + new_established_confirmed
+    )
     total_failed = prior_eviction["failed"] + new_failed
     total_oq = prior_eviction["open_questions"] + new_oq
     all_failed_titles = prior_eviction["failed_titles"] + evicted_failed_titles
 
     eviction_body = _format_eviction_body(
-        total_established, total_failed, total_oq, all_failed_titles
+        total_established,
+        total_failed,
+        total_oq,
+        all_failed_titles,
+        total_established_confirmed,
     )
     return _format_doc(parsed, eviction_body[:EVICTION_MAX])[:TOTAL_MAX]
 

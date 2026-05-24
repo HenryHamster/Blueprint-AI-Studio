@@ -1068,15 +1068,22 @@ def _outcome_progress_config() -> dict:
 
 
 def _compute_outcome_progress_signal(direction: dict) -> int:
-    """Deterministic outcome-progress proxy: count of confirmed established findings.
+    """Deterministic outcome-progress proxy: cumulative confirmed established findings.
 
-    Counts confirmed (non-proposed) entries in the direction's accumulated
-    research_context. This grows when a direction lands durable confirmed evidence
-    toward its success_evidence and stays flat when it merely ships
-    scaffolding/refactor PRs that produce no new confirmed findings — which is
-    exactly the signal the scaffolding detector keys off of.
+    Counts confirmed (non-proposed, non-failed) entries currently visible in the
+    direction's research_context PLUS confirmed findings that were evicted from
+    the document once it reached its character cap. Both halves apply the SAME
+    confirmed-only filter: the visible count excludes ``(proposed)`` /
+    ``(failed:)`` entries, and the evicted half reads ``established_confirmed`` —
+    the eviction summary's sub-count of durable evictions — NOT the raw
+    ``established`` total (which also tallies evicted proposed/failed entries).
+    This keeps the two halves consistent, so a saturated long-running direction
+    that evicts only churn (proposed/failed) entries does NOT appear to advance,
+    while genuine confirmed findings still increment the signal whether they sit
+    below the cap (visible) or were trimmed at the cap (evicted_confirmed). The
+    combined value is monotonically non-decreasing for confirmed progress.
     """
-    from app.research_context import _parse_research_context
+    from app.research_context import _parse_eviction_counts, _parse_research_context
 
     ctx = direction.get("research_context") or ""
     if not ctx:
@@ -1085,11 +1092,45 @@ def _compute_outcome_progress_signal(direction: dict) -> int:
     # Count only durably-landed findings: exclude proposed (not yet shipped) and
     # failed (retagged after an unsuccessful fix attempt) so churn-only directions
     # don't appear to advance.
-    return sum(
+    visible = sum(
         1
         for item in parsed.get("established", [])
         if "(proposed)" not in item and "(failed:" not in item
     )
+    evicted_confirmed = _parse_eviction_counts(parsed.get("eviction_summary")).get(
+        "established_confirmed", 0
+    )
+    return visible + evicted_confirmed
+
+
+def outcome_progress_summary_fields(direction: dict) -> dict:
+    """Cumulative confirmed-finding count + trend from outcome_progress_history.
+
+    Single source of truth for the eviction-robust signal surfaced to the
+    strategic cycle. Shared by both producers — strategic_analysis
+    (_build_outcome_evaluation) and strategic_spawning (_spawn_strategic_review)
+    — so the count selection and trend thresholds cannot drift between them.
+    Returns {} when no snapshots exist; otherwise {"confirmed_finding_count": int}
+    plus "confirmed_finding_trend" ("improving"/"declining"/"stable") once ≥2
+    snapshots are available. Trend compares the mean of the first half of
+    snapshots against the second half (±30% band).
+    """
+    snaps = direction.get("outcome_progress_history") or []
+    if not snaps:
+        return {}
+    progress_vals = [int(s.get("progress", 0) or 0) for s in snaps]
+    fields: dict = {"confirmed_finding_count": progress_vals[-1]}
+    if len(progress_vals) >= 2:
+        mid = len(progress_vals) // 2
+        first_avg = sum(progress_vals[:mid]) / max(mid, 1)
+        second_avg = sum(progress_vals[mid:]) / max(len(progress_vals) - mid, 1)
+        if second_avg > first_avg * 1.3:
+            fields["confirmed_finding_trend"] = "improving"
+        elif second_avg < first_avg * 0.7:
+            fields["confirmed_finding_trend"] = "declining"
+        else:
+            fields["confirmed_finding_trend"] = "stable"
+    return fields
 
 
 def record_outcome_progress_snapshot(direction: dict) -> None:
@@ -1201,13 +1242,15 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
         return None
     window = snaps[-run:]
     progress_vals = [int(s.get("progress", 0) or 0) for s in window]
-    # Gate on whether confirmed-finding count grew during the stall window.
-    # max() over the window is monotonic w.r.t. eviction: if research_context
-    # was trimmed mid-window, the peak is still captured and we correctly
-    # return None (advancing direction). success_evidence_fp is intentionally
-    # NOT used here: that text is static goal copy written at direction creation
-    # and never rewritten as findings accumulate, so its fingerprint is always
-    # constant regardless of whether the direction is advancing or stalled.
+    # Gate on whether the cumulative confirmed-finding count grew during the stall
+    # window. The signal from _compute_outcome_progress_signal is visible + evicted
+    # confirmed findings, so it is monotonically non-decreasing regardless of
+    # research_context cap saturation. A saturated-but-advancing direction produces
+    # growing cumulative values even though its visible count is pinned at the cap.
+    # success_evidence_fp is intentionally NOT used here: that text is static goal
+    # copy written at direction creation and never rewritten as findings accumulate,
+    # so its fingerprint is always constant regardless of whether the direction is
+    # advancing or stalled.
     if max(progress_vals) > progress_vals[0]:
         return None  # finding count grew -> direction is advancing
     # Never met its outcome (current completion detector must also be negative).
