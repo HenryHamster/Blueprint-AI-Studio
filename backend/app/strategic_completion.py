@@ -1082,7 +1082,14 @@ def _compute_outcome_progress_signal(direction: dict) -> int:
     if not ctx:
         return 0
     parsed = _parse_research_context(ctx)
-    return sum(1 for item in parsed.get("established", []) if "(proposed)" not in item)
+    # Count only durably-landed findings: exclude proposed (not yet shipped) and
+    # failed (retagged after an unsuccessful fix attempt) so churn-only directions
+    # don't appear to advance.
+    return sum(
+        1
+        for item in parsed.get("established", [])
+        if "(proposed)" not in item and "(failed:" not in item
+    )
 
 
 def record_outcome_progress_snapshot(direction: dict) -> None:
@@ -1194,9 +1201,15 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
         return None
     window = snaps[-run:]
     progress_vals = [int(s.get("progress", 0) or 0) for s in window]
-    fp_vals = [s.get("success_evidence_fp") for s in window]
-    if len(set(fp_vals)) != 1:
-        return None  # success_evidence changed across the window -> advancing
+    # Gate on whether confirmed-finding count grew during the stall window.
+    # max() over the window is monotonic w.r.t. eviction: if research_context
+    # was trimmed mid-window, the peak is still captured and we correctly
+    # return None (advancing direction). success_evidence_fp is intentionally
+    # NOT used here: that text is static goal copy written at direction creation
+    # and never rewritten as findings accumulate, so its fingerprint is always
+    # constant regardless of whether the direction is advancing or stalled.
+    if max(progress_vals) > progress_vals[0]:
+        return None  # finding count grew -> direction is advancing
     # Never met its outcome (current completion detector must also be negative).
     if _check_direction_completion(direction) is not None:
         return None
@@ -1212,7 +1225,7 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
         "stall_run_cycles": run,
         "progress_signal": progress_vals[-1],
         "outcome_progress_window": progress_vals,
-        "success_evidence_unchanged_cycles": run,
+        "progress_stagnant_cycles": run,
     }
 
 

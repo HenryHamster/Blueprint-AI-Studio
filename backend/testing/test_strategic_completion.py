@@ -5742,6 +5742,17 @@ class TestComputeOutcomeProgressSignal:
         d = {"research_context": ctx}
         assert _compute_outcome_progress_signal(d) == 2
 
+    def test_excludes_failed_findings(self):
+        # Findings retagged (failed: ...) must NOT count as progress.
+        ctx = (
+            "## Established Findings\n"
+            "- Finding A (failed: test_failure)\n"
+            "- Finding B (failed: unknown)\n"
+            "- Finding C (merged)\n"
+        )
+        d = {"research_context": ctx}
+        assert _compute_outcome_progress_signal(d) == 1  # only C counts
+
     def test_empty_context_returns_zero(self):
         assert _compute_outcome_progress_signal({}) == 0
         assert _compute_outcome_progress_signal({"research_context": ""}) == 0
@@ -5818,11 +5829,23 @@ class TestCheckOutcomeScaffolding:
         assert ev["stall_run_cycles"] == 6
         assert ev["progress_signal"] == 5
 
-    def test_does_not_fire_when_success_evidence_advancing(self):
-        # success_evidence fingerprint varies across the window -> not stalled.
+    def test_does_not_fire_when_progress_rising(self):
+        # confirmed-finding count grew during the window -> not stalled.
+        d = _scaffolding_direction([5, 5, 5, 6, 7, 8])
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_does_not_fire_when_progress_rose_then_evicted(self):
+        # Progress peaked mid-window but then dropped (eviction). max() > first
+        # value so we must not flag.
+        d = _scaffolding_direction([5, 5, 7, 7, 5, 5])
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_fires_when_only_fp_changes_but_progress_flat(self):
+        # Changing success_evidence fingerprint is NOT a reliable advancing signal;
+        # flat progress with varying fps must still flag.
         fps = [f"fp{i:015d}" for i in range(6)]
         d = _scaffolding_direction([5, 5, 5, 5, 5, 5], success_evidence_fps=fps)
-        assert _check_outcome_scaffolding(d) is None
+        assert _check_outcome_scaffolding(d) is not None
 
     def test_does_not_fire_on_churn_burn_low_merge_rate(self):
         # lifetime_merged still >= floor, but merge_rate is far below the min,
@@ -5876,6 +5899,28 @@ class TestCheckOutcomeScaffolding:
         # lifetime_merged = 0 + 2 = 2 < default merge_floor (8)
         assert _check_outcome_scaffolding(d) is None
 
+    def test_fires_when_churning_only_failed_findings(self):
+        # A direction that keeps shipping PRs but all its established findings
+        # are retagged (failed: ...) — the progress signal must stay at 0 and
+        # the scaffolding flag must still fire.
+        ctx = (
+            "## Established Findings\n"
+            "- Finding A (failed: test_failure)\n"
+            "- Finding B (failed: unknown)\n"
+        )
+        # All snapshots show 0 progress because the only established items are
+        # failed. Simulate that with progress_window=[0, 0, 0, 0, 0, 0] and
+        # inject the research_context so _compute_outcome_progress_signal would
+        # also return 0 if called fresh.
+        d = _scaffolding_direction(
+            [0, 0, 0, 0, 0, 0],
+            research_context=ctx,
+        )
+        ev = _check_outcome_scaffolding(d)
+        assert ev is not None
+        assert ev["progress_signal"] == 0
+        assert ev["progress_stagnant_cycles"] == 6
+
     # ── Agent evidence_progress verdict refinement ──────────────────────────
     # _scaffolding_direction has total_cycles=14, stall_run=6, so a verdict at
     # cycle_index >= 9 is "current" (14 - cycle_index < 6) and one at <= 8 is stale.
@@ -5927,15 +5972,21 @@ class TestCheckOutcomeScaffolding:
 
 
 class TestOutcomeScaffoldingSuccessEvidenceFp:
-    def test_unchanged_success_evidence_with_merges_flagged(self):
-        # All snapshots share the same fp -> success_evidence never advanced -> flagged.
+    def test_flat_progress_with_merges_flagged(self):
+        # Confirmed-finding count never grew -> stalled -> flagged.
         d = _scaffolding_direction([5, 5, 5, 5, 5, 5])
         ev = _check_outcome_scaffolding(d)
         assert ev is not None
-        assert ev["success_evidence_unchanged_cycles"] == 6
+        assert ev["progress_stagnant_cycles"] == 6
 
-    def test_changing_success_evidence_not_flagged(self):
-        # success_evidence text changed mid-window -> not flagged even with steady merges.
+    def test_rising_progress_with_unchanged_fp_not_flagged(self):
+        # Progress grew even though success_evidence fp is static — must NOT flag.
+        d = _scaffolding_direction([5, 5, 6, 7, 8, 9])
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_changing_fp_alone_does_not_suppress_flag(self):
+        # success_evidence text changing is not an advancing signal; flat progress
+        # with varying fps still flags.
         fps = [
             _EMPTY_SE_FP,
             _EMPTY_SE_FP,
@@ -5945,7 +5996,7 @@ class TestOutcomeScaffoldingSuccessEvidenceFp:
             "aabbccdd00112233",
         ]
         d = _scaffolding_direction([5, 5, 5, 5, 5, 5], success_evidence_fps=fps)
-        assert _check_outcome_scaffolding(d) is None
+        assert _check_outcome_scaffolding(d) is not None
 
     def test_snapshot_records_success_evidence_fp(self):
         d = {

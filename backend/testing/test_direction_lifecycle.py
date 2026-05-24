@@ -1515,7 +1515,7 @@ async def test_lifecycle_flags_outcome_scaffolding_and_notifies_once(
 async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
     db_session, mocker
 ):
-    """Once success-evidence advances across the window, the advisory flag is cleared."""
+    """Once the confirmed-finding count grows across the window, the advisory flag is cleared."""
     mocker.patch(
         "app.notification_dispatch.post_direction_outcome_stalled_message",
         new_callable=AsyncMock,
@@ -1532,10 +1532,10 @@ async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
     await db_session.refresh(project)
     assert project.directions[0].get("outcome_scaffolding_flagged") is True
 
-    # Progress resumes -> the success-evidence fingerprint now varies across the
-    # window, which the detector reads as advancement.
+    # Progress resumes -> the confirmed-finding count grows across the window,
+    # which the detector reads as advancement.
     project.directions[0]["outcome_progress_history"] = [
-        {"progress": 5, "success_evidence_fp": f"fp{i:015d}"} for i in range(6)
+        {"progress": p} for p in [5, 5, 6, 7, 8, 9]
     ]
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -1806,10 +1806,10 @@ async def test_scaffolding_flag_clear_resets_counter(db_session, mocker):
         new_callable=AsyncMock,
     )
 
-    # Vary the success_evidence fingerprints so _check_outcome_scaffolding returns None
+    # Grow the confirmed-finding count so _check_outcome_scaffolding returns None
     direction = _already_flagged_direction(flagged_cycles=2)
     direction["outcome_progress_history"] = [
-        {"progress": 5, "success_evidence_fp": f"fp{i:015d}"} for i in range(6)
+        {"progress": p} for p in [5, 5, 6, 7, 8, 9]
     ]
     project = await _make_cost_project(db_session, direction)
 
