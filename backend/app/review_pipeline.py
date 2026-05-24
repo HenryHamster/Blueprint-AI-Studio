@@ -35,6 +35,70 @@ from app.spawn_calibration import (
 logger = logging.getLogger(__name__)
 
 
+def build_ci_failure_fix_prompt(
+    *,
+    pr_number: int,
+    base_branch: str,
+    ci_errors: str,
+    owner: str | None = None,
+    repo: str | None = None,
+) -> str:
+    """Canonical prompt for a fix task spawned because CI failed on an
+    already-approved PR.
+
+    **Conflict-aware by construction.** A rollup PR that reaches the CI gate can
+    *also* be out-of-date / conflicting against base. A fix prompt that only
+    mentions "build/lint/test errors" — and worse, says "don't change logic" —
+    sends the agent to chase CI failures while the merge conflict sits
+    untouched, because the agent never even rebases onto base to discover it.
+    Each cycle burns a review-fix iteration until the global cap auto-closes
+    the PR with the work stranded (incident 2026-05-23, PR #5587: a single
+    trivial import conflict outlived 6 iterations of CI-only fixes).
+
+    Every CI-failure fix path MUST therefore rebase onto base first and resolve
+    any conflict as part of the same fix. This is the single source of truth so
+    the paths in ci_completion.py and task_lifecycle.py cannot drift again.
+    """
+    failing_tests = sorted(
+        set(re.findall(r"^FAILED\s+(\S+::\S+)", ci_errors or "", flags=re.MULTILINE))
+    )[:25]
+    failing_tests_block = (
+        "\nFailing tests (extracted from CI summary — fix these):\n"
+        + "\n".join(f"  - {t}" for t in failing_tests)
+        + "\n"
+        if failing_tests
+        else ""
+    )
+    check_runs_hint = ""
+    if owner and repo:
+        check_runs_hint = (
+            f"  2. Inspect the failing checks via the GitHub API "
+            f'(`curl -H "Authorization: Bearer $GITHUB_TOKEN" '
+            f"https://api.github.com/repos/{owner}/{repo}/commits/$(git rev-parse HEAD)/check-runs`) "
+            f"to confirm which checks are still failing on the latest head.\n"
+        )
+    return (
+        f"PR #{pr_number} is blocked by failing CI checks (code review already approved).\n\n"
+        f"IMPORTANT — verify current state before acting. Between when this task was spawned and "
+        f"when you run, the PR's mergeable state or check-run results may have changed. The PR may "
+        f"also be conflicting or behind `{base_branch}`, which blocks the merge independently of CI. "
+        f"After cloning:\n"
+        f"  1. Run `git fetch origin {base_branch} && git rebase origin/{base_branch}` FIRST — if "
+        f"conflicts surface, resolve every marker (preserve the intent of both branches) and continue "
+        f"the rebase before touching anything else. A conflicting PR cannot merge no matter how green CI is.\n"
+        f"{check_runs_hint}"
+        f"{failing_tests_block}\n"
+        f"CI errors captured at spawn time:\n{ci_errors[:2000]}\n\n"
+        f"Focus: fix the build/lint/test errors — the code review is already approved, "
+        f"don't re-architect unrelated code. If a failing test was already broken on `{base_branch}` "
+        f"(unrelated to this PR's diff), repairing it is still in scope — fix it as part of "
+        f"this PR rather than skipping or `./blocked`-ing.\n\n"
+        f"Before declaring done: ensure (a) `git rebase origin/{base_branch}` succeeds cleanly with no "
+        f"remaining conflict markers, (b) local lint/type/test suites pass on the changed files, "
+        f"and (c) every fix is committed."
+    )
+
+
 MAX_REVIEW_FIX_ITERATIONS = 16
 
 # Phase 2c (warm-VM continuity): how long after a source task's last heartbeat

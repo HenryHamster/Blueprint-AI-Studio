@@ -1318,24 +1318,6 @@ async def handle_ci_completion(
             return True
 
         ci_errors = ci_result.get("failed_logs", "CI checks failed")
-        # Pre-extract pytest failure tokens (FAILED testing/path::test_name)
-        # so the agent's prompt has a clean list up front instead of having
-        # to scan ~2KB of noisy log tail. ci_errors is also kept verbatim
-        # below for stack-trace context.
-        failing_tests = sorted(
-            set(
-                re.findall(
-                    r"^FAILED\s+(\S+::\S+)", ci_errors or "", flags=re.MULTILINE
-                )
-            )
-        )[:25]
-        failing_tests_block = (
-            "\nFailing tests (extracted from CI summary — fix these):\n"
-            + "\n".join(f"  - {t}" for t in failing_tests)
-            + "\n"
-            if failing_tests
-            else ""
-        )
         await create_pr_comment(
             gh_token,
             owner,
@@ -1343,24 +1325,14 @@ async def handle_ci_completion(
             ci_pr_number,
             f"**Blueprint CI**: Checks failed.\n\n```\n{ci_errors[:2000]}\n```",
         )
-        ci_fix_prompt = (
-            f"PR #{ci_pr_number} is blocked by failing CI checks (code review already approved).\n\n"
-            f"IMPORTANT — verify current state before acting. Between when this task was spawned and "
-            f"when you run, the PR's mergeable state or check-run results may have changed. After cloning:\n"
-            f"  1. Attempt `git rebase origin/{ci_base}` — if conflicts appear, resolve them first.\n"
-            f"  2. Inspect the failing checks via the GitHub API "
-            f'(`curl -H "Authorization: Bearer $GITHUB_TOKEN" '
-            f"https://api.github.com/repos/{owner}/{repo}/commits/$(git rev-parse HEAD)/check-runs`) "
-            f"to confirm which checks are still failing on the latest head.\n"
-            f"{failing_tests_block}\n"
-            f"CI errors captured at spawn time:\n{ci_errors[:2000]}\n\n"
-            f"Focus: fix the build/lint/test errors — the code review is already approved, "
-            f"don't re-architect unrelated code. If a failing test was already broken on `main` "
-            f"(unrelated to this PR's diff), repairing it is still in scope — fix it as part of "
-            f"this PR rather than skipping or `./blocked`-ing.\n\n"
-            f"Before declaring done: ensure (a) `git rebase origin/{ci_base}` succeeds cleanly with no "
-            f"remaining conflict markers, (b) local lint/type/test suites pass on the changed files, "
-            f"and (c) every fix is committed."
+        from app.review_pipeline import build_ci_failure_fix_prompt
+
+        ci_fix_prompt = build_ci_failure_fix_prompt(
+            pr_number=ci_pr_number,
+            base_branch=ci_base,
+            ci_errors=ci_errors,
+            owner=owner,
+            repo=repo,
         )
         fix_task, _ = await _spawn_pipeline_task(
             task,

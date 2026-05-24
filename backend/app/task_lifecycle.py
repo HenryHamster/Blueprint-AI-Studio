@@ -41,7 +41,7 @@ from app.shared_state import runtime_config as _runtime_config, DEFAULT_TASK_SCO
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project
 from app.payload_schemas import validate_internal_payload
-from app.review_pipeline import _spawn_pipeline_task
+from app.review_pipeline import _spawn_pipeline_task, build_ci_failure_fix_prompt
 from app.rollup_management import _check_and_trigger_rollup, _cleanup_branches
 from app.notification_dispatch import (
     is_residual_remediation_task,
@@ -3259,11 +3259,18 @@ async def _process_post_commit(
                                 pr_number,
                                 f"**Blueprint CI**: Checks failed — spawning fix task.\n\n```\n{ci_errors[:2000]}\n```",
                             )
-                            ci_fix_prompt = (
-                                f"CI checks failed on PR #{pr_number} (code review already approved).\n\n"
-                                f"CI errors:\n{ci_errors}\n\n"
-                                f"Fix only the build/lint/test errors. The code review is already "
-                                f"approved — don't change logic, just fix CI failures."
+                            # Conflict-aware canonical prompt (review_pipeline):
+                            # the old prompt here only mentioned "build/lint/test
+                            # errors" and said "don't change logic", so a PR that
+                            # was ALSO conflicting never got rebased — the fix
+                            # chased CI while the conflict outlived the global
+                            # iteration cap (PR #5587, 2026-05-23).
+                            ci_fix_prompt = build_ci_failure_fix_prompt(
+                                pr_number=pr_number,
+                                base_branch=base_branch,
+                                ci_errors=ci_errors,
+                                owner=owner,
+                                repo=repo,
                             )
                             # Phase 2d: APPROVE branch must NOT propagate warm-VM
                             # continuity onto downstream spawns. The reviewer's VM
