@@ -1300,9 +1300,12 @@ class TestFailureClassificationInvariants:
 
 # ── Prompt Vocabulary Parity ───────────────────────────────────────────────
 
-# MUST stay in sync with the bullet list under '## Required: self-review before `./done`'
-# in agent/src/prompt.ts (CODE_CHANGE_HELPER_GUIDANCE). Mirrored in backend for
-# invariant testing.
+# Always-on CI mirror of the SR category bullet list in agent/src/prompt.ts
+# (between SR_CATEGORIES_START / SR_CATEGORIES_END sentinels). This frozenset
+# is the source of truth used by CI (where prompt.ts is not in the Docker build
+# context). Keep it in sync with both:
+#   - the bullet list in agent/src/prompt.ts (SR_CATEGORIES_START/END region)
+#   - _REVIEW_CATEGORIES in backend/app/playbook_learning.py (excluding "other")
 AGENT_SELF_REVIEW_CATEGORIES = frozenset(
     {
         "correctness",
@@ -1321,29 +1324,176 @@ AGENT_SELF_REVIEW_CATEGORIES = frozenset(
 )
 
 
+def _resolve_prompt_ts_path() -> "str | None":
+    """Locate ``agent/src/prompt.ts`` across local + Docker test environments.
+
+    Search order:
+      1. ``AGENT_PROMPT_TS`` env override (caller-supplied path).
+      2. ``/agent/src/prompt.ts`` (Docker volume-mount target used by
+         ``scripts/test-backend.sh``).
+      3. Host filesystem at ``../../agent/src/prompt.ts`` from this test file
+         (``backend/testing/`` → repo root).
+
+    Returns the first existing path or ``None`` if none resolve.
+    """
+    env_override = os.getenv("AGENT_PROMPT_TS")
+    candidates = []
+    if env_override:
+        candidates.append(env_override)
+    candidates.append("/agent/src/prompt.ts")
+    candidates.append(
+        os.path.normpath(
+            os.path.join(
+                os.path.dirname(__file__), "..", "..", "agent", "src", "prompt.ts"
+            )
+        )
+    )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _parse_sr_categories_from_prompt(prompt_text: str) -> "frozenset[str]":
+    """Extract SR category IDs from the SR_CATEGORIES_START/END sentinel region.
+
+    The category bullet list in prompt.ts lives inside a TypeScript template
+    literal so backticks are escaped as \\` in the raw file. The regex matches
+    ``- \\`<id>\\``` to extract each ID.
+    """
+    start = prompt_text.find("SR_CATEGORIES_START")
+    end = prompt_text.find("SR_CATEGORIES_END", start + 1 if start != -1 else 0)
+    if start == -1 or end == -1:
+        raise ValueError(
+            "SR_CATEGORIES_START/END sentinels not found in prompt.ts. "
+            "Ensure the sentinel comments wrap the SR category bullet list."
+        )
+    region = prompt_text[start:end]
+    # Matches both escaped-backtick form (\`id\`, inside TS template literals)
+    # and plain-backtick form (`id`, for fixture strings in tests).
+    return frozenset(re.findall(r"- \\?`([^\\`]+)\\?`", region))
+
+
+def _check_sr_category_parity(
+    agent_cats: "frozenset[str]", backend_cats: "frozenset[str]"
+) -> "list[str]":
+    """Return directional mismatch messages; empty list means exact equality."""
+    messages = []
+    missing_from_backend = agent_cats - backend_cats
+    if missing_from_backend:
+        messages.append(
+            f"Categories in agent prompt but missing from backend _REVIEW_CATEGORIES: "
+            f"{sorted(missing_from_backend)}. "
+            f"Add them to _REVIEW_CATEGORIES in backend/app/playbook_learning.py."
+        )
+    missing_from_agent = backend_cats - agent_cats
+    if missing_from_agent:
+        messages.append(
+            f"Categories in backend _REVIEW_CATEGORIES but missing from agent prompt: "
+            f"{sorted(missing_from_agent)}. "
+            f"Add them to the SR category bullet list in agent/src/prompt.ts "
+            f"(between SR_CATEGORIES_START / SR_CATEGORIES_END sentinels) "
+            f"and to AGENT_SELF_REVIEW_CATEGORIES in backend/testing/test_invariants.py."
+        )
+    return messages
+
+
 class TestPromptVocabularyParity:
     """Cross-check that agent self-review categories and backend categorizer
-    stay in sync. A PR that adds a new category to the agent prompt but forgets
-    to teach the backend categorizer about it will fail this test.
+    stay in sync. A PR that adds or removes a category on one side without
+    updating the other will fail these tests.
     """
 
     def test_agent_categories_in_backend_vocabulary(self):
-        """Agent self-review categories must be a subset of backend review vocabulary.
+        """Agent self-review categories must exactly equal the backend review vocabulary.
 
-        If this fails: a category was added to agent/src/prompt.ts (in CODE_CHANGE_HELPER_GUIDANCE,
-        under the '## Required: self-review' bullet list) but not to backend/app/playbook_learning.py
-        (_REVIEW_CATEGORIES dict). Add the missing category to _REVIEW_CATEGORIES with its keyword list.
+        AGENT_SELF_REVIEW_CATEGORIES (this file) is the always-on CI mirror.
+        It must bidirectionally equal set(_REVIEW_CATEGORIES.keys()) — 'other' is
+        a backend-only residual catch-all and is exempt from parity.
+
+        If this fails: a category was added or removed on one side without updating
+        the other. Edit AGENT_SELF_REVIEW_CATEGORIES here AND either:
+          - backend/app/playbook_learning.py (_REVIEW_CATEGORIES) for backend-side changes
+          - agent/src/prompt.ts (SR_CATEGORIES_START/END region) for agent-side changes
         """
         from app.playbook_learning import _REVIEW_CATEGORIES
 
-        _valid_categories = set(_REVIEW_CATEGORIES.keys()) | {"other"}
+        backend_cats = frozenset(_REVIEW_CATEGORIES.keys()) - {"other"}
+        issues = _check_sr_category_parity(AGENT_SELF_REVIEW_CATEGORIES, backend_cats)
+        assert not issues, "\n".join(issues)
 
-        missing = AGENT_SELF_REVIEW_CATEGORIES - _valid_categories
-        assert not missing, (
-            f"Agent self-review categories missing from backend categorizer: {sorted(missing)}. "
-            f"Add them to _REVIEW_CATEGORIES in backend/app/playbook_learning.py "
-            f"and to the agent bullet list in agent/src/prompt.ts (CODE_CHANGE_HELPER_GUIDANCE)."
+    def test_agent_categories_match_prompt_source(self):
+        """Parsed prompt.ts categories must exactly match AGENT_SELF_REVIEW_CATEGORIES.
+
+        Skipped when agent/src/prompt.ts is not available (e.g. CI Docker context
+        which builds from ./backend only). Locally and with the agent/src mount from
+        scripts/test-backend.sh this check fires and prevents the mirror from drifting.
+
+        If this fails: the SR category bullet list in agent/src/prompt.ts differs from
+        AGENT_SELF_REVIEW_CATEGORIES in this file. Update AGENT_SELF_REVIEW_CATEGORIES
+        to match the authoritative prompt source (or vice versa).
+        """
+        prompt_path = _resolve_prompt_ts_path()
+        if prompt_path is None:
+            pytest.skip(
+                "agent/src/prompt.ts not available in this test environment "
+                "(CI docker context is ./backend; run locally or via "
+                "scripts/test-backend.sh from a checkout for enforcement)"
+            )
+        with open(prompt_path) as f:
+            prompt_text = f.read()
+        parsed_cats = _parse_sr_categories_from_prompt(prompt_text)
+        issues = _check_sr_category_parity(AGENT_SELF_REVIEW_CATEGORIES, parsed_cats)
+        assert not issues, (
+            "AGENT_SELF_REVIEW_CATEGORIES mirror has drifted from agent/src/prompt.ts:\n"
+            + "\n".join(issues)
         )
+
+
+class TestSrCategoryParityHelper:
+    """Unit tests demonstrating both failure directions of the parity helper.
+
+    These tests drive synthetic mismatched sets — they do NOT mutate the real
+    prompt.ts or backend _REVIEW_CATEGORIES dict.
+    """
+
+    def test_catches_category_in_backend_not_in_agent(self):
+        """A category present in the backend vocab but absent from the agent set is flagged."""
+        agent_cats = frozenset({"correctness", "security"})
+        backend_cats = frozenset({"correctness", "security", "extra-backend-only"})
+        issues = _check_sr_category_parity(agent_cats, backend_cats)
+        assert len(issues) == 1
+        assert "extra-backend-only" in issues[0]
+        assert "missing from agent prompt" in issues[0]
+
+    def test_catches_category_in_agent_not_in_backend(self):
+        """A category present in the agent set but absent from the backend vocab is flagged."""
+        agent_cats = frozenset({"correctness", "security", "extra-agent-only"})
+        backend_cats = frozenset({"correctness", "security"})
+        issues = _check_sr_category_parity(agent_cats, backend_cats)
+        assert len(issues) == 1
+        assert "extra-agent-only" in issues[0]
+        assert "missing from backend" in issues[0]
+
+    def test_passes_on_exact_match(self):
+        """Exact match between agent and backend category sets returns no issues."""
+        cats = frozenset({"correctness", "security", "error-handling"})
+        assert _check_sr_category_parity(cats, cats) == []
+
+    def test_parse_from_prompt_pinning_drift(self):
+        """When parsed-from-prompt set differs from mirror, the pinning check fails."""
+        fake_prompt = (
+            "<!-- SR_CATEGORIES_START -->\n"
+            "- `correctness` — logic bugs\n"
+            "- `not-in-mirror` — a fabricated category\n"
+            "<!-- SR_CATEGORIES_END -->\n"
+        )
+        parsed = _parse_sr_categories_from_prompt(fake_prompt)
+        assert parsed == frozenset({"correctness", "not-in-mirror"})
+        real_mirror = frozenset({"correctness", "security"})
+        issues = _check_sr_category_parity(real_mirror, parsed)
+        assert any("not-in-mirror" in msg for msg in issues)
+        assert any("security" in msg for msg in issues)
 
 
 # ── edges_considered Schema Invariants ────────────────────────────────────────

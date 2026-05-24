@@ -2197,7 +2197,8 @@ metrics, and reviewer-iteration priming.
 
 Use these canonical category IDs in \`check_results\` (drawn from the
 backend review vocabulary — must match exactly):
-<!-- vocabulary mirrored in backend/testing/test_invariants.py (TestPromptVocabularyParity) — keep parity -->
+<!-- vocabulary mirrored in backend/testing/test_invariants.py as AGENT_SELF_REVIEW_CATEGORIES frozenset — keep parity with both the frozenset and backend/app/playbook_learning.py (_REVIEW_CATEGORIES) -->
+<!-- SR_CATEGORIES_START -->
 - \`correctness\` — logic bugs, off-by-one errors, edge cases, race conditions
 - \`error-handling\` — unhandled exceptions, missing null checks, async errors
 - \`security\` — injection, XSS, CSRF, exposed secrets, unvalidated inputs
@@ -2210,6 +2211,7 @@ backend review vocabulary — must match exactly):
 - \`scope-drift\` — diff materially exceeds the declared task scope (see thresholds below)
 - \`regression_risk\` — previously-passing test now fails after changes (omit if no baseline available)
 - \`cross-system-contract\` — URL path, DTO field, or shared type referenced on one side has no matching definition on the other (see check below)
+<!-- SR_CATEGORIES_END -->
 
 **Scope-drift check (required for code-change tasks):**
 The \`scope-drift\` category has TWO triggers that both feed the SAME \`scope-drift\` entry

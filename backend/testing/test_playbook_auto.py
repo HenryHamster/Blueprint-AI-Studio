@@ -9840,11 +9840,9 @@ async def test_compute_sr_catch_rate_trends_all_fields_always_present(
         "by_fix_iteration",
         "by_scope",
         "by_severity",
-        "edges_considered_stats",
         "sr_skip_rate",
         "sr_skip_reason_distribution",
         "by_direction",
-        "execution_evidence_miss_rates",
         "overall_trend_verdict",
         "overall_trend_significant",
         "overall_trend_data_sufficient",
@@ -9854,7 +9852,8 @@ async def test_compute_sr_catch_rate_trends_all_fields_always_present(
 
     assert isinstance(result["sr_skip_reason_distribution"], dict)
     assert isinstance(result["by_direction"], dict)
-    assert isinstance(result["execution_evidence_miss_rates"], dict)
+    assert "execution_evidence_miss_rates" not in result
+    assert "edges_considered_stats" not in result
 
 
 @pytest.mark.asyncio

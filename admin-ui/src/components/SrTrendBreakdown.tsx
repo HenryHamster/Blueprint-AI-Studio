@@ -129,12 +129,6 @@ export interface SrSeverityBucket {
   trend?: 'improving' | 'stable' | 'regressing';
 }
 
-export interface ExecutionEvidenceMissRate {
-  miss_rate?: number | null;
-  miss_count?: number | null;
-  sample_count?: number | null;
-}
-
 export interface SrCoFailurePair {
   cat_a: string;
   cat_b: string;
@@ -209,8 +203,6 @@ export interface SrTrendData {
   sr_skip_reason_distribution?: Record<string, number> | null;
   by_severity?: Record<string, SrSeverityBucket> | null;
   by_direction?: Record<string, Record<string, DirectionSrCatStat>> | null;
-  execution_evidence_miss_rates?: Record<string, ExecutionEvidenceMissRate> | null;
-  edges_considered_stats?: Record<string, number> | null;
   co_failure_pairs?: SrCoFailurePair[] | null;
   reviewer_hallucination_rate?: ReviewerHallucinationRate | null;
 }

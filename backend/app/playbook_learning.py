@@ -4483,8 +4483,6 @@ async def compute_sr_catch_rate_trends(
             "trend": sev_trend,
         }
 
-    edges_stats = _compute_edges_stats(all_tasks)
-
     # Compute overall (aggregate) hit rates across all categories, weighted by human_count.
     # This represents the true cycle-over-cycle change of the headline metric.
     current_total_hits = 0
@@ -4568,7 +4566,6 @@ async def compute_sr_catch_rate_trends(
         "by_fix_iteration": by_fix_iteration,
         "by_scope": by_scope,
         "by_severity": by_severity,
-        "edges_considered_stats": edges_stats,
         "sr_skip_rate": sr_skip_rate,
         "sr_skip_reason_distribution": sr_skip_dist if sr_skip_dist is not None else {},
         "overall_hit_rate": overall_hit_rate,
@@ -4612,9 +4609,6 @@ async def compute_sr_catch_rate_trends(
         direction_text_map=_dir_text_map or None,
     )
     result["by_direction"] = by_direction or {}
-
-    exec_evidence = _compute_execution_evidence_miss_rates(current_window_tasks)
-    result["execution_evidence_miss_rates"] = exec_evidence or {}
 
     from app.sr_blind_spots import (
         aggregate_sr_co_failure_pairs,

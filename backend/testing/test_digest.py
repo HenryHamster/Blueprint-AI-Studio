@@ -10501,10 +10501,6 @@ async def test_digest_sr_trends_full_fidelity_passthrough(
             "sr_skip_rate": 0.05,
             "sr_skip_reason_distribution": {"legacy_unknown": 2},
             "by_direction": {"dir-abc": {"correctness": {"hit_count": 2}}},
-            "execution_evidence_miss_rates": {
-                "test-coverage": {"miss_rate": 0.3, "miss_count": 3, "sample_count": 10}
-            },
-            "edges_considered_stats": {"total": 50, "with_sr": 40},
         }
     }
     db_session.add(project)
@@ -10522,8 +10518,8 @@ async def test_digest_sr_trends_full_fidelity_passthrough(
     assert trends["sr_skip_rate"] == 0.05
     assert trends["sr_skip_reason_distribution"] == {"legacy_unknown": 2}
     assert "dir-abc" in trends["by_direction"]
-    assert "test-coverage" in trends["execution_evidence_miss_rates"]
-    assert trends["edges_considered_stats"] == {"total": 50, "with_sr": 40}
+    assert "execution_evidence_miss_rates" not in trends
+    assert "edges_considered_stats" not in trends
     assert trends["by_severity"]["high"]["trend"] == "stable"
     assert trends["computed_at"] == "2026-05-01T00:00:00"
     assert trends["categories"]["correctness"]["fp_count"] == 1
@@ -10676,8 +10672,6 @@ async def test_digest_sr_trends_empty_optional_fields_present(
             "sr_skip_rate": None,
             "sr_skip_reason_distribution": {},
             "by_direction": {},
-            "execution_evidence_miss_rates": {},
-            "edges_considered_stats": {},
         }
     }
     db_session.add(project)
@@ -10696,13 +10690,12 @@ async def test_digest_sr_trends_empty_optional_fields_present(
         "sr_skip_rate",
         "sr_skip_reason_distribution",
         "by_direction",
-        "execution_evidence_miss_rates",
-        "edges_considered_stats",
     ):
         assert key in trends, f"missing key: {key}"
     assert trends["sr_skip_rate"] is None
     assert trends["by_direction"] == {}
-    assert trends["execution_evidence_miss_rates"] == {}
+    assert "execution_evidence_miss_rates" not in trends
+    assert "edges_considered_stats" not in trends
 
 
 @pytest.mark.asyncio
