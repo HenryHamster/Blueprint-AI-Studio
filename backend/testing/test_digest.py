@@ -10760,6 +10760,73 @@ async def test_serialize_sr_catch_rate_trends_is_stale(client: AsyncClient, db_s
     assert trends3["is_stale"] is True
 
 
+@pytest.mark.asyncio
+async def test_digest_sr_trends_overall_sr_alone_passthrough(
+    client: AsyncClient, db_session
+):
+    """Digest explicitly promotes overall_sr_alone_* fields from sr_catch_rate_trends."""
+    # Case 1: all catches are reviewer-origin → combined high, author-only low
+    project = make_project()
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": "2026-05-01T00:00:00",
+            "categories": {},
+            "by_task_type": {},
+            "overall_hit_rate": 0.80,
+            "overall_sr_alone_hit_rate": 0.10,
+            "previous_overall_sr_alone_hit_rate": 0.12,
+            "overall_sr_alone_trend_verdict": "stable",
+            "overall_sr_alone_trend_significant": False,
+            "overall_sr_alone_trend_data_sufficient": True,
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    trends = response.json().get("self_review_prediction_accuracy_trends")
+    assert trends is not None
+    assert trends["overall_hit_rate"] == 0.80
+    assert trends["overall_sr_alone_hit_rate"] == 0.10, (
+        "combined high but author-only should be low"
+    )
+    assert trends["overall_sr_alone_trend_verdict"] == "stable"
+    assert trends["overall_sr_alone_trend_significant"] is False
+    assert trends["overall_sr_alone_trend_data_sufficient"] is True
+
+    # Case 2: data insufficient → fields present but None / stable / data_sufficient=False
+    project2 = make_project()
+    project2.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": "2026-05-01T00:00:00",
+            "categories": {},
+            "by_task_type": {},
+        }
+    }
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project2)
+
+    response2 = await client.get(f"/api/admin/digest?project_id={project2.id}")
+    assert response2.status_code == 200
+    trends2 = response2.json().get("self_review_prediction_accuracy_trends")
+    assert trends2 is not None
+    # All five SR-alone fields must be present even when source lacks them
+    for field in (
+        "overall_sr_alone_hit_rate",
+        "previous_overall_sr_alone_hit_rate",
+        "overall_sr_alone_trend_verdict",
+        "overall_sr_alone_trend_significant",
+        "overall_sr_alone_trend_data_sufficient",
+    ):
+        assert field in trends2, f"missing promoted field: {field}"
+    assert trends2["overall_sr_alone_hit_rate"] is None
+    assert trends2["overall_sr_alone_trend_significant"] is None
+    assert trends2["overall_sr_alone_trend_data_sufficient"] is None
+
+
 # ---------------------------------------------------------------------------
 # Per-direction SR breakdown endpoint
 # ---------------------------------------------------------------------------

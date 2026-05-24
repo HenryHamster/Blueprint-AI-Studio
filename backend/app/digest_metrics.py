@@ -118,6 +118,23 @@ def _serialize_sr_catch_rate_trends(sr_trends: Dict[str, Any]) -> Dict[str, Any]
         "overall_trend_verdict": sr_trends.get("overall_trend_verdict"),
         "overall_trend_significant": sr_trends.get("overall_trend_significant"),
         "overall_trend_data_sufficient": sr_trends.get("overall_trend_data_sufficient"),
+        # Author-only (SR-alone) overall rates and significance-gated trend — mirrors the
+        # combined overall fields above but uses only catches from origin='sr', excluding
+        # fresh-reviewer rescues. Promoted explicitly so callers can detect when the author
+        # self-review is regressing even while the combined gate looks healthy.
+        "overall_sr_alone_hit_rate": sr_trends.get("overall_sr_alone_hit_rate"),
+        "previous_overall_sr_alone_hit_rate": sr_trends.get(
+            "previous_overall_sr_alone_hit_rate"
+        ),
+        "overall_sr_alone_trend_verdict": sr_trends.get(
+            "overall_sr_alone_trend_verdict"
+        ),
+        "overall_sr_alone_trend_significant": sr_trends.get(
+            "overall_sr_alone_trend_significant"
+        ),
+        "overall_sr_alone_trend_data_sufficient": sr_trends.get(
+            "overall_sr_alone_trend_data_sufficient"
+        ),
     }
     for key, value in sr_trends.items():
         serialized.setdefault(key, value)

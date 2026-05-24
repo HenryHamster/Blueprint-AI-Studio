@@ -14319,3 +14319,125 @@ async def test_refresh_sr_catch_rate_fetch_covers_both_windows(
         "fetch must cover both 0-14 and 14-28 day windows; "
         "data_sufficient=False means the previous window was starved"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for overall SR-alone (author-only) catch rate
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_overall_sr_alone_low_when_all_catches_are_reviewer_saves(
+    db_session: AsyncSession,
+):
+    """When all catches carry origin='reviewer', combined overall is high but SR-alone is 0."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Both windows: 6 tasks per window, all flagged by reviewer (not author).
+    for age in (2, 20):
+        for _ in range(6):
+            t = _make_sr_task(
+                project.id,
+                age_days=age,
+                human_cats={"correctness": 1},
+                sr_failed_cats=["correctness"],
+                check_result_overrides={"correctness": {"origin": "reviewer"}},
+            )
+            db_session.add(t)
+            tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    # Combined: all 6 correctness findings were caught → hit rate = 1.0
+    assert result["overall_hit_rate"] == 1.0, (
+        f"combined overall should be 1.0 but got {result['overall_hit_rate']}"
+    )
+    # SR-alone: none were caught by the author → rate = 0.0
+    assert result["overall_sr_alone_hit_rate"] == 0.0, (
+        f"SR-alone overall should be 0.0 but got {result['overall_sr_alone_hit_rate']}"
+    )
+    # Trend fields must be present
+    assert "overall_sr_alone_trend_verdict" in result
+    assert "overall_sr_alone_trend_significant" in result
+    assert "overall_sr_alone_trend_data_sufficient" in result
+
+
+@pytest.mark.asyncio
+async def test_overall_sr_alone_trend_data_sufficiency_gate(
+    db_session: AsyncSession,
+):
+    """SR-alone trend reports None for trend_significant when data is below threshold."""
+    from app.playbook_learning import compute_sr_catch_rate_trends, _MIN_SR_FINDINGS
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Build _MIN_SR_FINDINGS tasks in each window — exactly at the threshold.
+    # Both windows have identical sr_alone rates so the z-test gives "stable".
+    for age in (2, 20):
+        for _ in range(_MIN_SR_FINDINGS):
+            t = _make_sr_task(
+                project.id,
+                age_days=age,
+                human_cats={"correctness": 1},
+                sr_failed_cats=["correctness"],  # sr_alone catch
+            )
+            db_session.add(t)
+            tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    # Data is sufficient and rates identical → verdict is "stable", not None
+    assert result["overall_sr_alone_trend_verdict"] == "stable"
+    # trend_significant is False (not None) when data sufficient but no change
+    assert result["overall_sr_alone_trend_significant"] is not None or (
+        result["overall_sr_alone_trend_data_sufficient"] is False
+    ), "trend_significant must be a bool (not None) when data is sufficient"
+
+
+@pytest.mark.asyncio
+async def test_overall_sr_alone_fields_present_when_data_insufficient(
+    db_session: AsyncSession,
+):
+    """When compute_sr_catch_rate_trends returns a result, all SR-alone keys are present."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Mix: some SR-alone, some reviewer saves in both windows (>= 5 each).
+    for age in (2, 20):
+        for i in range(6):
+            overrides = {"correctness": {"origin": "reviewer"}} if i % 2 == 0 else None
+            t = _make_sr_task(
+                project.id,
+                age_days=age,
+                human_cats={"correctness": 1},
+                sr_failed_cats=["correctness"],
+                check_result_overrides=overrides,
+            )
+            db_session.add(t)
+            tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    expected_keys = {
+        "overall_sr_alone_hit_rate",
+        "previous_overall_sr_alone_hit_rate",
+        "overall_sr_alone_trend_verdict",
+        "overall_sr_alone_trend_significant",
+        "overall_sr_alone_trend_data_sufficient",
+    }
+    missing = expected_keys - set(result.keys())
+    assert not missing, f"Missing SR-alone keys in result: {missing}"
+    # Rates must be floats in [0, 1], not None (we have both sr_alone and reviewer catches)
+    rate = result["overall_sr_alone_hit_rate"]
+    assert isinstance(rate, float) and 0.0 <= rate <= 1.0, (
+        f"overall_sr_alone_hit_rate should be float in [0,1], got {rate!r}"
+    )

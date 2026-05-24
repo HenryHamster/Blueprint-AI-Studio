@@ -4511,6 +4511,58 @@ async def compute_sr_catch_rate_trends(
         else None
     )
 
+    # Compute author-only (SR-alone) overall hit rate by summing raw integer counts
+    # across categories — preferred over reconstructing from rounded per-category rates.
+    current_sr_alone_hits = 0
+    current_sr_alone_humans = 0
+    previous_sr_alone_hits = 0
+    previous_sr_alone_humans = 0
+    for cat in all_cats:
+        c = current_stats.get(cat, _empty_cat)
+        p = previous_stats.get(cat, _empty_cat)
+        if c.get("human_count", 0) > 0:
+            current_sr_alone_hits += c.get("sr_alone_hit_count", 0)
+            current_sr_alone_humans += c["human_count"]
+        if p.get("human_count", 0) > 0:
+            previous_sr_alone_hits += p.get("sr_alone_hit_count", 0)
+            previous_sr_alone_humans += p["human_count"]
+    overall_sr_alone_hit_rate: Optional[float] = (
+        round(current_sr_alone_hits / current_sr_alone_humans, 3)
+        if current_sr_alone_humans > 0
+        else None
+    )
+    previous_overall_sr_alone_hit_rate: Optional[float] = (
+        round(previous_sr_alone_hits / previous_sr_alone_humans, 3)
+        if previous_sr_alone_humans > 0
+        else None
+    )
+    _sr_alone_data_sufficient = (
+        overall_sr_alone_hit_rate is not None
+        and previous_overall_sr_alone_hit_rate is not None
+        and current_sr_alone_humans >= _MIN_SR_FINDINGS
+        and previous_sr_alone_humans >= _MIN_SR_FINDINGS
+    )
+    if _sr_alone_data_sufficient:
+        _sr_alone_delta = overall_sr_alone_hit_rate - previous_overall_sr_alone_hit_rate
+        _sr_alone_sig = _is_trend_significant(
+            overall_sr_alone_hit_rate,
+            current_sr_alone_humans,
+            previous_overall_sr_alone_hit_rate,
+            previous_sr_alone_humans,
+        )
+        if _sr_alone_sig and _sr_alone_delta >= _TREND_DELTA_THRESHOLD:
+            overall_sr_alone_trend_verdict: str = "improving"
+        elif _sr_alone_sig and _sr_alone_delta <= -_TREND_DELTA_THRESHOLD:
+            overall_sr_alone_trend_verdict = "declining"
+        else:
+            overall_sr_alone_trend_verdict = "stable"
+        overall_sr_alone_trend_significant: Optional[bool] = (
+            _sr_alone_sig and abs(_sr_alone_delta) >= _TREND_DELTA_THRESHOLD
+        )
+    else:
+        overall_sr_alone_trend_verdict = "stable"
+        overall_sr_alone_trend_significant = None
+
     # Significance-gated overall trend verdict — mirrors the per-category treatment
     # so the headline is as trustworthy as the per-category breakdown.
     # Only labeled "improving"/"declining" when both windows have >= _MIN_SR_FINDINGS
@@ -4573,6 +4625,11 @@ async def compute_sr_catch_rate_trends(
         "overall_trend_verdict": overall_trend_verdict,
         "overall_trend_significant": overall_trend_significant,
         "overall_trend_data_sufficient": _overall_data_sufficient,
+        "overall_sr_alone_hit_rate": overall_sr_alone_hit_rate,
+        "previous_overall_sr_alone_hit_rate": previous_overall_sr_alone_hit_rate,
+        "overall_sr_alone_trend_verdict": overall_sr_alone_trend_verdict,
+        "overall_sr_alone_trend_significant": overall_sr_alone_trend_significant,
+        "overall_sr_alone_trend_data_sufficient": _sr_alone_data_sufficient,
         "current_finding_count": current_finding_count,
         "previous_finding_count": previous_finding_count,
     }
