@@ -2425,6 +2425,21 @@ async def _handle_strategic_completion(
                                 "Strategic review: recommended_mode=pause"
                             )
                             d["paused_at"] = _utcnow().isoformat()
+                        # Persist context-structured fields (same cap as CREATE path)
+                        _DIR_FIELD_MAX = 500
+                        ctx = d.get("context") or {}
+                        for _ctx_field in (
+                            "success_evidence",
+                            "retirement_condition",
+                            "implementation_constraints",
+                        ):
+                            if _ctx_field in changes:
+                                val = str(changes[_ctx_field] or "").strip()
+                                if val:
+                                    ctx[_ctx_field] = val[:_DIR_FIELD_MAX]
+                                else:
+                                    ctx.pop(_ctx_field, None)
+                        d["context"] = ctx
                         # Record rationale as a note
                         if rationale:
                             notes = d.get("notes", [])

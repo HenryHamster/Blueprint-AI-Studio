@@ -2178,6 +2178,277 @@ async def test_strategic_completion_persists_recommended_mode_on_update(
 
 
 @pytest.mark.asyncio
+async def test_strategic_update_persists_success_evidence_and_retirement_condition(
+    db_session, mocker
+):
+    """Direction-op `update` with success_evidence and retirement_condition persists
+    both into direction['context'], matching the CREATE path behaviour."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P-upd-ctx",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-ctx1",
+                "text": "Existing direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-ctx1",
+                    "rationale": "clarifying success criteria",
+                    "changes": {
+                        "success_evidence": "All login flows pass SAML e2e",
+                        "retirement_condition": "3 cycles with zero auth failures",
+                    },
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in (project.directions or []) if d.get("id") == "d-ctx1")
+    ctx = target.get("context") or {}
+    assert ctx.get("success_evidence") == "All login flows pass SAML e2e"
+    assert ctx.get("retirement_condition") == "3 cycles with zero auth failures"
+
+
+@pytest.mark.asyncio
+async def test_strategic_update_persists_implementation_constraints(db_session, mocker):
+    """Direction-op `update` with implementation_constraints persists it into
+    direction['context'], matching the CREATE path behaviour."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P-upd-ic",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-ic1",
+                "text": "Existing direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "context": {"success_evidence": "prior evidence"},
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-ic1",
+                    "rationale": "adding constraints",
+                    "changes": {
+                        "implementation_constraints": "Must not modify public API surface",
+                    },
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in (project.directions or []) if d.get("id") == "d-ic1")
+    ctx = target.get("context") or {}
+    assert ctx.get("implementation_constraints") == "Must not modify public API surface"
+    # Existing context field should be preserved
+    assert ctx.get("success_evidence") == "prior evidence"
+
+
+@pytest.mark.asyncio
+async def test_strategic_update_clears_context_fields_when_none(db_session, mocker):
+    """Direction-op `update` with None value for a context field removes it from context."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P-upd-clr",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-clr1",
+                "text": "Existing direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "context": {
+                    "success_evidence": "Old evidence",
+                    "retirement_condition": "Old condition",
+                },
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-clr1",
+                    "rationale": "clearing stale criteria",
+                    "changes": {
+                        "success_evidence": None,
+                        "retirement_condition": None,
+                    },
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in (project.directions or []) if d.get("id") == "d-clr1")
+    ctx = target.get("context") or {}
+    assert "success_evidence" not in ctx
+    assert "retirement_condition" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_strategic_update_caps_context_fields_at_500(db_session, mocker):
+    """Direction-op `update` truncates oversized context field values to 500 chars."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P-upd-cap",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-cap1",
+                "text": "Existing direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    long_value = "x" * 800
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-cap1",
+                    "rationale": "testing cap",
+                    "changes": {
+                        "success_evidence": long_value,
+                        "retirement_condition": long_value,
+                    },
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in (project.directions or []) if d.get("id") == "d-cap1")
+    ctx = target.get("context") or {}
+    assert len(ctx.get("success_evidence", "")) == 500
+    assert len(ctx.get("retirement_condition", "")) == 500
+
+
+@pytest.mark.asyncio
 async def test_strategic_completion_drops_invalid_recommended_mode(db_session, mocker):
     """Unknown recommended_mode values are silently dropped on create."""
     from unittest.mock import AsyncMock
