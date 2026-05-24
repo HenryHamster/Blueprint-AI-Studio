@@ -25,7 +25,8 @@
     "review_pipeline.py": 2450,
     "deploy_health.py": 1250,
     "regression_layer_classifier.py": 520,
-    "pipeline_regression_dispatcher.py": 9700,
+    "regression_dispatcher_metrics.py": 800,
+    "pipeline_regression_dispatcher.py": 9200,
     "release_qualifier.py": 5900
   },
   "frontend": {
