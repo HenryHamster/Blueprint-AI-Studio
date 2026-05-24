@@ -86,6 +86,25 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "_evaluate_sr_catch_rate_targets",
         "compute_pipeline_health_summary",
     ),
+    "app.regression_recovery_evaluators": (
+        "RegressionClassShape",
+        "SPAWNABLE_REGRESSION_CLASS_SHAPES",
+        "_recover_agent_vm_resource",
+        "_recover_cross_case_fingerprint",
+        "_recover_fix_loop_divergence_fingerprint",
+        "_recover_layer_concentration",
+        "_recover_observation_alert_sla",
+        "_recover_prevention_low",
+        "_recover_recurring_class",
+        "_recover_reviewer_sla_stall",
+        "_recover_sr_below_floor",
+        "_recover_sr_false_attestation",
+        "_recover_sr_pass_engagement_thinning",
+        "_recover_strategic_cycle_stall",
+        "_recover_viewport_coverage_drop",
+        "_recover_viewport_regression",
+        "match_spawnable_shape",
+    ),
 }
 
 

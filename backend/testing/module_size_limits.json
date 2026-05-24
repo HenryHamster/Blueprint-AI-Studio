@@ -26,6 +26,7 @@
     "deploy_health.py": 1250,
     "regression_layer_classifier.py": 520,
     "regression_dispatcher_metrics.py": 800,
+    "regression_recovery_evaluators.py": 1000,
     "pipeline_regression_dispatcher.py": 9200,
     "release_qualifier.py": 5900,
     "playbook_learning.py": 7100,
