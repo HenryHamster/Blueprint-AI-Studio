@@ -28,6 +28,7 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.research_direction_state import RETIRED_DIRECTION_STATUSES
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -1272,17 +1273,6 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
     }
 
 
-# Terminal direction statuses whose match a well-formed distinction may override.
-# "completed" belongs here: a direction that auto-completes on saturation
-# (research_direction_state sets status="completed") is just as terminal as a
-# retired one, so a re-scoped successor with a real distinction must be allowed.
-# Omitting it made the dedup treat completed directions as live competitors and
-# silently blocked every successor regardless of wording — the reason
-# decomposition could not re-spawn after it saturated (2026-05-24).
-_RETIRED_DIRECTION_STATUSES = frozenset(
-    {"expired", "retired", "superseded", "completed"}
-)
-
 _MIN_DISTINCTION_CHARS = (
     20  # well-formed distinction must be at least this many characters
 )
@@ -1359,7 +1349,7 @@ def _is_direction_duplicate(
             # Check distinction override possibilities
             if has_well_formed_distinction:
                 # Override for retired directions
-                if d.get("status") in _RETIRED_DIRECTION_STATUSES:
+                if d.get("status") in RETIRED_DIRECTION_STATUSES:
                     continue  # distinction overrides match against retired direction
                 # Override for active same-category directions
                 if d.get("status") == "active" and proposal_cat_for_matching:

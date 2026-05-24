@@ -969,9 +969,8 @@ class TestRecordResearchTaskFailureScopeEmpty:
         task.first_payload = {"type": "research"}
         return task
 
-    def _make_session(self, project):
+    def _make_session(self):
         session = AsyncMock()
-        session.get.return_value = project
         session.add = MagicMock()
         return session
 
@@ -986,69 +985,84 @@ class TestRecordResearchTaskFailureScopeEmpty:
         ]
         return project
 
-    def test_scope_empty_marks_cycle_productive(self):
+    def _run(self, project, coro):
+        """Run coro with with_directions_locked patched to call mutate_fn on project.directions."""
         import asyncio
+        from unittest.mock import patch
+
+        async def _mock_wdl(session, project_id, mutate_fn):
+            mutate_fn(project.directions)
+
+        with patch("app.research_completion.with_directions_locked", _mock_wdl):
+            asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_scope_empty_marks_cycle_productive(self):
         from app.research_completion import _record_research_task_failure
 
         task = self._make_task("SCOPE_EMPTY")
         project = self._make_project()
-        session = self._make_session(project)
-
-        asyncio.get_event_loop().run_until_complete(
-            _record_research_task_failure(task, session)
-        )
+        self._run(project, _record_research_task_failure(task, self._make_session()))
 
         direction = project.directions[0]
         assert direction["last_cycle_productive"] is True
 
     def test_scope_empty_resets_unproductive_counter(self):
-        import asyncio
         from app.research_completion import _record_research_task_failure
 
         task = self._make_task("SCOPE_EMPTY")
         project = self._make_project(consecutive_unproductive=3)
-        session = self._make_session(project)
-
-        asyncio.get_event_loop().run_until_complete(
-            _record_research_task_failure(task, session)
-        )
+        self._run(project, _record_research_task_failure(task, self._make_session()))
 
         direction = project.directions[0]
         assert direction.get("consecutive_unproductive_cycles", 0) == 0
 
     def test_code_error_marks_cycle_unproductive(self):
-        import asyncio
         from app.research_completion import _record_research_task_failure
 
         task = self._make_task("CODE_ERROR")
         project = self._make_project(consecutive_unproductive=1)
-        session = self._make_session(project)
-
-        asyncio.get_event_loop().run_until_complete(
-            _record_research_task_failure(task, session)
-        )
+        self._run(project, _record_research_task_failure(task, self._make_session()))
 
         direction = project.directions[0]
         assert direction["last_cycle_productive"] is False
         assert direction.get("consecutive_unproductive_cycles", 0) == 2
 
     def test_scope_empty_history_entry_has_failure_category(self):
-        import asyncio
         from app.research_completion import _record_research_task_failure
 
         task = self._make_task("SCOPE_EMPTY")
         project = self._make_project()
-        session = self._make_session(project)
-
-        asyncio.get_event_loop().run_until_complete(
-            _record_research_task_failure(task, session)
-        )
+        self._run(project, _record_research_task_failure(task, self._make_session()))
 
         direction = project.directions[0]
         history = direction.get("research_history", [])
         assert len(history) == 1
         assert history[0]["research_task_failed"] is True
         assert history[0]["failure_category"] == "SCOPE_EMPTY"
+
+    def test_uses_with_directions_locked_not_session_get(self):
+        """Direction writes must go through with_directions_locked (no stale read-modify-write)."""
+        import asyncio
+        from unittest.mock import patch
+        from app.research_completion import _record_research_task_failure
+
+        task = self._make_task("CODE_ERROR")
+        project = self._make_project()
+        session = self._make_session()
+
+        called_with = []
+
+        async def mock_wdl(sess, project_id, mutate_fn):
+            called_with.append(project_id)
+            mutate_fn(project.directions)
+
+        with patch("app.research_completion.with_directions_locked", mock_wdl):
+            asyncio.get_event_loop().run_until_complete(
+                _record_research_task_failure(task, session)
+            )
+
+        assert called_with == [task.project_id]
+        session.get.assert_not_called()
 
 
 class TestTrimFindingForMemo:

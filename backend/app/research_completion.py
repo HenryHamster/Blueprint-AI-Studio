@@ -60,6 +60,7 @@ from app.research_context import (  # noqa: F401 — re-exported for callers/tes
     _build_research_context,
 )
 from app.research_direction_state import (  # noqa: F401 — re-exported for callers/tests
+    RETIRED_DIRECTION_STATUSES,
     _compute_saturation,
     _detect_dedup_deadlock,
     apply_post_spawn_state,
@@ -94,7 +95,7 @@ from app.task_completion import (
     _ensure_branch,
     _apply_synthesized_memo,
 )
-from app.task_locking import with_design_doc_locked
+from app.task_locking import with_design_doc_locked, with_directions_locked
 from app.plan_completion import (
     _validate_plan_dependencies,
     _log_file_overlaps,
@@ -780,8 +781,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # rather than at spawn time prevents the cascade observed on 2026-05-03
     # where one strategic_review spawned 4 research tasks AT ONCE and
     # immediately tripped the modulo-6 gate for the next strategic_review.
-    from sqlalchemy.orm.attributes import flag_modified
-
     project_obj = await session.get(Project, task.project_id)
     if project_obj is not None:
         new_count = ((project_obj.vision or {}).get("_research_spawn_count") or 0) + 1
@@ -1229,11 +1228,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _pfh = _d.get("recently_filtered_finding_hashes") or []
             _previously_filtered_hashes = set(_pfh)
             break
-    _RETIRED_STATUSES = frozenset({"retired", "expired", "completed", "superseded"})
     _retired_ctx_list: list[dict] = []
     for _d in _dedup_project_dirs:
         if (
-            _d.get("status") in _RETIRED_STATUSES
+            _d.get("status") in RETIRED_DIRECTION_STATUSES
             and _d.get("id") != _direction_id_for_dedup
         ):
             _rc = _d.get("research_context", "") or ""
@@ -1358,22 +1356,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         for f in _dedup_outcome.filtered
         if f.get("title") in _title_to_fhash
     }
-    if _new_filtered_hashes and _scope_cal_project and _scope_cal_project.directions:
-        _fh_dirs = list(_scope_cal_project.directions)
-        _fh_changed = False
-        for _d in _fh_dirs:
-            if _d.get("id") == _direction_id_for_dedup:
-                _existing_fh = _d.get("recently_filtered_finding_hashes") or []
-                _combined_fh = list(
-                    dict.fromkeys(_existing_fh + list(_new_filtered_hashes))
-                )
-                _d["recently_filtered_finding_hashes"] = _combined_fh[-50:]
-                _fh_changed = True
-                break
-        if _fh_changed:
-            _scope_cal_project.directions = _fh_dirs
-            flag_modified(_scope_cal_project, "directions")
-            session.add(_scope_cal_project)
+    if _new_filtered_hashes:
+
+        def _update_filtered_hashes(dirs: list) -> None:
+            for _d in dirs:
+                if _d.get("id") == _direction_id_for_dedup:
+                    _existing_fh = _d.get("recently_filtered_finding_hashes") or []
+                    _combined_fh = list(
+                        dict.fromkeys(_existing_fh + list(_new_filtered_hashes))
+                    )
+                    _d["recently_filtered_finding_hashes"] = _combined_fh[-50:]
+                    break
+
+        await with_directions_locked(session, task.project_id, _update_filtered_hashes)
 
     # Also index by parent_direction_id in task context as fallback
     _parent_direction_id = (task.context or {}).get("direction_id")
@@ -1490,29 +1485,30 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if not target_id:
                 type_filtered_count += 1
                 continue  # direction_update requires a target direction_id
-            dir_project = await session.get(Project, task.project_id)
-            if not dir_project:
-                type_filtered_count += 1
-                continue
-            directions = list(dir_project.directions or [])
-            for d in directions:
-                if d.get("id") == target_id:
-                    d["pending_update"] = {
-                        "suggested_text": finding.get("suggested_text", d.get("text")),
-                        "suggested_priority": finding.get(
-                            "suggested_priority", d.get("priority")
-                        ),
-                        "suggested_paths": finding.get(
-                            "suggested_paths", d.get("paths", [])
-                        ),
-                        "rationale": finding.get("description", "")[:300],
-                        "proposed_at": _utcnow().isoformat(),
-                        "proposed_by": str(task.id),
-                    }
-                    break
-            dir_project.directions = directions
-            flag_modified(dir_project, "directions")
-            session.add(dir_project)
+            _du_finding = finding
+            _du_target_id = target_id
+            _du_task_id = str(task.id)
+
+            def _set_pending_update(dirs: list) -> None:
+                for d in dirs:
+                    if d.get("id") == _du_target_id:
+                        d["pending_update"] = {
+                            "suggested_text": _du_finding.get(
+                                "suggested_text", d.get("text")
+                            ),
+                            "suggested_priority": _du_finding.get(
+                                "suggested_priority", d.get("priority")
+                            ),
+                            "suggested_paths": _du_finding.get(
+                                "suggested_paths", d.get("paths", [])
+                            ),
+                            "rationale": _du_finding.get("description", "")[:300],
+                            "proposed_at": _utcnow().isoformat(),
+                            "proposed_by": _du_task_id,
+                        }
+                        break
+
+            await with_directions_locked(session, task.project_id, _set_pending_update)
             type_filtered_count += 1
             continue  # Don't create a task for direction_update findings
 
@@ -2483,21 +2479,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         }
         if _spawned_memo_ids:
             _deferred_stats["memo_ids"] = _spawned_memo_ids
-        _proj = await session.get(Project, task.project_id)
-        if _proj and _proj.directions:
-            _dirs = list(_proj.directions)
-            _changed = False
-            for _d in _dirs:
+        _ds_task_id = str(task.id)
+
+        def _write_deferred_stats(dirs: list) -> None:
+            for _d in dirs:
                 _hist = _d.get("research_history") or []
-                if _hist and _hist[-1].get("task_id") == str(task.id):
+                if _hist and _hist[-1].get("task_id") == _ds_task_id:
                     _hist[-1]["deferred_stats"] = _deferred_stats
                     _d["research_history"] = _hist
-                    _changed = True
-            if _changed:
-                _proj.directions = _dirs
-                flag_modified(_proj, "directions")
-                session.add(_proj)
-                await session.commit()
+
+        await with_directions_locked(session, task.project_id, _write_deferred_stats)
+        await session.commit()
 
     # Mark per-direction cycle productivity so direction_lifecycle can pick
     # an adaptive cooldown: productive cycles (>=1 task spawned) get a shorter
@@ -2514,11 +2506,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     if current_direction_id:
         touched_dir_ids.add(current_direction_id)
     if touched_dir_ids:
-        project = await session.get(Project, task.project_id)
-        if project:
-            directions = list(project.directions or [])
-            changed = False
-            for d in directions:
+
+        def _update_productivity(dirs: list) -> None:
+            for d in dirs:
                 did = d.get("id")
                 if did in touched_dir_ids:
                     productive = tasks_by_dir.get(did, 0) > 0
@@ -2529,12 +2519,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         d["consecutive_unproductive_cycles"] = (
                             int(d.get("consecutive_unproductive_cycles", 0) or 0) + 1
                         )
-                    changed = True
-            if changed:
-                project.directions = directions
-                flag_modified(project, "directions")
-                session.add(project)
-                await session.commit()
+
+        await with_directions_locked(session, task.project_id, _update_productivity)
+        await session.commit()
 
     # Credit playbook entries shown to this research agent when research succeeded.
     # followed_count tracks how many times each entry was seen by a successful research agent,
@@ -2572,13 +2559,6 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
     )
     if not direction_id:
         return
-    project = await session.get(Project, task.project_id)
-    if not project:
-        return
-    directions = list(project.directions or [])
-    target = next((d for d in directions if d.get("id") == direction_id), None)
-    if not target:
-        return
     now_iso = _utcnow().isoformat()
     failure_category = classify_failure(task, task.latest_status_message or "")
     entry = {
@@ -2594,29 +2574,37 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
         "research_task_failed": True,
         "failure_category": failure_category,
     }
-    history = target.get("research_history", [])
-    new_history = history + [entry]
-    # Share the existing eviction/aggregate rule: keep last 10, aggregate older entries
-    if len(new_history) > 10:
-        target["history_aggregate"] = _fold_evicted_into_aggregate(
-            target.get("history_aggregate"), new_history[:-10]
-        )
-    target["research_history"] = new_history[-10:]
-    target["last_researched_at"] = now_iso
     # Infra failures are transient — use the shorter productive cooldown so the
     # direction is retried promptly instead of waiting out the full unproductive window.
     productive = failure_category in INFRA_CLASSES
-    target["last_cycle_productive"] = productive
-    if productive:
-        target["consecutive_unproductive_cycles"] = 0
-    else:
-        target["consecutive_unproductive_cycles"] = (
-            int(target.get("consecutive_unproductive_cycles", 0) or 0) + 1
+    _found = False
+
+    def _record_failure(dirs: list) -> None:
+        nonlocal _found
+        target = next((d for d in dirs if d.get("id") == direction_id), None)
+        if not target:
+            return
+        _found = True
+        history = target.get("research_history", [])
+        new_history = history + [entry]
+        # Share the existing eviction/aggregate rule: keep last 10, aggregate older entries
+        if len(new_history) > 10:
+            target["history_aggregate"] = _fold_evicted_into_aggregate(
+                target.get("history_aggregate"), new_history[:-10]
+            )
+        target["research_history"] = new_history[-10:]
+        target["last_researched_at"] = now_iso
+        target["last_cycle_productive"] = productive
+        if productive:
+            target["consecutive_unproductive_cycles"] = 0
+        else:
+            target["consecutive_unproductive_cycles"] = (
+                int(target.get("consecutive_unproductive_cycles", 0) or 0) + 1
+            )
+
+    await with_directions_locked(session, task.project_id, _record_failure)
+    if _found:
+        logger.warning(
+            f"[RESEARCH] Recorded failed research task {task.id} on direction "
+            f"{direction_id} ({failure_category})"
         )
-    project.directions = directions
-    flag_modified(project, "directions")
-    session.add(project)
-    logger.warning(
-        f"[RESEARCH] Recorded failed research task {task.id} on direction "
-        f"{direction_id} ({failure_category})"
-    )

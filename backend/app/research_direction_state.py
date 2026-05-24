@@ -41,6 +41,10 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 
+RETIRED_DIRECTION_STATUSES = frozenset(
+    {"expired", "retired", "superseded", "completed"}
+)
+
 _EVICTED_FINDINGS_CAP = 50
 _ARCHIVED_DIAGNOSES_CAP = 50
 _DIAGNOSIS_MAX_CHARS = 500

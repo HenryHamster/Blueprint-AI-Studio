@@ -1020,10 +1020,11 @@ class TestIsDirectionDuplicate:
         distinction = (
             "This focuses on the refresh-token rotation path, not initial login"
         )
-        is_dup, _ = _is_direction_duplicate(
+        is_dup, override = _is_direction_duplicate(
             proposal, existing, [], distinction=distinction
         )
         assert is_dup is False
+        assert override is None
 
     def test_distinction_does_not_bypass_active_direction_match_without_category(self):
         # Distinction has no effect on active-direction matches when categories not specified

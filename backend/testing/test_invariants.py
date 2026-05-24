@@ -2154,6 +2154,47 @@ class TestDirectionsLockInvariant:
         _check_lock_invariant("directions", "directions", "with_directions_locked")
 
 
+class TestResearchCompletionDirectionsLocked:
+    """Positive ratchet: research_completion.py must keep its direction writes routed
+    through with_directions_locked.
+
+    Complements TestDirectionsLockInvariant (which is a *negative* ratchet — catches
+    new direct .directions = assignments).  This positive ratchet catches the mirror
+    failure: a with_directions_locked call site is removed without being replaced by
+    another locked call, so the operation silently disappears rather than blowing up.
+
+    _EXPECTED_MIN_CALLS is set to 5 (the five sites migrated in PR #5704).  It must
+    not decrease.  If a call site is removed, either add a replacement locked call or
+    lower this constant in the same PR with an explanation.
+    """
+
+    _EXPECTED_MIN_CALLS = 5
+
+    def test_research_completion_locked_call_count(self):
+        """research_completion.py must have at least 5 with_directions_locked call sites."""
+        import ast
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        rc_path = os.path.join(app_dir, "research_completion.py")
+        with open(rc_path) as f:
+            source = f.read()
+        tree = ast.parse(source, filename=rc_path)
+        call_count = sum(
+            1
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "with_directions_locked"
+        )
+        assert call_count >= self._EXPECTED_MIN_CALLS, (
+            f"research_completion.py has only {call_count} call(s) to "
+            f"with_directions_locked (expected >= {self._EXPECTED_MIN_CALLS}). "
+            "All five migrated direction-write sites must remain routed through the "
+            "canonical locked helper — do not remove calls without replacing them "
+            "or lowering _EXPECTED_MIN_CALLS with an explanation."
+        )
+
+
 # ── Vision Lock Invariant ─────────────────────────────────────────────────────
 
 

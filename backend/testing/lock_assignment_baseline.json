@@ -19,7 +19,6 @@
     "auto_remediation.py": 1,
     "direction_lifecycle.py": 1,
     "main.py": 5,
-    "research_completion.py": 5,
     "rollup_management.py": 1,
     "routers/admin_projects.py": 1,
     "routers/directions.py": 5,

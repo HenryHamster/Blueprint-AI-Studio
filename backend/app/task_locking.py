@@ -523,26 +523,40 @@ async def with_directions_locked(
     session: AsyncSession,
     project_id,
     mutate_fn: Callable[[list], list | None],
-) -> None:
+    *,
+    skip_locked: bool = False,
+) -> bool:
     """Atomic read-modify-write of project.directions under a project row lock.
 
     Mirror of ``with_design_doc_locked`` for the sibling ``directions`` JSON
-    column. Acquires SELECT FOR UPDATE (skip_locked=False — background callers
-    wait rather than silently skip), hands ``mutate_fn`` the current directions
-    list loaded *inside* the lock, then writes the result back. ``mutate_fn``
-    may mutate the list in place and return None, or return a replacement list
-    (for whole-array overwrites). Caller is responsible for committing.
+    column. Acquires SELECT FOR UPDATE, hands ``mutate_fn`` the current
+    directions list loaded *inside* the lock, then writes the result back.
+    ``mutate_fn`` may mutate the list in place and return None, or return a
+    replacement list (for whole-array overwrites). Caller is responsible for
+    committing.
+
+    Args:
+        skip_locked: When False (default), block until the lock is acquired
+            (suitable for background callers that must not silently drop
+            updates). When True, return False immediately if the row is held
+            by another session — preserves best-effort / non-blocking
+            semantics for hot dispatch paths.
+
+    Returns:
+        True if mutate_fn was applied, False if the row was held and
+        skip_locked=True caused an immediate skip.
 
     This is the canonical helper for serializing directions mutations. Loading
     the array inside the lock is what prevents a whole-array overwrite from
     silently dropping a direction another writer appended concurrently — the
     same lost-update class already eliminated for ``design_doc``.
     """
-    async with project_lock(session, project_id, skip_locked=False) as project:
+    async with project_lock(session, project_id, skip_locked=skip_locked) as project:
         if project is None:
-            return
+            return False
         directions = list(project.directions or [])
         result = mutate_fn(directions)
         project.directions = result if result is not None else directions
         flag_modified(project, "directions")
         session.add(project)
+    return True
