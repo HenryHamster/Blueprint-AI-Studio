@@ -1003,6 +1003,28 @@ class TestIsDirectionDuplicate:
         assert is_dup is False
         assert override is None
 
+    def test_distinction_bypasses_completed_direction_match(self):
+        # Regression (2026-05-24): a direction that auto-completed on saturation
+        # is terminal, so a well-formed distinction must override the overlap —
+        # exactly like a retired one. Before the fix, "completed" was missing from
+        # the override-eligible set, so the dedup treated completed directions as
+        # live competitors and silently blocked every re-scoped successor
+        # (decomposition could not re-spawn after it saturated).
+        proposal = "migrate authentication service oauth token"
+        existing = [
+            {
+                "text": "migrate authentication service oauth2 token system",
+                "status": "completed",
+            }
+        ]
+        distinction = (
+            "This focuses on the refresh-token rotation path, not initial login"
+        )
+        is_dup, _ = _is_direction_duplicate(
+            proposal, existing, [], distinction=distinction
+        )
+        assert is_dup is False
+
     def test_distinction_does_not_bypass_active_direction_match_without_category(self):
         # Distinction has no effect on active-direction matches when categories not specified
         proposal = "migrate authentication service oauth token"

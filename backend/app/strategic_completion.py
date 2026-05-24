@@ -1272,7 +1272,16 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
     }
 
 
-_RETIRED_DIRECTION_STATUSES = frozenset({"expired", "retired", "superseded"})
+# Terminal direction statuses whose match a well-formed distinction may override.
+# "completed" belongs here: a direction that auto-completes on saturation
+# (research_direction_state sets status="completed") is just as terminal as a
+# retired one, so a re-scoped successor with a real distinction must be allowed.
+# Omitting it made the dedup treat completed directions as live competitors and
+# silently blocked every successor regardless of wording — the reason
+# decomposition could not re-spawn after it saturated (2026-05-24).
+_RETIRED_DIRECTION_STATUSES = frozenset(
+    {"expired", "retired", "superseded", "completed"}
+)
 
 _MIN_DISTINCTION_CHARS = (
     20  # well-formed distinction must be at least this many characters
@@ -1321,13 +1330,14 @@ def _is_direction_duplicate(
 ) -> tuple[bool, dict | None]:
     """Return (is_duplicate, override_matched_direction) for proposal_text.
 
-    All directions (active and retired) use the same overlap threshold of 4 shared
+    All directions (active and terminal) use the same overlap threshold of 4 shared
     non-stopword tokens. When a well-formed distinction is supplied:
-      - If matching direction is retired-status, distinction overrides the block.
+      - If matching direction is terminal-status (retired/expired/superseded/completed),
+        distinction overrides the block.
       - If matching direction is ACTIVE and same category as proposal, distinction
         overrides the block. Returns override_matched_direction with the matched direction
         so the caller can record an audit entry.
-      - Cross-category matches with distinction still block (no override).
+      - Cross-category active matches with distinction still block (no override).
     Matches against recently-rejected proposals always block regardless of distinction.
     """
     words = set(proposal_text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS

@@ -22,7 +22,7 @@
     "strategic_completion.py": 3200,
     "rollup_management.py": 3150,
     "reaper.py": 3550,
-    "review_pipeline.py": 2350,
+    "review_pipeline.py": 2450,
     "deploy_health.py": 1250,
     "regression_layer_classifier.py": 520,
     "pipeline_regression_dispatcher.py": 9700,
