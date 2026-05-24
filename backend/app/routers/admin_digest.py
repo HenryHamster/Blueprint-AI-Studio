@@ -5249,12 +5249,14 @@ async def get_direction_sr_breakdown(
 ) -> Dict[str, Any]:
     """Per-direction SR catch-rate breakdown.
 
-    Delegates to the canonical ``compute_sr_catch_rate_by_direction`` model
-    (severity-aware ``_categorize_review_issues``, sr_alone/reviewer_save
-    origin tracking, ``_finalize_examples`` deduped/sensitive-stripped/capped
-    examples, all-iterations human-truth set). Only directions with at least
-    ``_MIN_DIRECTION_SR_SAMPLE`` qualifying tasks (both SR ``check_results``
-    and ``_first_attempt_rejection_categories`` present) are included.
+    Primary path: reads the canonical ``sr_catch_rate_trends.by_direction``
+    snapshot already persisted on the project, so direction-level data uses
+    the same measurement population as the headline project-wide SR metric
+    (includes failed terminal tasks, preserves trend/history metadata, and
+    is not starved by the 2000-task COMPLETED-only fallback window).
+
+    Fallback (no stored snapshot): recomputes from COMPLETED tasks within
+    *days*, matching the pre-snapshot behaviour.
 
     Per-direction shape::
 
@@ -5266,9 +5268,54 @@ async def get_direction_sr_breakdown(
           "categories": {
             "<cat>": {"hit_rate", "miss_rate", "sample_count", "examples"?}
           },
-          "worst_category": str | None
+          "worst_category": str | None,
+          "trend": str | None,
+          "previous_miss_rate": float | None,
+          "rate_history": list | None
         }
     """
+    dir_text: Dict[str, str] = {}
+    stored_by_dir: Dict[str, Any] = {}
+    project = await session.get(Project, project_id)
+    if project:
+        for d in project.directions or []:
+            did = str(d.get("id") or d.get("direction_id") or "")
+            if did:
+                dir_text[did] = d.get("text") or d.get("description") or ""
+        stored_trends = (project.design_doc or {}).get("sr_catch_rate_trends") or {}
+        stored_by_dir = stored_trends.get("by_direction") or {}
+
+    if stored_by_dir:
+        directions_out: list = []
+        sorted_entries = sorted(
+            stored_by_dir.items(),
+            key=lambda item: (-(item[1].get("miss_rate") or 0), item[0]),
+        )
+        for direction_id, entry in sorted_entries:
+            categories = dict(
+                sorted(
+                    (entry.get("categories") or {}).items(),
+                    key=lambda item: (-(item[1].get("miss_rate") or 0), item[0]),
+                )
+            )
+            worst_category = next(iter(categories), None)
+            directions_out.append(
+                {
+                    "direction_id": direction_id,
+                    "direction_text": entry.get("direction_text")
+                    or dir_text.get(direction_id, ""),
+                    "sample_size": entry.get("sample_count", 0),
+                    "overall_catch_rate": entry.get("overall_catch_rate"),
+                    "categories": categories,
+                    "worst_category": worst_category,
+                    "trend": entry.get("trend"),
+                    "previous_miss_rate": entry.get("previous_miss_rate"),
+                    "rate_history": entry.get("rate_history"),
+                }
+            )
+        return {"directions": directions_out, "min_sample": _MIN_DIRECTION_SR_SAMPLE}
+
+    # No stored snapshot yet — fall back to recomputing from COMPLETED tasks.
     cutoff = datetime.utcnow() - timedelta(days=days)
     stmt = (
         select(Task)
@@ -5284,20 +5331,8 @@ async def get_direction_sr_breakdown(
         .limit(2000)
     )
     all_tasks = (await session.execute(stmt)).scalars().all()
-
-    dir_text: Dict[str, str] = {}
-    stored_by_dir: Dict[str, Any] = {}
-    project = await session.get(Project, project_id)
-    if project:
-        for d in (project.design_doc or {}).get("directions") or []:
-            did = str(d.get("id") or d.get("direction_id") or "")
-            if did:
-                dir_text[did] = d.get("text") or d.get("description") or ""
-        stored_trends = (project.design_doc or {}).get("sr_catch_rate_trends") or {}
-        stored_by_dir = stored_trends.get("by_direction") or {}
-
     directions_out = compute_direction_sr_breakdown_for_endpoint(
-        all_tasks, dir_text, existing_by_direction=stored_by_dir
+        all_tasks, dir_text, existing_by_direction={}
     )
     return {"directions": directions_out, "min_sample": _MIN_DIRECTION_SR_SAMPLE}
 

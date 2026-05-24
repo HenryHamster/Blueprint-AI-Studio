@@ -2907,16 +2907,19 @@ async def claim_task(
                             and isinstance(cdata.get("miss_rate"), (int, float))
                         }
                         if dir_cats:
-                            direction_text = ""
-                            for d in project_for_playbook.directions or []:
-                                if d.get("id") == task_direction_id:
-                                    direction_text = (
-                                        d.get("text")
-                                        or d.get("description")
-                                        or d.get("title")
-                                        or ""
-                                    )
-                                    break
+                            # Prefer direction_text already stored in the snapshot;
+                            # fall back to scanning project.directions for older entries.
+                            direction_text = dir_entry.get("direction_text") or ""
+                            if not direction_text:
+                                for d in project_for_playbook.directions or []:
+                                    if d.get("id") == task_direction_id:
+                                        direction_text = (
+                                            d.get("text")
+                                            or d.get("description")
+                                            or d.get("title")
+                                            or ""
+                                        )
+                                        break
                             direction_payload: dict = {
                                 "direction_id": task_direction_id,
                                 "direction_text": direction_text,
@@ -2928,6 +2931,24 @@ async def claim_task(
                                 ]
                             if isinstance(dir_entry.get("miss_rate"), (int, float)):
                                 direction_payload["miss_rate"] = dir_entry["miss_rate"]
+                            if isinstance(
+                                dir_entry.get("overall_catch_rate"), (int, float)
+                            ):
+                                direction_payload["overall_catch_rate"] = dir_entry[
+                                    "overall_catch_rate"
+                                ]
+                            if isinstance(dir_entry.get("trend"), str):
+                                direction_payload["trend"] = dir_entry["trend"]
+                            if isinstance(
+                                dir_entry.get("previous_miss_rate"), (int, float)
+                            ):
+                                direction_payload["previous_miss_rate"] = dir_entry[
+                                    "previous_miss_rate"
+                                ]
+                            if isinstance(dir_entry.get("rate_history"), list):
+                                direction_payload["rate_history"] = dir_entry[
+                                    "rate_history"
+                                ]
                             response["project_context"][
                                 "self_review_catch_rate_for_direction"
                             ] = direction_payload

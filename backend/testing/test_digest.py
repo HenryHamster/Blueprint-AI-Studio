@@ -11039,6 +11039,80 @@ async def test_direction_sr_breakdown_categories_sorted_worst_first(
     assert cats["correctness"]["miss_rate"] == 0.0
 
 
+@pytest.mark.asyncio
+async def test_direction_sr_breakdown_uses_stored_snapshot(
+    client: AsyncClient, db_session
+):
+    """When sr_catch_rate_trends.by_direction is stored on the project, the endpoint
+    uses it as the primary source — not the narrow COMPLETED-only task query.
+
+    Proof: project has a stored snapshot for direction 'd-stored' but zero
+    qualifying tasks in the DB. The endpoint must return the stored entry.
+    """
+    stored_by_dir = {
+        "d-lower": {
+            "sample_count": 5,
+            "miss_rate": 0.2,
+            "overall_catch_rate": 0.8,
+            "categories": {
+                "style-conventions": {
+                    "hit_rate": 0.8,
+                    "miss_rate": 0.2,
+                    "sample_count": 5,
+                }
+            },
+        },
+        "d-stored": {
+            "sample_count": 7,
+            "miss_rate": 0.571,
+            "overall_catch_rate": 0.429,
+            "categories": {
+                "scope-drift": {
+                    "hit_rate": 0.8,
+                    "miss_rate": 0.2,
+                    "sample_count": 7,
+                },
+                "regression_risk": {
+                    "hit_rate": 0.429,
+                    "miss_rate": 0.571,
+                    "sample_count": 7,
+                },
+            },
+            "trend": "increasing",
+            "previous_miss_rate": 0.4,
+            "rate_history": [0.4, 0.571],
+        },
+    }
+    project = make_project(
+        directions=[{"id": "d-stored", "text": "Stored direction label"}],
+        design_doc={"sr_catch_rate_trends": {"by_direction": stored_by_dir}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/direction-sr-breakdown"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert [entry["direction_id"] for entry in body["directions"]] == [
+        "d-stored",
+        "d-lower",
+    ]
+    assert len(body["directions"]) == 2
+    entry = body["directions"][0]
+    assert entry["direction_id"] == "d-stored"
+    assert entry["direction_text"] == "Stored direction label"
+    assert entry["sample_size"] == 7
+    assert entry["overall_catch_rate"] == 0.429
+    assert entry["worst_category"] == "regression_risk"
+    assert list(entry["categories"]) == ["regression_risk", "scope-drift"]
+    assert entry["trend"] == "increasing"
+    assert entry["previous_miss_rate"] == 0.4
+    assert entry["rate_history"] == [0.4, 0.571]
+
+
 # ---------------------------------------------------------------------------
 # SR missed retrospectives endpoint
 # ---------------------------------------------------------------------------
