@@ -440,6 +440,11 @@ runtime_config: Dict = {
     # runtime_config_json; persisted across restarts.
     "promotion_enabled": False,
     "smoketest_enabled": False,
+    # Broadcast alert safety cap — limits the number of projects receiving
+    # orchestrator-wide broadcast alerts (errors, halts, rollbacks, recovery).
+    # Global orchestrator safety cap, not per-project. Operator-tunable via
+    # runtime_config_json; persisted across restarts.
+    "project_broadcast_limit": 1000,
 }
 
 # Scope-aware per-class retry budgets. When a task's context includes a scope
@@ -708,6 +713,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "warm_continuity_cooldown_seconds",
                     "warm_backlog_reuse_failure_rate_threshold",
                     "warm_backlog_reuse_cooldown_seconds",
+                    "project_broadcast_limit",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))
