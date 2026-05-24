@@ -984,6 +984,17 @@ class TestShouldTriggerCodeDefectInvestigation:
         t.payloads = [{"type": "create", "prompt": "p"}]
         assert should_trigger_code_defect_investigation(t) is False
 
+    def test_rate_limit_skipped(self):
+        # Weekly quota exhaustion (RATE_LIMIT / INFRA_CLASS) must not spawn
+        # an investigation — the failure is operational, not a code defect,
+        # and a self-rate-limited investigation cascade would waste quota.
+        t = _task(
+            "You've hit your weekly limit · resets 9pm (UTC)",
+            {"direction_id": "d-1", "failure_category": "rate_limited"},
+        )
+        t.payloads = [{"type": "create", "prompt": "p"}]
+        assert should_trigger_code_defect_investigation(t) is False
+
 
 def _timeout_task(
     subtype: str, task_type: str = "create", direction_id: str | None = "d-1"
