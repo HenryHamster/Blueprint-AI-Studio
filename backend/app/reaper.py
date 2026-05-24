@@ -133,11 +133,19 @@ _reaper_last_cycle_completed_at: datetime | None = None
 # automatically on process restart (in-memory); tunable via runtime_config key
 # "reaper_cycle_halt_threshold".
 _REAPER_CYCLE_HALT_THRESHOLD: int = 5
+# Half-open probe limit: after this many consecutive failed probes the reaper
+# escalates to a hard halt that requires operator reset (like the original behavior).
+# Tunable via runtime_config key "reaper_half_open_probe_limit".
+_REAPER_HALF_OPEN_PROBE_LIMIT: int = 3
 _reaper_halt_state: dict = {
     "halted": False,
     "halt_timestamp": None,
     "last_error": None,
     "crash_count": 0,
+    # hard_halted=True → terminal; requires operator reset (not auto-recovered).
+    # hard_halted=False + halted=True → soft halt; auto-recovers after cooldown.
+    "hard_halted": False,
+    "half_open_failures": 0,  # consecutive failed half-open probes
 }
 
 
@@ -163,6 +171,8 @@ def get_reaper_stats() -> dict:
         if _reaper_halt_state["halt_timestamp"]
         else None,
         "halt_crash_count": _reaper_halt_state["crash_count"],
+        "hard_halted": _reaper_halt_state.get("hard_halted", False),
+        "half_open_failures": _reaper_halt_state.get("half_open_failures", 0),
     }
 
 
@@ -194,6 +204,30 @@ async def _post_reaper_halt_alert(crash_count: int, last_error: str) -> None:
             await s.commit()
     except Exception:
         logger.exception("[REAPER] Failed to post halt alert")
+
+
+async def _post_reaper_recovery_alert(probe_failures: int) -> None:
+    """Post an INFO alert to every project when the reaper autonomously recovers."""
+    try:
+        from app.models import Alert, AlertSeverity
+
+        async with AsyncSessionLocal() as s:
+            proj_ids = (await s.execute(select(Project.id))).scalars().all()
+            for pid in proj_ids:
+                s.add(
+                    Alert(
+                        project_id=pid,
+                        severity=AlertSeverity.INFO,
+                        title="Reaper service recovered autonomously",
+                        message=(
+                            f"Reaper self-recovered after {probe_failures} failed "
+                            "probe(s). Normal reap cycles have resumed."
+                        ),
+                    )
+                )
+            await s.commit()
+    except Exception:
+        logger.exception("[REAPER] Failed to post recovery alert")
 
 
 # Per-(provider, model) regression scan cadence. The reaper itself fires every
@@ -714,12 +748,40 @@ async def reaper_service():
     consecutive_errors = 0
     while True:
         if _reaper_halt_state["halted"]:
-            try:
-                await asyncio.sleep(300)
-            except asyncio.CancelledError:
-                logger.info("[REAPER] Service shutting down (halted).")
-                break
-            continue
+            if _reaper_halt_state.get("hard_halted"):
+                # Hard halt: persistent bug, requires operator reset.
+                try:
+                    await asyncio.sleep(300)
+                except asyncio.CancelledError:
+                    logger.info("[REAPER] Service shutting down (hard-halted).")
+                    break
+                continue
+            # Soft halt: check whether the cooldown has elapsed for a half-open probe.
+            halt_ts = _reaper_halt_state.get("halt_timestamp")
+            cooldown_base = int(
+                _runtime_config.get("reaper_cycle_halt_cooldown_seconds", 300)
+            )
+            half_open_failures = _reaper_halt_state.get("half_open_failures", 0)
+            cooldown = min(cooldown_base * (2**half_open_failures), 3600)
+            elapsed = (
+                (_utcnow() - halt_ts).total_seconds() if halt_ts else (cooldown + 1)
+            )
+            if elapsed < cooldown:
+                remaining = cooldown - elapsed
+                try:
+                    await asyncio.sleep(min(60.0, max(5.0, remaining)))
+                except asyncio.CancelledError:
+                    logger.info("[REAPER] Service shutting down (soft-halted).")
+                    break
+                continue
+            logger.info(
+                "[REAPER] Halt cooldown elapsed (%.0fs, half_open_failures=%d) "
+                "— attempting half-open probe cycle",
+                elapsed,
+                half_open_failures,
+            )
+            _reaper_halt_state["_in_probe"] = True
+            # Fall through to run one probe cycle (no continue).
         try:
             async with AsyncSessionLocal() as session:
                 # Step 1: Read active tasks WITHOUT locks (avoids blocking heartbeat writes)
@@ -3450,6 +3512,27 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(f"[REAPER] Routine message purge: {e}", exc_info=True)
             consecutive_errors = 0
+            if _reaper_halt_state.get("_in_probe"):
+                _probe_failures = _reaper_halt_state.get("half_open_failures", 0)
+                _reaper_halt_state.update(
+                    {
+                        "halted": False,
+                        "hard_halted": False,
+                        "halt_timestamp": None,
+                        "last_error": None,
+                        "crash_count": 0,
+                        "half_open_failures": 0,
+                        "_in_probe": False,
+                    }
+                )
+                logger.info(
+                    "[REAPER] Autonomous recovery: half-open probe succeeded after %d failure(s)",
+                    _probe_failures,
+                )
+                with contextlib.suppress(Exception):
+                    asyncio.get_running_loop().create_task(  # noqa: RUF006
+                        _post_reaper_recovery_alert(_probe_failures)
+                    )
             # Liveness telemetry: only bump on the success path. If the
             # cycle body raised above, neither this counter nor the
             # last-completed timestamp advances — the /metrics gauge will
@@ -3470,7 +3553,53 @@ async def reaper_service():
             _halt_threshold = _runtime_config.get(
                 "reaper_cycle_halt_threshold", _REAPER_CYCLE_HALT_THRESHOLD
             )
-            if (
+            if _reaper_halt_state.get("_in_probe"):
+                # Probe cycle failed; escalate or re-halt.
+                _reaper_halt_state["_in_probe"] = False
+                _ho_failures = _reaper_halt_state.get("half_open_failures", 0) + 1
+                _probe_limit = int(
+                    _runtime_config.get(
+                        "reaper_half_open_probe_limit", _REAPER_HALF_OPEN_PROBE_LIMIT
+                    )
+                )
+                if _ho_failures >= _probe_limit:
+                    _reaper_halt_state.update(
+                        {
+                            "halted": True,
+                            "hard_halted": True,
+                            "halt_timestamp": _utcnow(),
+                            "last_error": str(e)[:500],
+                            "crash_count": consecutive_errors,
+                            "half_open_failures": _ho_failures,
+                        }
+                    )
+                    logger.error(
+                        "[REAPER] HARD HALT after %d consecutive failed probe(s) "
+                        "— operator reset required; last error: %s",
+                        _ho_failures,
+                        e,
+                    )
+                    with contextlib.suppress(Exception):
+                        asyncio.get_running_loop().create_task(  # noqa: RUF006
+                            _post_reaper_halt_alert(consecutive_errors, str(e)[:500])
+                        )
+                else:
+                    _reaper_halt_state.update(
+                        {
+                            "halted": True,
+                            "hard_halted": False,
+                            "halt_timestamp": _utcnow(),
+                            "last_error": str(e)[:500],
+                            "crash_count": consecutive_errors,
+                            "half_open_failures": _ho_failures,
+                        }
+                    )
+                    logger.warning(
+                        "[REAPER] Half-open probe failed (%d/%d) — re-halting with extended cooldown",
+                        _ho_failures,
+                        _probe_limit,
+                    )
+            elif (
                 consecutive_errors >= _halt_threshold
                 and not _reaper_halt_state["halted"]
             ):

@@ -378,6 +378,14 @@ runtime_config: Dict = {
     "auto_archive_terminal_after_days": 7,
     "auto_archive_max_terminal_tasks_per_project": 200,
     "auto_archive_interval_minutes": 60,
+    # Reaper cycle-level circuit breaker. After reaper_cycle_halt_threshold
+    # consecutive whole-cycle exceptions the reaper enters a soft HALTED state.
+    # After reaper_cycle_halt_cooldown_seconds it attempts a half-open probe.
+    # After reaper_half_open_probe_limit consecutive failed probes it escalates
+    # to a hard halt that requires operator reset.
+    "reaper_cycle_halt_threshold": 5,
+    "reaper_cycle_halt_cooldown_seconds": 300,
+    "reaper_half_open_probe_limit": 3,
     # Per-scope heartbeat-stale thresholds (seconds). Large-scope tasks
     # legitimately run longer stretches without a heartbeat, so reaping at the
     # small-scope bar flags them as dead while they're still making progress.
@@ -752,6 +760,9 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "warm_backlog_reuse_failure_rate_threshold",
                     "warm_backlog_reuse_cooldown_seconds",
                     "project_broadcast_limit",
+                    "reaper_cycle_halt_threshold",
+                    "reaper_cycle_halt_cooldown_seconds",
+                    "reaper_half_open_probe_limit",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))
@@ -2007,6 +2018,8 @@ def get_reaper_halt_state() -> Dict[str, Any]:
             "halt_timestamp": ts.isoformat() if ts else None,
             "last_error": state.get("last_error"),
             "crash_count": state.get("crash_count", 0),
+            "hard_halted": bool(state.get("hard_halted")),
+            "half_open_failures": state.get("half_open_failures", 0),
         }
     except Exception:  # noqa: BLE001
         return {
@@ -2014,6 +2027,8 @@ def get_reaper_halt_state() -> Dict[str, Any]:
             "halt_timestamp": None,
             "last_error": None,
             "crash_count": 0,
+            "hard_halted": False,
+            "half_open_failures": 0,
         }
 
 
@@ -2036,6 +2051,8 @@ def reset_reaper_halt_state() -> bool:
                 "halt_timestamp": None,
                 "last_error": None,
                 "crash_count": 0,
+                "hard_halted": False,
+                "half_open_failures": 0,
             }
         )
         logger.info("[REAPER] Halt state cleared by operator reset.")

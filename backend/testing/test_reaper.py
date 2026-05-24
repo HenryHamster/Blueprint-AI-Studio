@@ -43,6 +43,7 @@ from app.reaper import (
     _progress_stale_cutoff,
     _reaper_halt_state,
     _REAPER_CYCLE_HALT_THRESHOLD,
+    _REAPER_HALF_OPEN_PROBE_LIMIT,
     get_reaper_stats,
     is_reaper_halted,
 )
@@ -4827,18 +4828,25 @@ class _FailingSessionCM:
         pass
 
 
+_HALT_STATE_CLEAN = {
+    "halted": False,
+    "halt_timestamp": None,
+    "last_error": None,
+    "crash_count": 0,
+    "hard_halted": False,
+    "half_open_failures": 0,
+    "_in_probe": False,
+}
+
+
 @pytest.fixture()
 def clean_halt_state():
     """Reset _reaper_halt_state to the clean baseline before and after each test."""
     import app.reaper as _reaper_mod
 
-    _reaper_mod._reaper_halt_state.update(
-        {"halted": False, "halt_timestamp": None, "last_error": None, "crash_count": 0}
-    )
+    _reaper_mod._reaper_halt_state.update(_HALT_STATE_CLEAN)
     yield _reaper_mod._reaper_halt_state
-    _reaper_mod._reaper_halt_state.update(
-        {"halted": False, "halt_timestamp": None, "last_error": None, "crash_count": 0}
-    )
+    _reaper_mod._reaper_halt_state.update(_HALT_STATE_CLEAN)
 
 
 @pytest.mark.asyncio
@@ -4974,3 +4982,121 @@ async def test_per_task_crash_does_not_trigger_cycle_halt(
     assert _reaper_mod._reaper_cycles_completed_count == cycles_before + 1, (
         "cycle must complete cleanly: per-task crash is isolated, not a cycle-level error"
     )
+
+
+# ── Half-open circuit breaker (auto-recovery) ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_half_open_probe_recovers_after_cooldown(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, clean_halt_state, mocker
+):
+    """When the halt cooldown elapses the reaper runs a probe cycle; on success
+    it clears halt state and posts a recovery alert."""
+    import app.reaper as _reaper_mod
+
+    recovery_alert = mocker.patch(
+        "app.reaper._post_reaper_recovery_alert", new_callable=AsyncMock
+    )
+    # Pre-set soft halt with an expired cooldown (10 min ago).
+    _reaper_mod._reaper_halt_state.update(
+        {
+            "halted": True,
+            "hard_halted": False,
+            "halt_timestamp": datetime.utcnow() - timedelta(seconds=600),
+            "last_error": "transient-error",
+            "crash_count": 5,
+            "half_open_failures": 0,
+        }
+    )
+
+    await _run_reaper_once()
+
+    assert _reaper_halt_state["halted"] is False, (
+        "halt must be cleared after a successful probe cycle"
+    )
+    assert _reaper_halt_state.get("hard_halted") is False
+    assert _reaper_halt_state.get("half_open_failures") == 0
+    assert is_reaper_halted() is False
+    stats = get_reaper_stats()
+    assert stats["halted"] is False
+    assert stats.get("hard_halted") is False
+    assert recovery_alert.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_half_open_probe_failure_rehalts_with_incremented_counter(
+    reaper_side_effects, clean_halt_state, mocker
+):
+    """A half-open probe that crashes re-halts (soft) with half_open_failures incremented."""
+    import app.reaper as _reaper_mod
+
+    mocker.patch("app.reaper.AsyncSessionLocal", _FailingSessionCM())
+    mocker.patch("app.reaper._post_reaper_halt_alert", new_callable=AsyncMock)
+
+    _reaper_mod._reaper_halt_state.update(
+        {
+            "halted": True,
+            "hard_halted": False,
+            "halt_timestamp": datetime.utcnow() - timedelta(seconds=600),
+            "last_error": "initial-error",
+            "crash_count": 5,
+            "half_open_failures": 0,
+        }
+    )
+
+    async def _stop_after_rehalt(secs):
+        # Stop once the probe has finished and re-halted (not during cooldown sleep).
+        if _reaper_halt_state["halted"] and not _reaper_halt_state.get("_in_probe"):
+            raise _StopLoop()
+
+    mocker.patch("asyncio.sleep", side_effect=_stop_after_rehalt)
+
+    await _run_reaper_once()
+
+    assert _reaper_halt_state["halted"] is True, (
+        "reaper must re-halt after probe failure"
+    )
+    assert _reaper_halt_state.get("hard_halted") is False, "must remain a soft halt"
+    assert _reaper_halt_state.get("half_open_failures") == 1
+
+
+@pytest.mark.asyncio
+async def test_half_open_hard_halt_after_probe_limit(
+    reaper_side_effects, clean_halt_state, mocker
+):
+    """After _REAPER_HALF_OPEN_PROBE_LIMIT consecutive failed probes the reaper
+    escalates to a hard halt that requires operator reset."""
+    import app.reaper as _reaper_mod
+
+    mocker.patch("app.reaper.AsyncSessionLocal", _FailingSessionCM())
+    mocker.patch("app.reaper._post_reaper_halt_alert", new_callable=AsyncMock)
+
+    probe_limit = _REAPER_HALF_OPEN_PROBE_LIMIT
+    # Use a timestamp far enough in the past that even the extended cooldown
+    # (base * 2^(probe_limit-1)) has definitely elapsed.
+    _reaper_mod._reaper_halt_state.update(
+        {
+            "halted": True,
+            "hard_halted": False,
+            "halt_timestamp": datetime.utcnow() - timedelta(hours=2),
+            "last_error": "recurring-error",
+            "crash_count": 5,
+            "half_open_failures": probe_limit - 1,
+        }
+    )
+
+    async def _stop_on_hard_halt(secs):
+        if _reaper_halt_state.get("hard_halted"):
+            raise _StopLoop()
+
+    mocker.patch("asyncio.sleep", side_effect=_stop_on_hard_halt)
+
+    await _run_reaper_once()
+
+    assert _reaper_halt_state.get("hard_halted") is True, (
+        "must escalate to hard halt after probe_limit consecutive failures"
+    )
+    assert _reaper_halt_state["halted"] is True
+    assert _reaper_halt_state.get("half_open_failures") == probe_limit
+    assert is_reaper_halted() is True
