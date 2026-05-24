@@ -479,6 +479,7 @@ async def _process_direction_lifecycle(
         _check_outcome_scaffolding,
         _compute_churn_metrics,
         _compute_lifetime_burn_metrics,
+        _evidence_progress_suppresses_scaffolding,
         _outcome_progress_config,
     )
 
@@ -1305,12 +1306,13 @@ async def _process_direction_lifecycle(
                 _scaffolding_cfg = _outcome_progress_config()
                 _esc_threshold = _scaffolding_cfg["escalation_cycles"]
                 _retire_threshold = _scaffolding_cfg["max_flagged_cycles"]
-                # An advancing/met evidence_progress verdict suppresses the counter
-                # increment for this pass — the agent confirmed real progress.
-                _ep = d.get("evidence_progress")
-                _ep_suppresses = isinstance(_ep, dict) and _ep.get("status") in (
-                    "advancing",
-                    "met",
+                # A RECENT advancing/met evidence_progress verdict suppresses the
+                # counter increment — uses the same recency-aware helper as the
+                # detector so stale verdicts grant no credit (consistent semantics).
+                _ep_suppresses = _evidence_progress_suppresses_scaffolding(
+                    d,
+                    scaffolding_ev["total_cycles"],
+                    scaffolding_ev["stall_run_cycles"],
                 )
                 if not _ep_suppresses:
                     _flag_cycles = d.get("outcome_scaffolding_flagged_cycles", 0) + 1

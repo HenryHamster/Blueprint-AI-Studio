@@ -1210,12 +1210,12 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
         rate >= min_merge_rate, so churn/burn directions (low merge rate / high
         non-merge volume) are explicitly EXCLUDED — those are handled by the churn
         guardrail and lifetime-burn backstop in _check_direction_health;
-      - sustained no progress: the success_evidence fingerprint is unchanged
+      - sustained no progress: the cumulative confirmed-finding count did not grow
         across the last stall_run snapshots AND the direction has never reached a
         'met' outcome.
     Guards hard against false positives: requires a FULL stall_run window of
-    snapshots, so a single stalled cycle cannot trip the flag, and any change in
-    the success_evidence fingerprint anywhere in the window clears it.
+    snapshots, so a single stalled cycle cannot trip the flag, and any growth in
+    the confirmed-finding count anywhere in the window clears it.
     """
     if direction.get("outcome_progress_ever_met"):
         return None

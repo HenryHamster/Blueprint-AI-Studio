@@ -1832,16 +1832,15 @@ async def test_scaffolding_flag_clear_resets_counter(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_scaffolding_advancing_verdict_suppresses_counter_increment(
-    db_session, mocker
-):
-    """A stale-but-advancing evidence_progress verdict suppresses counter increment.
+async def test_scaffolding_stale_verdict_does_not_freeze_counter(db_session, mocker):
+    """A stale advancing evidence_progress verdict must NOT freeze the ladder counter.
 
     A stale advancing verdict (cycle_index far in the past) is old enough that
     _check_outcome_scaffolding still fires (the suppression inside the detector
-    requires a RECENT verdict). But the persistence-ladder check only requires
-    status in ('advancing', 'met'), so it still suppresses the counter for that
-    pass — giving the agent credit without clearing the flag.
+    requires a RECENT verdict via _evidence_progress_suppresses_scaffolding). The
+    persistence-pressure ladder must use the SAME recency-aware helper rather than
+    a recency-blind status check, so a stale verdict grants no credit — the counter
+    advances, the direction eventually escalates and auto-retires.
     """
     mocker.patch(
         "app.notification_dispatch.post_direction_outcome_stalled_message",
@@ -1853,8 +1852,8 @@ async def test_scaffolding_advancing_verdict_suppresses_counter_increment(
     )
 
     # cycle_index=1 with total_cycles=14 → 13 cycles stale → exceeds stall_run(6)
-    # so _evidence_progress_suppresses_scaffolding returns False inside the detector,
-    # meaning _check_outcome_scaffolding still returns truthy (persistence path taken).
+    # so _evidence_progress_suppresses_scaffolding returns False inside BOTH the
+    # detector AND the ladder, meaning the counter must increment.
     direction = _already_flagged_direction(
         flagged_cycles=1,
         evidence_progress={"status": "advancing", "cycle_index": 1},
@@ -1871,8 +1870,8 @@ async def test_scaffolding_advancing_verdict_suppresses_counter_increment(
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d.get("outcome_scaffolding_flagged_cycles") == 1, (
-        "counter must NOT increment when evidence_progress status is 'advancing'"
+    assert d.get("outcome_scaffolding_flagged_cycles") == 2, (
+        "counter MUST increment when evidence_progress verdict is stale (recency check fails)"
     )
     assert d.get("outcome_scaffolding_flagged") is True, (
         "flag must remain set (stale advancing does not clear the scaffolding flag)"
