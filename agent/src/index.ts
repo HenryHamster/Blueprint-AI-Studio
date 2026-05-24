@@ -1390,6 +1390,25 @@ export function validateBranchName(branch: string, label: string): string {
   return branch;
 }
 
+// Canonical task-type → branch-prefix mapping.
+// Convention: blueprint/{prefix}-{first-8-hex-of-task-uuid}
+// Mirrors backend/app/services.py _TASK_TYPE_BRANCH_PREFIX; keep in sync.
+// Types absent from this map default to the 'task' prefix.
+export const TASK_TYPE_BRANCH_PREFIX: Record<string, string> = {
+  fix: 'fix',
+  refactor: 'refactor',
+  docs: 'docs',
+  deps: 'deps',
+  migrate: 'migrate',
+};
+
+/** Return the canonical git branch name for a task. */
+export function deriveTaskBranch(taskType: string, taskId: string): string {
+  const prefix = TASK_TYPE_BRANCH_PREFIX[taskType] ?? 'task';
+  const shortId = taskId.replace(/-/g, '').slice(0, 8);
+  return `blueprint/${prefix}-${shortId}`;
+}
+
 export function sendLog(ws: WebSocket | null, content: string) {
   const sanitized = sanitize(content);
   appendToLogBuffer(sanitized);

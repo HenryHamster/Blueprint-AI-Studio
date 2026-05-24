@@ -55,6 +55,25 @@ from app.retry_budget import (
 
 logger = logging.getLogger(__name__)
 
+# Maps task type -> branch prefix used by the agent when naming work branches.
+# Convention: blueprint/{prefix}-{first-8-hex-of-task-uuid}
+# Deliberate subset of the canonical map in agent/src/index.ts /
+# backend/app/services.py: only the non-"task" prefixes these recovery paths
+# derive are listed. Other types (create, qa, fix, ...) fall back to "task" in
+# _derive_task_branch — and fix tasks reuse an existing branch, so they never
+# hit this fallback. Keep the listed prefixes in sync with the canonical map.
+_TASK_TYPE_BRANCH_PREFIX: Dict[str, str] = {
+    "docs": "docs",
+    "deps": "deps",
+    "migrate": "migrate",
+    "refactor": "refactor",
+}
+
+
+def _derive_task_branch(task_id: uuid.UUID, task_type: str | None) -> str:
+    prefix = _TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
+    return f"blueprint/{prefix}-{str(task_id).replace('-', '')[:8]}"
+
 
 class PostCommitLocked(Exception):
     """Raised when _process_post_commit can't acquire the task row within the
@@ -1521,18 +1540,7 @@ async def _process_post_commit(
                 and payload.artifact_type == ArtifactType.PULL_REQUEST
             ):
                 pr_number = int(payload.pr_url.rstrip("/").split("/")[-1])
-                short_id = str(task.id).replace("-", "")[:8]
-                branch = (
-                    f"blueprint/docs-{short_id}"
-                    if task_type == "docs"
-                    else f"blueprint/deps-{short_id}"
-                    if task_type == "deps"
-                    else f"blueprint/migrate-{short_id}"
-                    if task_type == "migrate"
-                    else f"blueprint/refactor-{short_id}"
-                    if task_type == "refactor"
-                    else f"blueprint/task-{short_id}"
-                )
+                branch = _derive_task_branch(task.id, task_type)
                 base_branch = task_payload.get("base_branch", "main")
                 original_prompt = task_payload.get("prompt", task.description or "")
                 is_intermediate = base_branch.startswith(

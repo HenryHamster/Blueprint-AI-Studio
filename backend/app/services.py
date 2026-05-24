@@ -289,6 +289,27 @@ def _extract_branch_short_id(branch_name: str) -> str | None:
     return m.group(1) if m else None
 
 
+# Maps task type -> branch prefix used by the agent when naming work branches.
+# Convention: blueprint/{prefix}-{first-8-hex-of-task-uuid}
+# Full mirror of the canonical map in agent/src/index.ts (TASK_TYPE_BRANCH_PREFIX);
+# keep in sync. Types absent here fall back to the "task" prefix in
+# _derive_task_branch. The reaper/rollup/task_lifecycle copies carry a deliberate
+# *subset* of these entries (see the note above each) — not a strict mirror.
+_TASK_TYPE_BRANCH_PREFIX: dict[str, str] = {
+    "fix": "fix",
+    "refactor": "refactor",
+    "docs": "docs",
+    "deps": "deps",
+    "migrate": "migrate",
+}
+
+
+def _derive_task_branch(task_id: uuid.UUID, task_type: str | None) -> str:
+    """Return the canonical blueprint branch name for a task."""
+    prefix = _TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
+    return f"blueprint/{prefix}-{str(task_id).replace('-', '')[:8]}"
+
+
 def _pr_possibly_open(ctx: dict | None) -> bool:
     """True if task context references a PR without an explicit closure marker.
 
@@ -516,16 +537,7 @@ async def _run_stale_branch_cleanup():
                 # Computed branch name from task ID (covers cases not in context)
                 first_payload = (row.payloads or [{}])[0]
                 task_type = first_payload.get("type", "task")
-                type_prefix = {
-                    "create": "task",
-                    "fix": "fix",
-                    "refactor": "refactor",
-                    "docs": "docs",
-                    "deps": "deps",
-                    "migrate": "migrate",
-                }.get(task_type, "task")
-                short_id = str(row.id).replace("-", "")[:8]
-                active_branches.add(f"blueprint/{type_prefix}-{short_id}")
+                active_branches.add(_derive_task_branch(row.id, task_type))
 
             try:
                 token = await _get_project_github_token(
@@ -1527,25 +1539,10 @@ async def _check_evaluating_timeouts():
                             try:
                                 from app.review_pipeline import _spawn_pipeline_task
 
-                                short_id = str(task.id).replace("-", "")[:8]
                                 task_type_str = (task.first_payload or {}).get(
                                     "type", ""
                                 ) or ""
-                                type_prefix_map = {
-                                    "docs": "docs",
-                                    "deps": "deps",
-                                    "migrate": "migrate",
-                                    "refactor": "refactor",
-                                    "perf": "task",
-                                    "qa": "task",
-                                    "security_audit": "task",
-                                    "debug": "task",
-                                    "smoketest": "task",
-                                }
-                                branch_prefix = type_prefix_map.get(
-                                    task_type_str, "task"
-                                )
-                                branch = f"blueprint/{branch_prefix}-{short_id}"
+                                branch = _derive_task_branch(task.id, task_type_str)
                                 base_branch = (task.first_payload or {}).get(
                                     "base_branch", "main"
                                 )
@@ -2556,14 +2553,7 @@ async def _recover_orphaned_tasks():
                     )
                     continue
 
-                short_id = str(task.id).replace("-", "")[:8]
-                type_prefix = {
-                    "docs": "docs",
-                    "deps": "deps",
-                    "migrate": "migrate",
-                    "refactor": "refactor",
-                }.get(task_type, "task")
-                branch = f"blueprint/{type_prefix}-{short_id}"
+                branch = _derive_task_branch(task.id, task_type)
 
                 try:
                     from app.github import _github_request
@@ -2756,13 +2746,7 @@ async def _recover_orphaned_tasks():
                 pr_number = int(pr_url.rstrip("/").split("/")[-1])
                 base_branch = locked.first_payload.get("base_branch", "main")
                 short_id = str(locked.id).replace("-", "")[:8]
-                type_prefix = {
-                    "docs": "docs",
-                    "deps": "deps",
-                    "migrate": "migrate",
-                    "refactor": "refactor",
-                }.get(task_type, "task")
-                branch = f"blueprint/{type_prefix}-{short_id}"
+                branch = _derive_task_branch(locked.id, task_type)
                 original_prompt = locked.first_payload.get(
                     "prompt", locked.description or ""
                 )

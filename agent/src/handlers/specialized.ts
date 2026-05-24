@@ -3,7 +3,7 @@ import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName, readHandlerOutput,
   persistAndPostStatus, git, runClaudeCode, sendHeartbeatSync,
-  setCurrentPromptFingerprint, listOpenPullRequestsForBranch, matchesRateLimit,
+  setCurrentPromptFingerprint, listOpenPullRequestsForBranch, deriveTaskBranch, matchesRateLimit,
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
@@ -189,8 +189,7 @@ export async function handleMigrate(
   git(['config', 'user.email', migrateBuildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', migrateBuildConfig?.git_user_name || 'Blueprint Agent']);
 
-  const shortId = taskId.replace(/-/g, '').slice(0, 8);
-  const workBranch = `blueprint/migrate-${shortId}`;
+  const workBranch = deriveTaskBranch('migrate', taskId);
   let staleBranchExists = false;
   try {
     git(['ls-remote', '--exit-code', 'origin', workBranch]);

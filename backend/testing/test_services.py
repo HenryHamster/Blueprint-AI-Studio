@@ -12,6 +12,7 @@ Uses isolated in-memory SQLite DB (same pattern as test_pipeline_reliability.py)
 """
 
 import asyncio
+import uuid as _uuid
 import pytest
 import pytest_asyncio
 from datetime import datetime, timedelta, timezone
@@ -35,6 +36,7 @@ from app.models import (
 )
 from app.routers.agent_status import _check_daily_cost_ceiling
 from app.services import (
+    _derive_task_branch,
     _persist_circuit_breakers,
     _persist_zone_health,
     _recover_orphaned_tasks,
@@ -1768,3 +1770,43 @@ async def test_stale_branch_prefixes_preserves_single_prefix(svc_db):
     await svc_db.commit()
     await svc_db.refresh(project)
     assert project.stale_branch_prefixes == ("task/",)
+
+
+# ── _derive_task_branch: task-type -> branch prefix mapping ──────────────────
+
+
+def test_derive_task_branch_known_prefixes():
+    """Each task type with a non-default prefix maps correctly."""
+    task_id = _uuid.UUID("12345678-abcd-ef01-2345-678abcdef012")
+    short = "12345678"
+    assert _derive_task_branch(task_id, "fix") == f"blueprint/fix-{short}"
+    assert _derive_task_branch(task_id, "refactor") == f"blueprint/refactor-{short}"
+    assert _derive_task_branch(task_id, "docs") == f"blueprint/docs-{short}"
+    assert _derive_task_branch(task_id, "deps") == f"blueprint/deps-{short}"
+    assert _derive_task_branch(task_id, "migrate") == f"blueprint/migrate-{short}"
+
+
+def test_derive_task_branch_default_prefix():
+    """Task types that map to 'task' all yield blueprint/task-{short_id}."""
+    task_id = _uuid.UUID("12345678-abcd-ef01-2345-678abcdef012")
+    short = "12345678"
+    for task_type in (
+        "create",
+        "qa",
+        "perf",
+        "security_audit",
+        "debug",
+        "smoketest",
+        None,
+        "",
+    ):
+        assert _derive_task_branch(task_id, task_type) == f"blueprint/task-{short}", (
+            task_type
+        )
+
+
+def test_derive_task_branch_short_id_derivation():
+    """short_id is exactly the first 8 hex chars of the UUID with dashes stripped."""
+    task_id = _uuid.UUID("aabbccdd-1122-3344-5566-778899aabbcc")
+    branch = _derive_task_branch(task_id, "create")
+    assert branch == "blueprint/task-aabbccdd"

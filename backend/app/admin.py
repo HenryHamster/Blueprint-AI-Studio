@@ -991,10 +991,10 @@ async def bulk_action_tasks(
                         )
                         if artifact and artifact.pr_url:
                             pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
-                            branch = (
-                                f"blueprint/task-{str(task.id).replace('-', '')[:8]}"
-                            )
                             task_payload = task.first_payload
+                            branch = _derive_task_branch(
+                                task.id, task_payload.get("type")
+                            )
                             base_branch = task_payload.get("base_branch", "main")
 
                             if ctx.get("touched_critical"):
@@ -1671,8 +1671,8 @@ async def request_changes(
         raise HTTPException(status_code=400, detail="No PR found for this task")
 
     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
-    branch = f"blueprint/task-{str(task.id).replace('-', '')[:8]}"
     task_payload = task.first_payload
+    branch = _derive_task_branch(task.id, task_payload.get("type"))
     base_branch = task_payload.get("base_branch", "main")
 
     from app.review_pipeline import _spawn_pipeline_task
@@ -2295,8 +2295,8 @@ async def modify_task(
                 )
                 if artifact and artifact.pr_url:
                     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
-                    branch = f"blueprint/task-{str(task.id).replace('-', '')[:8]}"
                     task_payload = task.first_payload
+                    branch = _derive_task_branch(task.id, task_payload.get("type"))
                     base_branch = task_payload.get("base_branch", "main")
 
                     if ctx.get("touched_critical"):

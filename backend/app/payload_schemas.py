@@ -206,7 +206,6 @@ class StrategicReviewPayload(_SystemPopulated):
     running_update_acknowledged_at: str | None = None
     user_last_active_at: str | None = None
     self_reflection_log: list[dict[str, Any]] | None = None
-    is_self_repo: bool | None = None
     directions_summary: list[dict[str, Any]] | None = None
     outcome_evaluation: dict[str, Any] | None = None
     recent_interventions: dict[str, Any] | None = None

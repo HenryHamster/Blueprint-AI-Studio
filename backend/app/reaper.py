@@ -40,6 +40,25 @@ from app.time_utils import _utcnow, set_retry_after, RETRY_AFTER_MAX_MINUTES
 
 logger = logging.getLogger(__name__)
 
+# Maps task type -> branch prefix used by the agent when naming work branches.
+# Convention: blueprint/{prefix}-{first-8-hex-of-task-uuid}
+# Deliberate subset of the canonical map in agent/src/index.ts /
+# backend/app/services.py: only the non-"task" prefixes these recovery paths
+# derive are listed. Other types (create, qa, fix, ...) fall back to "task" in
+# _derive_task_branch — and fix tasks reuse an existing branch, so they never
+# hit this fallback. Keep the listed prefixes in sync with the canonical map.
+_TASK_TYPE_BRANCH_PREFIX: Dict[str, str] = {
+    "docs": "docs",
+    "deps": "deps",
+    "migrate": "migrate",
+    "refactor": "refactor",
+}
+
+
+def _derive_task_branch(task_id: uuid.UUID, task_type: str | None) -> str:
+    prefix = _TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
+    return f"blueprint/{prefix}-{str(task_id).replace('-', '')[:8]}"
+
 
 async def _relock_orphan_task(
     session,
@@ -1868,24 +1887,9 @@ async def reaper_service():
                             try:
                                 from app.review_pipeline import _spawn_pipeline_task
 
-                                _short_id = str(task.id).replace("-", "")[:8]
                                 _task_type = (task.first_payload or {}).get(
                                     "type", ""
                                 ) or ""
-                                _type_prefix_map = {
-                                    "docs": "docs",
-                                    "deps": "deps",
-                                    "migrate": "migrate",
-                                    "refactor": "refactor",
-                                    "perf": "task",
-                                    "qa": "task",
-                                    "security_audit": "task",
-                                    "debug": "task",
-                                    "smoketest": "task",
-                                }
-                                _branch_prefix = _type_prefix_map.get(
-                                    _task_type, "task"
-                                )
                                 # Prefer the source task's existing branch (fix tasks
                                 # carry the PR's HEAD ref; create/refactor tasks carry
                                 # the branch the agent already pushed). Only fall back
@@ -1895,7 +1899,7 @@ async def reaper_service():
                                 # and the review fails on `git clone --branch`.
                                 _branch = (task.first_payload or {}).get(
                                     "branch"
-                                ) or f"blueprint/{_branch_prefix}-{_short_id}"
+                                ) or _derive_task_branch(task.id, _task_type)
                                 _base_branch = (task.first_payload or {}).get(
                                     "base_branch", "main"
                                 )

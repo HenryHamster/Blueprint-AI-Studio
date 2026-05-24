@@ -80,7 +80,9 @@ def test_weekly_limit_routes_to_quota_exhausted_kind(msg):
     from app.providers.base import LLMAuthMode
 
     sig = AnthropicProvider().classify_rate_limit_signal(LLMAuthMode.OAUTH, msg.lower())
-    assert sig is not None, f"weekly-limit message not recognized as rate limit: {msg!r}"
+    assert sig is not None, (
+        f"weekly-limit message not recognized as rate limit: {msg!r}"
+    )
     assert sig.kind == "quota_exhausted", (
         f"weekly-limit message should be quota_exhausted (24h cooldown), got {sig.kind!r}"
     )
