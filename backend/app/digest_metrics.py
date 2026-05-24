@@ -1337,7 +1337,9 @@ def compute_failure_grouping(
 
     for t in failed_tasks:
         tid = str(t.id)
-        cls = classify_failure(t, error_log_map.get(tid))
+        cls = classify_failure(
+            t, error_log_map.get(tid), at_time=t.last_heartbeat or t.started_at
+        )
         _task_cost = 0.0
         if t.vm_provisioned_at and t.vm_stopped_at and t.vm_stopped_at >= window_start:
             _rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
@@ -1549,7 +1551,7 @@ def compute_digest_trend_history(
         _p_by_class: dict[str, int] = {}
         _p_by_taxonomy: dict[str, int] = {}
         for _ft in _p_failed_tasks:
-            _cls = _classify_failure(_ft)
+            _cls = _classify_failure(_ft, at_time=_ft.last_heartbeat or _ft.started_at)
             _p_by_class[_cls] = _p_by_class.get(_cls, 0) + 1
             _tax = _classify_taxonomy(_ft)
             _p_by_taxonomy[_tax] = _p_by_taxonomy.get(_tax, 0) + 1
@@ -2047,7 +2049,9 @@ async def compute_remediation_funnel(
     for r in _rem_tasks:
         if r.status != TaskStatus.FAILED:
             continue
-        cls = _classify_failure(r) or "unknown"
+        cls = (
+            _classify_failure(r, at_time=r.last_heartbeat or r.started_at) or "unknown"
+        )
         failed_remediations_by_class[cls] = failed_remediations_by_class.get(cls, 0) + 1
 
     investigations_spawned_by_class: Dict[str, int] = {}

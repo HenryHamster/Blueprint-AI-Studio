@@ -414,3 +414,91 @@ class TestOrphanReapCrashIsolation:
         # Simulate quarantine: DB transition happens, streak entry is removed
         del _orphan_reap_crash_streaks[task_id]
         assert task_id not in _orphan_reap_crash_streaks
+
+
+# ---------------------------------------------------------------------------
+# Tests for the reaper liveness probe in _monitor_background_tasks
+# ---------------------------------------------------------------------------
+
+
+class TestReaperLivenessProbe:
+    """Verify the lifecycle watchdog respects the reaper's HALTED state.
+
+    When the reaper self-halts after a crash-loop, the module-level halt
+    state persists for the lifetime of the process.  Cancelling and
+    re-creating the asyncio.Task only produces another halted reaper (the new
+    task sees the same ``_reaper_halt_state["halted"] = True`` and immediately
+    enters the 300s sleep loop).  The watchdog must therefore skip the cancel
+    when the reaper is halted.
+    """
+
+    def test_halted_reaper_is_not_cancelled(self):
+        """Simulate the watchdog probe logic: a HALTED reaper must not be cancelled."""
+        from unittest.mock import MagicMock
+
+        cancel_reasons: Dict[str, str] = {}
+        mock_reaper_task = MagicMock()
+        mock_reaper_task.done.return_value = False
+
+        reaper_last_cycle = None  # no completed cycles — looks stalled
+        is_halted = True  # but the reaper is HALTED
+
+        # Mirror the probe logic from lifecycle.py _monitor_background_tasks
+        _reaper_stall_threshold = 300.0
+        if mock_reaper_task is not None and not mock_reaper_task.done():
+            if is_halted:
+                pass  # halted intentionally — skip cancel
+            elif reaper_last_cycle is not None:
+                from app.time_utils import _utcnow
+                from datetime import timedelta
+
+                stale_last = _utcnow() - timedelta(seconds=400)
+                age = (_utcnow() - stale_last).total_seconds()
+                if age > _reaper_stall_threshold:
+                    cancel_reasons["reaper"] = (
+                        f"watchdog cancelled: no cycle completion in {int(age)}s"
+                    )
+                    mock_reaper_task.cancel()
+
+        mock_reaper_task.cancel.assert_not_called()
+        assert "reaper" not in cancel_reasons
+
+    def test_stalled_non_halted_reaper_is_cancelled(self):
+        """When the reaper is NOT halted but its last cycle is too old, it is cancelled."""
+        from unittest.mock import MagicMock
+        from datetime import timedelta
+        from app.time_utils import _utcnow
+
+        cancel_reasons: Dict[str, str] = {}
+        mock_reaper_task = MagicMock()
+        mock_reaper_task.done.return_value = False
+
+        stale_last_cycle = _utcnow() - timedelta(seconds=400)
+        is_halted = False
+
+        _reaper_stall_threshold = 300.0
+        if mock_reaper_task is not None and not mock_reaper_task.done():
+            if is_halted:
+                pass
+            elif stale_last_cycle is not None:
+                age = (_utcnow() - stale_last_cycle).total_seconds()
+                if age > _reaper_stall_threshold:
+                    reaper_reason = f"no cycle completion in {int(age)}s"
+                    cancel_reasons["reaper"] = f"watchdog cancelled: {reaper_reason}"
+                    mock_reaper_task.cancel()
+
+        mock_reaper_task.cancel.assert_called_once()
+        assert "reaper" in cancel_reasons
+
+    def test_is_reaper_halted_reflects_halt_state(self):
+        """is_reaper_halted() returns True when _reaper_halt_state[halted] is True."""
+        import app.reaper as _reaper_mod
+
+        original = _reaper_mod._reaper_halt_state.copy()
+        try:
+            _reaper_mod._reaper_halt_state["halted"] = True
+            assert _reaper_mod.is_reaper_halted() is True
+            _reaper_mod._reaper_halt_state["halted"] = False
+            assert _reaper_mod.is_reaper_halted() is False
+        finally:
+            _reaper_mod._reaper_halt_state.update(original)

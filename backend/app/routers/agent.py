@@ -68,6 +68,7 @@ from app.sr_blind_spots import (
     aggregate_sr_blind_spot_themes,
     aggregate_sr_co_failure_pairs,
 )
+from app.pipeline_health import compute_pipeline_health_summary
 
 logger = logging.getLogger(__name__)
 
@@ -1495,8 +1496,6 @@ async def claim_task(
         # Pipeline health summary (for gated task types; else-branch covers the rest)
         pipeline_health = None
         try:
-            from app.routers.admin_digest import compute_pipeline_health_summary
-
             pipeline_health = await compute_pipeline_health_summary(
                 session, task.project_id
             )
@@ -1738,8 +1737,6 @@ async def claim_task(
     else:
         # Lightweight pipeline health for all other task types
         try:
-            from app.routers.admin_digest import compute_pipeline_health_summary
-
             pipeline_health = await compute_pipeline_health_summary(
                 session, task.project_id
             )

@@ -89,6 +89,12 @@ from app.dispatcher_formatters import (
     _parse_iso_timestamp,
     _parse_signal_timestamp,
 )
+from app.pipeline_health import (
+    _LONE_CHECKER_ALERT_TITLE,
+    _evaluate_lone_checker_alert,
+    _evaluate_sr_catch_rate_targets,
+    compute_pipeline_health_summary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1681,7 +1687,6 @@ async def _current_signal_value_for_class(
 
     if regression_class == "pipeline_success_rate":
         from app.models import Task as TaskModel
-        from app.routers.admin_digest import compute_pipeline_health_summary
 
         summary = await compute_pipeline_health_summary(
             session, project_id, lookback_hours=24
@@ -3810,9 +3815,6 @@ async def _escalate_stale_observation_alerts(
     ``signal_snapshot_at_spawn`` so downstream consumers can dismiss the alert when the
     case closes. Returns the number of new investigate tasks spawned.
     """
-    from app.routers.admin_digest import (  # noqa: PLC0415
-        _LONE_CHECKER_ALERT_TITLE,
-    )
     from app.models import Project as _EscProject  # noqa: PLC0415
 
     _esc_project = await session.get(_EscProject, project_id)
@@ -6549,8 +6551,6 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
     # have entered lone-checker state (SR is the only reviewer, catch-rate
     # unmeasurable). Wrapped in try/except for the same reason as above.
     try:
-        from app.routers.admin_digest import _evaluate_lone_checker_alert
-
         await _evaluate_lone_checker_alert(session, project_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -6564,8 +6564,6 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
     # for any configured category falls below the project's per-category target
     # for >=2 consecutive windows. Same try/except pattern.
     try:
-        from app.routers.admin_digest import _evaluate_sr_catch_rate_targets
-
         await _evaluate_sr_catch_rate_targets(session, project_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning(

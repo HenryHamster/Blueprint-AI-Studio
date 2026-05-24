@@ -39,6 +39,7 @@ from app.failure_classification import (
     get_account_failure_class_records,
     get_top_residual_fingerprints,
     normalize_agent_failure_category,
+    persist_authoritative_verdict,
     persist_failure_category,
     record_account_failure_class,
     record_residual_fingerprint,
@@ -2692,6 +2693,28 @@ class TestParseFailedCorrelation:
         assert result == CODE_ERROR
         assert "rate_limit_correlation_reclassified" not in task.context
 
+    def test_parse_failed_reclassifies_via_weekly_limit_text_in_status_message(
+        self, monkeypatch
+    ):
+        """normalize_agent_failure_category returns RATE_LIMIT for parse_failed when
+        latest_status_message contains a verbatim weekly-limit phrase — the text-override
+        branch now covers _ALL_GENERIC_CODE_ERROR_LABELS (including parse_failed)."""
+        import app.max_plan_pool as pool_mod
+
+        # Ensure account/pool correlation paths don't fire so the TEXT override is
+        # the sole reclassification mechanism.
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+
+        weekly_limit_msg = (
+            "You've hit your weekly limit · resets 9pm (UTC)\nNo output produced."
+        )
+        task = _task(weekly_limit_msg)
+        result = normalize_agent_failure_category("parse_failed", task)
+        assert result == RATE_LIMIT
+
     def test_classify_failure_class_parse_failed_pool_rate_limited(self, monkeypatch):
         """classify_failure fast-path via agent_category=parse_failed during pool block."""
         import app.max_plan_pool as pool_mod
@@ -2759,3 +2782,81 @@ class TestCorrelationReclassificationMarker:
         assert task.context.get("rate_limit_kind") is not None
         # But correlation marker must NOT be set when text signal matched
         assert "rate_limit_correlation_reclassified" not in task.context
+
+
+class TestPersistAuthoritativeVerdictShortCircuit:
+    """persist_authoritative_verdict() short-circuit prevents RATE_LIMIT→CODE_ERROR
+    drift when analytics paths call classify_failure() after cooldown has lifted.
+
+    Done-looks-like from the task spec: create a failed task, classify at the
+    failure instant (at_time=heartbeat) to get RATE_LIMIT, advance the clock
+    past cooldown, call classify_failure() the way digest_metrics/anomaly_detection
+    does, assert the verdict is still RATE_LIMIT.
+    """
+
+    def test_persisted_rate_limit_survives_post_cooldown_classify(self, monkeypatch):
+        """Reaper persists RATE_LIMIT at failure instant; analytics path calling
+        classify_failure() hours later (no at_time, no active cooldown) must
+        still return RATE_LIMIT via the short-circuit, not CODE_ERROR."""
+        import app.max_plan_pool as pool_mod
+
+        # Simulate post-cooldown state: no accounts rate-limited, pool healthy.
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+
+        # Task with a generic failure label that would default to CODE_ERROR
+        # when no rate-limit state is active (this is the drift scenario).
+        task = _task(
+            "",
+            ctx={"failure_category": "claude_code_failed"},
+        )
+
+        # Without persist_authoritative_verdict, analytics path returns CODE_ERROR.
+        assert classify_failure(task) == CODE_ERROR, (
+            "baseline: no persisted verdict + no active cooldown → CODE_ERROR"
+        )
+
+        # Reaper classifies at the failure instant (cooldown was active then) and
+        # persists the authoritative verdict.
+        persist_authoritative_verdict(task, RATE_LIMIT)
+
+        # Analytics path (digest_metrics, anomaly_detection, finding_deduplication)
+        # calls classify_failure() without at_time — short-circuit must return
+        # the persisted verdict, not re-run correlation against expired state.
+        result = classify_failure(task)
+        assert result == RATE_LIMIT, (
+            f"Expected RATE_LIMIT (persisted by reaper at failure instant) "
+            f"but got {result!r} — classify_failure() ignored the persisted verdict, "
+            f"causing RATE_LIMIT→CODE_ERROR drift after cooldown expired"
+        )
+
+    def test_persisted_verdict_written_to_context_failure_class_key(self):
+        """persist_authoritative_verdict writes to context['failure_class'], not
+        context['failure_category'] — verify the key and value are correct."""
+        task = _task("", ctx={})
+        persist_authoritative_verdict(task, RATE_LIMIT)
+        assert task.context.get("failure_class") == RATE_LIMIT
+
+    def test_persisted_verdict_overrides_generic_code_error_fast_path(self):
+        """failure_class short-circuit takes precedence over the failure_category
+        fast-path so analytics paths see the persisted verdict even when
+        failure_category=claude_code_failed would re-map to CODE_ERROR."""
+        task = _task(
+            "",
+            ctx={"failure_category": "claude_code_failed", "failure_class": RATE_LIMIT},
+        )
+        assert classify_failure(task) == RATE_LIMIT
+
+    def test_no_persisted_verdict_still_re_derives(self, monkeypatch):
+        """Without a persisted verdict, classify_failure() must still re-derive
+        normally — the short-circuit must not suppress first-call classification."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+        )
+        task = _task("", ctx={"failure_category": "incomplete"})
+        # No persist_authoritative_verdict call — re-derives from pool state.
+        assert classify_failure(task) == RATE_LIMIT

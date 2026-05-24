@@ -774,7 +774,7 @@ def normalize_agent_failure_category(
     label_lower = label.lower()
     mapped = _AGENT_CATEGORY_TO_CLASS.get(label_lower)
     if mapped:
-        if mapped == CODE_ERROR and label_lower in _GENERIC_AGENT_CODE_LABELS:
+        if mapped == CODE_ERROR and label_lower in _ALL_GENERIC_CODE_ERROR_LABELS:
             combined = (task.latest_status_message or "").lower()
             override = _text_provider_failure_override(task, combined)
             if override:
@@ -1597,6 +1597,19 @@ def classify_failure_with_confidence(
     return FailureClassification(failure_class=failure_class, confidence=0.7)
 
 
+def persist_authoritative_verdict(task: "Task", failure_class: str) -> None:
+    """Persist the authoritative failure verdict to task.context['failure_class'].
+
+    Call this from authoritative classification sites (reaper, agent_status) at
+    the failure instant so analytics paths that invoke classify_failure() hours
+    later short-circuit to the same verdict without re-running rate-limit
+    correlation against post-cooldown account state.
+    """
+    ctx = dict(task.context or {})
+    ctx["failure_class"] = failure_class
+    task.context = ctx
+
+
 def _classify_failure_class(
     task: "Task", logs: str | None = None, at_time: "datetime | None" = None
 ) -> str:
@@ -1613,6 +1626,14 @@ def _classify_failure_class(
         return SCOPE_EMPTY
     if _status_msg_raw[:8].lower().startswith("blocker:"):
         return BLOCKED_PRECONDITION
+
+    # Short-circuit: if reaper/agent_status already persisted the authoritative
+    # verdict at the failure instant via persist_authoritative_verdict(), return
+    # it without re-running rate-limit correlation. Prevents RATE_LIMIT→CODE_ERROR
+    # flips when analytics paths call classify_failure() hours after the cooldown lifted.
+    persisted_class = (task.context or {}).get("failure_class")
+    if isinstance(persisted_class, str) and persisted_class:
+        return persisted_class
 
     # Fast path: agent already reported a structured category — prefer it over regex.
     # Accept both the legacy lowercase labels (pre-normalization writes) and the

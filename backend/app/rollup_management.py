@@ -40,6 +40,26 @@ from app.shared_state import runtime_config as _runtime_config
 logger = logging.getLogger(__name__)
 
 
+# Maps task type -> branch prefix used by the agent when naming work branches.
+# Convention: blueprint/{prefix}-{first-8-hex-of-task-uuid}
+# Deliberate subset of the canonical map in agent/src/index.ts /
+# backend/app/services.py: only the non-"task" prefixes these recovery paths
+# derive are listed. Other types (create, qa, fix, ...) fall back to "task" in
+# _derive_task_branch — and fix tasks reuse an existing branch, so they never
+# hit this fallback. Keep the listed prefixes in sync with the canonical map.
+_TASK_TYPE_BRANCH_PREFIX: dict[str, str] = {
+    "docs": "docs",
+    "deps": "deps",
+    "migrate": "migrate",
+    "refactor": "refactor",
+}
+
+
+def _derive_task_branch(task_id: uuid.UUID, task_type: str | None) -> str:
+    prefix = _TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
+    return f"blueprint/{prefix}-{str(task_id).replace('-', '')[:8]}"
+
+
 # Circuit-breaker: cap how many times the stale-PR rollup recovery in
 # ``_check_and_trigger_rollup`` respawns a review for one unmerged child.
 # Without a cap, a review that keeps failing fast — e.g. pre-empted at dispatch
@@ -1119,9 +1139,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     continue
 
                 c_payload = c.first_payload
-                branch = (c.context or {}).get(
-                    "branch"
-                ) or f"blueprint/task-{str(c.id).replace('-', '')[:8]}"
+                branch = (c.context or {}).get("branch") or _derive_task_branch(
+                    c.id, c_payload.get("type")
+                )
                 base_branch = c_payload.get("base_branch", "main")
                 original_prompt = c_payload.get("prompt", c.description or "")
                 review_task, was_spawned = await _spawn_pipeline_task(

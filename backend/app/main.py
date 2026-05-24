@@ -155,11 +155,6 @@ _ORCHESTRATOR_DELETE_TTL: float = 1800.0  # 30 minutes
 # likely to consult next.
 _ORCHESTRATOR_DELETE_MAX_ENTRIES: int = 5000
 
-# Broadcast alert safety cap — limits the number of projects receiving
-# cross-project broadcast alerts (orchestrator errors, halts, rollbacks, recovery).
-# Single source of truth: changed here and applies to all broadcast helpers.
-_PROJECT_BROADCAST_LIMIT: int = 1000
-
 
 def is_orchestrator_initiated_delete(vm_id: str) -> tuple[bool, str | None]:
     """Return (True, reason) if `vm_id` was deleted by the orchestrator
@@ -960,15 +955,14 @@ async def _create_orchestrator_error_alerts(
         f"The orchestrator has encountered {consecutive_errors} consecutive errors. "
         "The pipeline may be stalled. Check logs for details."
     )
+    limit = _runtime_config.get("project_broadcast_limit", 1000)
     project_ids = (
-        (await session.execute(select(Project.id).limit(_PROJECT_BROADCAST_LIMIT)))
-        .scalars()
-        .all()
+        (await session.execute(select(Project.id).limit(limit))).scalars().all()
     )
-    if len(project_ids) == _PROJECT_BROADCAST_LIMIT:
+    if len(project_ids) == limit:
         logger.warning(
             "_create_orchestrator_error_alerts: project_ids capped at %d",
-            _PROJECT_BROADCAST_LIMIT,
+            limit,
         )
     existing_rows = (
         (
@@ -1017,15 +1011,12 @@ async def _create_halted_alerts(
         f"Halted at: {halted_at.isoformat()}. "
         "Pipeline will auto-recover after 1h cooldown, or manually set max VMs > 0."
     )
+    limit = _runtime_config.get("project_broadcast_limit", 1000)
     project_ids = (
-        (await session.execute(select(Project.id).limit(_PROJECT_BROADCAST_LIMIT)))
-        .scalars()
-        .all()
+        (await session.execute(select(Project.id).limit(limit))).scalars().all()
     )
-    if len(project_ids) == _PROJECT_BROADCAST_LIMIT:
-        logger.warning(
-            "_create_halted_alerts: project_ids capped at %d", _PROJECT_BROADCAST_LIMIT
-        )
+    if len(project_ids) == limit:
+        logger.warning("_create_halted_alerts: project_ids capped at %d", limit)
     for pid in project_ids:
         alert = Alert(
             project_id=pid,
@@ -1052,15 +1043,14 @@ async def _create_rollback_alerts(
         f"Deployment automatically rolled back from {rolled_back_from[:8]} "
         f"to {rolled_back_to[:8]}."
     )
+    limit = _runtime_config.get("project_broadcast_limit", 1000)
     project_ids = (
-        (await session.execute(select(Project.id).limit(_PROJECT_BROADCAST_LIMIT)))
-        .scalars()
-        .all()
+        (await session.execute(select(Project.id).limit(limit))).scalars().all()
     )
-    if len(project_ids) == _PROJECT_BROADCAST_LIMIT:
+    if len(project_ids) == limit:
         logger.warning(
             "_create_rollback_alerts: project_ids capped at %d",
-            _PROJECT_BROADCAST_LIMIT,
+            limit,
         )
     existing_rows = (
         (
@@ -1098,15 +1088,14 @@ async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
     """Create INFO alerts and dismiss existing HALTED ERROR alerts when deployment auto-recovers."""
     recovery_title = "Deployment auto-recovered from HALTED state after 1h cooldown"
     now = _utcnow()
+    limit = _runtime_config.get("project_broadcast_limit", 1000)
     project_ids = (
-        (await session.execute(select(Project.id).limit(_PROJECT_BROADCAST_LIMIT)))
-        .scalars()
-        .all()
+        (await session.execute(select(Project.id).limit(limit))).scalars().all()
     )
-    if len(project_ids) == _PROJECT_BROADCAST_LIMIT:
+    if len(project_ids) == limit:
         logger.warning(
             "_create_halted_recovery_alerts: project_ids capped at %d",
-            _PROJECT_BROADCAST_LIMIT,
+            limit,
         )
     # Single batched query for all undismissed HALTED ERROR alerts across all projects
     halted_alerts = (

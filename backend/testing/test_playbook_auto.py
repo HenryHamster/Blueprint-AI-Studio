@@ -5454,12 +5454,15 @@ async def test_compute_sr_catch_rate_trends_by_direction_trend_increasing(
     project = await _make_project(db_session)
     direction_id = "d-trend-increasing"
 
-    # Seed prior state: miss_rate was 0.0 (all caught)
+    # Seed prior state: miss_rate was 0.0 (all caught) over 4 prior samples.
+    # sample_count is required for the two-proportion z-test that now gates the
+    # trend label; with n=4 prior and n=4 current the 0.0→1.0 jump is significant.
     project.design_doc = {
         "sr_catch_rate_trends": {
             "by_direction": {
                 direction_id: {
                     "miss_rate": 0.0,
+                    "sample_count": 4,
                     "rate_history": [0.0],
                 }
             }
@@ -5501,12 +5504,15 @@ async def test_compute_sr_catch_rate_trends_by_direction_trend_decreasing(
     project = await _make_project(db_session)
     direction_id = "d-trend-decreasing"
 
-    # Seed prior state: miss_rate was 1.0 (all missed)
+    # Seed prior state: miss_rate was 1.0 (all missed) over 4 prior samples.
+    # sample_count is required for the two-proportion z-test that now gates the
+    # trend label; with n=4 prior and n=4 current the 1.0→0.0 drop is significant.
     project.design_doc = {
         "sr_catch_rate_trends": {
             "by_direction": {
                 direction_id: {
                     "miss_rate": 1.0,
+                    "sample_count": 4,
                     "rate_history": [1.0],
                 }
             }
@@ -5769,6 +5775,134 @@ async def test_compute_sr_catch_rate_trends_by_direction_stores_direction_text(
     assert result is not None
     entry = result["by_direction"][direction_id]
     assert entry.get("direction_text") == "Fix the login regression"
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_direction_significance_gates_trend(
+    db_session: AsyncSession,
+):
+    """Per-direction trends require both significance AND delta threshold.
+
+    With small sample size (n=5), a delta of 0.2 is noise (z < 1.28) → 'stable'.
+    With large sample size (n=30), the same delta is significant (z >= 1.28) → 'increasing'.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    # --- Small n: direction with 5 tasks, previous hit_rate=0.4, current hit_rate=0.6 ---
+    project_small = await _make_project(db_session)
+    direction_id_small = "d-small-n"
+
+    # Seed prior state: hit_rate was 0.4 (2 caught, 3 missed)
+    project_small.design_doc = {
+        "sr_catch_rate_trends": {
+            "by_direction": {
+                direction_id_small: {
+                    "miss_rate": 0.6,  # 1 - 0.4
+                    "sample_count": 5,
+                    "rate_history": [0.6],
+                }
+            }
+        }
+    }
+    await db_session.flush()
+
+    # Current window: 3 caught, 2 missed → hit_rate 0.6, miss_rate 0.4 (delta = -0.2)
+    tasks_small = []
+    for _ in range(3):
+        t = _make_sr_task_with_direction(
+            project_small.id,
+            direction_id_small,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],  # SR caught (flagged the human-flagged cat)
+        )
+        db_session.add(t)
+        tasks_small.append(t)
+    for _ in range(2):
+        t = _make_sr_task_with_direction(
+            project_small.id,
+            direction_id_small,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],  # SR missed (did not flag the human-flagged cat)
+        )
+        db_session.add(t)
+        tasks_small.append(t)
+    for t in _make_window_padding(project_small.id, age_days=2):
+        db_session.add(t)
+        tasks_small.append(t)
+    for t in _make_window_padding(project_small.id, age_days=20):
+        db_session.add(t)
+        tasks_small.append(t)
+
+    # --- Large n: direction with 30 tasks, same delta but z-test significant ---
+    project_large = await _make_project(db_session)
+    direction_id_large = "d-large-n"
+
+    # Seed prior state: hit_rate was 0.4 (12 caught, 18 missed)
+    project_large.design_doc = {
+        "sr_catch_rate_trends": {
+            "by_direction": {
+                direction_id_large: {
+                    "miss_rate": 0.6,  # 1 - 0.4
+                    "sample_count": 30,
+                    "rate_history": [0.6],
+                }
+            }
+        }
+    }
+    await db_session.flush()
+
+    # Current window: 18 caught, 12 missed → hit_rate 0.6, miss_rate 0.4 (delta = -0.2)
+    tasks_large = []
+    for _ in range(18):
+        t = _make_sr_task_with_direction(
+            project_large.id,
+            direction_id_large,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],  # SR caught (flagged the human-flagged cat)
+        )
+        db_session.add(t)
+        tasks_large.append(t)
+    for _ in range(12):
+        t = _make_sr_task_with_direction(
+            project_large.id,
+            direction_id_large,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],  # SR missed (did not flag the human-flagged cat)
+        )
+        db_session.add(t)
+        tasks_large.append(t)
+    for t in _make_window_padding(project_large.id, age_days=2):
+        db_session.add(t)
+        tasks_large.append(t)
+    for t in _make_window_padding(project_large.id, age_days=20):
+        db_session.add(t)
+        tasks_large.append(t)
+
+    await db_session.flush()
+
+    result_small = await compute_sr_catch_rate_trends(
+        project_small.id, db_session, tasks_small
+    )
+    result_large = await compute_sr_catch_rate_trends(
+        project_large.id, db_session, tasks_large
+    )
+
+    assert result_small is not None
+    assert result_large is not None
+    entry_small = result_small["by_direction"][direction_id_small]
+    entry_large = result_large["by_direction"][direction_id_large]
+
+    # Same delta (-0.2), but different significance at n=5 vs n=30
+    assert entry_small["trend"] == "stable", (
+        "n=5, delta=-0.2: z < 1.28, not significant → stable"
+    )
+    assert entry_large["trend"] == "decreasing", (
+        "n=30, delta=-0.2: z >= 1.28, significant → decreasing"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

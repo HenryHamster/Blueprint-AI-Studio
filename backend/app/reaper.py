@@ -40,6 +40,25 @@ from app.time_utils import _utcnow, set_retry_after, RETRY_AFTER_MAX_MINUTES
 
 logger = logging.getLogger(__name__)
 
+# Maps task type -> branch prefix used by the agent when naming work branches.
+# Convention: blueprint/{prefix}-{first-8-hex-of-task-uuid}
+# Deliberate subset of the canonical map in agent/src/index.ts /
+# backend/app/services.py: only the non-"task" prefixes these recovery paths
+# derive are listed. Other types (create, qa, fix, ...) fall back to "task" in
+# _derive_task_branch — and fix tasks reuse an existing branch, so they never
+# hit this fallback. Keep the listed prefixes in sync with the canonical map.
+_TASK_TYPE_BRANCH_PREFIX: Dict[str, str] = {
+    "docs": "docs",
+    "deps": "deps",
+    "migrate": "migrate",
+    "refactor": "refactor",
+}
+
+
+def _derive_task_branch(task_id: uuid.UUID, task_type: str | None) -> str:
+    prefix = _TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
+    return f"blueprint/{prefix}-{str(task_id).replace('-', '')[:8]}"
+
 
 async def _relock_orphan_task(
     session,
@@ -125,6 +144,18 @@ _ORPHAN_REAP_CRASH_STREAK_LIMIT = 3
 _reaper_cycles_completed_count: int = 0
 _reaper_last_cycle_completed_at: datetime | None = None
 
+# Cycle-level circuit breaker. After N consecutive whole-cycle exceptions the
+# reaper enters HALTED state, stops cycling, and posts an ERROR alert. Resets
+# automatically on process restart (in-memory); tunable via runtime_config key
+# "reaper_cycle_halt_threshold".
+_REAPER_CYCLE_HALT_THRESHOLD: int = 5
+_reaper_halt_state: dict = {
+    "halted": False,
+    "halt_timestamp": None,
+    "last_error": None,
+    "crash_count": 0,
+}
+
 
 def get_reaper_stats() -> dict:
     """Snapshot of reaper liveness for /metrics and admin observability.
@@ -143,7 +174,42 @@ def get_reaper_stats() -> dict:
     return {
         "cycles_completed_total": _reaper_cycles_completed_count,
         "last_cycle_age_seconds": age_seconds,
+        "halted": _reaper_halt_state["halted"],
+        "halt_timestamp": _reaper_halt_state["halt_timestamp"].isoformat()
+        if _reaper_halt_state["halt_timestamp"]
+        else None,
+        "halt_crash_count": _reaper_halt_state["crash_count"],
     }
+
+
+def is_reaper_halted() -> bool:
+    """Liveness probe: True iff the reaper has self-halted after a crash-loop."""
+    return _reaper_halt_state["halted"]
+
+
+async def _post_reaper_halt_alert(crash_count: int, last_error: str) -> None:
+    """Post an ERROR-severity alert to every project when the reaper self-halts."""
+    try:
+        from app.models import Alert, AlertSeverity
+
+        async with AsyncSessionLocal() as s:
+            proj_ids = (await s.execute(select(Project.id))).scalars().all()
+            for pid in proj_ids:
+                s.add(
+                    Alert(
+                        project_id=pid,
+                        severity=AlertSeverity.ERROR,
+                        title="Reaper service HALTED after crash-loop",
+                        message=(
+                            f"Reaper crash-looped {crash_count}× and self-halted. "
+                            f"Last error: {last_error[:300]}. "
+                            "No new reap cycles until process restart or operator reset."
+                        ),
+                    )
+                )
+            await s.commit()
+    except Exception:
+        logger.exception("[REAPER] Failed to post halt alert")
 
 
 # Per-(provider, model) regression scan cadence. The reaper itself fires every
@@ -662,6 +728,13 @@ async def reaper_service():
 
     consecutive_errors = 0
     while True:
+        if _reaper_halt_state["halted"]:
+            try:
+                await asyncio.sleep(300)
+            except asyncio.CancelledError:
+                logger.info("[REAPER] Service shutting down (halted).")
+                break
+            continue
         try:
             async with AsyncSessionLocal() as session:
                 # Step 1: Read active tasks WITHOUT locks (avoids blocking heartbeat writes)
@@ -1814,24 +1887,9 @@ async def reaper_service():
                             try:
                                 from app.review_pipeline import _spawn_pipeline_task
 
-                                _short_id = str(task.id).replace("-", "")[:8]
                                 _task_type = (task.first_payload or {}).get(
                                     "type", ""
                                 ) or ""
-                                _type_prefix_map = {
-                                    "docs": "docs",
-                                    "deps": "deps",
-                                    "migrate": "migrate",
-                                    "refactor": "refactor",
-                                    "perf": "task",
-                                    "qa": "task",
-                                    "security_audit": "task",
-                                    "debug": "task",
-                                    "smoketest": "task",
-                                }
-                                _branch_prefix = _type_prefix_map.get(
-                                    _task_type, "task"
-                                )
                                 # Prefer the source task's existing branch (fix tasks
                                 # carry the PR's HEAD ref; create/refactor tasks carry
                                 # the branch the agent already pushed). Only fall back
@@ -1841,7 +1899,7 @@ async def reaper_service():
                                 # and the review fails on `git clone --branch`.
                                 _branch = (task.first_payload or {}).get(
                                     "branch"
-                                ) or f"blueprint/{_branch_prefix}-{_short_id}"
+                                ) or _derive_task_branch(task.id, _task_type)
                                 _base_branch = (task.first_payload or {}).get(
                                     "base_branch", "main"
                                 )
@@ -3396,6 +3454,30 @@ async def reaper_service():
                 await session.rollback()
             except Exception:
                 logger.exception("[REAPER] Rollback after reaper error failed")
+            _halt_threshold = _runtime_config.get(
+                "reaper_cycle_halt_threshold", _REAPER_CYCLE_HALT_THRESHOLD
+            )
+            if (
+                consecutive_errors >= _halt_threshold
+                and not _reaper_halt_state["halted"]
+            ):
+                _reaper_halt_state.update(
+                    {
+                        "halted": True,
+                        "halt_timestamp": _utcnow(),
+                        "last_error": str(e)[:500],
+                        "crash_count": consecutive_errors,
+                    }
+                )
+                logger.error(
+                    "[REAPER] HALTED after %d consecutive cycle crashes — last error: %s",
+                    consecutive_errors,
+                    e,
+                )
+                with contextlib.suppress(Exception):
+                    asyncio.get_running_loop().create_task(  # noqa: RUF006
+                        _post_reaper_halt_alert(consecutive_errors, str(e)[:500])
+                    )
 
         # Sleep before next cycle; use exponential backoff on consecutive errors
         sleep_seconds = min(60 * (2**consecutive_errors), 300)

@@ -565,6 +565,32 @@ describe('handleInvestigate — report reading and status mapping', () => {
     expect(call.artifact_type).toBe('ERROR_LOG');
   });
 
+  it('posts rate_limited instead of parse_failed when transcript contains a weekly-limit message', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    const rateLimitTranscript = "You've hit your weekly limit · resets 9pm (UTC)\nNo output produced.";
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 1, allOutput: rateLimitTranscript, lastResultText: '' });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('rate_limited');
+  });
+
+  it('posts rate_limited instead of parse_failed when lastResultText contains a weekly-limit message', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 1,
+      allOutput: '',
+      lastResultText: "You've hit your weekly limit · resets 9pm (UTC)",
+    });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.failure_category).toBe('rate_limited');
+  });
+
   it('throws when no prompt is provided in payload or task', async () => {
     await expect(
       handleInvestigate(

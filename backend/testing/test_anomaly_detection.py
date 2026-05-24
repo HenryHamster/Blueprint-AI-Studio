@@ -1319,3 +1319,46 @@ async def test_parent_requeued_no_cross_direction_fingerprint():
     result = await _compute_research_anomalies(project_id, session)
 
     assert not any(a["signal"].startswith("CrossDirectionFingerprint_") for a in result)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Persisted verdict — rate-limit drift prevention
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_persisted_rate_limit_verdict_not_reclassified_as_code_error():
+    """Anomaly detection must honour the reaper's persisted RATE_LIMIT verdict.
+
+    When the reaper calls persist_authoritative_verdict() at failure time and
+    anomaly_detection runs hours later (after the rate-limit cooldown lifted),
+    classify_failure()'s short-circuit returns the persisted class so the task
+    is bucketed as RATE_LIMIT — not reclassified as CODE_ERROR.
+    """
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    project = make_project(directions=[])
+
+    # 4 tasks whose message would default to CODE_ERROR but have RATE_LIMIT
+    # persisted by the reaper via persist_authoritative_verdict().
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.FAILED,
+            latest_status_message="generic agent death",
+            context={"failure_class": "RATE_LIMIT"},
+            created_at=now - timedelta(hours=5 + i),
+        )
+        for i in range(4)
+    ]
+    session = _make_session(tasks=tasks, project=project)
+
+    result = await _compute_research_anomalies(project_id, session)
+
+    signals = [a["signal"] for a in result]
+    assert any("RATE_LIMIT" in s for s in signals), (
+        f"RATE_LIMIT anomaly missing: {signals}"
+    )
+    assert not any("CODE_ERROR" in s for s in signals), (
+        f"Unexpected CODE_ERROR (verdict drifted): {signals}"
+    )

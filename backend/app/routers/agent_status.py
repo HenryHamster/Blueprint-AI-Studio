@@ -2446,22 +2446,10 @@ async def update_agent_status(
                 session.add(task)
                 try:
                     from app.review_pipeline import _spawn_pipeline_task
+                    from app.admin import _derive_task_branch
 
-                    _short_id = str(task.id).replace("-", "")[:8]
                     _task_type = (task.first_payload or {}).get("type", "") or ""
-                    _type_prefix_map = {
-                        "docs": "docs",
-                        "deps": "deps",
-                        "migrate": "migrate",
-                        "refactor": "refactor",
-                        "perf": "task",
-                        "qa": "task",
-                        "security_audit": "task",
-                        "debug": "task",
-                        "smoketest": "task",
-                    }
-                    _branch_prefix = _type_prefix_map.get(_task_type, "task")
-                    _branch = f"blueprint/{_branch_prefix}-{_short_id}"
+                    _branch = _derive_task_branch(task.id, _task_type)
                     _base_branch = (task.first_payload or {}).get("base_branch", "main")
                     _original_prompt = (task.first_payload or {}).get(
                         "prompt", task.description or ""

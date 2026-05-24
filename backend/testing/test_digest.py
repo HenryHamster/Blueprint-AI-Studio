@@ -887,6 +887,43 @@ async def test_digest_project_filter(client: AsyncClient, db_session):
     assert "Task B" not in titles
 
 
+def test_compute_failure_grouping_respects_persisted_verdict():
+    """Persisted authoritative verdict is returned by compute_failure_grouping even
+    without at_time, preventing RATE_LIMIT→CODE_ERROR drift for analytics paths."""
+    from app.failure_classification import (
+        RATE_LIMIT,
+        persist_authoritative_verdict,
+    )
+
+    now = _utcnow()
+    heartbeat = now - timedelta(hours=2)
+    window_start = now - timedelta(hours=24)
+
+    task = make_task(
+        status=TaskStatus.FAILED,
+        latest_status_message="claude_code_failed",
+        context={"failure_category": "claude_code_failed"},
+        last_heartbeat=heartbeat,
+    )
+    # Simulate the reaper persisting RATE_LIMIT at the failure instant.
+    persist_authoritative_verdict(task, RATE_LIMIT)
+
+    result = compute_failure_grouping(
+        failed_tasks=[task],
+        error_log_map={},
+        dir_id_to_text={},
+        window_start=window_start,
+        now=now,
+    )
+    groups = {g["failure_class"]: g for g in result["failure_groups"]}
+    assert RATE_LIMIT in groups, (
+        f"Expected RATE_LIMIT group from persisted verdict, got: {list(groups)}"
+    )
+    assert "CODE_ERROR" not in groups, (
+        "classify_failure must not flip RATE_LIMIT→CODE_ERROR in analytics path"
+    )
+
+
 @pytest.mark.asyncio
 async def test_digest_active_count(client: AsyncClient, db_session):
     """In-progress tasks appear in active_count/active_tasks and not in completed_count."""

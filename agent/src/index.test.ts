@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, isViewportBootstrapFailure, isInfrastructureFailure, runViewportSuiteWithFallback, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, isViewportBootstrapFailure, isInfrastructureFailure, runViewportSuiteWithFallback, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, TASK_TYPE_BRANCH_PREFIX, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -251,6 +251,57 @@ describe('validateBranchName', () => {
 
   it('throws on backtick character', () => {
     expect(() => validateBranchName('feat`cmd`', 'branch')).toThrow('Invalid branch');
+  });
+});
+
+// ── deriveTaskBranch ─────────────────────────────────────────────────────────
+// Pins the task-type → branch-prefix mapping so drift between the agent and
+// backend/app/services.py _TASK_TYPE_BRANCH_PREFIX is caught immediately.
+describe('deriveTaskBranch', () => {
+  const taskId = 'abcdef12-3456-7890-abcd-ef1234567890';
+  const shortId = 'abcdef12'; // taskId.replace(/-/g,'').slice(0,8)
+
+  it('maps fix → fix prefix', () => {
+    expect(deriveTaskBranch('fix', taskId)).toBe(`blueprint/fix-${shortId}`);
+  });
+
+  it('maps refactor → refactor prefix', () => {
+    expect(deriveTaskBranch('refactor', taskId)).toBe(`blueprint/refactor-${shortId}`);
+  });
+
+  it('maps docs → docs prefix', () => {
+    expect(deriveTaskBranch('docs', taskId)).toBe(`blueprint/docs-${shortId}`);
+  });
+
+  it('maps deps → deps prefix', () => {
+    expect(deriveTaskBranch('deps', taskId)).toBe(`blueprint/deps-${shortId}`);
+  });
+
+  it('maps migrate → migrate prefix', () => {
+    expect(deriveTaskBranch('migrate', taskId)).toBe(`blueprint/migrate-${shortId}`);
+  });
+
+  it('defaults unknown types to task prefix', () => {
+    expect(deriveTaskBranch('create', taskId)).toBe(`blueprint/task-${shortId}`);
+    expect(deriveTaskBranch('qa', taskId)).toBe(`blueprint/task-${shortId}`);
+    expect(deriveTaskBranch('review', taskId)).toBe(`blueprint/task-${shortId}`);
+    expect(deriveTaskBranch('', taskId)).toBe(`blueprint/task-${shortId}`);
+  });
+
+  it('TASK_TYPE_BRANCH_PREFIX covers all explicitly-mapped types', () => {
+    // Keep in sync with backend/app/services.py _TASK_TYPE_BRANCH_PREFIX
+    expect(TASK_TYPE_BRANCH_PREFIX).toEqual({
+      fix: 'fix',
+      refactor: 'refactor',
+      docs: 'docs',
+      deps: 'deps',
+      migrate: 'migrate',
+    });
+  });
+
+  it('uses first 8 hex chars of task UUID with dashes removed', () => {
+    const id = '11223344-aaaa-bbbb-cccc-ddddeeee0000';
+    expect(deriveTaskBranch('fix', id)).toBe('blueprint/fix-11223344');
   });
 });
 
