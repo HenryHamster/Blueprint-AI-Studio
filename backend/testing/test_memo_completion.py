@@ -17,9 +17,11 @@ from sqlmodel import select
 from app.auth import create_agent_token
 from app.models import Artifact, ArtifactType, Project, Task, TaskStatus
 from app.task_completion import (
+    _apply_synthesized_memo,
     _handle_memo_completion,
     _normalize_memo,
     _parse_memo_output,
+    _synthesize_memo_from_source_finding,
 )
 from testing.factories import make_project, make_task
 
@@ -333,3 +335,89 @@ async def test_memo_status_endpoint_creates_exactly_one_artifact(
     assert artifacts[0].artifact_type == ArtifactType.MEMO
     persisted = json.loads(artifacts[0].logs)
     assert persisted["summary"] == memo["summary"]
+
+
+# ── _apply_synthesized_memo (spawn-time completion) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_apply_synthesized_memo_creates_completed_task_with_artifact(
+    db_session, _quiet_broadcast
+):
+    """Dispatcher memos whose reasoning is known at spawn time are persisted as
+    COMPLETED with a MEMO artifact immediately — never entering QUEUED."""
+    project = make_project(name="SynthMemoProj")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Memo: synthesized",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "memo", "topic": "X", "base_branch": "main"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    memo = {
+        "summary": "Synthesized at spawn",
+        "reasoning": "Full reasoning known at spawn time.",
+        "citations": [f"task:{task.id}"],
+        "tags": ["regression-false-positive"],
+    }
+
+    _apply_synthesized_memo(task, memo, db_session)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Task is COMPLETED immediately — never lingered in QUEUED
+    assert task.status == TaskStatus.COMPLETED
+
+    # Exactly one MEMO artifact
+    artifacts = (
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1
+    art = artifacts[0]
+    assert art.artifact_type == ArtifactType.MEMO
+    persisted = json.loads(art.logs)
+    assert persisted["summary"] == "Synthesized at spawn"
+    assert persisted["citations"] == [f"task:{task.id}"]
+
+    # plan_output mirrors the memo
+    assert isinstance(task.plan_output, dict)
+    assert task.plan_output["memo"]["summary"] == "Synthesized at spawn"
+    assert task.plan_output["memo"]["tags"] == ["regression-false-positive"]
+
+
+def test_synthesize_memo_from_source_finding_regression_false_positive():
+    """_synthesize_memo_from_source_finding produces a valid memo dict for
+    regression_false_positive when verdict_reason is present."""
+    sf = {
+        "verdict_reason": "Pattern is a false positive: noise",
+        "investigation_summary": "Investigated 3 occurrences, all benign.",
+        "regression_class": "rate_limit",
+    }
+    result = _synthesize_memo_from_source_finding(
+        "regression_false_positive", sf, "task-abc"
+    )
+    assert result is not None
+    assert result["summary"] == sf["verdict_reason"][:200]
+    assert "rate_limit" in result["tags"]
+    assert "task:task-abc" in result["citations"]
+
+
+def test_synthesize_memo_from_source_finding_returns_none_without_key_data():
+    """Returns None when the required reasoning field is absent — falls back to VM."""
+    assert (
+        _synthesize_memo_from_source_finding("regression_false_positive", {}, "t-1")
+        is None
+    )
+    assert (
+        _synthesize_memo_from_source_finding("investigation_unactionable", {}, "t-2")
+        is None
+    )
