@@ -597,3 +597,171 @@ def test_normalize_agent_category_parse_failed_without_rate_limit_is_code_error(
     )
     t = _task("")
     assert normalize_agent_failure_category("parse_failed", t) == "CODE_ERROR"
+
+
+# ── db_account_was_rate_limited: durable DB-state check ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_db_account_was_rate_limited_active_cooldown(monkeypatch):
+    """Returns True when DB record shows an active cooldown window."""
+    from datetime import datetime, timedelta
+    from unittest.mock import AsyncMock, MagicMock
+    from app.max_plan_pool import db_account_was_rate_limited
+    from app.models import MaxPlanAccount
+
+    disabled_at = datetime.utcnow() - timedelta(minutes=5)
+    fake_account = MaxPlanAccount(
+        user_id="test",
+        name="test-acct",
+        rate_limit_state={
+            "disabled_models": {
+                "claude-sonnet-4-6": {
+                    "at": disabled_at.isoformat(),
+                    "hits": 1,
+                    "kind": "rate_limit",
+                }
+            }
+        },
+    )
+
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = fake_account
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(return_value=mock_result)
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    mock_session_factory = MagicMock(return_value=mock_session)
+
+    monkeypatch.setattr("app.max_plan_pool.AsyncSessionLocal", mock_session_factory)
+
+    result = await db_account_was_rate_limited("some-acct-id")
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_db_account_was_rate_limited_expired_cooldown(monkeypatch):
+    """Returns False when DB record shows an expired cooldown window."""
+    from datetime import datetime, timedelta
+    from unittest.mock import AsyncMock, MagicMock
+    from app.max_plan_pool import db_account_was_rate_limited
+    from app.models import MaxPlanAccount
+
+    # hits=1 → 30-minute exponential; disabled 2 hours ago → expired
+    disabled_at = datetime.utcnow() - timedelta(hours=2)
+    fake_account = MaxPlanAccount(
+        user_id="test",
+        name="test-acct",
+        rate_limit_state={
+            "disabled_models": {
+                "claude-sonnet-4-6": {
+                    "at": disabled_at.isoformat(),
+                    "hits": 1,
+                    "kind": "rate_limit",
+                }
+            }
+        },
+    )
+
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = fake_account
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(return_value=mock_result)
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    mock_session_factory = MagicMock(return_value=mock_session)
+
+    monkeypatch.setattr("app.max_plan_pool.AsyncSessionLocal", mock_session_factory)
+
+    result = await db_account_was_rate_limited("some-acct-id")
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_db_account_was_rate_limited_at_time_respected(monkeypatch):
+    """at_time shifts the reference point: same DB record returns True inside
+    the window and False after it, using the explicit at_time parameter."""
+    from datetime import datetime, timedelta
+    from unittest.mock import AsyncMock, MagicMock
+    from app.max_plan_pool import db_account_was_rate_limited
+    from app.models import MaxPlanAccount
+
+    disabled_at = datetime(2026, 1, 1, 12, 0, 0)
+    fake_account = MaxPlanAccount(
+        user_id="test",
+        name="test-acct",
+        rate_limit_state={
+            "disabled_models": {
+                "claude-sonnet-4-6": {
+                    "at": disabled_at.isoformat(),
+                    "hits": 1,
+                    "kind": "rate_limit",
+                }
+            }
+        },
+    )
+
+    def _make_factory():
+        mock_result = MagicMock()
+        mock_result.scalar_one_or_none.return_value = fake_account
+        mock_session = AsyncMock()
+        mock_session.execute = AsyncMock(return_value=mock_result)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+        return MagicMock(return_value=mock_session)
+
+    # 10 minutes after disable → inside 30-minute cooldown
+    monkeypatch.setattr("app.max_plan_pool.AsyncSessionLocal", _make_factory())
+    assert (
+        await db_account_was_rate_limited(
+            "acct", at_time=disabled_at + timedelta(minutes=10)
+        )
+        is True
+    )
+
+    # 35 minutes after disable → cooldown expired
+    monkeypatch.setattr("app.max_plan_pool.AsyncSessionLocal", _make_factory())
+    assert (
+        await db_account_was_rate_limited(
+            "acct", at_time=disabled_at + timedelta(minutes=35)
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_db_account_was_rate_limited_account_not_found(monkeypatch):
+    """Returns False when no account row exists in the DB."""
+    from unittest.mock import AsyncMock, MagicMock
+    from app.max_plan_pool import db_account_was_rate_limited
+
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = None
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(return_value=mock_result)
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    mock_session_factory = MagicMock(return_value=mock_session)
+
+    monkeypatch.setattr("app.max_plan_pool.AsyncSessionLocal", mock_session_factory)
+
+    result = await db_account_was_rate_limited("nonexistent-id")
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_db_account_was_rate_limited_db_error_degrades_to_false(monkeypatch):
+    """Returns False (never raises) when the DB session raises an exception."""
+    from unittest.mock import AsyncMock, MagicMock
+    from app.max_plan_pool import db_account_was_rate_limited
+
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(side_effect=RuntimeError("DB unavailable"))
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+    mock_session_factory = MagicMock(return_value=mock_session)
+
+    monkeypatch.setattr("app.max_plan_pool.AsyncSessionLocal", mock_session_factory)
+
+    result = await db_account_was_rate_limited("acct-id")
+    assert result is False

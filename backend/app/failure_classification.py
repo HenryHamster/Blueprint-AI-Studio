@@ -755,7 +755,11 @@ def persist_failure_category(
 
 
 def normalize_agent_failure_category(
-    raw: str | None, task: "Task", *, at_time: "datetime | None" = None
+    raw: str | None,
+    task: "Task",
+    *,
+    at_time: "datetime | None" = None,
+    db_rl_override: bool = False,
 ) -> str:
     """Canonicalize an agent-reported ``failure_category`` label to an uppercase class name.
 
@@ -767,6 +771,11 @@ def normalize_agent_failure_category(
     at_time: reference timestamp for rate-limit cooldown checks. Pass
     ``task.last_heartbeat`` (the failure instant) so a lag between failure and
     report time cannot cause a now-elapsed cooldown to be missed.
+
+    db_rl_override: pre-computed result of a durable DB rate-limit check. Pass
+    True when the caller has already confirmed (via db_account_was_rate_limited)
+    that the account was in cooldown at at_time, even if the in-memory pool
+    shows no cooldown (cross-instance case). Defaults to False (no override).
     """
     if not raw:
         return classify_failure(task, at_time=at_time)
@@ -785,7 +794,8 @@ def normalize_agent_failure_category(
             mapped == CODE_ERROR
             and label_lower in _ALL_GENERIC_CODE_ERROR_LABELS
             and (
-                _account_was_rate_limited(task, at_time=at_time)
+                db_rl_override
+                or _account_was_rate_limited(task, at_time=at_time)
                 or _pool_was_rate_limited(at_time=at_time)
             )
         ):

@@ -184,6 +184,52 @@ def test_is_in_rate_limit_cooldown_malformed_at_field():
     assert acct.is_in_rate_limit_cooldown() is False
 
 
+def test_is_in_rate_limit_cooldown_at_time_parameter():
+    """at_time shifts the reference point: same entry, different at_time → different result."""
+    disabled_at = datetime(2026, 1, 1, 12, 0, 0)  # noon
+    at_str = disabled_at.isoformat()
+    acct = _make_account(
+        rate_limit_state={
+            "disabled_models": {
+                "claude-sonnet-4-6": {"at": at_str, "hits": 1, "kind": "rate_limit"}
+            }
+        }
+    )
+    # hits=1 → exponential = 30 minutes cooldown
+    # reference 10 minutes after disable → still in cooldown
+    inside_window = disabled_at + timedelta(minutes=10)
+    assert acct.is_in_rate_limit_cooldown(at_time=inside_window) is True
+    # reference 31 minutes after disable → cooldown expired
+    after_window = disabled_at + timedelta(minutes=31)
+    assert acct.is_in_rate_limit_cooldown(at_time=after_window) is False
+
+
+def test_is_in_rate_limit_cooldown_quota_exhausted_uses_24h():
+    """quota_exhausted kind uses 24-hour flat window, not exponential."""
+    disabled_at = datetime(2026, 1, 1, 12, 0, 0)
+    at_str = disabled_at.isoformat()
+    acct = _make_account(
+        rate_limit_state={
+            "disabled_models": {
+                "claude-opus-4-7": {
+                    "at": at_str,
+                    "hits": 1,
+                    "kind": "quota_exhausted",
+                }
+            }
+        }
+    )
+    # 5 hours after — still in 24-hour window
+    assert (
+        acct.is_in_rate_limit_cooldown(at_time=disabled_at + timedelta(hours=5)) is True
+    )
+    # 25 hours after — window expired
+    assert (
+        acct.is_in_rate_limit_cooldown(at_time=disabled_at + timedelta(hours=25))
+        is False
+    )
+
+
 def test_mark_merged_records_episode_investigate_started_at_re_armed():
     inv = _T0 + timedelta(minutes=5)
     recovered = _T0 + timedelta(hours=2)

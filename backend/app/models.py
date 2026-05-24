@@ -1417,23 +1417,27 @@ class MaxPlanAccount(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
     )
 
-    def is_in_rate_limit_cooldown(self) -> bool:
+    def is_in_rate_limit_cooldown(self, at_time: "datetime | None" = None) -> bool:
         """Return True if any model is still in rate-limit cooldown from persisted state.
 
         Reads self.rate_limit_state (JSONB, populated by _persist_rate_limit_state
-        in max_plan_pool). Uses a conservative 4-hour upper-bound window — the
-        maximum quarantine cooldown — to avoid a circular import of the precise
-        _cooldown_seconds_for_info helper (max_plan_pool imports models).
-        The in-memory pool check (max_plan_pool.account_in_rate_limit_cooldown)
-        is authoritative when the pool is loaded; this method is a fallback for
-        callers that have an ORM-loaded account but no live pool (e.g. tests,
-        admin tooling). Returns False on any parse failure.
+        in max_plan_pool). Inlines the same cooldown-window math as
+        max_plan_pool._cooldown_seconds_for_info to avoid a circular import
+        (max_plan_pool imports models).
+
+        at_time: reference timestamp for the check. Pass the failure instant so
+        reaper lag between failure and classification cannot cause a missed
+        correlation. Defaults to now.
+
+        Returns False on any parse failure.
         """
         try:
             dm = (self.rate_limit_state or {}).get("disabled_models") or {}
             if not dm:
                 return False
-            now = _utcnow()
+            now = at_time if at_time is not None else _utcnow()
+            if getattr(now, "tzinfo", None) is not None:
+                now = now.replace(tzinfo=None)
             for info in dm.values():
                 at_str = info.get("at")
                 if not at_str:
@@ -1444,7 +1448,21 @@ class MaxPlanAccount(SQLModel, table=True):
                         at_dt = at_dt.replace(tzinfo=None)
                 except (ValueError, TypeError):
                     continue
-                if (now - at_dt).total_seconds() < 4 * 3600:
+                # Mirror max_plan_pool._cooldown_seconds_for_info inline.
+                kind = info.get("kind")
+                if kind == "quota_exhausted":
+                    cooldown = 24 * 3600
+                elif kind == "quarantine":
+                    cooldown = 15 * 60
+                elif kind == "regression":
+                    cooldown = 6 * 3600
+                else:
+                    hits = info.get("hits", 1)
+                    cooldown = min(30 * (2 ** (hits - 1)), 240) * 60
+                    hint = info.get("retry_after_seconds")
+                    if isinstance(hint, (int, float)) and hint > cooldown:
+                        cooldown = int(hint)
+                if (now - at_dt).total_seconds() < cooldown:
                     return True
             return False
         except Exception:

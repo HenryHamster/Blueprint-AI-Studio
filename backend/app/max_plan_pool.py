@@ -1274,6 +1274,39 @@ def pool_wide_rate_limit_cooldown(at_time: datetime | None = None) -> bool:
     return False
 
 
+async def db_account_was_rate_limited(
+    account_id: str, at_time: datetime | None = None
+) -> bool:
+    """Return True if the account's persisted rate-limit state shows an active cooldown.
+
+    Reads MaxPlanAccount.rate_limit_state directly from the DB, bypassing the
+    in-memory pool. Use as a cross-instance fallback: when the orchestrator
+    instance classifying a failure is not the one that recorded the rate-limit,
+    the in-memory pool is empty for that account but the DB record is authoritative.
+
+    Never raises — any exception returns False so the classification path degrades
+    gracefully to the in-memory/text-only path.
+    """
+    try:
+        from sqlmodel import select as sql_select
+        from app.models import MaxPlanAccount
+
+        async with AsyncSessionLocal() as session:
+            row = await session.execute(
+                sql_select(MaxPlanAccount).where(MaxPlanAccount.id == account_id)
+            )
+            acct = row.scalar_one_or_none()
+            if acct is None:
+                return False
+            return acct.is_in_rate_limit_cooldown(at_time=at_time)
+    except Exception:
+        logger.debug(
+            "[MAX_PLAN_POOL] db_account_was_rate_limited degraded to False for account %s",
+            account_id,
+        )
+        return False
+
+
 def describe_pool_blockage(model: str | None, user_id: str | None = None) -> str:
     """Human-readable description of why no account can pick up a task.
     Used by reaper queued-age alerts to distinguish rate-limit cooldown from

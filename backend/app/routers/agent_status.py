@@ -50,6 +50,7 @@ from app.max_plan_pool import (
     _extract_task_model,
     clear_rate_limit_state_on_success,
     clear_regression_on_success,
+    db_account_was_rate_limited,
     disable_account_for_auth,
     disable_account_model,
     get_task_llm_account_id,
@@ -1028,10 +1029,18 @@ async def update_agent_status(
     if payload.failure_category:
         from app.failure_classification import normalize_agent_failure_category
 
+        _fc_at_time = task.last_heartbeat or task.started_at
+        _fc_acct_id = get_task_llm_account_id(task)
+        _db_rl = (
+            await db_account_was_rate_limited(_fc_acct_id, at_time=_fc_at_time)
+            if _fc_acct_id
+            else False
+        )
         normalized_failure_category = normalize_agent_failure_category(
             payload.failure_category,
             task,
-            at_time=task.last_heartbeat or task.started_at,
+            at_time=_fc_at_time,
+            db_rl_override=_db_rl,
         )
         ctx = dict(task.context or {})
         ctx["failure_category"] = normalized_failure_category
@@ -2123,11 +2132,21 @@ async def update_agent_status(
                         normalize_agent_failure_category,
                     )
 
+                    _fc_at_time2 = task.last_heartbeat or task.started_at
+                    _fc_acct_id2 = get_task_llm_account_id(task)
+                    _db_rl2 = (
+                        await db_account_was_rate_limited(
+                            _fc_acct_id2, at_time=_fc_at_time2
+                        )
+                        if _fc_acct_id2
+                        else False
+                    )
                     ctx = dict(task.context or {})
                     ctx["failure_category"] = normalize_agent_failure_category(
                         payload.failure_category,
                         task,
-                        at_time=task.last_heartbeat or task.started_at,
+                        at_time=_fc_at_time2,
+                        db_rl_override=_db_rl2,
                     )
                     task.context = ctx
                     flag_modified(task, "context")

@@ -2638,6 +2638,76 @@ class TestAtTimeFailureInstantCorrelation:
         ), "generic label at sweep time (cooldown expired) falls back to CODE_ERROR"
 
 
+class TestDbRlOverrideCorrelation:
+    """db_rl_override bypasses in-memory pool so cross-instance rate-limit correlation works."""
+
+    def test_db_rl_override_true_reclassifies_generic_to_rate_limit(self, monkeypatch):
+        """db_rl_override=True upgrades a generic CODE_ERROR to RATE_LIMIT even when
+        the in-memory pool shows no cooldown (cross-instance case)."""
+        import app.max_plan_pool as pool_mod
+
+        # In-memory pool is empty for this account (different instance never saw RL).
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+
+        task = _task("", ctx={"llm_account_id": "acct-cross-instance"})
+        result = normalize_agent_failure_category(
+            "incomplete", task, db_rl_override=True
+        )
+        assert result == RATE_LIMIT
+
+    def test_db_rl_override_false_falls_through_to_code_error(self, monkeypatch):
+        """db_rl_override=False (default) with no in-memory cooldown → CODE_ERROR."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+
+        task = _task("", ctx={"llm_account_id": "acct-no-rl"})
+        result = normalize_agent_failure_category(
+            "incomplete", task, db_rl_override=False
+        )
+        assert result == CODE_ERROR
+
+    def test_db_rl_override_only_applies_to_generic_labels(self, monkeypatch):
+        """db_rl_override=True does not override authoritative labels like test_failed."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+
+        task = _task("", ctx={"llm_account_id": "acct-test-fail"})
+        result = normalize_agent_failure_category(
+            "test_failed", task, db_rl_override=True
+        )
+        assert result == CODE_ERROR
+
+    def test_correlation_reclassification_context_persisted_on_db_override(
+        self, monkeypatch
+    ):
+        """When db_rl_override drives the reclassification, the correlation marker
+        is still written to task.context (same as in-memory path)."""
+        import app.max_plan_pool as pool_mod
+
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+        )
+
+        task = _task("", ctx={"llm_account_id": "acct-marker"})
+        result = normalize_agent_failure_category(
+            "incomplete", task, db_rl_override=True
+        )
+        assert result == RATE_LIMIT
+        assert task.context.get("rate_limit_correlation_reclassified") is True
+
+
 class TestParseFailedCorrelation:
     """parse_failed deaths correlate to RATE_LIMIT when pool/account is rate-limited."""
 
