@@ -12,12 +12,22 @@ import { describeJsonExtractionResult, extractJsonArrayDetailed, extractJsonObje
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
   READ_THE_FAILURE_MESSAGE, SIZE_GUARDRAIL_GUIDANCE, PRIOR_ATTEMPT_DIVERGENCE, BEYOND_SCOPE_REPORTING,
+  PARALLEL_AUDIT_GUIDANCE,
   getTaskTypeFocusBlock,
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, computePromptFingerprint, type PlaybookEntry,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
+
+/** Returns true when the project has opted into parallel audit fan-out. */
+function isParallelAuditEnabled(task: Record<string, unknown>): boolean {
+  const meta = task.project_metadata;
+  if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
+    return (meta as Record<string, unknown>).enable_parallel_review === true;
+  }
+  return false;
+}
 
 // ── Candidate-SHA helpers (release qualifier) ────────────────────────────────
 
@@ -135,7 +145,8 @@ Rules:
   const secFingerprint = computePromptFingerprint('security_audit', secBuildConfig);
   setCurrentPromptFingerprint(secFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: secFingerprint });
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + secFirstTaskSection + securityPromptSuffix + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const secParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + secFirstTaskSection + securityPromptSuffix + secParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const findings = readHandlerOutput(taskId, 'security_findings', ws);
   let logs = findings !== null ? sanitize(JSON.stringify(findings)) : '';
@@ -582,7 +593,8 @@ IMPORTANT: Always write /tmp/debug_report_${taskId}.json even if you cannot dete
   const debugFingerprint = computePromptFingerprint('debug');
   setCurrentPromptFingerprint(debugFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: debugFingerprint });
-  const { allOutput } = await runClaudeCode(debugPrompt + debugFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const debugParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
+  const { allOutput } = await runClaudeCode(debugPrompt + debugFirstTaskSection + debugParallelGuidance + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const debugResult = readHandlerOutput(taskId, 'debug_report', ws) as { root_cause: string; affected_files: string[]; fix_prompt: string; confidence: string } | null;
 
@@ -682,7 +694,8 @@ Rules:
   const perfFingerprint = computePromptFingerprint('perf', perfBuildConfig);
   setCurrentPromptFingerprint(perfFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: perfFingerprint });
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfFirstTaskSection + perfPerfSuffix + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const perfParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfFirstTaskSection + perfPerfSuffix + perfParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const perfFindings = readHandlerOutput(taskId, 'perf_report', ws);
   let logs = perfFindings !== null ? sanitize(JSON.stringify(perfFindings)) : '';
@@ -798,7 +811,8 @@ IMPORTANT:
   const investigateFingerprint = computePromptFingerprint('investigate');
   setCurrentPromptFingerprint(investigateFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: investigateFingerprint });
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(investigatePrompt + investigateFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const investigateParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(investigatePrompt + investigateFirstTaskSection + investigateParallelGuidance + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   let investigationResult = readHandlerOutput(taskId, 'investigation_report', ws);
   if (investigationResult === null) {
@@ -985,7 +999,8 @@ Rules:
   const selfAuditFingerprint = computePromptFingerprint('self_audit', buildConfig);
   setCurrentPromptFingerprint(selfAuditFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: selfAuditFingerprint });
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(selfAuditPrompt + typeHint + firstTaskSection + promptSuffix + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const selfAuditParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(selfAuditPrompt + typeHint + firstTaskSection + promptSuffix + selfAuditParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   // Parse findings: prefer structured file output, then a {findings:[...]} object
   // anywhere in the output, then a bare array of findings (wrapped on our side).
@@ -1273,8 +1288,9 @@ Rules:
   const releaseAuditFingerprint = computePromptFingerprint('release_audit', buildConfig);
   setCurrentPromptFingerprint(releaseAuditFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: releaseAuditFingerprint });
+  const releaseAuditParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(
-    releaseAuditPrompt + typeHint + firstTaskSection + promptSuffix + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`,
+    releaseAuditPrompt + typeHint + firstTaskSection + promptSuffix + releaseAuditParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`,
     ws, statusRef, model, effort, disallowedTools,
   );
 

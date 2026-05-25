@@ -170,6 +170,79 @@ export function getTaskTypeHints(buildConfig?: BuildConfig): Record<string, stri
 
 export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. Use WebFetch to look up API documentation, library references, or framework guides when working with unfamiliar code. Use WebSearch to find solutions for specific error messages or unusual patterns. If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg". If you hit a barrier, have a question for the project owner, or want to flag something important, use ./messages send \'your message\' (types: NOTE, QUESTION, FEEDBACK, BUG_REPORT, BLOCKER).';
 
+// Adaptive parallel-subagent guidance for rollup PRs touching multiple
+// modules. Only inject when shouldFanOutReview() AND the per-project
+// enable_parallel_review flag both allow it — the fingerprint moves when
+// present so review telemetry can A/B by fingerprint. Trivial diffs MUST
+// skip fan-out: the block itself reminds the agent of that even when present.
+export const PARALLEL_REVIEW_GUIDANCE = `
+## Parallel review fan-out (rollup PRs touching multiple modules)
+
+This PR touches multiple module groups (build_config directories). To keep wall-clock close to the slowest module review instead of the sum, fan out the per-file checklist work (Correctness, Security, Code Quality, Test Coverage) using parallel investigation subagents. Self-check before fanning out: if the diff is actually trivial (a few files in one module) skip fan-out and review serially — subagent overhead dominates on small diffs.
+
+Fan-out plan:
+1. Group the changed files by build_config directory (one group per module).
+2. Spawn one investigation subagent per module group with the Task/Agent tool. Each subagent's prompt: read the diff for its assigned files only, apply the per-file checklist (Correctness, Security, Code Quality, Test Coverage), and return a short structured list of findings (severity, file, line, description). Keep each subagent prompt small — pass only the file list and the checklist, not the whole PR context.
+3. After all subagents return, summarize each finding to a single line before recompositing into your working set. This protects context budget.
+4. Run your OWN cross-module coherence pass over the recomposited findings AND the diff: shared types, interface contracts, naming consistency, layering, cross-file invariants. Subagents cannot see across module boundaries — this pass is mandatory and is yours alone.
+5. Emit the SINGLE verdict JSON yourself. Subagents are investigation-only — no subagent writes /tmp/review_verdict_*, makes edits, or emits a verdict.
+
+Fail-soft: if context is tight after recompositing subagent output, drop fan-out and finish serially. A complete serial review beats an incomplete parallel one.
+`;
+
+// Adaptive parallel-subagent guidance for fix iterations on rollups touching
+// multiple modules or carrying many reviewer issues. Only inject when
+// shouldFanOutFix() AND the per-project enable_parallel_fix flag both allow
+// it. Atomicity contract: ONLY the parent agent may Write/Edit/commit —
+// subagents return investigation reports only.
+export const PARALLEL_FIX_GUIDANCE = `
+## Parallel fix investigation (rollup PRs with multi-module diffs or many reviewer issues)
+
+This fix iteration has enough scope that parallel investigation subagents can reduce wall-clock. Use the Task/Agent tool to fan out root-cause investigation. **Read the atomicity contract below before delegating anything.**
+
+**ATOMICITY CONTRACT — non-negotiable:**
+Only the parent agent (you) may Write, Edit, NotebookEdit, or run Bash (git/check/pr) commands that change files. Subagents return investigation reports ONLY. A subagent that writes or edits files is a bug — remind yourself of this before spawning each one.
+
+**Slicing axes — choose the one that fits:**
+- **Module axis**: one subagent per build_config directory group. Each subagent reads the diff for its assigned files, identifies root causes for the reviewer's cited issues in those files, and returns: file, line, proposed fix location, estimated risk, suggested verify steps.
+- **Issue-cluster axis**: when reviewer issues are high (≥6) and span ≥2 files, group related issues into clusters and assign one subagent per cluster. Each subagent returns the same investigation report shape.
+Pick the axis that maps more naturally onto the actual issues — you may use a mix.
+
+**Fan-out plan:**
+1. Before spawning, summarize the review feedback to a compact form — fix prompts are large. Pass only the relevant issue subset and file list to each subagent, not the whole review history.
+2. Spawn subagents in parallel using the Task/Agent tool. Each subagent prompt: "You are an investigation-only subagent. Read these files and these reviewer issues. Return a structured report: {file, line, root_cause, proposed_fix_location, risk, verify_steps}. Do NOT write or edit any files."
+3. After all reports return, summarize each finding to a single line before merging. This protects your context budget.
+4. Merge and deduplicate: if two subagents propose overlapping fixes, resolve the conflict yourself (pick the more conservative one or ask yourself which is correct). Do NOT apply conflicting fixes from two subagents — that is when serial fallback is safer.
+5. Batch-read all affected files ONCE before applying any edits. Then apply changes sequentially yourself.
+6. Run your own cross-module coherence pass after edits: shared types, interface contracts, naming consistency. Subagents cannot see across module boundaries — this is yours alone.
+
+**Fail-soft:** If subagents disagree on root cause or their reports conflict, fall back to serial investigation for the conflicting files rather than guessing. Incomplete parallel fix is worse than complete serial fix.
+
+**Self-check before delegating each slice:** "Am I asking this subagent to apply the fix?" If yes, revise the prompt to ask for investigation only.
+`;
+
+// Adaptive parallel-subagent guidance for read-only audit/investigation
+// handlers. Inject when the per-project enable_parallel_review flag is set.
+// Output schema is unchanged — only investigation strategy changes.
+export const PARALLEL_AUDIT_GUIDANCE = `
+## Parallel audit fan-out (investigation-only handlers)
+
+These handlers never Edit or Write source files — atomicity is automatic. Fan out investigation work using parallel subagents when the scope spans multiple concern axes (e.g. one subagent per OWASP category for security audits, one per system for self-audits, one per file-cluster for investigate/debug/perf/release_audit).
+
+**Fan-out plan:**
+1. Identify 2-4 natural concern axes for the current task (OWASP category, system boundary, file cluster, failure mode, etc.).
+2. Spawn one investigation subagent per axis using the Task/Agent tool. Each subagent's prompt: read its assigned files/scope only, return a short structured findings list (severity, location, description). Keep each prompt small — pass only the relevant scope, not the full task context.
+3. After all subagents return, summarize each finding to a single line before merging. This protects context budget.
+4. Run your OWN coherence pass over the recomposited findings: deduplication, consistent severity assignment, cross-axis invariants that individual subagents cannot see.
+5. Emit the SINGLE output JSON yourself (the file written to /tmp/...). Subagents are investigation-only — no subagent writes the output file or emits a findings list as the final result.
+
+**Output schema unchanged:** only HOW the investigation is done changes, not WHAT is emitted. The final /tmp/ output file must match the handler's documented schema exactly.
+
+**Self-check:** if the task scope is narrow (one file, one system, one failure), skip fan-out — subagent overhead dominates on small scopes. Fan out only when parallelism meaningfully reduces wall-clock.
+
+Fail-soft: if context is tight after recompositing subagent output, drop fan-out and finish serially. A complete serial audit beats an incomplete parallel one.
+`;
+
 // Generalized override of the trained "lint failed → refactor source"
 // reflex for project-specific assertion messages that encode policy. The
 // 2026-05-03 dogfood run lost a full strategic cycle because investigation
@@ -342,15 +415,16 @@ export function assembleFailureGuidanceBlocks(): string {
 // a given task type. Used to correlate production task outcomes back to prompt
 // revisions cycle-over-cycle. Only hashes static/deterministic content —
 // task IDs, file paths, and payload-specific text are intentionally excluded.
-export function computePromptFingerprint(taskType: string, buildConfig?: BuildConfig): string {
+export function computePromptFingerprint(
+  taskType: string,
+  buildConfig?: BuildConfig,
+  options?: { includeParallelFixGuidance?: boolean },
+): string {
   const hints = getTaskTypeHints(buildConfig);
   const taskHint = hints[taskType] ?? '';
-  const content = [
-    taskHint,
-    DEFAULT_TOOL_GUIDANCE,
-    assembleFailureGuidanceBlocks(),
-  ].join('\n\n');
-  return createHash('sha256').update(content).digest('hex').slice(0, 12);
+  const sections = [taskHint, DEFAULT_TOOL_GUIDANCE, assembleFailureGuidanceBlocks()];
+  if (options?.includeParallelFixGuidance) sections.push(PARALLEL_FIX_GUIDANCE);
+  return createHash('sha256').update(sections.join('\n\n')).digest('hex').slice(0, 12);
 }
 
 // Within-task fix-iteration history. Each retry attempt of the within-VM

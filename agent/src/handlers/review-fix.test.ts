@@ -111,6 +111,8 @@ import {
 } from './review-fix.js';
 import { runCodeChangeTask } from './code-change.js';
 import { resolveBuildConfig } from '../build-config.js';
+import { shouldFanOutReview, shouldFanOutFix } from '../constants.js';
+import { computePromptFingerprint } from '../prompt.js';
 
 const BLUEPRINT_CONFIG = {
   directories: [
@@ -2191,5 +2193,363 @@ describe('handleFix — fix-task SR focus block', () => {
     );
     const prompt = capturedFixPrompt();
     expect(prompt).not.toContain('Repeating-issues verification');
+  });
+});
+
+// ── shouldFanOutReview threshold helper ──────────────────────────────────────
+describe('shouldFanOutReview — fan-out gating helper', () => {
+  it('returns false for trivial diff (1 file, 1 dir)', () => {
+    expect(shouldFanOutReview(['backend/app/foo.py'], BLUEPRINT_CONFIG)).toBe(false);
+  });
+
+  it('returns false for single-module rollup (10 files, 1 dir)', () => {
+    const files = Array.from({ length: 10 }, (_, i) => `backend/app/m${i}.py`);
+    expect(shouldFanOutReview(files, BLUEPRINT_CONFIG)).toBe(false);
+  });
+
+  it('returns true for multi-module rollup (8 files, 3 dirs)', () => {
+    const files = [
+      'agent/src/a.ts', 'agent/src/b.ts', 'agent/src/c.ts',
+      'admin-ui/src/d.tsx', 'admin-ui/src/e.tsx',
+      'backend/app/f.py', 'backend/app/g.py', 'backend/app/h.py',
+    ];
+    expect(shouldFanOutReview(files, BLUEPRINT_CONFIG)).toBe(true);
+  });
+
+  it('returns false when buildConfig is missing (conservative default)', () => {
+    const files = Array.from({ length: 8 }, (_, i) => `pkg${i}/src/m.ts`);
+    expect(shouldFanOutReview(files, undefined)).toBe(false);
+  });
+
+  it('ignores test files when counting non-test threshold', () => {
+    // 3 non-test files (below threshold of 4) across 2 dirs → false even with test padding
+    const files = [
+      'agent/src/a.ts',
+      'agent/src/a.test.ts',
+      'admin-ui/src/b.tsx',
+      'admin-ui/src/b.test.tsx',
+      'backend/app/c.py',
+      'backend/testing/test_c.py',
+    ];
+    expect(shouldFanOutReview(files, BLUEPRINT_CONFIG)).toBe(false);
+  });
+});
+
+// ── handleReview: parallel-review fan-out injection ──────────────────────────
+describe('handleReview — parallel-review fan-out gating', () => {
+  const PARALLEL_PAYLOAD = { pr_number: 700, branch: 'feat/rollup', base_branch: 'main', original_prompt: '' };
+  const BIG_DIFF = (
+    'M\tagent/src/a.ts\n' +
+    'M\tagent/src/b.ts\n' +
+    'M\tadmin-ui/src/c.tsx\n' +
+    'M\tadmin-ui/src/d.tsx\n' +
+    'M\tbackend/app/e.py'
+  );
+
+  function mockBigCrossModuleDiff(): void {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) return BIG_DIFF;
+      return '';
+    }) as unknown as typeof indexMod.git);
+    vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
+  }
+
+  function lastReviewPrompt(): string {
+    const calls = vi.mocked(indexMod.runClaudeCode).mock.calls;
+    if (calls.length === 0) throw new Error('runClaudeCode was not invoked');
+    return calls[calls.length - 1][0];
+  }
+
+  it('injects PARALLEL_REVIEW_GUIDANCE when the project flag is on and threshold is met', async () => {
+    mockBigCrossModuleDiff();
+    await handleReview(
+      'task-parallel-on',
+      PARALLEL_PAYLOAD,
+      {
+        context: { scope: 'large' },
+        project_metadata: { enable_parallel_review: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).toContain('Parallel review fan-out');
+  });
+
+  it('does NOT inject parallel guidance when the project flag is off (even for big multi-module diffs)', async () => {
+    mockBigCrossModuleDiff();
+    await handleReview(
+      'task-parallel-off',
+      PARALLEL_PAYLOAD,
+      {
+        context: { scope: 'large' },
+        project_metadata: { enable_parallel_review: false },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).not.toContain('Parallel review fan-out');
+  });
+
+  it('does NOT inject parallel guidance when project_metadata is absent (backward compatibility)', async () => {
+    mockBigCrossModuleDiff();
+    await handleReview(
+      'task-parallel-absent',
+      PARALLEL_PAYLOAD,
+      { context: { scope: 'large' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).not.toContain('Parallel review fan-out');
+  });
+
+  it('does NOT inject parallel guidance when the helper returns false (trivial diff) even with flag on', async () => {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return 'M\tbackend/app/only.py';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+    vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
+    await handleReview(
+      'task-parallel-trivial',
+      PARALLEL_PAYLOAD,
+      {
+        context: { scope: 'small' },
+        project_metadata: { enable_parallel_review: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).not.toContain('Parallel review fan-out');
+  });
+
+  it('prompt fingerprint changes when parallel guidance is enabled', () => {
+    const baseFp = computeReviewPromptFingerprint(BLUEPRINT_CONFIG);
+    const parallelFp = computeReviewPromptFingerprint(BLUEPRINT_CONFIG, { includeParallelReviewGuidance: true });
+    expect(parallelFp).not.toBe(baseFp);
+  });
+
+  it('records review_was_parallelized=true in the verdict JSON when fan-out was injected', async () => {
+    mockBigCrossModuleDiff();
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue('{"verdict":"APPROVE","feedback":"ok"}');
+    await handleReview(
+      'task-parallel-telemetry',
+      PARALLEL_PAYLOAD,
+      {
+        context: { scope: 'large' },
+        project_metadata: { enable_parallel_review: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const lastCall = vi.mocked(indexMod.persistAndPostStatus).mock.calls.at(-1);
+    if (!lastCall) throw new Error('persistAndPostStatus was not invoked');
+    const payload = lastCall[1] as { verdict_json?: string };
+    expect(payload.verdict_json).toBeDefined();
+    const parsed = JSON.parse(defined(payload.verdict_json)) as Record<string, unknown>;
+    expect(parsed.review_was_parallelized).toBe(true);
+  });
+
+  it('does NOT add review_was_parallelized when fan-out was not injected', async () => {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return 'M\tbackend/app/only.py';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+    vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue('{"verdict":"APPROVE","feedback":"ok"}');
+    await handleReview(
+      'task-parallel-no-telemetry',
+      PARALLEL_PAYLOAD,
+      {
+        context: { scope: 'small' },
+        project_metadata: { enable_parallel_review: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const lastCall = vi.mocked(indexMod.persistAndPostStatus).mock.calls.at(-1);
+    if (!lastCall) throw new Error('persistAndPostStatus was not invoked');
+    const payload = lastCall[1] as { verdict_json?: string };
+    expect(payload.verdict_json).toBeDefined();
+    const parsed = JSON.parse(defined(payload.verdict_json)) as Record<string, unknown>;
+    expect(parsed.review_was_parallelized).toBeUndefined();
+  });
+});
+
+// ── shouldFanOutFix threshold helper ─────────────────────────────────────────
+describe('shouldFanOutFix — fan-out gating helper', () => {
+  it('returns false for trivial diff (1 file)', () => {
+    expect(shouldFanOutFix(['backend/app/foo.py'], 0, [], BLUEPRINT_CONFIG)).toBe(false);
+  });
+
+  it('returns false for single-module diff below file threshold', () => {
+    const files = ['backend/app/a.py', 'backend/app/b.py', 'backend/app/c.py'];
+    expect(shouldFanOutFix(files, 0, [], BLUEPRINT_CONFIG)).toBe(false);
+  });
+
+  it('returns true for multi-module diff (4+ non-test files, 2+ dirs)', () => {
+    const files = [
+      'agent/src/a.ts', 'agent/src/b.ts',
+      'backend/app/c.py', 'backend/app/d.py',
+    ];
+    expect(shouldFanOutFix(files, 0, [], BLUEPRINT_CONFIG)).toBe(true);
+  });
+
+  it('returns true when reviewer issues cross threshold (6 issues, 2 files)', () => {
+    expect(shouldFanOutFix([], 6, ['file_a.ts', 'file_b.ts'], BLUEPRINT_CONFIG)).toBe(true);
+  });
+
+  it('returns false when issue count meets threshold but only 1 file', () => {
+    expect(shouldFanOutFix([], 6, ['file_a.ts'], BLUEPRINT_CONFIG)).toBe(false);
+  });
+
+  it('returns false when issue file count meets threshold but issue count is below', () => {
+    expect(shouldFanOutFix([], 5, ['file_a.ts', 'file_b.ts'], BLUEPRINT_CONFIG)).toBe(false);
+  });
+
+  it('returns false when buildConfig is missing and diff is trivial', () => {
+    const files = ['agent/src/a.ts', 'backend/app/b.py'];
+    expect(shouldFanOutFix(files, 0, [], undefined)).toBe(false);
+  });
+
+  it('ignores test files when counting non-test threshold', () => {
+    // 3 non-test files across 2 dirs but below minNonTestFiles=4 → false
+    const files = [
+      'agent/src/a.ts',
+      'agent/src/a.test.ts',
+      'backend/app/b.py',
+      'backend/testing/test_b.py',
+      'admin-ui/src/c.tsx',
+    ];
+    expect(shouldFanOutFix(files, 0, [], BLUEPRINT_CONFIG)).toBe(false);
+  });
+});
+
+// ── handleFix: parallel-fix fan-out injection ─────────────────────────────────
+describe('handleFix — parallel-fix fan-out gating', () => {
+  const FIX_PAYLOAD = {
+    pr_number: 800,
+    branch: 'fix/rollup',
+    base_branch: 'main',
+    prompt: 'Fix the issues',
+    original_prompt: 'Original task',
+  };
+  const BIG_FIX_DIFF = [
+    'agent/src/a.ts',
+    'agent/src/b.ts',
+    'backend/app/c.py',
+    'backend/app/d.py',
+  ].join('\n');
+
+  function mockBigFixDiff(): void {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-only')) return BIG_FIX_DIFF;
+      return '';
+    }) as unknown as typeof indexMod.git);
+    vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
+  }
+
+  it('injects PARALLEL_FIX_GUIDANCE when flag is on and multi-module diff threshold is met', async () => {
+    mockBigFixDiff();
+    await handleFix(
+      'task-fix-parallel-on',
+      FIX_PAYLOAD,
+      {
+        context: { scope: 'large', review_loop: { review_history: [] } },
+        project_metadata: { enable_parallel_fix: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(capturedFixPrompt()).toContain('Parallel fix investigation');
+  });
+
+  it('injects PARALLEL_FIX_GUIDANCE when flag is on and reviewer issue count meets threshold', async () => {
+    vi.mocked(indexMod.git).mockReturnValue('');
+    vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
+    const issues = Array.from({ length: 6 }, (_, i) => ({
+      severity: 'major',
+      description: `Issue ${i}`,
+      file: i < 3 ? 'backend/app/foo.py' : 'agent/src/bar.ts',
+    }));
+    await handleFix(
+      'task-fix-parallel-issues',
+      FIX_PAYLOAD,
+      {
+        context: {
+          scope: 'large',
+          review_loop: { review_history: [{ iteration: 1, feedback: 'feedback', issues }] },
+        },
+        project_metadata: { enable_parallel_fix: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(capturedFixPrompt()).toContain('Parallel fix investigation');
+  });
+
+  it('does NOT inject PARALLEL_FIX_GUIDANCE when flag is off', async () => {
+    mockBigFixDiff();
+    await handleFix(
+      'task-fix-parallel-off',
+      FIX_PAYLOAD,
+      {
+        context: { scope: 'large', review_loop: { review_history: [] } },
+        project_metadata: { enable_parallel_fix: false },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(capturedFixPrompt()).not.toContain('Parallel fix investigation');
+  });
+
+  it('does NOT inject PARALLEL_FIX_GUIDANCE when project_metadata is absent (backward compat)', async () => {
+    mockBigFixDiff();
+    await handleFix(
+      'task-fix-parallel-absent',
+      FIX_PAYLOAD,
+      { context: { scope: 'large', review_loop: { review_history: [] } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(capturedFixPrompt()).not.toContain('Parallel fix investigation');
+  });
+
+  it('does NOT inject PARALLEL_FIX_GUIDANCE when diff is trivial (single-module)', async () => {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-only')) {
+        return 'backend/app/only.py';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+    vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
+    await handleFix(
+      'task-fix-parallel-trivial',
+      FIX_PAYLOAD,
+      {
+        context: { scope: 'small', review_loop: { review_history: [] } },
+        project_metadata: { enable_parallel_fix: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(capturedFixPrompt()).not.toContain('Parallel fix investigation');
+  });
+
+  it('prompt fingerprint changes when parallel fix guidance is enabled', () => {
+    const baseFp = computePromptFingerprint('fix', BLUEPRINT_CONFIG);
+    const parallelFp = computePromptFingerprint('fix', BLUEPRINT_CONFIG, { includeParallelFixGuidance: true });
+    expect(parallelFp).not.toBe(baseFp);
+  });
+
+  it('writes fix_parallelized telemetry file when fan-out is injected', async () => {
+    mockBigFixDiff();
+    await handleFix(
+      'task-fix-telemetry',
+      FIX_PAYLOAD,
+      {
+        context: { scope: 'large', review_loop: { review_history: [] } },
+        project_metadata: { enable_parallel_fix: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(
+      '/tmp/fix_parallelized_task-fix-telemetry.json',
+      expect.stringContaining('"fix_was_parallelized":true'),
+      'utf-8',
+    );
   });
 });

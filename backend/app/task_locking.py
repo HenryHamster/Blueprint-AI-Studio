@@ -184,6 +184,7 @@ async def lock_project_or_429(
         # FOR NO KEY UPDATE — see project_lock: serializes project-row writers
         # without blocking FK child-row inserts (FOR KEY SHARE). PK never changes.
         .with_for_update(skip_locked=True, key_share=True)
+        .execution_options(populate_existing=True)
     )
     project = result.scalars().first()
     if project is not None:
@@ -284,6 +285,7 @@ async def project_lock(
         # INSERT blocked on a held project lock). The project PK is never updated,
         # so FOR NO KEY UPDATE is the correct, strictly-safer lock here.
         .with_for_update(skip_locked=skip_locked, key_share=True)
+        .execution_options(populate_existing=True)
     )
     try:
         result = await asyncio.wait_for(session.execute(stmt), timeout=timeout)
@@ -432,6 +434,7 @@ async def lock_project_for_strategic_transition(
             # FOR NO KEY UPDATE — see project_lock: serializes project-row writers
             # without blocking FK child-row inserts (FOR KEY SHARE). PK never changes.
             .with_for_update(skip_locked=True, key_share=True)
+            .execution_options(populate_existing=True)
         )
         project = result.scalars().first()
         if project is not None:

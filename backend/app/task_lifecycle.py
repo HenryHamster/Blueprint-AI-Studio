@@ -2211,6 +2211,7 @@ async def _process_post_commit(
 
                 verdict_parsed = False
                 verdict_unparseable = False
+                review_was_parallelized = False
 
                 # Method 1: verdict_json field (from /tmp/verdict.json on the agent)
                 if payload.verdict_json:
@@ -2231,6 +2232,9 @@ async def _process_post_commit(
                                     for p in raw_investigated
                                     if isinstance(p, str) and p
                                 ][:25]
+                            review_was_parallelized = bool(
+                                vj.get("review_was_parallelized", False)
+                            )
                             verdict_parsed = True
                             logger.info(
                                 f"[REVIEW PIPELINE] Verdict from verdict_json field: {verdict}"
@@ -2478,6 +2482,7 @@ async def _process_post_commit(
                 task.context = {
                     **(task.context or {}),
                     "blueprint_review_verdict": verdict,
+                    "review_was_parallelized": review_was_parallelized,
                 }
                 session.add(task)
 

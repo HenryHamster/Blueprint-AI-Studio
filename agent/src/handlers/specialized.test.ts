@@ -125,6 +125,7 @@ import {
 import { runCodeChangeTask } from './code-change.js';
 import { execFileSync } from 'child_process';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
+import { PARALLEL_AUDIT_GUIDANCE } from '../prompt.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-abc123';
@@ -1537,5 +1538,67 @@ describe('handleSmoketest — candidate-SHA pinning', () => {
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.failure_category).toBe('clone_failed');
+  });
+});
+
+// ── PARALLEL_AUDIT_GUIDANCE injection ────────────────────────────────────────
+describe('Parallel audit guidance injection', () => {
+  const PARALLEL_TASK = { ...BASE_TASK, project_metadata: { enable_parallel_review: true } };
+  const SERIAL_TASK = { ...BASE_TASK, project_metadata: { enable_parallel_review: false } };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+  });
+
+  it('handleSecurityAudit injects PARALLEL_AUDIT_GUIDANCE when flag is on', async () => {
+    await handleSecurityAudit(TASK_ID, BASE_PAYLOAD, PARALLEL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(PARALLEL_AUDIT_GUIDANCE);
+  });
+
+  it('handleSecurityAudit omits PARALLEL_AUDIT_GUIDANCE when flag is off', async () => {
+    await handleSecurityAudit(TASK_ID, BASE_PAYLOAD, SERIAL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).not.toContain(PARALLEL_AUDIT_GUIDANCE);
+  });
+
+  it('handleInvestigate injects PARALLEL_AUDIT_GUIDANCE when flag is on', async () => {
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, PARALLEL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(PARALLEL_AUDIT_GUIDANCE);
+  });
+
+  it('handleInvestigate omits PARALLEL_AUDIT_GUIDANCE when flag is off', async () => {
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, SERIAL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).not.toContain(PARALLEL_AUDIT_GUIDANCE);
+  });
+
+  it('handleDebug injects PARALLEL_AUDIT_GUIDANCE when flag is on', async () => {
+    const debugPayload = { ...BASE_PAYLOAD, error_logs: 'some error', failed_task_title: 'bad task' };
+    await handleDebug(TASK_ID, debugPayload, PARALLEL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(PARALLEL_AUDIT_GUIDANCE);
+  });
+
+  it('handleDebug omits PARALLEL_AUDIT_GUIDANCE when flag is off', async () => {
+    const debugPayload = { ...BASE_PAYLOAD, error_logs: 'some error', failed_task_title: 'bad task' };
+    await handleDebug(TASK_ID, debugPayload, SERIAL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).not.toContain(PARALLEL_AUDIT_GUIDANCE);
+  });
+
+  it('handlePerf injects PARALLEL_AUDIT_GUIDANCE when flag is on', async () => {
+    await handlePerf(TASK_ID, BASE_PAYLOAD, PARALLEL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(PARALLEL_AUDIT_GUIDANCE);
+  });
+
+  it('handleSelfAudit injects PARALLEL_AUDIT_GUIDANCE when flag is on', async () => {
+    await handleSelfAudit(TASK_ID, BASE_PAYLOAD, PARALLEL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(PARALLEL_AUDIT_GUIDANCE);
   });
 });

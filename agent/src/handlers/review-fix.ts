@@ -13,10 +13,10 @@ import { runCodeChangeTask } from './code-change.js';
 import { runFreshReviewerPass } from './standard.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
-import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT, FRONTEND_NPM_TIMEOUT } from '../constants.js';
+import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT, FRONTEND_NPM_TIMEOUT, shouldFanOutReview, shouldFanOutFix } from '../constants.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
-  FIX_TASK_FOCUS, getTaskTypeFocusBlock,
+  FIX_TASK_FOCUS, getTaskTypeFocusBlock, PARALLEL_REVIEW_GUIDANCE, PARALLEL_FIX_GUIDANCE,
   assembleFailureGuidanceBlocks,
   readClaudeMd, formatProjectContext, configureAgentPermissions, computePromptFingerprint,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, type PlaybookEntry,
@@ -111,6 +111,11 @@ type ReviewPromptFingerprintOptions = {
   branch?: string;
   baseBranch?: string;
   includePlannedFilesClassificationGuidance?: boolean;
+  // When the parent's enable_parallel_review flag is on AND the helper says
+  // fan-out is worth it, handleReview injects PARALLEL_REVIEW_GUIDANCE. The
+  // fingerprint MUST move so reviewer telemetry can A/B the two modes — same
+  // fingerprint for both would silently mix parallel and serial outcomes.
+  includeParallelReviewGuidance?: boolean;
 };
 
 // ── Static review-guidance fragments (shared with prompt fingerprint) ────────
@@ -325,6 +330,9 @@ function buildReviewPromptFingerprintContent(
   if (rollupGuidance) sections.push(rollupGuidance.trim());
   if (options.includePlannedFilesClassificationGuidance) {
     sections.push(buildPlannedFilesClassificationGuidance());
+  }
+  if (options.includeParallelReviewGuidance) {
+    sections.push(PARALLEL_REVIEW_GUIDANCE);
   }
   sections.push(DEFAULT_TOOL_GUIDANCE);
   return sections.join('\n\n');
@@ -1006,11 +1014,21 @@ ${plannedFilesSection}
 ${buildReviewDiffAccessHint(baseBranch)}
 ${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCoreGuidance(reviewBuildConfig, taskId)}`;
 
-  const launchedReviewPrompt = reviewPrompt + `\n\n${DEFAULT_TOOL_GUIDANCE}`;
+  // Parallel-review fan-out gating: per-project flag AND helper-threshold both
+  // required. False positives (extra fan-out) are cheap subagent overhead;
+  // false negatives are wall-clock that subagent investigation would have
+  // saved. Inject the guidance just before DEFAULT_TOOL_GUIDANCE so prompt
+  // ordering stays deterministic for the fingerprint.
+  const reviewProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
+  const parallelReviewFlag = reviewProjectMeta?.enable_parallel_review === true;
+  const parallelReviewInjected = parallelReviewFlag && shouldFanOutReview(changedFilePathList, reviewBuildConfig);
+  const parallelReviewBlock = parallelReviewInjected ? `\n\n${PARALLEL_REVIEW_GUIDANCE}` : '';
+  const launchedReviewPrompt = reviewPrompt + parallelReviewBlock + `\n\n${DEFAULT_TOOL_GUIDANCE}`;
   const promptFingerprint = computeReviewPromptFingerprint(reviewBuildConfig, {
     branch,
     baseBranch,
     includePlannedFilesClassificationGuidance: plannedFiles.length > 0 && plannedFilesSection.includes('Files changed but NOT in the original plan:'),
+    includeParallelReviewGuidance: parallelReviewInjected,
   });
   statusRef.value = 'Running code review...';
   setCurrentPromptFingerprint(promptFingerprint);
@@ -1039,6 +1057,9 @@ ${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCore
         // schemas.StatusUpdate.verdict_json max_length=10000.
         if (investigatedFiles.length > 0 && !parsed.investigated_files) {
           parsed.investigated_files = investigatedFiles.slice(0, 25);
+        }
+        if (parallelReviewInjected) {
+          parsed.review_was_parallelized = true;
         }
         const augmented = JSON.stringify(parsed);
         verdictJsonField = augmented;
@@ -1223,6 +1244,24 @@ export async function handleFix(
   if (fixSelfReviewSection) {
     basePrompt = `${fixSelfReviewSection}${basePrompt}`;
   }
+
+  // Parallel fix fan-out gating: per-project flag AND helper-threshold both
+  // required. Inject PARALLEL_FIX_GUIDANCE near DEFAULT_TOOL_GUIDANCE so the
+  // fingerprint is stable and telemetry can A/B by fingerprint.
+  const fixProjectMetaEarly = task.project_metadata as Record<string, unknown> | undefined;
+  const parallelFixFlag = fixProjectMetaEarly?.enable_parallel_fix === true;
+  const latestIssuesForFanOut = reviewHistory[reviewHistory.length - 1]?.issues ?? [];
+  const reviewIssueFilesForFanOut = latestIssuesForFanOut
+    .map(i => i.file)
+    .filter((f): f is string => typeof f === 'string' && f.length > 0);
+  const parallelFixInjected =
+    parallelFixFlag &&
+    shouldFanOutFix(
+      fixChangedFilePathList,
+      latestIssuesForFanOut.length,
+      reviewIssueFilesForFanOut,
+      fixBuildConfig,
+    );
 
   // Always check for conflict markers — even if rebase/merge appeared to succeed
   let enrichedPrompt = basePrompt;
@@ -1417,7 +1456,8 @@ export async function handleFix(
       fixSrFocusBlock += `\n4. **Repeating-issues verification** — these CRITICAL/MAJOR issues appeared in multiple prior iterations. Verify each is now resolved and record under \`correctness\` or \`regression_risk\` in your self-review JSON:\n${repeating.map(d => `- ${d}`).join('\n')}\n`;
     }
   }
-  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${CODE_CHANGE_HELPER_GUIDANCE}${fixSrFocusBlock}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${assembleFailureGuidanceBlocks()}\n\n${DEFAULT_TOOL_GUIDANCE}`;
+  const parallelFixBlock = parallelFixInjected ? `\n\n${PARALLEL_FIX_GUIDANCE}` : '';
+  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${CODE_CHANGE_HELPER_GUIDANCE}${fixSrFocusBlock}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${assembleFailureGuidanceBlocks()}${parallelFixBlock}\n\n${DEFAULT_TOOL_GUIDANCE}`;
 
   // Structured-response invitation: when the agent disagrees with a reviewer
   // issue (e.g. an unplanned file is actually caller-impact, not scope-creep),
@@ -1501,12 +1541,19 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
   }
 
   // Run Claude with the review feedback as the prompt
-  const promptFingerprint = computePromptFingerprint('fix', fixBuildConfig);
+  const promptFingerprint = computePromptFingerprint('fix', fixBuildConfig, { includeParallelFixGuidance: parallelFixInjected });
   statusRef.value = 'Addressing review feedback...';
   setCurrentPromptFingerprint(promptFingerprint);
   // Emit once before the fix session starts so fast fix/rebase tasks still
   // persist the stable code-change fingerprint on the backend.
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
+  // Telemetry: persist parallelization marker so orchestrator can attribute outcomes.
+  if (parallelFixInjected) {
+    try {
+      const parallelMarker = JSON.stringify({ fix_was_parallelized: true, task_id: taskId });
+      fs.writeFileSync(`/tmp/fix_parallelized_${taskId}.json`, parallelMarker, 'utf-8');
+    } catch { /* non-fatal */ }
+  }
   const fixBaseCommit = git(['rev-parse', 'HEAD']);
   // 2026-05-04: post-Claude lint/test/push pipeline replaced with
   // runCodeChangeTask. Claude calls ./check + ./pr open (which pushes

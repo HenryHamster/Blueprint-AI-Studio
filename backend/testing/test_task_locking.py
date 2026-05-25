@@ -1026,6 +1026,65 @@ async def test_concurrent_research_outcomes_preserve_both_directions(db_session)
     assert entry_b.get("tasks_completed") == 1, f"dir-b lost update: {entry_b}"
 
 
+@pytest.mark.asyncio
+async def test_with_directions_locked_refreshes_stale_identity_map(db_session):
+    """Regression: project_lock must use populate_existing=True so a Project
+    already in the session's identity map gets refreshed from the DB before
+    mutate_fn runs, not the stale cached snapshot from before the lock.
+
+    Scenario: session A loads the project (caching directions=[old]); session B
+    commits directions=[new]; session A calls with_directions_locked — without
+    populate_existing the mutate_fn would see [old] and overwrite [new].
+    """
+    project = Project(name="populate-existing-test", user_id="user")
+    project.directions = [{"id": "d-original", "status": "active"}]
+    db_session.add(project)
+    await db_session.commit()
+
+    # Pull the project into db_session's identity map.
+    result = await db_session.execute(select(Project).where(Project.id == project.id))
+    cached = result.scalar_one()
+    assert cached.directions == [{"id": "d-original", "status": "active"}]
+
+    # Commit a direction change from a second session (simulates another writer).
+    Session = sessionmaker(
+        bind=db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with Session() as second_session:
+        r2 = await second_session.execute(
+            select(Project).where(Project.id == project.id)
+        )
+        proj2 = r2.scalar_one()
+        from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+        proj2.directions = [{"id": "d-updated", "status": "active"}]
+        _flag_modified(proj2, "directions")
+        second_session.add(proj2)
+        await second_session.commit()
+
+    # with_directions_locked must refresh the identity-mapped instance via
+    # populate_existing=True and pass the committed [d-updated] to mutate_fn.
+    seen_directions: list = []
+
+    def _capture(dirs: list) -> None:
+        seen_directions.extend(dirs)
+
+    await with_directions_locked(db_session, project.id, _capture)
+    await db_session.commit()
+
+    ids_seen = [d["id"] for d in seen_directions]
+    assert "d-updated" in ids_seen, (
+        f"with_directions_locked passed stale cached directions to mutate_fn: "
+        f"{seen_directions!r} — populate_existing=True is required on the lock SELECT"
+    )
+    assert "d-original" not in ids_seen, (
+        f"stale direction 'd-original' was not evicted by populate_existing=True: "
+        f"{seen_directions!r}"
+    )
+
+
 @pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
 @pytest.mark.asyncio
 async def test_with_vision_locked_serializes_concurrent_writers(db_session):

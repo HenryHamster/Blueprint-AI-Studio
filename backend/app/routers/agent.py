@@ -1006,6 +1006,8 @@ async def claim_task(
             "github_repo": project.github_repo,
             "build_config": _build_cfg,
             "enable_fresh_reviewer": _build_cfg.get("enable_fresh_reviewer", False),
+            "enable_parallel_review": _build_cfg.get("enable_parallel_review", False),
+            "enable_parallel_fix": _build_cfg.get("enable_parallel_fix", False),
             "enable_self_improvement": project.enable_self_improvement,
         }
 

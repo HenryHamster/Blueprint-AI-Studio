@@ -251,6 +251,8 @@ class BuildConfig(BaseModel):
     git_user_email: str = "blueprint-agent@automated.dev"
     detected_at: str | None = None
     enable_fresh_reviewer: bool = False
+    enable_parallel_review: bool = False
+    enable_parallel_fix: bool = False
 
 
 class OnboardPayload(BaseModel):

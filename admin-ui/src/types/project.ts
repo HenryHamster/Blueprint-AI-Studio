@@ -36,6 +36,8 @@ export interface BuildConfig {
   env_vars?: Record<string, string>;
   detected_at?: string;
   enable_fresh_reviewer?: boolean;
+  enable_parallel_review?: boolean;
+  enable_parallel_fix?: boolean;
 }
 
 export interface Project {

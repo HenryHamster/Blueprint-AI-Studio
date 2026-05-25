@@ -17718,6 +17718,53 @@ def test_compute_review_quality_metrics_review_accuracy_shape():
     assert acc["recall"] == 1.0
 
 
+def test_parallel_review_effectiveness_buckets_correctly():
+    """Tasks with review_was_parallelized=True/False bucket into parallel/serial."""
+
+    def _make_review(parallelized: bool, verdict: str = "APPROVE"):
+        return make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={
+                "blueprint_review_verdict": verdict,
+                "review_was_parallelized": parallelized,
+            },
+        )
+
+    parallel_tasks = [_make_review(True) for _ in range(3)]
+    serial_tasks = [_make_review(False) for _ in range(3)]
+    result = compute_review_quality_metrics(parallel_tasks + serial_tasks)
+    pre = result["parallel_review_effectiveness"]
+    assert pre is not None
+    assert pre["sample_sizes"]["parallel"] == 3
+    assert pre["sample_sizes"]["serial"] == 3
+    assert pre["parallel"]["count"] == 3
+    assert pre["serial"]["count"] == 3
+    assert pre["parallel"]["approval_rate"] == 1.0
+    assert pre["serial"]["approval_rate"] == 1.0
+
+
+def test_parallel_review_effectiveness_none_when_insufficient_sample():
+    """Returns None when either bucket has fewer than 3 tasks."""
+
+    def _make_review(parallelized: bool):
+        return make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={
+                "blueprint_review_verdict": "APPROVE",
+                "review_was_parallelized": parallelized,
+            },
+        )
+
+    # Only 2 parallel tasks — below threshold
+    tasks = [_make_review(True) for _ in range(2)] + [
+        _make_review(False) for _ in range(5)
+    ]
+    result = compute_review_quality_metrics(tasks)
+    assert result["parallel_review_effectiveness"] is None
+
+
 # ---------------------------------------------------------------------------
 # /api/admin/projects/{id}/warm-reuse-funnel tests
 # ---------------------------------------------------------------------------
