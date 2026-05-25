@@ -806,6 +806,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
     findings = _parse_research_findings(logs)
     insights = await _parse_research_insights(str(task.id))
+    # Agent JSON sometimes contains non-dict entries (bare strings, nulls).
+    # The downstream .get() loop would AttributeError and the handler-failed
+    # branch in task_lifecycle would terminally FAIL a research task that
+    # actually completed. Drop them here.
+    if findings:
+        findings = [f for f in findings if isinstance(f, dict)]
     if not findings:
         task.latest_status_message = "Research completed with no actionable findings"
         task.plan_output = []

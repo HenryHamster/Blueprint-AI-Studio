@@ -33,13 +33,13 @@ def _compute_retry_after_escalation_action(
 ) -> str | None:
     """Decide how to escalate a task that keeps cycling through retry_after holds.
 
-    Returns 'fail' once `resets` reaches the secondary `fail_threshold` (auto-fail
-    so the requeue/retry machinery can take over with fresh context), 'alert'
-    when only the WARNING `alert_threshold` is crossed, or None below both bars.
-    The fail check wins ties when both thresholds are crossed.
+    Pool exhaustion is a wait condition, not a terminal one: when every account
+    is rate-limited the right behaviour is to wait for recovery, not to drop the
+    task on the floor. We fire a WARNING once `resets` crosses `alert_threshold`
+    so the situation is visible, and never escalate to 'fail'. `fail_threshold`
+    is accepted for call-site compatibility but ignored.
     """
-    if fail_threshold > 0 and resets >= fail_threshold:
-        return "fail"
+    del fail_threshold
     if alert_threshold > 0 and resets >= alert_threshold:
         return "alert"
     return None
