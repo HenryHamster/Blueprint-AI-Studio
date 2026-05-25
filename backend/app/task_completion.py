@@ -2373,11 +2373,13 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
         )
         task.plan_output = []
         session.add(task)
+        await session.commit()
         return
 
     # Store all findings for display
     task.plan_output = findings
     session.add(task)
+    await session.commit()
 
     base_branch = (task.first_payload).get("base_branch", "main")
 
@@ -2508,6 +2510,7 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
             f"{len(informational)} medium/low finding(s) surfaced as PR comment"
         )
     session.add(task)
+    await session.commit()
 
     await broadcast_to_project(
         str(task.project_id),

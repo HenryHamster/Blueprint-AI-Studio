@@ -1676,13 +1676,17 @@ def _already_flagged_direction(flagged_cycles: int = 0, **extra) -> dict:
     d["outcome_scaffolding_flagged_at"] = datetime.utcnow().isoformat()
     d["outcome_scaffolding_evidence"] = {"total_cycles": 14}
     d["outcome_scaffolding_flagged_cycles"] = flagged_cycles
+    # total_cycles = 4 (research_history) + 10 (history_aggregate) = 14.
+    # Set last_cycle_count to 13 so the lifecycle pass sees one new cycle (14>13)
+    # and advances the counter exactly once — simulating a real completed cycle.
+    d["outcome_scaffolding_last_cycle_count"] = 13
     d.update(extra)
     return d
 
 
 @pytest.mark.asyncio
-async def test_scaffolding_flag_counter_increments_each_cycle(db_session, mocker):
-    """outcome_scaffolding_flagged_cycles increments each lifecycle pass while the flag holds."""
+async def test_scaffolding_flag_counter_increments_on_new_cycle(db_session, mocker):
+    """outcome_scaffolding_flagged_cycles increments only when a new research cycle has completed."""
     mocker.patch(
         "app.notification_dispatch.post_direction_outcome_stalled_message",
         new_callable=AsyncMock,
@@ -1692,6 +1696,7 @@ async def test_scaffolding_flag_counter_increments_each_cycle(db_session, mocker
         new_callable=AsyncMock,
     )
 
+    # last_cycle_count=13 < total_cycles=14 → one new cycle → counter advances
     direction = _already_flagged_direction(flagged_cycles=1)
     project = await _make_cost_project(db_session, direction)
 
@@ -1706,11 +1711,84 @@ async def test_scaffolding_flag_counter_increments_each_cycle(db_session, mocker
 
     d = project.directions[0]
     assert d.get("outcome_scaffolding_flagged_cycles") == 2, (
-        f"counter should be 2 after one pass with existing count=1, got {d.get('outcome_scaffolding_flagged_cycles')}"
+        f"counter should be 2 after one new cycle, got {d.get('outcome_scaffolding_flagged_cycles')}"
     )
     assert d["status"] == "active", (
         "direction must remain active — only the counter increments"
     )
+
+
+@pytest.mark.asyncio
+async def test_scaffolding_counter_does_not_increment_without_new_cycle(
+    db_session, mocker
+):
+    """outcome_scaffolding_flagged_cycles must NOT advance when no new research cycle completed."""
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_scaffolding_escalation_message",
+        new_callable=AsyncMock,
+    )
+
+    direction = _already_flagged_direction(flagged_cycles=1)
+    # Override last_cycle_count to equal current total_cycles (14) — no new cycle
+    direction["outcome_scaffolding_last_cycle_count"] = 14
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d.get("outcome_scaffolding_flagged_cycles") == 1, (
+        f"counter must not advance when no new cycle completed, got {d.get('outcome_scaffolding_flagged_cycles')}"
+    )
+    assert d["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_scaffolding_legacy_missing_watermark_backfills_without_increment(
+    db_session, mocker
+):
+    """Legacy flagged directions missing the watermark must backfill it without advancing."""
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    escalate_notify = mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_scaffolding_escalation_message",
+        new_callable=AsyncMock,
+    )
+
+    direction = _already_flagged_direction(flagged_cycles=2)
+    direction.pop("outcome_scaffolding_last_cycle_count", None)
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d.get("outcome_scaffolding_flagged_cycles") == 2, (
+        "legacy missing watermark must not miscount the current total_cycles as a new cycle"
+    )
+    assert d.get("outcome_scaffolding_last_cycle_count") == 14, (
+        "legacy missing watermark should be backfilled to the current completed-cycle count"
+    )
+    assert d["status"] == "active"
+    escalate_notify.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1745,6 +1823,52 @@ async def test_scaffolding_escalation_fires_at_mid_threshold(db_session, mocker)
     d = project.directions[0]
     assert d.get("outcome_scaffolding_flagged_cycles") == 3
     assert d["status"] == "active", "escalation must not retire the direction"
+    escalate_notify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_scaffolding_escalation_does_not_refire_without_new_cycle(
+    db_session, mocker
+):
+    """Escalation notification must not repeat on later ticks without a new completed cycle."""
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    escalate_notify = mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_scaffolding_escalation_message",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_direction_milestone_message",
+        new_callable=AsyncMock,
+    )
+
+    direction = _already_flagged_direction(flagged_cycles=2)
+    project = await _make_cost_project(db_session, direction)
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    assert project.directions[0].get("outcome_scaffolding_flagged_cycles") == 3
+    escalate_notify.assert_awaited_once()
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d.get("outcome_scaffolding_flagged_cycles") == 3, (
+        "counter must stay pinned when no new cycle completed after escalation"
+    )
     escalate_notify.assert_awaited_once()
 
 
@@ -1828,6 +1952,9 @@ async def test_scaffolding_flag_clear_resets_counter(db_session, mocker):
     )
     assert "outcome_scaffolding_flagged_cycles" not in d, (
         "counter should be removed when flag is cleared"
+    )
+    assert "outcome_scaffolding_last_cycle_count" not in d, (
+        "last_cycle_count watermark should be removed when flag is cleared"
     )
 
 

@@ -1230,6 +1230,9 @@ async def _process_direction_lifecycle(
                 d["outcome_scaffolding_flagged"] = True
                 d["outcome_scaffolding_flagged_at"] = _utcnow().isoformat()
                 d["outcome_scaffolding_evidence"] = scaffolding_ev
+                d["outcome_scaffolding_last_cycle_count"] = scaffolding_ev[
+                    "total_cycles"
+                ]
                 directions_modified = True
                 logger.warning(
                     f"[AUTONOMOUS] Direction {did} flagged outcome-less scaffolding: "
@@ -1315,9 +1318,28 @@ async def _process_direction_lifecycle(
                     scaffolding_ev["stall_run_cycles"],
                 )
                 if not _ep_suppresses:
-                    _flag_cycles = d.get("outcome_scaffolding_flagged_cycles", 0) + 1
-                    d["outcome_scaffolding_flagged_cycles"] = _flag_cycles
-                    directions_modified = True
+                    _advanced_flag_cycle = False
+                    _current_cycles = scaffolding_ev["total_cycles"]
+                    _last_counted = d.get("outcome_scaffolding_last_cycle_count")
+                    if _last_counted is None:
+                        # Legacy flagged records predate the watermark field.
+                        # Backfill from the current completed-cycle count so
+                        # this tick does not miscount a stale cycle as new work.
+                        d["outcome_scaffolding_last_cycle_count"] = _current_cycles
+                        _last_counted = _current_cycles
+                        directions_modified = True
+                    if _current_cycles <= _last_counted:
+                        # No new completed research cycle — skip increment.
+                        pass
+                    else:
+                        _flag_cycles = (
+                            d.get("outcome_scaffolding_flagged_cycles", 0) + 1
+                        )
+                        d["outcome_scaffolding_flagged_cycles"] = _flag_cycles
+                        d["outcome_scaffolding_last_cycle_count"] = _current_cycles
+                        _advanced_flag_cycle = True
+                        directions_modified = True
+                    _flag_cycles = d.get("outcome_scaffolding_flagged_cycles", 0)
                     if _flag_cycles >= _retire_threshold:
                         # Auto-retire — mirroring the code_failure_pause_count ladder.
                         d["status"] = "completed"
@@ -1366,7 +1388,7 @@ async def _process_direction_lifecycle(
                         # downstream greedy selection cannot spawn a cycle on it
                         # this tick (mirrors the auto-pause `continue` at L1202).
                         continue
-                    elif _flag_cycles == _esc_threshold:
+                    elif _advanced_flag_cycle and _flag_cycles == _esc_threshold:
                         # Escalation notification at mid-threshold.
                         try:
                             from app.notification_dispatch import (  # noqa: PLC0415
@@ -1390,6 +1412,7 @@ async def _process_direction_lifecycle(
             d.pop("outcome_scaffolding_flagged_at", None)
             d.pop("outcome_scaffolding_evidence", None)
             d.pop("outcome_scaffolding_flagged_cycles", None)
+            d.pop("outcome_scaffolding_last_cycle_count", None)
             directions_modified = True
             logger.info(
                 f"[AUTONOMOUS] Cleared outcome-scaffolding flag on {did}: "
