@@ -542,6 +542,12 @@ def _build_preventive_context(
     if project_anomalies:
         modules = {f.split("/", 1)[0].lower() for f in related_files if "/" in f}
         for key, info in project_anomalies.items():
+            # Project anomaly entries are sometimes stored as raw strings rather
+            # than the {"latest_details": ...} dict shape, which previously
+            # AttributeError'd here and crashed the entire research dispatch
+            # loop (every research task spawned 0 children, no log, no status).
+            if not isinstance(info, dict):
+                continue
             details = (info.get("latest_details") or "").lower()
             if not details:
                 continue

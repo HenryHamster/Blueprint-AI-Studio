@@ -1241,3 +1241,46 @@ class TestSummarizeDispatchOutcome:
             deferred_reason_parts=long_reasons,
         )
         assert len(msg) <= 500
+
+
+class TestBuildPreventiveContext:
+    """Regression: project_anomalies entries are sometimes stored as raw strings
+    rather than the {'latest_details': ...} dict shape, which crashed
+    _build_preventive_context with AttributeError: 'str' object has no attribute
+    'get' and silently killed the entire research dispatch loop — 5+ consecutive
+    research tasks spawned 0 children with no log, no status_message."""
+
+    def test_string_anomaly_value_is_skipped_not_crashes(self):
+        from app.research_completion import _build_preventive_context
+
+        finding = {"related_files": ["backend/app/task_lifecycle.py"]}
+        project_anomalies = {
+            "task_count_spike": "raw string value, no dict",  # the corrupt shape
+            "other_key": {  # well-formed; details include the top-level module
+                "latest_details": "backend module path mismatch in task_lifecycle"
+            },
+        }
+        # Must not raise. The dict-shaped entry can still match.
+        result = _build_preventive_context(finding, {}, project_anomalies)
+        assert result is not None
+        assert result.get("anomaly_key") == "other_key"
+        assert "backend module path mismatch" in result.get("warning", "")
+
+    def test_all_string_anomalies_returns_none(self):
+        from app.research_completion import _build_preventive_context
+
+        finding = {"related_files": ["backend/app/task_lifecycle.py"]}
+        project_anomalies = {
+            "k1": "string value",
+            "k2": 42,
+            "k3": None,
+        }
+        # All non-dict — no anomaly match possible, must not raise.
+        assert _build_preventive_context(finding, {}, project_anomalies) is None
+
+    def test_empty_project_anomalies_returns_none(self):
+        from app.research_completion import _build_preventive_context
+
+        finding = {"related_files": ["backend/app/foo.py"]}
+        assert _build_preventive_context(finding, {}, None) is None
+        assert _build_preventive_context(finding, {}, {}) is None
