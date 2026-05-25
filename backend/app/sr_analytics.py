@@ -26,6 +26,7 @@ from app.models import (
     TaskStatus,
     _utcnow,
 )
+from app.playbook_sr_metrics import _task_prompt_fingerprint  # noqa: F401
 from app.shared_state import DEFAULT_TASK_SCOPE
 from app.sr_blind_spots import _REVIEWER_ORIGINS
 
@@ -1001,17 +1002,6 @@ def _compute_cat_severity_calibration(
             else:
                 bucket["matched"] += 1
     return result
-
-
-def _task_prompt_fingerprint(task: Task) -> str:
-    """Resolve the task's prompt fingerprint with legacy context fallback."""
-    if isinstance(task.prompt_fingerprint, str) and task.prompt_fingerprint:
-        return task.prompt_fingerprint
-    ctx = task.context or {}
-    legacy = ctx.get("prompt_fingerprint")
-    if isinstance(legacy, str) and legacy:
-        return legacy
-    return "unknown"
 
 
 def compute_sr_quality_by_fingerprint(

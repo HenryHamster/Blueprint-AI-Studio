@@ -1589,6 +1589,233 @@ def compute_recurring_error_clusters(
     ][:5]
 
 
+def compute_retry_pattern_summary(failed_tasks: List[Task]) -> Dict[str, Any]:
+    """Summarize multi-attempt failures and whether retries shifted failure class.
+
+    Pure function — no database calls. Looks at each failed task's
+    ``_failure_class_history`` chain; entries with ≥2 attempts contribute
+    to ``total_multi_attempt_failures``. ``repeat_class_count`` counts how
+    many such chains had two consecutive identical classes.
+    """
+    from app.retry_budget import failure_class_history_classes
+
+    _multi_attempt = []
+    for _t in failed_tasks:
+        _hist = failure_class_history_classes(
+            (_t.context or {}).get("_failure_class_history")
+        )
+        if len(_hist) >= 2:
+            _multi_attempt.append(_hist)
+    _repeat_count = sum(
+        1 for h in _multi_attempt if any(h[i] == h[i + 1] for i in range(len(h) - 1))
+    )
+    _pattern_counts: Dict[str, int] = {}
+    for _hist in _multi_attempt:
+        _key = " -> ".join(_hist)
+        _pattern_counts[_key] = _pattern_counts.get(_key, 0) + 1
+    _top_patterns = sorted(_pattern_counts.items(), key=lambda x: x[1], reverse=True)[
+        :3
+    ]
+    return {
+        "total_multi_attempt_failures": len(_multi_attempt),
+        "repeat_class_count": _repeat_count,
+        "top_patterns": [{"sequence": s, "count": c} for s, c in _top_patterns],
+    }
+
+
+def compute_review_cap_exhaustion_summary(
+    failed_tasks: List[Task],
+    *,
+    window_start: "datetime",
+) -> Dict[str, Any]:
+    """Summarize tasks that FAILED with failure_detail=review_cap_exhausted.
+
+    Pure function — no database calls. Aggregates iteration counts, top
+    directions, and VM cost burned while the review-fix loop was unable
+    to converge.
+    """
+    from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+
+    _cap_tasks = [
+        t
+        for t in failed_tasks
+        if (t.context or {}).get("failure_detail") == "review_cap_exhausted"
+    ]
+    _cap_iters: List[int] = []
+    _cap_dir_counts: Dict[str, int] = {}
+    _cap_total_cost = 0.0
+    for _t in _cap_tasks:
+        _ctx = _t.context or {}
+        _it = _ctx.get("review_cap_iterations")
+        if isinstance(_it, (int, float)):
+            _cap_iters.append(int(_it))
+        _did = _ctx.get("direction_id")
+        if _did:
+            _did_s = str(_did)
+            _cap_dir_counts[_did_s] = _cap_dir_counts.get(_did_s, 0) + 1
+        if (
+            _t.vm_provisioned_at
+            and _t.vm_stopped_at
+            and _t.vm_stopped_at >= window_start
+        ):
+            _rate = SPOT_RATE if _t.vm_spot else ON_DEMAND_RATE
+            _cap_total_cost += (
+                _rate * (_t.vm_stopped_at - _t.vm_provisioned_at).total_seconds()
+            )
+    _top_cap_dirs = sorted(_cap_dir_counts.items(), key=lambda x: x[1], reverse=True)[
+        :3
+    ]
+    return {
+        "count": len(_cap_tasks),
+        "avg_iterations": (sum(_cap_iters) / len(_cap_iters)) if _cap_iters else None,
+        "top_directions": [{"direction_id": d, "count": c} for d, c in _top_cap_dirs],
+        "total_cost_usd": round(_cap_total_cost, 4),
+        "avg_cost_usd": round(_cap_total_cost / len(_cap_tasks), 4)
+        if _cap_tasks
+        else None,
+    }
+
+
+def compute_resurrection_outcome_summary(
+    completed_tasks: List[Task],
+    failed_tasks: List[Task],
+) -> Dict[str, Any]:
+    """Count tasks that the reaper auto-resurrected and how many still failed.
+
+    Pure function — no database calls. A task is considered resurrected when
+    its context's ``_resurrection_count`` is ≥1.
+    """
+    _resurrected_completed = 0
+    _resurrected_failed = 0
+    for _t in completed_tasks:
+        if (_t.context or {}).get("_resurrection_count", 0) >= 1:
+            _resurrected_completed += 1
+    for _t in failed_tasks:
+        if (_t.context or {}).get("_resurrection_count", 0) >= 1:
+            _resurrected_failed += 1
+    _resurrected_total = _resurrected_completed + _resurrected_failed
+    return {
+        "total": _resurrected_total,
+        "completed": _resurrected_completed,
+        "failed_again": _resurrected_failed,
+        "success_rate": (_resurrected_completed / _resurrected_total)
+        if _resurrected_total
+        else None,
+    }
+
+
+def compute_rejection_pattern_summary(
+    all_tasks: List[Task],
+    *,
+    window_start: "datetime",
+) -> Dict[str, Any]:
+    """Aggregate ``pr_rejected`` tasks completed within the window.
+
+    Pure function — no database calls. Normalises rejection notes (lower-cased,
+    whitespace-collapsed, truncated to 120 chars) so near-duplicate notes count
+    together; returns the top three by frequency.
+    """
+    from app.routers.admin_analytics import _derive_completed_at
+
+    _rejected_in_window = [
+        t
+        for t in all_tasks
+        if (t.context or {}).get("pr_rejected")
+        and _derive_completed_at(t) >= window_start
+    ]
+    _note_counts: Dict[str, int] = {}
+    for _t in _rejected_in_window:
+        _note = ((_t.context or {}).get("pr_rejection_note") or "").strip()
+        if not _note:
+            continue
+        _snip = " ".join(_note.lower().split())[:120]
+        _note_counts[_snip] = _note_counts.get(_snip, 0) + 1
+    _top_notes = sorted(_note_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+    return {
+        "total_rejected": len(_rejected_in_window),
+        "top_notes": [{"snippet": s, "count": c} for s, c in _top_notes],
+    }
+
+
+def compute_anomaly_adjustment_summary() -> Dict[str, Any]:
+    """Snapshot the in-memory anomaly-driven pipeline adjustment state.
+
+    Reads from ``app.shared_state.anomaly_adjustments`` (an in-process dict
+    mutated by the anomaly-detection loop). Pure transform over that dict.
+    """
+    from app.shared_state import anomaly_adjustments as _anomaly_adjustments
+
+    return {
+        "active": bool(_anomaly_adjustments.get("active")),
+        "adjusted_at": _anomaly_adjustments.get("adjusted_at"),
+        "trigger_anomalies": list(_anomaly_adjustments.get("trigger_anomalies") or []),
+        "pre_adjustment_max_vms": _anomaly_adjustments.get("pre_adjustment_max_vms"),
+        "adjusted_max_vms": _anomaly_adjustments.get("adjusted_max_vms"),
+        "failure_gate_threshold": _anomaly_adjustments.get("failure_gate_threshold"),
+        "pre_adjustment_failure_gate": _anomaly_adjustments.get(
+            "pre_adjustment_failure_gate"
+        ),
+        "forced_restoration_count": _anomaly_adjustments.get(
+            "forced_restoration_count", 0
+        ),
+        "forced_restored_at": _anomaly_adjustments.get("forced_restored_at"),
+    }
+
+
+def compute_migration_health(
+    completed_tasks: List[Task],
+    failed_tasks: List[Task],
+    *,
+    error_log_map: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Summarize migration-task throughput and migration-error incidence.
+
+    Pure function — no database calls. Imports ``EXPECTED_SCHEMA_REVISION``
+    at call time to avoid a hard import cycle with ``app.main``.
+    """
+    from app.main import EXPECTED_SCHEMA_REVISION
+    from app.failure_classification import classify_failure as _mig_classify
+
+    def _task_type(t: Task) -> Optional[str]:
+        return (t.first_payload or {}).get("type")
+
+    def _touched_migration(t: Task) -> bool:
+        ctx = t.context or {}
+        files = ctx.get("related_files") or []
+        if isinstance(files, list) and any(
+            isinstance(f, str) and f.startswith("backend/alembic/versions/")
+            for f in files
+        ):
+            return True
+        payload_files = (t.first_payload or {}).get("related_files") or []
+        return isinstance(payload_files, list) and any(
+            isinstance(f, str) and f.startswith("backend/alembic/versions/")
+            for f in payload_files
+        )
+
+    _migrate_completed = [t for t in completed_tasks if _task_type(t) == "migrate"]
+    _migrate_failed = [t for t in failed_tasks if _task_type(t) == "migrate"]
+    _migration_errors = sum(
+        1
+        for t in failed_tasks
+        if (t.context or {}).get("failure_class") == "MIGRATION_ERROR"
+        or _mig_classify(t, error_log_map.get(str(t.id))) == "MIGRATION_ERROR"
+    )
+    _auto_generated_migrations = sum(
+        1
+        for t in (completed_tasks + failed_tasks)
+        if _task_type(t) != "migrate" and _touched_migration(t)
+    )
+    return {
+        "current_schema_revision": EXPECTED_SCHEMA_REVISION,
+        "migration_tasks_in_window": len(_migrate_completed) + len(_migrate_failed),
+        "migration_tasks_succeeded": len(_migrate_completed),
+        "migration_tasks_failed": len(_migrate_failed),
+        "migration_errors_in_window": _migration_errors,
+        "auto_generated_migrations": _auto_generated_migrations,
+    }
+
+
 def compute_digest_trend_history(
     *,
     all_tasks: List[Task],

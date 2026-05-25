@@ -23,14 +23,20 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.admin import _get_user_project_with_role
+from app.auth import get_current_user
+from app.database import get_session
 from app.models import Project, Task, TaskStatus, _utcnow
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 from app.task_locking import project_lock
+
+router = APIRouter()
 
 # ---------------------------------------------------------------------------
 # Cold-start stage breakdown (per-stage p50 decomposition)
@@ -738,3 +744,136 @@ async def maybe_write_daily_snapshot(
     if not _last_run_due(container.get("last_run_at"), now):
         return None
     return await write_snapshot(session, project_id)
+
+
+# ---------------------------------------------------------------------------
+# HTTP endpoints (sub-router, mounted by app.routers.admin_digest)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/projects/{project_id}/efficiency-axes")
+async def get_efficiency_axes(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return per-axis current/baseline/drift/history for the project's efficiency baseline.
+
+    Reads ``project.design_doc["efficiency_baseline"]`` (populated weekly by
+    the ``_efficiency_snapshot_service``) and returns each of the five
+    foundational axes — ``cost_per_merged_pr``, ``vm_cold_start_p50_ms``,
+    ``vm_reuse_rate``, ``median_api_calls_per_task``,
+    ``median_review_iterations`` — with the latest snapshot value, the
+    immutable baseline value, percentage drift from baseline, and a
+    time-series of up to 26 weekly snapshots for trend rendering.
+
+    Also returns ``vm_cold_start_breakdown``: a per-stage p50 ms breakdown of
+    the cold-start interval from the latest snapshot.  ``dispatch_to_slot_ms``
+    is the queue-wait before a provisioning slot is acquired (isolates our own
+    concurrency throttle from real GCE boot latency); the remaining stages
+    decompose boot through agent claim.  All values are None when no tasks in
+    the latest snapshot had stage data.
+
+    Response shape::
+
+        {
+          "axes": {
+            "<axis>": {
+              "current": float|None,
+              "baseline": float|None,
+              "drift_pct": float|None,
+              "history": [{"captured_at": iso8601, "value": float|None}, ...]
+            },
+            ...
+          },
+          "baseline_captured_at": iso8601|None,
+          "last_snapshot_at": iso8601|None,
+          "vm_cold_start_breakdown": {
+            "dispatch_to_slot_ms": float|None,
+            "dispatch_to_creds_ms": float|None,
+            "creds_to_env_ms": float|None,
+            "env_to_payload_ms": float|None,
+            "payload_to_systemctl_ms": float|None,
+            "systemctl_to_startup_ms": float|None,
+            "startup_to_claim_ms": float|None
+          } | None
+        }
+
+    ``drift_pct`` is None whenever either side is missing or baseline is 0.
+    ``history`` is ordered oldest-first; before any snapshot fires it is ``[]``.
+    Before the first snapshot fires, all axis values are None and both
+    timestamps are None.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+    return await read_baseline_with_drift(session, project_id)
+
+
+@router.get("/projects/{project_id}/llm-cost-breakdown")
+async def get_llm_cost_breakdown(
+    project_id: uuid.UUID,
+    window_days: int = Query(default=7, ge=1, le=90),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Per-provider and per-model LLM cost/token breakdown over a project window.
+
+    Read-only view over recently-terminal tasks (COMPLETED/FAILED/CANCELLED
+    within ``window_days``, default 7). Reuses the snapshot pricing table
+    (:data:`app.efficiency_snapshot.LLM_TOKEN_PRICING`) so cost numbers are
+    consistent with ``llm_cost_per_merged_pr``.
+
+    Response shape::
+
+        {
+          "window_days": int,
+          "generated_at": iso8601,
+          "by_provider": [
+            {
+              "provider": str,
+              "total_input_tokens": int,
+              "total_output_tokens": int,
+              "total_cost_usd": float,
+              "mean_cost_per_task": float,
+              "share_of_total_cost": float|None,
+              "task_count": int,
+              "llm_call_count": int
+            }, ...
+          ],
+          "by_model": [
+            {
+              "provider": str,
+              "model": str,
+              "total_input_tokens": int,
+              "total_output_tokens": int,
+              "total_cost_usd": float,
+              "mean_cost_per_task": float,
+              "share_of_total_cost": float|None,
+              "task_count": int,
+              "llm_call_count": int,
+              "priced": bool
+            }, ...
+          ],
+          "totals": {
+            "total_input_tokens": int,
+            "total_output_tokens": int,
+            "total_cost_usd": float,
+            "task_count": int,
+            "priced_task_count": int,
+            "unpriced_task_count": int,
+            "unpriced_coverage_fraction": float|None
+          },
+          "unpriced_combos": [str, ...]
+        }
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+    tasks = await _load_recent_tasks(session, project_id, window_days=window_days)
+    breakdown = compute_llm_cost_breakdown(tasks)
+    return {
+        "window_days": window_days,
+        "generated_at": _utcnow().isoformat(),
+        **breakdown,
+    }

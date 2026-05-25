@@ -10,8 +10,9 @@ import logging
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import cast, or_
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,10 +20,21 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 import app.shared_state as _shared_state
-from app.models import Project, Task, TaskHistory, TaskStatus
+from app.auth import require_admin
+from app.database import get_session
+from app.models import (
+    Project,
+    RegressionCaseStatus,
+    RegressionRemediationCase,
+    Task,
+    TaskHistory,
+    TaskStatus,
+)
 from app.payload_schemas import validate_internal_payload
 from app.strategic_completion import _is_direction_duplicate
 from app.time_utils import _utcnow
+
+router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
@@ -1835,3 +1847,107 @@ async def _expire_stale_proposals(session) -> int:
         # is closed.
         await session.rollback()
     return total_expired
+
+
+@router.get("/anomaly-tracker/snapshot")
+async def get_anomaly_tracker_snapshot(
+    project_id: Optional[uuid.UUID] = Query(default=None),
+    freshness_hours: int = Query(default=24, ge=1, le=720),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Read-only snapshot of shared_state.persistent_anomalies.
+
+    Surfaces which fingerprints the detection pipeline is currently tracking,
+    how aged they are, and when the detection sweep last ran (so a silent
+    writer failure is visible). Pure passthrough of stored entries — no
+    normalization, no garbage collection.
+    """
+    pid_filter = str(project_id) if project_id else None
+    now = _utcnow()
+    stale_cutoff_iso = (now - timedelta(hours=freshness_hours)).isoformat()
+
+    # Collect (project_id, RegressionRemediationCase) for last_dispatch_attempt_at.
+    # Best-effort lookup: an active case whose regression_class is the dispatcher's
+    # f"anomaly:{anomaly_key}" form gets its last_seen_at echoed; missing rows
+    # return null. Filter to ACTIVE so this scales with backlog rather than
+    # whole-table size on a hot endpoint.
+    case_where = [RegressionRemediationCase.status == RegressionCaseStatus.ACTIVE]
+    if project_id is not None:
+        case_where.append(RegressionRemediationCase.project_id == project_id)
+    cases = (
+        (await session.execute(select(RegressionRemediationCase).where(*case_where)))
+        .scalars()
+        .all()
+    )
+    # (project_id, anomaly_key) -> latest last_seen_at across rows. The
+    # dispatcher writes regression_class = f"anomaly:{anomaly_key}"
+    # (pipeline_regression_dispatcher.py:1748) — strip that prefix here so the
+    # index keys match the persistent_anomalies anomaly_key directly.
+    case_index: Dict[tuple, datetime] = {}
+    _ANOMALY_PREFIX = "anomaly:"
+    for c in cases:
+        if not c.last_seen_at:
+            continue
+        rclass = c.regression_class or ""
+        if not rclass.startswith(_ANOMALY_PREFIX):
+            continue
+        anomaly_key = rclass[len(_ANOMALY_PREFIX) :]
+        key = (str(c.project_id), anomaly_key)
+        prior = case_index.get(key)
+        if prior is None or c.last_seen_at > prior:
+            case_index[key] = c.last_seen_at
+
+    projects_payload: List[Dict[str, Any]] = []
+    total = 0
+    for proj_key, proj_anomalies in _shared_state.persistent_anomalies.items():
+        if pid_filter and proj_key != pid_filter:
+            continue
+        if not proj_anomalies:
+            continue
+        entries: List[Dict[str, Any]] = []
+        for anomaly_key, entry in proj_anomalies.items():
+            if not isinstance(entry, dict):
+                continue
+            first_seen = entry.get("first_seen")
+            last_seen = entry.get("last_seen")
+            first_seen_iso = (
+                first_seen.isoformat()
+                if isinstance(first_seen, datetime)
+                else (first_seen or None)
+            )
+            last_seen_iso = (
+                last_seen.isoformat()
+                if isinstance(last_seen, datetime)
+                else (last_seen or None)
+            )
+            stuck = bool(last_seen_iso and last_seen_iso < stale_cutoff_iso)
+            dispatch_at = case_index.get((proj_key, anomaly_key))
+            entries.append(
+                {
+                    "key": anomaly_key,
+                    "first_seen": first_seen_iso,
+                    "last_seen": last_seen_iso,
+                    "occurrence_count": entry.get("occurrence_count", 0),
+                    "severity": entry.get("severity"),
+                    "latest_details": entry.get("latest_details"),
+                    "fingerprint": entry.get("fingerprint"),
+                    "affected_directions": entry.get("affected_directions"),
+                    "last_dispatch_attempt_at": dispatch_at.isoformat()
+                    if dispatch_at
+                    else None,
+                    "stuck": stuck,
+                }
+            )
+        # Sort by last_seen desc; entries with missing last_seen sink to the bottom.
+        entries.sort(key=lambda e: e.get("last_seen") or "", reverse=True)
+        total += len(entries)
+        projects_payload.append({"project_id": proj_key, "anomalies": entries})
+
+    last_run = _shared_state.last_anomaly_detection_run_at
+    return {
+        "last_detection_run_at": last_run.isoformat() if last_run else None,
+        "freshness_window_hours": freshness_hours,
+        "total": total,
+        "projects": projects_payload,
+    }
