@@ -1132,3 +1132,112 @@ class TestFindingsTypeFilter:
         assert filtered == [{"title": "ok"}, {"title": "also ok"}]
         for _f in filtered:
             assert _f.get("title") in {"ok", "also ok"}
+
+
+class TestSummarizeDispatchOutcome:
+    """_summarize_dispatch_outcome composes the post-dispatch status_message that
+    surfaces spawn/dedup/defer counts on the task itself. Before this lived only
+    in logs and task.context, leaving latest_status_message stuck at the last
+    agent heartbeat."""
+
+    def _outcome(
+        self,
+        hash_=0,
+        word=0,
+        file_=0,
+        evidence=0,
+        retired=0,
+        archived=0,
+    ):
+        # Lightweight stand-in for DedupOutcome — _summarize_dispatch_outcome
+        # uses getattr() so any object with the right int attrs works.
+        class _O:
+            pass
+
+        o = _O()
+        o.hash_dedup_count = hash_
+        o.word_overlap_count = word
+        o.file_overlap_count = file_
+        o.evidence_overlap_count = evidence
+        o.retired_approach_count = retired
+        o.archived_diagnoses_count = archived
+        return o
+
+    def test_all_spawned_no_dedup_no_defer(self):
+        from app.research_completion import _summarize_dispatch_outcome
+
+        msg = _summarize_dispatch_outcome(
+            spawned=5, total_findings=5, dedup_outcome=self._outcome()
+        )
+        assert msg == "spawned 5/5 findings"
+
+    def test_partial_spawn_with_dedup_breakdown(self):
+        from app.research_completion import _summarize_dispatch_outcome
+
+        msg = _summarize_dispatch_outcome(
+            spawned=2,
+            total_findings=5,
+            dedup_outcome=self._outcome(hash_=1, word=2),
+        )
+        assert "spawned 2/5 findings" in msg
+        assert "dedup filtered" in msg
+        assert "1 hash" in msg
+        assert "2 word-overlap" in msg
+
+    def test_includes_deferred_reasons(self):
+        from app.research_completion import _summarize_dispatch_outcome
+
+        msg = _summarize_dispatch_outcome(
+            spawned=1,
+            total_findings=4,
+            dedup_outcome=self._outcome(),
+            deferred_reason_parts=["batch cap (3)"],
+        )
+        assert "spawned 1/4 findings" in msg
+        assert "deferred: batch cap (3)" in msg
+
+    def test_zero_spawn_full_dedup_is_loud(self):
+        """The regression we just fixed: 5 findings → 0 children with dedup
+        eating everything. The status_message must show this, not look healthy."""
+        from app.research_completion import _summarize_dispatch_outcome
+
+        msg = _summarize_dispatch_outcome(
+            spawned=0,
+            total_findings=5,
+            dedup_outcome=self._outcome(hash_=3, word=2),
+        )
+        assert "spawned 0/5 findings" in msg
+        assert "3 hash" in msg and "2 word-overlap" in msg
+
+    def test_full_dedup_breakdown_all_categories(self):
+        from app.research_completion import _summarize_dispatch_outcome
+
+        msg = _summarize_dispatch_outcome(
+            spawned=0,
+            total_findings=6,
+            dedup_outcome=self._outcome(
+                hash_=1, word=1, file_=1, evidence=1, retired=1, archived=1
+            ),
+        )
+        for label in (
+            "1 hash",
+            "1 word-overlap",
+            "1 file-overlap",
+            "1 evidence-overlap",
+            "1 retired-approach",
+            "1 archived-diagnosis",
+        ):
+            assert label in msg, f"missing {label!r} in {msg!r}"
+
+    def test_message_truncates_at_500_chars(self):
+        from app.research_completion import _summarize_dispatch_outcome
+
+        # Construct deferred reasons that would push past 500 chars
+        long_reasons = [f"reason_{i}_with_padding_text" * 5 for i in range(20)]
+        msg = _summarize_dispatch_outcome(
+            spawned=0,
+            total_findings=99,
+            dedup_outcome=self._outcome(hash_=9),
+            deferred_reason_parts=long_reasons,
+        )
+        assert len(msg) <= 500

@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.database import closing_session
 from app.models import (
     Artifact,
     ArtifactType,
@@ -742,6 +743,106 @@ async def query_findings_index(
     return rows
 
 
+async def _shelve_findings_for_next_cycle(
+    task_id: uuid.UUID,
+    findings: List[Dict[str, Any]],
+    reason: str,
+) -> None:
+    """Append `findings` to a research task's `context.prior_deferred_findings`
+    in a fresh session, so the next research cycle's recovery code (around
+    line 850 in _handle_research_completion) re-processes them.
+
+    Use this from defer/race paths where the in-memory task was detached after
+    an unlocked-window break and cannot be safely mutated by the caller (see
+    _ensure_branch docstring). Findings are stamped with deferred_reason,
+    deferred_count, originally_researched_at, and finding_hash so the recovery
+    loop's decay / stale-cutoff / hash filters can act on them like any other
+    deferred entry.
+    """
+    actionable = [f for f in findings if isinstance(f, dict)]
+    if not actionable:
+        return
+    now_iso = _utcnow().isoformat()
+    stamped: list[dict] = []
+    for f in actionable:
+        s = dict(f)
+        s["deferred_count"] = int(s.get("deferred_count", 0) or 0) + 1
+        s["deferred_reason"] = reason
+        s.setdefault("originally_researched_at", now_iso)
+        if not s.get("finding_hash"):
+            s["finding_hash"] = _finding_hash(
+                s.get("title", ""), s.get("description", "")
+            )
+        stamped.append(s)
+    try:
+        async with closing_session() as session:
+            res = await session.execute(
+                select(Task).where(Task.id == task_id).with_for_update()
+            )
+            t = res.scalars().one_or_none()
+            if t is None:
+                logger.warning(
+                    f"[RESEARCH] shelve_findings: task {task_id} not found"
+                )
+                return
+            ctx = dict(t.context or {})
+            existing = list(ctx.get("prior_deferred_findings") or [])
+            ctx["prior_deferred_findings"] = existing + stamped
+            t.context = ctx
+            flag_modified(t, "context")
+            t.latest_status_message = (
+                f"Findings shelved ({reason}): {len(stamped)} deferred to next cycle"
+            )[:500]
+            session.add(t)
+            await session.commit()
+            logger.warning(
+                f"[RESEARCH] Shelved {len(stamped)} finding(s) on task {task_id} "
+                f"(reason={reason}) for next-cycle recovery"
+            )
+    except Exception:
+        logger.exception(
+            f"[RESEARCH] shelve_findings failed for task {task_id} reason={reason}"
+        )
+
+
+def _summarize_dispatch_outcome(
+    spawned: int,
+    total_findings: int,
+    dedup_outcome: Any | None,
+    deferred_reason_parts: list[str] | None = None,
+) -> str:
+    """Build the post-dispatch status_message that surfaces spawn / dedup / defer
+    counts. Today these stats live only in logs and task.context; surfacing them
+    on the task itself lets the admin UI and ./tasks failures CLI show why a
+    research cycle produced N children instead of M."""
+    parts: list[str] = [f"spawned {spawned}/{total_findings} findings"]
+    if dedup_outcome is not None:
+        dedup_breakdown: list[str] = []
+        if getattr(dedup_outcome, "hash_dedup_count", 0):
+            dedup_breakdown.append(f"{dedup_outcome.hash_dedup_count} hash")
+        if getattr(dedup_outcome, "word_overlap_count", 0):
+            dedup_breakdown.append(f"{dedup_outcome.word_overlap_count} word-overlap")
+        if getattr(dedup_outcome, "file_overlap_count", 0):
+            dedup_breakdown.append(f"{dedup_outcome.file_overlap_count} file-overlap")
+        if getattr(dedup_outcome, "evidence_overlap_count", 0):
+            dedup_breakdown.append(
+                f"{dedup_outcome.evidence_overlap_count} evidence-overlap"
+            )
+        if getattr(dedup_outcome, "retired_approach_count", 0):
+            dedup_breakdown.append(
+                f"{dedup_outcome.retired_approach_count} retired-approach"
+            )
+        if getattr(dedup_outcome, "archived_diagnoses_count", 0):
+            dedup_breakdown.append(
+                f"{dedup_outcome.archived_diagnoses_count} archived-diagnosis"
+            )
+        if dedup_breakdown:
+            parts.append("dedup filtered: " + ", ".join(dedup_breakdown))
+    if deferred_reason_parts:
+        parts.append("deferred: " + " + ".join(deferred_reason_parts))
+    return " | ".join(parts)[:500]
+
+
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
     """Parse research findings and create tasks from them."""
     # Increment _research_spawn_count on completion (variable name is legacy;
@@ -1010,6 +1111,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         task, research_branch, original_base, "RESEARCH", session
     )
     if relocked is None:
+        # Research is one-shot: there is no "next sweep" that re-runs the
+        # handler on this task, so the comment-promised recovery in
+        # _ensure_branch never fires. Shelve the findings into
+        # prior_deferred_findings (in a fresh session — see helper) so the
+        # next research cycle on this direction can recover them. The
+        # failure path (task FAILED) is loud already; this covers the
+        # peer-mutation defer path that used to drop findings silently.
+        await _shelve_findings_for_next_cycle(
+            task.id, findings, "branch_creation_defer"
+        )
         return
     task = relocked
 
@@ -2311,6 +2422,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             task.id,
         )
 
+    _deferral_reasons: list[str] = []
+    if _low_actionability_deferred:
+        _deferral_reasons.append(
+            f"low_actionability ({len(_low_actionability_deferred)})"
+        )
+    if _degradation_gate_deferred:
+        _deferral_reasons.append(
+            f"degradation gate ({_health_reason}; {len(_degradation_gate_deferred)})"
+        )
+    if _batch_cap_deferred:
+        _deferral_reasons.append(f"batch cap ({len(_batch_cap_deferred)})")
+
     if _all_deferred or _scope_skip_counts or _spawned_memo_ids:
         ctx = dict(task.context or {})
         if _all_deferred:
@@ -2322,23 +2445,24 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         task.context = ctx
         flag_modified(task, "context")
         session.add(task)
-        _deferral_reasons: list[str] = []
-        if _low_actionability_deferred:
-            _deferral_reasons.append(
-                f"low_actionability ({len(_low_actionability_deferred)})"
-            )
-        if _degradation_gate_deferred:
-            _deferral_reasons.append(
-                f"degradation gate ({_health_reason}; {len(_degradation_gate_deferred)})"
-            )
-        if _batch_cap_deferred:
-            _deferral_reasons.append(f"batch cap ({len(_batch_cap_deferred)})")
         _reason = " + ".join(_deferral_reasons) if _deferral_reasons else "unknown"
         logger.warning(
             f"[RESEARCH] Deferred {len(_all_deferred)} findings ({_reason}); "
             f"spawning {_impl_spawned} tasks. "
             f"Stored in task.context['deferred_findings'] for next cycle."
         )
+
+    # Surface the cycle outcome on the task itself. Previously this lived only
+    # in logs + task.context, leaving `latest_status_message` stuck at the last
+    # agent heartbeat (e.g. "[15.7MB] Using tool: Bash") and giving no signal
+    # in the admin UI / failures CLI when spawned-vs-filtered drifted.
+    task.latest_status_message = _summarize_dispatch_outcome(
+        spawned=_impl_spawned,
+        total_findings=len(findings),
+        dedup_outcome=_dedup_outcome,
+        deferred_reason_parts=_deferral_reasons,
+    )
+    session.add(task)
 
     await session.commit()
     for ct in child_tasks:
