@@ -7102,6 +7102,24 @@ def test_ci_failure_fix_prompt_is_conflict_aware():
     assert "Fix only the build/lint/test errors" not in prompt
 
 
+def test_ci_failure_fix_prompt_includes_test_diagnosis_guidance():
+    """Regression guard: after PRs #5793 (shard-5 flake) + #5789 (sibling mock-
+    signature drift in test_rate_limit_detection.py) both hit the 8-iter cap on
+    'NEW failing test' loops, the prompt now tells the agent to diagnose the
+    test (real regression / sibling-broken / flake) before editing their diff."""
+    prompt = build_ci_failure_fix_prompt(
+        pr_number=1,
+        base_branch="main",
+        ci_errors="FAILED testing/test_foo.py::test_bar",
+    )
+    # Must surface the three failure modes and tell the agent to look at the test.
+    assert "Diagnose before fixing" in prompt
+    assert "mock-signature drift" in prompt
+    assert "flake" in prompt
+    # Must tell the agent to verify on base HEAD before editing their diff.
+    assert "Run the test on `main` HEAD" in prompt
+
+
 def test_ci_failure_fix_prompt_check_runs_hint_optional():
     with_owner = build_ci_failure_fix_prompt(
         pr_number=1,

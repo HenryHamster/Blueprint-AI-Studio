@@ -9,6 +9,29 @@ import {
 } from '../prompt.js';
 import { extractJsonObjectDetailed, describeJsonExtractionResult, JsonExtractionError } from '../json-extract.js';
 
+// Scan raw Codex JSONL output for an item.completed agent_message event and
+// return its full item.text. This recovers the memo JSON when allOutput
+// contains Codex JSONL envelopes (where the memo JSON is embedded as an
+// escaped string in item.text and cannot be found by the normal extractor).
+function extractCodexAgentMessageText(text: string): string | null {
+  for (const line of text.split('\n')) {
+    if (!line.startsWith('{')) continue;
+    try {
+      const ev = JSON.parse(line) as Record<string, unknown>;
+      if (
+        (ev.type === 'item.completed' || ev.type === 'item.updated') &&
+        ev.item != null && typeof ev.item === 'object'
+      ) {
+        const item = ev.item as Record<string, unknown>;
+        if (item.type === 'agent_message' && typeof item.text === 'string') {
+          return item.text;
+        }
+      }
+    } catch { /* not a parseable JSONL envelope — skip */ }
+  }
+  return null;
+}
+
 // ── Handler: Memo (terminal reasoning artifact, no repo clone, no PR) ────────
 //
 // Memo tasks document a piece of reasoning that strategic review can cite
@@ -128,6 +151,13 @@ Rules:
   const sources: Array<{ label: string; text: string }> = [];
   if (lastResultText) sources.push({ label: 'lastResultText', text: lastResultText });
   if (allOutput) sources.push({ label: 'allOutput', text: allOutput });
+  // If allOutput contains raw Codex JSONL, the memo JSON is embedded as an
+  // escaped string in item.text and the normal extractor cannot reach it.
+  // Parse the envelopes to recover the unescaped inner text as a third source.
+  if (allOutput) {
+    const codexText = extractCodexAgentMessageText(allOutput);
+    if (codexText) sources.push({ label: 'allOutput[codex-agent_message]', text: codexText });
+  }
 
   for (const src of sources) {
     if (!src.text.includes('"summary"') || !src.text.includes('"reasoning"')) continue;

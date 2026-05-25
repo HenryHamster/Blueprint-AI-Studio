@@ -1147,6 +1147,13 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     continue
 
                 c_payload = c.first_payload
+                # Branch must respect the child's task type — agents use
+                # `blueprint/refactor-*` for refactor tasks, etc. Hardcoding
+                # `task-` here stalled review respawns on refactor children
+                # (incident 2026-05-25, PRs #5779/#5812/#5815/#5819 all hit
+                # the review cap because the clone targeted blueprint/task-*
+                # while the agent had pushed blueprint/refactor-*).
+                from app.shared_state import derive_task_branch as _derive_task_branch
                 branch = (c.context or {}).get("branch") or _derive_task_branch(
                     c.id, c_payload.get("type")
                 )

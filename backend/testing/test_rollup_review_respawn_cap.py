@@ -114,7 +114,9 @@ async def rollup_db():
     await engine.dispose()
 
 
-async def _make_respawn_scenario(session, *, child_respawn_count):
+async def _make_respawn_scenario(
+    session, *, child_respawn_count, payload_type="create"
+):
     """Build an EVALUATING parent with one stale, unmerged COMPLETED child.
 
     The child has a PR artifact and an ``updated_at`` 30 min in the past so it
@@ -143,7 +145,7 @@ async def _make_respawn_scenario(session, *, child_respawn_count):
     child = Task(
         project_id=project.id,
         parent_task_id=parent.id,
-        payloads=[{"type": "create", "prompt": "child"}],
+        payloads=[{"type": payload_type, "prompt": "child"}],
         status=TaskStatus.COMPLETED,
         context={"_review_respawn_count": child_respawn_count},
         requires_approval=False,
@@ -231,9 +233,7 @@ async def test_below_cap_increments_counter_by_one_on_real_spawn(rollup_db, mock
 
     from app.rollup_management import _check_and_trigger_rollup
 
-    parent, child = await _make_respawn_scenario(
-        rollup_db, child_respawn_count=start
-    )
+    parent, child = await _make_respawn_scenario(rollup_db, child_respawn_count=start)
 
     await _check_and_trigger_rollup(child, rollup_db)
 
@@ -244,6 +244,56 @@ async def test_below_cap_increments_counter_by_one_on_real_spawn(rollup_db, mock
     # Below cap → parent stays un-escalated.
     await rollup_db.refresh(parent)
     assert parent.requires_approval is False
+
+
+@pytest.mark.asyncio
+async def test_respawn_uses_task_type_branch_prefix(rollup_db, mocker):
+    """Regression — 2026-05-25 incident: PRs #5779/#5812/#5815/#5819 stalled
+    at the review cap because rollup_management hardcoded `blueprint/task-*`
+    for the clone target, while the agent had pushed `blueprint/refactor-*`
+    for refactor-type children. The respawn must derive the branch from the
+    child's task type via shared_state.derive_task_branch, not synthesize."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._verify_pr_merged",
+        new=AsyncMock(return_value=False),
+    )
+    spawned_review = Task(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "review", "prompt": "review"}],
+        status=TaskStatus.QUEUED,
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(spawned_review, True),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+    from app.shared_state import derive_task_branch
+
+    # Refactor-type child — agents push these to blueprint/refactor-{8hex},
+    # NOT blueprint/task-{8hex}.
+    _parent, child = await _make_respawn_scenario(
+        rollup_db, child_respawn_count=0, payload_type="refactor"
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    mock_spawn.assert_awaited_once()
+    spawn_kwargs = mock_spawn.call_args.kwargs
+    spawn_args = mock_spawn.call_args.args
+    # _spawn_pipeline_task signature: (source_task, task_type, session,
+    # pr_number, branch, base_branch, ...). branch is positional index 4.
+    branch_passed = spawn_kwargs.get("branch") or spawn_args[4]
+    expected = derive_task_branch(child.id, "refactor")
+    assert branch_passed == expected, (
+        f"respawn cloned wrong branch: got {branch_passed!r}, expected {expected!r} "
+        f"(must use child's task type, not hardcoded 'task-' prefix)"
+    )
+    assert "refactor-" in branch_passed
 
 
 @pytest.mark.asyncio
@@ -278,9 +328,7 @@ async def test_dedup_hit_does_not_increment_counter(rollup_db, mocker):
 
     from app.rollup_management import _check_and_trigger_rollup
 
-    parent, child = await _make_respawn_scenario(
-        rollup_db, child_respawn_count=start
-    )
+    parent, child = await _make_respawn_scenario(rollup_db, child_respawn_count=start)
 
     await _check_and_trigger_rollup(child, rollup_db)
 

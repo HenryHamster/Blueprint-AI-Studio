@@ -14,7 +14,10 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 
 from app.database import get_session
-from app.shared_state import limiter
+from app.shared_state import (
+    derive_task_branch as _derive_task_branch,
+    limiter,
+)
 from app.models import (
     Task,
     TaskStatus,
@@ -1717,32 +1720,6 @@ async def request_changes(
 
 
 _FRESH_REVIEWER_COOLDOWN_SECS = 3600  # 1 hour
-
-# Maps a task's payload ``type`` to the branch prefix the agent uses when
-# deriving the work branch. Mirrors the agent's branchPrefix wiring
-# (agent/src/handlers/standard.ts: create/qa->task, refactor->refactor,
-# docs->docs, deps->deps; handlers/specialized.ts->migrate). Fix tasks reuse
-# an existing branch carried in the payload, so they never need this fallback.
-_TASK_TYPE_BRANCH_PREFIX = {
-    "create": "task",
-    "qa": "task",
-    "fix": "task",
-    "refactor": "refactor",
-    "docs": "docs",
-    "deps": "deps",
-    "migrate": "migrate",
-}
-
-
-def _derive_task_branch(task_id: uuid.UUID, task_type: str | None) -> str:
-    """Derive an agent work branch name from the task type.
-
-    Mirrors the agent's branch derivation (``blueprint/{prefix}-{8hex}``,
-    agent/src/index.ts and handlers/specialized.ts) where ``8hex`` is the
-    dashless task UUID prefix and ``prefix`` depends on the task type.
-    """
-    prefix = _TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
-    return f"blueprint/{prefix}-{str(task_id).replace('-', '')[:8]}"
 
 
 @router.post("/tasks/{task_id}/request-fresh-reviewer")

@@ -90,6 +90,11 @@ def build_ci_failure_fix_prompt(
         f"{check_runs_hint}"
         f"{failing_tests_block}\n"
         f"CI errors captured at spawn time:\n{ci_errors[:2000]}\n\n"
+        f"Diagnose before fixing. A 'new' test failure can be: (a) your diff regressed, "
+        f"(b) a sibling PR broke the test — mock-signature drift or fixture change, or (c) flake. "
+        f"Read the failing test first; confirm its mocks match the live signatures they patch. A "
+        f'TypeError like "got multiple values for argument" or "unexpected keyword" is the mock, '
+        f"not your code. Run the test on `{base_branch}` HEAD too — if it fails there, fix the test.\n\n"
         f"Focus: fix the build/lint/test errors — the code review is already approved, "
         f"don't re-architect unrelated code. If a failing test was already broken on `{base_branch}` "
         f"(unrelated to this PR's diff), repairing it is still in scope — fix it as part of "

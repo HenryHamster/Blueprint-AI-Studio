@@ -298,4 +298,63 @@ describe('handleMemo', () => {
 
     expect(runClaudeCode).toHaveBeenCalledTimes(1);
   });
+
+  // ── Codex JSONL path regression tests ────────────────────────────────────
+
+  it('succeeds when memo JSON in lastResultText exceeds 200 characters', async () => {
+    // Regression: Codex item.completed used to truncate item.text to 200 chars
+    // before storing in lastResultText, silently breaking long memo JSON objects.
+    const longMemoJson = JSON.stringify({
+      summary: 'A detailed summary describing the architectural decision around service coupling.',
+      reasoning: 'Extended reasoning that covers multiple aspects: (1) the current coupling between modules A and B creates a hidden dependency that makes isolated deploys impossible; (2) moving the shared state into a dedicated service resolves this; (3) the migration path is low-risk because the interface is already well-defined.',
+      citations: ['task:abc123', 'direction:def456', 'file:backend/app/shared_state.py'],
+      tags: ['coupling', 'architecture', 'migration'],
+    });
+    expect(longMemoJson.length).toBeGreaterThan(200);
+
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: longMemoJson,
+    });
+
+    await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBeUndefined();
+    expect(call.logs).toContain('architectural decision');
+  });
+
+  it('recovers memo JSON from a Codex item.completed JSONL envelope in allOutput', async () => {
+    // Regression: when allOutput contains raw Codex JSONL, the memo JSON is
+    // embedded as an escaped string inside item.text. The normal extractor
+    // cannot find it (escaped keys like \"summary\" trip the bracket matcher),
+    // so extractCodexAgentMessageText must parse the envelope and return item.text.
+    const fullMemoJson = JSON.stringify({
+      summary: 'Outcome analysis for direction d-3da640d2.',
+      reasoning: 'The direction was retired because the targeted refactor scope exceeded the available task budget. Evidence from three prior attempts shows consistent timeout at the 45-minute mark when the diff grows past 800 lines. Recommendation: decompose into smaller clusters before re-attempting.',
+      citations: ['direction:d-3da640d2', 'task:t-aabbccdd'],
+      tags: ['direction-retired', 'scope', 'decomposition'],
+    });
+
+    const codexJsonlLine = JSON.stringify({
+      type: 'item.completed',
+      item: { type: 'agent_message', text: fullMemoJson },
+    });
+
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      // lastResultText is truncated (simulating the pre-fix behaviour)
+      lastResultText: fullMemoJson.slice(0, 200),
+      allOutput: `[codex] turn.started\n${codexJsonlLine}\n[codex] turn.completed\n`,
+    });
+
+    await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBeUndefined();
+    expect(call.logs).toContain('direction-retired');
+  });
 });
