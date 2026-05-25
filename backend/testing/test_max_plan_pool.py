@@ -31,6 +31,7 @@ from app.max_plan_pool import (
     _daily_reset_if_elapsed,
     _max_plan_pools,
     _normalize_rl_model,
+    _pending_rl_persists,
     _prune_health_events,
     _serialize_disabled_model_info,
     cascade_disabled_models,
@@ -1174,6 +1175,25 @@ class TestQuarantineTrigger:
         with patch("app.max_plan_pool._persist_rate_limit_state"):
             await disable_account_model(acct_id, OPUS, kind="quota_exhausted")
         assert acct["disabled_models"][OPUS].get("kind") == "quota_exhausted"
+
+    async def test_disable_account_model_queues_retry_on_raw_persist_exception(self):
+        acct_id = "a"
+        acct = _acct(id=acct_id)
+        _account_by_id[acct_id] = acct
+        _pending_rl_persists.clear()
+
+        async def _raise_connection_error(*args, **kwargs):
+            raise ConnectionRefusedError("db offline")
+
+        with patch(
+            "app.max_plan_pool._persist_rate_limit_state",
+            side_effect=_raise_connection_error,
+        ):
+            await disable_account_model(acct_id, OPUS, kind="rate_limit")
+
+        assert OPUS in acct["disabled_models"]
+        assert acct_id in _pending_rl_persists
+        _pending_rl_persists.clear()
 
 
 # ── disable_account_for_auth (non-recoverable auth hard-disable) ──────────────

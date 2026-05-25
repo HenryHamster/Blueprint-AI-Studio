@@ -17,8 +17,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Mapping
 
-from sqlalchemy.exc import SQLAlchemyError
-
 from app.database import AsyncSessionLocal
 from app.models import LLMAuthMode, LLMProviderName
 from app.providers.base import merge_settings
@@ -1607,6 +1605,31 @@ async def _persist_rate_limit_state(acct_id: str) -> None:
         await rl_session.commit()
 
 
+def _queue_rate_limit_persist_retry(acct_id: str) -> None:
+    if acct_id not in _pending_rl_persists:
+        _pending_rl_persists.append(acct_id)
+
+
+async def _persist_rate_limit_state_best_effort(acct_id: str, reason: str) -> None:
+    """Persist cooldown state without breaking the caller's control flow.
+
+    Some failures surface as raw driver or transport exceptions before SQLAlchemy
+    wraps them. Rate-limit bookkeeping is already designed to retry DB persists
+    later, so treat any persistence exception as non-fatal and queue the account
+    for the next retry sweep.
+    """
+    try:
+        await _persist_rate_limit_state(acct_id)
+    except Exception as exc:
+        logger.warning(
+            "[POOL] Failed to persist %s for %s: %s — queued for retry",
+            reason,
+            acct_id,
+            exc,
+        )
+        _queue_rate_limit_persist_retry(acct_id)
+
+
 async def select_max_plan_account_balanced(
     user_id: str,
     provider_models: List[tuple[str, str | None]],
@@ -2171,14 +2194,7 @@ async def disable_account_model(
                 f"[POOL] Account {acct['name']} regression-quarantined on model {primary_key} "
                 f"(flat {_REGRESSION_COOLDOWN_SECONDS // 60}min reprobe cooldown)"
             )
-            try:
-                await _persist_rate_limit_state(acct_id)
-            except SQLAlchemyError as e:
-                logger.warning(
-                    f"[POOL] Failed to persist regression state for {acct_id}: {e} — queued for retry"
-                )
-                if acct_id not in _pending_rl_persists:
-                    _pending_rl_persists.append(acct_id)
+            await _persist_rate_limit_state_best_effort(acct_id, "regression state")
             return
         # Record rate-limit event for rolling health score + success-rate tracking
         _prune_health_events(acct, now)
@@ -2237,14 +2253,7 @@ async def disable_account_model(
                 f"high-confidence failures — {_QUARANTINE_COOLDOWN_SECONDS // 60}min recheck cooldown"
             )
 
-        try:
-            await _persist_rate_limit_state(acct_id)
-        except SQLAlchemyError as e:
-            logger.warning(
-                f"[POOL] Failed to persist rate-limit state for {acct_id}: {e} — queued for retry"
-            )
-            if acct_id not in _pending_rl_persists:
-                _pending_rl_persists.append(acct_id)
+        await _persist_rate_limit_state_best_effort(acct_id, "rate-limit state")
 
 
 async def disable_account_for_auth(acct_id: str, reason: str) -> bool:
@@ -2279,14 +2288,7 @@ async def disable_account_for_auth(acct_id: str, reason: str) -> bool:
         logger.warning(
             f"[POOL] Account {acct['name']} HARD-DISABLED (non-recoverable auth): {reason}"
         )
-        try:
-            await _persist_rate_limit_state(acct_id)
-        except SQLAlchemyError as e:
-            logger.warning(
-                f"[POOL] Failed to persist auth-disable for {acct_id}: {e} — queued for retry"
-            )
-            if acct_id not in _pending_rl_persists:
-                _pending_rl_persists.append(acct_id)
+        await _persist_rate_limit_state_best_effort(acct_id, "auth-disable")
         return True
 
 
@@ -2323,14 +2325,7 @@ async def clear_rate_limit_state_on_success(acct_id: str, model: str) -> bool:
         logger.info(
             f"[POOL] Account {acct['name']} cleared disabled models {cleared} after successful {model} task"
         )
-        try:
-            await _persist_rate_limit_state(acct_id)
-        except SQLAlchemyError as e:
-            logger.warning(
-                f"[POOL] Failed to persist rate-limit clear for {acct_id}: {e} — queued for retry"
-            )
-            if acct_id not in _pending_rl_persists:
-                _pending_rl_persists.append(acct_id)
+        await _persist_rate_limit_state_best_effort(acct_id, "rate-limit clear")
         return True
 
 
@@ -2374,14 +2369,7 @@ async def clear_account_model_regression(
         logger.info(
             f"[POOL] Account {acct['name']} cleared regression-quarantine on {model} (manual override)"
         )
-        try:
-            await _persist_rate_limit_state(acct_id)
-        except SQLAlchemyError as e:
-            logger.warning(
-                f"[POOL] Failed to persist regression clear for {acct_id}: {e} — queued for retry"
-            )
-            if acct_id not in _pending_rl_persists:
-                _pending_rl_persists.append(acct_id)
+        await _persist_rate_limit_state_best_effort(acct_id, "regression clear")
         return True
 
 
@@ -2425,14 +2413,7 @@ async def clear_regression_on_success(acct_id: str, model: str) -> dict | None:
         logger.info(
             f"[POOL] Account {acct['name']} auto-recovered regression on {model} after probe success"
         )
-        try:
-            await _persist_rate_limit_state(acct_id)
-        except SQLAlchemyError as e:
-            logger.warning(
-                f"[POOL] Failed to persist regression recovery for {acct_id}: {e} — queued for retry"
-            )
-            if acct_id not in _pending_rl_persists:
-                _pending_rl_persists.append(acct_id)
+        await _persist_rate_limit_state_best_effort(acct_id, "regression recovery")
         return recovery_info
 
 
