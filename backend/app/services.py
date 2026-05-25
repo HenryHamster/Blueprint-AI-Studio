@@ -260,20 +260,28 @@ _JWT_QUOTA_FLOOR = 10  # App-JWT (~60/hr bucket)
 
 # Branch naming conventions these prefixes emit:
 #   {namespace}/{task|fix|refactor|docs|deps|migrate}-{short_id}
-#   research/{short_id}
-#   plan/{short_id}
+#   research/{short_id}  (default staging prefix)
+#   plan/{short_id}      (default staging prefix)
 # short_id is the first 8 hex chars of the owning task's UUID (dashes stripped).
 # ``{namespace}`` is per-project (``project.task_branch_namespace``); the
 # Blueprint self-repo uses ``"blueprint"``, other installs ship their own.
-def _build_branch_short_id_re(namespace: str) -> re.Pattern:
+_DEFAULT_STAGING_PREFIXES: tuple[str, ...] = ("research/", "plan/")
+
+
+def _build_branch_short_id_re(
+    namespace: str,
+    staging_prefixes: tuple[str, ...] = _DEFAULT_STAGING_PREFIXES,
+) -> re.Pattern:
     """Compile the short-id extraction regex for a project's namespace.
 
-    The ``research/`` and ``plan/`` staging prefixes stay hardcoded — they
-    are not project-configurable (their values are inherited from the agent's
-    staging-branch convention, not from per-project build_config).
+    ``staging_prefixes`` controls which rollup-staging branch prefixes
+    (e.g. ``research/``, ``plan/``) are recognized alongside the task-branch
+    namespace.  Defaults to Blueprint's conventional pair; projects can
+    override via ``build_config.staging_branch_prefixes``.
     """
+    staging_alt = "|".join(re.escape(p) for p in staging_prefixes)
     return re.compile(
-        rf"^(?:{re.escape(namespace)}/(?:task|fix|refactor|docs|deps|migrate)-|research/|plan/)"
+        rf"^(?:{re.escape(namespace)}/(?:task|fix|refactor|docs|deps|migrate)-|{staging_alt})"
         r"([a-f0-9]{8})$"
     )
 
@@ -583,7 +591,14 @@ async def _run_stale_branch_cleanup():
 
             # Batch-load task metadata for every branch whose name matches our
             # known short_id shape. One SQL query replaces ~N GitHub calls.
-            project_branch_re = _build_branch_short_id_re(project_namespace)
+            project_staging_prefixes = tuple(
+                (project.build_config or {}).get(
+                    "staging_branch_prefixes", _DEFAULT_STAGING_PREFIXES
+                )
+            )
+            project_branch_re = _build_branch_short_id_re(
+                project_namespace, project_staging_prefixes
+            )
             branch_short_ids = {
                 sid
                 for b in branches

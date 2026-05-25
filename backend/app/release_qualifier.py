@@ -810,7 +810,7 @@ async def run_qualification(
     # 2. Snapshot the candidate SHA — integration branch HEAD.  Audit C3: this
     #    GitHub round-trip is done BEFORE taking the ReleaseVersion row lock so
     #    the lock is not held across external I/O.
-    integration_branch, promotion_target = _lts_branch_names()
+    integration_branch, promotion_target = _lts_branch_names(project)
     try:
         candidate_sha = await github.get_branch_sha(
             token, owner, repo, integration_branch
@@ -1150,7 +1150,8 @@ async def _spawn_qualifier_smoketest_task(
     keeps advancing while the task is queued (audit C4 contract — the payload
     field name is exactly ``candidate_sha``).
     """
-    integration_branch, _promotion_target = _lts_branch_names()
+    project = await session.get(Project, project_id)
+    integration_branch, _promotion_target = _lts_branch_names(project)
     payload: dict[str, Any] = {
         "type": "smoketest",
         "base_branch": integration_branch,
@@ -3309,7 +3310,7 @@ async def _reconcile_if_promotion_failed_landed(
 
             # Idempotency check — is the candidate already on main?
             if not await _candidate_already_on_main(
-                token, owner, repo, candidate_sha, version
+                token, owner, repo, candidate_sha, version, project=project
             ):
                 return False
 
@@ -3322,7 +3323,7 @@ async def _reconcile_if_promotion_failed_landed(
 
             # Resolve the real promotion-target HEAD SHA so promoted_sha points
             # at the merge commit, not the candidate (which may be a parent).
-            _integration_branch, promotion_target = _lts_branch_names()
+            _integration_branch, promotion_target = _lts_branch_names(project)
             promoted_sha: str | None = None
             try:
                 promoted_sha = await github.get_branch_sha(
@@ -3490,7 +3491,7 @@ async def _reconcile_if_pending_auto_merge_landed(
 
             # 1. Idempotency check — is the candidate already on main?
             if await _candidate_already_on_main(
-                token, owner, repo, candidate_sha, version
+                token, owner, repo, candidate_sha, version, project=project
             ):
                 logger.info(
                     "[RELEASE_QUALIFIER] reconcile pending_auto_merge: candidate "
@@ -3498,7 +3499,7 @@ async def _reconcile_if_pending_auto_merge_landed(
                     candidate_sha[:8],
                     version.version_number,
                 )
-                _integration_branch, promotion_target = _lts_branch_names()
+                _integration_branch, promotion_target = _lts_branch_names(project)
                 promoted_sha: str | None = None
                 try:
                     promoted_sha = await github.get_branch_sha(
@@ -3889,6 +3890,8 @@ async def _candidate_already_on_main(
     repo: str,
     candidate_sha: str,
     version: release_version.ReleaseVersion,
+    *,
+    project: Project | None = None,
 ) -> bool:
     """Return True iff ``candidate_sha`` is already reachable from ``main``.
 
@@ -3911,7 +3914,7 @@ async def _candidate_already_on_main(
     would skip a real merge.  A genuinely-already-merged candidate will be
     re-detected on the next retry once GitHub is reachable again.
     """
-    _integration_branch, promotion_target = _lts_branch_names()
+    _integration_branch, promotion_target = _lts_branch_names(project)
     try:
         ancestry = await github.is_ancestor_of(
             token,
@@ -3949,6 +3952,8 @@ async def _promotion_pr_landed(
     pr_number: int,
     candidate_sha: str,
     version: release_version.ReleaseVersion,
+    *,
+    project: Project | None = None,
 ) -> bool:
     """Return True iff promotion PR ``pr_number`` has in fact already merged.
 
@@ -4019,7 +4024,9 @@ async def _promotion_pr_landed(
     )
     if not candidate_sha:
         return False
-    return await _candidate_already_on_main(token, owner, repo, candidate_sha, version)
+    return await _candidate_already_on_main(
+        token, owner, repo, candidate_sha, version, project=project
+    )
 
 
 def _idempotent_pr_url(base_record: dict[str, Any] | None) -> str:
@@ -4306,7 +4313,7 @@ async def promote(
     # and do NOT record a failure.  This is a read-only GitHub call and now
     # runs unlocked (the intermediate commit above released the row lock).
     if candidate_sha and await _candidate_already_on_main(
-        token, owner, repo, candidate_sha, version
+        token, owner, repo, candidate_sha, version, project=project
     ):
         logger.info(
             "[RELEASE_QUALIFIER] promote: candidate %s for v%d is already "
@@ -4408,7 +4415,7 @@ async def promote(
         # idempotency check before recording a failure: if the candidate is
         # already on main, this is a successful prior promotion, not a failure.
         if candidate_sha and await _candidate_already_on_main(
-            token, owner, repo, candidate_sha, version
+            token, owner, repo, candidate_sha, version, project=project
         ):
             logger.info(
                 "[RELEASE_QUALIFIER] promote: PR creation failed for v%d but "
@@ -4532,7 +4539,7 @@ async def promote(
         # merge_blocked failure right after the merge.  It falls back to the
         # ancestry check only when the PR state is indeterminate.
         if await _promotion_pr_landed(
-            token, owner, repo, pr_number, candidate_sha, version
+            token, owner, repo, pr_number, candidate_sha, version, project=project
         ):
             logger.info(
                 "[RELEASE_QUALIFIER] promote: PR #%s for v%d returned "
@@ -4916,7 +4923,8 @@ async def _record_promotion_success(
     is non-fatal — it is wrapped in try/except and only logs a warning.  The
     merge already succeeded; the tag is cosmetic convenience.
     """
-    integration_branch, promotion_target = _lts_branch_names()
+    _record_project = await session.get(Project, version.project_id)
+    integration_branch, promotion_target = _lts_branch_names(_record_project)
     locked = await _relock_version_for_promotion_write(
         session, version, lock_released=lock_released
     )
@@ -4993,14 +5001,10 @@ async def _record_promotion_success(
     try:
         from app.problem_model import parse_problem_model
 
-        # _record_promotion_success has no `project` in scope — fetch it.  (Bug:
-        # the prior code referenced an undefined `project`, so the NameError was
-        # always swallowed here and every promotion opened v(N+1) with goal=None
-        # instead of snapshotting current_focus.)
-        _project = await session.get(Project, version.project_id)
-        if _project is not None:
+        if _record_project is not None:
             _next_goal = (
-                parse_problem_model(_project.problem_model).intent.current_focus or None
+                parse_problem_model(_record_project.problem_model).intent.current_focus
+                or None
             )
     except Exception:
         logger.exception(

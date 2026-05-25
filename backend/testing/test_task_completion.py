@@ -1,5 +1,5 @@
 """
-Unit tests for app/task_completion.py pure functions.
+Unit tests for app/task_completion.py and app/task_completion_investigation.py.
 
 Covers:
 - _parse_plan_output: JSON extraction from agent logs
@@ -8,6 +8,9 @@ Covers:
 - _log_file_overlaps: overlapping file detection
 - _compute_first_attempt_succeeded: attempt_count threshold and status check
 - _ensure_branch: retry/backoff, token refresh, exists-verification, terminal failure
+- _handle_investigation_terminal_failure / _maybe_spawn_reinvestigation_after_failure
+- _record_regression_signal_if_matching / _maybe_spawn_followup_investigation
+- _maybe_escalate_exhausted_followups
 """
 
 import asyncio
@@ -35,16 +38,10 @@ from app.task_completion import (
     _record_remediation_outcome,
     _record_remediation_if_terminal,
     _record_project_remediation_outcome,
-    _maybe_spawn_followup_investigation,
     _handle_investigation_completion,
-    _extract_partial_diagnosis,
-    _handle_investigation_terminal_failure,
-    _maybe_spawn_reinvestigation_after_failure,
     _is_structural_diagnosis,
     _clear_direction_diagnosis_flag,
     _calculate_remediation_scope,
-    _record_regression_signal_if_matching,
-    _maybe_escalate_exhausted_followups,
     _persist_direction_field_update,
     build_blueprint_pr_footer,
     build_blueprint_pr_merge_summary_comment,
@@ -52,6 +49,14 @@ from app.task_completion import (
     BLUEPRINT_PR_META_MARKER,
     BLUEPRINT_PR_MERGE_SUMMARY_MARKER,
     _synthesize_memo_from_source_finding,
+)
+from app.task_completion_investigation import (
+    _maybe_spawn_followup_investigation,
+    _extract_partial_diagnosis,
+    _handle_investigation_terminal_failure,
+    _maybe_spawn_reinvestigation_after_failure,
+    _record_regression_signal_if_matching,
+    _maybe_escalate_exhausted_followups,
 )
 from app.strategic_constants import STRATEGIC_RATIONALE_MAX
 from app.models import Alert, AlertSeverity, Project, Task, TaskStatus

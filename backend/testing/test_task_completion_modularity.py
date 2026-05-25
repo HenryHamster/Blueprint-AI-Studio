@@ -1,12 +1,14 @@
 """Modularity tripwire for ``app.task_completion``.
 
 ``task_completion`` is in the middle of a split — the self-audit completion
-section now lives in ``task_completion_self_audit``. The facade re-exports
-each moved symbol so existing ``from app.task_completion import X`` callers
-keep working, but nothing in the suite has been preventing a future PR from
-re-introducing one of those symbols as a brand-new definition inside
-``task_completion.py`` — which would silently re-grow the monolith and
-shadow the canonical implementation in the sibling module.
+section now lives in ``task_completion_self_audit`` and the follow-up /
+investigation subsystem now lives in ``task_completion_investigation``. The
+facade re-exports each moved symbol so existing ``from app.task_completion
+import X`` callers keep working, but nothing in the suite has been
+preventing a future PR from re-introducing one of those symbols as a
+brand-new definition inside ``task_completion.py`` — which would silently
+re-grow the monolith and shadow the canonical implementation in the sibling
+module.
 
 This tripwire enforces two halves of the facade contract for each
 EXTRACTED_SYMBOLS entry:
@@ -45,6 +47,25 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "_maybe_auto_clear_direction_mode",
         "_normalize_self_audit_finding",
         "_parse_self_audit_findings",
+    ),
+    "app.task_completion_investigation": (
+        "_DIAGNOSIS_FLAGS_CLEARED_KEYS",
+        "_FOLLOWUP_INVESTIGATION_CAP_PER_FINGERPRINT",
+        "_FOLLOWUP_INVESTIGATION_DECAY_DAYS",
+        "_REMEDIATION_HISTORY_MAX",
+        "_active_followup_timestamps",
+        "_append_followup_dedup_note",
+        "_extract_partial_diagnosis",
+        "_find_sibling_fingerprint_investigation",
+        "_followup_history_all_failed",
+        "_handle_investigation_terminal_failure",
+        "_maybe_escalate_exhausted_followups",
+        "_maybe_spawn_followup_investigation",
+        "_maybe_spawn_low_confidence_followup",
+        "_maybe_spawn_reinvestigation_after_failure",
+        "_project_active_followup_count",
+        "_recent_followup_investigation_exists",
+        "_record_regression_signal_if_matching",
     ),
 }
 

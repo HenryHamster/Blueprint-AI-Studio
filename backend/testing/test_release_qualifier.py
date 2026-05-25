@@ -9711,3 +9711,257 @@ async def test_pending_auto_merge_pr_ci_pending_not_reconciled(db_session, mocke
     assert version.status == "open"
     assert version.last_qualification["status"] == "pending"
     assert "promotion_pending" in version.last_qualification
+
+
+# ===========================================================================
+# Per-project branch resolution — _lts_branch_names must use project columns
+# ===========================================================================
+
+
+async def _make_project_and_version_custom_branches(
+    db_session,
+    *,
+    integration_branch: str,
+    promotion_target: str,
+    phase: str = "stabilize",
+):
+    """Create a project with non-default branch columns and an open version."""
+    project = Project(
+        name="custom-branch-project",
+        user_id="cb-user",
+        github_owner="acme",
+        github_repo="custom",
+        integration_branch=integration_branch,
+        promotion_target=promotion_target,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    from app import release_version as _rv
+
+    version = await _rv.open_version(db_session, project.id, version_number=1)
+    if phase != "build":
+        _rv.set_version_phase(version, phase, reasoning="test setup")
+        db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return project, version
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_uses_project_integration_branch(db_session, mocker):
+    """run_qualification must snapshot the candidate SHA from the project's
+    configured integration_branch, not the global runtime_config default.
+
+    A project with integration_branch='trunk' should call github.get_branch_sha
+    with 'trunk', never with 'main' (the global default).
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+
+    project, version = await _make_project_and_version_custom_branches(
+        db_session,
+        integration_branch="trunk",
+        promotion_target="release",
+        phase="stabilize",
+    )
+
+    candidate = "trunk1ca" * 5  # 40-char placeholder SHA
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+
+    branch_sha_calls: list[str] = []
+
+    async def _branch_sha(token, owner, repo, branch, **kwargs):
+        branch_sha_calls.append(branch)
+        return candidate
+
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(side_effect=_branch_sha))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    assert result["candidate_sha"] == candidate
+
+    # The integration_branch snapshot call must use 'trunk', not 'main'.
+    assert "trunk" in branch_sha_calls, (
+        f"Expected get_branch_sha call for 'trunk' but got calls: {branch_sha_calls}"
+    )
+    assert "main" not in branch_sha_calls, (
+        "Got unexpected call for 'main' — should use per-project integration_branch"
+    )
+
+
+@pytest.mark.asyncio
+async def test_smoketest_payload_uses_project_integration_branch(db_session, mocker):
+    """The qualifier-smoketest payload's base_branch must equal the project's
+    configured integration_branch, not the global runtime_config default.
+
+    A project with integration_branch='trunk' should produce a smoketest task
+    whose payload.base_branch == 'trunk'.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = True
+
+    project, version = await _make_project_and_version_custom_branches(
+        db_session,
+        integration_branch="trunk",
+        promotion_target="release",
+        phase="stabilize",
+    )
+
+    candidate = "smktrunk" * 5  # 40-char SHA
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    assert result["smoketest_enabled"] is True
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    by_type = {(t.first_payload or {}).get("type"): t for t in tasks}
+    smoke_task = by_type.get("smoketest")
+    assert smoke_task is not None, "Smoketest task was not spawned"
+
+    # base_branch must be the per-project integration_branch, not 'main'.
+    assert smoke_task.first_payload["base_branch"] == "trunk", (
+        f"Expected base_branch='trunk' but got {smoke_task.first_payload['base_branch']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_candidate_already_on_main_uses_project_promotion_target(
+    db_session, mocker
+):
+    """_candidate_already_on_main must check ancestry against the project's
+    configured promotion_target, not the global runtime_config default.
+
+    A project with promotion_target='release' should call github.is_ancestor_of
+    with 'release' as the descendant branch, not 'main'.
+    """
+    project, version = await _make_project_and_version_custom_branches(
+        db_session,
+        integration_branch="trunk",
+        promotion_target="release",
+        phase="build",
+    )
+
+    candidate = "chkancst" * 5  # 40-char SHA
+
+    ancestor_calls: list[str] = []
+
+    async def _is_ancestor(token, owner, repo, sha, branch, **kwargs):
+        ancestor_calls.append(branch)
+        return True
+
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(side_effect=_is_ancestor))
+
+    result = await rq._candidate_already_on_main(
+        "gh-token",
+        "acme",
+        "custom",
+        candidate,
+        version,
+        project=project,
+    )
+
+    assert result is True
+    assert ancestor_calls == ["release"], (
+        f"Expected is_ancestor_of called with 'release' but got: {ancestor_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_promotion_failed_uses_project_promotion_target(
+    db_session, mocker
+):
+    """When a promotion_failed version is reconciled (candidate landed on main
+    out-of-band), promoted_sha is resolved from the project's promotion_target
+    branch, not the global runtime_config default.
+
+    A project with promotion_target='release' should call get_branch_sha with
+    'release' to resolve the promoted merge commit SHA.
+    """
+    project, version = await _make_project_and_version_custom_branches(
+        db_session,
+        integration_branch="trunk",
+        promotion_target="release",
+        phase="build",
+    )
+
+    candidate_sha = "rcnclfld" * 5  # 40 chars
+    release_head_sha = "rlsehead" * 5  # 40 chars
+
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": candidate_sha,
+        "error": "merge_blocked",
+        "confidence": 0.9,
+        "sub_scores": {},
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    # Candidate is now on the promotion_target branch (operator merged it).
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+
+    branch_sha_calls: list[str] = []
+
+    async def _branch_sha(token, owner, repo, branch, **kwargs):
+        branch_sha_calls.append(branch)
+        return release_head_sha
+
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(side_effect=_branch_sha))
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value=None))
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 1
+
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.promoted_sha == release_head_sha
+
+    # promoted_sha must be resolved from the per-project promotion_target.
+    assert "release" in branch_sha_calls, (
+        f"Expected get_branch_sha call for 'release' but got: {branch_sha_calls}"
+    )
+    assert "main" not in branch_sha_calls, (
+        "Got unexpected 'main' branch call — should use per-project promotion_target"
+    )
