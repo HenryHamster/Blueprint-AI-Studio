@@ -621,20 +621,37 @@ def _account_was_rate_limited(task: "Task", at_time: "datetime | None" = None) -
         return False
 
 
-def _pool_was_rate_limited(at_time: "datetime | None" = None) -> bool:
-    """Return True if the entire account pool was in rate-limit cooldown.
+def _pool_was_rate_limited(
+    task: "Task | None" = None, at_time: "datetime | None" = None
+) -> bool:
+    """Return True if the eligible account pool was in rate-limit cooldown.
 
-    Complements _account_was_rate_limited for the pre-assignment case (task died
-    before an account was assigned) and the healthy-account-but-blocked-pool case.
+    Scopes the check to the candidate set the task could actually dispatch to:
+    - providers: the task's routed provider (when resolvable from context)
+    - model: the task's routed model (when stored in context)
+    - user_id: the user who owns the task's assigned account (when assigned)
+
+    Prevents accounts for unrelated users or providers from changing the verdict.
+    Falls back to the global pool when task is None or context is missing.
     Never raises — returns False with a debug log on any error.
     """
     try:
-        from app.max_plan_pool import pool_wide_rate_limit_cooldown
+        from app.max_plan_pool import (
+            get_task_rate_limit_scope,
+            pool_wide_rate_limit_cooldown,
+        )
 
         norm_time = at_time
         if norm_time is not None and getattr(norm_time, "tzinfo", None) is not None:
             norm_time = norm_time.replace(tzinfo=None)
-        result = pool_wide_rate_limit_cooldown(at_time=norm_time)
+        scope = get_task_rate_limit_scope(task) if task is not None else {}
+
+        result = pool_wide_rate_limit_cooldown(
+            at_time=norm_time,
+            providers=scope.get("providers"),
+            model=scope.get("model"),
+            user_id=scope.get("user_id"),
+        )
         if not result:
             logger.debug(
                 "[FAILURE_CLASS] pool_wide_rate_limit_cooldown: pool not fully blocked"
@@ -796,7 +813,7 @@ def normalize_agent_failure_category(
             and (
                 db_rl_override
                 or _account_was_rate_limited(task, at_time=at_time)
-                or _pool_was_rate_limited(at_time=at_time)
+                or _pool_was_rate_limited(task, at_time=at_time)
             )
         ):
             _persist_correlation_reclassification_context(task)
@@ -1699,7 +1716,7 @@ def _classify_failure_class(
                 if agent_lower in _ALL_GENERIC_CODE_ERROR_LABELS and (
                     db_rl_override
                     or _account_was_rate_limited(task, at_time=at_time)
-                    or _pool_was_rate_limited(at_time)
+                    or _pool_was_rate_limited(task, at_time=at_time)
                 ):
                     _persist_correlation_reclassification_context(task)
                     return RATE_LIMIT
@@ -1724,7 +1741,7 @@ def _classify_failure_class(
         if (
             db_rl_override
             or _account_was_rate_limited(task, at_time=at_time)
-            or _pool_was_rate_limited(at_time)
+            or _pool_was_rate_limited(task, at_time=at_time)
         ):
             _persist_correlation_reclassification_context(task)
             return RATE_LIMIT
@@ -1996,7 +2013,7 @@ def _classify_failure_class(
     if (
         db_rl_override
         or _account_was_rate_limited(task, at_time=at_time)
-        or _pool_was_rate_limited(at_time)
+        or _pool_was_rate_limited(task, at_time=at_time)
     ):
         _persist_correlation_reclassification_context(task)
         return RATE_LIMIT

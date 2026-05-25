@@ -2451,7 +2451,7 @@ class TestPoolWideRateLimitCorrelation:
         import app.max_plan_pool as pool_mod
 
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: True
         )
         task = _task("", ctx={"failure_category": "incomplete"})
         assert classify_failure(task) == RATE_LIMIT
@@ -2467,7 +2467,7 @@ class TestPoolWideRateLimitCorrelation:
             {account_id: {"enabled": True, "disabled_models": {}}},
         )
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: True
         )
         task = _task(
             "", ctx={"failure_category": "incomplete", "llm_account_id": account_id}
@@ -2479,7 +2479,7 @@ class TestPoolWideRateLimitCorrelation:
         import app.max_plan_pool as pool_mod
 
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
         task = _task("", ctx={"failure_category": "incomplete"})
         assert classify_failure(task) == CODE_ERROR
@@ -2489,7 +2489,7 @@ class TestPoolWideRateLimitCorrelation:
         import app.max_plan_pool as pool_mod
 
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: True
         )
         task = _task("", ctx={"failure_category": "test_failed"})
         assert classify_failure(task) == CODE_ERROR
@@ -2502,9 +2502,92 @@ class TestPoolWideRateLimitCorrelation:
         import app.max_plan_pool as pool_mod
 
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: True
         )
-        assert _pool_was_rate_limited(at_time=datetime.now(tz=timezone.utc)) is True
+        assert (
+            _pool_was_rate_limited(None, at_time=datetime.now(tz=timezone.utc)) is True
+        )
+
+    def test_pool_check_scoped_to_task_provider(self, monkeypatch):
+        """Pool check passes task provider so unrelated-provider accounts are excluded."""
+        import app.max_plan_pool as pool_mod
+        from app.failure_classification import _pool_was_rate_limited
+
+        captured = {}
+
+        def fake_pool_check(at_time=None, **kwargs):
+            captured.update(kwargs)
+            return False
+
+        monkeypatch.setattr(pool_mod, "pool_wide_rate_limit_cooldown", fake_pool_check)
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        task = _task("", ctx={"llm_provider": "anthropic"})
+        _pool_was_rate_limited(task)
+        assert captured.get("providers") == ["anthropic"]
+
+    def test_pool_check_scoped_to_task_model(self, monkeypatch):
+        """Pool check passes task model so model-specific cooldown is evaluated."""
+        import app.max_plan_pool as pool_mod
+        from app.failure_classification import _pool_was_rate_limited
+
+        captured = {}
+
+        def fake_pool_check(at_time=None, **kwargs):
+            captured.update(kwargs)
+            return False
+
+        monkeypatch.setattr(pool_mod, "pool_wide_rate_limit_cooldown", fake_pool_check)
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        task = _task("", ctx={"llm_model": "claude-sonnet-4-5"})
+        _pool_was_rate_limited(task)
+        assert captured.get("model") == "claude-sonnet-4-5"
+
+    def test_mixed_provider_pool_unrelated_exhaustion_no_verdict_change(
+        self, monkeypatch
+    ):
+        """Openai-provider exhaustion must not flip anthropic-only task to RATE_LIMIT."""
+        import app.max_plan_pool as pool_mod
+
+        def scoped_pool_check(at_time=None, *, providers=None, **_):
+            # Only openai is exhausted; anthropic task should not see True.
+            if providers == ["anthropic"]:
+                return False
+            return True  # openai pool is exhausted
+
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", scoped_pool_check
+        )
+        monkeypatch.setattr(pool_mod, "_account_by_id", {})
+        task = _task(
+            "", ctx={"failure_category": "incomplete", "llm_provider": "anthropic"}
+        )
+        assert classify_failure(task) == CODE_ERROR
+
+    def test_mixed_user_pool_unrelated_exhaustion_no_verdict_change(self, monkeypatch):
+        """Another user's fully-exhausted pool must not flip this task to RATE_LIMIT."""
+        import app.max_plan_pool as pool_mod
+
+        account_id = "acct-user-a"
+        monkeypatch.setattr(
+            pool_mod,
+            "_account_by_id",
+            {account_id: {"user_id": "user-a", "disabled_models": {}}},
+        )
+
+        def scoped_pool_check(at_time=None, *, user_id=None, **_):
+            # user-b is exhausted; user-a (task's owner) is not.
+            if user_id == "user-a":
+                return False
+            return True  # user-b pool exhausted
+
+        monkeypatch.setattr(
+            pool_mod, "pool_wide_rate_limit_cooldown", scoped_pool_check
+        )
+        task = _task(
+            "",
+            ctx={"failure_category": "incomplete", "llm_account_id": account_id},
+        )
+        assert classify_failure(task) == CODE_ERROR
 
 
 class TestAtTimeFailureInstantCorrelation:
@@ -2560,7 +2643,7 @@ class TestAtTimeFailureInstantCorrelation:
         # Pool-wide check must be disabled so only the account-level at_time
         # correlation drives the result — isolates the variable under test.
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
 
         task = _task(
@@ -2613,7 +2696,7 @@ class TestAtTimeFailureInstantCorrelation:
         # Pool-wide check must be disabled so only the account-level at_time
         # correlation drives the result — isolates the variable under test.
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
 
         # Simulate agent_status code path: task with last_heartbeat set
@@ -2676,7 +2759,7 @@ class TestAtTimeFailureInstantCorrelation:
         )
         # Isolate the account-level at_time correlation from the pool-wide check.
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
 
         failure_time = datetime.utcnow() - timedelta(minutes=5)
@@ -2706,7 +2789,7 @@ class TestDbRlOverrideCorrelation:
         # In-memory pool is empty for this account (different instance never saw RL).
         monkeypatch.setattr(pool_mod, "_account_by_id", {})
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
 
         task = _task("", ctx={"llm_account_id": "acct-cross-instance"})
@@ -2721,7 +2804,7 @@ class TestDbRlOverrideCorrelation:
 
         monkeypatch.setattr(pool_mod, "_account_by_id", {})
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
 
         task = _task("", ctx={"llm_account_id": "acct-no-rl"})
@@ -2736,7 +2819,7 @@ class TestDbRlOverrideCorrelation:
 
         monkeypatch.setattr(pool_mod, "_account_by_id", {})
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
 
         task = _task("", ctx={"llm_account_id": "acct-test-fail"})
@@ -2754,7 +2837,7 @@ class TestDbRlOverrideCorrelation:
 
         monkeypatch.setattr(pool_mod, "_account_by_id", {})
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
 
         task = _task("", ctx={"llm_account_id": "acct-marker"})
@@ -2796,7 +2879,7 @@ class TestParseFailedCorrelation:
 
         monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
 
         task = _task("", ctx={"llm_account_id": account_id})
@@ -2812,7 +2895,7 @@ class TestParseFailedCorrelation:
 
         monkeypatch.setattr(pool_mod, "_account_by_id", fake_pool)
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
 
         task = _task("", ctx={"llm_account_id": account_id})
@@ -2832,7 +2915,7 @@ class TestParseFailedCorrelation:
         # the sole reclassification mechanism.
         monkeypatch.setattr(pool_mod, "_account_by_id", {})
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
 
         weekly_limit_msg = (
@@ -2847,7 +2930,7 @@ class TestParseFailedCorrelation:
         import app.max_plan_pool as pool_mod
 
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: True
         )
 
         task = _task("", ctx={"failure_category": "parse_failed"})
@@ -2877,7 +2960,7 @@ class TestCorrelationReclassificationMarker:
         import app.max_plan_pool as pool_mod
 
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: True
         )
 
         for label in ("incomplete", "fatal"):
@@ -2898,7 +2981,7 @@ class TestCorrelationReclassificationMarker:
         import app.max_plan_pool as pool_mod
 
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: True
         )
 
         msg = "Fatal error: Quota exceeded for quota metric 'GenerateRequests'. Please retry in 39.8s."
@@ -2930,7 +3013,7 @@ class TestPersistAuthoritativeVerdictShortCircuit:
         # Simulate post-cooldown state: no accounts rate-limited, pool healthy.
         monkeypatch.setattr(pool_mod, "_account_by_id", {})
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
 
         # Task with a generic failure label that would default to CODE_ERROR
@@ -3001,7 +3084,7 @@ class TestPersistAuthoritativeVerdictShortCircuit:
         import app.max_plan_pool as pool_mod
 
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: True
         )
         task = _task("", ctx={"failure_category": "incomplete"})
         # No persist_authoritative_verdict call — re-derives from pool state.
@@ -3020,7 +3103,7 @@ class TestReaperDbRlOverrideClassifyFailure:
 
         monkeypatch.setattr(pool_mod, "_account_by_id", {})
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
 
         task = _task("", ctx={"failure_category": "claude_code_failed"})
@@ -3033,7 +3116,7 @@ class TestReaperDbRlOverrideClassifyFailure:
 
         monkeypatch.setattr(pool_mod, "_account_by_id", {})
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
 
         task = _task("", ctx={"failure_category": "incomplete"})
@@ -3047,7 +3130,7 @@ class TestReaperDbRlOverrideClassifyFailure:
 
         monkeypatch.setattr(pool_mod, "_account_by_id", {})
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
 
         task = _task("", ctx={"failure_category": "claude_code_failed"})
@@ -3072,7 +3155,7 @@ class TestReaperDbRlOverrideClassifyFailure:
 
         monkeypatch.setattr(pool_mod, "_account_by_id", {})
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
 
         task = _task("", ctx={"failure_category": "test_failed"})
@@ -3093,7 +3176,7 @@ class TestSilentDeathPoolWideCoverage:
 
         monkeypatch.setattr(pool_mod, "_account_by_id", {})
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: True
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: True
         )
         # No failure_category, no account id, empty status message — pure silent death.
         task = _task("", ctx={})
@@ -3106,7 +3189,7 @@ class TestSilentDeathPoolWideCoverage:
 
         monkeypatch.setattr(pool_mod, "_account_by_id", {})
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
         task = _task("", ctx={})
         assert classify_failure(task) == AGENT_TIMEOUT
@@ -3117,7 +3200,7 @@ class TestSilentDeathPoolWideCoverage:
 
         monkeypatch.setattr(pool_mod, "_account_by_id", {})
         monkeypatch.setattr(
-            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None: False
+            pool_mod, "pool_wide_rate_limit_cooldown", lambda at_time=None, **_: False
         )
         task = _task("", ctx={})
         assert classify_failure(task, db_rl_override=True) == RATE_LIMIT

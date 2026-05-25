@@ -11910,6 +11910,71 @@ async def test_generic_failure_with_healthy_account_burns_retry(
 
 
 @pytest.mark.asyncio
+async def test_generic_accountless_failure_uses_scoped_db_pool_rl_check(
+    client: AsyncClient, db_session, mocker
+):
+    """Accountless DB RL correlation must preserve provider/model scope.
+
+    Without the scoped arguments, an unrelated user's or provider's exhausted
+    pool can flip this task into RATE_LIMIT. The durable DB fallback in
+    agent_status.py must pass through the task's routed provider/model when
+    no account ID is present.
+    """
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    pool_wide_mock = mocker.patch(
+        "app.routers.agent_status.db_pool_wide_rate_limit_cooldown",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    project = Project(
+        name="Scoped DB Pool RL Test", user_id="test-user-scoped-db-pool-001"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test task"}],
+        vm_instance_id="agent-vm-scoped-db-pool-001",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "llm_provider": "anthropic",
+            "llm_model": "claude-sonnet-4-6",
+        },
+        attempt_count=0,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id_str = str(task.id)
+
+    token = create_agent_token(task_id_str, "agent-vm-scoped-db-pool-001")
+    payload = {
+        "task_id": task_id_str,
+        "status": "FAILED",
+        "failure_category": "incomplete",
+        "logs": "Process exited with code 1",
+    }
+    resp = await client.post(
+        "/api/agent/status", json=payload, headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempt_count == 0
+    pool_wide_mock.assert_awaited_once_with(
+        at_time=task.started_at,
+        providers=["anthropic"],
+        model="claude-sonnet-4-6",
+        user_id=None,
+    )
+
+
+@pytest.mark.asyncio
 async def test_requeue_parent_task_uses_vm_stopped_at_for_rate_limit_correlation(
     db_session, mocker
 ):

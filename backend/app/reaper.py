@@ -734,6 +734,7 @@ async def reaper_service():
         db_pool_wide_rate_limit_cooldown,
         disable_account_model,
         get_task_llm_account_id,
+        get_task_rate_limit_scope,
         _extract_task_model,
         release_max_plan_account,
     )
@@ -1445,6 +1446,7 @@ async def reaper_service():
                             _at_time_rl = (
                                 fresh_task.last_heartbeat or fresh_task.started_at
                             )
+                            _db_rl_scope = get_task_rate_limit_scope(fresh_task)
                             if _db_rl_acct:
                                 if await db_account_was_rate_limited(
                                     _db_rl_acct, at_time=_at_time_rl
@@ -1457,7 +1459,10 @@ async def reaper_service():
                                         _db_rl_acct,
                                     )
                             elif await db_pool_wide_rate_limit_cooldown(
-                                at_time=_at_time_rl
+                                at_time=_at_time_rl,
+                                providers=_db_rl_scope.get("providers"),
+                                model=_db_rl_scope.get("model"),
+                                user_id=_db_rl_scope.get("user_id"),
                             ):
                                 is_rate_limited = True
                                 logger.info(

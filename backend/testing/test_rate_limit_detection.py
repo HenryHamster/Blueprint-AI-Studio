@@ -577,7 +577,8 @@ def test_normalize_agent_category_parse_failed_with_rate_limit_is_rate_limit(
         lambda task, at_time=None: True,
     )
     monkeypatch.setattr(
-        "app.failure_classification._pool_was_rate_limited", lambda at_time=None: False
+        "app.failure_classification._pool_was_rate_limited",
+        lambda task=None, at_time=None: False,
     )
     t = _task("")
     assert normalize_agent_failure_category("parse_failed", t) == "RATE_LIMIT"
@@ -593,7 +594,8 @@ def test_normalize_agent_category_parse_failed_without_rate_limit_is_code_error(
         lambda task, at_time=None: False,
     )
     monkeypatch.setattr(
-        "app.failure_classification._pool_was_rate_limited", lambda at_time=None: False
+        "app.failure_classification._pool_was_rate_limited",
+        lambda task=None, at_time=None: False,
     )
     t = _task("")
     assert normalize_agent_failure_category("parse_failed", t) == "CODE_ERROR"

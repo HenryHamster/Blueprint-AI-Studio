@@ -29,6 +29,7 @@ backend/.testmondata
 /strategic
 /suggest
 /blocked
+/gh-token
 /check
 /pr
 /done

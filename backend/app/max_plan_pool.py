@@ -17,8 +17,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Mapping
 
-from sqlalchemy.exc import SQLAlchemyError
-
 from app.database import AsyncSessionLocal
 from app.models import LLMAuthMode, LLMProviderName
 from app.providers.base import merge_settings
@@ -85,6 +83,36 @@ def get_task_llm_auth_mode(task_or_ctx: Any) -> str | None:
     if isinstance(raw, str) and raw.strip():
         return raw.strip()
     return None
+
+
+def get_task_llm_model(task_or_ctx: Any) -> str | None:
+    ctx = _task_context(task_or_ctx)
+    raw = ctx.get("llm_model")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def get_task_rate_limit_scope(task_or_ctx: Any) -> dict[str, Any]:
+    """Return the candidate-pool scope for rate-limit correlation."""
+    providers: list[str] | None = None
+    provider = get_task_llm_provider(task_or_ctx)
+    if provider:
+        providers = [provider]
+
+    user_id: str | None = None
+    account_id = get_task_llm_account_id(task_or_ctx)
+    if account_id:
+        acct = _account_by_id.get(str(account_id))
+        raw_user_id = acct.get("user_id") if acct else None
+        if isinstance(raw_user_id, str) and raw_user_id.strip():
+            user_id = raw_user_id.strip()
+
+    return {
+        "providers": providers,
+        "model": get_task_llm_model(task_or_ctx),
+        "user_id": user_id,
+    }
 
 
 def clear_task_llm_runtime_context(context: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -1248,24 +1276,51 @@ def account_in_rate_limit_cooldown(account_id: str | None) -> bool:
     return False
 
 
-def pool_wide_rate_limit_cooldown(at_time: datetime | None = None) -> bool:
-    """Return True if every account in the pool is in rate-limit cooldown.
+def pool_wide_rate_limit_cooldown(
+    at_time: datetime | None = None,
+    *,
+    user_id: str | None = None,
+    providers: list[str] | None = None,
+    model: str | None = None,
+) -> bool:
+    """Return True if every eligible account is in rate-limit cooldown.
 
-    Fires when NO account is healthy or probing and at least one account has an
-    active rate-limit entry. Returns False when the pool is empty (no accounts
-    configured) or when any account is healthy/probing. Safe to call from
-    synchronous contexts — individual dict reads are atomic in CPython.
+    Scoped to the candidate set the task could actually dispatch to:
+    - user_id: only that user's pool (omit → global pool, backward-compatible)
+    - providers: only accounts on those providers
+    - model: use model-specific state check; omitting falls back to the
+      conservative model=None path (any disabled entry → unavailable)
+
+    Returns False when the eligible pool is empty or any account is healthy/probing.
+    Safe to call from synchronous contexts — individual dict reads are atomic in CPython.
     """
-    accts = _all_accounts()
+    accts: list[dict] = _max_plan_pools.get(user_id, []) if user_id else _all_accounts()
+    if providers:
+        norm_providers = {
+            _normalize_provider_name(p) or LLMProviderName.ANTHROPIC.value
+            for p in providers
+        }
+        accts = [
+            a
+            for a in accts
+            if (
+                _normalize_provider_name(a.get("provider"))
+                or LLMProviderName.ANTHROPIC.value
+            )
+            in norm_providers
+        ]
     if not accts:
         return False
     now = at_time if at_time is not None else _utcnow()
     for acct in accts:
-        if _account_state_for_model(acct, None, now=now) in ("healthy", "probing"):
+        if _account_state_for_model(acct, model, now=now) in ("healthy", "probing"):
             return False
     # All accounts unavailable — confirm at least one has an active rate-limit entry.
+    norm_model = _normalize_rl_model(model) if model else None
     for acct in accts:
-        for info in (acct.get("disabled_models") or {}).values():
+        dm = acct.get("disabled_models") or {}
+        infos = [dm[norm_model]] if (norm_model and norm_model in dm) else dm.values()
+        for info in infos:
             at_dt = info.get("at")
             if at_dt is not None and (
                 now - at_dt
@@ -1333,26 +1388,34 @@ def _db_account_runtime_ready(acct: Any) -> bool:
         return False
 
 
-async def db_pool_wide_rate_limit_cooldown(at_time: datetime | None = None) -> bool:
-    """Return True if the pool is rate-limit blocked per DB state.
+async def db_pool_wide_rate_limit_cooldown(
+    at_time: datetime | None = None,
+    *,
+    user_id: str | None = None,
+    providers: list[str] | None = None,
+    model: str | None = None,
+) -> bool:
+    """Return True if the eligible pool is rate-limit blocked per DB state.
 
     DB-backed cross-instance equivalent of pool_wide_rate_limit_cooldown. Use as a
     fallback when the in-memory pool may not reflect the current state — e.g., when
     a different Cloud Run instance recorded the cooldown, or when no account was
     assigned to the failed task (accountless death) so per-account checks are skipped.
 
-    Mirrors the in-memory classifier's semantics rather than requiring every account
-    to be in cooldown. An enabled account is "potentially usable" iff it has runtime
-    credentials AND has no rate-limit entries in its persisted state — matching the
-    in-memory _account_state_for_model(model=None) path, which conservatively treats
-    any disabled_models entry as unavailable at model=None. The pool is classified as
-    rate-limit blocked iff no enabled account is potentially usable AND at least one
-    enabled account is in active rate-limit cooldown. This correctly handles the
-    mixed-state pool (e.g., one account rate-limited, another missing credentials):
-    if the only thing blocking the pool from being usable IS the cooldown, classify
+    Scoped to the candidate set the task could actually dispatch to:
+    - user_id: filter to that user's accounts
+    - providers: filter to accounts on those providers
+    - model: when set, "potentially usable" means credentials present AND the
+      specific model has no active cooldown (vs. the conservative no-disabled-models
+      check used when model is omitted)
+
+    The pool is classified as rate-limit blocked iff no eligible account is potentially
+    usable AND at least one eligible account is in active rate-limit cooldown. This
+    correctly handles the mixed-state pool (e.g., one account rate-limited, another
+    missing credentials): if the only thing blocking the pool IS the cooldown, classify
     the failure as RATE_LIMIT rather than burning retry budget as AGENT_TIMEOUT.
 
-    Returns False on any DB/parse error or when the pool has no enabled accounts.
+    Returns False on any DB/parse error or when the eligible pool has no accounts.
     Never raises.
     """
     try:
@@ -1360,21 +1423,52 @@ async def db_pool_wide_rate_limit_cooldown(at_time: datetime | None = None) -> b
         from app.models import MaxPlanAccount
 
         async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                sql_select(MaxPlanAccount).where(MaxPlanAccount.enabled == True)  # noqa: E712
-            )
+            stmt = sql_select(MaxPlanAccount).where(MaxPlanAccount.enabled == True)  # noqa: E712
+            if user_id is not None:
+                stmt = stmt.where(MaxPlanAccount.user_id == user_id)
+            result = await session.execute(stmt)
             accounts = result.scalars().all()
 
         if not accounts:
             return False
 
+        # Optional provider filter (post-query — provider is an enum, easier to
+        # normalise in Python than in SQL for the multi-provider case).
+        if providers:
+            norm_providers = {
+                _normalize_provider_name(p) or LLMProviderName.ANTHROPIC.value
+                for p in providers
+            }
+            accounts = [
+                a
+                for a in accounts
+                if (
+                    _normalize_provider_name(a.provider)
+                    or LLMProviderName.ANTHROPIC.value
+                )
+                in norm_providers
+            ]
+        if not accounts:
+            return False
+
+        norm_model = _normalize_rl_model(model) if model else None
         any_in_cooldown = False
         for acct in accounts:
             disabled_models = (acct.rate_limit_state or {}).get("disabled_models") or {}
-            # Potentially-usable mirror of in-memory model=None path: must have
-            # credentials AND no rate-limit entries at all (expired or not).
-            if _db_account_runtime_ready(acct) and not disabled_models:
-                return False
+            if _db_account_runtime_ready(acct):
+                if norm_model:
+                    # Model-scoped: potentially usable if the specific model has no
+                    # active cooldown (more accurate than "no disabled_models at all").
+                    if (
+                        norm_model not in disabled_models
+                        or not acct.is_in_rate_limit_cooldown(at_time=at_time)
+                    ):
+                        return False
+                else:
+                    # Conservative model=None path: must have credentials AND no
+                    # rate-limit entries at all (expired or not).
+                    if not disabled_models:
+                        return False
             if acct.is_in_rate_limit_cooldown(at_time=at_time):
                 any_in_cooldown = True
         return any_in_cooldown
@@ -1509,6 +1603,31 @@ async def _persist_rate_limit_state(acct_id: str) -> None:
         db_acct.enabled = acct.get("enabled", True)
         rl_session.add(db_acct)
         await rl_session.commit()
+
+
+def _queue_rate_limit_persist_retry(acct_id: str) -> None:
+    if acct_id not in _pending_rl_persists:
+        _pending_rl_persists.append(acct_id)
+
+
+async def _persist_rate_limit_state_best_effort(acct_id: str, reason: str) -> None:
+    """Persist cooldown state without breaking the caller's control flow.
+
+    Some failures surface as raw driver or transport exceptions before SQLAlchemy
+    wraps them. Rate-limit bookkeeping is already designed to retry DB persists
+    later, so treat any persistence exception as non-fatal and queue the account
+    for the next retry sweep.
+    """
+    try:
+        await _persist_rate_limit_state(acct_id)
+    except Exception as exc:
+        logger.warning(
+            "[POOL] Failed to persist %s for %s: %s — queued for retry",
+            reason,
+            acct_id,
+            exc,
+        )
+        _queue_rate_limit_persist_retry(acct_id)
 
 
 async def select_max_plan_account_balanced(
@@ -2075,14 +2194,7 @@ async def disable_account_model(
                 f"[POOL] Account {acct['name']} regression-quarantined on model {primary_key} "
                 f"(flat {_REGRESSION_COOLDOWN_SECONDS // 60}min reprobe cooldown)"
             )
-            try:
-                await _persist_rate_limit_state(acct_id)
-            except SQLAlchemyError as e:
-                logger.warning(
-                    f"[POOL] Failed to persist regression state for {acct_id}: {e} — queued for retry"
-                )
-                if acct_id not in _pending_rl_persists:
-                    _pending_rl_persists.append(acct_id)
+            await _persist_rate_limit_state_best_effort(acct_id, "regression state")
             return
         # Record rate-limit event for rolling health score + success-rate tracking
         _prune_health_events(acct, now)
@@ -2141,14 +2253,7 @@ async def disable_account_model(
                 f"high-confidence failures — {_QUARANTINE_COOLDOWN_SECONDS // 60}min recheck cooldown"
             )
 
-        try:
-            await _persist_rate_limit_state(acct_id)
-        except SQLAlchemyError as e:
-            logger.warning(
-                f"[POOL] Failed to persist rate-limit state for {acct_id}: {e} — queued for retry"
-            )
-            if acct_id not in _pending_rl_persists:
-                _pending_rl_persists.append(acct_id)
+        await _persist_rate_limit_state_best_effort(acct_id, "rate-limit state")
 
 
 async def disable_account_for_auth(acct_id: str, reason: str) -> bool:
@@ -2183,14 +2288,7 @@ async def disable_account_for_auth(acct_id: str, reason: str) -> bool:
         logger.warning(
             f"[POOL] Account {acct['name']} HARD-DISABLED (non-recoverable auth): {reason}"
         )
-        try:
-            await _persist_rate_limit_state(acct_id)
-        except SQLAlchemyError as e:
-            logger.warning(
-                f"[POOL] Failed to persist auth-disable for {acct_id}: {e} — queued for retry"
-            )
-            if acct_id not in _pending_rl_persists:
-                _pending_rl_persists.append(acct_id)
+        await _persist_rate_limit_state_best_effort(acct_id, "auth-disable")
         return True
 
 
@@ -2227,14 +2325,7 @@ async def clear_rate_limit_state_on_success(acct_id: str, model: str) -> bool:
         logger.info(
             f"[POOL] Account {acct['name']} cleared disabled models {cleared} after successful {model} task"
         )
-        try:
-            await _persist_rate_limit_state(acct_id)
-        except SQLAlchemyError as e:
-            logger.warning(
-                f"[POOL] Failed to persist rate-limit clear for {acct_id}: {e} — queued for retry"
-            )
-            if acct_id not in _pending_rl_persists:
-                _pending_rl_persists.append(acct_id)
+        await _persist_rate_limit_state_best_effort(acct_id, "rate-limit clear")
         return True
 
 
@@ -2278,14 +2369,7 @@ async def clear_account_model_regression(
         logger.info(
             f"[POOL] Account {acct['name']} cleared regression-quarantine on {model} (manual override)"
         )
-        try:
-            await _persist_rate_limit_state(acct_id)
-        except SQLAlchemyError as e:
-            logger.warning(
-                f"[POOL] Failed to persist regression clear for {acct_id}: {e} — queued for retry"
-            )
-            if acct_id not in _pending_rl_persists:
-                _pending_rl_persists.append(acct_id)
+        await _persist_rate_limit_state_best_effort(acct_id, "regression clear")
         return True
 
 
@@ -2329,14 +2413,7 @@ async def clear_regression_on_success(acct_id: str, model: str) -> dict | None:
         logger.info(
             f"[POOL] Account {acct['name']} auto-recovered regression on {model} after probe success"
         )
-        try:
-            await _persist_rate_limit_state(acct_id)
-        except SQLAlchemyError as e:
-            logger.warning(
-                f"[POOL] Failed to persist regression recovery for {acct_id}: {e} — queued for retry"
-            )
-            if acct_id not in _pending_rl_persists:
-                _pending_rl_persists.append(acct_id)
+        await _persist_rate_limit_state_best_effort(acct_id, "regression recovery")
         return recovery_info
 
 

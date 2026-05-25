@@ -1155,22 +1155,25 @@ async def test_reaper_db_rl_pool_wide_accountless_silent_death_free_requeue(
         return_value=False,
     )
     # Pool-wide DB check returns True — this is the branch under test.
-    mocker.patch(
+    pool_wide_mock = mocker.patch(
         "app.max_plan_pool.db_pool_wide_rate_limit_cooldown",
         new_callable=AsyncMock,
         return_value=True,
     )
 
     project = await _make_project(reaper_db)
+    failure_time = datetime.utcnow() - timedelta(minutes=10)
     t = Task(
         project_id=project.id,
         payloads=[{"type": "create", "model": "sonnet"}],
         vm_instance_id="vm-pool-rl-accountless",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=failure_time,
         context={
             # No max_plan_account_id — accountless task.
+            "llm_provider": "anthropic",
+            "llm_model": "claude-sonnet-4-6",
             # No rate-limit keywords in last_error — purely pool-wide DB signal.
         },
     )
@@ -1190,6 +1193,12 @@ async def test_reaper_db_rl_pool_wide_accountless_silent_death_free_requeue(
     # No account to blacklist — blacklisted_accounts should be absent or empty.
     assert not ctx.get("blacklisted_accounts"), (
         "accountless RL requeue must not create a spurious blacklisted_accounts entry"
+    )
+    pool_wide_mock.assert_awaited_once_with(
+        at_time=failure_time,
+        providers=["anthropic"],
+        model="claude-sonnet-4-6",
+        user_id=None,
     )
 
 
