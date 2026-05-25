@@ -2247,19 +2247,6 @@ async def _handle_strategic_completion(
                     )
                 text = text[:STRATEGIC_DIRECTION_TEXT_MAX]
                 raw_dedup_reasoning = op_entry.get("dedup_reasoning")
-                rejected_match = _find_recent_rejected_proposal(
-                    text,
-                    [d for d in directions if d.get("status") == "rejected"],
-                )
-                if rejected_match:
-                    logger.info(
-                        "[STRATEGIC] Skipping direction '%s' because it matches recently rejected proposal '%s' (rejected_at=%s); project=%s",
-                        text[:60],
-                        (rejected_match.get("text") or "")[:60],
-                        rejected_match.get("rejected_at"),
-                        project.id,
-                    )
-                    continue
                 # Advisory dedup: the strategic agent owns its direction set, so a
                 # proposal that resembles an existing direction is no longer
                 # hard-blocked — we surface the resemblance (log + a note on the

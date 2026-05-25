@@ -2231,7 +2231,6 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
 
 from app.strategic_completion import (
     _find_matching_direction,
-    _find_recent_rejected_proposal,
     _normalize_recommended_mode,
     _reset_scaffolding_state_on_outcome_change,
 )
@@ -2785,32 +2784,6 @@ async def strategic_operation(
         )
         raw_dedup_reasoning = data.get("dedup_reasoning")
         directions = list(project.directions or [])
-        rejected_match = _find_recent_rejected_proposal(
-            text,
-            [d for d in directions if d.get("status") == "rejected"],
-        )
-        if rejected_match:
-            logger.info(
-                "[STRATEGIC] API path: direction '%s' matches recently rejected proposal '%s' (rejected_at=%s) — hard-blocking; project=%s",
-                text[:60],
-                (rejected_match.get("text") or "")[:60],
-                rejected_match.get("rejected_at"),
-                project.id,
-            )
-            ctx = task.context or {}
-            task.context = {**ctx, "_strategic_api_called": True}
-            flag_modified(task, "context")
-            session.add(task)
-            await session.commit()
-            return JSONResponse(
-                content=_resp(
-                    {
-                        "status": "skipped",
-                        "reason": "Direction matches a recently rejected proposal",
-                    }
-                ),
-                status_code=409,
-            )
         # Advisory dedup (see strategic_completion._is_direction_duplicate): the
         # strategic agent owns its direction set, so a proposal that resembles an
         # existing direction is surfaced (log + a note on the created direction),
