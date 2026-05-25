@@ -56,6 +56,7 @@ from app.routers.agent_credentials import router as agent_credentials_router
 from app.routers.github import router as github_router
 from app.routers.projects import router as projects_router
 from app.routers.directions import router as directions_router
+from app.direction_lifecycle import _reset_outcome_detection_state
 from app.routers.deploy import router as deploy_router
 from app.routers.admin_users import router as admin_users_router
 from app.routers.admin_notifications import router as admin_notifications_router
@@ -2931,6 +2932,9 @@ async def strategic_operation(
         updated = False
         for d in directions:
             if d.get("id") == dir_id:
+                _pre_text = d.get("text")
+                _pre_se = (d.get("context") or {}).get("success_evidence")
+                _pre_rc = (d.get("context") or {}).get("retirement_condition")
                 if "text" in changes:
                     d["text"] = _cap_str(
                         changes["text"],
@@ -3044,6 +3048,12 @@ async def strategic_operation(
                     d["notes"] = _cap_list(
                         notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
                     )
+                if (
+                    d.get("text") != _pre_text
+                    or (d.get("context") or {}).get("success_evidence") != _pre_se
+                    or (d.get("context") or {}).get("retirement_condition") != _pre_rc
+                ):
+                    _reset_outcome_detection_state(d)
                 updated = True
                 break
         if not updated:

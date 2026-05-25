@@ -921,14 +921,17 @@ def _check_direction_health(direction: dict) -> str | None:
         )
         if churn_threshold > 0:
             metrics = _compute_churn_metrics(direction)
-            if metrics and metrics["non_merge_finished"] >= churn_threshold:
-                if metrics["merge_rate"] < churn_min_merge_rate:
-                    return (
-                        f"Churn guardrail: {metrics['non_merge_finished']} tasks finished "
-                        f"without merging, {metrics['merged']} merged in last "
-                        f"{metrics['window_cycles']} cycles "
-                        f"(merge rate {metrics['merge_rate']:.0%})"
-                    )
+            if (
+                metrics
+                and metrics["non_merge_finished"] >= churn_threshold
+                and metrics["merge_rate"] < churn_min_merge_rate
+            ):
+                return (
+                    f"Churn guardrail: {metrics['non_merge_finished']} tasks finished "
+                    f"without merging, {metrics['merged']} merged in last "
+                    f"{metrics['window_cycles']} cycles "
+                    f"(merge rate {metrics['merge_rate']:.0%})"
+                )
 
         # Rule 6: Lifetime cumulative burn backstop — catches slow-burn directions that stay
         # just under the rolling-window threshold every window but accumulate hundreds of
@@ -943,13 +946,16 @@ def _check_direction_health(direction: dict) -> str | None:
         )
         if lifetime_threshold > 0:
             lm = _compute_lifetime_burn_metrics(direction)
-            if lm and lm["lifetime_non_merge_finished"] >= lifetime_threshold:
-                if lm["lifetime_merge_rate"] < lifetime_min_merge_rate:
-                    return (
-                        f"Lifetime burn backstop: {lm['lifetime_non_merge_finished']} tasks "
-                        f"finished without merging lifetime, {lm['lifetime_merged']} merged "
-                        f"(lifetime merge rate {lm['lifetime_merge_rate']:.0%})"
-                    )
+            if (
+                lm
+                and lm["lifetime_non_merge_finished"] >= lifetime_threshold
+                and lm["lifetime_merge_rate"] < lifetime_min_merge_rate
+            ):
+                return (
+                    f"Lifetime burn backstop: {lm['lifetime_non_merge_finished']} tasks "
+                    f"finished without merging lifetime, {lm['lifetime_merged']} merged "
+                    f"(lifetime merge rate {lm['lifetime_merge_rate']:.0%})"
+                )
 
     return None
 
@@ -1310,17 +1316,23 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
     snaps = direction.get("outcome_progress_history") or []
     if run < 2 or len(snaps) < run:
         return None
-    window = snaps[-run:]
+    # Filter snapshots to the current contract fingerprint so that contract rewrites
+    # (success_evidence, retirement_condition, etc.) cannot mix old-contract measurements
+    # into the stall-run window. If fewer than run snapshots exist under the current
+    # contract, the window is insufficient and we return None — a direction whose contract
+    # was just rewritten needs time to build up new-contract evidence before the detector
+    # can fire. This is a defense-in-depth layer; callers should also call
+    # _reset_outcome_detection_state on contract changes to clear the history outright.
+    se_text = ((direction.get("context") or {}).get("success_evidence") or "").encode()
+    current_fp = hashlib.sha256(se_text).hexdigest()[:16]
+    contract_snaps = [s for s in snaps if s.get("success_evidence_fp") == current_fp]
+    if len(contract_snaps) < run:
+        return None
+    window = contract_snaps[-run:]
     progress_vals = [int(s.get("progress", 0) or 0) for s in window]
-    # Gate on whether the cumulative confirmed-finding count grew during the stall
-    # window. The signal from _compute_outcome_progress_signal is visible + evicted
-    # confirmed findings, so it is monotonically non-decreasing regardless of
-    # research_context cap saturation. A saturated-but-advancing direction produces
-    # growing cumulative values even though its visible count is pinned at the cap.
-    # success_evidence_fp is intentionally NOT used here: that text is static goal
-    # copy written at direction creation and never rewritten as findings accumulate,
-    # so its fingerprint is always constant regardless of whether the direction is
-    # advancing or stalled.
+    # Gate on whether the cumulative confirmed-finding count grew during the stall window.
+    # The signal from _compute_outcome_progress_signal is visible + evicted confirmed
+    # findings — monotonically non-decreasing regardless of research_context cap saturation.
     if max(progress_vals) > progress_vals[0]:
         return None  # finding count grew -> direction is advancing
     # Never met its outcome (current completion detector must also be negative).
@@ -1575,9 +1587,12 @@ async def _check_direction_starvation(
                 if fallback_category:
                     fallback_dir["category"] = fallback_category
 
-                updated_directions = [*list(directions), fallback_dir]
-                project.directions = updated_directions
-                flag_modified(project, "directions")
+                from app.task_locking import with_directions_locked
+
+                _fd = fallback_dir
+                await with_directions_locked(
+                    session, project.id, lambda dirs: dirs.append(_fd)
+                )
 
                 vision["_direction_starvation_count"] = 0
                 vision.pop("_strategic_frequency_override", None)
@@ -2404,6 +2419,12 @@ async def _handle_strategic_completion(
                     continue
                 for d in directions:
                     if d.get("id") == dir_id:
+                        # Snapshot contract fields before mutation to detect real changes.
+                        _pre_text = d.get("text")
+                        _pre_paths = list(d.get("paths") or [])
+                        _pre_ctx = d.get("context") or {}
+                        _pre_se = _pre_ctx.get("success_evidence")
+                        _pre_rc = _pre_ctx.get("retirement_condition")
                         if "text" in changes:
                             new_text = str(changes["text"])
                             if len(new_text) > STRATEGIC_DIRECTION_TEXT_MAX:
@@ -2547,6 +2568,19 @@ async def _handle_strategic_completion(
                         ):
                             _reset_scaffolding_state_on_outcome_change(d)
                         d["context"] = ctx
+                        # Reset outcome-detection state when any contract field changed.
+                        _new_ctx = d.get("context") or {}
+                        if (
+                            d.get("text") != _pre_text
+                            or list(d.get("paths") or []) != _pre_paths
+                            or _new_ctx.get("success_evidence") != _pre_se
+                            or _new_ctx.get("retirement_condition") != _pre_rc
+                        ):
+                            from app.direction_lifecycle import (
+                                _reset_outcome_detection_state,
+                            )
+
+                            _reset_outcome_detection_state(d)
                         # Record rationale as a note
                         if rationale:
                             notes = d.get("notes", [])
@@ -2601,8 +2635,10 @@ async def _handle_strategic_completion(
                         break
 
         if ops_applied > 0:
-            project.directions = directions
-            flag_modified(project, "directions")
+            from app.task_locking import with_directions_locked
+
+            _dirs = list(directions)
+            await with_directions_locked(session, task.project_id, lambda _: _dirs)
 
     # Apply version_phase_decision + qualify_request from the parsed output
     # (fallback / log-parse path). In practice the agent emits both fields

@@ -2612,7 +2612,7 @@ async def test_auto_recovery_with_frozen_churn_history(db_session):
     auto_pause_count=1, with ``auto_recovered_at`` set, rather than re-pausing to 2.
     """
     # Build the frozen churn history that triggered the pause:
-    # 5 cycles × 5 completed tasks, 0 merged → 25 non-merge finished, merge rate 0%
+    # 5 cycles x 5 completed tasks, 0 merged -> 25 non-merge finished, merge rate 0%
     # The grace period skips the churn rule until a NEW cycle is appended, so this
     # frozen history must not re-pause the direction on the same lifecycle tick.
     churn_history = [
@@ -6915,6 +6915,311 @@ async def test_get_directions_includes_context_fields_when_set(
     assert ctx.get("retirement_condition") == "Zero failures for 4 weeks"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. Directions-lock invariant
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestDirectionsRouterLockRatchet:
+    """Positive ratchet: routers/directions.py must keep its direction writes
+    routed through with_directions_locked.
+
+    Complements TestDirectionsLockInvariants in test_task_locking.py (negative
+    ratchet — catches new direct .directions = assignments in *new* files).
+    This positive ratchet catches the mirror failure: a with_directions_locked
+    call site is removed from the router without being replaced, so the
+    operation silently regresses to an unlocked write.
+
+    _EXPECTED_MIN_CALLS is set to 5 (the five mutation sites active at the
+    time this PR was written — the ratchet was originally set to 6 in PR #5811
+    but audit of routers/directions.py confirmed only 5 call sites exist; the
+    constant is corrected here). It must not decrease. If a call site is
+    removed, either add a replacement locked call or lower this constant in the
+    same PR with an explanation.
+    """
+
+    _EXPECTED_MIN_CALLS = 5
+
+    def test_directions_router_locked_call_count(self):
+        """routers/directions.py must have at least 6 with_directions_locked call sites."""
+        import ast
+        from pathlib import Path
+
+        router_path = (
+            Path(__file__).resolve().parents[1] / "app" / "routers" / "directions.py"
+        )
+        source = router_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(router_path))
+        call_count = sum(
+            1
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "with_directions_locked"
+        )
+        assert call_count >= self._EXPECTED_MIN_CALLS, (
+            f"routers/directions.py has only {call_count} call(s) to "
+            f"with_directions_locked (expected >= {self._EXPECTED_MIN_CALLS}). "
+            "All direction mutation sites in the router must remain routed through "
+            "the canonical locked helper — do not remove calls without replacing them "
+            "or lowering _EXPECTED_MIN_CALLS with an explanation in the PR."
+        )
+
+
+# ── Contract-reset integration tests (operator PATCH path) ────────────────────
+#
+# Each test seeds a direction with all 8 stale outcome-detection fields, then
+# mutates ONE contract field through the operator PATCH endpoint, and asserts:
+#   (a) the new contract value is persisted, and
+#   (b) all outcome-detection state is reset to a clean baseline.
+#
+# The reset guard lives at routers/directions.py lines 706-715.  These tests
+# provide end-to-end coverage so a future writer cannot remove the guard
+# without at least one test failing.
+
+
+_STALE_OUTCOME_DIRECTION = {
+    "id": "d-contract-reset",
+    "text": "Original direction text",
+    "status": "active",
+    "priority": "medium",
+    "paths": ["src/old/"],
+    "added_at": "2026-01-01T00:00:00",
+    "context": {
+        "success_evidence": "Old success criteria",
+        "retirement_condition": "Old retirement condition",
+    },
+    # All 8 stale outcome-detection keys
+    "outcome_progress_history": [{"progress": 5, "success_evidence_fp": "stale-fp"}],
+    "outcome_progress_ever_met": True,
+    "evidence_progress": {"status": "advancing"},
+    "possibly_complete": True,
+    "completion_suggestion": "Looks almost done",
+    "outcome_scaffolding_flagged": True,
+    "outcome_scaffolding_flagged_at": "2026-01-01T00:00:00",
+    "outcome_scaffolding_flagged_cycles": 3,
+}
+
+_OUTCOME_DETECTION_OPTIONAL_KEYS = (
+    "outcome_progress_ever_met",
+    "evidence_progress",
+    "possibly_complete",
+    "completion_suggestion",
+    "outcome_scaffolding_flagged",
+    "outcome_scaffolding_flagged_at",
+    "outcome_scaffolding_flagged_cycles",
+)
+
+
+async def _seed_stale_direction(db_session, project_id: str) -> None:
+    """Replace the project's directions list with a single stale-state direction.
+
+    Called after _deploy_project to inject stale outcome-detection state so
+    the operator PATCH endpoint has something to reset.
+    """
+    import copy
+    import uuid as _uuid
+    from sqlalchemy import select as _sa_select
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.models import Project as _Project
+
+    result = await db_session.execute(
+        _sa_select(_Project).where(_Project.id == _uuid.UUID(project_id))
+    )
+    project = result.scalar_one()
+    project.directions = [copy.deepcopy(_STALE_OUTCOME_DIRECTION)]
+    flag_modified(project, "directions")
+    await db_session.commit()
+    await db_session.refresh(project)
+
+
+def _assert_outcome_detection_reset(d: dict) -> None:
+    """Assert that all outcome-detection state is at a clean baseline."""
+    assert d["outcome_progress_history"] == [], (
+        "outcome_progress_history must be emptied (set to []) by the reset"
+    )
+    for key in _OUTCOME_DETECTION_OPTIONAL_KEYS:
+        assert key not in d, (
+            f"{key} must be removed from direction by the contract-reset guard"
+        )
+
+
+@pytest.mark.asyncio
+async def test_update_direction_text_resets_outcome_detection_state(
+    client: AsyncClient, db_session, mocker
+):
+    """PATCH text triggers _reset_outcome_detection_state on the direction.
+
+    Operator updating the direction goal text is a contract change: the
+    success criteria may now mean something different, so all accumulated
+    outcome-detection state must be cleared.
+    """
+    project_id = await _deploy_project(client, mocker)
+    await _seed_stale_direction(db_session, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/d-contract-reset",
+        json={"text": "Rewritten direction text"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["direction"]["text"] == "Rewritten direction text"
+
+    from sqlalchemy import select as _sa_select
+    import uuid as _uuid
+    from app.models import Project as _Project
+
+    result = await db_session.execute(
+        _sa_select(_Project).where(_Project.id == _uuid.UUID(project_id))
+    )
+    project = result.scalar_one()
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-contract-reset")
+    assert d["text"] == "Rewritten direction text", "contract field must be updated"
+    _assert_outcome_detection_reset(d)
+
+
+@pytest.mark.asyncio
+async def test_update_direction_paths_resets_outcome_detection_state(
+    client: AsyncClient, db_session, mocker
+):
+    """PATCH paths triggers _reset_outcome_detection_state on the direction.
+
+    Changing the file-scope paths is a contract change because it redefines
+    what evidence is relevant, invalidating prior outcome snapshots.
+    """
+    project_id = await _deploy_project(client, mocker)
+    await _seed_stale_direction(db_session, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/d-contract-reset",
+        json={"paths": ["src/new/", "tests/new/"]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["direction"]["paths"] == ["src/new/", "tests/new/"]
+
+    from sqlalchemy import select as _sa_select
+    import uuid as _uuid
+    from app.models import Project as _Project
+
+    result = await db_session.execute(
+        _sa_select(_Project).where(_Project.id == _uuid.UUID(project_id))
+    )
+    project = result.scalar_one()
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-contract-reset")
+    assert d["paths"] == ["src/new/", "tests/new/"], "paths must be updated"
+    _assert_outcome_detection_reset(d)
+
+
+@pytest.mark.asyncio
+async def test_update_direction_completion_criteria_resets_outcome_detection_state(
+    client: AsyncClient, db_session, mocker
+):
+    """PATCH completion_criteria triggers _reset_outcome_detection_state.
+
+    Rewriting the completion criteria changes the contract by which the system
+    measures whether the direction is done.
+    """
+    project_id = await _deploy_project(client, mocker)
+    await _seed_stale_direction(db_session, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/d-contract-reset",
+        json={"completion_criteria": "All integration tests green for 3 cycles"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["direction"]["completion_criteria"] == (
+        "All integration tests green for 3 cycles"
+    )
+
+    from sqlalchemy import select as _sa_select
+    import uuid as _uuid
+    from app.models import Project as _Project
+
+    result = await db_session.execute(
+        _sa_select(_Project).where(_Project.id == _uuid.UUID(project_id))
+    )
+    project = result.scalar_one()
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-contract-reset")
+    assert d.get("completion_criteria") == "All integration tests green for 3 cycles"
+    _assert_outcome_detection_reset(d)
+
+
+@pytest.mark.asyncio
+async def test_update_direction_success_evidence_resets_outcome_detection_state(
+    client: AsyncClient, db_session, mocker
+):
+    """PATCH success_evidence triggers _reset_outcome_detection_state.
+
+    success_evidence is the primary fingerprint used by the outcome scaffolding
+    detector.  Changing it invalidates all accumulated fingerprinted snapshots.
+    """
+    project_id = await _deploy_project(client, mocker)
+    await _seed_stale_direction(db_session, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/d-contract-reset",
+        json={"success_evidence": "All SAML login flows pass e2e for 2 cycles"},
+    )
+    assert resp.status_code == 200, resp.text
+    ctx = resp.json()["direction"].get("context") or {}
+    assert ctx.get("success_evidence") == "All SAML login flows pass e2e for 2 cycles"
+
+    from sqlalchemy import select as _sa_select
+    import uuid as _uuid
+    from app.models import Project as _Project
+
+    result = await db_session.execute(
+        _sa_select(_Project).where(_Project.id == _uuid.UUID(project_id))
+    )
+    project = result.scalar_one()
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-contract-reset")
+    ctx = d.get("context") or {}
+    assert ctx.get("success_evidence") == "All SAML login flows pass e2e for 2 cycles"
+    _assert_outcome_detection_reset(d)
+
+
+@pytest.mark.asyncio
+async def test_update_direction_retirement_condition_resets_outcome_detection_state(
+    client: AsyncClient, db_session, mocker
+):
+    """PATCH retirement_condition triggers _reset_outcome_detection_state.
+
+    Changing when the direction should be retired is a contract change that
+    may make previously-met conditions irrelevant.
+    """
+    project_id = await _deploy_project(client, mocker)
+    await _seed_stale_direction(db_session, project_id)
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/d-contract-reset",
+        json={"retirement_condition": "Zero auth failures for 3 consecutive cycles"},
+    )
+    assert resp.status_code == 200, resp.text
+    ctx = resp.json()["direction"].get("context") or {}
+    assert (
+        ctx.get("retirement_condition") == "Zero auth failures for 3 consecutive cycles"
+    )
+
+    from sqlalchemy import select as _sa_select
+    import uuid as _uuid
+    from app.models import Project as _Project
+
+    result = await db_session.execute(
+        _sa_select(_Project).where(_Project.id == _uuid.UUID(project_id))
+    )
+    project = result.scalar_one()
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-contract-reset")
+    ctx = d.get("context") or {}
+    assert (
+        ctx.get("retirement_condition") == "Zero auth failures for 3 consecutive cycles"
+    )
+    _assert_outcome_detection_reset(d)
+
+
 @pytest.mark.asyncio
 async def test_update_direction_clears_scaffolding_state_on_outcome_change(
     client: AsyncClient, db_session, mocker
@@ -6947,7 +7252,9 @@ async def test_update_direction_clears_scaffolding_state_on_outcome_change(
     assert resp.status_code == 200, resp.text
     updated = resp.json()["direction"]
     assert "outcome_progress_ever_met" not in updated
-    assert "outcome_progress_history" not in updated
+    # Either popped (scaffolding reset) or reset to [] (outcome-detection reset).
+    # Both forms mean "cleared" and consumers read via `... or []`.
+    assert not updated.get("outcome_progress_history")
     assert "evidence_progress" not in updated
 
 

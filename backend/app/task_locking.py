@@ -446,6 +446,24 @@ async def lock_project_for_strategic_transition(
     return None  # row held past retry window — caller defers
 
 
+async def _with_project_locked_list_mutation(
+    session: AsyncSession,
+    project_id,
+    mutate_fn: Callable[[list], list | None],
+    *,
+    skip_locked: bool,
+) -> bool:
+    async with project_lock(session, project_id, skip_locked=skip_locked) as project:
+        if project is None:
+            return False
+        directions = list(project.directions or [])
+        result = mutate_fn(directions)
+        project.directions = result if result is not None else directions
+        flag_modified(project, "directions")
+        session.add(project)
+    return True
+
+
 async def with_design_doc_locked(
     session: AsyncSession,
     project_id,
@@ -551,12 +569,9 @@ async def with_directions_locked(
     silently dropping a direction another writer appended concurrently — the
     same lost-update class already eliminated for ``design_doc``.
     """
-    async with project_lock(session, project_id, skip_locked=skip_locked) as project:
-        if project is None:
-            return False
-        directions = list(project.directions or [])
-        result = mutate_fn(directions)
-        project.directions = result if result is not None else directions
-        flag_modified(project, "directions")
-        session.add(project)
-    return True
+    return await _with_project_locked_list_mutation(
+        session,
+        project_id,
+        mutate_fn,
+        skip_locked=skip_locked,
+    )

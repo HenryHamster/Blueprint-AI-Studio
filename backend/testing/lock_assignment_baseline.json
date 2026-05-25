@@ -21,7 +21,6 @@
     "main.py": 5,
     "rollup_management.py": 1,
     "routers/admin_projects.py": 1,
-    "routers/directions.py": 5,
     "strategic_completion.py": 2,
     "task_locking.py": 1
   },

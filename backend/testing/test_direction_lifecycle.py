@@ -1348,7 +1348,7 @@ async def test_grace_period_expires_after_new_cycle_appended_triggers_pause(
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
         "auto_recovered_at": recovered_at.isoformat(),
-        "research_history": pre_history + [new_cycle],
+        "research_history": [*pre_history, new_cycle],
     }
     project = await _make_cost_project(db_session, direction)
 
@@ -1443,6 +1443,10 @@ async def test_grace_period_does_not_block_code_failure_pause(db_session, mocker
     )
 
 
+# sha256("")[:16] — fingerprint for directions without success_evidence
+_EMPTY_SE_FP = "e3b0c44298fc1c14"
+
+
 def _scaffolding_direction_for_lifecycle(progress_window):
     return {
         "id": "d-scaffold-lc",
@@ -1468,7 +1472,10 @@ def _scaffolding_direction_for_lifecycle(progress_window):
             "total_tasks_failed": 0,
             "total_tasks_failed_infra": 0,
         },
-        "outcome_progress_history": [{"progress": p} for p in progress_window],
+        "outcome_progress_history": [
+            {"progress": p, "success_evidence_fp": _EMPTY_SE_FP}
+            for p in progress_window
+        ],
     }
 
 
@@ -2003,3 +2010,123 @@ async def test_scaffolding_stale_verdict_does_not_freeze_counter(db_session, moc
     assert d.get("outcome_scaffolding_flagged") is True, (
         "flag must remain set (stale advancing does not clear the scaffolding flag)"
     )
+
+
+# ── Contract-reset and fingerprint-filter unit tests ──────────────────────────
+
+
+def test_reset_outcome_detection_state_clears_all_keys():
+    """_reset_outcome_detection_state empties history and removes all outcome-detection fields."""
+    from app.direction_lifecycle import _reset_outcome_detection_state
+
+    d = {
+        "status": "active",
+        "outcome_progress_history": [{"progress": 5, "success_evidence_fp": "abc"}],
+        "outcome_progress_ever_met": True,
+        "evidence_progress": {"status": "advancing"},
+        "possibly_complete": True,
+        "completion_suggestion": "done",
+        "outcome_scaffolding_flagged": True,
+        "outcome_scaffolding_flagged_at": "2026-01-01T00:00:00",
+        "outcome_scaffolding_flagged_cycles": 3,
+    }
+    _reset_outcome_detection_state(d)
+
+    assert d["outcome_progress_history"] == [], "history must be emptied (not removed)"
+    for key in (
+        "outcome_progress_ever_met",
+        "evidence_progress",
+        "possibly_complete",
+        "completion_suggestion",
+        "outcome_scaffolding_flagged",
+        "outcome_scaffolding_flagged_at",
+        "outcome_scaffolding_flagged_cycles",
+    ):
+        assert key not in d, f"{key} should be removed by reset"
+    assert d["status"] == "active", "non-outcome keys must survive the reset"
+
+
+def test_check_outcome_scaffolding_filters_stale_contract_snapshots():
+    """Snapshots with an old success_evidence_fp are excluded from the stall window.
+
+    The detector must return None when all snapshots pre-date the current contract,
+    then fire once enough new-contract snapshots accumulate.
+    """
+    import hashlib
+    from app.strategic_completion import _check_outcome_scaffolding
+
+    old_fp = hashlib.sha256(b"old contract").hexdigest()[:16]
+    new_se = "new success evidence"
+    new_fp = hashlib.sha256(new_se.encode()).hexdigest()[:16]
+
+    direction = {
+        "id": "d-fp-filter",
+        "text": "test",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "context": {"success_evidence": new_se},
+        "research_history": [
+            {
+                "tasks_created": 3,
+                "tasks_completed": 3,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 3,
+            }
+            for _ in range(14)
+        ],
+        "history_aggregate": {
+            "total_cycles": 10,
+            "total_prs_merged": 8,
+            "total_tasks_completed": 8,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        },
+        # All snapshots carry the OLD fingerprint — none match new contract.
+        "outcome_progress_history": [
+            {"progress": 5, "success_evidence_fp": old_fp} for _ in range(6)
+        ],
+    }
+    assert _check_outcome_scaffolding(direction) is None, (
+        "old-contract snapshots must not fire the detector"
+    )
+
+    # Replace with new-contract snapshots — detector should now fire.
+    direction["outcome_progress_history"] = [
+        {"progress": 5, "success_evidence_fp": new_fp} for _ in range(6)
+    ]
+    assert _check_outcome_scaffolding(direction) is not None, (
+        "new-contract snapshots must fire the detector once stall window is full"
+    )
+
+
+# ── Additional contract-reset unit tests ──────────────────────────────────────
+
+
+def test_reset_outcome_detection_state_clears_completion_suggestion():
+    """_reset_outcome_detection_state specifically removes the completion_suggestion field.
+
+    completion_suggestion is the least-frequently-tested of the 8 outcome-detection
+    keys.  Verify it is removed (not left as an empty string or None) so a stale
+    advisory is never surfaced to operators after a contract rewrite.
+    """
+    from app.direction_lifecycle import _reset_outcome_detection_state
+
+    d = {
+        "status": "active",
+        "text": "Improve auth coverage",
+        "completion_suggestion": "All SAML tests green — direction may be done",
+        "outcome_progress_history": [{"progress": 4, "success_evidence_fp": "fp-old"}],
+        "outcome_progress_ever_met": True,
+    }
+    _reset_outcome_detection_state(d)
+
+    assert "completion_suggestion" not in d, (
+        "completion_suggestion must be removed, not left as empty value"
+    )
+    assert d["outcome_progress_history"] == [], "history must be emptied, not removed"
+    assert "outcome_progress_ever_met" not in d
+    assert d["status"] == "active", "non-outcome fields must survive the reset"
+    assert d["text"] == "Improve auth coverage", "text must survive the reset"

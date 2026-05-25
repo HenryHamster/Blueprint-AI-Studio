@@ -61,6 +61,29 @@ _PARTIAL_SUCCESS_RATE_DROP = 0.5
 # persist indefinitely.
 _STUCK_INTERVENTION_TTL_HOURS = 72
 
+_OUTCOME_DETECTION_KEYS = (
+    "outcome_progress_history",
+    "outcome_progress_ever_met",
+    "evidence_progress",
+    "possibly_complete",
+    "completion_suggestion",
+    "outcome_scaffolding_flagged",
+    "outcome_scaffolding_flagged_at",
+    "outcome_scaffolding_flagged_cycles",
+)
+
+
+def _reset_outcome_detection_state(d: dict) -> None:
+    """Clear per-direction outcome-detection state after a contract field changes.
+
+    Called whenever text, paths, completion_criteria, success_evidence, or
+    retirement_condition is rewritten so the next research cycle measures
+    against the new contract rather than poisoned snapshots from the old one.
+    """
+    d["outcome_progress_history"] = []
+    for key in _OUTCOME_DETECTION_KEYS[1:]:
+        d.pop(key, None)
+
 
 def _detect_partial_remediation_success(direction: dict) -> bool | None:
     """Return True if post-remediation code-failure rate is materially lower than pre-remediation.
@@ -464,8 +487,40 @@ async def _process_direction_lifecycle(
     busy_direction_ids: set,
     now: datetime,
 ) -> list:
+    """Acquire project-row lock, then delegate to the inner lifecycle worker.
+
+    Uses skip_locked=True so a concurrent operator write causes this background
+    tick to be skipped rather than queue behind a 30s lock timeout.  The next
+    scheduled cycle will pick up any directions that were not processed.
+    """
+    from app.task_locking import project_lock  # noqa: PLC0415
+
+    async with project_lock(session, project.id, skip_locked=True) as _locked:
+        if _locked is None:
+            logger.debug(
+                "[LIFECYCLE] Skipping direction lifecycle for %s: project row held by concurrent writer",
+                project.id,
+            )
+            return []
+        # Reload directions inside the lock so we read the latest committed
+        # state and cannot overwrite a concurrent write that committed between
+        # the caller's outer project load and this lock acquisition.
+        await session.refresh(project, attribute_names=["directions"])
+        return await _process_direction_lifecycle_locked(
+            project, session, cooldown_minutes, busy_direction_ids, now
+        )
+
+
+async def _process_direction_lifecycle_locked(
+    project: Project,
+    session: AsyncSession,
+    cooldown_minutes: float,
+    busy_direction_ids: set,
+    now: datetime,
+) -> list:
     """Prune dead directions, auto-recover paused ones, and return eligible active directions.
 
+    Always called under the project-row lock (via _process_direction_lifecycle).
     Mutates project.directions in place for auto-pause and recovery state changes.
     Commits the session if any direction state was modified.
 
