@@ -18,6 +18,7 @@ from typing import Any, Callable, NamedTuple
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+import app.shared_state as _shared_state
 from app.dispatcher_formatters import (
     _CROSS_CASE_FINGERPRINT_LOOKBACK,
     _extract_evaluating_since,
@@ -713,175 +714,519 @@ class RegressionClassShape(NamedTuple):
     ) = None
 
 
-SPAWNABLE_REGRESSION_CLASS_SHAPES: tuple[RegressionClassShape, ...] = (
-    RegressionClassShape("sr_catch_rate", "exact", "sr_catch_rate", "sr_catch_rate"),
-    RegressionClassShape(
+_SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW = timedelta(hours=24)
+_SR_CATCH_RATE_FROZEN_SIGNAL_FRESH_WINDOW = timedelta(hours=6)
+
+
+def _sr_trends(doc: dict[str, Any] | None) -> dict[str, Any]:
+    return (doc or {}).get("sr_catch_rate_trends") or {}
+
+
+def _sr_catch_rate_last_sufficient_at(
+    doc: dict[str, Any] | None,
+    _project_id: uuid.UUID,
+) -> Any:
+    return _sr_trends(doc).get("last_sufficient_computed_at")
+
+
+def _sr_catch_rate_signal_heartbeat_at(
+    doc: dict[str, Any] | None,
+    _project_id: uuid.UUID,
+) -> Any:
+    return _sr_trends(doc).get("signal_last_computed_at")
+
+
+def _fix_loop_divergence_last_computed_at(
+    doc: dict[str, Any] | None,
+    _project_id: uuid.UUID,
+) -> Any:
+    body = doc or {}
+    return body.get("fix_loop_divergence_signal_last_computed_at") or body.get(
+        "fix_loop_divergence_detected_at"
+    )
+
+
+def _persistent_anomaly_last_computed_at(
+    _doc: dict[str, Any] | None,
+    project_id: uuid.UUID,
+) -> Any:
+    return (_shared_state.persistent_anomalies.get(str(project_id)) or {}).get(
+        "signal_last_computed_at"
+    )
+
+
+def _deploy_health_last_computed_at(
+    _doc: dict[str, Any] | None,
+    _project_id: uuid.UUID,
+) -> Any:
+    return _shared_state.deploy_monitoring.get("signal_last_computed_at")
+
+
+def _sr_blind_spot_last_computed_at(
+    doc: dict[str, Any] | None,
+    _project_id: uuid.UUID,
+) -> Any:
+    return (doc or {}).get("sr_blind_spot_signal_last_computed_at")
+
+
+class TelemetrySignalSpec(NamedTuple):
+    """Telemetry signal source metadata used across watchdog/recovery paths."""
+
+    signal_name: str
+    source_module: str
+    freshness_window: timedelta
+    last_computed_at: Callable[[dict[str, Any] | None, uuid.UUID], Any]
+    signal_heartbeat_at: Callable[[dict[str, Any] | None, uuid.UUID], Any] | None = None
+    last_sufficient_at: Callable[[dict[str, Any] | None, uuid.UUID], Any] | None = None
+    never_sufficient_regression_class: str | None = None
+    sufficiency_stale_regression_class: str | None = None
+    sufficiency_stale_window: timedelta | None = None
+    frozen_signal_fresh_window: timedelta | None = None
+
+
+TELEMETRY_SIGNAL_SPECS: tuple[TelemetrySignalSpec, ...] = (
+    TelemetrySignalSpec(
         "sr_catch_rate",
-        "prefix",
-        "sr_catch_rate:",
-        "sr_catch_rate:correctness:dir-coverage-test",
+        "playbook_learning.compute_sr_catch_rate_trends",
+        timedelta(hours=48),
+        _sr_catch_rate_last_sufficient_at,
+        signal_heartbeat_at=_sr_catch_rate_signal_heartbeat_at,
+        last_sufficient_at=_sr_catch_rate_last_sufficient_at,
+        never_sufficient_regression_class="telemetry_never_sufficient:sr_catch_rate",
+        sufficiency_stale_regression_class="telemetry_sufficiency_stale:sr_catch_rate",
+        sufficiency_stale_window=_SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW,
+        frozen_signal_fresh_window=_SR_CATCH_RATE_FROZEN_SIGNAL_FRESH_WINDOW,
     ),
-    RegressionClassShape(
-        "sr_catch_rate", "prefix", "sr_catch_rate:", "sr_catch_rate:correctness"
-    ),
-    RegressionClassShape(
-        "sr_false_positive", "exact", "sr_false_positive", "sr_false_positive"
-    ),
-    RegressionClassShape(
-        "sr_false_positive",
-        "prefix",
-        "sr_false_positive:",
-        "sr_false_positive:correctness",
-    ),
-    RegressionClassShape(
-        "fix_loop_divergence", "exact", "fix_loop_divergence", "fix_loop_divergence"
-    ),
-    RegressionClassShape(
+    TelemetrySignalSpec(
         "fix_loop_divergence",
-        "prefix",
-        "fix_loop_divergence:",
-        "fix_loop_divergence:lint",
+        "fix_loop_telemetry (computed alongside task fix-loop history)",
+        timedelta(days=7),
+        _fix_loop_divergence_last_computed_at,
     ),
-    RegressionClassShape(
+    TelemetrySignalSpec(
+        "persistent_anomaly",
+        "anomaly_detection (updated on task completion)",
+        timedelta(hours=48),
+        _persistent_anomaly_last_computed_at,
+    ),
+    TelemetrySignalSpec(
+        "deploy_health",
+        "deploy_health (updated on deploy events)",
+        timedelta(hours=6),
+        _deploy_health_last_computed_at,
+    ),
+    TelemetrySignalSpec(
         "sr_blind_spot",
-        "prefix",
-        "sr_blind_spot:theme:",
-        "sr_blind_spot:theme:flaky-async",
+        "sr_blind_spots.compute_sr_blind_spot_themes (call on task completion)",
+        timedelta(days=7),
+        _sr_blind_spot_last_computed_at,
     ),
-    RegressionClassShape(
-        "sr_blind_spot", "prefix", "sr_blind_spot:", "sr_blind_spot:correctness"
+)
+
+_TELEMETRY_SIGNAL_SPECS_BY_NAME = {
+    spec.signal_name: spec for spec in TELEMETRY_SIGNAL_SPECS
+}
+
+_SIGNAL_STALENESS_WINDOWS = {
+    spec.signal_name: spec.freshness_window for spec in TELEMETRY_SIGNAL_SPECS
+}
+
+
+def get_telemetry_signal_spec(signal_name: str) -> TelemetrySignalSpec | None:
+    """Return metadata for a telemetry-monitored signal."""
+    return _TELEMETRY_SIGNAL_SPECS_BY_NAME.get(signal_name)
+
+
+class BuiltInSignalSpec(NamedTuple):
+    """Canonical metadata for dispatcher built-in signals."""
+
+    signal_name: str
+    evaluator_name: str | None
+    dispatch_evaluator_name: str | None
+    dispatch_context_keys: tuple[str, ...] = ()
+    probe_kind: str | None = None
+    probe_regression_class: str | None = None
+    recovery_shapes: tuple[RegressionClassShape, ...] = ()
+
+
+BUILT_IN_SIGNAL_SPECS: tuple[BuiltInSignalSpec, ...] = (
+    BuiltInSignalSpec(
+        "sr_catch_rate",
+        "sr_catch_rate_signal",
+        "_evaluate_sr_catch_rate_signal",
+        ("project_design_doc",),
+        "current_state",
+        "sr_catch_rate",
+        (
+            RegressionClassShape(
+                "sr_catch_rate", "exact", "sr_catch_rate", "sr_catch_rate"
+            ),
+            RegressionClassShape(
+                "sr_catch_rate",
+                "prefix",
+                "sr_catch_rate:",
+                "sr_catch_rate:correctness:dir-coverage-test",
+            ),
+            RegressionClassShape(
+                "sr_catch_rate",
+                "prefix",
+                "sr_catch_rate:",
+                "sr_catch_rate:correctness",
+            ),
+        ),
     ),
-    RegressionClassShape(
-        "pipeline_success_rate",
-        "exact",
-        "pipeline_success_rate",
-        "pipeline_success_rate",
+    BuiltInSignalSpec(
+        "sr_false_positive",
+        "sr_false_positive_signal",
+        "_evaluate_sr_false_positive_signal",
+        ("project_design_doc",),
+        recovery_shapes=(
+            RegressionClassShape(
+                "sr_false_positive",
+                "exact",
+                "sr_false_positive",
+                "sr_false_positive",
+            ),
+            RegressionClassShape(
+                "sr_false_positive",
+                "prefix",
+                "sr_false_positive:",
+                "sr_false_positive:correctness",
+            ),
+        ),
     ),
-    RegressionClassShape(
-        "persistent_anomaly", "prefix", "anomaly:", "anomaly:cov-test"
+    BuiltInSignalSpec(
+        "sr_catch_rate_direction",
+        "sr_catch_rate_direction_signals",
+        "_evaluate_sr_catch_rate_direction_signals",
+        ("project_design_doc",),
     ),
-    RegressionClassShape(
-        "telemetry_stale",
-        "prefix",
-        "telemetry_stale:",
-        "telemetry_stale:sr_catch_rate",
+    BuiltInSignalSpec(
+        "fix_loop_divergence",
+        "fix_loop_divergence_signal",
+        "_evaluate_fix_loop_divergence_signal",
+        probe_kind="current_state",
+        probe_regression_class="fix_loop_divergence",
+        recovery_shapes=(
+            RegressionClassShape(
+                "fix_loop_divergence",
+                "exact",
+                "fix_loop_divergence",
+                "fix_loop_divergence",
+            ),
+            RegressionClassShape(
+                "fix_loop_divergence",
+                "prefix",
+                "fix_loop_divergence:",
+                "fix_loop_divergence:lint",
+            ),
+        ),
     ),
-    RegressionClassShape(
-        "telemetry_never_sufficient",
-        "prefix",
-        "telemetry_never_sufficient:",
-        "telemetry_never_sufficient:sr_catch_rate",
-    ),
-    RegressionClassShape(
-        "telemetry_sufficiency_stale",
-        "prefix",
-        "telemetry_sufficiency_stale:",
-        "telemetry_sufficiency_stale:sr_catch_rate",
-    ),
-    RegressionClassShape(
-        "background_service_crash",
-        "prefix",
-        "background_service_crash:",
-        "background_service_crash:reaper",
-    ),
-    RegressionClassShape(
-        "viewport_regression",
-        "prefix",
-        "viewport_regression:",
-        "viewport_regression:DashboardHome:overflow@375",
-        _recover_viewport_regression,
-    ),
-    RegressionClassShape(
-        "viewport_coverage_drop",
-        "exact",
-        "viewport_coverage_drop",
-        "viewport_coverage_drop",
-        _recover_viewport_coverage_drop,
-    ),
-    RegressionClassShape(
-        "reviewer_sla_stall",
-        "prefix",
-        "reviewer_sla_stall:",
-        "reviewer_sla_stall:00000000-0000-0000-0000-000000000000",
-        _recover_reviewer_sla_stall,
-    ),
-    RegressionClassShape(
-        "layer_concentration",
-        "prefix",
-        "layer_concentration:",
-        f"layer_concentration:{LAYER_DISPLAY_ORDER[0]}",
-        _recover_layer_concentration,
-    ),
-    RegressionClassShape(
-        "cross_case_fingerprint",
-        "prefix",
-        "cross_case_fingerprint:",
-        "cross_case_fingerprint:deadbeef",
-        _recover_cross_case_fingerprint,
-    ),
-    RegressionClassShape(
-        "recurring_class",
-        "prefix",
-        "recurring_class:",
-        "recurring_class:sr_catch_rate:correctness",
-        _recover_recurring_class,
-    ),
-    RegressionClassShape(
-        "strategic_cycle_stall",
-        "exact",
-        "strategic_cycle_stall",
-        "strategic_cycle_stall",
-        _recover_strategic_cycle_stall,
-    ),
-    RegressionClassShape(
-        "agent_vm_resource",
-        "exact",
-        "agent_vm_resource_exhaustion",
-        "agent_vm_resource_exhaustion",
-        _recover_agent_vm_resource,
-    ),
-    RegressionClassShape(
-        "low_prevention_rate_7d",
-        "exact",
-        "cross_layer_defense_prevention_low",
-        "cross_layer_defense_prevention_low",
-        _recover_prevention_low,
-    ),
-    RegressionClassShape(
-        "sr_catch_rate_below_floor",
-        "exact",
-        "sr_catch_rate_below_floor",
-        "sr_catch_rate_below_floor",
-        _recover_sr_below_floor,
-    ),
-    RegressionClassShape(
-        "sr_pass_engagement_thinning",
-        "exact",
-        "sr_pass_engagement_thinning",
-        "sr_pass_engagement_thinning",
-        _recover_sr_pass_engagement_thinning,
-    ),
-    RegressionClassShape(
-        "sr_false_attestation",
-        "exact",
-        "sr_false_attestation",
-        "sr_false_attestation",
-        _recover_sr_false_attestation,
-    ),
-    RegressionClassShape(
+    BuiltInSignalSpec(
         "fix_loop_divergence_fingerprint",
-        "prefix",
-        "fix_loop_divergence_fingerprint:",
-        "fix_loop_divergence_fingerprint:cov-test-fp",
-        _recover_fix_loop_divergence_fingerprint,
+        "fix_loop_divergence_fingerprint_signal",
+        "_evaluate_fix_loop_divergence_fingerprint_signal",
+        probe_kind="fix_loop_divergence_fingerprint",
+        recovery_shapes=(
+            RegressionClassShape(
+                "fix_loop_divergence_fingerprint",
+                "prefix",
+                "fix_loop_divergence_fingerprint:",
+                "fix_loop_divergence_fingerprint:cov-test-fp",
+                _recover_fix_loop_divergence_fingerprint,
+            ),
+        ),
     ),
-    RegressionClassShape(
+    BuiltInSignalSpec(
+        "pipeline_success_rate",
+        "pipeline_success_signal",
+        "_evaluate_pipeline_success_signal",
+        probe_kind="current_state",
+        probe_regression_class="pipeline_success_rate",
+        recovery_shapes=(
+            RegressionClassShape(
+                "pipeline_success_rate",
+                "exact",
+                "pipeline_success_rate",
+                "pipeline_success_rate",
+            ),
+        ),
+    ),
+    BuiltInSignalSpec(
+        "persistent_anomaly",
+        "anomaly_signal",
+        "_evaluate_anomaly_signal",
+        probe_kind="persistent_anomaly_collection",
+        recovery_shapes=(
+            RegressionClassShape(
+                "persistent_anomaly", "prefix", "anomaly:", "anomaly:cov-test"
+            ),
+        ),
+    ),
+    BuiltInSignalSpec(
+        "sr_blind_spot",
+        "sr_blind_spot_signal",
+        "_evaluate_sr_blind_spot_signal",
+        probe_kind="sr_blind_spot_any",
+        recovery_shapes=(
+            RegressionClassShape(
+                "sr_blind_spot",
+                "prefix",
+                "sr_blind_spot:theme:",
+                "sr_blind_spot:theme:flaky-async",
+            ),
+            RegressionClassShape(
+                "sr_blind_spot",
+                "prefix",
+                "sr_blind_spot:",
+                "sr_blind_spot:correctness",
+            ),
+        ),
+    ),
+    BuiltInSignalSpec(
+        "layer_concentration",
+        "layer_concentration_signal",
+        "_evaluate_layer_concentration_signal",
+        recovery_shapes=(
+            RegressionClassShape(
+                "layer_concentration",
+                "prefix",
+                "layer_concentration:",
+                f"layer_concentration:{LAYER_DISPLAY_ORDER[0]}",
+                _recover_layer_concentration,
+            ),
+        ),
+    ),
+    BuiltInSignalSpec(
+        "cross_case_fingerprint",
+        "cross_case_fingerprint_signal",
+        "_evaluate_cross_case_fingerprint_signal",
+        recovery_shapes=(
+            RegressionClassShape(
+                "cross_case_fingerprint",
+                "prefix",
+                "cross_case_fingerprint:",
+                "cross_case_fingerprint:deadbeef",
+                _recover_cross_case_fingerprint,
+            ),
+        ),
+    ),
+    BuiltInSignalSpec(
+        "recurring_class",
+        "recurring_class_signal",
+        "_evaluate_recurring_class_signal",
+        recovery_shapes=(
+            RegressionClassShape(
+                "recurring_class",
+                "prefix",
+                "recurring_class:",
+                "recurring_class:sr_catch_rate:correctness",
+                _recover_recurring_class,
+            ),
+        ),
+    ),
+    BuiltInSignalSpec(
+        "strategic_cycle_stall",
+        "strategic_cycle_stall_signal",
+        "_evaluate_strategic_cycle_stall_signal",
+        ("project_vision",),
+        "strategic_cycle_stall_any",
+        recovery_shapes=(
+            RegressionClassShape(
+                "strategic_cycle_stall",
+                "exact",
+                "strategic_cycle_stall",
+                "strategic_cycle_stall",
+                _recover_strategic_cycle_stall,
+            ),
+        ),
+    ),
+    BuiltInSignalSpec(
+        "telemetry_staleness",
+        "telemetry_staleness_signal",
+        "_evaluate_telemetry_staleness_signal",
+        ("project_design_doc",),
+        recovery_shapes=(
+            RegressionClassShape(
+                "telemetry_stale",
+                "prefix",
+                "telemetry_stale:",
+                "telemetry_stale:sr_catch_rate",
+            ),
+            RegressionClassShape(
+                "telemetry_never_sufficient",
+                "prefix",
+                "telemetry_never_sufficient:",
+                "telemetry_never_sufficient:sr_catch_rate",
+            ),
+            RegressionClassShape(
+                "telemetry_sufficiency_stale",
+                "prefix",
+                "telemetry_sufficiency_stale:",
+                "telemetry_sufficiency_stale:sr_catch_rate",
+            ),
+        ),
+    ),
+    BuiltInSignalSpec(
+        "viewport_regression",
+        "viewport_regression_signal",
+        "_evaluate_viewport_regression_signal",
+        probe_kind="viewport_regression_collection",
+        recovery_shapes=(
+            RegressionClassShape(
+                "viewport_regression",
+                "prefix",
+                "viewport_regression:",
+                "viewport_regression:DashboardHome:overflow@375",
+                _recover_viewport_regression,
+            ),
+        ),
+    ),
+    BuiltInSignalSpec(
+        "viewport_coverage_drop",
+        "viewport_coverage_drop_signal",
+        "_evaluate_viewport_coverage_drop_signal",
+        ("project_design_doc",),
+        "viewport_coverage_drop",
+        recovery_shapes=(
+            RegressionClassShape(
+                "viewport_coverage_drop",
+                "exact",
+                "viewport_coverage_drop",
+                "viewport_coverage_drop",
+                _recover_viewport_coverage_drop,
+            ),
+        ),
+    ),
+    BuiltInSignalSpec(
+        "reviewer_sla_stall",
+        "reviewer_sla_signal",
+        "_evaluate_reviewer_sla_signal",
+        recovery_shapes=(
+            RegressionClassShape(
+                "reviewer_sla_stall",
+                "prefix",
+                "reviewer_sla_stall:",
+                "reviewer_sla_stall:00000000-0000-0000-0000-000000000000",
+                _recover_reviewer_sla_stall,
+            ),
+        ),
+    ),
+    BuiltInSignalSpec(
+        "agent_vm_resource",
+        "agent_vm_resource_signal",
+        "_evaluate_agent_vm_resource_signal",
+        probe_kind="agent_vm_resource_count",
+        recovery_shapes=(
+            RegressionClassShape(
+                "agent_vm_resource",
+                "exact",
+                "agent_vm_resource_exhaustion",
+                "agent_vm_resource_exhaustion",
+                _recover_agent_vm_resource,
+            ),
+        ),
+    ),
+    BuiltInSignalSpec(
+        "low_prevention_rate_7d",
+        "low_prevention_rate_signal",
+        "_evaluate_low_prevention_rate_signal",
+        recovery_shapes=(
+            RegressionClassShape(
+                "low_prevention_rate_7d",
+                "exact",
+                "cross_layer_defense_prevention_low",
+                "cross_layer_defense_prevention_low",
+                _recover_prevention_low,
+            ),
+        ),
+    ),
+    BuiltInSignalSpec(
+        "sr_catch_rate_below_floor",
+        "sr_below_floor_signal",
+        "_evaluate_sr_below_floor_signal",
+        ("project_design_doc",),
+        recovery_shapes=(
+            RegressionClassShape(
+                "sr_catch_rate_below_floor",
+                "exact",
+                "sr_catch_rate_below_floor",
+                "sr_catch_rate_below_floor",
+                _recover_sr_below_floor,
+            ),
+        ),
+    ),
+    BuiltInSignalSpec(
+        "sr_pass_engagement_thinning",
+        "sr_pass_engagement_thinning_signal",
+        "_evaluate_sr_pass_engagement_thinning_signal",
+        ("project_design_doc",),
+        recovery_shapes=(
+            RegressionClassShape(
+                "sr_pass_engagement_thinning",
+                "exact",
+                "sr_pass_engagement_thinning",
+                "sr_pass_engagement_thinning",
+                _recover_sr_pass_engagement_thinning,
+            ),
+        ),
+    ),
+    BuiltInSignalSpec(
+        "sr_false_attestation",
+        "sr_false_attestation_signal",
+        "_evaluate_sr_false_attestation_signal",
+        ("project_design_doc",),
+        recovery_shapes=(
+            RegressionClassShape(
+                "sr_false_attestation",
+                "exact",
+                "sr_false_attestation",
+                "sr_false_attestation",
+                _recover_sr_false_attestation,
+            ),
+        ),
+    ),
+    BuiltInSignalSpec(
+        "background_service_crash",
+        None,
+        None,
+        recovery_shapes=(
+            RegressionClassShape(
+                "background_service_crash",
+                "prefix",
+                "background_service_crash:",
+                "background_service_crash:reaper",
+            ),
+        ),
+    ),
+    BuiltInSignalSpec(
         "observation_alert_sla",
-        "prefix",
-        "observation_alert_sla:",
-        "observation_alert_sla:Cross-layer backfill lag: stalled",
-        _recover_observation_alert_sla,
+        None,
+        None,
+        recovery_shapes=(
+            RegressionClassShape(
+                "observation_alert_sla",
+                "prefix",
+                "observation_alert_sla:",
+                "observation_alert_sla:Cross-layer backfill lag: stalled",
+                _recover_observation_alert_sla,
+            ),
+        ),
     ),
+)
+
+DISPATCH_BUILT_IN_SIGNAL_SPECS: tuple[BuiltInSignalSpec, ...] = tuple(
+    spec for spec in BUILT_IN_SIGNAL_SPECS if spec.dispatch_evaluator_name is not None
+)
+
+SPAWNABLE_REGRESSION_CLASS_SHAPES: tuple[RegressionClassShape, ...] = tuple(
+    shape for spec in BUILT_IN_SIGNAL_SPECS for shape in spec.recovery_shapes
+)
+
+_ALL_EVALUATOR_NAMES: tuple[str, ...] = tuple(
+    spec.evaluator_name
+    for spec in DISPATCH_BUILT_IN_SIGNAL_SPECS
+    if spec.evaluator_name is not None
 )
 
 

@@ -468,7 +468,7 @@ async def lifespan(app):
     # Start the Regression Recovery Scan (closes or re-arms MERGED cases)
     async def _regression_recovery_scan_service():
         """Periodic leader-only scan: re-evaluates MERGED regression cases."""
-        from app.pipeline_regression_dispatcher import run_recovery_once
+        from app.regression_recovery_watchdog import run_recovery_once
 
         _SCAN_INTERVAL = 300  # 5 minutes
         while True:
@@ -508,7 +508,7 @@ async def lifespan(app):
         ACTIVE thresholds run in 24h and MERGED in 6h, so a 30-minute cadence is
         more than enough to catch staleness without burning DB cycles.
         """
-        from app.pipeline_regression_dispatcher import run_watchdog_once
+        from app.regression_recovery_watchdog import run_watchdog_once
 
         _SCAN_INTERVAL = 1800  # 30 minutes
         while True:

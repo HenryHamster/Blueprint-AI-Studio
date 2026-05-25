@@ -19,7 +19,6 @@ import contextlib
 import contextvars
 import hashlib
 import logging
-import re
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -35,15 +34,11 @@ from app.deploy_health import (
 from app.models import (
     Alert,
     AlertSeverity,
-    CLOSE_REASON_RECOVERED_MARGINAL,
-    CLOSE_REASON_RECOVERED_UNATTENDED,
     DeploymentState,
     ESCALATION_REASON_ESCALATED_CROSS_CASE_FINGERPRINT,
     ESCALATION_REASON_ESCALATED_CROSS_LAYER,
     ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION,
     ESCALATION_REASON_ESCALATED_RECURRENCE,
-    ESCALATION_REASON_STALE_ACTIVE,
-    ESCALATION_REASON_STALE_MERGED,
     RegressionCaseStatus,
     RegressionRemediationCase,
     Task,
@@ -75,7 +70,12 @@ from app.regression_dispatcher_metrics import (  # noqa: F401
     compute_mtti_p50_sec,
     compute_untargeted_layers,
 )
-import app.shared_state as _shared_state
+from app.dispatcher_read_api import (  # noqa: F401
+    _REGRESSION_RECOVERY_COOLDOWN,
+    get_dispatcher_cycle_records,
+    get_regression_mtta_data,
+    get_sr_persistent_blind_spot_hint,
+)
 from app.shared_state import (
     runtime_config as _runtime_config,
     get_project_integration_branch as _get_project_integration_branch,
@@ -106,15 +106,33 @@ from app.dispatcher_formatters import (
     _parse_iso_timestamp,
     _parse_signal_timestamp,
 )
-from app.pipeline_health import (
+from app.pipeline_health import (  # noqa: F401
     _LONE_CHECKER_ALERT_TITLE,
     _evaluate_lone_checker_alert,
     _evaluate_sr_catch_rate_targets,
     compute_pipeline_health_summary,
 )
+from app.regression_recovery_watchdog import (  # noqa: F401
+    _auto_close_recovered_manual_intervention,
+    _run_compliance_followup_once,
+    run_dispatcher_watchdog_alarms,
+    run_recovery_once,
+    run_watchdog_once,
+)
+from app.regression_recovery_watchdog import (
+    _ensure_watchdog_alert_open,
+    _resolve_watchdog_alert,
+    _run_signal_staleness_watchdog,
+)
 from app.regression_recovery_evaluators import (  # noqa: F401
+    BuiltInSignalSpec,
+    BUILT_IN_SIGNAL_SPECS,
+    DISPATCH_BUILT_IN_SIGNAL_SPECS,
     RegressionClassShape,
     SPAWNABLE_REGRESSION_CLASS_SHAPES,
+    TelemetrySignalSpec,
+    TELEMETRY_SIGNAL_SPECS,
+    _ALL_EVALUATOR_NAMES,
     _recover_agent_vm_resource,
     _recover_cross_case_fingerprint,
     _recover_fix_loop_divergence_fingerprint,
@@ -129,7 +147,15 @@ from app.regression_recovery_evaluators import (  # noqa: F401
     _recover_strategic_cycle_stall,
     _recover_viewport_coverage_drop,
     _recover_viewport_regression,
+    _SIGNAL_STALENESS_WINDOWS,
+    _SR_CATCH_RATE_FROZEN_SIGNAL_FRESH_WINDOW,
+    _SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW,
+    get_telemetry_signal_spec,
     match_spawnable_shape,
+)
+from app.viewport_coverage import (  # noqa: F401
+    compute_viewport_coverage_snapshot,
+    update_viewport_coverage_snapshot_from_diff,
 )
 
 logger = logging.getLogger(__name__)
@@ -162,8 +188,6 @@ _MAX_DIRECTION_SR_SPAWNS_PER_CYCLE = 2
 # tasks in 24h is the same threshold operators use to mute "low signal" pages.
 _PIPELINE_SUCCESS_MIN_SAMPLE = 10
 
-# Give merged signals time to settle before the recovery scan re-evaluates them.
-_REGRESSION_RECOVERY_COOLDOWN = timedelta(minutes=15)
 _RECURRENCE_LOOKBACK = timedelta(days=30)
 
 # Watchdog staleness thresholds.  An ACTIVE case that hasn't been updated in
@@ -266,29 +290,6 @@ _STALENESS_ALERT_TITLE_PREFIX = "Dispatcher cycle staleness:"
 _ZERO_SPAWN_ALERT_TITLE_PREFIX = "Dispatcher zero-spawn streak:"
 _CROSS_LAYER_BACKFILL_ALERT_TITLE_PREFIX = "Cross-layer backfill lag:"
 _EVALUATOR_FAILURE_ALERT_TITLE_PREFIX = "Evaluator failure:"
-_ALL_EVALUATOR_NAMES: tuple[str, ...] = (
-    "sr_catch_rate_signal",
-    "sr_false_positive_signal",
-    "sr_catch_rate_direction_signals",
-    "fix_loop_divergence_signal",
-    "fix_loop_divergence_fingerprint_signal",
-    "pipeline_success_signal",
-    "anomaly_signal",
-    "sr_blind_spot_signal",
-    "layer_concentration_signal",
-    "cross_case_fingerprint_signal",
-    "recurring_class_signal",
-    "strategic_cycle_stall_signal",
-    "telemetry_staleness_signal",
-    "viewport_regression_signal",
-    "viewport_coverage_drop_signal",
-    "reviewer_sla_signal",
-    "agent_vm_resource_signal",
-    "low_prevention_rate_signal",
-    "sr_below_floor_signal",
-    "sr_pass_engagement_thinning_signal",
-    "sr_false_attestation_signal",
-)
 
 _ACTIVE_INVESTIGATE_STATUSES = (
     TaskStatus.QUEUED,
@@ -338,26 +339,6 @@ _cycle_rejections_var: contextvars.ContextVar[dict | None] = contextvars.Context
 # ``RegressionRemediationCase.signal_healthy_since_at`` (durable, per-case)
 # and read/written inside ``_auto_close_recovered_manual_intervention``.
 
-_SIGNAL_STALENESS_WINDOWS = {
-    "sr_catch_rate": timedelta(hours=48),
-    "fix_loop_divergence": timedelta(days=7),
-    "sr_blind_spot": timedelta(days=7),
-    "persistent_anomaly": timedelta(hours=48),
-    "deploy_health": timedelta(hours=6),
-    "ci_completion": timedelta(hours=6),
-}
-
-# SR catch-rate frozen-but-fresh detection window. When signal_last_computed_at is
-# recent (signal is still computing) but last_sufficient_computed_at is stale,
-# the metric is frozen (not accumulating new data). Alert faster than the general
-# staleness window to catch frozen-in-place metrics before 48h passes.
-_SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW = timedelta(hours=24)
-
-# Frozen-but-fresh sub-window: the signal heartbeat (signal_last_computed_at) must
-# be newer than this for the metric to count as "computing" when its
-# last_sufficient_computed_at has gone stale past the sufficiency window above.
-_SR_CATCH_RATE_FROZEN_SIGNAL_FRESH_WINDOW = timedelta(hours=6)
-
 # Per-project last cycle timestamp (monotonic). Updated in run_once finally
 # block even when run_once raises. Used by the staleness watchdog alarm.
 # An absent entry means no cycle has ever completed for this process boot.
@@ -383,212 +364,6 @@ _recovery_counts_var: contextvars.ContextVar[dict] = contextvars.ContextVar(
     "_recovery_counts",
     default=None,
 )
-
-
-async def _run_signal_staleness_watchdog(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    project_design_doc: dict[str, Any] | None,
-) -> int:
-    """Emit warning Alerts when a known signal source has stopped updating."""
-    doc = project_design_doc or {}
-    now = _utcnow()
-    specs: list[tuple[str, Any, timedelta]] = [
-        (
-            "sr_catch_rate",
-            (doc.get("sr_catch_rate_trends") or {}).get("last_sufficient_computed_at"),
-            _SIGNAL_STALENESS_WINDOWS["sr_catch_rate"],
-        ),
-        (
-            "fix_loop_divergence",
-            doc.get("fix_loop_divergence_signal_last_computed_at")
-            or doc.get("fix_loop_divergence_detected_at"),
-            _SIGNAL_STALENESS_WINDOWS["fix_loop_divergence"],
-        ),
-        (
-            "persistent_anomaly",
-            (
-                (_shared_state.persistent_anomalies.get(str(project_id)) or {}).get(
-                    "signal_last_computed_at"
-                )
-            ),
-            _SIGNAL_STALENESS_WINDOWS["persistent_anomaly"],
-        ),
-        (
-            "deploy_health",
-            _shared_state.deploy_monitoring.get("signal_last_computed_at"),
-            _SIGNAL_STALENESS_WINDOWS["deploy_health"],
-        ),
-        (
-            "sr_blind_spot",
-            doc.get("sr_blind_spot_signal_last_computed_at"),
-            _SIGNAL_STALENESS_WINDOWS["sr_blind_spot"],
-        ),
-    ]
-    created = 0
-    for signal_name, raw_ts, threshold in specs:
-        computed_at = _parse_iso_timestamp(raw_ts)
-        if computed_at is None or (now - computed_at) <= threshold:
-            continue
-        age = now - computed_at
-        title = f"Signal staleness: {signal_name}"
-        message = (
-            f"{signal_name} last computed {round(age.total_seconds() / 3600, 1)}h "
-            f"ago; freshness window is {round(threshold.total_seconds() / 3600, 1)}h."
-        )
-        existing = (
-            (
-                await session.execute(
-                    select(Alert).where(
-                        Alert.project_id == project_id,
-                        Alert.task_id.is_(None),
-                        Alert.severity == AlertSeverity.WARNING,
-                        Alert.dismissed_at.is_(None),
-                        Alert.title == title,
-                    )
-                )
-            )
-            .scalars()
-            .first()
-        )
-        if existing is None:
-            session.add(
-                Alert(
-                    project_id=project_id,
-                    severity=AlertSeverity.WARNING,
-                    title=title,
-                    message=message,
-                )
-            )
-            created += 1
-
-    # Detect frozen-but-fresh: signal is computing (signal_last_computed_at recent)
-    # but last_sufficient_computed_at is stale. The metric has frozen and stopped
-    # producing real data. Use a tighter window than general staleness to alert faster.
-    _sr_trends = doc.get("sr_catch_rate_trends") or {}
-    signal_ts = _sr_trends.get("signal_last_computed_at")
-    sufficient_ts = _sr_trends.get("last_sufficient_computed_at")
-    if signal_ts and sufficient_ts:
-        signal_at = _parse_iso_timestamp(signal_ts)
-        sufficient_at = _parse_iso_timestamp(sufficient_ts)
-        if (
-            signal_at is not None
-            and sufficient_at is not None
-            and (now - signal_at) <= _SR_CATCH_RATE_FROZEN_SIGNAL_FRESH_WINDOW  # fresh
-            and (now - sufficient_at) > _SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW
-        ):
-            title = "Signal frozen: sr_catch_rate"
-            age = now - sufficient_at
-            message = (
-                f"sr_catch_rate signal is computing (fresh heartbeat) but real data "
-                f"has not refreshed in {round(age.total_seconds() / 3600, 1)}h. "
-                f"The trend is frozen."
-            )
-            existing = (
-                (
-                    await session.execute(
-                        select(Alert).where(
-                            Alert.project_id == project_id,
-                            Alert.task_id.is_(None),
-                            Alert.severity == AlertSeverity.WARNING,
-                            Alert.dismissed_at.is_(None),
-                            Alert.title == title,
-                        )
-                    )
-                )
-                .scalars()
-                .first()
-            )
-            if existing is None:
-                session.add(
-                    Alert(
-                        project_id=project_id,
-                        severity=AlertSeverity.WARNING,
-                        title=title,
-                        message=message,
-                    )
-                )
-                created += 1
-
-    # Detect never-sufficient: signal has run (heartbeat present) but has never
-    # produced a real, well-sampled measurement (last_sufficient_computed_at absent).
-    if signal_ts and not sufficient_ts:
-        title = "Signal staleness: sr_catch_rate"
-        message = (
-            "sr_catch_rate has been computed but has never reached data sufficiency. "
-            "The metric is running but has not produced a real, well-sampled measurement."
-        )
-        existing = (
-            (
-                await session.execute(
-                    select(Alert).where(
-                        Alert.project_id == project_id,
-                        Alert.task_id.is_(None),
-                        Alert.severity == AlertSeverity.WARNING,
-                        Alert.dismissed_at.is_(None),
-                        Alert.title == title,
-                    )
-                )
-            )
-            .scalars()
-            .first()
-        )
-        if existing is None:
-            session.add(
-                Alert(
-                    project_id=project_id,
-                    severity=AlertSeverity.WARNING,
-                    title=title,
-                    message=message,
-                )
-            )
-            created += 1
-
-    return created
-
-
-async def get_dispatcher_cycle_records(
-    session: AsyncSession,
-    project_id: str | None = None,
-    limit: int = 100,
-    window_hours: int | None = None,
-) -> list[dict]:
-    """Return recent dispatcher cycle records from the durable table.
-
-    Reads from ``DispatcherCycleRecord``.  Optionally filters to one project
-    and/or a trailing window.  Results are returned oldest-first (matching
-    the deque-iteration order callers historically relied on).
-
-    On an empty table, returns ``[]`` — never raises — so the health
-    endpoint can render 'no data' on cold start.
-    """
-    from app.models import DispatcherCycleRecord
-
-    stmt = select(DispatcherCycleRecord)
-    if project_id is not None:
-        stmt = stmt.where(DispatcherCycleRecord.project_id == uuid.UUID(project_id))
-    if window_hours is not None:
-        cutoff = _utcnow() - timedelta(hours=window_hours)
-        stmt = stmt.where(DispatcherCycleRecord.cycle_started_at >= cutoff)
-    stmt = stmt.order_by(DispatcherCycleRecord.cycle_started_at.desc()).limit(limit)
-    rows = (await session.execute(stmt)).scalars().all()
-    # Return oldest-first to mirror the prior deque semantics.
-    rows = list(reversed(rows))
-    return [
-        {
-            "project_id": str(r.project_id),
-            "cycle_started_at": r.cycle_started_at.isoformat(),
-            "cycle_finished_at": r.cycle_finished_at.isoformat(),
-            "signals_evaluated": r.signals_evaluated or 0,
-            "signals_tripped": r.signals_tripped or 0,
-            "spawns_emitted": r.spawns_emitted or 0,
-            "rejections_by_reason": dict(r.rejections_by_reason or {}),
-            "mttd_p50_sec": r.mttd_p50_sec,
-            "marginal_recoveries_count": r.marginal_recoveries_count or 0,
-            "confirmed_recoveries_count": r.confirmed_recoveries_count or 0,
-        }
-        for r in rows
-    ]
 
 
 async def _prune_old_dispatcher_cycle_records(session: AsyncSession) -> int:
@@ -1228,56 +1003,66 @@ async def _current_signal_value_for_class(
 
     if regression_class.startswith("telemetry_never_sufficient:"):
         signal = regression_class[len("telemetry_never_sufficient:") :]
-        if signal == "sr_catch_rate":
-            doc = project_design_doc or {}
-            _sr_trends = doc.get("sr_catch_rate_trends") or {}
-            if not _sr_trends.get("signal_last_computed_at"):
-                return None
-            has_sufficient = bool(_sr_trends.get("last_sufficient_computed_at"))
-            suffix = "" if not has_sufficient else "now has"
-            return {
-                "signal_name": "telemetry_never_sufficient",
-                "prior_rate": None,
-                "current_rate": None,
-                "sample_size": 0,
-                "magnitude": 0.0,
-                "tripped": not has_sufficient,
-                "extras": [
-                    f"Signal '{signal}' has {suffix if suffix else 'not'} reached data sufficiency."
-                ],
-            }
-        return None
+        spec = get_telemetry_signal_spec(signal)
+        if spec is None or spec.never_sufficient_regression_class != regression_class:
+            return None
+        if spec.signal_heartbeat_at is None or spec.last_sufficient_at is None:
+            return None
+        doc = project_design_doc or {}
+        signal_ts = spec.signal_heartbeat_at(doc, project_id)
+        if not signal_ts:
+            return None
+        has_sufficient = bool(spec.last_sufficient_at(doc, project_id))
+        suffix = "" if not has_sufficient else "now has"
+        return {
+            "signal_name": "telemetry_never_sufficient",
+            "prior_rate": None,
+            "current_rate": None,
+            "sample_size": 0,
+            "magnitude": 0.0,
+            "tripped": not has_sufficient,
+            "extras": [
+                f"Signal '{signal}' has {suffix if suffix else 'not'} reached data sufficiency."
+            ],
+        }
 
     if regression_class.startswith("telemetry_sufficiency_stale:"):
         signal = regression_class[len("telemetry_sufficiency_stale:") :]
-        if signal == "sr_catch_rate":
-            doc = project_design_doc or {}
-            _sr_trends = doc.get("sr_catch_rate_trends") or {}
-            signal_ts = _sr_trends.get("signal_last_computed_at")
-            sufficient_ts = _sr_trends.get("last_sufficient_computed_at")
-            if not signal_ts or not sufficient_ts:
-                return None
-            signal_at = _parse_iso_timestamp(signal_ts)
-            sufficient_at = _parse_iso_timestamp(sufficient_ts)
-            now = _utcnow()
-            if signal_at is None or sufficient_at is None:
-                return None
-            is_fresh = (now - signal_at) <= _SR_CATCH_RATE_FROZEN_SIGNAL_FRESH_WINDOW
-            is_frozen = (now - sufficient_at) > _SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW
-            age = now - sufficient_at
-            return {
-                "signal_name": "telemetry_sufficiency_stale",
-                "prior_rate": None,
-                "current_rate": None,
-                "sample_size": 0,
-                "magnitude": round(age.total_seconds() / 3600, 2),
-                "tripped": is_fresh and is_frozen,
-                "extras": [
-                    f"Signal '{signal}' frozen: real data stale for "
-                    f"{round(age.total_seconds() / 3600, 1)}h but signal computing."
-                ],
-            }
-        return None
+        spec = get_telemetry_signal_spec(signal)
+        if spec is None or spec.sufficiency_stale_regression_class != regression_class:
+            return None
+        if spec.signal_heartbeat_at is None or spec.last_sufficient_at is None:
+            return None
+        doc = project_design_doc or {}
+        signal_ts = spec.signal_heartbeat_at(doc, project_id)
+        sufficient_ts = spec.last_sufficient_at(doc, project_id)
+        if not signal_ts or not sufficient_ts:
+            return None
+        signal_at = _parse_iso_timestamp(signal_ts)
+        sufficient_at = _parse_iso_timestamp(sufficient_ts)
+        now = _utcnow()
+        if (
+            signal_at is None
+            or sufficient_at is None
+            or spec.frozen_signal_fresh_window is None
+            or spec.sufficiency_stale_window is None
+        ):
+            return None
+        is_fresh = (now - signal_at) <= spec.frozen_signal_fresh_window
+        is_frozen = (now - sufficient_at) > spec.sufficiency_stale_window
+        age = now - sufficient_at
+        return {
+            "signal_name": "telemetry_sufficiency_stale",
+            "prior_rate": None,
+            "current_rate": None,
+            "sample_size": 0,
+            "magnitude": round(age.total_seconds() / 3600, 2),
+            "tripped": is_fresh and is_frozen,
+            "extras": [
+                f"Signal '{signal}' frozen: real data stale for "
+                f"{round(age.total_seconds() / 3600, 1)}h but signal computing."
+            ],
+        }
 
     if regression_class.startswith("background_service_crash:"):
         service = regression_class[len("background_service_crash:") :]
@@ -3783,111 +3568,6 @@ async def _evaluate_viewport_regression_signal(
     return spawned
 
 
-_VIEWPORT_ASSERTION_RE = re.compile(
-    r"(expectNoOverflowAt|expectNoTextTruncationAt|expectMinTouchTargetAt)\s*\("
-)
-_VIEWPORT_ESCAPE_HATCH_RE = re.compile(
-    r"data-viewport-allow-(overflow|truncation|small-target)"
-)
-_VIEWPORT_TEST_PATH_RE = re.compile(r"^admin-ui/src/.+\.viewport\.test\.[tj]sx?$")
-_COMPONENT_PATH_RE = re.compile(r"^admin-ui/src/components/[^/]+\.tsx$")
-
-
-def compute_viewport_coverage_snapshot(
-    diff_text: str, pr_number: int | None = None
-) -> dict:
-    """Compute a viewport_coverage_snapshot dict from a PR unified diff.
-
-    Counts expectNoOverflowAt / expectNoTextTruncationAt / expectMinTouchTargetAt
-    call sites in *.viewport.test.{ts,tsx} files, new data-viewport-allow-*
-    escape-hatch attributes in component files, and deleted component files.
-    Returns a dict suitable for project.design_doc["viewport_coverage_snapshot"].
-    """
-    assertion_before = 0
-    assertion_after = 0
-    escape_hatches = 0
-    removed_components: list[str] = []
-
-    in_viewport_test = False
-    in_component = False
-    current_path = ""
-
-    for line in diff_text.splitlines():
-        if line.startswith("diff --git "):
-            parts = line.split(" ")
-            # parts: ["diff", "--git", "a/path", "b/path"]
-            raw = parts[3] if len(parts) >= 4 else ""
-            current_path = raw[2:] if raw.startswith("b/") else raw
-            in_viewport_test = bool(_VIEWPORT_TEST_PATH_RE.match(current_path))
-            in_component = bool(_COMPONENT_PATH_RE.match(current_path))
-            continue
-
-        if line.startswith("deleted file mode") and _COMPONENT_PATH_RE.match(
-            current_path
-        ):
-            removed_components.append(current_path)
-            continue
-
-        if in_viewport_test:
-            if line.startswith("-") and not line.startswith("---"):
-                if _VIEWPORT_ASSERTION_RE.search(line):
-                    assertion_before += 1
-            elif line.startswith("+") and not line.startswith("+++"):
-                if _VIEWPORT_ASSERTION_RE.search(line):
-                    assertion_after += 1
-            else:
-                # context line — present on both sides
-                if _VIEWPORT_ASSERTION_RE.search(line):
-                    assertion_before += 1
-                    assertion_after += 1
-
-        if in_component and line.startswith("+") and not line.startswith("+++"):
-            if _VIEWPORT_ESCAPE_HATCH_RE.search(line):
-                escape_hatches += 1
-
-    return {
-        "assertion_count_before": assertion_before,
-        "assertion_count_after": assertion_after,
-        "new_escape_hatch_count": escape_hatches,
-        "removed_component_files": removed_components[:50],
-        "merged_pr": pr_number,
-    }
-
-
-async def update_viewport_coverage_snapshot_from_diff(
-    session: AsyncSession,
-    project: Any,
-    pr_number: int,
-    diff_text: str,
-) -> None:
-    """Write viewport_coverage_snapshot to project.design_doc.
-
-    Called by the PR-merge hook (rollup_management) each time a PR merges.
-    Skips silently when the project has no admin-ui directory in the diff.
-    """
-    from app.shared_state import with_design_doc_locked
-
-    if "admin-ui/" not in diff_text:
-        return
-
-    snap = compute_viewport_coverage_snapshot(diff_text, pr_number=pr_number)
-
-    def _mutate(doc: dict) -> None:
-        doc["viewport_coverage_snapshot"] = snap
-
-    await with_design_doc_locked(session, project.id, _mutate)
-    logger.info(
-        "[REGRESSION_DISPATCHER] viewport_coverage_snapshot updated "
-        "project=%s pr=%s before=%d after=%d escape_hatches=%d removed=%d",
-        project.id,
-        pr_number,
-        snap["assertion_count_before"],
-        snap["assertion_count_after"],
-        snap["new_escape_hatch_count"],
-        len(snap["removed_component_files"]),
-    )
-
-
 def _probe_viewport_coverage_drop(project_design_doc: dict | None) -> bool:
     """Side-effect-free probe: would viewport_coverage_drop trip right now?"""
     doc = project_design_doc or {}
@@ -4602,39 +4282,9 @@ def _get_staleness_raw_ts(
     project_id: uuid.UUID,
 ) -> tuple[Any, timedelta]:
     """Return (raw_timestamp_str, freshness_threshold) for a staleness-monitored signal."""
-    if signal_name == "sr_catch_rate":
-        _sr_trends = doc.get("sr_catch_rate_trends") or {}
-        raw = _sr_trends.get("last_sufficient_computed_at")
-    elif signal_name == "fix_loop_divergence":
-        raw = doc.get("fix_loop_divergence_signal_last_computed_at") or doc.get(
-            "fix_loop_divergence_detected_at"
-        )
-    elif signal_name == "persistent_anomaly":
-        raw = (_shared_state.persistent_anomalies.get(str(project_id)) or {}).get(
-            "signal_last_computed_at"
-        )
-    elif signal_name == "deploy_health":
-        raw = _shared_state.deploy_monitoring.get("signal_last_computed_at")
-    elif signal_name == "sr_blind_spot":
-        raw = doc.get("sr_blind_spot_signal_last_computed_at")
-    else:
-        raw = None
+    spec = get_telemetry_signal_spec(signal_name)
+    raw = spec.last_computed_at(doc, project_id) if spec is not None else None
     return raw, _SIGNAL_STALENESS_WINDOWS.get(signal_name, timedelta(hours=48))
-
-
-_TELEMETRY_STALENESS_SIGNALS: list[tuple[str, str]] = [
-    ("sr_catch_rate", "playbook_learning.compute_sr_catch_rate_trends"),
-    (
-        "fix_loop_divergence",
-        "fix_loop_telemetry (computed alongside task fix-loop history)",
-    ),
-    ("persistent_anomaly", "anomaly_detection (updated on task completion)"),
-    ("deploy_health", "deploy_health (updated on deploy events)"),
-    (
-        "sr_blind_spot",
-        "sr_blind_spots.compute_sr_blind_spot_themes (call on task completion)",
-    ),
-]
 
 
 async def _evaluate_telemetry_staleness_signal(
@@ -4655,20 +4305,20 @@ async def _evaluate_telemetry_staleness_signal(
     doc = project_design_doc or {}
     now = _utcnow()
     spawned = 0
-    for signal, source_module in _TELEMETRY_STALENESS_SIGNALS:
+    for spec in TELEMETRY_SIGNAL_SPECS:
         if spawned >= spawn_budget_left:
             break
-        raw_ts, threshold = _get_staleness_raw_ts(signal, doc, project_id)
+        raw_ts, threshold = _get_staleness_raw_ts(spec.signal_name, doc, project_id)
         computed_at = _parse_iso_timestamp(raw_ts)
         if computed_at is None or (now - computed_at) <= threshold:
             continue
         age = now - computed_at
-        regression_class = f"telemetry_stale:{signal}"
+        regression_class = f"telemetry_stale:{spec.signal_name}"
         prompt = "\n".join(
             [
-                f"Telemetry staleness: signal '{signal}' has not refreshed in {round(age.total_seconds() / 3600, 1)}h.",
+                f"Telemetry staleness: signal '{spec.signal_name}' has not refreshed in {round(age.total_seconds() / 3600, 1)}h.",
                 f"Last computed: {computed_at.isoformat()} (freshness window: {round(threshold.total_seconds() / 3600, 1)}h).",
-                f"This signal is computed by: {source_module}.",
+                f"This signal is computed by: {spec.source_module}.",
                 "",
                 "Diagnose why this signal stopped computing and ship a fix.",
                 "Produce the structured diagnosis JSON ({summary, root_cause, recommended_fix, severity, confidence, affected_files}).",
@@ -4685,14 +4335,14 @@ async def _evaluate_telemetry_staleness_signal(
             sample_size=0,
             magnitude=round(age.total_seconds() / 3600, 2),
             extras=[
-                f"Signal '{signal}' last computed {round(age.total_seconds() / 3600, 1)}h ago."
+                f"Signal '{spec.signal_name}' last computed {round(age.total_seconds() / 3600, 1)}h ago."
             ],
-            title_hint=f"telemetry staleness: {signal}",
+            title_hint=f"telemetry staleness: {spec.signal_name}",
             prompt_override=prompt,
             extra_snapshot_fields={
                 "signal_last_computed_at": computed_at.isoformat(),
                 "age_hours": round(age.total_seconds() / 3600, 1),
-                "source_module": source_module,
+                "source_module": spec.source_module,
             },
         )
         if spawn is not None:
@@ -4701,20 +4351,30 @@ async def _evaluate_telemetry_staleness_signal(
     # Detect frozen-but-fresh: signal is computing (fresh heartbeat) but real data
     # has not refreshed in the sufficiency-stale window. The metric is frozen.
     if spawned < spawn_budget_left:
-        _sr_trends = doc.get("sr_catch_rate_trends") or {}
-        signal_ts = _sr_trends.get("signal_last_computed_at")
-        sufficient_ts = _sr_trends.get("last_sufficient_computed_at")
-        if signal_ts and sufficient_ts:
+        sr_spec = get_telemetry_signal_spec("sr_catch_rate")
+        signal_ts = sr_spec.signal_heartbeat_at(doc, project_id) if sr_spec else None
+        sufficient_ts = sr_spec.last_sufficient_at(doc, project_id) if sr_spec else None
+        if (
+            sr_spec is not None
+            and sr_spec.signal_heartbeat_at is not None
+            and sr_spec.last_sufficient_at is not None
+            and signal_ts
+            and sufficient_ts
+        ):
             signal_at = _parse_iso_timestamp(signal_ts)
             sufficient_at = _parse_iso_timestamp(sufficient_ts)
             if (
                 signal_at is not None
                 and sufficient_at is not None
-                and (now - signal_at) <= _SR_CATCH_RATE_FROZEN_SIGNAL_FRESH_WINDOW
-                and (now - sufficient_at) > _SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW
+                and sr_spec.frozen_signal_fresh_window is not None
+                and sr_spec.sufficiency_stale_window is not None
+                and (now - signal_at) <= sr_spec.frozen_signal_fresh_window
+                and (now - sufficient_at) > sr_spec.sufficiency_stale_window
             ):
-                source_module = "playbook_learning.compute_sr_catch_rate_trends"
-                regression_class = "telemetry_sufficiency_stale:sr_catch_rate"
+                regression_class = (
+                    sr_spec.sufficiency_stale_regression_class
+                    or "telemetry_sufficiency_stale:sr_catch_rate"
+                )
                 age = now - sufficient_at
                 prompt = "\n".join(
                     [
@@ -4723,7 +4383,7 @@ async def _evaluate_telemetry_staleness_signal(
                         f"signal_last_computed_at: {signal_at.isoformat()} (fresh)",
                         f"last_sufficient_computed_at: {sufficient_at.isoformat()} "
                         f"({round(age.total_seconds() / 3600, 1)}h stale)",
-                        f"This signal is computed by: {source_module}.",
+                        f"This signal is computed by: {sr_spec.source_module}.",
                         "",
                         "The metric is running its computation cycle but failing to accumulate"
                         " sufficient data. Diagnose why new data is not flowing into the measurement.",
@@ -4753,7 +4413,7 @@ async def _evaluate_telemetry_staleness_signal(
                         "signal_last_computed_at": signal_at.isoformat(),
                         "last_sufficient_computed_at": sufficient_at.isoformat(),
                         "sufficiency_stale_hours": round(age.total_seconds() / 3600, 1),
-                        "source_module": source_module,
+                        "source_module": sr_spec.source_module,
                     },
                 )
                 if spawn is not None:
@@ -4762,18 +4422,26 @@ async def _evaluate_telemetry_staleness_signal(
     # Detect never-sufficient: sr_catch_rate has been running (heartbeat present)
     # but has never produced a real measurement (last_sufficient_computed_at absent).
     if spawned < spawn_budget_left:
-        _sr_trends = doc.get("sr_catch_rate_trends") or {}
-        signal_ts = _sr_trends.get("signal_last_computed_at")
-        sufficient_ts = _sr_trends.get("last_sufficient_computed_at")
-        if signal_ts and not sufficient_ts:
-            source_module = "playbook_learning.compute_sr_catch_rate_trends"
-            regression_class = "telemetry_never_sufficient:sr_catch_rate"
+        sr_spec = get_telemetry_signal_spec("sr_catch_rate")
+        signal_ts = sr_spec.signal_heartbeat_at(doc, project_id) if sr_spec else None
+        sufficient_ts = sr_spec.last_sufficient_at(doc, project_id) if sr_spec else None
+        if (
+            sr_spec is not None
+            and sr_spec.signal_heartbeat_at is not None
+            and sr_spec.last_sufficient_at is not None
+            and signal_ts
+            and not sufficient_ts
+        ):
+            regression_class = (
+                sr_spec.never_sufficient_regression_class
+                or "telemetry_never_sufficient:sr_catch_rate"
+            )
             prompt = "\n".join(
                 [
                     "Telemetry degenerate: signal 'sr_catch_rate' has been computed repeatedly"
                     " but has never reached data sufficiency.",
                     "signal_last_computed_at is set but last_sufficient_computed_at is absent.",
-                    f"This signal is computed by: {source_module}.",
+                    f"This signal is computed by: {sr_spec.source_module}.",
                     "",
                     "Diagnose why this signal never reaches data sufficiency and ship a fix.",
                     "Possible causes: sample size too small, no reviewer rejections in task"
@@ -4796,11 +4464,9 @@ async def _evaluate_telemetry_staleness_signal(
                 title_hint="telemetry never-sufficient: sr_catch_rate",
                 prompt_override=prompt,
                 extra_snapshot_fields={
-                    "signal_last_computed_at": _sr_trends.get(
-                        "signal_last_computed_at"
-                    ),
+                    "signal_last_computed_at": signal_ts,
                     "last_sufficient_computed_at": None,
-                    "source_module": source_module,
+                    "source_module": sr_spec.source_module,
                 },
             )
             if spawn is not None:
@@ -4812,8 +4478,8 @@ async def _evaluate_telemetry_staleness_signal(
 async def _evaluate_strategic_cycle_stall_signal(
     session: AsyncSession,
     project_id: uuid.UUID,
+    project_vision: dict | None,
     spawn_budget_left: int,
-    project_vision: dict | None = None,
 ) -> int:
     """Trip strategic_cycle_stall when no strategic task completed in stall window.
 
@@ -4902,275 +4568,6 @@ async def _evaluate_strategic_cycle_stall_signal(
         ),
     )
     return 1 if spawn is not None else 0
-
-
-async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int:
-    """Re-evaluate merged regression cases and close or re-arm them."""
-    from app.models import Project
-
-    project = await session.get(Project, project_id)
-    if project is None:
-        return 0
-
-    now = _utcnow()
-    rows = (
-        (
-            await session.execute(
-                select(RegressionRemediationCase).where(
-                    RegressionRemediationCase.project_id == project_id,
-                    RegressionRemediationCase.status == RegressionCaseStatus.MERGED,
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    changed = 0
-    for case in rows:
-        snapshot = case.signal_snapshot_at_merge or {}
-        merged_at_raw = snapshot.get("captured_at") or case.updated_at.isoformat()
-        try:
-            merged_at = datetime.fromisoformat(
-                str(merged_at_raw).replace("Z", "+00:00")
-            )
-        except ValueError:
-            merged_at = case.updated_at
-        if merged_at.tzinfo is not None:
-            merged_at = merged_at.replace(tzinfo=None)
-        if now < merged_at + _REGRESSION_RECOVERY_COOLDOWN:
-            continue
-        # Guard the per-case signal re-derivation (and re-arm bookkeeping) so a
-        # single class that raises while being evaluated cannot abort the whole
-        # project's recovery scan and strand every other MERGED case. Mirrors
-        # the try/except wrapping the post-loop observation helpers below.
-        try:
-            state = await _current_signal_value_for_class(
-                session,
-                project_id,
-                case.regression_class,
-                project.design_doc,
-            )
-            if state is None:
-                continue
-            if not state["tripped"]:
-                # Verify the fix PR's merge commit is a confirmed ancestor of the
-                # integration branch before treating the case as recovered.  A rollup
-                # child PR merged only to a staging branch has NOT yet landed on the
-                # integration branch; closing the case would suppress re-spawning while
-                # the regression is still live.  Fail-open (proceed) when credentials
-                # are unavailable, the API returns None, or any error occurs; skip ONLY
-                # on a definitive False (commit confirmed unreachable from the branch).
-                _fix_pr_num = case.last_remediation_pr_number
-                if _fix_pr_num is not None:
-                    try:
-                        from app.github import (
-                            get_pull_request as _rr_get_pr,
-                            get_repo_installation_token as _rr_get_token,
-                            is_ancestor_of as _rr_is_ancestor,
-                        )
-
-                        if project.github_owner and project.github_repo:
-                            _rr_token = await _rr_get_token(
-                                project.github_owner, project.github_repo
-                            )
-                            if _rr_token:
-                                _rr_pr_data = await _rr_get_pr(
-                                    _rr_token,
-                                    project.github_owner,
-                                    project.github_repo,
-                                    _fix_pr_num,
-                                    project_id=str(project_id),
-                                )
-                                _rr_merge_sha = (_rr_pr_data or {}).get(
-                                    "merge_commit_sha"
-                                )
-                                if _rr_merge_sha:
-                                    _rr_branch = _get_project_integration_branch(
-                                        project
-                                    )
-                                    _rr_is_anc = await _rr_is_ancestor(
-                                        _rr_token,
-                                        project.github_owner,
-                                        project.github_repo,
-                                        _rr_merge_sha,
-                                        _rr_branch,
-                                        project_id=str(project_id),
-                                    )
-                                    if _rr_is_anc is not True:
-                                        logger.info(
-                                            "[REGRESSION_DISPATCHER] Skipping close for "
-                                            "project=%s class=%s: fix PR #%s merge commit "
-                                            "%s not confirmed ancestor of %s "
-                                            "(result=%s — indeterminate treated as not landed)",
-                                            project_id,
-                                            case.regression_class,
-                                            _fix_pr_num,
-                                            _rr_merge_sha,
-                                            _rr_branch,
-                                            _rr_is_anc,
-                                        )
-                                        continue
-                    except Exception as _rr_exc:
-                        logger.warning(
-                            "[REGRESSION_DISPATCHER] Ancestry check skipped for "
-                            "project=%s class=%s PR #%s: %s — proceeding with close",
-                            project_id,
-                            case.regression_class,
-                            _fix_pr_num,
-                            _rr_exc,
-                        )
-                mismatch_entry = _compute_recovery_layer_mismatch(
-                    case.fingerprint_to_fix_log, case.symptoms_by_layer, now
-                )
-                case.mark_closed()
-                # Reset the recovery clock so a future re-escalation does not
-                # pick up a stale healthy_since on the same row (mirrors the
-                # prior process-local ``_signal_healthy_since.pop`` semantics).
-                case.signal_healthy_since_at = None
-                new_entries: list[dict[str, Any]] = [
-                    {
-                        "fingerprint": case.regression_class,
-                        "recovered_at": now.isoformat(),
-                        "post_merge_value": state["current_rate"],
-                    }
-                ]
-                if mismatch_entry:
-                    new_entries.append(mismatch_entry)
-                case.fingerprint_to_fix_log = (
-                    list(case.fingerprint_to_fix_log or []) + new_entries
-                )
-            else:
-                last_spawn = await _last_spawn_for_class(
-                    session, project_id, case.regression_class
-                )
-                if last_spawn is not None and last_spawn.created_at:
-                    last_at = last_spawn.created_at
-                    if last_at.tzinfo is not None:
-                        last_at = last_at.replace(tzinfo=None)
-                    if now < last_at + _REGRESSION_COOLDOWN:
-                        logger.info(
-                            "[REGRESSION_DISPATCHER] recovery-rearm-cooldown-deferred "
-                            "project=%s class=%s last_spawn=%s cooldown_until=%s",
-                            project_id,
-                            case.regression_class,
-                            last_at.isoformat(),
-                            (last_at + _REGRESSION_COOLDOWN).isoformat(),
-                        )
-                        continue
-                # Recovery-scan re-arm: a MERGED case whose signal re-tripped
-                # honors the 6h class-level cooldown (see guard above). Pass
-                # fast_track=False so the dispatcher does not bypass that cooldown
-                # — the post-merge signal needs time to settle, not an immediate
-                # re-investigation. Failure-driven re-arm (task_lifecycle hook)
-                # uses the default fast_track=True to opt into the bypass.
-                case.re_arm(fast_track=False)
-                # Re-armed cases start a fresh recovery clock — do not let a
-                # stale healthy_since from a prior lifecycle short-circuit the
-                # auto-close stable window after a future escalation.
-                case.signal_healthy_since_at = None
-            session.add(case)
-            changed += 1
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[REGRESSION_DISPATCHER] recovery evaluation raised for "
-                "project=%s class=%s — skipping this case: %s",
-                project_id,
-                case.regression_class,
-                exc,
-            )
-            continue
-    if changed:
-        await session.commit()
-
-    # Opportunistic backfill: populate layers_targeted on any fix-log entries
-    # that lack it. Bounded per tick; GitHub failures are logged and skipped.
-    try:
-        await _backfill_layers_targeted_once(session, project_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "[REGRESSION_DISPATCHER] layers_targeted backfill raised for project=%s: %s",
-            project_id,
-            exc,
-        )
-
-    # Non-spawning observation: open a WARNING alert when the path-based
-    # layer classifier is increasingly returning [] across recently-merged
-    # fix-log entries. Wrapped in try/except so a transient failure here
-    # cannot break the rest of the recovery scan.
-    try:
-        await _evaluate_path_classifier_coverage(session, project_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "[REGRESSION_DISPATCHER] path-classifier coverage evaluation raised "
-            "for project=%s: %s",
-            project_id,
-            exc,
-        )
-
-    # Non-spawning observation: open a WARNING alert when the cross-layer
-    # awaiting_backfill backlog stops draining (count past 24h grace exceeds
-    # threshold OR the oldest entry is older than age threshold). Wrapped in
-    # try/except so a transient failure here cannot break the rest of the
-    # recovery scan.
-    try:
-        await _evaluate_awaiting_backfill_alert(session, project_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "[REGRESSION_DISPATCHER] awaiting_backfill alert evaluation raised "
-            "for project=%s: %s",
-            project_id,
-            exc,
-        )
-
-    # Non-spawning observation: open a WARNING alert when >=2 SR categories
-    # have entered lone-checker state (SR is the only reviewer, catch-rate
-    # unmeasurable). Wrapped in try/except for the same reason as above.
-    try:
-        await _evaluate_lone_checker_alert(session, project_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "[REGRESSION_DISPATCHER] lone-checker alert evaluation raised "
-            "for project=%s: %s",
-            project_id,
-            exc,
-        )
-
-    # Non-spawning observation: emit/dismiss WARNING alerts when SR catch-rate
-    # for any configured category falls below the project's per-category target
-    # for >=2 consecutive windows. Same try/except pattern.
-    try:
-        await _evaluate_sr_catch_rate_targets(session, project_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "[REGRESSION_DISPATCHER] sr_catch_rate_targets alert evaluation "
-            "raised for project=%s: %s",
-            project_id,
-            exc,
-        )
-
-    try:
-        await _run_compliance_followup_once(session, project_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "[REGRESSION_DISPATCHER] compliance-followup raised for project=%s: %s",
-            project_id,
-            exc,
-        )
-
-    # Second-stage escalation: promote observation-only alerts that have been
-    # open past SLA into RegressionRemediationCases with investigate tasks so
-    # the autonomous loop can remediate the underlying condition.
-    try:
-        await _escalate_stale_observation_alerts(session, project_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "[REGRESSION_DISPATCHER] observation-alert SLA escalation raised "
-            "for project=%s: %s",
-            project_id,
-            exc,
-        )
-
-    return changed
 
 
 async def _evaluate_anomaly_signal(
@@ -5494,749 +4891,94 @@ async def _spawn_auto_escalation_meta_investigate(
     return new_task
 
 
-async def _persist_recovery_cycle_record(
+def _dispatch_signal_context_value(
+    key: str,
+    project_design_doc: dict | None,
+    project_vision: dict | None,
+) -> Any:
+    if key == "project_design_doc":
+        return project_design_doc
+    if key == "project_vision":
+        return project_vision
+    raise ValueError(f"unknown dispatch signal context key: {key}")
+
+
+async def _invoke_dispatch_signal_evaluator(
+    spec: BuiltInSignalSpec,
     session: AsyncSession,
     project_id: uuid.UUID,
-    cycle_started_at: datetime,
-    marginal_closed: int,
-    confirmed_closed: int,
-) -> None:
-    """Persist a recovery cycle record with marginal/confirmed recovery counts."""
-    from app.models import DispatcherCycleRecord
-
-    try:
-        session.add(
-            DispatcherCycleRecord(
-                project_id=project_id,
-                cycle_started_at=cycle_started_at,
-                cycle_finished_at=_utcnow(),
-                signals_evaluated=0,
-                signals_tripped=0,
-                spawns_emitted=0,
-                rejections_by_reason={},
-                marginal_recoveries_count=marginal_closed,
-                confirmed_recoveries_count=confirmed_closed,
-            )
-        )
-        await session.commit()
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "[REGRESSION_WATCHDOG] recovery-cycle-record write failed",
-            exc_info=True,
-        )
-        try:
-            await session.rollback()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-async def _check_marginal_recovery_rate_threshold(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-) -> None:
-    """Check if marginal recovery rate exceeds threshold for >=2 consecutive cycles.
-
-    If both the last 2 recovery cycles have marginal_rate > threshold (default 0.30),
-    emit a WARNING alert.
-    """
-    threshold = float(
-        _runtime_config.get("marginal_recovery_rate_threshold", 0.30) or 0.30
-    )
-    records = await get_dispatcher_cycle_records(
-        session,
-        project_id=str(project_id),
-        limit=2,
-    )
-    if len(records) < 2:
-        return
-
-    rates = []
-    for rec in records[-2:]:
-        marginal = rec.get("marginal_recoveries_count", 0)
-        confirmed = rec.get("confirmed_recoveries_count", 0)
-        total = marginal + confirmed
-        if total > 0:
-            rates.append(marginal / total)
-        else:
-            rates.append(0.0)
-
-    if len(rates) == 2 and all(r > threshold for r in rates):
-        session.add(
-            Alert(
-                project_id=project_id,
-                severity=AlertSeverity.WARNING,
-                title="High marginal recovery rate threshold exceeded"[:200],
-                message=(
-                    f"Marginal recovery rate exceeded {threshold:.0%} "
-                    f"for {len(rates)} consecutive cycles. "
-                    f"Rates: {[f'{r:.1%}' for r in rates]}. "
-                    f"May indicate fixes that do not fully address root causes."
-                )[:1000],
-            )
-        )
-        await session.commit()
-
-
-async def run_watchdog_once(session: AsyncSession, project_id: uuid.UUID) -> int:
-    """Escalate stale ACTIVE/MERGED cases and auto-close recovered NMI cases.
-
-    Two-pass scan:
-    - ACTIVE cases not updated in 24h or MERGED cases not updated in 6h are
-      escalated to NEEDS_MANUAL_INTERVENTION with an operator-visible Alert.
-    - NEEDS_MANUAL_INTERVENTION cases whose underlying signal has organically
-      stayed below threshold for ``regression_recovered_unattended_window_hours``
-      are auto-closed as ``recovered_unattended`` so the operator queue
-      reflects only escalations that genuinely still need attention.
-
-    Returns the total number of cases mutated this tick (escalated + auto-closed).
-    """
-    cycle_started_at = _utcnow()
-    _recovery_counts = {"marginal": 0, "confirmed": 0}
-    _token = _recovery_counts_var.set(_recovery_counts)
-    mutated = 0
-    marginal_closed = 0
-    confirmed_closed = 0
-    try:
-        now = _utcnow()
-        rows = (
-            (
-                await session.execute(
-                    select(RegressionRemediationCase).where(
-                        RegressionRemediationCase.project_id == project_id,
-                        RegressionRemediationCase.status.in_(
-                            [
-                                RegressionCaseStatus.ACTIVE,
-                                RegressionCaseStatus.MERGED,
-                            ]
-                        ),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-
-        for case in rows:
-            try:
-                updated = case.updated_at
-                if updated.tzinfo is not None:
-                    updated = updated.replace(tzinfo=None)
-
-                if case.status == RegressionCaseStatus.ACTIVE:
-                    threshold = _WATCHDOG_ACTIVE_STALE_THRESHOLD
-                    reason = "ACTIVE case stale — investigation may have finished with low confidence and no remediation was spawned"
-                    escalation_reason = ESCALATION_REASON_STALE_ACTIVE
-                else:  # MERGED
-                    threshold = _WATCHDOG_MERGED_STALE_THRESHOLD
-                    reason = (
-                        "MERGED case stale — recovery scan did not auto-close it "
-                        "within the staleness window. The underlying signal is most "
-                        "likely still tripped while the case is in re-arm cooldown, "
-                        "or a transient evaluation error skipped the case on recent "
-                        "recovery ticks."
-                    )
-                    escalation_reason = ESCALATION_REASON_STALE_MERGED
-
-                if now < updated + threshold:
-                    continue
-
-                # ACTIVE-stale auto-escalation: if the original investigation child is
-                # still running and we have not yet auto-escalated this case, give the
-                # autonomous loop ONE more attempt — spawn a meta-investigate task
-                # focused on the remediation BLOCKER (merge conflicts, reviewer/CI
-                # disagreement, leader-death cascade) and let the 24h window restart
-                # from the auto-escalation moment. `auto_escalation_count` is the
-                # cooldown gate (capped at 1 — the next stale tick goes straight to
-                # NMI). We scope the meta task with `signal_name=auto_escalation_meta_investigate`
-                # so the existing _last_spawn_for_class cooldown — keyed on
-                # (spawned_by, regression_class) — does not block the meta-investigate;
-                # `_in_flight_for_class` likewise dedups on regression_class, but here
-                # we deliberately want a peer task running alongside the original
-                # investigation, so we bypass _maybe_spawn entirely and emit the
-                # task/history/alert inline.
-                if (
-                    case.status == RegressionCaseStatus.ACTIVE
-                    and (case.auto_escalation_count or 0) == 0
-                ):
-                    child_alive = await _has_active_remediation_child(session, case)
-                    if child_alive:
-                        meta_task = await _spawn_auto_escalation_meta_investigate(
-                            session, project_id, case
-                        )
-                        case.auto_escalation_count = (
-                            case.auto_escalation_count or 0
-                        ) + 1
-                        case.last_remediation_task_id = meta_task.id
-                        case.updated_at = now
-                        session.add(case)
-                        logger.info(
-                            "[REGRESSION_WATCHDOG] auto-escalate project=%s class=%s "
-                            "meta_task=%s (one-shot, count=1)",
-                            project_id,
-                            case.regression_class,
-                            meta_task.id,
-                        )
-                        mutated += 1
-                        continue
-
-                logger.warning(
-                    "[REGRESSION_WATCHDOG] stale-%s project=%s class=%s updated_at=%s "
-                    "threshold_hours=%s — escalating to NEEDS_MANUAL_INTERVENTION",
-                    case.status,
-                    project_id,
-                    case.regression_class,
-                    updated.isoformat(),
-                    threshold.total_seconds() / 3600,
-                )
-                case.status = RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION
-                case.needs_manual_intervention_at = now
-                case.escalation_reason = escalation_reason
-                session.add(case)
-                session.add(
-                    Alert(
-                        project_id=project_id,
-                        severity=AlertSeverity.WARNING,
-                        title=f"Regression case stalled: {case.regression_class}"[:200],
-                        message=(
-                            f"{reason}. Case last updated {updated.isoformat()}; "
-                            f"staleness threshold {threshold}. Manual review required."
-                        )[:1000],
-                    )
-                )
-                mutated += 1
-            except Exception as _case_exc:  # noqa: BLE001
-                logger.warning(
-                    "[REGRESSION_WATCHDOG] error processing case project=%s class=%s: %s",
-                    project_id,
-                    getattr(case, "regression_class", "<unknown>"),
-                    _case_exc,
-                )
-                continue
-
-        if mutated:
-            await session.commit()
-
-        (
-            marginal_closed,
-            confirmed_closed,
-        ) = await _auto_close_recovered_manual_intervention(session, project_id)
-        _recovery_counts["marginal"] = marginal_closed
-        _recovery_counts["confirmed"] = confirmed_closed
-        return mutated + marginal_closed + confirmed_closed
-    finally:
-        _recovery_counts_var.reset(_token)
-        if marginal_closed or confirmed_closed:
-            await _persist_recovery_cycle_record(
-                session, project_id, cycle_started_at, marginal_closed, confirmed_closed
-            )
-            await _check_marginal_recovery_rate_threshold(session, project_id)
-
-
-async def _auto_close_recovered_manual_intervention(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-) -> tuple[int, int]:
-    """Auto-close NEEDS_MANUAL_INTERVENTION cases whose signal has recovered.
-
-    Re-evaluates each case's underlying signal via ``_current_signal_value_for_class``
-    and persists the first-healthy moment on
-    ``RegressionRemediationCase.signal_healthy_since_at``.  Once the case has
-    been continuously healthy for the configured stable window, transitions
-    to CLOSED with ``last_remediation_result = 'recovered_unattended'`` and
-    emits a single INFO Alert.  The stable window therefore survives worker
-    restarts — a worker that drops mid-window does not let the next worker
-    reset the clock.
-
-    Race protection: each candidate row is re-acquired with
-    ``with_for_update(skip_locked=True)`` and the status is re-checked under the
-    lock so the operator ``Clear`` button (which transitions back to ACTIVE) can't
-    race against this auto-close pass into a double-write.
-
-    Returns: tuple of (marginal_recoveries_count, confirmed_recoveries_count)
-    """
-    from app.models import Project
-
-    # populate_existing: a caller that left a partial Project (e.g. via
-    # ``load_only(Project.id)``) in the session identity map would otherwise
-    # return that cached partial here, and the ``design_doc`` access below
-    # would fire a sync lazy-load in async context. See ``run_once``.
-    project = await session.get(Project, project_id, populate_existing=True)
-    if project is None:
-        return 0, 0
-    design_doc = project.design_doc
-
-    candidate_rows = (
-        await session.execute(
-            select(
-                RegressionRemediationCase.id,
-                RegressionRemediationCase.regression_class,
-            ).where(
-                RegressionRemediationCase.project_id == project_id,
-                RegressionRemediationCase.status
-                == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
-            )
-        )
-    ).all()
-    if not candidate_rows:
-        return 0, 0
-
-    window_hours = int(
-        _runtime_config.get("regression_recovered_unattended_window_hours", 24) or 24
-    )
-    window = timedelta(hours=window_hours)
-    now = _utcnow()
-    marginal_closed = 0
-    confirmed_closed = 0
-    mutated_rows = 0
-    for case_id, _candidate_class in candidate_rows:
-        locked = (
-            await session.execute(
-                select(RegressionRemediationCase)
-                .where(
-                    RegressionRemediationCase.id == case_id,
-                    RegressionRemediationCase.status
-                    == RegressionCaseStatus.NEEDS_MANUAL_INTERVENTION,
-                )
-                .with_for_update(skip_locked=True)
-            )
-        ).scalar_one_or_none()
-        # Row is held by a peer (operator clear, parallel watchdog) or its
-        # status changed between the candidate scan and the lock. Skip;
-        # no marker mutation needed because the column lives on the row
-        # whose status will dictate the next-tick behavior.
-        if locked is None:
-            continue
-
-        state = await _current_signal_value_for_class(
-            session, project_id, locked.regression_class, design_doc
-        )
-        # state is None means telemetry is missing for this class (e.g. empty
-        # design_doc) — treat as 'unknown' rather than 'healthy' so a case we
-        # cannot evaluate does not silently retire after the stable window.
-        if state is None:
-            continue
-        if state.get("tripped"):
-            # Signal tripped again — reset the recovery clock so any future
-            # healthy run starts the stable-window timer from scratch.
-            if locked.signal_healthy_since_at is not None:
-                locked.signal_healthy_since_at = None
-                session.add(locked)
-                mutated_rows += 1
-            continue
-
-        if locked.signal_healthy_since_at is None:
-            locked.signal_healthy_since_at = now
-            session.add(locked)
-            mutated_rows += 1
-            first_healthy = now
-        else:
-            first_healthy = locked.signal_healthy_since_at
-        if now - first_healthy < window:
-            continue
-
-        post_value = state.get("current_rate")
-
-        # Determine if the recovery is marginal by comparing the pre-fix signal
-        # value (stored at merge time) with the current post-fix value. The
-        # polarity (which direction is "improvement") depends on the signal:
-        # sr_catch_rate and pipeline_success_rate are higher-is-better;
-        # divergence/blind-spot/anomaly counts are lower-is-better.
-        pre_value = (locked.signal_snapshot_at_merge or {}).get("current_rate")
-        close_reason = CLOSE_REASON_RECOVERED_UNATTENDED
-        alert_severity = AlertSeverity.INFO
-        marginal = False
-        if isinstance(pre_value, (int, float)) and isinstance(post_value, (int, float)):
-            higher_is_better = _signal_higher_is_better(locked.regression_class)
-            improvement = (
-                post_value - pre_value if higher_is_better else pre_value - post_value
-            )
-            # Reference magnitude for the relative-improvement ratio is the
-            # pre-fix value's distance from the "best" end of the scale. For
-            # higher-is-better signals like a hit-rate, recovering from 0.40
-            # toward 1.0 has a 0.60 headroom — using pre_value (0.40) as the
-            # denominator would overstate the relative improvement.
-            if higher_is_better:
-                reference = max(1.0 - pre_value, 0.0)
-            else:
-                reference = pre_value if pre_value > 0 else 0.0
-            rel_floor = float(
-                _runtime_config.get(
-                    "regression_recovered_marginal_relative_floor", 0.10
-                )
-                or 0.10
-            )
-            abs_floor = float(
-                _runtime_config.get(
-                    "regression_recovered_marginal_absolute_floor", 0.05
-                )
-                or 0.05
-            )
-            if improvement <= 0:
-                # Signal did not improve (or got worse) despite not tripping.
-                marginal = True
-            else:
-                rel_improvement = (
-                    improvement / reference if reference > 0 else float("inf")
-                )
-                if rel_improvement < rel_floor and improvement < abs_floor:
-                    marginal = True
-            if marginal:
-                close_reason = CLOSE_REASON_RECOVERED_MARGINAL
-                alert_severity = AlertSeverity.WARNING
-        elif pre_value is not None or post_value is not None:
-            # Snapshot exists but does not carry numeric metrics we can compare
-            # — operators should be able to see this in logs (otherwise it is
-            # indistinguishable from a confirmed clean recovery).
-            logger.info(
-                "[REGRESSION_WATCHDOG] snapshot-missing project=%s class=%s "
-                "pre_value=%r post_value=%r — falling back to %s without "
-                "magnitude check",
-                project_id,
-                locked.regression_class,
-                pre_value,
-                post_value,
-                CLOSE_REASON_RECOVERED_UNATTENDED,
-            )
-
-        watchdog_mismatch = _compute_recovery_layer_mismatch(
-            locked.fingerprint_to_fix_log, locked.symptoms_by_layer, now
-        )
-        locked.mark_closed()
-        locked.last_remediation_result = close_reason
-        watchdog_entries: list[dict[str, Any]] = [
-            {
-                "fingerprint": locked.regression_class,
-                "recovered_at": now.isoformat(),
-                "post_recovery_value": post_value,
-                "reason": close_reason,
-            }
-        ]
-        if watchdog_mismatch:
-            watchdog_entries.append(watchdog_mismatch)
-        locked.fingerprint_to_fix_log = (
-            list(locked.fingerprint_to_fix_log or []) + watchdog_entries
-        )
-        # Cleared on close so the column never carries a stale value across
-        # case lifecycles — mirrors the prior process-local ``.pop()`` calls.
-        locked.signal_healthy_since_at = None
-        session.add(locked)
-        if marginal:
-            alert_title = f"Regression marginal recovery: {locked.regression_class}"[
-                :200
-            ]
-            alert_message = (
-                f"NEEDS_MANUAL_INTERVENTION case for '{locked.regression_class}' "
-                f"auto-closed with marginal improvement: pre-fix={pre_value}, "
-                f"post-fix={post_value}. Signal likely to re-trip."
-            )[:1000]
-        else:
-            alert_title = f"Regression auto-recovered: {locked.regression_class}"[:200]
-            alert_message = (
-                f"NEEDS_MANUAL_INTERVENTION case for '{locked.regression_class}' "
-                f"auto-closed: underlying signal stayed below threshold for "
-                f"{window_hours}h without operator action."
-            )[:1000]
-        session.add(
-            Alert(
-                project_id=project_id,
-                severity=alert_severity,
-                title=alert_title,
-                message=alert_message,
-            )
-        )
-        # Spawn follow-up investigation for marginal recoveries so the
-        # autonomous loop diagnoses inadequate fixes proactively.
-        if marginal and bool(
-            _runtime_config.get("regression_marginal_followup_enabled", True)
-        ):
-            followup_cooldown_hours = int(
-                _runtime_config.get("regression_marginal_followup_cooldown_hours", 72)
-                or 72
-            )
-            # Cooldown anchor lives on the row column so it survives any future
-            # fix-log restructuring and is index-friendly. Strip tz for the
-            # comparison since the column is stored as naive UTC.
-            last_followup_at = locked.marginal_followup_spawned_at
-            if last_followup_at is not None and last_followup_at.tzinfo is not None:
-                last_followup_at = last_followup_at.replace(tzinfo=None)
-            if last_followup_at is None or now - last_followup_at >= timedelta(
-                hours=followup_cooldown_hours
-            ):
-                # Build layer-history summary from prior spawn log entries.
-                _seen_layers: list[str] = []
-                for _e in locked.fingerprint_to_fix_log or []:
-                    if isinstance(_e, dict):
-                        for _layer in _e.get("spawn_layers_enumerated") or []:
-                            if _layer not in _seen_layers:
-                                _seen_layers.append(_layer)
-                _layer_block = (
-                    f"\n\nLayer history: {', '.join(_seen_layers)}"
-                    if _seen_layers
-                    else ""
-                )
-                _followup_prompt = (
-                    f"Prior fix for regression class '{locked.regression_class}' "
-                    f"was closed as MARGINAL recovery: pre-fix signal={pre_value}, "
-                    f"post-fix signal={post_value}. The improvement was insufficient "
-                    f"(< 10% relative AND < 5% absolute).{_layer_block}\n\n"
-                    "Diagnose why the prior fix was insufficient — examine the "
-                    "fix-log entries and propose either (a) a stronger remediation "
-                    "in the same layer, or (b) a defense in a different layer."
-                )
-                _followup_payload = validate_internal_payload(
-                    {
-                        "type": "investigate",
-                        "prompt": _followup_prompt,
-                        "base_branch": _get_project_integration_branch(project),
-                        "effort": "low",
-                    },
-                    "pipeline_regression_dispatcher:marginal_followup",
-                )
-                _followup_task = Task(
-                    project_id=project_id,
-                    title=(f"Marginal-recovery follow-up: {locked.regression_class}")[
-                        :200
-                    ],
-                    description=(
-                        "Auto-spawned: prior fix closed as marginal recovery — "
-                        "investigate why the prior remediation was insufficient."
-                    )[:500],
-                    payloads=[_followup_payload],
-                    context={
-                        "spawned_by": "pipeline_regression_dispatcher_marginal_followup",
-                        "regression_class": locked.regression_class,
-                        "signal_name": "marginal_followup",
-                        "pre_fix_value": pre_value,
-                        "post_fix_value": post_value,
-                        "remediation_case_id": str(locked.id),
-                    },
-                    vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-                    status=TaskStatus.QUEUED,
-                    created_by="ORCHESTRATOR",
-                )
-                session.add(_followup_task)
-                await session.flush()
-                session.add(
-                    TaskHistory(
-                        task_id=_followup_task.id,
-                        action="SPAWNED",
-                        details={
-                            "spawned_by": "PIPELINE_REGRESSION_DISPATCHER_MARGINAL_FOLLOWUP",
-                            "regression_class": locked.regression_class,
-                            "signal_name": "marginal_followup",
-                        },
-                    )
-                )
-                # Persist cooldown anchor on the column (durable across fix-log
-                # restructuring) and append a fix-log audit entry for history.
-                locked.marginal_followup_spawned_at = now
-                locked.fingerprint_to_fix_log = list(
-                    locked.fingerprint_to_fix_log or []
-                ) + [
-                    {
-                        "type": "marginal_followup_spawned",
-                        "spawned_at": now.isoformat(),
-                        "task_id": str(_followup_task.id),
-                        "pre_value": pre_value,
-                        "post_value": post_value,
-                    }
-                ]
-                session.add(locked)
-                logger.info(
-                    "[REGRESSION_WATCHDOG] marginal-followup-spawned project=%s "
-                    "class=%s task_id=%s pre_value=%s post_value=%s",
-                    project_id,
-                    locked.regression_class,
-                    _followup_task.id,
-                    pre_value,
-                    post_value,
-                )
-        logger.info(
-            "[REGRESSION_WATCHDOG] auto-recovered project=%s class=%s "
-            "window_hours=%d pre_value=%s post_value=%s reason=%s",
-            project_id,
-            locked.regression_class,
-            window_hours,
-            pre_value,
-            post_value,
-            close_reason,
-        )
-        if marginal:
-            marginal_closed += 1
-        else:
-            confirmed_closed += 1
-
-    if marginal_closed or confirmed_closed or mutated_rows:
-        await session.commit()
-    return marginal_closed, confirmed_closed
-
-
-async def _run_compliance_followup_once(
-    session: AsyncSession,
-    project_id: uuid.UUID,
+    project_design_doc: dict | None,
+    project_vision: dict | None,
+    spawn_budget_left: int,
 ) -> int:
-    """Spawn compliance follow-up tasks for non-compliant cross-layer fixes.
-
-    Scans MERGED/CLOSED cases for fix-log entries where spawn_was_cross_layer
-    is True and layers_targeted (post-backfill) covers <2 distinct canonical
-    layers. Entries that include recommended_unmodifiable_layers (e.g. CI_WORKFLOW
-    documented in the diagnosis report) count toward the effective layer total so
-    that a fix that correctly documented an unmodifiable layer is not penalized.
-    Gated by runtime config and a per-case cooldown column.
-    """
-    from app.models import Project as _ComplianceProject  # noqa: PLC0415
-    from app.regression_layer_classifier import ALL_LAYERS
-
-    if not bool(_runtime_config.get("regression_compliance_followup_enabled", True)):
+    """Run one built-in signal evaluator via the canonical registry."""
+    if spec.dispatch_evaluator_name is None:
         return 0
-
-    _compliance_project = await session.get(_ComplianceProject, project_id)
-    cooldown_hours = int(
-        _runtime_config.get("regression_compliance_followup_cooldown_hours", 72) or 72
+    evaluator = globals()[spec.dispatch_evaluator_name]
+    args: list[Any] = [session, project_id]
+    args.extend(
+        _dispatch_signal_context_value(key, project_design_doc, project_vision)
+        for key in spec.dispatch_context_keys
     )
-    now = _utcnow()
-    _all_layers = set(ALL_LAYERS)
+    args.append(spawn_budget_left)
+    return await evaluator(*args)
 
-    rows = (
-        (
-            await session.execute(
-                select(RegressionRemediationCase).where(
-                    RegressionRemediationCase.project_id == project_id,
-                    RegressionRemediationCase.status.in_(
-                        [RegressionCaseStatus.MERGED, RegressionCaseStatus.CLOSED]
-                    ),
-                )
-            )
+
+async def _built_in_signal_would_trip(
+    spec: BuiltInSignalSpec,
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    project_design_doc: dict | None,
+) -> bool:
+    """Evaluate the deploy-defer probe configured for one built-in signal."""
+    if spec.probe_kind is None:
+        return False
+    if spec.probe_kind == "current_state":
+        if spec.probe_regression_class is None:
+            return False
+        state = await _current_signal_value_for_class(
+            session,
+            project_id,
+            spec.probe_regression_class,
+            project_design_doc,
         )
-        .scalars()
-        .all()
-    )
+        return state is not None and state["tripped"]
+    if spec.probe_kind == "fix_loop_divergence_fingerprint":
+        return bool(
+            _runtime_config.get("fix_loop_divergence_fingerprint_enabled", False)
+            and await _collect_fix_loop_divergence_fingerprints(session, project_id)
+        )
+    if spec.probe_kind == "persistent_anomaly_collection":
+        import app.shared_state as _ss
 
-    max_spawns = int(
-        _runtime_config.get("regression_compliance_followup_max_spawns", 3) or 3
-    )
-
-    spawned = 0
-    for case in rows:
-        followup_count = getattr(case, "compliance_followup_count", 0) or 0
-        if followup_count >= max_spawns:
-            continue
-
-        last_at = getattr(case, "compliance_followup_spawned_at", None)
-        if last_at is not None:
-            if last_at.tzinfo is not None:
-                last_at = last_at.replace(tzinfo=None)
-            if now - last_at < timedelta(hours=cooldown_hours):
-                continue
-
-        # Only the most-recent classified cross-layer-mandated entry decides
-        # compliance for the case. If that entry is compliant, do not look further
-        # back: an older non-compliant entry has already been superseded by a
-        # newer compliant fix and re-spawning would be a permanent loop, since
-        # the spawned compliance_followup's own merged fix is recorded with
-        # spawn_was_cross_layer=False and never displaces the older entry.
-        non_compliant_entry = None
-        for entry in reversed(case.fingerprint_to_fix_log or []):
+        proj_anomalies = _ss.persistent_anomalies.get(str(project_id)) or {}
+        recency_cutoff = (
+            _utcnow() - timedelta(hours=_ANOMALY_DISPATCH_RECENCY_HOURS)
+        ).isoformat()
+        for entry in proj_anomalies.values():
             if not isinstance(entry, dict):
                 continue
-            if not entry.get("spawn_was_cross_layer"):
+            if (
+                int(entry.get("occurrence_count") or 0)
+                < _ANOMALY_DISPATCH_MIN_OCCURRENCES
+            ):
                 continue
-            if "layers_targeted" not in entry:
-                continue  # awaiting_backfill — not yet classified
-            targeted = set(entry.get("layers_targeted") or []) & _all_layers
-            recommended_unmod = (
-                set(entry.get("recommended_unmodifiable_layers") or []) & _all_layers
-            )
-            if len(targeted | recommended_unmod) < 2:
-                non_compliant_entry = entry
-            break
-
-        if non_compliant_entry is None:
-            continue
-
-        targeted = set(non_compliant_entry.get("layers_targeted") or []) & _all_layers
-        spawn_layers = list(non_compliant_entry.get("spawn_layers_enumerated") or [])
-        missing = [la for la in spawn_layers if la not in targeted]
-
-        _prompt = (
-            f"Cross-layer investigation for '{case.regression_class}' required "
-            f"defenses in >=2 distinct canonical layers, but PR #"
-            f"{non_compliant_entry.get('fix_pr_number', 'unknown')} only targeted: "
-            f"{sorted(targeted) or ['(none)']}. "
-            f"Layers seen in symptoms but not yet defended: {missing or ['(unknown)']}. "
-            "Propose a defense in a distinct canonical layer not yet addressed.\n\n"
-            "Note: .github/workflows/ cannot be modified by the agent. A CI_WORKFLOW "
-            "recommendation belongs in the diagnosis report (set "
-            "'recommended_unmodifiable_layers': ['CI_WORKFLOW'] in context), not the diff."
-        )
-        _payload = validate_internal_payload(
-            {
-                "type": "investigate",
-                "prompt": _prompt,
-                "base_branch": _get_project_integration_branch(_compliance_project),
-                "effort": "low",
-            },
-            "pipeline_regression_dispatcher:compliance_followup",
-        )
-        _task = Task(
-            project_id=project_id,
-            title=f"Compliance follow-up: {case.regression_class}"[:200],
-            description=(
-                "Auto-spawned: cross-layer fix targeted <2 canonical layers — "
-                "compliance follow-up required."
-            )[:500],
-            payloads=[_payload],
-            context={
-                "spawned_by": "pipeline_regression_dispatcher_compliance_followup",
-                "regression_class": case.regression_class,
-                "signal_name": "compliance_followup",
-                "targeted_layers": sorted(targeted),
-                "missing_layers": missing,
-                "remediation_case_id": str(case.id),
-            },
-            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-            status=TaskStatus.QUEUED,
-            created_by="ORCHESTRATOR",
-        )
-        session.add(_task)
-        await session.flush()
-        session.add(
-            TaskHistory(
-                task_id=_task.id,
-                action="SPAWNED",
-                details={
-                    "spawned_by": "PIPELINE_REGRESSION_DISPATCHER_COMPLIANCE_FOLLOWUP",
-                    "regression_class": case.regression_class,
-                    "signal_name": "compliance_followup",
-                },
-            )
-        )
-        case.compliance_followup_spawned_at = now
-        case.compliance_followup_count = followup_count + 1
-        case.fingerprint_to_fix_log = list(case.fingerprint_to_fix_log or []) + [
-            {
-                "type": "compliance_followup_spawned",
-                "spawned_at": now.isoformat(),
-                "task_id": str(_task.id),
-                "targeted_layers": sorted(targeted),
-                "missing_layers": missing,
-            }
-        ]
-        session.add(case)
-        spawned += 1
-        logger.info(
-            "[REGRESSION_WATCHDOG] compliance-followup-spawned project=%s "
-            "class=%s task_id=%s targeted=%s missing=%s",
-            project_id,
-            case.regression_class,
-            _task.id,
-            sorted(targeted),
-            missing,
-        )
-
-    if spawned:
-        await session.commit()
-    return spawned
+            if str(entry.get("last_seen") or "") < recency_cutoff:
+                continue
+            return True
+        return False
+    if spec.probe_kind == "sr_blind_spot_any":
+        return await _probe_sr_blind_spot_any_trip(session, project_id)
+    if spec.probe_kind == "strategic_cycle_stall_any":
+        return await _probe_strategic_stall_any_trip(session, project_id)
+    if spec.probe_kind == "viewport_regression_collection":
+        return bool(await _collect_viewport_failures(session, project_id))
+    if spec.probe_kind == "viewport_coverage_drop":
+        return _probe_viewport_coverage_drop(project_design_doc)
+    if spec.probe_kind == "agent_vm_resource_count":
+        vm_failures = await _collect_agent_vm_failures(session, project_id)
+        return len(vm_failures) >= _AGENT_VM_RESOURCE_MIN_FAILURES
+    raise ValueError(f"unknown probe kind: {spec.probe_kind}")
 
 
 async def _any_signal_would_trip(
@@ -6247,62 +4989,17 @@ async def _any_signal_would_trip(
     """Side-effect-free probe: would any subscribed signal trip right now?
 
     Used to gate the deploy-monitoring defer alert so we don't claim a signal
-    tripped when none actually would. Mirrors the classes scanned in
-    ``run_once``: SR catch-rate, fix-loop divergence, pipeline success-rate,
-    persistent anomalies.
+    tripped when none actually would. The registry marks which built-in
+    signals participate in the side-effect-free probe.
     """
-    sr_state = await _current_signal_value_for_class(
-        session,
-        project_id,
-        "sr_catch_rate",
-        project_design_doc,
-    )
-    if sr_state is not None and sr_state["tripped"]:
-        return True
-    fl_state = await _current_signal_value_for_class(
-        session,
-        project_id,
-        "fix_loop_divergence",
-        project_design_doc,
-    )
-    if fl_state is not None and fl_state["tripped"]:
-        return True
-    if _runtime_config.get("fix_loop_divergence_fingerprint_enabled", False):
-        if await _collect_fix_loop_divergence_fingerprints(session, project_id):
+    for spec in DISPATCH_BUILT_IN_SIGNAL_SPECS:
+        if await _built_in_signal_would_trip(
+            spec,
+            session,
+            project_id,
+            project_design_doc,
+        ):
             return True
-    ps_state = await _current_signal_value_for_class(
-        session,
-        project_id,
-        "pipeline_success_rate",
-        project_design_doc,
-    )
-    if ps_state is not None and ps_state["tripped"]:
-        return True
-    import app.shared_state as _ss
-
-    proj_anomalies = _ss.persistent_anomalies.get(str(project_id)) or {}
-    recency_cutoff = (
-        _utcnow() - timedelta(hours=_ANOMALY_DISPATCH_RECENCY_HOURS)
-    ).isoformat()
-    for entry in proj_anomalies.values():
-        if not isinstance(entry, dict):
-            continue
-        if int(entry.get("occurrence_count") or 0) < _ANOMALY_DISPATCH_MIN_OCCURRENCES:
-            continue
-        if str(entry.get("last_seen") or "") < recency_cutoff:
-            continue
-        return True
-    if await _probe_sr_blind_spot_any_trip(session, project_id):
-        return True
-    if await _probe_strategic_stall_any_trip(session, project_id):
-        return True
-    if await _collect_viewport_failures(session, project_id):
-        return True
-    if _probe_viewport_coverage_drop(project_design_doc):
-        return True
-    vm_failures = await _collect_agent_vm_failures(session, project_id)
-    if len(vm_failures) >= _AGENT_VM_RESOURCE_MIN_FAILURES:
-        return True
     return False
 
 
@@ -6354,248 +5051,6 @@ async def _probe_strategic_stall_any_trip(
         (t.first_payload or {}).get("type") in _STRATEGIC_TASK_TYPES
         for t in prior_strategic
     )
-
-
-async def _ensure_watchdog_alert_open(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    title_prefix: str,
-    title: str,
-    message: str,
-    severity: AlertSeverity,
-) -> None:
-    """Open a watchdog alert if none is already open (deduped by title prefix)."""
-    existing = (
-        (
-            await session.execute(
-                select(Alert).where(
-                    Alert.project_id == project_id,
-                    Alert.title.like(title_prefix + "%"),
-                    Alert.dismissed_at.is_(None),
-                )
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if existing is None:
-        session.add(
-            Alert(
-                project_id=project_id,
-                severity=severity,
-                title=title[:200],
-                message=message[:1000],
-            )
-        )
-        await session.commit()
-
-
-async def _resolve_watchdog_alert(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    title_prefix: str,
-) -> None:
-    """Auto-resolve an open watchdog alert by setting dismissed_at."""
-    open_alert = (
-        (
-            await session.execute(
-                select(Alert).where(
-                    Alert.project_id == project_id,
-                    Alert.title.like(title_prefix + "%"),
-                    Alert.dismissed_at.is_(None),
-                )
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if open_alert is not None:
-        open_alert.dismissed_at = _utcnow()
-        await session.commit()
-
-
-async def _check_cross_layer_backfill_lag(
-    session: AsyncSession,
-    project_ids: list[uuid.UUID],
-) -> None:
-    """Emit an INFO alert when cross-layer fix-log entries sit unbackfilled too long.
-
-    Reads three runtime-config knobs:
-      cross_layer_backfill_alert_threshold_hours (int, default 24)
-      cross_layer_backfill_alert_dedupe_hours    (int, default 24)
-      cross_layer_backfill_alert_disabled_projects (list[str] of project IDs)
-    """
-    threshold_hours = int(
-        _runtime_config.get("cross_layer_backfill_alert_threshold_hours", 24) or 24
-    )
-    dedupe_hours = int(
-        _runtime_config.get("cross_layer_backfill_alert_dedupe_hours", 24) or 24
-    )
-    disabled_projects = list(
-        _runtime_config.get("cross_layer_backfill_alert_disabled_projects", []) or []
-    )
-
-    now = _utcnow()
-    threshold_dt = now - timedelta(hours=threshold_hours)
-
-    for pid in project_ids:
-        if str(pid) in disabled_projects:
-            continue
-
-        cases = (
-            (
-                await session.execute(
-                    select(RegressionRemediationCase).where(
-                        RegressionRemediationCase.project_id == pid
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-
-        stale_count = 0
-        oldest_merged_at: datetime | None = None
-
-        for case in cases:
-            for entry in case.fingerprint_to_fix_log or []:
-                if not isinstance(entry, dict):
-                    continue
-                if not entry.get("spawn_was_cross_layer"):
-                    continue
-                if "layers_targeted" in entry:
-                    continue
-                merged_at_raw = entry.get("merged_at")
-                if not merged_at_raw:
-                    continue
-                try:
-                    merged_dt = _to_naive_utc(
-                        datetime.fromisoformat(
-                            str(merged_at_raw).replace("Z", "+00:00")
-                        )
-                    )
-                except (ValueError, TypeError):
-                    continue
-                if merged_dt >= threshold_dt:
-                    continue
-                stale_count += 1
-                if oldest_merged_at is None or merged_dt < oldest_merged_at:
-                    oldest_merged_at = merged_dt
-
-        if stale_count > 0:
-            # Check dedupe: dismiss stale open alert if outside window, then re-emit.
-            dedupe_cutoff = now - timedelta(hours=dedupe_hours)
-            open_alert = (
-                (
-                    await session.execute(
-                        select(Alert).where(
-                            Alert.project_id == pid,
-                            Alert.title.like(
-                                _CROSS_LAYER_BACKFILL_ALERT_TITLE_PREFIX + "%"
-                            ),
-                            Alert.dismissed_at.is_(None),
-                        )
-                    )
-                )
-                .scalars()
-                .first()
-            )
-            if open_alert is not None:
-                if open_alert.created_at >= dedupe_cutoff:
-                    # Within dedupe window — skip to avoid duplicate
-                    continue
-                # Outside dedupe window: dismiss the stale one, emit fresh
-                open_alert.dismissed_at = now
-                await session.commit()
-
-            oldest_str = (
-                oldest_merged_at.date().isoformat() if oldest_merged_at else "unknown"
-            )
-            await _ensure_watchdog_alert_open(
-                session,
-                pid,
-                _CROSS_LAYER_BACKFILL_ALERT_TITLE_PREFIX,
-                f"{_CROSS_LAYER_BACKFILL_ALERT_TITLE_PREFIX} {stale_count} entries unbackfilled",
-                (
-                    f"{stale_count} cross-layer fix-log entries unbackfilled for "
-                    f">{threshold_hours}h, oldest merged_at={oldest_str}; "
-                    "compliance_rate may be biased"
-                ),
-                AlertSeverity.INFO,
-            )
-        else:
-            await _resolve_watchdog_alert(
-                session, pid, _CROSS_LAYER_BACKFILL_ALERT_TITLE_PREFIX
-            )
-
-
-async def run_dispatcher_watchdog_alarms(
-    session: AsyncSession,
-    project_ids: list[uuid.UUID],
-) -> None:
-    """Check cycle-staleness and zero-spawn-streak alarms for all projects.
-
-    Must be called BEFORE the per-project run_once loop so the staleness alarm
-    fires even when run_once hangs or raises on the subsequent tick.
-    """
-    await _check_cross_layer_backfill_lag(session, project_ids)
-
-    now_mono = time.monotonic()
-
-    for pid in project_ids:
-        pid_str = str(pid)
-
-        # --- Alarm 1: cycle staleness (HIGH / ERROR) ---
-        last_mono = _last_cycle_monotonic.get(pid_str)
-        if last_mono is not None:
-            elapsed = now_mono - last_mono
-            if elapsed > _DISPATCHER_STALENESS_THRESHOLD_SECONDS:
-                await _ensure_watchdog_alert_open(
-                    session,
-                    pid,
-                    _STALENESS_ALERT_TITLE_PREFIX,
-                    f"{_STALENESS_ALERT_TITLE_PREFIX} {int(elapsed)}s since last cycle",
-                    f"Dispatcher has not completed a cycle for project {pid} in "
-                    f"{int(elapsed)}s (threshold {_DISPATCHER_STALENESS_THRESHOLD_SECONDS}s). "
-                    "The dispatcher session may be wedged or the orchestrator tick stalled.",
-                    AlertSeverity.ERROR,
-                )
-            else:
-                await _resolve_watchdog_alert(
-                    session, pid, _STALENESS_ALERT_TITLE_PREFIX
-                )
-        # No baseline yet → don't alert; clock starts from first completed cycle.
-
-        # --- Alarm 2: zero-spawn streak (MEDIUM / WARNING) ---
-        # Read the most recent K cycle rows from the durable table so the
-        # streak detection survives worker restarts. The query takes the
-        # newest K and we evaluate the streak in any order — the "streak
-        # broken" predicate is order-independent.
-        recent = await get_dispatcher_cycle_records(
-            session,
-            project_id=pid_str,
-            limit=_DISPATCHER_ZERO_SPAWN_STREAK_K,
-        )
-        if len(recent) >= _DISPATCHER_ZERO_SPAWN_STREAK_K:
-            streak_broken = any(
-                r["spawns_emitted"] > 0 or r.get("signals_tripped", 0) == 0
-                for r in recent
-            )
-            if not streak_broken:
-                await _ensure_watchdog_alert_open(
-                    session,
-                    pid,
-                    _ZERO_SPAWN_ALERT_TITLE_PREFIX,
-                    f"{_ZERO_SPAWN_ALERT_TITLE_PREFIX} {_DISPATCHER_ZERO_SPAWN_STREAK_K} consecutive cycles suppressed",
-                    f"The last {_DISPATCHER_ZERO_SPAWN_STREAK_K} dispatcher cycles for project {pid} "
-                    "all had tripped signals but zero spawns (cooldown/cap/dedup/manual-intervention). "
-                    "Review active remediation cases or adjust spawn-suppression config.",
-                    AlertSeverity.WARNING,
-                )
-            else:
-                await _resolve_watchdog_alert(
-                    session, pid, _ZERO_SPAWN_ALERT_TITLE_PREFIX
-                )
 
 
 async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
@@ -6696,330 +5151,26 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
         # Cap 2: per-cycle system-wide concurrency budget.
         spawn_budget = min(project_remaining, _REGRESSION_DISPATCHER_SYSTEM_CAP)
 
-        try:
-            _spawned += await _evaluate_sr_catch_rate_signal(
-                session,
-                project_id,
-                project.design_doc,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("sr_catch_rate_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "sr_catch_rate_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_sr_false_positive_signal(
-                session,
-                project_id,
-                project.design_doc,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("sr_false_positive_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "sr_false_positive_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_sr_catch_rate_direction_signals(
-                session,
-                project_id,
-                project.design_doc,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("sr_catch_rate_direction_signals")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "sr_catch_rate_direction_signals",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_fix_loop_divergence_signal(
-                session,
-                project_id,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("fix_loop_divergence_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "fix_loop_divergence_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_fix_loop_divergence_fingerprint_signal(
-                session,
-                project_id,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("fix_loop_divergence_fingerprint_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "fix_loop_divergence_fingerprint_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_pipeline_success_signal(
-                session,
-                project_id,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("pipeline_success_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "pipeline_success_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_anomaly_signal(
-                session,
-                project_id,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("anomaly_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "anomaly_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_sr_blind_spot_signal(
-                session,
-                project_id,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("sr_blind_spot_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "sr_blind_spot_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_layer_concentration_signal(
-                session,
-                project_id,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("layer_concentration_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "layer_concentration_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_cross_case_fingerprint_signal(
-                session,
-                project_id,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("cross_case_fingerprint_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "cross_case_fingerprint_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_recurring_class_signal(
-                session,
-                project_id,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("recurring_class_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "recurring_class_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_strategic_cycle_stall_signal(
-                session,
-                project_id,
-                spawn_budget - _spawned,
-                project.vision,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("strategic_cycle_stall_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "strategic_cycle_stall_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_telemetry_staleness_signal(
-                session,
-                project_id,
-                project.design_doc,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("telemetry_staleness_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "telemetry_staleness_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_viewport_regression_signal(
-                session,
-                project_id,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("viewport_regression_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "viewport_regression_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_viewport_coverage_drop_signal(
-                session,
-                project_id,
-                project.design_doc,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("viewport_coverage_drop_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "viewport_coverage_drop_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_reviewer_sla_signal(
-                session,
-                project_id,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("reviewer_sla_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "reviewer_sla_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_agent_vm_resource_signal(
-                session,
-                project_id,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("agent_vm_resource_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "agent_vm_resource_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_low_prevention_rate_signal(
-                session,
-                project_id,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("low_prevention_rate_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "low_prevention_rate_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_sr_below_floor_signal(
-                session,
-                project_id,
-                project.design_doc,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("sr_below_floor_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "sr_below_floor_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_sr_pass_engagement_thinning_signal(
-                session,
-                project_id,
-                project.design_doc,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("sr_pass_engagement_thinning_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "sr_pass_engagement_thinning_signal",
-                project_id,
-                _exc,
-            )
-        try:
-            _spawned += await _evaluate_sr_false_attestation_signal(
-                session,
-                project_id,
-                project.design_doc,
-                spawn_budget - _spawned,
-            )
-            _se_count += 1
-        except Exception as _exc:  # noqa: BLE001
-            _failed_evaluator_names.append("sr_false_attestation_signal")
-            logger.warning(
-                "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
-                "sr_false_attestation_signal",
-                project_id,
-                _exc,
-            )
+        for spec in DISPATCH_BUILT_IN_SIGNAL_SPECS:
+            try:
+                _spawned += await _invoke_dispatch_signal_evaluator(
+                    spec,
+                    session,
+                    project_id,
+                    project.design_doc,
+                    project.vision,
+                    spawn_budget - _spawned,
+                )
+                _se_count += 1
+            except Exception as _exc:  # noqa: BLE001
+                if spec.evaluator_name is not None:
+                    _failed_evaluator_names.append(spec.evaluator_name)
+                    logger.warning(
+                        "[REGRESSION_DISPATCHER] evaluator %s raised project=%s: %s",
+                        spec.evaluator_name,
+                        project_id,
+                        _exc,
+                    )
 
         # Surface / resolve per-evaluator failure alerts so operators can see
         # which signals are partially blind.  Uses the same deduped-alert
@@ -7085,232 +5236,3 @@ async def run_once(session: AsyncSession, project_id: uuid.UUID) -> int:
         # Cheap when the index hits no expired rows; failures are swallowed.
         await _prune_old_dispatcher_cycle_records(session)
         _last_cycle_monotonic[str(project_id)] = time.monotonic()
-
-
-async def get_regression_mtta_data(
-    session: AsyncSession,
-    project_id: uuid.UUID | None = None,
-    window_days: int = 30,
-) -> dict[str, Any]:
-    """Return MTTA lifecycle stats per regression class.
-
-    Computes p50/p90 per lifecycle stage (signal-trip → detect → investigate →
-    PR-merge → signal-recovery) from historical cases, and enriches active cases
-    with live elapsed time plus predicted ETA derived from the class's historical
-    p50 distribution.  Active cases whose p50 has been exceeded carry a negative
-    ETA (overdue indicator).
-    """
-    from collections import defaultdict
-    from datetime import datetime
-
-    cutoff = _utcnow() - timedelta(days=window_days)
-    where: list[Any] = [RegressionRemediationCase.first_seen_at >= cutoff]
-    if project_id is not None:
-        where.append(RegressionRemediationCase.project_id == project_id)
-
-    cases = (
-        (
-            await session.execute(
-                select(RegressionRemediationCase).where(*where).limit(2000)
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    now = _utcnow()
-
-    def _pct(vals: list[float], p: float) -> float | None:
-        if not vals:
-            return None
-        s = sorted(vals)
-        return s[min(int(len(s) * p), len(s) - 1)]
-
-    def _parse_dt(v: str | None) -> datetime | None:
-        if not v:
-            return None
-        try:
-            return datetime.fromisoformat(v.replace("Z", ""))
-        except (ValueError, TypeError):
-            return None
-
-    class_cases: dict[str, list] = defaultdict(list)
-    for c in cases:
-        class_cases[c.regression_class].append(c)
-
-    rows = []
-    for rclass, cls_cases in class_cases.items():
-        detect_s: list[float] = []
-        invest_s: list[float] = []
-        itom_s: list[float] = []
-        mtor_s: list[float] = []
-        active_info: list[dict[str, Any]] = []
-
-        for c in cls_cases:
-            if (ttd := c.time_to_detect_sec) is not None and ttd >= 0:
-                detect_s.append(ttd)
-            if (tti := c.time_to_investigate_sec) is not None and tti >= 0:
-                invest_s.append(float(tti))
-            # ep_investigate_start tracks the per-episode investigation anchor.
-            # Starts at the lifetime investigate_spawned_at; advances to each
-            # cycle's recovered_at so re-armed cases report per-episode durations
-            # rather than inflated lifetime spans (mirrors the approach in
-            # admin_digest._compute_regression_case_summary).
-            ep_investigate_start = c.investigate_spawned_at
-            for entry in c.fingerprint_to_fix_log or []:
-                if not isinstance(entry, dict):
-                    continue
-                merged_dt = _parse_dt(entry.get("merged_at"))
-                recovered_dt = _parse_dt(entry.get("recovered_at"))
-                if merged_dt and ep_investigate_start:
-                    d = (merged_dt - ep_investigate_start).total_seconds()
-                    if d >= 0:
-                        itom_s.append(d)
-                if merged_dt and recovered_dt:
-                    d2 = (recovered_dt - merged_dt).total_seconds()
-                    if d2 >= 0:
-                        mtor_s.append(d2)
-                # Advance anchor so the next episode is measured from when
-                # the previous cycle resolved, not the case's original spawn.
-                if recovered_dt is not None:
-                    ep_investigate_start = recovered_dt
-
-            if c.status == RegressionCaseStatus.CLOSED:
-                continue
-            anchor = (
-                c.signal_first_crossed_at or c.signal_first_seen_at or c.first_seen_at
-            )
-            live_elapsed = round((now - anchor).total_seconds()) if anchor else None
-            # ep_investigate_start now reflects the latest episode's anchor
-            # (last recovered_at, or the original investigate_spawned_at when
-            # there have been no recoveries yet).
-            live_inv = (
-                round((now - ep_investigate_start).total_seconds())
-                if ep_investigate_start
-                else None
-            )
-            rec_check_in: int | None = None
-            elapsed_since_merge: int | None = None
-            if c.status == RegressionCaseStatus.MERGED:
-                last_entry = next(
-                    (
-                        e
-                        for e in reversed(c.fingerprint_to_fix_log or [])
-                        if isinstance(e, dict) and e.get("merged_at")
-                    ),
-                    None,
-                )
-                if last_entry and (m := _parse_dt(last_entry["merged_at"])):
-                    secs = int(
-                        (m + _REGRESSION_RECOVERY_COOLDOWN - now).total_seconds()
-                    )
-                    rec_check_in = secs if secs > 0 else None
-                    elapsed_since_merge = int((now - m).total_seconds())
-            active_info.append(
-                {
-                    "case_id": str(c.id),
-                    "status": c.status,
-                    "live_elapsed_sec": live_elapsed,
-                    "live_elapsed_investigate_sec": live_inv,
-                    "recovery_check_in_sec": rec_check_in,
-                    "elapsed_since_merge_sec": elapsed_since_merge,
-                }
-            )
-
-        p50_detect = _pct(detect_s, 0.5)
-        p50_invest = _pct(invest_s, 0.5)
-        p50_itom = _pct(itom_s, 0.5)
-        p50_mtor = _pct(mtor_s, 0.5)
-
-        # Enrich active cases with ETA predictions based on class historical p50.
-        # Negative ETAs indicate the case has exceeded the typical p50 duration.
-        for ai in active_info:
-            ai["eta_to_investigate_sec"] = (
-                int(p50_detect - ai["live_elapsed_sec"])
-                if p50_detect is not None and ai["live_elapsed_sec"] is not None
-                else None
-            )
-            ai["eta_to_merge_sec"] = (
-                int(p50_itom - ai["live_elapsed_investigate_sec"])
-                if p50_itom is not None
-                and ai["live_elapsed_investigate_sec"] is not None
-                else None
-            )
-            ai["eta_to_recovery_sec"] = (
-                int(p50_mtor - ai["elapsed_since_merge_sec"])
-                if p50_mtor is not None and ai["elapsed_since_merge_sec"] is not None
-                else None
-            )
-
-        rows.append(
-            {
-                "regression_class": rclass,
-                "sample_count": len(cls_cases),
-                "stages": {
-                    "signal_trip_to_detect": {
-                        "p50_sec": p50_detect,
-                        "p90_sec": _pct(detect_s, 0.9),
-                        "sample_count": len(detect_s),
-                    },
-                    "detect_to_investigate": {
-                        "p50_sec": p50_invest,
-                        "p90_sec": _pct(invest_s, 0.9),
-                        "sample_count": len(invest_s),
-                    },
-                    "investigate_to_merge": {
-                        "p50_sec": p50_itom,
-                        "p90_sec": _pct(itom_s, 0.9),
-                        "sample_count": len(itom_s),
-                    },
-                    "merge_to_recovery": {
-                        "p50_sec": p50_mtor,
-                        "p90_sec": _pct(mtor_s, 0.9),
-                        "sample_count": len(mtor_s),
-                    },
-                },
-                "active_cases": active_info,
-            }
-        )
-
-    rows.sort(key=lambda r: r["sample_count"], reverse=True)
-    return {
-        "project_id": str(project_id) if project_id else None,
-        "window_days": window_days,
-        "class_count": len(rows),
-        "classes": rows,
-        "recovery_cooldown_sec": int(_REGRESSION_RECOVERY_COOLDOWN.total_seconds()),
-    }
-
-
-async def get_sr_persistent_blind_spot_hint(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    days: int = 14,
-) -> dict[str, Any] | None:
-    """Return the persistent SR blind-spot hint for agent task context injection.
-
-    Queries the last *days* of completed tasks and calls
-    ``sr_blind_spots.compute_persistent_sr_blind_spot_hint`` to identify
-    categories whose reviewer-disagreement rate exceeds the threshold in >=2
-    consecutive 7-day windows.  Returns None when no persistent categories
-    exist (i.e. below-threshold or insufficient sample size).
-    """
-    from app.sr_blind_spots import compute_persistent_sr_blind_spot_hint
-
-    now = _utcnow()
-    tasks = (
-        (
-            await session.execute(
-                select(Task).where(
-                    Task.project_id == project_id,
-                    Task.status == TaskStatus.COMPLETED,
-                    Task.created_at >= now - timedelta(days=days),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    result = compute_persistent_sr_blind_spot_hint(tasks, now=now)
-    return result if result.get("categories") else None

@@ -5971,6 +5971,90 @@ async def test_strategic_stall_prompt_without_bloat_marker(db_session):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_signal_invoker_passes_nontrailing_project_vision_context(
+    db_session,
+):
+    """Registry-backed invoker passes project_vision before the budgeted spawn arg."""
+    from app.pipeline_regression_dispatcher import (
+        DISPATCH_BUILT_IN_SIGNAL_SPECS,
+        _STRATEGIC_CYCLE_STALL_HOURS,
+        _invoke_dispatch_signal_evaluator,
+    )
+
+    bloat_marker = {
+        "skipped_at": "2026-05-20T12:00:00",
+        "size": 310000,
+        "top_contributors": [{"key": "design_doc", "size": 270000}],
+    }
+    project = make_project(
+        design_doc={}, vision={"_strategic_payload_bloat_skip": bloat_marker}
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    prior_strategic = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "strategic_review", "prompt": "x", "base_branch": "main"}],
+        context={},
+    )
+    active_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "x", "base_branch": "main"}],
+        context={},
+    )
+    db_session.add(prior_strategic)
+    db_session.add(active_task)
+    await db_session.commit()
+
+    prior_strategic.created_at = _utcnow() - timedelta(
+        hours=_STRATEGIC_CYCLE_STALL_HOURS + 2
+    )
+    active_task.created_at = _utcnow() - timedelta(
+        hours=_STRATEGIC_CYCLE_STALL_HOURS - 1
+    )
+    db_session.add(prior_strategic)
+    db_session.add(active_task)
+    await db_session.commit()
+
+    strategic_spec = next(
+        spec
+        for spec in DISPATCH_BUILT_IN_SIGNAL_SPECS
+        if spec.signal_name == "strategic_cycle_stall"
+    )
+
+    spawned = await _invoke_dispatch_signal_evaluator(
+        strategic_spec,
+        db_session,
+        project.id,
+        project.design_doc,
+        project.vision,
+        1,
+    )
+    assert spawned == 1
+
+    tasks = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.context["regression_class"].as_string()
+                    == "strategic_cycle_stall",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(tasks) == 1
+    prompt = (tasks[0].first_payload or {}).get("prompt", "")
+    assert "ROOT CAUSE IDENTIFIED" in prompt
+    assert "310000" in prompt
+
+
+@pytest.mark.asyncio
 async def test_strategic_stall_spawns_with_bloat_marker_in_prompt(db_session):
     """run_once() spawns a stall task whose prompt contains compaction guidance when bloat marker is set."""
     from app.pipeline_regression_dispatcher import _STRATEGIC_CYCLE_STALL_HOURS
@@ -8430,6 +8514,51 @@ async def test_sr_catch_rate_never_sufficient_emits_warning_alert(db_session):
     )
     assert len(alerts) == 1
     assert "sufficiency" in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_signal_staleness_watchdog_defers_commit_to_run_once(db_session):
+    """The extracted watchdog helper must not commit alerts on its own."""
+    from app.models import Alert, AlertSeverity
+    from app.pipeline_regression_dispatcher import _run_signal_staleness_watchdog
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    stale_ts = (now - timedelta(days=3)).isoformat()
+    project = make_project(
+        design_doc={
+            "sr_catch_rate_trends": {
+                "last_sufficient_computed_at": stale_ts,
+            },
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    created = await _run_signal_staleness_watchdog(
+        db_session,
+        project.id,
+        project.design_doc,
+    )
+    assert created == 1
+
+    await db_session.rollback()
+
+    alerts = (
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == AlertSeverity.WARNING,
+                    Alert.title == "Signal staleness: sr_catch_rate",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == []
 
 
 @pytest.mark.asyncio
@@ -11155,1260 +11284,6 @@ async def test_awaiting_backfill_alert_evaluator_failure_does_not_break_recovery
     titles = [a.title for a in alerts]
     # Path-classifier evaluator still ran and created its alert.
     assert _PATH_CLASSIFIER_COVERAGE_ALERT_TITLE in titles
-
-
-# ---------------------------------------------------------------------------
-# Viewport regression evaluator tests
-# ---------------------------------------------------------------------------
-
-
-def _make_viewport_task(
-    project_id,
-    *,
-    status_message: str,
-    title: str = "Test Task",
-    updated_at_offset_hours: int = 1,
-) -> Task:
-    """Create a FAILED Task whose status_message triggers VIEWPORT_REGRESSION classification."""
-    now = _utcnow()
-    task = make_task(
-        project_id=project_id,
-        status=TaskStatus.FAILED,
-        title=title,
-        created_at=now - timedelta(hours=updated_at_offset_hours),
-        updated_at=now - timedelta(hours=updated_at_offset_hours),
-    )
-    task.latest_status_message = status_message
-    return task
-
-
-class TestViewportRegressionEvaluator:
-    """Tests for _collect_viewport_failures + _evaluate_viewport_regression_signal."""
-
-    @pytest.mark.asyncio
-    async def test_viewport_failure_trips_and_spawns(self, db_session):
-        """Two FAILED tasks with viewport errors on same component+width spawn a case."""
-        from app.models import RegressionRemediationCase
-        from app.pipeline_regression_dispatcher import (
-            _VIEWPORT_REGRESSION_MIN_FAILURES,
-            _collect_viewport_failures,
-            _evaluate_viewport_regression_signal,
-        )
-
-        assert _VIEWPORT_REGRESSION_MIN_FAILURES >= 2, "threshold sanity"
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        msg = (
-            "expectNoOverflowAt(375): 2 element(s) overflow at width=375px:\n"
-            "  <div> right=400px (limit 376px)\n"
-            "Found in MessagesPanel.viewport.test.tsx"
-        )
-        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
-            db_session.add(_make_viewport_task(project.id, status_message=msg))
-        await db_session.commit()
-
-        trips = await _collect_viewport_failures(db_session, project.id)
-        assert len(trips) == 1
-        assert trips[0]["component"] == "MessagesPanel"
-        assert trips[0]["width"] == "375"
-        assert trips[0]["count"] >= _VIEWPORT_REGRESSION_MIN_FAILURES
-
-        spawned = await _evaluate_viewport_regression_signal(
-            db_session, project.id, spawn_budget_left=2
-        )
-        assert spawned == 1
-        await db_session.commit()
-
-        cases = (
-            (
-                await db_session.execute(
-                    select(RegressionRemediationCase).where(
-                        RegressionRemediationCase.project_id == project.id,
-                        RegressionRemediationCase.regression_class
-                        == "viewport_regression:MessagesPanel:overflow@375",
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        assert len(cases) == 1
-
-    @pytest.mark.asyncio
-    async def test_below_threshold_does_not_spawn(self, db_session):
-        """A single viewport failure (below min) does not spawn."""
-        from app.pipeline_regression_dispatcher import (
-            _VIEWPORT_REGRESSION_MIN_FAILURES,
-            _collect_viewport_failures,
-        )
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        msg = (
-            "expectMinTouchTargetAt(375): 1 element(s) below 44px touch target\n"
-            "Found in AlertsBanner.viewport.test.tsx"
-        )
-        # Add one fewer than the minimum
-        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES - 1):
-            db_session.add(_make_viewport_task(project.id, status_message=msg))
-        await db_session.commit()
-
-        trips = await _collect_viewport_failures(db_session, project.id)
-        assert len(trips) == 0
-
-    @pytest.mark.asyncio
-    async def test_unknown_component_fallback(self, db_session):
-        """When the file reference is absent, component falls back to 'unknown'."""
-        from app.pipeline_regression_dispatcher import (
-            _VIEWPORT_REGRESSION_MIN_FAILURES,
-            _collect_viewport_failures,
-        )
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        msg = "expectNoOverflowAt(375): document.documentElement.scrollWidth=400px > 376px"
-        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
-            db_session.add(_make_viewport_task(project.id, status_message=msg))
-        await db_session.commit()
-
-        trips = await _collect_viewport_failures(db_session, project.id)
-        assert len(trips) == 1
-        assert trips[0]["component"] == "unknown"
-        assert trips[0]["width"] == "375"
-
-    @pytest.mark.asyncio
-    async def test_unknown_width_fallback(self, db_session):
-        """When width cannot be extracted, width falls back to '0'."""
-        from app.pipeline_regression_dispatcher import (
-            _VIEWPORT_REGRESSION_MIN_FAILURES,
-            _collect_viewport_failures,
-        )
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        msg = (
-            "expectnooverflowat( ): some viewport overflow detected\n"
-            "Found in TaskDetailDrawerMeta.viewport.test.tsx"
-        )
-        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
-            db_session.add(_make_viewport_task(project.id, status_message=msg))
-        await db_session.commit()
-
-        trips = await _collect_viewport_failures(db_session, project.id)
-        assert len(trips) == 1
-        assert trips[0]["component"] == "TaskDetailDrawerMeta"
-        assert trips[0]["width"] == "0"
-
-    @pytest.mark.asyncio
-    async def test_dedup_same_component_width_updates_not_duplicates(self, db_session):
-        """A second run_once with the same viewport failure class updates the case, not duplicates."""
-        from app.models import RegressionRemediationCase
-        from app.pipeline_regression_dispatcher import run_once
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        msg = (
-            "expectNoOverflowAt(375): 1 element(s) overflow\n"
-            "Found in SearchFilterBar.viewport.test.tsx"
-        )
-        for _ in range(2):
-            db_session.add(_make_viewport_task(project.id, status_message=msg))
-        await db_session.commit()
-
-        first = await run_once(db_session, project.id)
-        assert first == 1
-        await db_session.commit()
-
-        # Second run: in-flight case should block re-spawn
-        second = await run_once(db_session, project.id)
-        assert second == 0
-
-        cases = (
-            (
-                await db_session.execute(
-                    select(RegressionRemediationCase).where(
-                        RegressionRemediationCase.project_id == project.id,
-                        RegressionRemediationCase.regression_class.like(
-                            "viewport_regression:%"
-                        ),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        assert len(cases) == 1
-
-    @pytest.mark.asyncio
-    async def test_overflow_only_failure_type(self, db_session):
-        """Failures from expectNoOverflowAt classify as 'overflow'."""
-        from app.pipeline_regression_dispatcher import (
-            _VIEWPORT_REGRESSION_MIN_FAILURES,
-            _collect_viewport_failures,
-        )
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        msg = (
-            "expectNoOverflowAt(375): 2 element(s) overflow at width=375px\n"
-            "Found in MessagesPanel.viewport.test.tsx"
-        )
-        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
-            db_session.add(_make_viewport_task(project.id, status_message=msg))
-        await db_session.commit()
-
-        trips = await _collect_viewport_failures(db_session, project.id)
-        assert len(trips) == 1
-        assert trips[0]["failure_type"] == "overflow"
-
-    @pytest.mark.asyncio
-    async def test_touch_target_only_failure_type(self, db_session):
-        """Failures from expectMinTouchTargetAt classify as 'touch_target'."""
-        from app.pipeline_regression_dispatcher import (
-            _VIEWPORT_REGRESSION_MIN_FAILURES,
-            _collect_viewport_failures,
-        )
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        msg = (
-            "expectMinTouchTargetAt(375): 1 element(s) below 44px touch target\n"
-            "Found in AlertsBanner.viewport.test.tsx"
-        )
-        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
-            db_session.add(_make_viewport_task(project.id, status_message=msg))
-        await db_session.commit()
-
-        trips = await _collect_viewport_failures(db_session, project.id)
-        assert len(trips) == 1
-        assert trips[0]["failure_type"] == "touch_target"
-
-    @pytest.mark.asyncio
-    async def test_mixed_failure_types(self, db_session):
-        """When a (component, width) bucket has both overflow and touch_target failures, classify as 'mixed'."""
-        from app.pipeline_regression_dispatcher import (
-            _VIEWPORT_REGRESSION_MIN_FAILURES,
-            _collect_viewport_failures,
-        )
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        overflow_msg = (
-            "expectNoOverflowAt(375): 2 element(s) overflow\n"
-            "Found in TestComponent.viewport.test.tsx"
-        )
-        touch_target_msg = (
-            "expectMinTouchTargetAt(375): 1 element(s) below 44px\n"
-            "Found in TestComponent.viewport.test.tsx"
-        )
-        # Add at least _VIEWPORT_REGRESSION_MIN_FAILURES failures
-        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES - 1):
-            db_session.add(_make_viewport_task(project.id, status_message=overflow_msg))
-        db_session.add(_make_viewport_task(project.id, status_message=touch_target_msg))
-        await db_session.commit()
-
-        trips = await _collect_viewport_failures(db_session, project.id)
-        assert len(trips) == 1
-        assert trips[0]["failure_type"] == "mixed"
-
-    def test_extract_failure_type_text_truncation(self):
-        """_extract_failure_type returns 'text_truncation' for expectNoTextTruncationAt messages."""
-        from app.pipeline_regression_dispatcher import _extract_failure_type
-
-        msg = "expectNoTextTruncationAt(375): 1 element(s) truncated at width=375px"
-        assert _extract_failure_type(msg) == "text_truncation"
-
-    def test_extract_failure_type_overflow(self):
-        """_extract_failure_type returns 'overflow' for expectNoOverflowAt messages."""
-        from app.pipeline_regression_dispatcher import _extract_failure_type
-
-        msg = "expectNoOverflowAt(375): 2 element(s) overflow at width=375px"
-        assert _extract_failure_type(msg) == "overflow"
-
-    def test_extract_failure_type_unknown(self):
-        """_extract_failure_type returns 'unknown' when no known assertion is in the message."""
-        from app.pipeline_regression_dispatcher import _extract_failure_type
-
-        assert _extract_failure_type("some generic failure") == "unknown"
-
-    @pytest.mark.asyncio
-    async def test_regression_class_includes_assertion_type(self, db_session):
-        """Emitted regression_class includes assertion type: viewport_regression:<C>:<type>@<w>."""
-        from app.models import RegressionRemediationCase
-        from app.pipeline_regression_dispatcher import (
-            _VIEWPORT_REGRESSION_MIN_FAILURES,
-            _evaluate_viewport_regression_signal,
-        )
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        msg = (
-            "expectMinTouchTargetAt(375): 1 element(s) below 44px touch target\n"
-            "Found in TaskCard.viewport.test.tsx"
-        )
-        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
-            db_session.add(_make_viewport_task(project.id, status_message=msg))
-        await db_session.commit()
-
-        spawned = await _evaluate_viewport_regression_signal(
-            db_session, project.id, spawn_budget_left=2
-        )
-        assert spawned == 1
-        await db_session.commit()
-
-        cases = (
-            (
-                await db_session.execute(
-                    select(RegressionRemediationCase).where(
-                        RegressionRemediationCase.project_id == project.id,
-                        RegressionRemediationCase.regression_class
-                        == "viewport_regression:TaskCard:touch_target@375",
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        assert len(cases) == 1
-
-    @pytest.mark.asyncio
-    async def test_introducing_pr_number_in_trip_dict(self, db_session):
-        """Trip dict includes introducing_pr_number when earliest task has pr_number in payload."""
-        from app.pipeline_regression_dispatcher import (
-            _VIEWPORT_REGRESSION_MIN_FAILURES,
-            _collect_viewport_failures,
-        )
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        msg = (
-            "expectNoOverflowAt(375): overflow detected\n"
-            "Found in MessagesPanel.viewport.test.tsx"
-        )
-        now = _utcnow()
-        for i in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
-            task = make_task(
-                project_id=project.id,
-                status=TaskStatus.FAILED,
-                payloads=[{"type": "review", "pr_number": 1234}],
-                created_at=now - timedelta(hours=i + 1),
-                updated_at=now - timedelta(hours=i + 1),
-            )
-            task.latest_status_message = msg
-            db_session.add(task)
-        await db_session.commit()
-
-        trips = await _collect_viewport_failures(db_session, project.id)
-        assert len(trips) == 1
-        assert trips[0]["introducing_pr_number"] == 1234
-        assert trips[0]["introducing_commit_sha"] is None
-
-    @pytest.mark.asyncio
-    async def test_introducing_commit_sha_in_trip_dict_when_no_pr(self, db_session):
-        """Trip dict includes introducing_commit_sha from context head_sha when no pr_number."""
-        from app.pipeline_regression_dispatcher import (
-            _VIEWPORT_REGRESSION_MIN_FAILURES,
-            _collect_viewport_failures,
-        )
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        msg = (
-            "expectNoOverflowAt(375): overflow detected\n"
-            "Found in KanbanBoard.viewport.test.tsx"
-        )
-        sha = "abc123def456789"
-        now = _utcnow()
-        for i in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
-            task = make_task(
-                project_id=project.id,
-                status=TaskStatus.FAILED,
-                context={"head_sha": sha},
-                created_at=now - timedelta(hours=i + 1),
-                updated_at=now - timedelta(hours=i + 1),
-            )
-            task.latest_status_message = msg
-            db_session.add(task)
-        await db_session.commit()
-
-        trips = await _collect_viewport_failures(db_session, project.id)
-        assert len(trips) == 1
-        assert trips[0]["introducing_pr_number"] is None
-        assert trips[0]["introducing_commit_sha"] == sha
-
-    @pytest.mark.asyncio
-    async def test_introducing_attribution_none_when_no_signals(self, db_session):
-        """Trip dict has both attribution fields as None when task has no pr_number or head_sha."""
-        from app.pipeline_regression_dispatcher import (
-            _VIEWPORT_REGRESSION_MIN_FAILURES,
-            _collect_viewport_failures,
-        )
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        msg = (
-            "expectNoOverflowAt(375): overflow detected\n"
-            "Found in DirectionsPanel.viewport.test.tsx"
-        )
-        for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
-            db_session.add(_make_viewport_task(project.id, status_message=msg))
-        await db_session.commit()
-
-        trips = await _collect_viewport_failures(db_session, project.id)
-        assert len(trips) == 1
-        assert trips[0]["introducing_pr_number"] is None
-        assert trips[0]["introducing_commit_sha"] is None
-
-    @pytest.mark.asyncio
-    async def test_earliest_task_used_for_attribution(self, db_session):
-        """The earliest failing task's pr_number is used, not the most recent."""
-        from app.pipeline_regression_dispatcher import (
-            _VIEWPORT_REGRESSION_MIN_FAILURES,
-            _collect_viewport_failures,
-        )
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        msg = (
-            "expectNoOverflowAt(375): overflow detected\n"
-            "Found in ResearchBrowser.viewport.test.tsx"
-        )
-        now = _utcnow()
-        # Create tasks from newest to oldest; the oldest (highest offset) has pr_number=100.
-        # All other (newer) tasks have pr_number=999.
-        for i in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
-            pr_num = 100 if i == _VIEWPORT_REGRESSION_MIN_FAILURES - 1 else 999
-            task = make_task(
-                project_id=project.id,
-                status=TaskStatus.FAILED,
-                payloads=[{"type": "review", "pr_number": pr_num}],
-                created_at=now - timedelta(hours=i + 1),
-                updated_at=now - timedelta(hours=i + 1),
-            )
-            task.latest_status_message = msg
-            db_session.add(task)
-        await db_session.commit()
-
-        trips = await _collect_viewport_failures(db_session, project.id)
-        assert len(trips) == 1
-        # The oldest task (pr_number=100) should determine attribution
-        assert trips[0]["introducing_pr_number"] == 100
-
-    @pytest.mark.asyncio
-    async def test_hyphenated_composed_filename_extracted_correctly(self, db_session):
-        """Hyphenated composed-page filenames are preserved in full, not truncated."""
-        from app.pipeline_regression_dispatcher import (
-            _VIEWPORT_REGRESSION_MIN_FAILURES,
-            _collect_viewport_failures,
-        )
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        composed_cases = [
-            (
-                "operator-home-composed",
-                "expectNoOverflowAt(375): overflow at width=375px\nFound in operator-home-composed.viewport.test.tsx",
-            ),
-            (
-                "kanban-composed",
-                "expectNoOverflowAt(375): overflow at width=375px\nFound in kanban-composed.viewport.test.tsx",
-            ),
-            (
-                "pipeline-composed",
-                "expectNoOverflowAt(375): overflow at width=375px\nFound in pipeline-composed.viewport.test.tsx",
-            ),
-        ]
-
-        for _component, msg in composed_cases:
-            for _ in range(_VIEWPORT_REGRESSION_MIN_FAILURES):
-                db_session.add(_make_viewport_task(project.id, status_message=msg))
-        await db_session.commit()
-
-        trips = await _collect_viewport_failures(db_session, project.id)
-        components = {t["component"] for t in trips}
-
-        # Each composed-page test must produce a distinct, fully-named component
-        assert "operator-home-composed" in components, (
-            f"expected operator-home-composed in {components}"
-        )
-        assert "kanban-composed" in components, (
-            f"expected kanban-composed in {components}"
-        )
-        assert "pipeline-composed" in components, (
-            f"expected pipeline-composed in {components}"
-        )
-        # Must be three distinct buckets, not collapsed to "composed"
-        assert len(components) == 3, f"expected 3 distinct components, got {components}"
-        assert "composed" not in components, "bare 'composed' token must not appear"
-
-
-# ---------------------------------------------------------------------------
-# viewport_coverage_drop signal tests
-# ---------------------------------------------------------------------------
-
-
-def _design_doc_with_coverage_drop(
-    *,
-    before: int = 10,
-    after: int = 7,
-    escape_hatches: int = 0,
-    removed_components: list | None = None,
-) -> dict:
-    return {
-        "viewport_coverage_snapshot": {
-            "assertion_count_before": before,
-            "assertion_count_after": after,
-            "new_escape_hatch_count": escape_hatches,
-            "removed_component_files": removed_components or [],
-            "merged_pr": 1234,
-        }
-    }
-
-
-@pytest.mark.asyncio
-async def test_viewport_coverage_drop_test_deletion(db_session):
-    """Signal fires when assertions are deleted (post count < pre count)."""
-    project = make_project(
-        design_doc=_design_doc_with_coverage_drop(before=10, after=7)
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    spawned = await run_once(db_session, project.id)
-    assert spawned == 1
-
-    task = (
-        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
-        .scalars()
-        .first()
-    )
-    assert task is not None
-    ctx = task.context or {}
-    assert ctx["regression_class"] == "viewport_coverage_drop"
-    assert ctx["signal_name"] == "viewport_coverage_drop"
-    payload = task.first_payload or {}
-    assert "viewport_coverage_drop" in payload.get("prompt", "")
-
-
-@pytest.mark.asyncio
-async def test_viewport_coverage_drop_skip_insertion(db_session):
-    """Signal fires when .skip() insertion reduces effective assertion count."""
-    project = make_project(design_doc=_design_doc_with_coverage_drop(before=8, after=5))
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    spawned = await run_once(db_session, project.id)
-    assert spawned == 1
-
-    task = (
-        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
-        .scalars()
-        .first()
-    )
-    assert task is not None
-    assert (task.context or {}).get("regression_class") == "viewport_coverage_drop"
-
-
-@pytest.mark.asyncio
-async def test_viewport_coverage_drop_escape_hatch_attribute(db_session):
-    """Signal fires when new escape-hatch attributes are added (count stable but coverage eroded)."""
-    project = make_project(
-        design_doc=_design_doc_with_coverage_drop(before=10, after=10, escape_hatches=2)
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    spawned = await run_once(db_session, project.id)
-    assert spawned == 1
-
-    task = (
-        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
-        .scalars()
-        .first()
-    )
-    assert task is not None
-    ctx = task.context or {}
-    assert ctx["regression_class"] == "viewport_coverage_drop"
-    payload = task.first_payload or {}
-    assert "escape-hatch" in payload.get("prompt", "")
-
-
-@pytest.mark.asyncio
-async def test_viewport_coverage_drop_no_signal_on_component_removal(db_session):
-    """Signal does NOT fire when a component file was legitimately removed."""
-    project = make_project(
-        design_doc=_design_doc_with_coverage_drop(
-            before=10,
-            after=7,
-            removed_components=["admin-ui/src/components/OldWidget.tsx"],
-        )
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    spawned = await run_once(db_session, project.id)
-    assert spawned == 0
-
-    tasks = (
-        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
-        .scalars()
-        .all()
-    )
-    assert tasks == []
-
-
-# ---------------------------------------------------------------------------
-# viewport_coverage_snapshot producer tests
-# ---------------------------------------------------------------------------
-
-
-class TestComputeViewportCoverageSnapshot:
-    """Unit tests for compute_viewport_coverage_snapshot (pure function)."""
-
-    def _make_diff(
-        self,
-        *,
-        removed_assertions: int = 0,
-        added_assertions: int = 0,
-        context_assertions: int = 0,
-        escape_hatches: int = 0,
-        deleted_component: str | None = None,
-    ) -> str:
-        lines = []
-        if deleted_component:
-            lines.append(f"diff --git a/{deleted_component} b/{deleted_component}")
-            lines.append("deleted file mode 100644")
-            lines.append(f"--- a/{deleted_component}")
-            lines.append("+++ /dev/null")
-
-        lines.append(
-            "diff --git a/admin-ui/src/components/Foo.viewport.test.tsx"
-            " b/admin-ui/src/components/Foo.viewport.test.tsx"
-        )
-        lines.append("--- a/admin-ui/src/components/Foo.viewport.test.tsx")
-        lines.append("+++ b/admin-ui/src/components/Foo.viewport.test.tsx")
-        for _ in range(context_assertions):
-            lines.append(" expectNoOverflowAt(container, 375);")
-        for _ in range(removed_assertions):
-            lines.append("-expectNoOverflowAt(container, 375);")
-        for _ in range(added_assertions):
-            lines.append("+expectNoTextTruncationAt(container, 375);")
-
-        if escape_hatches:
-            lines.append(
-                "diff --git a/admin-ui/src/components/Bar.tsx"
-                " b/admin-ui/src/components/Bar.tsx"
-            )
-            lines.append("--- a/admin-ui/src/components/Bar.tsx")
-            lines.append("+++ b/admin-ui/src/components/Bar.tsx")
-            for _ in range(escape_hatches):
-                lines.append("+  <div data-viewport-allow-overflow>")
-
-        return "\n".join(lines)
-
-    def test_happy_path_drop(self):
-        from app.pipeline_regression_dispatcher import (
-            compute_viewport_coverage_snapshot,
-        )
-
-        diff = self._make_diff(
-            context_assertions=5, removed_assertions=3, added_assertions=0
-        )
-        snap = compute_viewport_coverage_snapshot(diff, pr_number=42)
-        # before = 5 context + 3 removed = 8
-        assert snap["assertion_count_before"] == 8
-        # after = 5 context + 0 added = 5
-        assert snap["assertion_count_after"] == 5
-        assert snap["new_escape_hatch_count"] == 0
-        assert snap["removed_component_files"] == []
-        assert snap["merged_pr"] == 42
-
-    def test_escape_hatch_addition(self):
-        from app.pipeline_regression_dispatcher import (
-            compute_viewport_coverage_snapshot,
-        )
-
-        diff = self._make_diff(
-            context_assertions=4,
-            removed_assertions=0,
-            added_assertions=0,
-            escape_hatches=2,
-        )
-        snap = compute_viewport_coverage_snapshot(diff, pr_number=99)
-        assert snap["assertion_count_before"] == snap["assertion_count_after"] == 4
-        assert snap["new_escape_hatch_count"] == 2
-
-    def test_legitimate_component_removal_suppresses(self):
-        from app.pipeline_regression_dispatcher import (
-            compute_viewport_coverage_snapshot,
-            _probe_viewport_coverage_drop,
-        )
-
-        diff = self._make_diff(
-            context_assertions=5,
-            removed_assertions=3,
-            deleted_component="admin-ui/src/components/OldWidget.tsx",
-        )
-        snap = compute_viewport_coverage_snapshot(diff, pr_number=77)
-        assert snap["removed_component_files"] == [
-            "admin-ui/src/components/OldWidget.tsx"
-        ]
-        # Probe should suppress when a component was legitimately removed
-        assert not _probe_viewport_coverage_drop({"viewport_coverage_snapshot": snap})
-
-    def test_no_admin_ui_files_skipped(self):
-        from app.pipeline_regression_dispatcher import (
-            compute_viewport_coverage_snapshot,
-        )
-
-        diff = "diff --git a/backend/app/foo.py b/backend/app/foo.py\n-old\n+new\n"
-        snap = compute_viewport_coverage_snapshot(diff, pr_number=1)
-        assert snap["assertion_count_before"] == 0
-        assert snap["assertion_count_after"] == 0
-        assert snap["new_escape_hatch_count"] == 0
-
-    @pytest.mark.asyncio
-    async def test_update_writes_to_design_doc(self, db_session):
-        """update_viewport_coverage_snapshot_from_diff writes to project.design_doc."""
-        from app.pipeline_regression_dispatcher import (
-            update_viewport_coverage_snapshot_from_diff,
-        )
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        diff = self._make_diff(context_assertions=6, removed_assertions=2)
-        await update_viewport_coverage_snapshot_from_diff(
-            db_session, project, 123, diff
-        )
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        snap = (project.design_doc or {}).get("viewport_coverage_snapshot")
-        assert snap is not None
-        assert snap["assertion_count_before"] == 8
-        assert snap["assertion_count_after"] == 6
-        assert snap["merged_pr"] == 123
-
-    @pytest.mark.asyncio
-    async def test_update_skips_when_no_admin_ui(self, db_session):
-        """update_viewport_coverage_snapshot_from_diff is a no-op when no admin-ui in diff."""
-        from app.pipeline_regression_dispatcher import (
-            update_viewport_coverage_snapshot_from_diff,
-        )
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        diff = "diff --git a/backend/app/foo.py b/backend/app/foo.py\n+pass\n"
-        await update_viewport_coverage_snapshot_from_diff(db_session, project, 99, diff)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        snap = (project.design_doc or {}).get("viewport_coverage_snapshot")
-        assert snap is None
-
-    @pytest.mark.asyncio
-    async def test_round_trip_triggers_dispatcher(self, db_session):
-        """Producer write + dispatcher read + run_once spawns a case end-to-end."""
-        from app.pipeline_regression_dispatcher import (
-            update_viewport_coverage_snapshot_from_diff,
-        )
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        # Diff that drops 3 assertions: before=8, after=5
-        diff = self._make_diff(context_assertions=5, removed_assertions=3)
-        await update_viewport_coverage_snapshot_from_diff(
-            db_session, project, 555, diff
-        )
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        spawned = await run_once(db_session, project.id)
-        assert spawned == 1
-
-        task = (
-            (
-                await db_session.execute(
-                    select(Task).where(Task.project_id == project.id)
-                )
-            )
-            .scalars()
-            .first()
-        )
-        assert task is not None
-        assert (task.context or {}).get("regression_class") == "viewport_coverage_drop"
-
-
-# ---------------------------------------------------------------------------
-# Reviewer SLA stall signal tests
-# ---------------------------------------------------------------------------
-
-
-class TestReviewerSlaStallSignal:
-    """Tests for _evaluate_reviewer_sla_signal."""
-
-    @pytest.mark.asyncio
-    async def test_stall_trips_and_spawns(self, db_session):
-        """ACTIVE case with EVALUATING task older than threshold spawns an investigation."""
-        from app.models import RegressionCaseStatus, RegressionRemediationCase
-        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
-        import app.shared_state as _shared_state
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        now = _utcnow()
-        evaluating_at = now - timedelta(hours=10)
-        stalled_task = make_task(
-            project_id=project.id,
-            status=TaskStatus.EVALUATING,
-            created_at=evaluating_at,
-            updated_at=evaluating_at,
-        )
-        stalled_task.status_log = [
-            {
-                "t": evaluating_at.isoformat(),
-                "msg": "Status changed: IN_PROGRESS → EVALUATING",
-            }
-        ]
-        db_session.add(stalled_task)
-        await db_session.commit()
-        await db_session.refresh(stalled_task)
-
-        case = RegressionRemediationCase(
-            project_id=project.id,
-            regression_class="sr_catch_rate",
-            status=RegressionCaseStatus.ACTIVE,
-            hit_count=1,
-            last_remediation_task_id=stalled_task.id,
-            last_remediation_pr_number=1234,
-        )
-        db_session.add(case)
-        await db_session.commit()
-
-        original_config = dict(_shared_state.runtime_config)
-        _shared_state.runtime_config["reviewer_sla_stall_hours"] = 6
-        try:
-            spawned = await _evaluate_reviewer_sla_signal(db_session, project.id, 2)
-        finally:
-            _shared_state.runtime_config.clear()
-            _shared_state.runtime_config.update(original_config)
-
-        assert spawned == 1
-        await db_session.commit()
-
-        tasks = (
-            (
-                await db_session.execute(
-                    select(Task).where(Task.project_id == project.id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        investigate_tasks = [
-            t for t in tasks if (t.first_payload or {}).get("type") == "investigate"
-        ]
-        assert len(investigate_tasks) == 1
-        ctx = investigate_tasks[0].context or {}
-        assert ctx.get("regression_class", "").startswith("reviewer_sla_stall:")
-        assert ctx.get("signal_name") == "reviewer_sla_stall"
-        prompt = (investigate_tasks[0].first_payload or {}).get("prompt", "")
-        assert "#1234" in prompt
-        assert "EVALUATING" in prompt
-
-    @pytest.mark.asyncio
-    async def test_within_sla_does_not_spawn(self, db_session):
-        """ACTIVE case with EVALUATING task younger than threshold does not spawn."""
-        from app.models import RegressionCaseStatus, RegressionRemediationCase
-        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
-        import app.shared_state as _shared_state
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        now = _utcnow()
-        recent_at = now - timedelta(hours=2)
-        task = make_task(
-            project_id=project.id,
-            status=TaskStatus.EVALUATING,
-            created_at=recent_at,
-            updated_at=recent_at,
-        )
-        db_session.add(task)
-        await db_session.commit()
-        await db_session.refresh(task)
-
-        case = RegressionRemediationCase(
-            project_id=project.id,
-            regression_class="sr_catch_rate",
-            status=RegressionCaseStatus.ACTIVE,
-            hit_count=1,
-            last_remediation_task_id=task.id,
-        )
-        db_session.add(case)
-        await db_session.commit()
-
-        original_config = dict(_shared_state.runtime_config)
-        _shared_state.runtime_config["reviewer_sla_stall_hours"] = 6
-        try:
-            spawned = await _evaluate_reviewer_sla_signal(db_session, project.id, 2)
-        finally:
-            _shared_state.runtime_config.clear()
-            _shared_state.runtime_config.update(original_config)
-
-        assert spawned == 0
-
-    @pytest.mark.asyncio
-    async def test_skip_terminal_task(self, db_session):
-        """Cases whose linked task is COMPLETED/FAILED/CANCELLED are skipped."""
-        from app.models import RegressionCaseStatus, RegressionRemediationCase
-        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
-        import app.shared_state as _shared_state
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        old_at = _utcnow() - timedelta(hours=20)
-        for terminal_status in (
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.CANCELLED,
-        ):
-            task = make_task(
-                project_id=project.id,
-                status=terminal_status,
-                created_at=old_at,
-                updated_at=old_at,
-            )
-            db_session.add(task)
-        await db_session.commit()
-
-        terminal_tasks = (
-            (
-                await db_session.execute(
-                    select(Task).where(Task.project_id == project.id)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for t in terminal_tasks:
-            case = RegressionRemediationCase(
-                project_id=project.id,
-                regression_class=f"sr_catch_rate:{t.id}",
-                status=RegressionCaseStatus.ACTIVE,
-                hit_count=1,
-                last_remediation_task_id=t.id,
-            )
-            db_session.add(case)
-        await db_session.commit()
-
-        original_config = dict(_shared_state.runtime_config)
-        _shared_state.runtime_config["reviewer_sla_stall_hours"] = 6
-        try:
-            spawned = await _evaluate_reviewer_sla_signal(db_session, project.id, 5)
-        finally:
-            _shared_state.runtime_config.clear()
-            _shared_state.runtime_config.update(original_config)
-
-        assert spawned == 0
-
-    @pytest.mark.asyncio
-    async def test_skip_non_evaluating_task(self, db_session):
-        """Cases whose task is IN_PROGRESS (not yet in EVALUATING) are skipped."""
-        from app.models import RegressionCaseStatus, RegressionRemediationCase
-        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
-        import app.shared_state as _shared_state
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        old_at = _utcnow() - timedelta(hours=20)
-        task = make_task(
-            project_id=project.id,
-            status=TaskStatus.IN_PROGRESS,
-            created_at=old_at,
-            updated_at=old_at,
-        )
-        db_session.add(task)
-        await db_session.commit()
-        await db_session.refresh(task)
-
-        case = RegressionRemediationCase(
-            project_id=project.id,
-            regression_class="sr_catch_rate",
-            status=RegressionCaseStatus.ACTIVE,
-            hit_count=1,
-            last_remediation_task_id=task.id,
-        )
-        db_session.add(case)
-        await db_session.commit()
-
-        original_config = dict(_shared_state.runtime_config)
-        _shared_state.runtime_config["reviewer_sla_stall_hours"] = 6
-        try:
-            spawned = await _evaluate_reviewer_sla_signal(db_session, project.id, 2)
-        finally:
-            _shared_state.runtime_config.clear()
-            _shared_state.runtime_config.update(original_config)
-
-        assert spawned == 0
-
-    @pytest.mark.asyncio
-    async def test_dedup_in_flight_investigation_blocks_second_spawn(self, db_session):
-        """A second cycle with the prior SLA investigation still in-flight does not re-spawn."""
-        from app.models import RegressionCaseStatus, RegressionRemediationCase
-        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
-        import app.shared_state as _shared_state
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        now = _utcnow()
-        evaluating_at = now - timedelta(hours=10)
-        stalled_task = make_task(
-            project_id=project.id,
-            status=TaskStatus.EVALUATING,
-            created_at=evaluating_at,
-            updated_at=evaluating_at,
-        )
-        db_session.add(stalled_task)
-        await db_session.commit()
-        await db_session.refresh(stalled_task)
-
-        case = RegressionRemediationCase(
-            project_id=project.id,
-            regression_class="sr_catch_rate",
-            status=RegressionCaseStatus.ACTIVE,
-            hit_count=1,
-            last_remediation_task_id=stalled_task.id,
-        )
-        db_session.add(case)
-        await db_session.commit()
-        await db_session.refresh(case)
-
-        original_config = dict(_shared_state.runtime_config)
-        _shared_state.runtime_config["reviewer_sla_stall_hours"] = 6
-        try:
-            first = await _evaluate_reviewer_sla_signal(db_session, project.id, 2)
-            assert first == 1
-            await db_session.commit()
-
-            second = await _evaluate_reviewer_sla_signal(db_session, project.id, 2)
-            assert second == 0
-        finally:
-            _shared_state.runtime_config.clear()
-            _shared_state.runtime_config.update(original_config)
-
-    @pytest.mark.asyncio
-    async def test_status_log_fallback_uses_updated_at(self, db_session):
-        """When status_log has no EVALUATING entry, elapsed is derived from updated_at."""
-        from app.models import RegressionCaseStatus, RegressionRemediationCase
-        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
-        import app.shared_state as _shared_state
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        old_at = _utcnow() - timedelta(hours=10)
-        task = make_task(
-            project_id=project.id,
-            status=TaskStatus.EVALUATING,
-            created_at=old_at,
-            updated_at=old_at,
-            status_log=[],
-        )
-        db_session.add(task)
-        await db_session.commit()
-        await db_session.refresh(task)
-
-        case = RegressionRemediationCase(
-            project_id=project.id,
-            regression_class="sr_catch_rate_fallback",
-            status=RegressionCaseStatus.ACTIVE,
-            hit_count=1,
-            last_remediation_task_id=task.id,
-        )
-        db_session.add(case)
-        await db_session.commit()
-
-        original_config = dict(_shared_state.runtime_config)
-        _shared_state.runtime_config["reviewer_sla_stall_hours"] = 6
-        try:
-            spawned = await _evaluate_reviewer_sla_signal(db_session, project.id, 2)
-        finally:
-            _shared_state.runtime_config.clear()
-            _shared_state.runtime_config.update(original_config)
-
-        assert spawned == 1
-
-    @pytest.mark.asyncio
-    async def test_feature_flag_disabled_suppresses_spawns(self, db_session):
-        """Setting reviewer_sla_stall_enabled=False suppresses all spawns."""
-        from app.models import RegressionCaseStatus, RegressionRemediationCase
-        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
-        import app.shared_state as _shared_state
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        old_at = _utcnow() - timedelta(hours=20)
-        task = make_task(
-            project_id=project.id,
-            status=TaskStatus.EVALUATING,
-            created_at=old_at,
-            updated_at=old_at,
-        )
-        db_session.add(task)
-        await db_session.commit()
-        await db_session.refresh(task)
-
-        case = RegressionRemediationCase(
-            project_id=project.id,
-            regression_class="sr_catch_rate",
-            status=RegressionCaseStatus.ACTIVE,
-            hit_count=1,
-            last_remediation_task_id=task.id,
-        )
-        db_session.add(case)
-        await db_session.commit()
-
-        original_config = dict(_shared_state.runtime_config)
-        _shared_state.runtime_config["reviewer_sla_stall_enabled"] = False
-        try:
-            spawned = await _evaluate_reviewer_sla_signal(db_session, project.id, 2)
-        finally:
-            _shared_state.runtime_config.clear()
-            _shared_state.runtime_config.update(original_config)
-
-        assert spawned == 0
-
-    @pytest.mark.asyncio
-    async def test_high_threshold_suppresses_borderline_case(self, db_session):
-        """Setting reviewer_sla_stall_hours=48 suppresses a case stalled for only 8h."""
-        from app.models import RegressionCaseStatus, RegressionRemediationCase
-        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
-        import app.shared_state as _shared_state
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        old_at = _utcnow() - timedelta(hours=8)
-        task = make_task(
-            project_id=project.id,
-            status=TaskStatus.EVALUATING,
-            created_at=old_at,
-            updated_at=old_at,
-        )
-        db_session.add(task)
-        await db_session.commit()
-        await db_session.refresh(task)
-
-        case = RegressionRemediationCase(
-            project_id=project.id,
-            regression_class="sr_catch_rate",
-            status=RegressionCaseStatus.ACTIVE,
-            hit_count=1,
-            last_remediation_task_id=task.id,
-        )
-        db_session.add(case)
-        await db_session.commit()
-
-        original_config = dict(_shared_state.runtime_config)
-        _shared_state.runtime_config["reviewer_sla_stall_hours"] = 48
-        try:
-            spawned = await _evaluate_reviewer_sla_signal(db_session, project.id, 2)
-        finally:
-            _shared_state.runtime_config.clear()
-            _shared_state.runtime_config.update(original_config)
-
-        assert spawned == 0
-
-    @pytest.mark.asyncio
-    async def test_budget_zero_returns_immediately(self, db_session):
-        """spawn_budget_left=0 returns 0 without touching DB."""
-        from app.pipeline_regression_dispatcher import _evaluate_reviewer_sla_signal
-
-        project = make_project()
-        db_session.add(project)
-        await db_session.commit()
-        await db_session.refresh(project)
-
-        spawned = await _evaluate_reviewer_sla_signal(db_session, project.id, 0)
-        assert spawned == 0
 
 
 # ---------------------------------------------------------------------------
@@ -16756,6 +15631,58 @@ async def test_recovery_dynamic_shapes_return_healthy_with_no_data(db_session):
         assert state is not None, shape.example
         assert state["tripped"] is False, (
             f"{shape.example!r} should read healthy with no underlying activity"
+        )
+
+
+def test_dispatcher_signal_registry_derives_alert_and_staleness_metadata():
+    """Registry-backed metadata stays aligned across dispatcher surfaces."""
+    from app.pipeline_regression_dispatcher import (
+        BUILT_IN_SIGNAL_SPECS,
+        DISPATCH_BUILT_IN_SIGNAL_SPECS,
+        TELEMETRY_SIGNAL_SPECS,
+        _ALL_EVALUATOR_NAMES,
+        _SIGNAL_STALENESS_WINDOWS,
+    )
+
+    assert BUILT_IN_SIGNAL_SPECS, "built-in signal registry must not be empty"
+    assert DISPATCH_BUILT_IN_SIGNAL_SPECS, "dispatch signal registry must not be empty"
+    assert TELEMETRY_SIGNAL_SPECS, "telemetry registry must not be empty"
+
+    assert (
+        tuple(
+            spec.evaluator_name
+            for spec in DISPATCH_BUILT_IN_SIGNAL_SPECS
+            if spec.evaluator_name is not None
+        )
+        == _ALL_EVALUATOR_NAMES
+    )
+    assert {
+        spec.signal_name: spec.freshness_window for spec in TELEMETRY_SIGNAL_SPECS
+    } == _SIGNAL_STALENESS_WINDOWS
+
+
+def test_dispatcher_signal_registry_context_order_matches_evaluator_signature():
+    """Context-bearing dispatch evaluators must match registry-declared arg order."""
+    import inspect
+
+    import app.pipeline_regression_dispatcher as dispatcher
+
+    from app.pipeline_regression_dispatcher import DISPATCH_BUILT_IN_SIGNAL_SPECS
+
+    for spec in DISPATCH_BUILT_IN_SIGNAL_SPECS:
+        if not spec.dispatch_context_keys or spec.dispatch_evaluator_name is None:
+            continue
+        evaluator = getattr(dispatcher, spec.dispatch_evaluator_name)
+        params = list(inspect.signature(evaluator).parameters)
+        expected = [
+            "session",
+            "project_id",
+            *spec.dispatch_context_keys,
+            "spawn_budget_left",
+        ]
+        assert params[: len(expected)] == expected, (
+            f"{spec.dispatch_evaluator_name} must accept args in registry order; "
+            f"expected {expected}, got {params}"
         )
 
 

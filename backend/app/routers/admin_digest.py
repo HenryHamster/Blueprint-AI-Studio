@@ -5514,10 +5514,8 @@ async def get_regression_dispatcher_health(
     a cold start (empty table) — never raises — so the UI shows 'no data'
     rather than crashing.
     """
-    from app.pipeline_regression_dispatcher import (  # noqa: PLC0415
-        compute_mtti_p50_sec,
-        get_dispatcher_cycle_records,
-    )
+    from app.dispatcher_read_api import get_dispatcher_cycle_records  # noqa: PLC0415
+    from app.regression_dispatcher_metrics import compute_mtti_p50_sec  # noqa: PLC0415
 
     pid_str = str(project_id) if project_id else None
     # ``window_hours`` is bounded to 168 above; pull a large enough page that
@@ -5792,164 +5790,15 @@ async def get_regression_mtta(
     elapsed times for currently-active cases so operators can see 'is this
     auto-fixing on schedule or has it stalled?'
     """
-    from collections import defaultdict  # noqa: PLC0415
-
-    from app.pipeline_regression_dispatcher import _REGRESSION_RECOVERY_COOLDOWN  # noqa: PLC0415
-
-    cutoff = datetime.utcnow() - timedelta(days=window_days)
-    where: List = [RegressionRemediationCase.first_seen_at >= cutoff]
-    if project_id is not None:
-        where.append(RegressionRemediationCase.project_id == project_id)
-
-    cases = (
-        (
-            await session.execute(
-                select(RegressionRemediationCase)
-                .where(*where)
-                .order_by(RegressionRemediationCase.first_seen_at.desc())
-                .limit(2000)
-            )
-        )
-        .scalars()
-        .all()
+    from app.dispatcher_read_api import (  # noqa: PLC0415
+        get_regression_mtta_dashboard_data,
     )
 
-    now = datetime.utcnow()
-
-    def _pct(vals: List[float], p: float) -> Optional[float]:
-        if not vals:
-            return None
-        s = sorted(vals)
-        return s[min(int(len(s) * p), len(s) - 1)]
-
-    def _parse_dt(v: Optional[str]) -> Optional[datetime]:
-        if not v:
-            return None
-        try:
-            return datetime.fromisoformat(v.replace("Z", ""))
-        except (ValueError, TypeError):
-            return None
-
-    class_cases: Dict[str, List] = defaultdict(list)
-    for c in cases:
-        class_cases[c.regression_class].append(c)
-
-    rows = []
-    for rclass, cls_cases in class_cases.items():
-        detect_s: List[float] = []
-        investigate_s: List[float] = []
-        inv_to_merge_s: List[float] = []
-        merge_to_rec_s: List[float] = []
-        active_info: List[Dict[str, Any]] = []
-
-        for c in cls_cases:
-            ttd = c.time_to_detect_sec
-            if ttd is not None and ttd >= 0:
-                detect_s.append(ttd)
-            tti = c.time_to_investigate_sec
-            if tti is not None and tti >= 0:
-                investigate_s.append(float(tti))
-            # inv_anchor advances to recovered_dt after each cycle so
-            # re-armed cases report per-episode investigate→merge durations.
-            inv_anchor: Optional[datetime] = c.investigate_spawned_at
-            latest_merged_fix: Optional[datetime] = None
-            for entry in c.fingerprint_to_fix_log or []:
-                if not isinstance(entry, dict):
-                    continue
-                merged_dt = _parse_dt(entry.get("merged_at"))
-                recovered_dt = _parse_dt(entry.get("recovered_at"))
-                if merged_dt and inv_anchor:
-                    d = (merged_dt - inv_anchor).total_seconds()
-                    if d >= 0:
-                        inv_to_merge_s.append(d)
-                    latest_merged_fix = merged_dt
-                if merged_dt and recovered_dt:
-                    d2 = (recovered_dt - merged_dt).total_seconds()
-                    if d2 >= 0:
-                        merge_to_rec_s.append(d2)
-                if recovered_dt and latest_merged_fix is not None and not merged_dt:
-                    inv_anchor = recovered_dt
-                    latest_merged_fix = None
-
-            if c.status != RegressionCaseStatus.CLOSED:
-                anchor = (
-                    c.signal_first_crossed_at
-                    or c.signal_first_seen_at
-                    or c.first_seen_at
-                )
-                live_elapsed = round((now - anchor).total_seconds()) if anchor else None
-                live_inv = (
-                    round((now - c.investigate_spawned_at).total_seconds())
-                    if c.investigate_spawned_at
-                    else None
-                )
-                rec_check_in: Optional[int] = None
-                if c.status == RegressionCaseStatus.MERGED:
-                    last_entry = next(
-                        (
-                            e
-                            for e in reversed(c.fingerprint_to_fix_log or [])
-                            if isinstance(e, dict) and e.get("merged_at")
-                        ),
-                        None,
-                    )
-                    if last_entry:
-                        m = _parse_dt(last_entry["merged_at"])
-                        if m:
-                            secs = int(
-                                (
-                                    m + _REGRESSION_RECOVERY_COOLDOWN - now
-                                ).total_seconds()
-                            )
-                            rec_check_in = secs if secs > 0 else None
-                active_info.append(
-                    {
-                        "case_id": str(c.id),
-                        "status": c.status,
-                        "live_elapsed_sec": live_elapsed,
-                        "live_elapsed_investigate_sec": live_inv,
-                        "recovery_check_in_sec": rec_check_in,
-                    }
-                )
-
-        rows.append(
-            {
-                "regression_class": rclass,
-                "sample_count": len(cls_cases),
-                "stages": {
-                    "signal_trip_to_detect": {
-                        "p50_sec": _pct(detect_s, 0.5),
-                        "p90_sec": _pct(detect_s, 0.9),
-                        "sample_count": len(detect_s),
-                    },
-                    "detect_to_investigate": {
-                        "p50_sec": _pct(investigate_s, 0.5),
-                        "p90_sec": _pct(investigate_s, 0.9),
-                        "sample_count": len(investigate_s),
-                    },
-                    "investigate_to_merge": {
-                        "p50_sec": _pct(inv_to_merge_s, 0.5),
-                        "p90_sec": _pct(inv_to_merge_s, 0.9),
-                        "sample_count": len(inv_to_merge_s),
-                    },
-                    "merge_to_recovery": {
-                        "p50_sec": _pct(merge_to_rec_s, 0.5),
-                        "p90_sec": _pct(merge_to_rec_s, 0.9),
-                        "sample_count": len(merge_to_rec_s),
-                    },
-                },
-                "active_cases": active_info,
-            }
-        )
-
-    rows.sort(key=lambda r: r["sample_count"], reverse=True)
-    return {
-        "project_id": str(project_id) if project_id else None,
-        "window_days": window_days,
-        "class_count": len(rows),
-        "classes": rows,
-        "recovery_cooldown_sec": int(_REGRESSION_RECOVERY_COOLDOWN.total_seconds()),
-    }
+    return await get_regression_mtta_dashboard_data(
+        session,
+        project_id=project_id,
+        window_days=window_days,
+    )
 
 
 @router.get("/projects/{project_id}/efficiency-axes")

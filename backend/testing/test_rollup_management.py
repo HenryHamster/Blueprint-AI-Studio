@@ -93,7 +93,7 @@ def _mock_automerge_deps(mocker, *, pr_files, diff, merge_merged=True):
         new_callable=AsyncMock,
     )
     mocker.patch(
-        "app.pipeline_regression_dispatcher.update_viewport_coverage_snapshot_from_diff",
+        "app.viewport_coverage.update_viewport_coverage_snapshot_from_diff",
         new_callable=AsyncMock,
     )
     mock_spawn = mocker.patch(

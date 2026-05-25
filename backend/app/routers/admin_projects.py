@@ -24,6 +24,15 @@ router = APIRouter(
 )
 
 
+def _redact_build_config(build_config: dict, role: str) -> dict:
+    """Return build_config with env_vars omitted for non-owner callers."""
+    if role == "owner":
+        return build_config
+    result = dict(build_config)
+    result.pop("env_vars", None)
+    return result
+
+
 @router.get("/projects")
 @limiter.limit("30/minute")
 async def get_all_projects(
@@ -76,7 +85,9 @@ async def get_all_projects(
                 "github_repo": row.github_repo,
                 "is_self_repo": row.is_self_repo,
                 "autonomous_enabled": row.autonomous_enabled,
-                "build_config": row.build_config or {},
+                "build_config": _redact_build_config(
+                    row.build_config or {}, row.my_role
+                ),
                 "sr_catch_rate_targets": row.sr_catch_rate_targets or {},
                 "running_update_acknowledged_at": (
                     row.running_update_acknowledged_at.isoformat()
@@ -132,7 +143,7 @@ async def get_project(
             else None
         ),
         "self_reflection_log": project.self_reflection_log or [],
-        "build_config": project.build_config or {},
+        "build_config": _redact_build_config(project.build_config or {}, role),
         "autonomous_enabled": project.autonomous_enabled,
         "is_self_repo": project.is_self_repo,
         "sr_catch_rate_targets": project.sr_catch_rate_targets or {},
@@ -161,6 +172,11 @@ class ProjectUpdate(BaseModel):
     problem_model_patch: Dict[str, Any] | None = None
 
 
+_OWNER_ONLY_UPDATE_FIELDS = frozenset(
+    {"build_config", "autonomous_enabled", "design_doc", "vision"}
+)
+
+
 @router.patch("/projects/{project_id}")
 @limiter.limit("30/minute")
 async def update_project(
@@ -173,6 +189,26 @@ async def update_project(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+
+    # Fetch the caller's actual role so we can gate owner-only fields.
+    caller_member = (
+        await session.execute(
+            select(ProjectMember).where(
+                ProjectMember.project_id == project_id,
+                ProjectMember.user_id == current_user["user_id"],
+            )
+        )
+    ).scalar_one_or_none()
+    caller_role = caller_member.role if caller_member else "member"
+
+    if caller_role != "owner" and any(
+        getattr(payload, f) is not None for f in _OWNER_ONLY_UPDATE_FIELDS
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Only project owners may change build_config, autonomous_enabled, design_doc, or vision.",
+        )
+
     # Lock the project row whenever directions, design_doc, or vision are
     # being overwritten so concurrent agent writers cannot silently clobber.
     needs_lock = (
@@ -336,7 +372,7 @@ async def detect_project_build_config(
     current_user: dict = Depends(get_current_user),
 ):
     project = await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
+        project_id, current_user["user_id"], session, "owner"
     )
     if not project.github_owner or not project.github_repo:
         raise HTTPException(

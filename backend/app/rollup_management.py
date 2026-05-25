@@ -2268,7 +2268,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             )
                         try:
                             from app.github import get_pull_request_diff
-                            from app.pipeline_regression_dispatcher import (
+                            from app.viewport_coverage import (
                                 update_viewport_coverage_snapshot_from_diff,
                             )
 

@@ -44,6 +44,12 @@ DISPATCHER_PATH = os.path.normpath(
 
 
 EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
+    "app.dispatcher_read_api": (
+        "_REGRESSION_RECOVERY_COOLDOWN",
+        "get_dispatcher_cycle_records",
+        "get_regression_mtta_data",
+        "get_sr_persistent_blind_spot_hint",
+    ),
     "app.regression_dispatcher_metrics": (
         "compute_mtti_p50_sec",
         "_layers_targeted_union",
@@ -86,9 +92,28 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "_evaluate_sr_catch_rate_targets",
         "compute_pipeline_health_summary",
     ),
+    "app.regression_recovery_watchdog": (
+        "_auto_close_recovered_manual_intervention",
+        "_ensure_watchdog_alert_open",
+        "_resolve_watchdog_alert",
+        "_run_compliance_followup_once",
+        "_run_signal_staleness_watchdog",
+        "run_dispatcher_watchdog_alarms",
+        "run_recovery_once",
+        "run_watchdog_once",
+    ),
     "app.regression_recovery_evaluators": (
+        "BuiltInSignalSpec",
+        "BUILT_IN_SIGNAL_SPECS",
+        "DISPATCH_BUILT_IN_SIGNAL_SPECS",
         "RegressionClassShape",
         "SPAWNABLE_REGRESSION_CLASS_SHAPES",
+        "TelemetrySignalSpec",
+        "TELEMETRY_SIGNAL_SPECS",
+        "_ALL_EVALUATOR_NAMES",
+        "_SIGNAL_STALENESS_WINDOWS",
+        "_SR_CATCH_RATE_FROZEN_SIGNAL_FRESH_WINDOW",
+        "_SR_CATCH_RATE_SUFFICIENCY_STALE_WINDOW",
         "_recover_agent_vm_resource",
         "_recover_cross_case_fingerprint",
         "_recover_fix_loop_divergence_fingerprint",
@@ -103,7 +128,12 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "_recover_strategic_cycle_stall",
         "_recover_viewport_coverage_drop",
         "_recover_viewport_regression",
+        "get_telemetry_signal_spec",
         "match_spawnable_shape",
+    ),
+    "app.viewport_coverage": (
+        "compute_viewport_coverage_snapshot",
+        "update_viewport_coverage_snapshot_from_diff",
     ),
 }
 

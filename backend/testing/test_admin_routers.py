@@ -6,7 +6,7 @@ Tests for three admin routers:
 """
 
 import uuid
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient, ASGITransport
@@ -472,6 +472,120 @@ class TestGetAllProjects:
         assert resp.status_code == 200
         assert all("my_role" in p for p in resp.json()["items"])
 
+    @pytest.mark.asyncio
+    async def test_owner_sees_env_vars_in_list(self, client: AsyncClient, db_session):
+        """Owner can see env_vars in build_config from the list endpoint."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="EnvVars Owner List")
+        project.build_config = {"env_vars": {"SECRET": "s3cr3t"}, "node_version": "18"}
+        flag_modified(project, "build_config")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/projects")
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        target = next(p for p in items if p["id"] == str(project.id))
+        assert target["my_role"] == "owner"
+        assert target["build_config"].get("env_vars") == {"SECRET": "s3cr3t"}
+        assert target["build_config"].get("node_version") == "18"
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_see_env_vars_in_list(
+        self, client: AsyncClient, db_session
+    ):
+        """Member role cannot see env_vars from the list endpoint but sees other fields."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        other_project = Project(name="Member EnvVars List", user_id="other-owner-list")
+        db_session.add(other_project)
+        await db_session.commit()
+        await db_session.refresh(other_project)
+        other_project.build_config = {
+            "env_vars": {"SECRET": "hidden"},
+            "node_version": "20",
+        }
+        flag_modified(other_project, "build_config")
+        db_session.add(
+            ProjectMember(
+                project_id=other_project.id, user_id="other-owner-list", role="owner"
+            )
+        )
+        db_session.add(
+            ProjectMember(
+                project_id=other_project.id, user_id=TEST_USER_ID, role="member"
+            )
+        )
+        db_session.add(other_project)
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/projects")
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        target = next(p for p in items if p["id"] == str(other_project.id))
+        assert target["my_role"] == "member"
+        assert "env_vars" not in target["build_config"]
+        assert target["build_config"].get("node_version") == "20"
+
+
+class TestGetProject:
+    @pytest.mark.asyncio
+    async def test_owner_sees_env_vars_in_detail(self, client: AsyncClient, db_session):
+        """Owner can see env_vars in build_config from the detail endpoint."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="EnvVars Owner Detail")
+        project.build_config = {"env_vars": {"TOKEN": "abc"}, "node_version": "18"}
+        flag_modified(project, "build_config")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["my_role"] == "owner"
+        assert data["build_config"].get("env_vars") == {"TOKEN": "abc"}
+        assert data["build_config"].get("node_version") == "18"
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_see_env_vars_in_detail(
+        self, client: AsyncClient, db_session
+    ):
+        """Member cannot see env_vars from the detail endpoint but sees other fields."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        other_project = Project(
+            name="Member EnvVars Detail", user_id="other-owner-detail"
+        )
+        db_session.add(other_project)
+        await db_session.commit()
+        await db_session.refresh(other_project)
+        other_project.build_config = {
+            "env_vars": {"SECRET": "hidden"},
+            "node_version": "20",
+        }
+        flag_modified(other_project, "build_config")
+        db_session.add(
+            ProjectMember(
+                project_id=other_project.id, user_id="other-owner-detail", role="owner"
+            )
+        )
+        db_session.add(
+            ProjectMember(
+                project_id=other_project.id, user_id=TEST_USER_ID, role="member"
+            )
+        )
+        db_session.add(other_project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{other_project.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["my_role"] == "member"
+        assert "env_vars" not in data["build_config"]
+        assert data["build_config"].get("node_version") == "20"
+
 
 class TestUpdateProject:
     @pytest.mark.asyncio
@@ -653,6 +767,149 @@ class TestUpdateProject:
         doc = project.design_doc or {}
         assert doc.get("owner_key") == "writer_a"
         assert doc.get("_meta", {}).get("revision") == 2
+
+
+class TestUpdateProjectOwnerOnlyFields:
+    """Members may not mutate owner-only fields; owners always can."""
+
+    async def _make_member_project(self, db_session):
+        """Project owned by 'other-owner', with TEST_USER_ID as a member."""
+        owner_project = Project(name="Owner Project", user_id="other-owner")
+        db_session.add(owner_project)
+        await db_session.commit()
+        await db_session.refresh(owner_project)
+        db_session.add(
+            ProjectMember(
+                project_id=owner_project.id, user_id="other-owner", role="owner"
+            )
+        )
+        db_session.add(
+            ProjectMember(
+                project_id=owner_project.id, user_id=TEST_USER_ID, role="member"
+            )
+        )
+        await db_session.commit()
+        return owner_project
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_update_build_config(
+        self, client: AsyncClient, db_session
+    ):
+        """Member gets 403 when trying to change build_config."""
+        project = await self._make_member_project(db_session)
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"build_config": {"env_vars": {"SECRET": "x"}}},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_update_autonomous_enabled(
+        self, client: AsyncClient, db_session
+    ):
+        """Member gets 403 when trying to change autonomous_enabled."""
+        project = await self._make_member_project(db_session)
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"autonomous_enabled": True},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_update_design_doc(
+        self, client: AsyncClient, db_session
+    ):
+        """Member gets 403 when trying to change design_doc."""
+        project = await self._make_member_project(db_session)
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"design_doc": {"summary": "hacked"}},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_update_vision(self, client: AsyncClient, db_session):
+        """Member gets 403 when trying to change vision."""
+        project = await self._make_member_project(db_session)
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"vision": {"text": "my vision"}},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_member_can_update_name(self, client: AsyncClient, db_session):
+        """Member may still update non-privileged fields like name."""
+        project = await self._make_member_project(db_session)
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"name": "Renamed by member"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["name"] == "Renamed by member"
+
+    @pytest.mark.asyncio
+    async def test_owner_can_update_build_config_env_vars(
+        self, client: AsyncClient, db_session
+    ):
+        """Project owner can update build_config including env_vars."""
+        project = await _make_project(db_session)
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"build_config": {"env_vars": {"TOKEN": "secret"}}},
+        )
+        assert resp.status_code == 200
+        bc = resp.json().get("build_config") or {}
+        assert bc.get("env_vars", {}).get("TOKEN") == "secret"
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_requires_owner_for_env_vars_persistence(
+        self, client: AsyncClient, db_session
+    ):
+        """Members cannot detect-and-write build_config; owners still can."""
+        member_project = await self._make_member_project(db_session)
+        member_project.github_owner = "acme"
+        member_project.github_repo = "member-repo"
+        db_session.add(member_project)
+
+        owner_project = await _make_project(db_session, name="Owner Detect Project")
+        owner_project.github_owner = "acme"
+        owner_project.github_repo = "owner-repo"
+        db_session.add(owner_project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"env_vars": {"TOKEN": "secret"}, "node_version": "20"},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            member_resp = await client.post(
+                f"/api/admin/projects/{member_project.id}/detect-build-config"
+            )
+            owner_resp = await client.post(
+                f"/api/admin/projects/{owner_project.id}/detect-build-config"
+            )
+
+        assert member_resp.status_code == 403
+        assert "owner" in member_resp.text
+
+        assert owner_resp.status_code == 200
+        owner_build_config = owner_resp.json().get("build_config") or {}
+        assert owner_build_config.get("env_vars", {}).get("TOKEN") == "secret"
+
+        await db_session.refresh(member_project)
+        await db_session.refresh(owner_project)
+        assert member_project.build_config is None
+        assert (owner_project.build_config or {}).get("env_vars", {}).get("TOKEN") == (
+            "secret"
+        )
 
 
 class TestDeleteProject:

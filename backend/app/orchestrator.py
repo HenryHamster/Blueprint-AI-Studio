@@ -817,10 +817,12 @@ async def orchestrator_worker():
             # the orchestrator on dispatcher exceptions.
             global _last_regression_dispatch
             if (_utcnow() - _last_regression_dispatch).total_seconds() >= 60:
-                from app.pipeline_regression_dispatcher import (
+                from app.regression_recovery_watchdog import (
                     run_dispatcher_watchdog_alarms as _run_watchdog_alarms,
+                )
+                from app.pipeline_regression_dispatcher import (
                     run_once as _run_regression_dispatcher,
-                )  # noqa: PLC0415
+                )
 
                 # Pull IDs only (no Project ORM rows in any identity map). The
                 # dispatcher's run_once does ``session.get(Project, project_id)``
