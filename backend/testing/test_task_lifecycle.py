@@ -4040,11 +4040,16 @@ def test_smoketest_and_hotfix_gates_use_promotion_target():
     )
     assert 'and base_branch == "main"' not in src, (
         "Smoketest / hotfix back-merge gate hardcodes base_branch == 'main'; "
-        "use _runtime_config.get('promotion_target', 'main') instead"
+        "use _shared_state.get_project_promotion_target(project) instead"
     )
-    assert '"promotion_target"' in src, (
-        "task_lifecycle.py must reference 'promotion_target' for the "
-        "smoketest / hotfix gate — none found"
+    # Accept either the literal config key reference OR the per-project helper
+    # (post-migration 0125 the per-project Project.promotion_target column is
+    # resolved through _shared_state.get_project_promotion_target, which hides
+    # the string literal inside shared_state.py).
+    assert '"promotion_target"' in src or "get_project_promotion_target" in src, (
+        "task_lifecycle.py must reference promotion_target for the "
+        "smoketest / hotfix gate — neither the literal config key nor the "
+        "get_project_promotion_target helper was found"
     )
 
 

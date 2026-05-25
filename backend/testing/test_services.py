@@ -1774,6 +1774,70 @@ async def test_stale_branch_prefixes_preserves_single_prefix(svc_db):
     assert project.stale_branch_prefixes == ("task/",)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# protected_branches (project-driven cleanup safety)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_protected_branches_default_when_not_configured(svc_db):
+    """Project without build_config returns the default protected branch set."""
+    project = await _make_project(svc_db)
+    assert project.build_config is None
+    protected = project.protected_branches
+    assert "main" in protected
+    assert "master" in protected
+    assert "develop" in protected
+    assert "dev" in protected
+
+
+@pytest.mark.asyncio
+async def test_protected_branches_custom_from_build_config(svc_db):
+    """Project with custom protected_branches in build_config uses them."""
+    project = Project(
+        name="Custom Protected Project",
+        user_id="user1",
+        build_config={"protected_branches": ["trunk", "stable"]},
+    )
+    svc_db.add(project)
+    await svc_db.commit()
+    await svc_db.refresh(project)
+    protected = project.protected_branches
+    assert "trunk" in protected
+    assert "stable" in protected
+
+
+@pytest.mark.asyncio
+async def test_protected_branches_always_includes_integration_branch(svc_db):
+    """integration_branch is always in the protected set regardless of config."""
+    project = Project(
+        name="Integration Branch Project",
+        user_id="user1",
+        integration_branch="develop-lts",
+        build_config={"protected_branches": ["trunk"]},
+    )
+    svc_db.add(project)
+    await svc_db.commit()
+    await svc_db.refresh(project)
+    assert "develop-lts" in project.protected_branches
+
+
+@pytest.mark.asyncio
+async def test_protected_branches_always_includes_promotion_target(svc_db):
+    """promotion_target is always in the protected set regardless of config."""
+    project = Project(
+        name="Promotion Target Project",
+        user_id="user1",
+        build_config={"protected_branches": ["trunk"]},
+    )
+    svc_db.add(project)
+    await svc_db.commit()
+    await svc_db.refresh(project)
+    with patch.dict(_shared_state.runtime_config, {"promotion_target": "release-lts"}):
+        protected = project.protected_branches
+    assert "release-lts" in protected
+
+
 # ── _derive_task_branch: task-type -> branch prefix mapping ──────────────────
 
 

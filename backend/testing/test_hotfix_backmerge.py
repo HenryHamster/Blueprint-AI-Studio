@@ -412,6 +412,7 @@ async def test_advisory_lock_prevents_concurrent_duplicate_plan(db_session, mock
         "http://pr/55",
         None,
         "hook",
+        project=project,
         message="conflict",
         periodic=False,
     )
@@ -425,6 +426,7 @@ async def test_advisory_lock_prevents_concurrent_duplicate_plan(db_session, mock
         "http://pr/55",
         None,
         "reconciler",
+        project=project,
         message="conflict",
         periodic=False,
     )
@@ -789,3 +791,69 @@ async def test_reconcile_skipped_when_integration_equals_promotion(db_session, m
     assert result == {"status": "skipped", "reason": "lts_inactive"}
     create_mock.assert_not_called()
     merge_mock.assert_not_called()
+
+
+# ===========================================================================
+# Per-project promotion_target resolution
+# ===========================================================================
+
+
+async def test_open_backmerge_pr_uses_per_project_promotion_target(db_session, mocker):
+    """When project.promotion_target is set, it takes precedence over
+    runtime_config so the back-merge goes to the project-specific LTS branch."""
+    project = await _make_project(db_session)
+    project.integration_branch = "proj-trunk"
+    project.promotion_target = "proj-lts"
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # runtime_config points to different branches — project column wins.
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"integration_branch": "automain", "promotion_target": "main"},
+    )
+    create_mock, _merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 42, "html_url": "http://pr/42"},
+        merge_return={"merged": True},
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "merged"
+    # PR must use the per-project branch names, not the global config values.
+    assert create_mock.call_args.kwargs["head"] == "proj-lts"
+    assert create_mock.call_args.kwargs["base"] == "proj-trunk"
+    assert create_mock.call_args.kwargs["title"] == "Back-merge: proj-lts -> proj-trunk"
+
+
+async def test_reconcile_uses_per_project_branch_names(db_session, mocker):
+    """reconcile_main_into_automain uses per-project branch names for both the
+    LTS-active check and the back-merge PR."""
+    project = await _make_project(db_session)
+    project.integration_branch = "proj-trunk"
+    project.promotion_target = "proj-lts"
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # runtime_config has matching branches (LTS inactive globally) — project column wins.
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"integration_branch": "main", "promotion_target": "main"},
+    )
+    create_mock, _merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 43, "html_url": "http://pr/43"},
+        merge_return={"merged": True},
+    )
+
+    result = await hb.reconcile_main_into_automain(db_session, project.id)
+    await db_session.commit()
+
+    # Per-project branches differ, so LTS is active and reconciler runs.
+    assert result["status"] == "merged"
+    assert create_mock.call_args.kwargs["head"] == "proj-lts"
+    assert create_mock.call_args.kwargs["base"] == "proj-trunk"

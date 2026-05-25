@@ -7,6 +7,7 @@ from app.models import (
     CYCLE_META_MEMOS_AVAILABLE,
     CYCLE_META_MEMOS_CITED,
     MaxPlanAccount,
+    Project,
     RegressionRemediationCase,
     StrategicCycle,
 )
@@ -290,3 +291,28 @@ def test_mark_merged_fix_merge_sha_coexists_with_other_fields():
     assert entry.get("fix_merge_sha") == "deadbeef1234"
     assert entry.get("layers_targeted") == ["PROMPTS", "TESTS"]
     assert "episode_investigate_started_at" in entry
+
+
+# task_branch_prefix (project-level branch namespace)
+
+
+def _make_project(build_config=None):
+    return Project(name="Test", user_id="user1", build_config=build_config)
+
+
+def test_task_branch_prefix_defaults_to_blueprint():
+    assert _make_project().task_branch_prefix == "blueprint/"
+
+
+def test_task_branch_prefix_reads_from_build_config():
+    project = _make_project(build_config={"task_branch_prefix": "acme/"})
+    assert project.task_branch_prefix == "acme/"
+
+
+def test_task_branch_prefix_falls_back_when_build_config_is_none():
+    assert _make_project(build_config=None).task_branch_prefix == "blueprint/"
+
+
+def test_task_branch_prefix_falls_back_when_key_absent_in_build_config():
+    project = _make_project(build_config={"other_key": "value"})
+    assert project.task_branch_prefix == "blueprint/"

@@ -7,6 +7,7 @@
     "main.py": 2,
     "playbook_learning.py": 3,
     "playbook_lifecycle.py": 1,
+    "playbook_sr_metrics.py": 10,
     "playbook_storage.py": 1,
     "review_learning.py": 2,
     "routers/admin_notifications.py": 3,

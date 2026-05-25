@@ -1192,6 +1192,32 @@ export async function handleCreate(
     const prBranch = validateBranchName(strVal(payload.branch), 'branch');
     const prBaseBranch = validateBranchName(strVal(payload.base_branch, 'main'), 'base_branch');
     const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+
+    // Check the branch still exists before cloning — auto-delete-on-merge removes
+    // the head branch as soon as the PR is merged, making clone fatal. This is a
+    // permanent state (not a transient error), so short-circuit cleanly.
+    let branchExists = false;
+    try {
+      const lsOut = execFileSync('git', ['ls-remote', '--heads', cloneUrl, prBranch], { timeout: 30000 });
+      branchExists = lsOut.toString().trim().length > 0;
+    } catch {
+      // ls-remote itself failed (auth error, network, etc.) — let the clone attempt
+      // proceed and fail loudly so non-branch errors still surface.
+      branchExists = true;
+    }
+    if (!branchExists) {
+      const skipMsg = `PR head branch '${prBranch}' no longer exists on ${owner}/${repo} — likely merged and auto-deleted. Skipping review (nothing to review).`;
+      sendLog(ws, `[FreshReview] ${skipMsg}\n`);
+      await persistAndPostStatus(taskId, {
+        task_id: taskId,
+        status: 'COMPLETED',
+        artifact_type: 'ERROR_LOG',
+        logs: skipMsg,
+        failure_category: 'PR_BRANCH_DELETED',
+      });
+      return;
+    }
+
     sendLog(ws, `[FreshReview] Operator-requested pass — cloning ${owner}/${repo} branch ${prBranch}\n`);
     await prepareWorkspaceForRole({ workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken, branch: prBranch, baseBranch: prBaseBranch, depth: DEFAULT_CLONE_DEPTH });
     try { git(['fetch', 'origin', `+refs/heads/${prBaseBranch}:refs/remotes/origin/${prBaseBranch}`, '--depth', String(DEFAULT_CLONE_DEPTH)]); } catch { /* ok */ }

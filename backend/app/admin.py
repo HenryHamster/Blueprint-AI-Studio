@@ -852,6 +852,7 @@ async def bulk_action_tasks(
                             from app.routers.agent import get_github_token_for_task
                             from app.shared_state import (
                                 runtime_config as _runtime_config,
+                                get_project_promotion_target as _get_project_promotion_target,
                             )
                             from app.rollup_management import _cleanup_branches
                             from app.github import merge_pull_request, create_pr_comment
@@ -882,8 +883,13 @@ async def bulk_action_tasks(
                                 base_branch = (task.first_payload).get(
                                     "base_branch", "main"
                                 )
-                                _promotion_target = str(
-                                    _runtime_config.get("promotion_target", "main")
+                                _project = await session.get(Project, task.project_id)
+                                _promotion_target = (
+                                    _get_project_promotion_target(_project)
+                                    if _project is not None
+                                    else str(
+                                        _runtime_config.get("promotion_target", "main")
+                                    )
                                 )
                                 if (
                                     base_branch == _promotion_target
@@ -999,8 +1005,9 @@ async def bulk_action_tasks(
                         if artifact and artifact.pr_url:
                             pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
                             task_payload = task.first_payload
+                            _project = await session.get(Project, task.project_id)
                             branch = _derive_task_branch(
-                                task.id, task_payload.get("type")
+                                task.id, task_payload.get("type"), project=_project
                             )
                             base_branch = task_payload.get("base_branch", "main")
 
@@ -1679,7 +1686,8 @@ async def request_changes(
 
     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
     task_payload = task.first_payload
-    branch = _derive_task_branch(task.id, task_payload.get("type"))
+    _project = await session.get(Project, task.project_id)
+    branch = _derive_task_branch(task.id, task_payload.get("type"), project=_project)
     base_branch = task_payload.get("base_branch", "main")
 
     from app.review_pipeline import _spawn_pipeline_task
@@ -1765,10 +1773,11 @@ async def request_fresh_reviewer(
     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
     task_payload = task.first_payload
     review_loop = ctx.get("review_loop") or {}
+    _project = await session.get(Project, task.project_id)
     branch = (
         review_loop.get("branch")
         or task_payload.get("branch")
-        or _derive_task_branch(task_id, task_payload.get("type"))
+        or _derive_task_branch(task_id, task_payload.get("type"), project=_project)
     )
     base_branch = task_payload.get("base_branch", "main")
     related_files = task_payload.get("related_files") or ctx.get("related_files") or []
@@ -2133,7 +2142,10 @@ async def modify_task(
                 # Rollup PR approval: merge the rollup PR directly
                 try:
                     from app.routers.agent import get_github_token_for_task
-                    from app.shared_state import runtime_config as _runtime_config
+                    from app.shared_state import (
+                        runtime_config as _runtime_config,
+                        get_project_promotion_target as _get_project_promotion_target,
+                    )
                     from app.rollup_management import _cleanup_branches
                     from app.github import merge_pull_request, create_pr_comment
 
@@ -2165,8 +2177,11 @@ async def modify_task(
                         # Post-merge cleanup: branches + smoketest (mirrors webhook merge path)
                         await _cleanup_branches(task, session)
                         base_branch = (task.first_payload).get("base_branch", "main")
-                        _promotion_target = str(
-                            _runtime_config.get("promotion_target", "main")
+                        _project = await session.get(Project, task.project_id)
+                        _promotion_target = (
+                            _get_project_promotion_target(_project)
+                            if _project is not None
+                            else str(_runtime_config.get("promotion_target", "main"))
                         )
                         if base_branch == _promotion_target and _runtime_config.get(
                             "smoketest_enabled"
@@ -2280,7 +2295,10 @@ async def modify_task(
                 if artifact and artifact.pr_url:
                     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
                     task_payload = task.first_payload
-                    branch = _derive_task_branch(task.id, task_payload.get("type"))
+                    _project = await session.get(Project, task.project_id)
+                    branch = _derive_task_branch(
+                        task.id, task_payload.get("type"), project=_project
+                    )
                     base_branch = task_payload.get("base_branch", "main")
 
                     if ctx.get("touched_critical"):

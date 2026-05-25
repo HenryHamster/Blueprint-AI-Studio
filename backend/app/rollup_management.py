@@ -41,26 +41,6 @@ from app.shared_state import runtime_config as _runtime_config
 logger = logging.getLogger(__name__)
 
 
-# Maps task type -> branch prefix used by the agent when naming work branches.
-# Convention: blueprint/{prefix}-{first-8-hex-of-task-uuid}
-# Deliberate subset of the canonical map in agent/src/index.ts /
-# backend/app/services.py: only the non-"task" prefixes these recovery paths
-# derive are listed. Other types (create, qa, fix, ...) fall back to "task" in
-# _derive_task_branch — and fix tasks reuse an existing branch, so they never
-# hit this fallback. Keep the listed prefixes in sync with the canonical map.
-_TASK_TYPE_BRANCH_PREFIX: dict[str, str] = {
-    "docs": "docs",
-    "deps": "deps",
-    "migrate": "migrate",
-    "refactor": "refactor",
-}
-
-
-def _derive_task_branch(task_id: uuid.UUID, task_type: str | None) -> str:
-    prefix = _TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
-    return f"blueprint/{prefix}-{str(task_id).replace('-', '')[:8]}"
-
-
 # Circuit-breaker: cap how many times the stale-PR rollup recovery in
 # ``_check_and_trigger_rollup`` respawns a review for one unmerged child.
 # Without a cap, a review that keeps failing fast — e.g. pre-empted at dispatch
@@ -747,9 +727,11 @@ async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
 
     # Feature branches after PR merge
     if ctx.get("pr_merged"):
+        project = await session.get(Project, task.project_id)
+        branch_prefix = project.task_branch_prefix if project else "blueprint/"
         for payload in task.payloads or []:
             branch = payload.get("branch")
-            if branch and branch.startswith("blueprint/"):
+            if branch and branch.startswith(branch_prefix):
                 branches_to_delete.append(branch)
 
     for branch in branches_to_delete:

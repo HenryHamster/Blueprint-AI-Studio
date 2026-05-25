@@ -35,6 +35,10 @@ from app.models import (
 )
 from app.schemas import AgentStatusPayload
 from app.shared_state import limiter
+from app.shared_state import (
+    get_project_integration_branch as _get_project_integration_branch,
+    get_project_promotion_target as _get_project_promotion_target,
+)
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 import app.orchestrator as _orch
@@ -1343,11 +1347,18 @@ async def update_agent_status(
                         # (production) failure only when the LTS model is active.
                         # The LTS model is active when the integration trunk and
                         # promotion target are distinct branches.
-                        _promotion_target = str(
-                            _runtime_config.get("promotion_target", "main")
+                        _smoketest_project = await session.get(Project, task.project_id)
+                        _promotion_target = (
+                            _get_project_promotion_target(_smoketest_project)
+                            if _smoketest_project is not None
+                            else str(_runtime_config.get("promotion_target", "main"))
                         )
-                        _integration_branch = str(
-                            _runtime_config.get("integration_branch", "automain")
+                        _integration_branch = (
+                            _get_project_integration_branch(_smoketest_project)
+                            if _smoketest_project is not None
+                            else str(
+                                _runtime_config.get("integration_branch", "automain")
+                            )
                         )
                         is_post_promotion = base_branch == _promotion_target and (
                             _integration_branch != _promotion_target
@@ -2493,7 +2504,9 @@ async def update_agent_status(
                 session.add(task)
                 try:
                     from app.review_pipeline import _spawn_pipeline_task
-                    from app.admin import _derive_task_branch
+                    from app.shared_state import (
+                        derive_task_branch as _derive_task_branch,
+                    )
 
                     _task_type = (task.first_payload or {}).get("type", "") or ""
                     _branch = _derive_task_branch(task.id, _task_type)

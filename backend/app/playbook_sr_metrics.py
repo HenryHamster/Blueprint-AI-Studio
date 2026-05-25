@@ -1,0 +1,2798 @@
+"""Self-review catch-rate trends subsystem.
+
+Extracted from ``playbook_learning.py`` to isolate the
+``compute_sr_catch_rate_trends`` function and its constellation of
+private helpers and threshold constants. ``playbook_learning.py``
+re-exports the public entry point and the helpers/constants that other
+modules historically import from it, so existing call sites continue to
+work without changes.
+"""
+
+import logging
+import re
+import uuid
+from collections import Counter
+from datetime import datetime, timedelta
+from typing import Any, Literal
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
+from sqlalchemy.orm.attributes import flag_modified
+from sqlmodel import select
+
+from app.models import (
+    Alert,
+    AlertSeverity,
+    Task,
+    Project,
+    StrategicCycle,
+    TaskStatus,
+    _utcnow,
+)
+from app.shared_state import DEFAULT_TASK_SCOPE
+from app.sr_blind_spots import _REVIEWER_ORIGINS
+
+logger = logging.getLogger(__name__)
+
+# In-app Alert row title prefixes for SR catch-rate alerts. The router that
+# powers AlertsBanner returns Alert rows verbatim; we use these prefixes both
+# to format new rows and to find/dismiss prior matching rows on clear-transition.
+_SR_REGRESSION_ALERT_TITLE_PREFIX = "Self-review catch-rate regression"
+_SR_FLOOR_ALERT_TITLE_PREFIX = "Self-review catch-rate below floor"
+_SR_QUADRANT_ALERT_TITLE_PREFIX = "Self-review precision/recall shift"
+_PASS_ENGAGEMENT_THINNING_ALERT_TITLE_PREFIX = "PASS reasoning thinning"
+# Cap how many regressing categories/severities we name in an Alert title
+# before truncating; the full breakdown lives in `Alert.message`.
+_SR_ALERT_TITLE_MAX_PARTS = 5
+
+
+def _format_sr_alert_title(prefix: str, parts: list[str]) -> str:
+    """Compose an Alert title from a prefix and a list of regressing identifiers."""
+    if not parts:
+        return prefix
+    if len(parts) > _SR_ALERT_TITLE_MAX_PARTS:
+        head = ", ".join(parts[:_SR_ALERT_TITLE_MAX_PARTS])
+        joined = f"{head}, +{len(parts) - _SR_ALERT_TITLE_MAX_PARTS} more"
+    else:
+        joined = ", ".join(parts)
+    return f"{prefix}: {joined}"
+
+
+# Execution-evidence SR check categories. These track whether the agent
+# actually ran verification commands (pytest, lint, typecheck) and got exit 0.
+# Miss rate = fraction of tasks where the agent reported passed: false.
+_EXECUTION_EVIDENCE_CATEGORIES = frozenset(
+    ["tests_executed_cleanly", "lint_executed_cleanly", "typecheck_executed_cleanly"]
+)
+
+# Rate-of-change threshold below which a category is considered "stable" vs
+# "decreasing" / "increasing".  A 5pp shift is distinguishable from noise.
+_TREND_DELTA_THRESHOLD = 0.05
+# Minimum z-score (two-proportion z-test) required to assert a trend direction.
+# z=1.28 ≈ 80% CI two-tailed; gates directional labels against sampling noise
+# while preserving large genuine shifts even at small sample sizes.
+_TREND_Z_MIN = 1.28
+# Threshold for precision/recall quadrant classification (5pp absolute change).
+_PRECISION_RECALL_QUADRANT_THRESHOLD = 0.05
+_SR_SEVERITY_DELTA_THRESHOLDS: dict[str, float] = {
+    "CRITICAL": 0.03,
+    "MAJOR": 0.05,
+    "MINOR": 0.10,
+}
+
+# Baseline-floor alert: fire when a category's hit-rate stays below this
+# threshold for at least _FLOOR_MIN_CONSECUTIVE_WINDOWS measurement windows.
+_SR_FLOOR_THRESHOLD = 0.50
+_FLOOR_MIN_CONSECUTIVE_WINDOWS = 2
+
+# PASS reasoning thinning alert: fire when a non-regressing category has
+# engagement below this threshold with at least _SR_ENGAGEMENT_MIN_PASSES passes.
+_SR_ENGAGEMENT_THRESHOLD = 0.5
+_SR_ENGAGEMENT_MIN_PASSES = 10
+
+# ---------------------------------------------------------------------------
+# SR catch-rate trend tracking
+# ---------------------------------------------------------------------------
+
+# Minimum number of tasks with BOTH self-review check_results AND human
+# rejection categories required per window.  Half the human-review threshold
+# since SR data is sparser.
+_MIN_SR_SAMPLE = 5
+# Minimum total reviewer findings (across categories in a window) required for
+# the catch-rate and its cycle-over-cycle trend to be considered well-sampled.
+# Matches _MIN_SR_SAMPLE so the gate is on the true catch-rate denominator
+# (finding count) rather than task count; a window with ≥_MIN_SR_SAMPLE tasks
+# may still have fewer findings when most tasks flag zero or one category.
+_MIN_SR_FINDINGS = 5
+# Minimum total reviewer findings (across tasks in a window) required to emit
+# a hallucination-rate value; prevents noisy rates on tiny windows.
+_HALLUCINATION_RATE_MIN_FINDINGS = 10
+_MIN_DIRECTION_SR_SAMPLE = 3
+
+# Example-collection caps for miss-example surfacing in the agent prompt.
+_EXAMPLE_MAX_PER_CAT = 3
+_EXAMPLE_MAX_CATS = 5
+_EXAMPLE_MAX_DESC_LEN = 100
+
+# Tokens that indicate a description may contain sensitive material.
+# Case-insensitive substring match; keep as tuple for fast `in` checks.
+_SENSITIVE_TOKENS: tuple[str, ...] = (
+    "password",
+    "secret",
+    "credential",
+    "api_key",
+    "apikey",
+    "bearer",
+    "authorization:",
+    "private_key",
+    "sk-ant-",
+    "eyJ",
+)
+
+_URL_RE = re.compile(r"https?://\S+")
+_PR_REF_RE = re.compile(r"\b(?:PR|pr)\s*#?\s*\d+\b|#\s*\d+\b")
+
+_SR_CODE_CHANGE_TYPES = {"create", "fix", "refactor", "migrate"}
+_EDGE_CATS = {"correctness", "error-handling"}
+
+
+def _partition_edges_by_origin(edges: list) -> "tuple[list, list]":
+    """Split edges_considered into (author, reviewer) entries.
+
+    Entries without an explicit ``origin`` field count as author entries.
+    Non-dict entries are dropped.
+    """
+    author: list = []
+    reviewer: list = []
+    for e in edges:
+        if not isinstance(e, dict):
+            continue
+        if e.get("origin") == "reviewer":
+            reviewer.append(e)
+        else:
+            author.append(e)
+    return author, reviewer
+
+
+def _reviewer_caught_author_miss(author_entries: list, reviewer_entries: list) -> bool:
+    """Whether the reviewer caught a case the author missed in this task.
+
+    A catch is either a reviewer entry whose ``case`` (lowercased + trimmed)
+    is absent from the author entries, OR a reviewer entry that flags
+    ``handled: false`` for a case the author had marked ``handled: true``.
+    Entries with missing/non-string ``case`` are skipped.
+    """
+
+    def _norm(c: Any) -> str | None:
+        return c.strip().lower() if isinstance(c, str) and c.strip() else None
+
+    author_handled: dict[str, bool] = {}
+    for e in author_entries:
+        c = _norm(e.get("case"))
+        if c is None:
+            continue
+        h = bool(e.get("handled", True))
+        author_handled[c] = author_handled.get(c, False) or h
+
+    for e in reviewer_entries:
+        c = _norm(e.get("case"))
+        if c is None:
+            continue
+        if c not in author_handled:
+            return True
+        if author_handled[c] and not bool(e.get("handled", True)):
+            return True
+    return False
+
+
+def _compute_edges_stats(tasks: list) -> dict[str, Any] | None:
+    """Compute edges_considered rolling metrics for a task list.
+
+    Returns None when fewer than 3 qualifying code-change tasks with
+    ``_self_review_outcome`` exist. When sufficient data is present, returns::
+
+        {
+          "sample_size": int,
+          "tasks_with_edges_rate": float,
+          "avg_edges_per_task": float | None,
+          "unhandled_edge_flagged_rate": float | None,
+          "correctness_rejection_rate_with_edges": float | None,
+          "correctness_rejection_rate_without_edges": float | None,
+        }
+
+    The last two fields correlate tasks that enumerated edges vs. those that
+    didn't against subsequent correctness/error-handling reviewer flags,
+    enabling validation that edges_considered actually improves catch rate.
+    """
+    code_tasks = [
+        t
+        for t in tasks
+        if (t.first_payload or {}).get("type") in _SR_CODE_CHANGE_TYPES
+        and "_self_review_outcome" in (t.context or {})
+    ]
+    if len(code_tasks) < 3:
+        return None
+
+    with_edges: list = []
+    without_edges: list = []
+    with_unhandled_flag: list = []
+    with_all_handled: list = []
+    total_edges = 0
+    unhandled_flagged = 0
+    total_author_edges = 0
+    total_reviewer_edges = 0
+    n_with_author = 0
+    n_with_reviewer = 0
+    reviewer_caught = 0
+    for t in code_tasks:
+        edges = (t.context or {}).get("_self_review_outcome", {}).get(
+            "edges_considered"
+        ) or []
+        if not isinstance(edges, list):
+            edges = []
+        author_e, reviewer_e = _partition_edges_by_origin(edges)
+        total_author_edges += len(author_e)
+        total_reviewer_edges += len(reviewer_e)
+        if author_e:
+            n_with_author += 1
+            if any(not e.get("handled", True) for e in author_e):
+                with_unhandled_flag.append(t)
+            else:
+                with_all_handled.append(t)
+        if reviewer_e:
+            n_with_reviewer += 1
+            if _reviewer_caught_author_miss(author_e, reviewer_e):
+                reviewer_caught += 1
+        if edges:
+            with_edges.append(t)
+            total_edges += len(edges)
+            if any(not e.get("handled", True) for e in edges if isinstance(e, dict)):
+                unhandled_flagged += 1
+        else:
+            without_edges.append(t)
+
+    def _rejection_rate(task_list: list) -> float | None:
+        measured = [
+            t
+            for t in task_list
+            if "_first_attempt_rejection_categories" in (t.context or {})
+        ]
+        if not measured:
+            return None
+        flagged = sum(
+            1
+            for t in measured
+            if _EDGE_CATS
+            & set(t.context.get("_first_attempt_rejection_categories") or [])
+        )
+        return round(flagged / len(measured), 3)
+
+    n_with = len(with_edges)
+    n_total = len(code_tasks)
+    return {
+        "sample_size": n_total,
+        "tasks_with_edges_rate": round(n_with / n_total, 3),
+        "avg_edges_per_task": round(total_edges / n_with, 2) if n_with else None,
+        "unhandled_edge_flagged_rate": round(unhandled_flagged / n_with, 3)
+        if n_with
+        else None,
+        "correctness_rejection_rate_with_edges": _rejection_rate(with_edges),
+        "correctness_rejection_rate_without_edges": _rejection_rate(without_edges),
+        "correctness_rejection_rate_with_unhandled_flag": _rejection_rate(
+            with_unhandled_flag
+        ),
+        "correctness_rejection_rate_with_all_handled": _rejection_rate(
+            with_all_handled
+        ),
+        "author_avg_edges_per_task": round(total_author_edges / n_with_author, 2)
+        if n_with_author
+        else None,
+        "reviewer_avg_edges_per_task": round(total_reviewer_edges / n_with_reviewer, 2)
+        if n_with_reviewer
+        else None,
+        "tasks_with_reviewer_edges_count": n_with_reviewer,
+        "tasks_with_reviewer_edges_rate": round(n_with_reviewer / n_total, 3),
+        "reviewer_caught_count": reviewer_caught,
+        "reviewer_caught_rate": round(reviewer_caught / n_total, 3),
+    }
+
+
+def _stats_for_tasks(
+    tasks: list,
+) -> tuple[
+    int,
+    dict[str, dict],
+    dict[str, dict[str, dict]],
+    dict[str, dict],
+    dict[str, dict],
+    dict[str, dict[str, dict]],
+]:
+    """Compute SR stats for a pre-filtered task list (no date filtering).
+
+    Returns (count, cat_stats, type_cat_stats, all_iter_cat_stats, sev_stats,
+    scope_cat_stats). ``all_iter_cat_stats`` uses ALL review iterations as the
+    human-truth set (not just iteration 0). Falls back to first-attempt
+    categories when ``review_loop.review_history`` is absent (backward compat).
+    ``sev_stats`` accumulates per-severity hit/miss counts from review_history
+    issues across all categories. ``scope_cat_stats`` mirrors
+    ``type_cat_stats`` keyed by task scope (small|medium|large) instead of
+    task type, using ``task.context['scope']`` (default: small).
+    """
+    from app.playbook_learning import (
+        _categorize_review_issues,
+        _categorize_review_issues_keyword,
+    )
+
+    _sw = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
+
+    def _origin_bucket(
+        entry: dict[str, Any] | None,
+    ) -> Literal["sr_alone", "reviewer_save"]:
+        origin = entry.get("origin") if isinstance(entry, dict) else None
+        if isinstance(origin, str) and origin in _REVIEWER_ORIGINS:
+            return "reviewer_save"
+        return "sr_alone"
+
+    count = 0
+    cat_stats: dict[str, dict] = {}
+    type_cat_stats: dict[str, dict[str, dict]] = {}
+    all_iter_cat_stats: dict[str, dict] = {}
+    sev_stats: dict[str, dict] = {}
+    scope_cat_stats: dict[str, dict[str, dict]] = {}
+    for t in tasks:
+        ctx = t.context or {}
+        if "_self_review_outcome" not in ctx:
+            continue
+        check_results = ctx["_self_review_outcome"].get("check_results") or {}
+        # Combined view (author SR + reviewer save) — feeds hit/origin-split
+        # counters below where _origin_bucket separates `sr_alone` vs
+        # `reviewer_save`, so reviewer-stamped entries must remain present.
+        sr_failed = {c for c, r in check_results.items() if not r.get("passed", True)}
+        # Author-only view — used for FP/sr_failed_count attribution. A
+        # reviewer-stamped failure does not represent something the author SR
+        # caught, so it must not inflate the precision/false-positive metrics.
+        sr_failed_author = {
+            c
+            for c in sr_failed
+            if (check_results.get(c) or {}).get("origin") not in _REVIEWER_ORIGINS
+        }
+        rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
+        cat_weights: dict[str, int] = {}
+        rev_cats: dict[str, list[dict]] = {}
+        if rev_hist:
+            rev_cats = _categorize_review_issues(rev_hist)
+            for cat_name, issues in rev_cats.items():
+                cat_weights[cat_name] = max(_sw.get(i["severity"], 1) for i in issues)
+        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {}) - {
+            "other"
+        }
+
+        # FP tracking: among SR-failed categories, count those never confirmed by
+        # any human reviewer across all review iterations (first rejection OR later).
+        # Runs for every task (even those with no first-attempt rejection) because
+        # those are exactly the cases where SR may have flagged a false positive.
+        # Uses the author-only view so reviewer-stamped overrides are not
+        # falsely attributed to the author SR's precision.
+        all_human_flagged = set(rev_cats.keys()) | human_cats
+        for cat in sr_failed_author:
+            if cat not in cat_stats:
+                cat_stats[cat] = {
+                    "hit_count": 0,
+                    "sr_alone_hit_count": 0,
+                    "reviewer_save_hit_count": 0,
+                    "human_count": 0,
+                    "w_hit": 0.0,
+                    "w_total": 0.0,
+                    "miss_examples": [],
+                    "sr_failed_count": 0,
+                    "fp_count": 0,
+                }
+            cat_stats[cat].setdefault("sr_failed_count", 0)
+            cat_stats[cat].setdefault("fp_count", 0)
+            cat_stats[cat]["sr_failed_count"] += 1
+            if cat not in all_human_flagged:
+                cat_stats[cat]["fp_count"] += 1
+
+        if not human_cats:
+            continue
+        count += 1
+        for cat_name, issues in rev_cats.items():
+            for issue in issues:
+                sev = issue.get("severity", "")
+                if sev not in _sw:
+                    continue
+                if sev not in sev_stats:
+                    sev_stats[sev] = {"hit_count": 0, "human_count": 0}
+                sev_stats[sev]["human_count"] += 1
+                if cat_name in sr_failed:
+                    sev_stats[sev]["hit_count"] += 1
+        task_type = t.first_payload.get("type", "")
+        task_scope = (t.context or {}).get("scope", DEFAULT_TASK_SCOPE)
+        for cat in human_cats:
+            if cat not in cat_stats:
+                cat_stats[cat] = {
+                    "hit_count": 0,
+                    "sr_alone_hit_count": 0,
+                    "reviewer_save_hit_count": 0,
+                    "human_count": 0,
+                    "w_hit": 0.0,
+                    "w_total": 0.0,
+                    "miss_examples": [],
+                    "sr_failed_count": 0,
+                    "fp_count": 0,
+                }
+            cat_stats[cat]["human_count"] += 1
+            w = cat_weights.get(cat, 1)
+            cat_stats[cat]["w_total"] += w
+            if cat in sr_failed:
+                cat_stats[cat]["hit_count"] += 1
+                cat_stats[cat]["w_hit"] += w
+                bucket = _origin_bucket(check_results.get(cat))
+                if bucket == "sr_alone":
+                    cat_stats[cat]["sr_alone_hit_count"] += 1
+                else:
+                    cat_stats[cat]["reviewer_save_hit_count"] += 1
+            else:
+                for issue in rev_cats.get(cat, []):
+                    cat_stats[cat]["miss_examples"].append(
+                        {"desc": issue["desc"], "severity": issue["severity"]}
+                    )
+            if task_type:
+                if task_type not in type_cat_stats:
+                    type_cat_stats[task_type] = {}
+                if cat not in type_cat_stats[task_type]:
+                    type_cat_stats[task_type][cat] = {
+                        "hit_count": 0,
+                        "sr_alone_hit_count": 0,
+                        "reviewer_save_hit_count": 0,
+                        "human_count": 0,
+                        "miss_examples": [],
+                    }
+                type_cat_stats[task_type][cat]["human_count"] += 1
+                if cat in sr_failed:
+                    type_cat_stats[task_type][cat]["hit_count"] += 1
+                    bucket = _origin_bucket(check_results.get(cat))
+                    if bucket == "sr_alone":
+                        type_cat_stats[task_type][cat]["sr_alone_hit_count"] += 1
+                    else:
+                        type_cat_stats[task_type][cat]["reviewer_save_hit_count"] += 1
+                else:
+                    for issue in rev_cats.get(cat, []):
+                        type_cat_stats[task_type][cat]["miss_examples"].append(
+                            {"desc": issue["desc"], "severity": issue["severity"]}
+                        )
+            if task_scope:
+                if task_scope not in scope_cat_stats:
+                    scope_cat_stats[task_scope] = {}
+                if cat not in scope_cat_stats[task_scope]:
+                    scope_cat_stats[task_scope][cat] = {
+                        "hit_count": 0,
+                        "sr_alone_hit_count": 0,
+                        "reviewer_save_hit_count": 0,
+                        "human_count": 0,
+                        "miss_examples": [],
+                    }
+                scope_cat_stats[task_scope][cat]["human_count"] += 1
+                if cat in sr_failed:
+                    scope_cat_stats[task_scope][cat]["hit_count"] += 1
+                    bucket = _origin_bucket(check_results.get(cat))
+                    if bucket == "sr_alone":
+                        scope_cat_stats[task_scope][cat]["sr_alone_hit_count"] += 1
+                    else:
+                        scope_cat_stats[task_scope][cat]["reviewer_save_hit_count"] += 1
+                else:
+                    for issue in rev_cats.get(cat, []):
+                        scope_cat_stats[task_scope][cat]["miss_examples"].append(
+                            {"desc": issue["desc"], "severity": issue["severity"]}
+                        )
+        # All-iterations human truth: prefer persisted _all_iterations_rejection_categories
+        # (written by task_lifecycle on every rejection iteration); fall back to
+        # categorising review_history in-line, then to first-attempt categories.
+        _stored_all_iter = ctx.get("_all_iterations_rejection_categories") or {}
+        if _stored_all_iter:
+            all_iter_cats = set(_stored_all_iter.keys()) - {"other"}
+        elif rev_hist:
+            all_iter_cats = set(_categorize_review_issues_keyword(rev_hist).keys()) - {
+                "other"
+            }
+        else:
+            all_iter_cats = human_cats
+        for cat in all_iter_cats:
+            if cat not in all_iter_cat_stats:
+                all_iter_cat_stats[cat] = {"hit_count": 0, "human_count": 0}
+            all_iter_cat_stats[cat]["human_count"] += 1
+            if cat in sr_failed:
+                all_iter_cat_stats[cat]["hit_count"] += 1
+    return (
+        count,
+        cat_stats,
+        type_cat_stats,
+        all_iter_cat_stats,
+        sev_stats,
+        scope_cat_stats,
+    )
+
+
+def _sr_skip_stats(
+    tasks: list,
+) -> tuple[float | None, dict[str, int] | None]:
+    """Compute skip-rate and reason distribution over tasks-with-SR-outcome.
+
+    Denominator: tasks that have ``_self_review_outcome`` in their context.
+    Numerator: tasks whose outcome is a fallback envelope (structured
+    ``skip_reason`` present OR verdict=='unknown' with empty check_results).
+    Returns (None, None) when the sample is below _MIN_SR_SAMPLE.
+    """
+    total = 0
+    dist: dict[str, int] = {}
+    for t in tasks:
+        ctx = t.context or {}
+        outcome = ctx.get("_self_review_outcome")
+        if outcome is None:
+            continue
+        total += 1
+        reason = outcome.get("skip_reason")
+        if reason:
+            dist[str(reason)] = dist.get(str(reason), 0) + 1
+        elif outcome.get("verdict") == "unknown" and not (
+            outcome.get("check_results") or {}
+        ):
+            dist["legacy_unknown"] = dist.get("legacy_unknown", 0) + 1
+    if total < _MIN_SR_SAMPLE:
+        return None, None
+    skipped = sum(dist.values())
+    return round(skipped / total, 3), dist
+
+
+def _compute_execution_evidence_miss_rates(
+    tasks: list,
+) -> dict[str, dict[str, Any]]:
+    """Aggregate miss-rates for execution-evidence SR categories.
+
+    For each task that has ``_self_review_outcome`` with ``check_results``,
+    count how many include each execution-evidence category and how many
+    reported ``passed: false``. Returns miss_rate, miss_count, sample_count
+    per category; omits categories with zero samples.
+    """
+    totals: dict[str, dict[str, int]] = {}
+    for t in tasks:
+        ctx = t.context or {}
+        check_results = (ctx.get("_self_review_outcome") or {}).get(
+            "check_results"
+        ) or {}
+        for cat in _EXECUTION_EVIDENCE_CATEGORIES:
+            result = check_results.get(cat)
+            if result is None:
+                continue
+            if cat not in totals:
+                totals[cat] = {"sample_count": 0, "miss_count": 0}
+            totals[cat]["sample_count"] += 1
+            if not result.get("passed", True):
+                totals[cat]["miss_count"] += 1
+    out: dict[str, dict[str, Any]] = {}
+    for cat, s in totals.items():
+        if s["sample_count"] == 0:
+            continue
+        out[cat] = {
+            "miss_rate": round(s["miss_count"] / s["sample_count"], 3),
+            "miss_count": s["miss_count"],
+            "sample_count": s["sample_count"],
+        }
+    return out
+
+
+def _compute_cat_fp_stats(
+    tasks: list,
+) -> tuple[
+    dict[str, dict[str, int]],
+    dict[str, dict[str, dict[str, int]]],
+    dict[str, dict[str, dict[str, int]]],
+]:
+    """Return per-category fp/tp counts for SR failures.
+
+    A category counted as TP when ANY downstream signal independently
+    confirms the SR failure: reviewer_findings, _first_attempt_rejection_categories,
+    or review_loop.review_history (keyword-categorised). Otherwise FP.
+    Returns (cat_fp, type_cat_fp, scope_cat_fp) where keys are category,
+    (task_type, category), and (task_scope, category) respectively.
+    """
+    from app.playbook_learning import _categorize_review_issues_keyword
+
+    cat_fp: dict[str, dict[str, int]] = {}
+    type_cat_fp: dict[str, dict[str, dict[str, int]]] = {}
+    scope_cat_fp: dict[str, dict[str, dict[str, int]]] = {}
+    for t in tasks:
+        task_type = (t.first_payload or {}).get("type", "")
+        if task_type not in _SR_CODE_CHANGE_TYPES:
+            continue
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro:
+            continue
+        check_results = sro.get("check_results") or {}
+        # Author SR failures only — exclude reviewer-stamped overrides so a
+        # reviewer rescue is never attributed to the author SR as a TP/FP.
+        sr_failed = {
+            c
+            for c, r in check_results.items()
+            if isinstance(r, dict)
+            and not r.get("passed", True)
+            and r.get("origin") not in _REVIEWER_ORIGINS
+        }
+        if not sr_failed:
+            continue
+        reviewer_cats = {
+            f.get("category")
+            for f in (sro.get("reviewer_findings") or [])
+            if isinstance(f, dict) and f.get("category")
+        }
+        human_cats = set(ctx.get("_first_attempt_rejection_categories") or {})
+        rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
+        rev_hist_cats: set[str] = set()
+        if rev_hist:
+            rev_hist_cats = set(_categorize_review_issues_keyword(rev_hist).keys())
+        confirmed = reviewer_cats | human_cats | rev_hist_cats
+        task_scope = ctx.get("scope", DEFAULT_TASK_SCOPE)
+        for cat in sr_failed:
+            bucket = cat_fp.setdefault(cat, {"fp": 0, "tp": 0})
+            tbucket = type_cat_fp.setdefault(task_type, {}).setdefault(
+                cat, {"fp": 0, "tp": 0}
+            )
+            sbucket = scope_cat_fp.setdefault(task_scope, {}).setdefault(
+                cat, {"fp": 0, "tp": 0}
+            )
+            if cat in confirmed:
+                bucket["tp"] += 1
+                tbucket["tp"] += 1
+                sbucket["tp"] += 1
+            else:
+                bucket["fp"] += 1
+                tbucket["fp"] += 1
+                sbucket["fp"] += 1
+    return cat_fp, type_cat_fp, scope_cat_fp
+
+
+def _compute_cat_severity_calibration(
+    tasks: list,
+) -> dict[str, dict[str, int]]:
+    """Return per-category severity calibration counts.
+
+    For categories where the agent SR flagged a concern (passed=False, has
+    severity) AND the reviewer independently flagged the same category in
+    review_history, compare the agent's severity against the reviewer's
+    maximum severity for that category.
+
+    Returns {cat: {"under_rated": n, "over_rated": n, "matched": n, "total": n}}.
+    Under-rated = agent severity numerically lower than reviewer's — more
+    dangerous than over-rating because it suppresses escalation.
+    """
+    from app.playbook_learning import _categorize_review_issues
+
+    _sw = {"CRITICAL": 3, "MAJOR": 2, "MINOR": 1}
+    result: dict[str, dict[str, int]] = {}
+    for t in tasks:
+        task_type = (t.first_payload or {}).get("type", "")
+        if task_type not in _SR_CODE_CHANGE_TYPES:
+            continue
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro:
+            continue
+        check_results = sro.get("check_results") or {}
+        rev_hist = (ctx.get("review_loop") or {}).get("review_history") or []
+        if not rev_hist:
+            continue
+        rev_cats = _categorize_review_issues(rev_hist)
+        for cat, rev_issues in rev_cats.items():
+            cr = check_results.get(cat)
+            if not isinstance(cr, dict):
+                continue
+            if cr.get("passed", True):
+                continue
+            if cr.get("origin") in _REVIEWER_ORIGINS:
+                continue
+            agent_sev = (cr.get("severity") or "").upper()
+            if agent_sev not in _sw:
+                continue
+            sev_vals = [
+                _sw[i.get("severity", "")]
+                for i in rev_issues
+                if isinstance(i, dict) and i.get("severity", "") in _sw
+            ]
+            if not sev_vals:
+                continue
+            reviewer_max_val = max(sev_vals)
+            agent_val = _sw[agent_sev]
+            bucket = result.setdefault(
+                cat,
+                {"under_rated": 0, "over_rated": 0, "matched": 0, "total": 0},
+            )
+            bucket["total"] += 1
+            if agent_val < reviewer_max_val:
+                bucket["under_rated"] += 1
+            elif agent_val > reviewer_max_val:
+                bucket["over_rated"] += 1
+            else:
+                bucket["matched"] += 1
+    return result
+
+
+def _task_prompt_fingerprint(task: Task) -> str:
+    """Resolve the task's prompt fingerprint with legacy context fallback."""
+    if isinstance(task.prompt_fingerprint, str) and task.prompt_fingerprint:
+        return task.prompt_fingerprint
+    ctx = task.context or {}
+    legacy = ctx.get("prompt_fingerprint")
+    if isinstance(legacy, str) and legacy:
+        return legacy
+    return "unknown"
+
+
+def _score_reasoning_quality(reasoning: str) -> float:
+    """Score reasoning quality on a 0.0–1.0 scale based on specificity signals.
+
+    Rewards: file path citation, test/function name mention, minimum word count (≥6).
+    """
+    import re
+
+    if not reasoning or not isinstance(reasoning, str):
+        return 0.0
+
+    text = reasoning.strip()
+    if not text:
+        return 0.0
+
+    score = 0.0
+    signals = 0
+
+    # Signal 1: file path citation (e.g., "backend/app/foo.py" or "app/foo.py")
+    if re.search(r"\b(?:[\w\-./]*[\w\-/]+\.[\w]+)\b", text):
+        score += 0.33
+        signals += 1
+
+    # Signal 2: test/function name mention (e.g., "test_foo", "test_*.py", "::function")
+    if re.search(r"(?:test_\w+|_test\.py|\:\:\w+|\w+::)", text):
+        score += 0.33
+        signals += 1
+
+    # Signal 3: minimum word count (≥6 words)
+    word_count = len(text.split())
+    if word_count >= 6:
+        score += 0.34
+        signals += 1
+
+    # Normalize to 0.0–1.0 range
+    return min(1.0, score)
+
+
+def _compute_reasoning_engagement(
+    tasks: list,
+    cats: set[str],
+) -> dict[str, dict[str, Any]]:
+    """For each category in *cats*, compute the fraction of passed entries
+    that include a non-trivial reasoning string, plus a quality score.
+
+    A reasoning is 'non-trivial' when it is a non-empty string of more than
+    10 characters.  Only tasks with a non-skip SR outcome contribute.
+
+    Returns {cat: {"engagement_rate": float|None, "reasoning_quality_rate": float|None,
+                   "with_reasoning": int, "with_quality": int, "total_passes": int}}.
+    """
+    from app.sr_blind_spots import is_skipped_sr_outcome
+
+    stats: dict[str, dict[str, int | float]] = {
+        cat: {
+            "with_reasoning": 0,
+            "with_quality": 0,
+            "total_passes": 0,
+            "quality_scores": [],
+        }
+        for cat in cats
+    }
+    for t in tasks:
+        ctx = t.context or {}
+        sro = ctx.get("_self_review_outcome")
+        if not sro or is_skipped_sr_outcome(sro):
+            continue
+        check_results = sro.get("check_results") or {}
+        for cat in cats:
+            entry = check_results.get(cat)
+            if not isinstance(entry, dict) or not entry.get("passed", True):
+                continue
+            stats[cat]["total_passes"] += 1
+            reasoning = entry.get("reasoning") or ""
+            if isinstance(reasoning, str) and len(reasoning.strip()) > 10:
+                stats[cat]["with_reasoning"] += 1
+
+            # Compute quality score
+            quality_score = _score_reasoning_quality(reasoning)
+            stats[cat]["quality_scores"].append(quality_score)
+            if quality_score > 0.5:
+                stats[cat]["with_quality"] += 1
+
+    result: dict[str, dict[str, Any]] = {}
+    for cat, s in stats.items():
+        total = s["total_passes"]
+        quality_scores = s.get("quality_scores", [])
+        avg_quality = (
+            round(sum(quality_scores) / len(quality_scores), 3)
+            if quality_scores
+            else None
+        )
+        result[cat] = {
+            "engagement_rate": round(s["with_reasoning"] / total, 3)
+            if total > 0
+            else None,
+            "reasoning_quality_rate": avg_quality,
+            "with_reasoning": s["with_reasoning"],
+            "with_quality": s["with_quality"],
+            "total_passes": total,
+        }
+    return result
+
+
+def _collect_prompt_versions(tasks: list) -> dict:
+    """Return a Counter of prompt_version values seen in _self_review_outcome."""
+
+    c: Counter = Counter()
+    for t in tasks:
+        pv = (t.context or {}).get("_self_review_outcome", {}).get("prompt_version")
+        if pv is not None:
+            c[str(pv)] += 1
+    return c
+
+
+def _percentile(values: list, p: float) -> float:
+    """Compute p-th percentile (0–100) of a list using linear interpolation."""
+    sv = sorted(values)
+    n = len(sv)
+    if n == 1:
+        return float(sv[0])
+    idx = (p / 100.0) * (n - 1)
+    lo = int(idx)
+    hi = lo + 1
+    if hi >= n:
+        return float(sv[-1])
+    frac = idx - lo
+    return sv[lo] + frac * (sv[hi] - sv[lo])
+
+
+def _compute_miss_latency_stats(tasks: list) -> dict:
+    """Return per-category time-to-detect latency stats for SR misses.
+
+    An SR miss is a category where check_results[cat].passed == True but the
+    same category appears in _first_attempt_rejection_categories.  Latency =
+    rejection timestamp − SR completion timestamp.
+
+    Skips samples where both timestamps fall back to the same value (task.updated_at),
+    because the latency would be 0 and not a real signal.
+    """
+
+    def _parse_iso(s: object) -> datetime | None:
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(s))
+            return dt.replace(tzinfo=None) if dt.tzinfo else dt
+        except (ValueError, TypeError):
+            return None
+
+    def _updated_naive(t: object) -> datetime | None:
+        ua = getattr(t, "updated_at", None)
+        if ua is None:
+            return None
+        return ua.replace(tzinfo=None) if ua.tzinfo else ua  # type: ignore[return-value]
+
+    _LONE_CHECKER_P95_THRESHOLD = 7 * 86400  # 7 days in seconds
+
+    # per category: list of latency seconds
+    latencies: dict[str, list[float]] = {}
+
+    for task in tasks:
+        ctx = task.context or {}
+        sr_outcome = ctx.get("_self_review_outcome") or {}
+        check_results = sr_outcome.get("check_results") or {}
+        rejection_cats = ctx.get("_first_attempt_rejection_categories") or {}
+
+        if not check_results or not rejection_cats:
+            continue
+
+        missed_cats = [
+            cat
+            for cat, cr in check_results.items()
+            if isinstance(cr, dict)
+            and cr.get("passed") is True
+            and cat in rejection_cats
+        ]
+        if not missed_cats:
+            continue
+
+        # Resolve SR timestamp
+        sr_ts: datetime | None = None
+        for field in ("completed_at", "computed_at", "stamped_at"):
+            sr_ts = _parse_iso(sr_outcome.get(field))
+            if sr_ts is not None:
+                break
+        sr_fallback = sr_ts is None
+        if sr_ts is None:
+            sr_ts = _updated_naive(task)
+
+        # Resolve rejection timestamp
+        rej_ts: datetime | None = None
+        for field in (
+            "_first_attempt_rejection_at",
+            "_first_attempt_rejection_categories_at",
+        ):
+            rej_ts = _parse_iso(ctx.get(field))
+            if rej_ts is not None:
+                break
+        rej_fallback = rej_ts is None
+        if rej_ts is None:
+            rej_ts = _updated_naive(task)
+
+        # Skip if both timestamps came from the same fallback — no real signal
+        if sr_fallback and rej_fallback:
+            continue
+
+        if sr_ts is None or rej_ts is None:
+            continue
+
+        latency = (rej_ts - sr_ts).total_seconds()
+        if latency <= 0:
+            continue
+
+        for cat in missed_cats:
+            latencies.setdefault(cat, []).append(latency)
+
+    result: dict[str, dict] = {}
+    for cat, lats in latencies.items():
+        n = len(lats)
+        p50 = int(_percentile(lats, 50))
+        p95 = int(_percentile(lats, 95))
+        result[cat] = {
+            "time_to_miss_detect_p50_sec": p50,
+            "time_to_miss_detect_p95_sec": p95,
+            "time_to_miss_detect_sample_count": n,
+            "time_to_miss_detect_lone_checker": n >= 2
+            and p95 > _LONE_CHECKER_P95_THRESHOLD,
+        }
+    return result
+
+
+def _is_trend_significant(p1: float, n1: int, p2: float, n2: int) -> bool:
+    """Two-proportion z-test: return True when the observed difference exceeds
+    what sampling noise alone predicts at the _TREND_Z_MIN threshold.
+
+    Uses a pooled proportion under H0 (no real difference).  Falls back to the
+    raw delta >= _TREND_DELTA_THRESHOLD when the pooled SE is degenerate (both
+    rates are 0 or 1 and the standard error collapses to zero).
+    """
+    if n1 < 1 or n2 < 1:
+        return False
+    pooled_p = (p1 * n1 + p2 * n2) / (n1 + n2)
+    if pooled_p <= 0 or pooled_p >= 1:
+        return abs(p1 - p2) >= _TREND_DELTA_THRESHOLD
+    se = (pooled_p * (1 - pooled_p) * (1 / n1 + 1 / n2)) ** 0.5
+    if se == 0:
+        return False
+    return abs(p1 - p2) / se >= _TREND_Z_MIN
+
+
+async def compute_sr_catch_rate_trends(
+    project_id: uuid.UUID,
+    session: AsyncSession,
+    all_tasks: list,
+) -> dict[str, Any] | None:
+    """Compare SR prediction hit-rate per category, bucketed by strategic cycle.
+
+    Primary mode: uses the two most recently COMPLETED strategic cycles as
+    "current" and "previous" buckets (tasks keyed by ``strategic_cycle_id``).
+    Rolls further back through completed cycles if either bucket has fewer than
+    :data:`_MIN_SR_SAMPLE` qualifying tasks (both ``_self_review_outcome`` and
+    ``_first_attempt_rejection_categories`` present).
+
+    Fallback mode: when fewer than two completed cycles exist *or* no pair of
+    consecutive cycles has enough tasks, falls back to the existing 14-day
+    calendar windows so the metric is non-blank during onboarding and for
+    tasks that were never assigned a ``strategic_cycle_id``.
+
+    **Side effect**: writes the result to ``project.design_doc["sr_catch_rate_trends"]``
+    and maintains a per-category ``rate_history`` list (capped at 5 entries).
+    """
+    from app.playbook_learning import (
+        _finalize_examples,
+        compute_sr_catch_rate_by_direction,
+    )
+
+    now = _utcnow()
+
+    def _naive(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=None) if dt.tzinfo else dt
+
+    # --- Cycle-based bucketing (primary mode) ---
+    use_cycle_mode = False
+    current_cycle_id: str | None = None
+    previous_cycle_id: str | None = None
+    current_count = 0
+    previous_count = 0
+    current_stats: dict[str, dict] = {}
+    previous_stats: dict[str, dict] = {}
+    current_type_stats: dict[str, dict[str, dict]] = {}
+    current_window_tasks: list = []
+    previous_window_tasks: list = []
+    current_all_iter_stats: dict[str, dict] = {}
+    previous_all_iter_stats: dict[str, dict] = {}
+    current_sev_stats: dict[str, dict] = {}
+    previous_sev_stats: dict[str, dict] = {}
+
+    cycle_stmt = (
+        select(StrategicCycle)
+        .where(StrategicCycle.project_id == project_id)
+        .where(StrategicCycle.outcome == "completed")
+        .order_by(StrategicCycle.phase1_started_at.desc())
+        .limit(4)
+    )
+    cycle_rows = (await session.execute(cycle_stmt)).scalars().all()
+
+    if len(cycle_rows) >= 2:
+        # Targeted fetch scoped to the candidate cycle IDs — no date cap, no row
+        # cap — so each cycle's full task set is available for comparison,
+        # independent of the throughput-capped recency window in all_tasks.
+        _relevant_cycle_ids = [r.id for r in cycle_rows]
+        _dialect = session.bind.dialect.name if session.bind else "postgresql"
+        _cycle_where = [
+            Task.project_id == project_id,
+            Task.status.in_([TaskStatus.FAILED, TaskStatus.COMPLETED]),
+            Task.strategic_cycle_id.in_(_relevant_cycle_ids),
+        ]
+        if _dialect != "sqlite":
+            _cycle_where.append(Task.context.has_key("_self_review_outcome"))
+        _cycle_tasks = (
+            (
+                await session.execute(
+                    select(Task)
+                    .options(
+                        load_only(
+                            Task.id,
+                            Task.context,
+                            Task.created_at,
+                            Task.project_id,
+                            Task.strategic_cycle_id,
+                            Task.payloads,
+                        )
+                    )
+                    .where(*_cycle_where)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        task_by_cycle: dict[str, list] = {}
+        for t in _cycle_tasks:
+            cid = getattr(t, "strategic_cycle_id", None)
+            if cid:
+                task_by_cycle.setdefault(cid, []).append(t)
+        for i in range(len(cycle_rows) - 1):
+            c_cycle = cycle_rows[i]
+            p_cycle = cycle_rows[i + 1]
+            (
+                c_count,
+                c_stats,
+                c_type_stats,
+                c_all_iter,
+                c_sev,
+                c_scope_stats,
+            ) = _stats_for_tasks(task_by_cycle.get(c_cycle.id, []))
+            p_count, p_stats, _, p_all_iter, p_sev, _ = _stats_for_tasks(
+                task_by_cycle.get(p_cycle.id, [])
+            )
+            if c_count >= _MIN_SR_SAMPLE and p_count >= _MIN_SR_SAMPLE:
+                use_cycle_mode = True
+                current_cycle_id = c_cycle.id
+                previous_cycle_id = p_cycle.id
+                current_count = c_count
+                previous_count = p_count
+                current_stats = c_stats
+                previous_stats = p_stats
+                current_type_stats = c_type_stats
+                current_scope_stats = c_scope_stats
+                current_window_tasks = task_by_cycle.get(c_cycle.id, [])
+                previous_window_tasks = task_by_cycle.get(p_cycle.id, [])
+                current_all_iter_stats = c_all_iter
+                previous_all_iter_stats = p_all_iter
+                current_sev_stats = c_sev
+                previous_sev_stats = p_sev
+                break
+
+    if not use_cycle_mode:
+        # Calendar fallback for onboarding / tasks without strategic_cycle_id.
+        cutoff_14d_n = _naive(now - timedelta(days=14))
+        cutoff_28d_n = _naive(now - timedelta(days=28))
+        sentinel_n = datetime(9999, 12, 31)
+        cal_current = [
+            t
+            for t in all_tasks
+            if t.created_at and cutoff_14d_n <= _naive(t.created_at) < sentinel_n
+        ]
+        cal_previous = [
+            t
+            for t in all_tasks
+            if t.created_at and cutoff_28d_n <= _naive(t.created_at) < cutoff_14d_n
+        ]
+        (
+            current_count,
+            current_stats,
+            current_type_stats,
+            current_all_iter_stats,
+            current_sev_stats,
+            current_scope_stats,
+        ) = _stats_for_tasks(cal_current)
+        (
+            previous_count,
+            previous_stats,
+            _,
+            previous_all_iter_stats,
+            previous_sev_stats,
+            _,
+        ) = _stats_for_tasks(cal_previous)
+        current_window_tasks = cal_current
+        previous_window_tasks = cal_previous
+
+    # Gate on finding count (true catch-rate denominator), not task count.
+    # finding_count = total reviewer-flagged (task, category) pairs in the window.
+    current_finding_count = sum(s.get("human_count", 0) for s in current_stats.values())
+    previous_finding_count = sum(
+        s.get("human_count", 0) for s in previous_stats.values()
+    )
+    if (
+        current_finding_count < _MIN_SR_FINDINGS
+        or previous_finding_count < _MIN_SR_FINDINGS
+    ):
+        # Stamp a heartbeat so the staleness watchdog knows the job ran but had
+        # insufficient reviewer-rejection findings (low-data / idle state), not
+        # that the computation broke.  Mirrors sr_blind_spots heartbeat pattern.
+        # data_sufficient=False distinguishes this from a real refresh so the
+        # watchdog and UI can tell when the displayed trend is actually current.
+        _proj_row = await session.execute(
+            select(Project)
+            .where(Project.id == project_id)
+            .with_for_update(skip_locked=False, key_share=True)
+        )
+        _project = _proj_row.scalar_one_or_none()
+        if _project is not None:
+            _doc = dict(_project.design_doc or {})
+            _trends = dict(_doc.get("sr_catch_rate_trends") or {})
+            _trends["signal_last_computed_at"] = now.isoformat()
+            _trends["data_sufficient"] = False
+            # last_sufficient_computed_at is preserved (not overwritten) so
+            # callers can tell when data was last actually sufficient.
+            _doc["sr_catch_rate_trends"] = _trends
+            _project.design_doc = _doc
+            flag_modified(_project, "design_doc")
+            session.add(_project)
+        return None
+
+    all_cats = (
+        set(current_stats.keys())
+        | set(previous_stats.keys())
+        | set(current_all_iter_stats.keys())
+    )
+    if not all_cats:
+        return None
+
+    _empty_cat: dict[str, Any] = {
+        "hit_count": 0,
+        "sr_alone_hit_count": 0,
+        "reviewer_save_hit_count": 0,
+        "human_count": 0,
+        "w_hit": 0.0,
+        "w_total": 0.0,
+        "sr_failed_count": 0,
+        "fp_count": 0,
+    }
+    categories: dict[str, Any] = {}
+    for cat in all_cats:
+        curr = current_stats.get(cat, _empty_cat)
+        prev = previous_stats.get(cat, _empty_cat)
+        current_hit_rate = (
+            round(curr["hit_count"] / curr["human_count"], 3)
+            if curr["human_count"] > 0
+            else None
+        )
+        previous_hit_rate = (
+            round(prev["hit_count"] / prev["human_count"], 3)
+            if prev["human_count"] > 0
+            else None
+        )
+        miss_rate = (
+            round(1 - current_hit_rate, 3) if current_hit_rate is not None else None
+        )
+        sr_alone_hit_rate = (
+            round(curr["sr_alone_hit_count"] / curr["human_count"], 3)
+            if curr["human_count"] > 0
+            else None
+        )
+        reviewer_save_rate = (
+            round(curr["reviewer_save_hit_count"] / curr["human_count"], 3)
+            if curr["human_count"] > 0
+            else None
+        )
+
+        # Only compute trend when both windows have enough findings for the
+        # delta to be meaningful; fewer findings make the delta pure noise.
+        # A two-proportion z-test additionally gates directional labels: even
+        # with _MIN_SR_FINDINGS samples a delta near the floor threshold can
+        # be pure sampling noise, so we require statistical significance before
+        # asserting "increasing" / "decreasing".
+        _curr_findings = curr.get("human_count", 0)
+        _prev_findings = prev.get("human_count", 0)
+        _has_trend_data = (
+            current_hit_rate is not None
+            and previous_hit_rate is not None
+            and _curr_findings >= _MIN_SR_FINDINGS
+            and _prev_findings >= _MIN_SR_FINDINGS
+        )
+        if _has_trend_data:
+            delta = current_hit_rate - previous_hit_rate
+            _sig = _is_trend_significant(
+                current_hit_rate,
+                _curr_findings,
+                previous_hit_rate,
+                _prev_findings,
+            )
+            if _sig and delta >= _TREND_DELTA_THRESHOLD:
+                trend = "increasing"
+            elif _sig and delta <= -_TREND_DELTA_THRESHOLD:
+                trend = "decreasing"
+            else:
+                trend = "stable"
+            trend_significant: bool | None = (
+                _sig and abs(delta) >= _TREND_DELTA_THRESHOLD
+            )
+        else:
+            trend = "stable"
+            trend_significant = None
+
+        w_total = curr.get("w_total", 0.0)
+        weighted_miss_rate = (
+            round(1.0 - curr["w_hit"] / w_total, 3) if w_total > 0 else miss_rate
+        )
+
+        curr_sr_failed = curr.get("sr_failed_count", 0)
+        curr_fp = curr.get("fp_count", 0)
+        prev_sr_failed = prev.get("sr_failed_count", 0)
+        prev_fp = prev.get("fp_count", 0)
+        current_fp_rate = (
+            round(curr_fp / curr_sr_failed, 3) if curr_sr_failed > 0 else None
+        )
+        previous_fp_rate = (
+            round(prev_fp / prev_sr_failed, 3) if prev_sr_failed > 0 else None
+        )
+        if current_fp_rate is not None and previous_fp_rate is not None:
+            fp_delta = current_fp_rate - previous_fp_rate
+            _fp_sig = (
+                curr_sr_failed >= _MIN_SR_FINDINGS
+                and prev_sr_failed >= _MIN_SR_FINDINGS
+                and _is_trend_significant(
+                    current_fp_rate, curr_sr_failed, previous_fp_rate, prev_sr_failed
+                )
+            )
+            if _fp_sig and fp_delta >= _TREND_DELTA_THRESHOLD:
+                fp_trend = "increasing"
+            elif _fp_sig and fp_delta <= -_TREND_DELTA_THRESHOLD:
+                fp_trend = "decreasing"
+            else:
+                fp_trend = "stable"
+        else:
+            fp_trend = "stable"
+        precision = (
+            round((curr_sr_failed - curr_fp) / curr_sr_failed, 3)
+            if curr_sr_failed > 0
+            else None
+        )
+
+        curr_all = current_all_iter_stats.get(cat, {"hit_count": 0, "human_count": 0})
+        all_iter_hit_rate = (
+            round(curr_all["hit_count"] / curr_all["human_count"], 3)
+            if curr_all["human_count"] > 0
+            else None
+        )
+        all_iter_miss_rate = (
+            round(1 - all_iter_hit_rate, 3) if all_iter_hit_rate is not None else None
+        )
+
+        # Precision/recall quadrant: compare current vs previous window deltas.
+        previous_precision = (
+            round((prev_sr_failed - prev_fp) / prev_sr_failed, 3)
+            if prev_sr_failed > 0
+            else None
+        )
+        recall_delta: float | None = (
+            round(current_hit_rate - previous_hit_rate, 3)
+            if current_hit_rate is not None and previous_hit_rate is not None
+            else None
+        )
+        precision_delta: float | None = (
+            round(precision - previous_precision, 3)
+            if precision is not None and previous_precision is not None
+            else None
+        )
+        precision_recall_quadrant: str | None = None
+        if recall_delta is not None and precision_delta is not None:
+            _q = _PRECISION_RECALL_QUADRANT_THRESHOLD
+            p_up = precision_delta >= _q
+            p_down = precision_delta <= -_q
+            r_up = recall_delta >= _q
+            r_down = recall_delta <= -_q
+            if p_up and r_up:
+                precision_recall_quadrant = "healthy"
+            elif p_up and r_down:
+                precision_recall_quadrant = "conservative_shift"
+            elif p_down and r_up:
+                precision_recall_quadrant = "noisy_shift"
+            elif p_down and r_down:
+                precision_recall_quadrant = "both_declining"
+            elif not p_up and not p_down and not r_up and not r_down:
+                precision_recall_quadrant = "flat"
+            else:
+                precision_recall_quadrant = "mixed"
+
+        categories[cat] = {
+            "current_hit_rate": current_hit_rate,
+            "previous_hit_rate": previous_hit_rate,
+            "current_human_count": int(curr.get("human_count") or 0),
+            "previous_human_count": int(prev.get("human_count") or 0),
+            "low_confidence_finding_count": _curr_findings < _MIN_SR_FINDINGS,
+            "sr_alone_hit_count": int(curr.get("sr_alone_hit_count") or 0),
+            "reviewer_save_hit_count": int(curr.get("reviewer_save_hit_count") or 0),
+            "sr_alone_hit_rate": sr_alone_hit_rate,
+            "reviewer_save_rate": reviewer_save_rate,
+            "miss_rate": miss_rate,
+            "weighted_miss_rate": weighted_miss_rate,
+            "trend": trend,
+            "trend_significant": trend_significant,
+            "false_positive_rate": current_fp_rate,
+            "previous_fp_rate": previous_fp_rate,
+            "fp_trend": fp_trend,
+            "precision": precision,
+            "all_iterations_catch_rate": all_iter_hit_rate,
+            "all_iterations_miss_rate": all_iter_miss_rate,
+            "precision_recall_quadrant": precision_recall_quadrant,
+            "precision_delta": precision_delta,
+            "recall_delta": recall_delta,
+        }
+
+    # Attach miss examples to top-_EXAMPLE_MAX_CATS categories by weighted_miss_rate.
+    top_cats_for_examples = sorted(
+        all_cats,
+        key=lambda c: categories[c].get("weighted_miss_rate") or 0.0,
+        reverse=True,
+    )[:_EXAMPLE_MAX_CATS]
+    for cat in top_cats_for_examples:
+        raw = (current_stats.get(cat) or {}).get("miss_examples", [])
+        examples = _finalize_examples(raw)
+        if examples:
+            categories[cat]["examples"] = examples
+
+    _proj_row = await session.execute(
+        select(Project)
+        .where(Project.id == project_id)
+        .with_for_update(skip_locked=False, key_share=True)
+    )
+    project = _proj_row.scalar_one_or_none()
+    if not project:
+        return None
+
+    doc = dict(project.design_doc or {})
+    existing: dict = dict(doc.get("sr_catch_rate_trends") or {})
+    existing_computed_at: str | None = existing.get("computed_at")
+
+    is_new_window = True
+    if use_cycle_mode:
+        # In cycle mode a new window = new current cycle id.
+        is_new_window = existing.get("current_cycle_id") != current_cycle_id
+    elif existing_computed_at:
+        try:
+            last_dt = datetime.fromisoformat(existing_computed_at)
+            is_new_window = (now - last_dt).days >= 14
+        except (ValueError, TypeError):
+            pass
+
+    # Detect bucket-mode transition (cycle ↔ calendar). Rate history entries
+    # computed in one mode are not comparable to those from the other (cycle
+    # buckets span multi-week strategic cycles; calendar buckets are fixed
+    # 14-day windows), so history is reset on transition to avoid mixing them.
+    current_bucket_mode = "cycle" if use_cycle_mode else "calendar"
+    mode_changed = (
+        existing.get("bucket_mode") is not None
+        and existing.get("bucket_mode") != current_bucket_mode
+    )
+
+    existing_cats: dict = dict(existing.get("categories") or {})
+    for cat, data in categories.items():
+        prev_cat: dict = dict(existing_cats.get(cat) or {})
+        rate_history: list = list(prev_cat.get("rate_history") or [])
+        if mode_changed:
+            rate_history = []
+        if (is_new_window or not rate_history) and data["current_hit_rate"] is not None:
+            rate_history.append(data["current_hit_rate"])
+            rate_history = rate_history[-5:]
+        data["rate_history"] = rate_history
+
+    # Mark categories currently below the baseline floor so the UI can surface them.
+    _floor_thresh: float = float(doc.get("sr_floor_threshold") or _SR_FLOOR_THRESHOLD)
+    _floor_min_win: int = int(
+        doc.get("sr_floor_min_windows") or _FLOOR_MIN_CONSECUTIVE_WINDOWS
+    )
+    for cat, data in categories.items():
+        history = data.get("rate_history") or []
+        data["below_floor"] = len(history) >= _floor_min_win and all(
+            r < _floor_thresh for r in history[-_floor_min_win:]
+        )
+
+    # Attach reasoning engagement rate for all categories (not just regressing ones).
+    # Regressing = trend=="decreasing" OR below_floor.
+    regressing_cats = {
+        cat
+        for cat, data in categories.items()
+        if data.get("trend") == "decreasing" or data.get("below_floor")
+    }
+    all_cats = set(categories.keys())
+    eng = _compute_reasoning_engagement(current_window_tasks, all_cats)
+    for cat, cat_eng in eng.items():
+        categories[cat]["reasoning_engagement_rate"] = cat_eng["engagement_rate"]
+        categories[cat]["reasoning_quality_rate"] = cat_eng["reasoning_quality_rate"]
+        categories[cat]["reasoning_engagement_with"] = cat_eng["with_reasoning"]
+        categories[cat]["reasoning_engagement_total"] = cat_eng["total_passes"]
+
+    # Attach engagement_thinning flag for each category.
+    # Mirrors the thinning Alert predicate (lines ~4918) but also fires for regressing
+    # categories — the agent gate consumer takes the union of regressing+thinning itself.
+    _eng_threshold: float = float(
+        doc.get("sr_engagement_threshold") or _SR_ENGAGEMENT_THRESHOLD
+    )
+    _eng_min_passes: int = int(
+        doc.get("sr_engagement_min_passes") or _SR_ENGAGEMENT_MIN_PASSES
+    )
+    for cat, data in categories.items():
+        _rate = data.get("reasoning_engagement_rate")
+        _total = data.get("reasoning_engagement_total") or 0
+        data["engagement_thinning"] = bool(
+            _rate is not None and _rate < _eng_threshold and _total >= _eng_min_passes
+        )
+
+    # Attach false-positive stats: SR flagged but reviewer didn't independently flag.
+    # Both windows use _compute_cat_fp_stats so reviewer_findings count as confirmations
+    # consistently — without this, previous_fp_rate overcounts FPs and can trigger the
+    # sr_false_positive dispatcher signal spuriously after a fresh-reviewer wave.
+    cat_fp_stats, type_cat_fp_stats, scope_cat_fp_stats = _compute_cat_fp_stats(
+        current_window_tasks
+    )
+    prev_cat_fp_stats, _, _ = _compute_cat_fp_stats(previous_window_tasks)
+    for cat, data in categories.items():
+        fp_data = cat_fp_stats.get(cat) or {}
+        fp = fp_data.get("fp", 0)
+        tp = fp_data.get("tp", 0)
+        data["fp_count"] = fp
+        data["tp_count"] = tp
+        data["false_positive_rate"] = (
+            round(fp / (fp + tp), 3) if (fp + tp) > 0 else None
+        )
+        prev_fp_data = prev_cat_fp_stats.get(cat) or {}
+        prev_fp = prev_fp_data.get("fp", 0)
+        prev_tp = prev_fp_data.get("tp", 0)
+        data["previous_fp_rate"] = (
+            round(prev_fp / (prev_fp + prev_tp), 3) if (prev_fp + prev_tp) > 0 else None
+        )
+
+    # Attach severity calibration stats: compares agent severity vs reviewer severity
+    # for categories where both sides flagged it. Under-rating is the dangerous case.
+    sev_cal = _compute_cat_severity_calibration(current_window_tasks)
+    for cat, data in categories.items():
+        cal = sev_cal.get(cat)
+        if cal:
+            data["severity_calibration"] = cal
+
+    # Attach time-to-miss-detect latency stats per category.
+    miss_latency = _compute_miss_latency_stats(current_window_tasks)
+    for cat, data in categories.items():
+        stats = miss_latency.get(cat) or {}
+        data["time_to_miss_detect_p50_sec"] = stats.get("time_to_miss_detect_p50_sec")
+        data["time_to_miss_detect_p95_sec"] = stats.get("time_to_miss_detect_p95_sec")
+        data["time_to_miss_detect_sample_count"] = stats.get(
+            "time_to_miss_detect_sample_count", 0
+        )
+        data["time_to_miss_detect_lone_checker"] = stats.get(
+            "time_to_miss_detect_lone_checker", False
+        )
+
+    # Compute per-task-type category breakdown from current window only.
+    # Cells with fewer than _MIN_SR_SAMPLE observations are omitted.
+    by_task_type: dict[str, dict[str, Any]] = {}
+    for ttype, tcat_stats in current_type_stats.items():
+        type_cats: dict[str, Any] = {}
+        for cat, stats in tcat_stats.items():
+            if stats["human_count"] < _MIN_SR_SAMPLE:
+                continue
+            hit_rate = round(stats["hit_count"] / stats["human_count"], 3)
+            sr_alone_hit_rate = (
+                round(stats["sr_alone_hit_count"] / stats["human_count"], 3)
+                if stats["human_count"] > 0
+                else None
+            )
+            reviewer_save_rate = (
+                round(stats["reviewer_save_hit_count"] / stats["human_count"], 3)
+                if stats["human_count"] > 0
+                else None
+            )
+            raw_ex = stats.get("miss_examples", [])
+            ex = _finalize_examples(raw_ex)
+            entry: dict[str, Any] = {
+                "hit_rate": hit_rate,
+                "miss_rate": round(1 - hit_rate, 3),
+                "sample_count": stats["human_count"],
+                "sr_alone_hit_count": stats["sr_alone_hit_count"],
+                "reviewer_save_hit_count": stats["reviewer_save_hit_count"],
+                "sr_alone_hit_rate": sr_alone_hit_rate,
+                "reviewer_save_rate": reviewer_save_rate,
+            }
+            if ex:
+                entry["examples"] = ex
+            tfp = (type_cat_fp_stats.get(ttype) or {}).get(cat) or {}
+            fp_t = tfp.get("fp", 0)
+            tp_t = tfp.get("tp", 0)
+            entry["fp_count"] = fp_t
+            entry["tp_count"] = tp_t
+            entry["false_positive_rate"] = (
+                round(fp_t / (fp_t + tp_t), 3) if (fp_t + tp_t) > 0 else None
+            )
+            type_cats[cat] = entry
+        if type_cats:
+            by_task_type[ttype] = type_cats
+
+    # Per-fix-iteration breakdown — bucket current_window_tasks by the
+    # fix_iteration stamped on _self_review_outcome (1, 2, 3+) so operators
+    # can see which categories degrade across review-fix passes vs. which
+    # are weak from the start. Original tasks (no fix_iteration) bucket as "1".
+    def _fix_iter_bucket(t) -> str:
+        sro = (t.context or {}).get("_self_review_outcome") or {}
+        fi = sro.get("fix_iteration")
+        if fi is None:
+            fi_int = 1
+        else:
+            try:
+                fi_int = int(fi)
+            except (TypeError, ValueError):
+                fi_int = 1
+        if fi_int <= 1:
+            return "1"
+        if fi_int == 2:
+            return "2"
+        return "3+"
+
+    by_fix_iteration: dict[str, dict[str, Any]] = {}
+    fix_iter_buckets: dict[str, list] = {"1": [], "2": [], "3+": []}
+    for _t in current_window_tasks:
+        fix_iter_buckets[_fix_iter_bucket(_t)].append(_t)
+    for bucket_key in ("1", "2", "3+"):
+        bucket_tasks = fix_iter_buckets[bucket_key]
+        if not bucket_tasks:
+            continue
+        _, b_cat_stats, _, b_all_iter_stats, _, _ = _stats_for_tasks(bucket_tasks)
+        bucket_cats: dict[str, Any] = {}
+        for cat, stats in b_cat_stats.items():
+            if stats["human_count"] < _MIN_SR_SAMPLE:
+                continue
+            hit_rate = round(stats["hit_count"] / stats["human_count"], 3)
+            entry: dict[str, Any] = {
+                "miss_rate": round(1 - hit_rate, 3),
+                "sample_count": stats["human_count"],
+            }
+            ai = b_all_iter_stats.get(cat)
+            if ai and ai["human_count"] > 0:
+                ai_hit_rate = round(ai["hit_count"] / ai["human_count"], 3)
+                entry["all_iterations_miss_rate"] = round(1 - ai_hit_rate, 3)
+            ex = _finalize_examples(stats.get("miss_examples", []))
+            if ex:
+                entry["examples"] = ex
+            bucket_cats[cat] = entry
+        if bucket_cats:
+            by_fix_iteration[bucket_key] = bucket_cats
+
+    # Compute per-scope category breakdown from current window only.
+    # Cells with fewer than _MIN_SR_SAMPLE observations are omitted.
+    existing_by_scope: dict = dict(existing.get("by_scope") or {})
+    by_scope: dict[str, dict[str, Any]] = {}
+    for scope, scat_stats in current_scope_stats.items():
+        scope_cats: dict[str, Any] = {}
+        for cat, stats in scat_stats.items():
+            if stats["human_count"] < _MIN_SR_SAMPLE:
+                continue
+            hit_rate = round(stats["hit_count"] / stats["human_count"], 3)
+            sr_alone_hit_rate = (
+                round(stats["sr_alone_hit_count"] / stats["human_count"], 3)
+                if stats["human_count"] > 0
+                else None
+            )
+            reviewer_save_rate = (
+                round(stats["reviewer_save_hit_count"] / stats["human_count"], 3)
+                if stats["human_count"] > 0
+                else None
+            )
+            raw_ex = stats.get("miss_examples", [])
+            ex = _finalize_examples(raw_ex)
+            entry: dict[str, Any] = {
+                "hit_rate": hit_rate,
+                "miss_rate": round(1 - hit_rate, 3),
+                "sample_count": stats["human_count"],
+                "sr_alone_hit_count": stats["sr_alone_hit_count"],
+                "reviewer_save_hit_count": stats["reviewer_save_hit_count"],
+                "sr_alone_hit_rate": sr_alone_hit_rate,
+                "reviewer_save_rate": reviewer_save_rate,
+            }
+            if ex:
+                entry["examples"] = ex
+            sfp = (scope_cat_fp_stats.get(scope) or {}).get(cat) or {}
+            fp_s = sfp.get("fp", 0)
+            tp_s = sfp.get("tp", 0)
+            entry["fp_count"] = fp_s
+            entry["tp_count"] = tp_s
+            entry["false_positive_rate"] = (
+                round(fp_s / (fp_s + tp_s), 3) if (fp_s + tp_s) > 0 else None
+            )
+            # Persist rate_history and trend for this (scope, category) cell.
+            prev_scope_entry: dict = dict(
+                (existing_by_scope.get(scope) or {}).get(cat) or {}
+            )
+            scope_rate_history: list = list(prev_scope_entry.get("rate_history") or [])
+            if mode_changed:
+                scope_rate_history = []
+            if is_new_window or not scope_rate_history:
+                scope_rate_history.append(hit_rate)
+                scope_rate_history = scope_rate_history[-5:]
+            prev_scope_hit_rate = prev_scope_entry.get("hit_rate")
+            _prev_scope_sample = int(prev_scope_entry.get("sample_count") or 0)
+            if prev_scope_hit_rate is not None:
+                s_delta = hit_rate - prev_scope_hit_rate
+                _scope_n_curr = stats["human_count"]
+                _scope_sig = (
+                    _scope_n_curr >= _MIN_SR_FINDINGS
+                    and _prev_scope_sample >= _MIN_SR_FINDINGS
+                    and _is_trend_significant(
+                        hit_rate, _scope_n_curr, prev_scope_hit_rate, _prev_scope_sample
+                    )
+                )
+                if _scope_sig and s_delta >= _TREND_DELTA_THRESHOLD:
+                    scope_trend: str = "increasing"
+                elif _scope_sig and s_delta <= -_TREND_DELTA_THRESHOLD:
+                    scope_trend = "decreasing"
+                else:
+                    scope_trend = "stable"
+            else:
+                scope_trend = "stable"
+            entry["rate_history"] = scope_rate_history
+            entry["trend"] = scope_trend
+            scope_cats[cat] = entry
+        if scope_cats:
+            by_scope[scope] = scope_cats
+
+    sr_skip_rate, sr_skip_dist = _sr_skip_stats(current_window_tasks)
+
+    # Compute per-severity catch-rate breakdown across all categories.
+    by_severity: dict[str, Any] = {}
+    for sev in ("CRITICAL", "MAJOR", "MINOR"):
+        curr_s = current_sev_stats.get(sev, {"hit_count": 0, "human_count": 0})
+        prev_s = previous_sev_stats.get(sev, {"hit_count": 0, "human_count": 0})
+        curr_hit = (
+            round(curr_s["hit_count"] / curr_s["human_count"], 3)
+            if curr_s["human_count"] > 0
+            else None
+        )
+        prev_hit = (
+            round(prev_s["hit_count"] / prev_s["human_count"], 3)
+            if prev_s["human_count"] > 0
+            else None
+        )
+        curr_miss = round(1.0 - curr_hit, 3) if curr_hit is not None else None
+        prev_miss = round(1.0 - prev_hit, 3) if prev_hit is not None else None
+        if curr_miss is not None and prev_miss is not None:
+            sev_delta = curr_miss - prev_miss
+            thr = _SR_SEVERITY_DELTA_THRESHOLDS[sev]
+            _sev_n_curr = curr_s["human_count"]
+            _sev_n_prev = prev_s["human_count"]
+            _sev_sig = (
+                _sev_n_curr >= _MIN_SR_FINDINGS
+                and _sev_n_prev >= _MIN_SR_FINDINGS
+                and _is_trend_significant(
+                    curr_miss, _sev_n_curr, prev_miss, _sev_n_prev
+                )
+            )
+            sev_trend = (
+                "regressing"
+                if _sev_sig and sev_delta >= thr
+                else "improving"
+                if _sev_sig and sev_delta <= -thr
+                else "stable"
+            )
+        else:
+            sev_trend = "stable"
+        by_severity[sev] = {
+            "current_miss_rate": curr_miss,
+            "previous_miss_rate": prev_miss,
+            "current_hit_rate": curr_hit,
+            "previous_hit_rate": prev_hit,
+            "current_sample": curr_s["human_count"],
+            "previous_sample": prev_s["human_count"],
+            "trend": sev_trend,
+        }
+
+    # Compute overall (aggregate) hit rates across all categories, weighted by human_count.
+    # This represents the true cycle-over-cycle change of the headline metric.
+    current_total_hits = 0
+    current_total_humans = 0
+    previous_total_hits = 0
+    previous_total_humans = 0
+    for data in categories.values():
+        curr_hit_rate = data.get("current_hit_rate")
+        curr_human_count = data.get("current_human_count", 0)
+        prev_hit_rate = data.get("previous_hit_rate")
+        prev_human_count = data.get("previous_human_count", 0)
+        if curr_hit_rate is not None and curr_human_count > 0:
+            current_total_hits += round(curr_hit_rate * curr_human_count)
+            current_total_humans += curr_human_count
+        if prev_hit_rate is not None and prev_human_count > 0:
+            previous_total_hits += round(prev_hit_rate * prev_human_count)
+            previous_total_humans += prev_human_count
+    overall_hit_rate = (
+        round(current_total_hits / current_total_humans, 3)
+        if current_total_humans > 0
+        else None
+    )
+    previous_overall_hit_rate = (
+        round(previous_total_hits / previous_total_humans, 3)
+        if previous_total_humans > 0
+        else None
+    )
+
+    # Compute author-only (SR-alone) overall hit rate by summing raw integer counts
+    # across categories — preferred over reconstructing from rounded per-category rates.
+    current_sr_alone_hits = 0
+    current_sr_alone_humans = 0
+    previous_sr_alone_hits = 0
+    previous_sr_alone_humans = 0
+    for cat in all_cats:
+        c = current_stats.get(cat, _empty_cat)
+        p = previous_stats.get(cat, _empty_cat)
+        if c.get("human_count", 0) > 0:
+            current_sr_alone_hits += c.get("sr_alone_hit_count", 0)
+            current_sr_alone_humans += c["human_count"]
+        if p.get("human_count", 0) > 0:
+            previous_sr_alone_hits += p.get("sr_alone_hit_count", 0)
+            previous_sr_alone_humans += p["human_count"]
+    overall_sr_alone_hit_rate: float | None = (
+        round(current_sr_alone_hits / current_sr_alone_humans, 3)
+        if current_sr_alone_humans > 0
+        else None
+    )
+    previous_overall_sr_alone_hit_rate: float | None = (
+        round(previous_sr_alone_hits / previous_sr_alone_humans, 3)
+        if previous_sr_alone_humans > 0
+        else None
+    )
+    _sr_alone_data_sufficient = (
+        overall_sr_alone_hit_rate is not None
+        and previous_overall_sr_alone_hit_rate is not None
+        and current_sr_alone_humans >= _MIN_SR_FINDINGS
+        and previous_sr_alone_humans >= _MIN_SR_FINDINGS
+    )
+    if _sr_alone_data_sufficient:
+        _sr_alone_delta = overall_sr_alone_hit_rate - previous_overall_sr_alone_hit_rate
+        _sr_alone_sig = _is_trend_significant(
+            overall_sr_alone_hit_rate,
+            current_sr_alone_humans,
+            previous_overall_sr_alone_hit_rate,
+            previous_sr_alone_humans,
+        )
+        if _sr_alone_sig and _sr_alone_delta >= _TREND_DELTA_THRESHOLD:
+            overall_sr_alone_trend_verdict: str = "improving"
+        elif _sr_alone_sig and _sr_alone_delta <= -_TREND_DELTA_THRESHOLD:
+            overall_sr_alone_trend_verdict = "declining"
+        else:
+            overall_sr_alone_trend_verdict = "stable"
+        overall_sr_alone_trend_significant: bool | None = (
+            _sr_alone_sig and abs(_sr_alone_delta) >= _TREND_DELTA_THRESHOLD
+        )
+    else:
+        overall_sr_alone_trend_verdict = "stable"
+        overall_sr_alone_trend_significant = None
+
+    # Significance-gated overall trend verdict — mirrors the per-category treatment
+    # so the headline is as trustworthy as the per-category breakdown.
+    # Only labeled "improving"/"declining" when both windows have >= _MIN_SR_FINDINGS
+    # and the change passes the two-proportion z-test (_is_trend_significant).
+    _overall_data_sufficient = (
+        overall_hit_rate is not None
+        and previous_overall_hit_rate is not None
+        and current_total_humans >= _MIN_SR_FINDINGS
+        and previous_total_humans >= _MIN_SR_FINDINGS
+    )
+    if _overall_data_sufficient:
+        _overall_delta = overall_hit_rate - previous_overall_hit_rate
+        _overall_sig = _is_trend_significant(
+            overall_hit_rate,
+            current_total_humans,
+            previous_overall_hit_rate,
+            previous_total_humans,
+        )
+        if _overall_sig and _overall_delta >= _TREND_DELTA_THRESHOLD:
+            overall_trend_verdict: str = "improving"
+        elif _overall_sig and _overall_delta <= -_TREND_DELTA_THRESHOLD:
+            overall_trend_verdict = "declining"
+        else:
+            overall_trend_verdict = "stable"
+        overall_trend_significant: bool | None = (
+            _overall_sig and abs(_overall_delta) >= _TREND_DELTA_THRESHOLD
+        )
+    else:
+        overall_trend_verdict = "stable"
+        overall_trend_significant = None
+
+    # Prompt-version awareness: detect mixed-regime windows so the agent can
+    # caveat calibration surfaces and avoid mistaking prompt rollouts for regressions.
+    pv_counter = _collect_prompt_versions(current_window_tasks)
+    pv_counter_prev = _collect_prompt_versions(previous_window_tasks)
+    current_prompt_version: str | None = (
+        pv_counter.most_common(1)[0][0] if pv_counter else None
+    )
+    prev_prompt_version: str | None = (
+        pv_counter_prev.most_common(1)[0][0] if pv_counter_prev else None
+    )
+
+    result: dict[str, Any] = {
+        "computed_at": now.isoformat(),
+        "signal_last_computed_at": now.isoformat(),
+        "last_sufficient_computed_at": now.isoformat(),
+        "data_sufficient": True,
+        "bucket_mode": "cycle" if use_cycle_mode else "calendar",
+        "current_cycle_id": current_cycle_id,
+        "previous_cycle_id": previous_cycle_id,
+        "categories": categories,
+        "by_task_type": by_task_type,
+        "by_fix_iteration": by_fix_iteration,
+        "by_scope": by_scope,
+        "by_severity": by_severity,
+        "sr_skip_rate": sr_skip_rate,
+        "sr_skip_reason_distribution": sr_skip_dist if sr_skip_dist is not None else {},
+        "overall_hit_rate": overall_hit_rate,
+        "previous_overall_hit_rate": previous_overall_hit_rate,
+        "overall_trend_verdict": overall_trend_verdict,
+        "overall_trend_significant": overall_trend_significant,
+        "overall_trend_data_sufficient": _overall_data_sufficient,
+        "overall_sr_alone_hit_rate": overall_sr_alone_hit_rate,
+        "previous_overall_sr_alone_hit_rate": previous_overall_sr_alone_hit_rate,
+        "overall_sr_alone_trend_verdict": overall_sr_alone_trend_verdict,
+        "overall_sr_alone_trend_significant": overall_sr_alone_trend_significant,
+        "overall_sr_alone_trend_data_sufficient": _sr_alone_data_sufficient,
+        "current_finding_count": current_finding_count,
+        "previous_finding_count": previous_finding_count,
+    }
+    if current_prompt_version is not None:
+        result["prompt_version"] = current_prompt_version
+    if len(pv_counter) > 1:
+        result["mixed_prompt_versions"] = True
+    if (
+        current_prompt_version is not None
+        and prev_prompt_version is not None
+        and current_prompt_version != prev_prompt_version
+    ):
+        result["prompt_version_changed"] = True
+        for _scope_cats in by_scope.values():
+            for _scope_entry in _scope_cats.values():
+                _scope_entry["prompt_version_changed"] = True
+    if sr_skip_rate is not None:
+        result["sr_skip_rate"] = sr_skip_rate
+        result["sr_skip_reason_distribution"] = sr_skip_dist
+
+    _dir_text_map: dict[str, str] = {
+        str(d.get("id") or d.get("direction_id") or ""): (
+            d.get("text") or d.get("description") or ""
+        )
+        for d in (project.directions or [])
+        if d.get("id") or d.get("direction_id")
+    }
+    by_direction = compute_sr_catch_rate_by_direction(
+        all_tasks,
+        existing_by_direction={}
+        if mode_changed
+        else (existing.get("by_direction") or {}),
+        is_new_window=is_new_window,
+        direction_text_map=_dir_text_map or None,
+    )
+    result["by_direction"] = by_direction or {}
+
+    from app.sr_blind_spots import (
+        aggregate_sr_co_failure_pairs,
+        _count_reviewer_disagreement_directions,
+    )
+
+    co_pairs = aggregate_sr_co_failure_pairs(current_window_tasks)
+    result["co_failure_pairs"] = co_pairs or []
+
+    # Attach per-category failure-mode breakdown (reading_gap / judgment_gap / coverage_gap).
+    # Uses origin tags set by the fresh-reviewer pass in standard.ts:441-457.
+    failure_mode_dir_counts = _count_reviewer_disagreement_directions(
+        current_window_tasks
+    )
+    cat_failure_modes: dict[str, dict[str, int]] = {}
+    for (cat, _ttype), bucket in failure_mode_dir_counts.items():
+        if cat not in cat_failure_modes:
+            cat_failure_modes[cat] = {
+                "reading_gap": 0,
+                "judgment_gap": 0,
+                "coverage_gap": 0,
+            }
+        cat_failure_modes[cat]["reading_gap"] += bucket["miss_recovery_incomplete"]
+        cat_failure_modes[cat]["judgment_gap"] += bucket["miss_disagreement"]
+        cat_failure_modes[cat]["coverage_gap"] += bucket["miss_coverage_gap"]
+    for cat, data in categories.items():
+        modes = cat_failure_modes.get(cat)
+        if modes and sum(modes.values()) > 0:
+            dominant = max(modes.items(), key=lambda x: x[1])
+            data["miss_mode_breakdown"] = {**modes, "dominant_mode": dominant[0]}
+
+    # Reviewer hallucination rate: proportion of reviewer findings filtered as phantom file refs.
+    # Uses reviewer_findings_filtered written by the fresh-reviewer pass in standard.ts.
+    curr_hall_total = 0
+    curr_hall_filtered = 0
+    for _t in current_window_tasks:
+        _sro = (getattr(_t, "context", None) or {}).get("_self_review_outcome") or {}
+        _rff = _sro.get("reviewer_findings_filtered") or {}
+        _t_total = _rff.get("total_reviewer_findings")
+        _t_filtered = _rff.get("filtered_count")
+        if isinstance(_t_total, int) and isinstance(_t_filtered, int):
+            curr_hall_total += _t_total
+            curr_hall_filtered += _t_filtered
+    prev_hall_total = 0
+    prev_hall_filtered = 0
+    for _t in previous_window_tasks:
+        _sro = (getattr(_t, "context", None) or {}).get("_self_review_outcome") or {}
+        _rff = _sro.get("reviewer_findings_filtered") or {}
+        _t_total = _rff.get("total_reviewer_findings")
+        _t_filtered = _rff.get("filtered_count")
+        if isinstance(_t_total, int) and isinstance(_t_filtered, int):
+            prev_hall_total += _t_total
+            prev_hall_filtered += _t_filtered
+    curr_hall_rate: float | None = (
+        round(curr_hall_filtered / curr_hall_total, 3)
+        if curr_hall_total >= _HALLUCINATION_RATE_MIN_FINDINGS
+        else None
+    )
+    prev_hall_rate: float | None = (
+        round(prev_hall_filtered / prev_hall_total, 3)
+        if prev_hall_total >= _HALLUCINATION_RATE_MIN_FINDINGS
+        else None
+    )
+    if curr_hall_rate is not None or prev_hall_rate is not None:
+        hall_delta: float | None = (
+            round(curr_hall_rate - prev_hall_rate, 3)
+            if curr_hall_rate is not None and prev_hall_rate is not None
+            else None
+        )
+        result["reviewer_hallucination_rate"] = {
+            "current_rate": curr_hall_rate,
+            "previous_rate": prev_hall_rate,
+            "current_sample": curr_hall_total,
+            "previous_sample": prev_hall_total,
+            "delta": hall_delta,
+        }
+
+    doc["sr_catch_rate_trends"] = result
+    project.design_doc = doc
+    flag_modified(project, "design_doc")
+    session.add(project)
+
+    logger.info(
+        "[SR_CATCH_RATE_TRENDS] project=%s categories=%d",
+        project_id,
+        len(categories),
+    )
+
+    # Fire notification when categories or severity buckets are regressing.
+    try:
+        import asyncio
+        from app.notification_dispatch import (
+            post_failure_alert_message,
+            dispatch_external_notification,
+        )
+
+        regressing = {
+            cat: data
+            for cat, data in categories.items()
+            if data.get("trend") == "decreasing"
+        }
+        regressing_severities = {
+            sev: data
+            for sev, data in by_severity.items()
+            if data.get("trend") == "regressing"
+        }
+        fp_spiking = {
+            cat: data
+            for cat, data in categories.items()
+            if data.get("fp_trend") == "increasing"
+        }
+        alertable = {**regressing, **fp_spiking}
+        if alertable or regressing_severities:
+            # Dedup: in cycle mode key off cycle_id; in calendar mode use 14-day window.
+            # Dedup key includes both regressing categories and regressing severities.
+            alert_state: dict = dict(doc.get("sr_catch_rate_trends_alert") or {})
+            alert_computed_at: str | None = alert_state.get("computed_at")
+            alerted_cats: list = list(alert_state.get("categories") or [])
+            alerted_sevs: list = list(alert_state.get("severities") or [])
+            current_regressing_cats = sorted(alertable.keys())
+            current_regressing_sevs = sorted(regressing_severities.keys())
+
+            already_alerted = False
+            if use_cycle_mode:
+                already_alerted = (
+                    alert_state.get("cycle_id") == current_cycle_id
+                    and alerted_cats == current_regressing_cats
+                    and alerted_sevs == current_regressing_sevs
+                )
+            elif alert_computed_at:
+                try:
+                    last_alert_dt = datetime.fromisoformat(alert_computed_at)
+                    if (
+                        (now - last_alert_dt).days < 14
+                        and alerted_cats == current_regressing_cats
+                        and alerted_sevs == current_regressing_sevs
+                    ):
+                        already_alerted = True
+                except (ValueError, TypeError):
+                    pass
+
+            if not already_alerted:
+                lines = ["SR catch-rate regression detected:"]
+                for cat in current_regressing_cats:
+                    data = alertable[cat]
+                    if cat in regressing:
+                        prev = data.get("previous_hit_rate")
+                        curr_rate = data.get("current_hit_rate")
+                        sample = current_stats.get(cat, {}).get("human_count", 0)
+                        prev_str = f"{prev:.0%}" if prev is not None else "N/A"
+                        curr_str = (
+                            f"{curr_rate:.0%}" if curr_rate is not None else "N/A"
+                        )
+                        lines.append(
+                            f"  • {cat}: hit-rate {prev_str} → {curr_str} (n={sample})"
+                        )
+                    else:
+                        prev_fp = data.get("previous_fp_rate")
+                        curr_fp = data.get("false_positive_rate")
+                        sample = current_stats.get(cat, {}).get("sr_failed_count", 0)
+                        prev_str = f"{prev_fp:.0%}" if prev_fp is not None else "N/A"
+                        curr_str = f"{curr_fp:.0%}" if curr_fp is not None else "N/A"
+                        lines.append(
+                            f"  • {cat}: FP-rate {prev_str} → {curr_str} (n={sample})"
+                        )
+                if current_regressing_sevs:
+                    lines.append("Severity regressions:")
+                    for sev in current_regressing_sevs:
+                        data_sev = regressing_severities[sev]
+                        prev_miss = data_sev.get("previous_miss_rate")
+                        curr_miss = data_sev.get("current_miss_rate")
+                        sample_n = data_sev.get("current_sample", 0)
+                        prev_str = (
+                            f"{prev_miss:.0%}" if prev_miss is not None else "N/A"
+                        )
+                        curr_str = (
+                            f"{curr_miss:.0%}" if curr_miss is not None else "N/A"
+                        )
+                        lines.append(
+                            f"  • {sev}: {prev_str} → {curr_str} (n={sample_n})"
+                        )
+                description = "\n".join(lines)
+
+                # Add caveat if SR prompt changed during this window
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    description = (
+                        description
+                        + "\n\nNote: SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
+
+                await post_failure_alert_message(session, project_id, description)
+
+                # Surface the regression in AlertsBanner as a real Alert row.
+                # Dedup mirror: any prior undismissed regression Alert rows
+                # for this project are dismissed unless their title matches
+                # what we are about to insert (defense-in-depth — same gate
+                # as the design_doc dedup state above).
+                title_parts = list(current_regressing_cats) + [
+                    f"{s} severity" for s in current_regressing_sevs
+                ]
+                new_alert_title = _format_sr_alert_title(
+                    _SR_REGRESSION_ALERT_TITLE_PREFIX, title_parts
+                )
+                existing_reg_alerts = (
+                    (
+                        await session.execute(
+                            select(Alert).where(
+                                Alert.project_id == project_id,
+                                Alert.task_id.is_(None),
+                                Alert.severity == AlertSeverity.WARNING,
+                                Alert.dismissed_at.is_(None),
+                                Alert.title.like(
+                                    f"{_SR_REGRESSION_ALERT_TITLE_PREFIX}%"
+                                ),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if not any(a.title == new_alert_title for a in existing_reg_alerts):
+                    for a in existing_reg_alerts:
+                        a.dismissed_at = now
+                        session.add(a)
+                    session.add(
+                        Alert(
+                            project_id=project_id,
+                            severity=AlertSeverity.WARNING,
+                            title=new_alert_title,
+                            message=description,
+                        )
+                    )
+
+                webhook_payload: dict[str, Any] = {
+                    "project_id": str(project_id),
+                    "computed_at": result["computed_at"],
+                    "regressing_categories": [
+                        {
+                            "category": cat,
+                            "previous_hit_rate": alertable[cat].get(
+                                "previous_hit_rate"
+                            ),
+                            "current_hit_rate": alertable[cat].get("current_hit_rate"),
+                            "false_positive_rate": alertable[cat].get(
+                                "false_positive_rate"
+                            ),
+                            "fp_trend": alertable[cat].get("fp_trend"),
+                            "sample_size": current_stats.get(cat, {}).get(
+                                "human_count", 0
+                            ),
+                        }
+                        for cat in current_regressing_cats
+                    ],
+                    "regressing_severities": [
+                        {
+                            "severity": sev,
+                            "previous_miss_rate": regressing_severities[sev].get(
+                                "previous_miss_rate"
+                            ),
+                            "current_miss_rate": regressing_severities[sev].get(
+                                "current_miss_rate"
+                            ),
+                            "sample_size": regressing_severities[sev].get(
+                                "current_sample", 0
+                            ),
+                        }
+                        for sev in current_regressing_sevs
+                    ],
+                }
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    webhook_payload["prompt_version_caveat"] = (
+                        "SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
+                asyncio.ensure_future(
+                    dispatch_external_notification(
+                        project_id,
+                        event_type="sr_catch_rate_regression",
+                        payload=webhook_payload,
+                    )
+                )
+
+                doc["sr_catch_rate_trends_alert"] = {
+                    "computed_at": result["computed_at"],
+                    "cycle_id": current_cycle_id,
+                    "categories": current_regressing_cats,
+                    "severities": current_regressing_sevs,
+                }
+                project.design_doc = doc
+                flag_modified(project, "design_doc")
+                session.add(project)
+
+                logger.info(
+                    "[SR_CATCH_RATE_TRENDS] project=%s regression_alert categories=%s severities=%s",
+                    project_id,
+                    current_regressing_cats,
+                    current_regressing_sevs,
+                )
+        elif doc.get("sr_catch_rate_trends_alert"):
+            # Clear transition: previously firing, no longer firing this cycle.
+            # Dismiss any matching undismissed Alert rows + clear design_doc state.
+            stale_alerts = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == project_id,
+                            Alert.task_id.is_(None),
+                            Alert.severity == AlertSeverity.WARNING,
+                            Alert.dismissed_at.is_(None),
+                            Alert.title.like(f"{_SR_REGRESSION_ALERT_TITLE_PREFIX}%"),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for a in stale_alerts:
+                a.dismissed_at = now
+                session.add(a)
+            doc.pop("sr_catch_rate_trends_alert", None)
+            project.design_doc = doc
+            flag_modified(project, "design_doc")
+            session.add(project)
+    except Exception:
+        logger.exception("[SR_CATCH_RATE_TRENDS] notification failed, suppressing")
+
+    # Baseline-floor alert: fire when a category stays below _SR_FLOOR_THRESHOLD
+    # for at least _FLOOR_MIN_CONSECUTIVE_WINDOWS consecutive measurement windows.
+    try:
+        import asyncio
+        from app.notification_dispatch import (
+            post_failure_alert_message,
+            dispatch_external_notification,
+        )
+
+        floor_threshold: float = float(
+            doc.get("sr_floor_threshold") or _SR_FLOOR_THRESHOLD
+        )
+        floor_min_windows: int = int(
+            doc.get("sr_floor_min_windows") or _FLOOR_MIN_CONSECUTIVE_WINDOWS
+        )
+
+        below_floor = {
+            cat: data
+            for cat, data in categories.items()
+            if (
+                data.get("current_hit_rate") is not None
+                and len(data.get("rate_history") or []) >= floor_min_windows
+                and all(
+                    r < floor_threshold
+                    for r in (data.get("rate_history") or [])[-floor_min_windows:]
+                )
+            )
+        }
+
+        if below_floor:
+            floor_alert_state: dict = dict(doc.get("sr_catch_rate_floor_alert") or {})
+            floor_alerted_cats: list = list(floor_alert_state.get("categories") or [])
+            current_floor_cats = sorted(below_floor.keys())
+
+            floor_already_alerted = False
+            if use_cycle_mode:
+                floor_already_alerted = (
+                    floor_alert_state.get("cycle_id") == current_cycle_id
+                    and floor_alerted_cats == current_floor_cats
+                )
+            else:
+                floor_alert_at: str | None = floor_alert_state.get("computed_at")
+                if floor_alert_at:
+                    try:
+                        last_floor_dt = datetime.fromisoformat(floor_alert_at)
+                        if (
+                            now - last_floor_dt
+                        ).days < 14 and floor_alerted_cats == current_floor_cats:
+                            floor_already_alerted = True
+                    except (ValueError, TypeError):
+                        pass
+
+            if not floor_already_alerted:
+                lines = [
+                    f"SR catch-rate below floor ({floor_threshold:.0%}) for {floor_min_windows}+ windows:"
+                ]
+                for cat in current_floor_cats:
+                    data = below_floor[cat]
+                    curr_rate = data.get("current_hit_rate")
+                    sample = current_stats.get(cat, {}).get("human_count", 0)
+                    curr_str = f"{curr_rate:.0%}" if curr_rate is not None else "N/A"
+                    history = data.get("rate_history") or []
+                    history_str = ", ".join(
+                        f"{r:.0%}" for r in history[-floor_min_windows:]
+                    )
+                    lines.append(
+                        f"  • {cat}: {curr_str} (last {floor_min_windows} windows: {history_str}, n={sample})"
+                    )
+                description = "\n".join(lines)
+
+                # Add caveat if SR prompt changed during this window
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    description = (
+                        description
+                        + "\n\nNote: SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
+
+                await post_failure_alert_message(session, project_id, description)
+
+                # Surface as ERROR Alert row in AlertsBanner (stricter than the
+                # WARNING regression path — staying below floor for N consecutive
+                # windows is a higher-severity signal). Defense-in-depth dedup
+                # mirrors the regression path.
+                new_floor_title = _format_sr_alert_title(
+                    _SR_FLOOR_ALERT_TITLE_PREFIX, current_floor_cats
+                )
+                existing_floor_alerts = (
+                    (
+                        await session.execute(
+                            select(Alert).where(
+                                Alert.project_id == project_id,
+                                Alert.task_id.is_(None),
+                                Alert.severity == AlertSeverity.ERROR,
+                                Alert.dismissed_at.is_(None),
+                                Alert.title.like(f"{_SR_FLOOR_ALERT_TITLE_PREFIX}%"),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if not any(a.title == new_floor_title for a in existing_floor_alerts):
+                    for a in existing_floor_alerts:
+                        a.dismissed_at = now
+                        session.add(a)
+                    session.add(
+                        Alert(
+                            project_id=project_id,
+                            severity=AlertSeverity.ERROR,
+                            title=new_floor_title,
+                            message=description,
+                        )
+                    )
+
+                floor_payload: dict[str, Any] = {
+                    "project_id": str(project_id),
+                    "computed_at": result["computed_at"],
+                    "floor_threshold": floor_threshold,
+                    "below_floor_categories": [
+                        {
+                            "category": cat,
+                            "current_hit_rate": below_floor[cat].get(
+                                "current_hit_rate"
+                            ),
+                            "rate_history": below_floor[cat].get("rate_history"),
+                            "sample_size": current_stats.get(cat, {}).get(
+                                "human_count", 0
+                            ),
+                        }
+                        for cat in current_floor_cats
+                    ],
+                }
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    floor_payload["prompt_version_caveat"] = (
+                        "SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
+                asyncio.ensure_future(
+                    dispatch_external_notification(
+                        project_id,
+                        event_type="sr_catch_rate_below_floor",
+                        payload=floor_payload,
+                    )
+                )
+
+                doc["sr_catch_rate_floor_alert"] = {
+                    "computed_at": result["computed_at"],
+                    "cycle_id": current_cycle_id,
+                    "categories": current_floor_cats,
+                }
+                project.design_doc = doc
+                flag_modified(project, "design_doc")
+                session.add(project)
+
+                logger.info(
+                    "[SR_CATCH_RATE_TRENDS] project=%s floor_alert categories=%s",
+                    project_id,
+                    current_floor_cats,
+                )
+        elif doc.get("sr_catch_rate_floor_alert"):
+            # Clear transition: previously firing, no longer firing this cycle.
+            stale_floor_alerts = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == project_id,
+                            Alert.task_id.is_(None),
+                            Alert.severity == AlertSeverity.ERROR,
+                            Alert.dismissed_at.is_(None),
+                            Alert.title.like(f"{_SR_FLOOR_ALERT_TITLE_PREFIX}%"),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for a in stale_floor_alerts:
+                a.dismissed_at = now
+                session.add(a)
+            doc.pop("sr_catch_rate_floor_alert", None)
+            project.design_doc = doc
+            flag_modified(project, "design_doc")
+            session.add(project)
+    except Exception:
+        logger.exception(
+            "[SR_CATCH_RATE_TRENDS] floor notification failed, suppressing"
+        )
+
+    # Quadrant alert: fire when a category is classified as conservative_shift or
+    # noisy_shift.  both_declining is intentionally excluded (covered by regression
+    # alert); healthy/mixed/flat are silent.
+    try:
+        import asyncio
+        from app.notification_dispatch import (
+            post_failure_alert_message,
+            dispatch_external_notification,
+        )
+
+        quadrant_alertable = {
+            cat: data
+            for cat, data in categories.items()
+            if data.get("precision_recall_quadrant")
+            in ("conservative_shift", "noisy_shift")
+        }
+
+        if quadrant_alertable:
+            quadrant_alert_state: dict = dict(doc.get("sr_quadrant_alert") or {})
+            q_alerted_cats: list = list(quadrant_alert_state.get("categories") or [])
+            current_quadrant_cats = sorted(quadrant_alertable.keys())
+
+            q_already_alerted = False
+            if use_cycle_mode:
+                q_already_alerted = (
+                    quadrant_alert_state.get("cycle_id") == current_cycle_id
+                    and q_alerted_cats == current_quadrant_cats
+                )
+            else:
+                q_alert_at: str | None = quadrant_alert_state.get("computed_at")
+                if q_alert_at:
+                    try:
+                        last_q_dt = datetime.fromisoformat(q_alert_at)
+                        if (
+                            now - last_q_dt
+                        ).days < 14 and q_alerted_cats == current_quadrant_cats:
+                            q_already_alerted = True
+                    except (ValueError, TypeError):
+                        pass
+
+            if not q_already_alerted:
+                lines = ["SR precision/recall shift detected:"]
+                for cat in current_quadrant_cats:
+                    data = quadrant_alertable[cat]
+                    quadrant = data.get("precision_recall_quadrant")
+                    pdelta = data.get("precision_delta")
+                    rdelta = data.get("recall_delta")
+                    p_str = f"{pdelta:+.0%}" if pdelta is not None else "N/A"
+                    r_str = f"{rdelta:+.0%}" if rdelta is not None else "N/A"
+                    lines.append(
+                        f"  • {cat} [{quadrant}]: precision {p_str} / recall {r_str}"
+                    )
+                description = "\n".join(lines)
+
+                # Add caveat if SR prompt changed during this window
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    description = (
+                        description
+                        + "\n\nNote: SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
+
+                await post_failure_alert_message(session, project_id, description)
+
+                new_quadrant_title = _format_sr_alert_title(
+                    _SR_QUADRANT_ALERT_TITLE_PREFIX, current_quadrant_cats
+                )
+                existing_q_alerts = (
+                    (
+                        await session.execute(
+                            select(Alert).where(
+                                Alert.project_id == project_id,
+                                Alert.task_id.is_(None),
+                                Alert.severity == AlertSeverity.WARNING,
+                                Alert.dismissed_at.is_(None),
+                                Alert.title.like(f"{_SR_QUADRANT_ALERT_TITLE_PREFIX}%"),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if not any(a.title == new_quadrant_title for a in existing_q_alerts):
+                    for a in existing_q_alerts:
+                        a.dismissed_at = now
+                        session.add(a)
+                    session.add(
+                        Alert(
+                            project_id=project_id,
+                            severity=AlertSeverity.WARNING,
+                            title=new_quadrant_title,
+                            message=description,
+                        )
+                    )
+
+                q_payload: dict[str, Any] = {
+                    "project_id": str(project_id),
+                    "computed_at": result["computed_at"],
+                    "quadrant_categories": [
+                        {
+                            "category": cat,
+                            "quadrant": quadrant_alertable[cat].get(
+                                "precision_recall_quadrant"
+                            ),
+                            "precision_delta": quadrant_alertable[cat].get(
+                                "precision_delta"
+                            ),
+                            "recall_delta": quadrant_alertable[cat].get("recall_delta"),
+                        }
+                        for cat in current_quadrant_cats
+                    ],
+                }
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    q_payload["prompt_version_caveat"] = (
+                        "SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
+                asyncio.ensure_future(
+                    dispatch_external_notification(
+                        project_id,
+                        event_type="sr_precision_recall_shift",
+                        payload=q_payload,
+                    )
+                )
+
+                doc["sr_quadrant_alert"] = {
+                    "computed_at": result["computed_at"],
+                    "cycle_id": current_cycle_id,
+                    "categories": current_quadrant_cats,
+                }
+                project.design_doc = doc
+                flag_modified(project, "design_doc")
+                session.add(project)
+
+                logger.info(
+                    "[SR_CATCH_RATE_TRENDS] project=%s quadrant_alert categories=%s",
+                    project_id,
+                    current_quadrant_cats,
+                )
+        elif doc.get("sr_quadrant_alert"):
+            # Clear transition: no longer alertable this cycle.
+            stale_q_alerts = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == project_id,
+                            Alert.task_id.is_(None),
+                            Alert.severity == AlertSeverity.WARNING,
+                            Alert.dismissed_at.is_(None),
+                            Alert.title.like(f"{_SR_QUADRANT_ALERT_TITLE_PREFIX}%"),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for a in stale_q_alerts:
+                a.dismissed_at = now
+                session.add(a)
+            doc.pop("sr_quadrant_alert", None)
+            project.design_doc = doc
+            flag_modified(project, "design_doc")
+            session.add(project)
+    except Exception:
+        logger.exception(
+            "[SR_CATCH_RATE_TRENDS] quadrant notification failed, suppressing"
+        )
+
+    # PASS reasoning thinning alert: fire when a non-regressing category has
+    # engagement below threshold with enough PASS samples.  Suppressed for
+    # categories already covered by a regression or floor alert this cycle.
+    try:
+        import asyncio
+        from app.notification_dispatch import (
+            post_failure_alert_message,
+            dispatch_external_notification,
+        )
+
+        eng_threshold: float = float(
+            doc.get("sr_engagement_threshold") or _SR_ENGAGEMENT_THRESHOLD
+        )
+        eng_min_passes: int = int(
+            doc.get("sr_engagement_min_passes") or _SR_ENGAGEMENT_MIN_PASSES
+        )
+
+        thinning_cats = {
+            cat: data
+            for cat, data in categories.items()
+            if (
+                cat not in regressing_cats
+                and data.get("reasoning_engagement_rate") is not None
+                and data["reasoning_engagement_rate"] < eng_threshold
+                and (data.get("reasoning_engagement_total") or 0) >= eng_min_passes
+            )
+        }
+
+        if thinning_cats:
+            eng_alert_state: dict = dict(doc.get("sr_pass_engagement_alert") or {})
+            eng_alerted_cats: list = list(eng_alert_state.get("categories") or [])
+            current_thinning_cats = sorted(thinning_cats.keys())
+
+            eng_already_alerted = False
+            if use_cycle_mode:
+                eng_already_alerted = (
+                    eng_alert_state.get("cycle_id") == current_cycle_id
+                    and eng_alerted_cats == current_thinning_cats
+                )
+            else:
+                eng_alert_at: str | None = eng_alert_state.get("computed_at")
+                if eng_alert_at:
+                    try:
+                        last_eng_dt = datetime.fromisoformat(eng_alert_at)
+                        if (
+                            now - last_eng_dt
+                        ).days < 14 and eng_alerted_cats == current_thinning_cats:
+                            eng_already_alerted = True
+                    except (ValueError, TypeError):
+                        pass
+
+            if not eng_already_alerted:
+                lines = [
+                    f"PASS reasoning thinning (engagement < {eng_threshold:.0%}, may regress soon):"
+                ]
+                for cat in current_thinning_cats:
+                    data = thinning_cats[cat]
+                    rate = data.get("reasoning_engagement_rate")
+                    total = data.get("reasoning_engagement_total", 0)
+                    with_r = data.get("reasoning_engagement_with", 0)
+                    rate_str = f"{rate:.0%}" if rate is not None else "N/A"
+                    lines.append(
+                        f"  • {cat}: {with_r}/{total} PASSes with reasoning ({rate_str})"
+                    )
+                description = "\n".join(lines)
+
+                # Add caveat if SR prompt changed during this window
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    description = (
+                        description
+                        + "\n\nNote: SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
+
+                await post_failure_alert_message(session, project_id, description)
+
+                new_eng_title = _format_sr_alert_title(
+                    _PASS_ENGAGEMENT_THINNING_ALERT_TITLE_PREFIX, current_thinning_cats
+                )
+                existing_eng_alerts = (
+                    (
+                        await session.execute(
+                            select(Alert).where(
+                                Alert.project_id == project_id,
+                                Alert.task_id.is_(None),
+                                Alert.severity == AlertSeverity.WARNING,
+                                Alert.dismissed_at.is_(None),
+                                Alert.title.like(
+                                    f"{_PASS_ENGAGEMENT_THINNING_ALERT_TITLE_PREFIX}%"
+                                ),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if not any(a.title == new_eng_title for a in existing_eng_alerts):
+                    for a in existing_eng_alerts:
+                        a.dismissed_at = now
+                        session.add(a)
+                    session.add(
+                        Alert(
+                            project_id=project_id,
+                            severity=AlertSeverity.WARNING,
+                            title=new_eng_title,
+                            message=description,
+                        )
+                    )
+
+                thinning_payload: dict[str, Any] = {
+                    "project_id": str(project_id),
+                    "computed_at": result["computed_at"],
+                    "eng_threshold": eng_threshold,
+                    "thinning_categories": [
+                        {
+                            "category": cat,
+                            "engagement_rate": thinning_cats[cat].get(
+                                "reasoning_engagement_rate"
+                            ),
+                            "total_passes": thinning_cats[cat].get(
+                                "reasoning_engagement_total", 0
+                            ),
+                        }
+                        for cat in current_thinning_cats
+                    ],
+                }
+                if result.get("prompt_version_changed") or result.get(
+                    "mixed_prompt_versions"
+                ):
+                    thinning_payload["prompt_version_caveat"] = (
+                        "SR prompt version changed during this window — "
+                        + "attribution may be partly due to the prompt update"
+                    )
+                asyncio.ensure_future(
+                    dispatch_external_notification(
+                        project_id,
+                        event_type="sr_pass_reasoning_thinning",
+                        payload=thinning_payload,
+                    )
+                )
+
+                doc["sr_pass_engagement_alert"] = {
+                    "computed_at": result["computed_at"],
+                    "cycle_id": current_cycle_id,
+                    "categories": current_thinning_cats,
+                }
+                project.design_doc = doc
+                flag_modified(project, "design_doc")
+                session.add(project)
+
+                logger.info(
+                    "[SR_CATCH_RATE_TRENDS] project=%s engagement_thinning_alert categories=%s",
+                    project_id,
+                    current_thinning_cats,
+                )
+        elif doc.get("sr_pass_engagement_alert"):
+            # Clear transition: previously firing, no longer firing this cycle.
+            stale_eng_alerts = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == project_id,
+                            Alert.task_id.is_(None),
+                            Alert.severity == AlertSeverity.WARNING,
+                            Alert.dismissed_at.is_(None),
+                            Alert.title.like(
+                                f"{_PASS_ENGAGEMENT_THINNING_ALERT_TITLE_PREFIX}%"
+                            ),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for a in stale_eng_alerts:
+                a.dismissed_at = now
+                session.add(a)
+            doc.pop("sr_pass_engagement_alert", None)
+            project.design_doc = doc
+            flag_modified(project, "design_doc")
+            session.add(project)
+    except Exception:
+        logger.exception(
+            "[SR_CATCH_RATE_TRENDS] engagement thinning notification failed, suppressing"
+        )
+
+    await session.flush()
+
+    return result

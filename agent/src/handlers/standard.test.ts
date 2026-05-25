@@ -73,6 +73,10 @@ vi.mock('../build-config.js', async (importOriginal) => {
   return { ...actual };
 });
 
+vi.mock('../workspacePrep.js', () => ({
+  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
+}));
+
 // fs is consumed by both `import fs from 'fs'` (default import) and
 // `import * as fs from 'fs'` (namespace import) across the codebase under
 // test. Mock both shapes so vitest doesn't reject either access pattern.
@@ -3464,5 +3468,87 @@ describe('handleCreate — SCOPE_EMPTY pre-flight guard', () => {
       task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
     );
     expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalled();
+  });
+});
+
+// ── operator_requested_review_for branch-existence short-circuit ──────────────
+describe('operator_requested_review_for branch-existence check', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('short-circuits with COMPLETED when ls-remote returns empty (branch deleted)', async () => {
+    const { execFileSync } = await import('child_process');
+    const { persistAndPostStatus } = await import('../index.js');
+    // ls-remote returns empty → branch does not exist
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+
+    const task = {
+      title: 'Review PR #5819',
+      description: '',
+      context: { operator_requested_review_for: 'pr-5819' },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Automated review', branch: 'blueprint/task-deleted', base_branch: 'main' },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({
+        status: 'COMPLETED',
+        failure_category: 'PR_BRANCH_DELETED',
+      }),
+    );
+    // runCodeChangeTask must NOT be invoked — we returned early
+    expect(vi.mocked(runCodeChangeTask)).not.toHaveBeenCalled();
+  });
+
+  it('proceeds to clone when ls-remote returns a non-empty ref line (branch exists)', async () => {
+    const { execFileSync } = await import('child_process');
+    const { prepareWorkspaceForRole } = await import('../workspacePrep.js');
+    // ls-remote returns a non-empty line → branch exists
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from('abc123\trefs/heads/blueprint/task-active\n'));
+    // git mock (merge-base etc.) already returns ''
+
+    const task = {
+      title: 'Review PR #9999',
+      description: '',
+      context: { operator_requested_review_for: 'pr-9999' },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Automated review', branch: 'blueprint/task-active', base_branch: 'main' },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    expect(vi.mocked(prepareWorkspaceForRole)).toHaveBeenCalled();
+  });
+
+  it('proceeds to clone when ls-remote itself throws (treats as branch-present to surface real errors)', async () => {
+    const { execFileSync } = await import('child_process');
+    const { prepareWorkspaceForRole } = await import('../workspacePrep.js');
+    vi.mocked(execFileSync).mockImplementationOnce(() => { throw new Error('network error'); });
+
+    const task = {
+      title: 'Review PR #8888',
+      description: '',
+      context: { operator_requested_review_for: 'pr-8888' },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Automated review', branch: 'blueprint/task-maybe', base_branch: 'main' },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    // ls-remote threw → we assume the branch exists and let prepareWorkspaceForRole run
+    expect(vi.mocked(prepareWorkspaceForRole)).toHaveBeenCalled();
+    // COMPLETED/PR_BRANCH_DELETED must NOT have been posted
+    const { persistAndPostStatus } = await import('../index.js');
+    const deletedCalls = vi.mocked(persistAndPostStatus).mock.calls.filter(
+      ([, body]) => body['failure_category'] === 'PR_BRANCH_DELETED',
+    );
+    expect(deletedCalls).toHaveLength(0);
   });
 });

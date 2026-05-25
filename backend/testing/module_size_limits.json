@@ -30,7 +30,8 @@
     "pipeline_regression_dispatcher.py": 9200,
     "release_qualifier.py": 5900,
     "playbook_learning.py": 7100,
-    "playbook_capacity.py": 200
+    "playbook_capacity.py": 200,
+    "playbook_sr_metrics.py": 3100
   },
   "frontend": {
     "useAppState.ts": 3000,

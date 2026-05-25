@@ -26,7 +26,10 @@ from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
 from app.task_locking import lock_project_or_429, with_design_doc_locked
 from app.playbook_storage import archive_playbook_entry
-from app.shared_state import get_project_integration_branch
+from app.shared_state import (
+    get_project_integration_branch,
+    get_project_promotion_target,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +109,13 @@ _AUTO_REMEDIATION_DEFAULTS: Dict[str, Any] = {
 }
 
 
+def _build_auto_remediation_defaults(project) -> Dict[str, Any]:
+    integration = get_project_integration_branch(project)
+    promotion = get_project_promotion_target(project)
+    branch_whitelist = list(dict.fromkeys([integration, promotion]))
+    return {**_AUTO_REMEDIATION_DEFAULTS, "branch_whitelist": branch_whitelist}
+
+
 @router.get("/projects/{project_id}/auto-remediation")
 async def get_auto_remediation_config(
     project_id: uuid.UUID,
@@ -117,7 +127,7 @@ async def get_auto_remediation_config(
         project_id, current_user["user_id"], session, "member"
     )
     stored = (project.design_doc or {}).get("_auto_remediation", {})
-    config = {**_AUTO_REMEDIATION_DEFAULTS, **stored}
+    config = {**_build_auto_remediation_defaults(project), **stored}
 
     # Compute activity stats from tasks spawned by auto-remediation
     now = _utcnow()
@@ -258,7 +268,7 @@ async def update_auto_remediation_config(
     session.add(project)
     await session.commit()
 
-    config = {**_AUTO_REMEDIATION_DEFAULTS, **stored}
+    config = {**_build_auto_remediation_defaults(project), **stored}
     return {"project_id": str(project_id), "config": config}
 
 
@@ -276,6 +286,13 @@ _ISSUE_IMPLEMENTATION_DEFAULTS: Dict[str, Any] = {
 }
 
 
+def _build_issue_implementation_defaults(project) -> Dict[str, Any]:
+    return {
+        **_ISSUE_IMPLEMENTATION_DEFAULTS,
+        "base_branch": get_project_integration_branch(project),
+    }
+
+
 @router.get("/projects/{project_id}/issue-implementation")
 async def get_issue_implementation_config(
     project_id: uuid.UUID,
@@ -287,7 +304,7 @@ async def get_issue_implementation_config(
         project_id, current_user["user_id"], session, "member"
     )
     stored = (project.design_doc or {}).get("_issue_implementation", {})
-    config = {**_ISSUE_IMPLEMENTATION_DEFAULTS, **stored}
+    config = {**_build_issue_implementation_defaults(project), **stored}
     return {"project_id": str(project_id), "config": config}
 
 
@@ -363,7 +380,7 @@ async def update_issue_implementation_config(
     session.add(project)
     await session.commit()
 
-    config = {**_ISSUE_IMPLEMENTATION_DEFAULTS, **stored}
+    config = {**_build_issue_implementation_defaults(project), **stored}
     return {"project_id": str(project_id), "config": config}
 
 
@@ -510,6 +527,70 @@ async def update_integration_branch_config(
         "project_id": str(project_id),
         "integration_branch": get_project_integration_branch(project),
         "is_default": project.integration_branch is None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Promotion-target config endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/projects/{project_id}/promotion-target")
+async def get_promotion_target_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the per-project promotion/LTS target branch."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    return {
+        "project_id": str(project_id),
+        "promotion_target": get_project_promotion_target(project),
+        "is_default": project.promotion_target is None,
+    }
+
+
+@router.patch("/projects/{project_id}/promotion-target")
+async def update_promotion_target_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Set the per-project promotion/LTS target branch. Pass null to revert to global default."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if "promotion_target" not in body:
+        raise HTTPException(
+            status_code=422, detail="Request body must include 'promotion_target'"
+        )
+
+    branch = body["promotion_target"]
+    if branch is not None:
+        if not isinstance(branch, str) or not branch.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="'promotion_target' must be a non-empty string or null",
+            )
+        if not _VALID_BRANCH_RE.match(branch):
+            raise HTTPException(
+                status_code=422,
+                detail="'promotion_target' contains invalid characters",
+            )
+
+    project = await lock_project_or_429(session, project_id)
+    project.promotion_target = branch
+    session.add(project)
+    await session.commit()
+
+    return {
+        "project_id": str(project_id),
+        "promotion_target": get_project_promotion_target(project),
+        "is_default": project.promotion_target is None,
     }
 
 

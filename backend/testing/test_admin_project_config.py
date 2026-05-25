@@ -5,6 +5,7 @@ from app.models import Project
 from app.shared_state import (
     get_project_broadcast_limit,
     get_project_integration_branch,
+    get_project_promotion_target,
     runtime_config,
 )
 from testing.factories import make_membership
@@ -156,6 +157,103 @@ async def test_get_project_integration_branch_helper_legacy_fallback():
 
 
 # ---------------------------------------------------------------------------
+# Promotion-target config tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_get_promotion_target_defaults_to_main(
+    client: AsyncClient, db_session, project_owner
+):
+    """GET /promotion-target returns 'main' when no per-project value is set."""
+    project = project_owner
+    resp = await client.get(f"/api/admin/projects/{project.id}/promotion-target")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["project_id"] == str(project.id)
+    assert data["promotion_target"] == "main"
+    assert data["is_default"] is True
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_promotion_target_round_trip(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH then GET returns the updated promotion target branch."""
+    project = project_owner
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/promotion-target",
+        json={"promotion_target": "lts"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["promotion_target"] == "lts"
+    assert data["is_default"] is False
+
+    get_resp = await client.get(f"/api/admin/projects/{project.id}/promotion-target")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["promotion_target"] == "lts"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_promotion_target_null_reverts_to_default(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH with null clears the per-project override, reverting to global default."""
+    project = project_owner
+    await client.patch(
+        f"/api/admin/projects/{project.id}/promotion-target",
+        json={"promotion_target": "release"},
+    )
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/promotion-target",
+        json={"promotion_target": None},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["is_default"] is True
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_promotion_target_rejects_invalid_chars(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH rejects promotion target branch names with shell metacharacters."""
+    project = project_owner
+    for bad in ['main";id;"', "main$(cmd)", "main\nfoo"]:
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/promotion-target",
+            json={"promotion_target": bad},
+        )
+        assert resp.status_code == 422, (
+            f"expected 422 for {bad!r}, got {resp.status_code}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_project_promotion_target_helper_legacy_fallback():
+    """The helper falls back to runtime_config when project has no promotion_target set."""
+    original = runtime_config.get("promotion_target")
+    try:
+        runtime_config["promotion_target"] = "legacy-lts"
+
+        class _FakeProject:
+            promotion_target = None
+
+        result = get_project_promotion_target(_FakeProject())
+        assert result == "legacy-lts"
+    finally:
+        if original is None:
+            runtime_config.pop("promotion_target", None)
+        else:
+            runtime_config["promotion_target"] = original
+
+
+# ---------------------------------------------------------------------------
 # Broadcast-limit config tests
 # ---------------------------------------------------------------------------
 
@@ -296,3 +394,104 @@ async def test_get_project_broadcast_limit_helper():
             runtime_config.pop("project_broadcast_limit", None)
         else:
             runtime_config["project_broadcast_limit"] = original
+
+
+# ---------------------------------------------------------------------------
+# Auto-remediation config — project-aware defaults
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_get_auto_remediation_defaults_for_main_project(
+    client: AsyncClient, db_session, project_owner
+):
+    """branch_whitelist default includes 'main' when no integration_branch is set."""
+    project = project_owner
+    resp = await client.get(f"/api/admin/projects/{project.id}/auto-remediation")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert "main" in data["config"]["branch_whitelist"]
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_get_auto_remediation_defaults_for_custom_branch_project(
+    client: AsyncClient, db_session, project_owner
+):
+    """branch_whitelist default reflects the project's integration_branch, not hardcoded 'master'."""
+    project = project_owner
+    await client.patch(
+        f"/api/admin/projects/{project.id}/integration-branch",
+        json={"integration_branch": "trunk"},
+    )
+    resp = await client.get(f"/api/admin/projects/{project.id}/auto-remediation")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert "trunk" in data["config"]["branch_whitelist"]
+    assert "master" not in data["config"]["branch_whitelist"]
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_get_auto_remediation_stored_value_overrides_computed_default(
+    client: AsyncClient, db_session, project_owner
+):
+    """Stored branch_whitelist takes precedence over the computed default."""
+    project = project_owner
+    await client.patch(
+        f"/api/admin/projects/{project.id}/auto-remediation",
+        json={"branch_whitelist": ["release"]},
+    )
+    resp = await client.get(f"/api/admin/projects/{project.id}/auto-remediation")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["config"]["branch_whitelist"] == ["release"]
+
+
+# ---------------------------------------------------------------------------
+# Issue-implementation config — project-aware defaults
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_get_issue_implementation_defaults_for_main_project(
+    client: AsyncClient, db_session, project_owner
+):
+    """base_branch defaults to 'main' when no integration_branch is set."""
+    project = project_owner
+    resp = await client.get(f"/api/admin/projects/{project.id}/issue-implementation")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["config"]["base_branch"] == "main"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_get_issue_implementation_defaults_for_custom_branch_project(
+    client: AsyncClient, db_session, project_owner
+):
+    """base_branch default reflects the project's integration_branch."""
+    project = project_owner
+    await client.patch(
+        f"/api/admin/projects/{project.id}/integration-branch",
+        json={"integration_branch": "trunk"},
+    )
+    resp = await client.get(f"/api/admin/projects/{project.id}/issue-implementation")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["config"]["base_branch"] == "trunk"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_get_issue_implementation_stored_value_overrides_computed_default(
+    client: AsyncClient, db_session, project_owner
+):
+    """Stored base_branch takes precedence over the computed default."""
+    project = project_owner
+    await client.patch(
+        f"/api/admin/projects/{project.id}/issue-implementation",
+        json={"base_branch": "release"},
+    )
+    resp = await client.get(f"/api/admin/projects/{project.id}/issue-implementation")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["config"]["base_branch"] == "release"

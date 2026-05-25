@@ -212,17 +212,19 @@ _DIRECTION_FIRST_ATTEMPT_DECAY_HALF_LIFE_DAYS = 14
 _REVIEW_PLAYBOOK_REFRESH_DAYS = 30
 
 _MIN_REVIEW_SAMPLE = 10
-_TREND_DELTA_THRESHOLD = 0.05
-_PRECISION_RECALL_QUADRANT_THRESHOLD = 0.05
-_SR_SEVERITY_DELTA_THRESHOLDS: dict[str, float] = {
-    "CRITICAL": 0.03,
-    "MAJOR": 0.05,
-    "MINOR": 0.10,
-}
-_SR_FLOOR_THRESHOLD = 0.50
-_FLOOR_MIN_CONSECUTIVE_WINDOWS = 2
-_SR_ENGAGEMENT_THRESHOLD = 0.5
-_SR_ENGAGEMENT_MIN_PASSES = 10
+# SR catch-rate trend constants live in app.playbook_sr_metrics — re-exported
+# here so existing callers that do ``from app.review_learning import X`` keep
+# working and the modularity tripwire in test_playbook_learning_modularity.py
+# sees the canonical objects via every facade.
+from app.playbook_sr_metrics import (  # noqa: E402,F401
+    _FLOOR_MIN_CONSECUTIVE_WINDOWS,
+    _PRECISION_RECALL_QUADRANT_THRESHOLD,
+    _SR_ENGAGEMENT_MIN_PASSES,
+    _SR_ENGAGEMENT_THRESHOLD,
+    _SR_FLOOR_THRESHOLD,
+    _SR_SEVERITY_DELTA_THRESHOLDS,
+    _TREND_DELTA_THRESHOLD,
+)
 
 
 def _categorize_review_issues_keyword(review_history: list) -> dict[str, list[dict]]:

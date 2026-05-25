@@ -238,7 +238,7 @@ async def secret_reconciliation_service():
 
 
 _STALE_BRANCH_PREFIXES = ("blueprint/", "research/", "plan/")
-_PROTECTED_BRANCHES = frozenset(["main", "master", "develop", "dev"])
+_DEFAULT_PROTECTED_BRANCHES = ("main", "master", "develop", "dev")
 # Per-cycle caps. The age check costs one GitHub commit-date call per candidate
 # branch (i.e. branches that already passed the terminal-task filter), plus a
 # DELETE per actually-deleted branch. At 4 cycles/day these caps fit well
@@ -258,14 +258,30 @@ _QUOTA_FLOOR = 500  # install-token (5000/hr bucket)
 _JWT_QUOTA_FLOOR = 10  # App-JWT (~60/hr bucket)
 
 # Branch naming conventions these prefixes emit:
-#   blueprint/{task|fix|refactor|docs|deps|migrate}-{short_id}
+#   {namespace}/{task|fix|refactor|docs|deps|migrate}-{short_id}
 #   research/{short_id}
 #   plan/{short_id}
 # short_id is the first 8 hex chars of the owning task's UUID (dashes stripped).
+# Namespace defaults to 'blueprint/' but is configurable per project via
+# build_config.task_branch_prefix.
 _BRANCH_SHORT_ID_RE = re.compile(
     r"^(?:blueprint/(?:task|fix|refactor|docs|deps|migrate)-|research/|plan/)"
     r"([a-f0-9]{8})$"
 )
+
+# Type-prefix alternatives used when building per-project regexes.
+_BRANCH_TYPE_ALTS = "|".join(
+    sorted(set(_shared_state.TASK_TYPE_BRANCH_PREFIX.values()) | {"task"})
+)
+
+
+def _build_branch_short_id_re(namespace: str) -> re.Pattern:
+    """Return a compiled regex for a given task-branch namespace prefix."""
+    ns = re.escape(namespace)
+    return re.compile(
+        rf"^(?:{ns}(?:{_BRANCH_TYPE_ALTS})-|research/|plan/)([a-f0-9]{{8}})$"
+    )
+
 
 # Statuses a task can sit in after it's done. Only branches owned by tasks in
 # one of these states are eligible for stale-branch cleanup.
@@ -278,13 +294,21 @@ _TERMINAL_TASK_STATUSES = frozenset(
 )
 
 
-def _extract_branch_short_id(branch_name: str) -> str | None:
+def _extract_branch_short_id(branch_name: str, project=None) -> str | None:
     """Return the 8-char task short_id embedded in a branch name, or None.
 
-    Used by the stale branch cleanup to attribute each branch to the task that
-    created it without a GitHub API round-trip.
+    When *project* is provided its task_branch_prefix is used to build the
+    matching regex, so non-Blueprint deployments with custom prefixes are
+    handled correctly.  Falls back to the default 'blueprint/' pattern.
     """
-    m = _BRANCH_SHORT_ID_RE.match(branch_name)
+    if project is not None:
+        ns = _shared_state.get_project_task_branch_prefix(project)
+        pattern = (
+            _BRANCH_SHORT_ID_RE if ns == "blueprint/" else _build_branch_short_id_re(ns)
+        )
+    else:
+        pattern = _BRANCH_SHORT_ID_RE
+    m = pattern.match(branch_name)
     return m.group(1) if m else None
 
 
@@ -559,7 +583,9 @@ async def _run_stale_branch_cleanup():
             # Batch-load task metadata for every branch whose name matches our
             # known short_id shape. One SQL query replaces ~N GitHub calls.
             branch_short_ids = {
-                sid for b in branches if (sid := _extract_branch_short_id(b["name"]))
+                sid
+                for b in branches
+                if (sid := _extract_branch_short_id(b["name"], project))
             }
             # short_id -> (status, context). context is loaded so Gate 5.5 can
             # check for PR closure markers before deleting the branch.
@@ -589,7 +615,7 @@ async def _run_stale_branch_cleanup():
                 name = branch_info["name"]
 
                 # Gate 1: never touch protected branches
-                if name in _PROTECTED_BRANCHES:
+                if name in project.protected_branches:
                     continue
 
                 # Gate 2: skip if the name matches any active task's branch
@@ -599,7 +625,7 @@ async def _run_stale_branch_cleanup():
                 # Gate 3: name must match the known cleanup shape. Unknown
                 # shapes (hand-created branches someone kept around, legacy
                 # naming, etc.) are left alone.
-                short_id = _extract_branch_short_id(name)
+                short_id = _extract_branch_short_id(name, project)
                 if not short_id:
                     continue
 

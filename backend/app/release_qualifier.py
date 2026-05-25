@@ -122,6 +122,7 @@ from app.release_scoring import (
 from app.shared_state import (
     runtime_config as _runtime_config,
     get_project_integration_branch as _get_project_integration_branch,
+    get_project_promotion_target as _get_project_promotion_target,
 )
 from app.time_utils import _utcnow
 
@@ -153,11 +154,12 @@ def _lts_branch_names(project=None) -> tuple[str, str]:
     """
     if project is not None:
         integration = _get_project_integration_branch(project)
+        promotion = _get_project_promotion_target(project)
     else:
         # DEPRECATED: global runtime_config fallback — remove after per-project column stable.
         # Default "main" matches get_project_integration_branch and the runtime_config seed.
         integration = str(_runtime_config.get("integration_branch", "main"))
-    promotion = str(_runtime_config.get("promotion_target", "main"))
+        promotion = str(_runtime_config.get("promotion_target", "main"))
     return integration, promotion
 
 

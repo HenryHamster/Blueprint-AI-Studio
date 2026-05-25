@@ -2673,8 +2673,9 @@ async def _process_post_commit(
                         _integration_branch = _runtime_config.get(
                             "integration_branch", "main"
                         )
-                        _promotion_target = _runtime_config.get(
-                            "promotion_target", "main"
+                        _task_project = await session.get(Project, task.project_id)
+                        _promotion_target = _shared_state.get_project_promotion_target(
+                            _task_project
                         )
                         is_ci_gated_merge = base_branch in (
                             _integration_branch,
@@ -2916,6 +2917,14 @@ async def _process_post_commit(
                                             **(orig.context or {}),
                                             "pr_merged": True,
                                         }
+                                        _orig_project = await session.get(
+                                            Project, orig.project_id
+                                        )
+                                        _orig_promotion_target = (
+                                            _shared_state.get_project_promotion_target(
+                                                _orig_project
+                                            )
+                                        )
                                         # If this was a rollup PR review, mark the parent as COMPLETED
                                         is_rollup_merge = (
                                             orig.status == TaskStatus.EVALUATING
@@ -3048,10 +3057,7 @@ async def _process_post_commit(
                                         #   health_check_urls: list[str] — live URLs to probe with HTTP GET after local tests
                                         if (
                                             is_rollup_merge
-                                            and base_branch
-                                            == _runtime_config.get(
-                                                "promotion_target", "main"
-                                            )
+                                            and base_branch == _orig_promotion_target
                                             and _runtime_config.get("smoketest_enabled")
                                         ):
                                             try:
@@ -3146,10 +3152,7 @@ async def _process_post_commit(
                                         # conflict. (automain/LTS plan Phase 5)
                                         if (
                                             is_rollup_merge
-                                            and base_branch
-                                            == _runtime_config.get(
-                                                "promotion_target", "main"
-                                            )
+                                            and base_branch == _orig_promotion_target
                                             and bool(orig.first_payload.get("hotfix"))
                                         ):
                                             try:

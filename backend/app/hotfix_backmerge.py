@@ -120,7 +120,10 @@ async def reconcile_main_into_automain(
     result, or ``{"status": "skipped", "reason": "lts_inactive"}`` when the LTS
     branch model is not active.
     """
-    integration_branch, promotion_target = _lts_branch_names()
+    project = await session.get(Project, project_id)
+    if project is None:
+        return {"status": "skipped", "reason": "project_not_found"}
+    integration_branch, promotion_target = _lts_branch_names(project)
     if integration_branch == promotion_target:
         return {"status": "skipped", "reason": "lts_inactive"}
     return await open_backmerge_pr(session, project_id, periodic=True)
@@ -169,7 +172,6 @@ async def open_backmerge_pr(
 
     The caller commits the session.  Returns a status dict.
     """
-    integration_branch, promotion_target = _lts_branch_names()
     hotfix_task_id_str = str(hotfix_task_id) if hotfix_task_id is not None else None
     trigger_desc = _describe_trigger(merged_pr_url, hotfix_task_id_str)
 
@@ -189,6 +191,8 @@ async def open_backmerge_pr(
         )
         return {"status": "blocked", "error": "project_not_found"}
 
+    integration_branch, promotion_target = _lts_branch_names(project)
+
     # 1. Resolve GitHub credentials (App token → installation → PAT).
     resolved = await _resolve_github_with_session(session, project)
     if resolved is None:
@@ -200,6 +204,7 @@ async def open_backmerge_pr(
             session,
             project_id,
             trigger_desc,
+            project=project,
             reason="no GitHub credentials available",
             periodic=periodic,
         )
@@ -240,6 +245,7 @@ async def open_backmerge_pr(
             session,
             project_id,
             trigger_desc,
+            project=project,
             reason=f"could not open the back-merge PR: {str(exc)[:200]}",
             periodic=periodic,
         )
@@ -267,6 +273,7 @@ async def open_backmerge_pr(
             session,
             project_id,
             trigger_desc,
+            project=project,
             reason="the back-merge PR was created without a PR number",
             periodic=periodic,
         )
@@ -294,6 +301,7 @@ async def open_backmerge_pr(
             session,
             project_id,
             trigger_desc,
+            project=project,
             reason=f"merging back-merge PR #{pr_number} raised: {str(exc)[:200]}",
             pr_url=pr_url,
             periodic=periodic,
@@ -349,6 +357,7 @@ async def open_backmerge_pr(
             pr_url,
             hotfix_task_id_str,
             trigger_desc,
+            project=project,
             message=str(msg),
             periodic=periodic,
         )
@@ -367,6 +376,7 @@ async def open_backmerge_pr(
         session,
         project_id,
         trigger_desc,
+        project=project,
         reason=(
             f"back-merge PR #{pr_number} did not merge "
             f"(branch protection / checks): {str(msg)[:200]}"
@@ -442,6 +452,7 @@ async def _handle_conflict(
     *,
     message: str,
     periodic: bool,
+    project: Project | None = None,
 ) -> None:
     """Raise a conflict Alert and (if not already open) spawn a resolution plan.
 
@@ -502,7 +513,7 @@ async def _handle_conflict(
         )
         return
 
-    integration_branch, promotion_target = _lts_branch_names()
+    integration_branch, promotion_target = _lts_branch_names(project)
     conflict_alert_title = (
         f"Back-merge conflict: {promotion_target} -> {integration_branch}"
     )
@@ -537,6 +548,7 @@ async def _handle_conflict(
             pr_url,
             hotfix_task_id,
             trigger_desc,
+            project=project,
         )
 
     await _broadcast_alert(project_id, alert)
@@ -555,6 +567,8 @@ async def _spawn_resolution_plan(
     pr_url: str,
     hotfix_task_id: str | None,
     trigger_desc: str,
+    *,
+    project: Project | None = None,
 ) -> Task:
     """Create + queue a high-priority ``plan`` task to resolve the conflict.
 
@@ -562,7 +576,7 @@ async def _spawn_resolution_plan(
     ``git merge origin/main`` conflict resolution.  It is a NORMAL
     automain-bound fix — it deliberately does NOT carry ``hotfix:true``.
     """
-    integration_branch, promotion_target = _lts_branch_names()
+    integration_branch, promotion_target = _lts_branch_names(project)
     trigger_clause = f" ({trigger_desc})" if trigger_desc else ""
     prompt = (
         f"The automated `{promotion_target} -> {integration_branch}` back-merge PR #{pr_number} "
@@ -654,6 +668,7 @@ async def _raise_blocked_alert(
     project_id: uuid.UUID,
     trigger_desc: str,
     *,
+    project: Project | None = None,
     reason: str,
     pr_url: str | None = None,
     periodic: bool = False,
@@ -677,7 +692,7 @@ async def _raise_blocked_alert(
     No fix task is spawned either way — a 405 is a branch-protection / CI
     problem the operator resolves, not a code conflict.
     """
-    integration_branch, promotion_target = _lts_branch_names()
+    integration_branch, promotion_target = _lts_branch_names(project)
     blocked_alert_title = (
         f"Back-merge failed: {promotion_target} -> {integration_branch}"
     )

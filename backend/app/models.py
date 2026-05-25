@@ -313,6 +313,13 @@ class Project(SQLModel, table=True):
         default=None,
         sa_column=Column(String, nullable=True),
     )
+    # Per-project LTS/promotion target branch.
+    # NULL means "use the global runtime_config fallback then 'main'".
+    # See shared_state.get_project_promotion_target for the full fallback chain.
+    promotion_target: str | None = Field(
+        default=None,
+        sa_column=Column(String, nullable=True),
+    )
 
     @property
     def enable_self_improvement(self) -> bool:
@@ -332,6 +339,40 @@ class Project(SQLModel, table=True):
         if configured is not None:
             return tuple(configured)
         return _STALE_BRANCH_PREFIXES
+
+    @property
+    def protected_branches(self) -> frozenset[str]:
+        """Branch names that must never be deleted by stale-branch cleanup.
+
+        Reads from build_config.protected_branches if set; otherwise returns
+        the default set (main, master, develop, dev). Always includes the
+        project's integration_branch and promotion_target so misconfiguration
+        cannot delete trunk branches.
+        """
+        from app.services import _DEFAULT_PROTECTED_BRANCHES
+        from app.shared_state import (
+            get_project_integration_branch,
+            get_project_promotion_target,
+        )
+
+        configured = (self.build_config or {}).get("protected_branches")
+        if configured is not None:
+            base: frozenset[str] = frozenset(configured)
+        else:
+            base = frozenset(_DEFAULT_PROTECTED_BRANCHES)
+        return base | {
+            get_project_integration_branch(self),
+            get_project_promotion_target(self),
+        }
+
+    @property
+    def task_branch_prefix(self) -> str:
+        """Namespace prefix for task branch names (e.g. 'blueprint/').
+
+        Reads from build_config.task_branch_prefix if set; otherwise returns
+        Blueprint's conventional default ('blueprint/').
+        """
+        return (self.build_config or {}).get("task_branch_prefix") or "blueprint/"
 
     @property
     def alembic_versions_path(self) -> str:

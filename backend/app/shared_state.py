@@ -60,11 +60,33 @@ TASK_TYPE_BRANCH_PREFIX: Dict[str, str] = {
 }
 
 
-def derive_task_branch(task_id: Any, task_type: str | None) -> str:
-    """Derive an agent work branch name (``blueprint/{prefix}-{8hex}``)
-    from the task type and id, matching the agent's branch derivation."""
-    prefix = TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
-    return f"blueprint/{prefix}-{str(task_id).replace('-', '')[:8]}"
+def get_project_task_branch_prefix(project) -> str:
+    """Return the task-branch namespace prefix for a project (e.g. 'blueprint/').
+
+    Fallback chain:
+      1. project.build_config['task_branch_prefix'] (per-project override)
+      2. 'blueprint/' (Blueprint's conventional default)
+    """
+    per_project = (getattr(project, "build_config", None) or {}).get(
+        "task_branch_prefix"
+    )
+    if per_project:
+        return per_project
+    return "blueprint/"
+
+
+def derive_task_branch(task_id: Any, task_type: str | None, *, project=None) -> str:
+    """Derive an agent work branch name (``{namespace}{prefix}-{8hex}``)
+    from the task type and id, matching the agent's branch derivation.
+
+    When *project* is provided, the namespace prefix is read from
+    get_project_task_branch_prefix(); otherwise 'blueprint/' is used.
+    """
+    type_prefix = TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
+    namespace = (
+        get_project_task_branch_prefix(project) if project is not None else "blueprint/"
+    )
+    return f"{namespace}{type_prefix}-{str(task_id).replace('-', '')[:8]}"
 
 
 # Rate limiter — shared between main.py and admin.py
@@ -518,6 +540,23 @@ def get_project_integration_branch(project) -> str:
         return per_project
     # DEPRECATED: global runtime_config fallback — remove after per-project column is stable
     return runtime_config.get("integration_branch", "main")
+
+
+def get_project_promotion_target(project) -> str:
+    """Return the promotion/LTS target branch for a project.
+
+    Fallback chain:
+      1. project.promotion_target (per-project column, added by migration 0125+)
+      2. runtime_config["promotion_target"] (DEPRECATED global — transitional fallback for one release)
+      3. "main"
+
+    Using getattr so this helper is safe to call before the model migration lands.
+    """
+    per_project = getattr(project, "promotion_target", None)
+    if per_project:
+        return per_project
+    # DEPRECATED: global runtime_config fallback — remove after per-project column is stable
+    return runtime_config.get("promotion_target", "main")
 
 
 def get_project_broadcast_limit(project) -> int:

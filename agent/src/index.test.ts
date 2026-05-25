@@ -303,6 +303,15 @@ describe('deriveTaskBranch', () => {
     const id = '11223344-aaaa-bbbb-cccc-ddddeeee0000';
     expect(deriveTaskBranch('fix', id)).toBe('blueprint/fix-11223344');
   });
+
+  it('accepts a custom namespace prefix for non-Blueprint deployments', () => {
+    expect(deriveTaskBranch('fix', taskId, 'mybot/')).toBe(`mybot/fix-${shortId}`);
+    expect(deriveTaskBranch('create', taskId, 'acme/')).toBe(`acme/task-${shortId}`);
+  });
+
+  it('defaults namespace prefix to blueprint/ when omitted', () => {
+    expect(deriveTaskBranch('fix', taskId)).toBe(`blueprint/fix-${shortId}`);
+  });
 });
 
 // ── FailureCategory ──────────────────────────────────────────────────────────
