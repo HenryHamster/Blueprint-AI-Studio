@@ -313,9 +313,9 @@ class Project(SQLModel, table=True):
         default=None,
         sa_column=Column(String, nullable=True),
     )
-    # Per-project LTS/promotion target branch.
-    # NULL means "use the global runtime_config fallback then 'main'".
-    # See shared_state.get_project_promotion_target for the full fallback chain.
+    # Per-project promotion (LTS) branch. NULL means fall back to
+    # runtime_config["promotion_target"] then "main" — identical semantics
+    # to integration_branch. See shared_state.get_project_promotion_target.
     promotion_target: str | None = Field(
         default=None,
         sa_column=Column(String, nullable=True),
@@ -326,19 +326,33 @@ class Project(SQLModel, table=True):
         return bool((self.build_config or {}).get("enable_self_improvement", False))
 
     @property
+    def task_branch_namespace(self) -> str:
+        """Namespace prefix for agent task branches (``{namespace}/{prefix}-{8hex}``).
+
+        Reads from ``build_config.task_branch_namespace`` if set; otherwise
+        returns Blueprint's default (``"blueprint"``). A non-Blueprint install
+        can ship its own namespace (e.g. ``"autoproj"``) by setting this in
+        build_config, and the canonical resolver lives in
+        ``shared_state.get_project_task_branch_namespace``.
+        """
+        configured = (self.build_config or {}).get("task_branch_namespace")
+        if configured:
+            return str(configured)
+        return "blueprint"
+
+    @property
     def stale_branch_prefixes(self) -> tuple[str, ...]:
         """Branch name prefixes eligible for stale cleanup.
 
         Reads from build_config.stale_branch_prefixes if set; otherwise returns
-        Blueprint's conventional prefixes (blueprint/, research/, plan/).
-        An empty list in build_config disables cleanup for this project.
+        the project's task-branch namespace alongside Blueprint's conventional
+        staging prefixes (``{namespace}/, research/, plan/``). An empty list in
+        build_config disables cleanup for this project.
         """
-        from app.services import _STALE_BRANCH_PREFIXES
-
         configured = (self.build_config or {}).get("stale_branch_prefixes")
         if configured is not None:
             return tuple(configured)
-        return _STALE_BRANCH_PREFIXES
+        return (f"{self.task_branch_namespace}/", "research/", "plan/")
 
     @property
     def protected_branches(self) -> frozenset[str]:

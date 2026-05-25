@@ -31,6 +31,10 @@
     "release_qualifier.py": 5900,
     "playbook_learning.py": 7100,
     "playbook_capacity.py": 200,
+    "review_learning.py": 1100,
+    "playbook_lifecycle.py": 600,
+    "playbook_storage.py": 650,
+    "playbook_auto.py": 450,
     "playbook_sr_metrics.py": 3100
   },
   "frontend": {

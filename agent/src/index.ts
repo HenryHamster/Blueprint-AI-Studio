@@ -288,6 +288,11 @@ export interface BuildConfig {
   git_user_email?: string;
   enable_fresh_reviewer?: boolean;
   enable_parallel_review?: boolean;
+  /** Namespace prefix for agent work branches (``{namespace}/{prefix}-{8hex}``).
+   *  Defaults to ``"blueprint"`` so the self-repo's branch names are unchanged.
+   *  Mirrors ``project.task_branch_namespace`` on the backend (resolved via
+   *  ``shared_state.get_project_task_branch_namespace``). */
+  task_branch_namespace?: string;
 }
 
 // ── Environment ─────────────────────────────────────────────────────────────
@@ -1392,7 +1397,7 @@ export function validateBranchName(branch: string, label: string): string {
 }
 
 // Canonical task-type → branch-prefix mapping.
-// Convention: {namespace}{prefix}-{first-8-hex-of-task-uuid}
+// Convention: {namespace}/{prefix}-{first-8-hex-of-task-uuid}
 // Mirrors backend/app/shared_state.py TASK_TYPE_BRANCH_PREFIX (Python single source); keep in sync.
 // Types absent from this map default to the 'task' prefix.
 export const TASK_TYPE_BRANCH_PREFIX: Record<string, string> = {
@@ -1403,15 +1408,22 @@ export const TASK_TYPE_BRANCH_PREFIX: Record<string, string> = {
   migrate: 'migrate',
 };
 
+/** Default task-branch namespace — preserves Blueprint self-repo behavior. */
+export const TASK_BRANCH_NAMESPACE_DEFAULT = 'blueprint';
+
 /** Return the canonical git branch name for a task.
  *
- * @param namespacePrefix - per-project namespace (e.g. 'blueprint/'); defaults to 'blueprint/'
- *   Read from project.build_config.task_branch_prefix when available.
- */
-export function deriveTaskBranch(taskType: string, taskId: string, namespacePrefix = 'blueprint/'): string {
+ *  ``namespace`` defaults to ``"blueprint"`` so existing call sites stay
+ *  byte-identical; the per-project namespace flows in from
+ *  ``buildConfig.task_branch_namespace`` (mirrors the backend resolver). */
+export function deriveTaskBranch(
+  taskType: string,
+  taskId: string,
+  namespace: string = TASK_BRANCH_NAMESPACE_DEFAULT,
+): string {
   const prefix = TASK_TYPE_BRANCH_PREFIX[taskType] ?? 'task';
   const shortId = taskId.replace(/-/g, '').slice(0, 8);
-  return `${namespacePrefix}${prefix}-${shortId}`;
+  return `${namespace}/${prefix}-${shortId}`;
 }
 
 export function sendLog(ws: WebSocket | null, content: string) {
@@ -1642,7 +1654,8 @@ export async function setupWorkspace(
   git(['config', 'user.email', buildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', buildConfig?.git_user_name || 'Blueprint Agent']);
   const shortId = taskId.replace(/-/g, '').slice(0, 8);
-  const workBranch = `blueprint/${branchPrefix}-${shortId}`;
+  const namespace = buildConfig?.task_branch_namespace || TASK_BRANCH_NAMESPACE_DEFAULT;
+  const workBranch = `${namespace}/${branchPrefix}-${shortId}`;
   // Clean up stale remote branch from previous attempt (requeue scenario).
   // CRITICAL: if the stale branch has an open PR, deleting it auto-closes the PR
   // and triggers head_ref_deleted on GitHub — silently destroying the previous

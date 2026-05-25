@@ -36,7 +36,10 @@ from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/
     _ROLLUP_TRANSIENT_CTX_KEYS,
     _clear_rollup_transient_state,
 )
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import (
+    runtime_config as _runtime_config,
+    derive_task_branch as _derive_task_branch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1135,7 +1138,6 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # (incident 2026-05-25, PRs #5779/#5812/#5815/#5819 all hit
                 # the review cap because the clone targeted blueprint/task-*
                 # while the agent had pushed blueprint/refactor-*).
-                from app.shared_state import derive_task_branch as _derive_task_branch
                 branch = (c.context or {}).get("branch") or _derive_task_branch(
                     c.id, c_payload.get("type")
                 )

@@ -147,20 +147,14 @@ def _lts_branch_names(project=None) -> tuple[str, str]:
     promotion_target   — the LTS/deploy branch promotions land on (default "main").
     LTS model is considered active when these two differ.
 
-    When ``project`` is provided, integration_branch is resolved per-project via
-    ``get_project_integration_branch``; otherwise falls back to runtime_config.
-    Both paths default to "main" so a NULL per-project column with no global
+    Both values resolve per-project when possible, then fall back to
+    runtime_config, then to "main" so a NULL per-project column with no global
     override resolves identically regardless of which branch is taken.
     """
-    if project is not None:
-        integration = _get_project_integration_branch(project)
-        promotion = _get_project_promotion_target(project)
-    else:
-        # DEPRECATED: global runtime_config fallback — remove after per-project column stable.
-        # Default "main" matches get_project_integration_branch and the runtime_config seed.
-        integration = str(_runtime_config.get("integration_branch", "main"))
-        promotion = str(_runtime_config.get("promotion_target", "main"))
-    return integration, promotion
+    return (
+        _get_project_integration_branch(project),
+        _get_project_promotion_target(project),
+    )
 
 
 def _load_policy() -> dict[str, Any]:

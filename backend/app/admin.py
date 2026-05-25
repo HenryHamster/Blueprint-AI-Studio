@@ -884,12 +884,8 @@ async def bulk_action_tasks(
                                     "base_branch", "main"
                                 )
                                 _project = await session.get(Project, task.project_id)
-                                _promotion_target = (
-                                    _get_project_promotion_target(_project)
-                                    if _project is not None
-                                    else str(
-                                        _runtime_config.get("promotion_target", "main")
-                                    )
+                                _promotion_target = _get_project_promotion_target(
+                                    _project
                                 )
                                 if (
                                     base_branch == _promotion_target
@@ -1007,7 +1003,9 @@ async def bulk_action_tasks(
                             task_payload = task.first_payload
                             _project = await session.get(Project, task.project_id)
                             branch = _derive_task_branch(
-                                task.id, task_payload.get("type"), project=_project
+                                task.id,
+                                task_payload.get("type"),
+                                _project.task_branch_namespace,
                             )
                             base_branch = task_payload.get("base_branch", "main")
 
@@ -1687,7 +1685,9 @@ async def request_changes(
     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
     task_payload = task.first_payload
     _project = await session.get(Project, task.project_id)
-    branch = _derive_task_branch(task.id, task_payload.get("type"), project=_project)
+    branch = _derive_task_branch(
+        task.id, task_payload.get("type"), _project.task_branch_namespace
+    )
     base_branch = task_payload.get("base_branch", "main")
 
     from app.review_pipeline import _spawn_pipeline_task
@@ -1777,7 +1777,9 @@ async def request_fresh_reviewer(
     branch = (
         review_loop.get("branch")
         or task_payload.get("branch")
-        or _derive_task_branch(task_id, task_payload.get("type"), project=_project)
+        or _derive_task_branch(
+            task_id, task_payload.get("type"), _project.task_branch_namespace
+        )
     )
     base_branch = task_payload.get("base_branch", "main")
     related_files = task_payload.get("related_files") or ctx.get("related_files") or []
@@ -2178,11 +2180,7 @@ async def modify_task(
                         await _cleanup_branches(task, session)
                         base_branch = (task.first_payload).get("base_branch", "main")
                         _project = await session.get(Project, task.project_id)
-                        _promotion_target = (
-                            _get_project_promotion_target(_project)
-                            if _project is not None
-                            else str(_runtime_config.get("promotion_target", "main"))
-                        )
+                        _promotion_target = _get_project_promotion_target(_project)
                         if base_branch == _promotion_target and _runtime_config.get(
                             "smoketest_enabled"
                         ):
@@ -2297,7 +2295,9 @@ async def modify_task(
                     task_payload = task.first_payload
                     _project = await session.get(Project, task.project_id)
                     branch = _derive_task_branch(
-                        task.id, task_payload.get("type"), project=_project
+                        task.id,
+                        task_payload.get("type"),
+                        _project.task_branch_namespace,
                     )
                     base_branch = task_payload.get("base_branch", "main")
 

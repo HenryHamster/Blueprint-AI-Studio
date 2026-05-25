@@ -1031,6 +1031,18 @@ class TestBackendModuleSizeGuardrails:
     def test_pipeline_regression_dispatcher(self):
         self._check_module("pipeline_regression_dispatcher.py")
 
+    def test_review_learning(self):
+        self._check_module("review_learning.py")
+
+    def test_playbook_lifecycle(self):
+        self._check_module("playbook_lifecycle.py")
+
+    def test_playbook_storage(self):
+        self._check_module("playbook_storage.py")
+
+    def test_playbook_auto(self):
+        self._check_module("playbook_auto.py")
+
 
 # ── Frontend File Size Guardrails ─────────────────────────────────────────────
 
@@ -1615,6 +1627,59 @@ class TestReviewerOriginParity:
             "Update _REVIEWER_ORIGINS in backend/app/sr_blind_spots.py to match "
             "the non-author origins emitted by standard.ts."
         )
+
+
+# ── Playbook-Learning Facade Compatibility ────────────────────────────────────
+# After the playbook-learning split, key symbols moved to sub-modules
+# (review_learning, playbook_lifecycle, playbook_storage, playbook_auto).
+# playbook_learning re-exports them so existing callers keep working.
+# These tests lock the re-export surface so future agents cannot drop
+# compatibility symbols without a CI failure.
+
+
+class TestPlaybookLearningFacadeCompat:
+    def test_review_categories_is_canonical_object(self):
+        """playbook_learning._REVIEW_CATEGORIES must be the same object as
+        review_learning._REVIEW_CATEGORIES — not a local copy.
+
+        Guards against the facade shadowing the canonical dict, which would
+        cause category-taxonomy drift between the SR categorizer and parity checks.
+        """
+        from app.playbook_learning import _REVIEW_CATEGORIES as via_facade
+        from app.review_learning import _REVIEW_CATEGORIES as canonical
+
+        assert via_facade is canonical, (
+            "playbook_learning._REVIEW_CATEGORIES is not the same object as "
+            "review_learning._REVIEW_CATEGORIES. The facade must re-export the "
+            "canonical dict (not shadow it) to keep taxonomy in sync."
+        )
+
+    def test_compat_lifecycle_and_storage_symbols_accessible(self):
+        """Key lifecycle and storage symbols extracted from the playbook-learning
+        monolith must remain importable through app.playbook_learning.
+
+        If this fails: a backward-compat re-export was dropped. Either restore
+        the import in playbook_learning.py or update every caller that used it.
+        """
+        from app.playbook_learning import (
+            _AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS,
+            _IDLE_RETIRE_DAYS,
+            _PLAYBOOK_CAPACITY_BYTES,
+            _STALE_AGE_DAYS,
+            check_and_flag_stale_refs,
+            finalize_pending_playbook_entries,
+            retire_idle_auto_entries,
+            retire_ineffective_patterns,
+        )
+
+        assert _AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS > 0
+        assert _IDLE_RETIRE_DAYS > 0
+        assert _STALE_AGE_DAYS > 0
+        assert _PLAYBOOK_CAPACITY_BYTES > 0
+        assert callable(check_and_flag_stale_refs)
+        assert callable(finalize_pending_playbook_entries)
+        assert callable(retire_idle_auto_entries)
+        assert callable(retire_ineffective_patterns)
 
 
 # ── edges_considered Schema Invariants ────────────────────────────────────────

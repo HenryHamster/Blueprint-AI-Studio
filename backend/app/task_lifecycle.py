@@ -2670,12 +2670,16 @@ async def _process_post_commit(
                         # post-cutover it is the promotion / hotfix-rollup
                         # target, and a merge to main must never bypass CI.
                         head_sha = pr_data.get("head", {}).get("sha", "")
+                        project = (
+                            await session.get(Project, task.project_id)
+                            if task.project_id
+                            else None
+                        )
                         _integration_branch = _runtime_config.get(
                             "integration_branch", "main"
                         )
-                        _task_project = await session.get(Project, task.project_id)
                         _promotion_target = _shared_state.get_project_promotion_target(
-                            _task_project
+                            project
                         )
                         is_ci_gated_merge = base_branch in (
                             _integration_branch,

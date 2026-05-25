@@ -911,6 +911,55 @@ class TestUpdateProjectOwnerOnlyFields:
             "secret"
         )
 
+    @pytest.mark.asyncio
+    async def test_detect_build_config_preserves_existing_operator_settings(
+        self, client: AsyncClient, db_session
+    ):
+        """Detect should keep operator-managed secrets and reviewer toggles."""
+        project = await _make_project(db_session, name="Detect Preserve Config")
+        project.github_owner = "acme"
+        project.github_repo = "preserve-repo"
+        project.build_config = {
+            "env_vars": {"TOKEN": "secret"},
+            "enable_fresh_reviewer": True,
+            "enable_parallel_review": True,
+            "enable_parallel_fix": False,
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"language": "typescript"},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/detect-build-config"
+            )
+
+        assert resp.status_code == 200
+        build_config = resp.json().get("build_config") or {}
+        assert build_config.get("language") == "typescript"
+        assert build_config.get("env_vars", {}).get("TOKEN") == "secret"
+        assert build_config.get("enable_fresh_reviewer") is True
+        assert build_config.get("enable_parallel_review") is True
+        assert build_config.get("enable_parallel_fix") is False
+
+        await db_session.refresh(project)
+        assert (project.build_config or {}).get("env_vars", {}).get("TOKEN") == (
+            "secret"
+        )
+        assert (project.build_config or {}).get("enable_fresh_reviewer") is True
+        assert (project.build_config or {}).get("enable_parallel_review") is True
+        assert (project.build_config or {}).get("enable_parallel_fix") is False
+
 
 class TestDeleteProject:
     @pytest.mark.asyncio

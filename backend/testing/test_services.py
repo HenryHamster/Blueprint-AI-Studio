@@ -1732,6 +1732,24 @@ async def test_stale_branch_prefixes_default_when_not_configured(svc_db):
 
 
 @pytest.mark.asyncio
+async def test_stale_branch_prefixes_follows_namespace_override(svc_db):
+    """Project with task_branch_namespace override picks up the new prefix."""
+    project = Project(
+        name="Autoproj Project",
+        user_id="user1",
+        build_config={"task_branch_namespace": "autoproj"},
+    )
+    svc_db.add(project)
+    await svc_db.commit()
+    await svc_db.refresh(project)
+    assert project.task_branch_namespace == "autoproj"
+    # Without an explicit stale_branch_prefixes override, the namespace flows
+    # into the default cleanup-prefix tuple so per-project work branches stay
+    # eligible for sweep.
+    assert project.stale_branch_prefixes == ("autoproj/", "research/", "plan/")
+
+
+@pytest.mark.asyncio
 async def test_stale_branch_prefixes_custom_from_build_config(svc_db):
     """Project with custom prefixes in build_config uses them."""
     project = Project(
@@ -1876,3 +1894,58 @@ def test_derive_task_branch_short_id_derivation():
     task_id = _uuid.UUID("aabbccdd-1122-3344-5566-778899aabbcc")
     branch = _derive_task_branch(task_id, "create")
     assert branch == "blueprint/task-aabbccdd"
+
+
+# ── derive_task_branch: per-project namespace override ───────────────────────
+
+
+def test_derive_task_branch_custom_namespace():
+    """Passing namespace= overrides the leading 'blueprint/' segment."""
+    task_id = _uuid.UUID("12345678-abcd-ef01-2345-678abcdef012")
+    short = "12345678"
+    assert _derive_task_branch(task_id, "fix", "autoproj") == f"autoproj/fix-{short}"
+    assert _derive_task_branch(task_id, "refactor", "bot") == f"bot/refactor-{short}"
+    # Default kw matches pre-namespace call sites byte-for-byte.
+    assert _derive_task_branch(task_id, "fix") == f"blueprint/fix-{short}"
+
+
+def test_get_project_task_branch_namespace_fallback_chain():
+    """Resolver returns project override → runtime_config → 'blueprint'."""
+    from app.shared_state import (
+        get_project_task_branch_namespace,
+        runtime_config,
+    )
+
+    class _StubProject:
+        def __init__(self, build_config):
+            self.build_config = build_config
+
+    # Per-project build_config wins
+    assert (
+        get_project_task_branch_namespace(
+            _StubProject({"task_branch_namespace": "autoproj"})
+        )
+        == "autoproj"
+    )
+    # Empty build_config falls through to runtime_config default
+    assert get_project_task_branch_namespace(_StubProject({})) == runtime_config.get(
+        "task_branch_namespace", "blueprint"
+    )
+    # No project at all returns runtime_config default
+    assert get_project_task_branch_namespace(None) == runtime_config.get(
+        "task_branch_namespace", "blueprint"
+    )
+
+
+def test_build_branch_short_id_re_custom_namespace():
+    """Per-project regex recognizes branches under a custom namespace."""
+    from app.services import _build_branch_short_id_re
+
+    pattern = _build_branch_short_id_re("autoproj")
+    assert pattern.match("autoproj/refactor-abcdef12").group(1) == "abcdef12"
+    assert pattern.match("autoproj/fix-12345678").group(1) == "12345678"
+    # research/ and plan/ stay project-independent
+    assert pattern.match("research/abcdef12").group(1) == "abcdef12"
+    assert pattern.match("plan/abcdef12").group(1) == "abcdef12"
+    # The default Blueprint namespace is NOT matched by an autoproj regex.
+    assert pattern.match("blueprint/refactor-abcdef12") is None

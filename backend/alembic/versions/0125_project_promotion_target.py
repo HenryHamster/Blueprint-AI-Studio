@@ -1,7 +1,7 @@
-"""Add Project.promotion_target column for per-project LTS/promotion branch config.
+"""Add Project.promotion_target column for per-project promotion branch config.
 
-NULL means "use runtime_config['promotion_target'] fallback then 'main'".
-No backfill needed — existing rows fall back to the global default.
+NULL means fall back to runtime_config["promotion_target"] then "main" —
+identical semantics to integration_branch. No backfill needed.
 
 Revision ID: 0125
 Revises: 0124

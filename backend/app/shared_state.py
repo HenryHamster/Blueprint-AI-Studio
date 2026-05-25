@@ -59,34 +59,28 @@ TASK_TYPE_BRANCH_PREFIX: Dict[str, str] = {
     "migrate": "migrate",
 }
 
-
-def get_project_task_branch_prefix(project) -> str:
-    """Return the task-branch namespace prefix for a project (e.g. 'blueprint/').
-
-    Fallback chain:
-      1. project.build_config['task_branch_prefix'] (per-project override)
-      2. 'blueprint/' (Blueprint's conventional default)
-    """
-    per_project = (getattr(project, "build_config", None) or {}).get(
-        "task_branch_prefix"
-    )
-    if per_project:
-        return per_project
-    return "blueprint/"
+# Default namespace (the "blueprint" segment of ``blueprint/{prefix}-{8hex}``).
+# Per-project overrides come from project.task_branch_namespace (see
+# get_project_task_branch_namespace below); a non-Blueprint install can ship
+# its own namespace by setting build_config.task_branch_namespace.
+TASK_BRANCH_NAMESPACE_DEFAULT = "blueprint"
 
 
-def derive_task_branch(task_id: Any, task_type: str | None, *, project=None) -> str:
-    """Derive an agent work branch name (``{namespace}{prefix}-{8hex}``)
+def derive_task_branch(
+    task_id: Any,
+    task_type: str | None,
+    namespace: str = TASK_BRANCH_NAMESPACE_DEFAULT,
+) -> str:
+    """Derive an agent work branch name (``{namespace}/{prefix}-{8hex}``)
     from the task type and id, matching the agent's branch derivation.
 
-    When *project* is provided, the namespace prefix is read from
-    get_project_task_branch_prefix(); otherwise 'blueprint/' is used.
+    ``namespace`` defaults to ``"blueprint"`` so call sites that pre-date the
+    per-project namespace work unchanged for the self-repo. Callers that have
+    a project in hand should resolve the namespace via
+    :func:`get_project_task_branch_namespace` and pass it through.
     """
-    type_prefix = TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
-    namespace = (
-        get_project_task_branch_prefix(project) if project is not None else "blueprint/"
-    )
-    return f"{namespace}{type_prefix}-{str(task_id).replace('-', '')[:8]}"
+    prefix = TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
+    return f"{namespace}/{prefix}-{str(task_id).replace('-', '')[:8]}"
 
 
 # Rate limiter — shared between main.py and admin.py
@@ -484,6 +478,11 @@ runtime_config: Dict = {
     # preserves existing behavior until Phase 1 activates.
     # Operator-tunable via runtime_config_json; persisted across restarts.
     "integration_branch": "main",
+    # Task-branch namespace (the leading segment of ``{namespace}/{prefix}-{8hex}``
+    # agent work branches). DEPRECATED transitional global fallback — per-project
+    # ``build_config.task_branch_namespace`` is the real source of truth. Default
+    # ``"blueprint"`` preserves byte-identical behavior for the self-repo.
+    "task_branch_namespace": "blueprint",
     # Promotion/deploy target branch — the LTS branch that integration_branch
     # promotes INTO and that hotfixes land on. Defaults to "main" so self-repo
     # behavior is byte-for-byte identical. The LTS model is considered active
@@ -542,15 +541,36 @@ def get_project_integration_branch(project) -> str:
     return runtime_config.get("integration_branch", "main")
 
 
+def get_project_task_branch_namespace(project) -> str:
+    """Return the task-branch namespace for a project.
+
+    Fallback chain:
+      1. project.build_config['task_branch_namespace'] (per-project override)
+      2. runtime_config['task_branch_namespace'] (DEPRECATED global fallback)
+      3. ``TASK_BRANCH_NAMESPACE_DEFAULT`` (``"blueprint"``)
+
+    A non-Blueprint install (e.g. a project named ``autoproj``) configures its
+    namespace through ``build_config`` so its agent work branches land under
+    ``autoproj/{prefix}-{8hex}`` instead of the Blueprint default.
+    """
+    if project is not None:
+        build_config = getattr(project, "build_config", None) or {}
+        per_project = build_config.get("task_branch_namespace")
+        if per_project:
+            return str(per_project)
+    return runtime_config.get("task_branch_namespace", TASK_BRANCH_NAMESPACE_DEFAULT)
+
+
 def get_project_promotion_target(project) -> str:
-    """Return the promotion/LTS target branch for a project.
+    """Return the promotion target branch for a project.
 
     Fallback chain:
       1. project.promotion_target (per-project column, added by migration 0125+)
       2. runtime_config["promotion_target"] (DEPRECATED global — transitional fallback for one release)
       3. "main"
 
-    Using getattr so this helper is safe to call before the model migration lands.
+    Using getattr so this helper is safe to call before the model migration lands
+    (cluster 1/6 adds the column; until then the attribute will not exist).
     """
     per_project = getattr(project, "promotion_target", None)
     if per_project:
