@@ -10,11 +10,12 @@ Threshold and window are configurable via runtime_config:
   auto_playbook_window_days (default 7)
 
 This module owns failure-signature extraction and the
-``_maybe_auto_playbook`` writer.  Entry archival/suppression helpers
-(``maybe_archive_for_capacity``, ``_get_prior_archive_entry``,
-``_is_auto_playbook_suppressed``) live in ``app.playbook_learning`` and
-are lazy-imported below to keep this module a leaf of the import graph.
-``app.playbook_learning`` re-exports the public names from here for
+``_maybe_auto_playbook`` writer.  Entry archival/suppression helpers live in
+``app.playbook_capacity`` (``maybe_archive_for_capacity``) and
+``app.playbook_lifecycle`` (``_get_prior_archive_entry``,
+``_is_auto_playbook_suppressed``); both are pure leaves of the import graph,
+so they are imported eagerly here.
+``app.playbook_learning`` re-exports the public names from this module for
 backward compatibility with callers and tests that patch via
 ``app.playbook_learning._maybe_auto_playbook``.
 """
@@ -33,6 +34,11 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import Task, TaskStatus, _utcnow
+from app.playbook_capacity import maybe_archive_for_capacity
+from app.playbook_lifecycle import (
+    _get_prior_archive_entry,
+    _is_auto_playbook_suppressed,
+)
 from app.shared_state import DEFAULT_TASK_SCOPE
 from app.task_locking import with_design_doc_locked
 
@@ -180,15 +186,6 @@ async def _maybe_auto_playbook(
     ) if a new entry was created, ``None`` otherwise.
     """
     import app.shared_state as _ss  # noqa: PLC0415
-
-    # Lazy import to avoid a circular import: ``app.playbook_learning`` imports
-    # the public names from this module at module load to keep its facade,
-    # while these archive/suppression helpers are only needed at call time.
-    from app.playbook_learning import (  # noqa: PLC0415
-        _get_prior_archive_entry,
-        _is_auto_playbook_suppressed,
-        maybe_archive_for_capacity,
-    )
 
     threshold: int = _ss.runtime_config.get("auto_playbook_threshold", 3)
     window_days: int = _ss.runtime_config.get("auto_playbook_window_days", 7)

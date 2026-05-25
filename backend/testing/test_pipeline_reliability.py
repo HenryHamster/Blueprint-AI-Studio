@@ -1531,6 +1531,9 @@ async def test_ci_polling_behind_update_branch_exhausted_spawns_fix_with_alert(
     assert "BEHIND" in fix_prompt, fix_prompt
     assert "UNMERGEABLE" not in fix_prompt
     assert "merge conflicts against" not in fix_prompt
+    assert "gh-token" not in fix_prompt
+    assert "/api/agent/github/check-runs" in fix_prompt
+    assert "$AGENT_API_TOKEN" in fix_prompt
 
 
 @pytest.mark.asyncio
@@ -1802,7 +1805,7 @@ async def test_ci_polling_non_rollup_task_completes_on_conflict_fix(
     session.add(fake_fix)
     await session.commit()
     await session.refresh(fake_fix)
-    mocker.patch(
+    spawn_mock = mocker.patch(
         "app.review_pipeline._spawn_pipeline_task",
         new=AsyncMock(return_value=(fake_fix, True)),
     )
@@ -1824,6 +1827,11 @@ async def test_ci_polling_non_rollup_task_completes_on_conflict_fix(
         f"conflict resolution to a fix task — the review iteration itself is done. "
         f"Got {updated.status}."
     )
+    fix_prompt = spawn_mock.await_args.kwargs.get("fix_prompt", "")
+    assert "UNMERGEABLE" in fix_prompt, fix_prompt
+    assert "gh-token" not in fix_prompt
+    assert "/api/agent/github/check-runs" in fix_prompt
+    assert "$AGENT_API_TOKEN" in fix_prompt
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -72,10 +72,11 @@ def build_ci_failure_fix_prompt(
     check_runs_hint = ""
     if owner and repo:
         check_runs_hint = (
-            f"  2. Inspect the failing checks via the GitHub API "
-            f'(`GITHUB_TOKEN=$(./gh-token) && curl -H "Authorization: Bearer $GITHUB_TOKEN" '
-            f"https://api.github.com/repos/{owner}/{repo}/commits/$(git rev-parse HEAD)/check-runs`) "
-            f"to confirm which checks are still failing on the latest head.\n"
+            "  2. Inspect the failing checks via the orchestrator's read-only proxy "
+            '(`curl -sS -H "X-Agent-Token: $AGENT_API_TOKEN" '
+            '"$ORCHESTRATOR_URL/api/agent/github/check-runs?commit_sha=$(git rev-parse HEAD)" '
+            "| jq '.data.details[]'`) "
+            "to confirm which checks are still failing on the latest head.\n"
         )
     return (
         f"PR #{pr_number} is blocked by failing CI checks (code review already approved).\n\n"

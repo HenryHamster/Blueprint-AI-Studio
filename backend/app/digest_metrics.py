@@ -24,7 +24,7 @@ from app.sr_blind_spots import (
     _REVIEWER_ORIGINS,
     is_skipped_sr_outcome as _is_skipped_sr_outcome_shared,
 )
-from app.playbook_learning import _categorize_review_issues
+from app.review_learning import _categorize_review_issues
 
 logger = logging.getLogger(__name__)
 

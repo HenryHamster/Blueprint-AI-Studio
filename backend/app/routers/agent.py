@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -62,6 +63,7 @@ from app.github import (
     create_pull_request,
     get_pull_request,
     create_check_run,
+    get_check_runs,
 )
 from app.broadcast import broadcast_to_project
 from app.sr_blind_spots import (
@@ -73,6 +75,8 @@ from app.pipeline_health import compute_pipeline_health_summary
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
+
+_COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{7,40}$")
 
 
 async def _create_review_check_run_bg(
@@ -1511,7 +1515,7 @@ async def claim_task(
         current_task_scope = (task.context or {}).get("scope")
         if task_type in ("create", "fix", "refactor"):
             try:
-                from app.playbook_learning import _categorize_review_issues
+                from app.review_learning import _categorize_review_issues
 
                 cutoff_14d = _utcnow() - timedelta(days=14)
                 combined_review_history = []
@@ -1537,7 +1541,7 @@ async def claim_task(
                             for cat, issues in top3
                         }
 
-                from app.playbook_learning import (
+                from app.review_learning import (
                     compute_recurring_first_review_descriptions,
                 )
 
@@ -1601,7 +1605,7 @@ async def claim_task(
         review_effectiveness = None
         if task_type in ("create", "fix", "refactor"):
             try:
-                from app.playbook_learning import compute_review_effectiveness
+                from app.review_learning import compute_review_effectiveness
 
                 review_effectiveness = await compute_review_effectiveness(
                     project_id=task.project_id,
@@ -2522,7 +2526,7 @@ async def claim_task(
                 }
                 research_top_review_issues = None
                 try:
-                    from app.playbook_learning import (
+                    from app.review_learning import (
                         compute_recurring_first_review_descriptions,
                     )
 
@@ -2545,7 +2549,7 @@ async def claim_task(
                     )
                 research_review_effectiveness = None
                 try:
-                    from app.playbook_learning import compute_review_effectiveness
+                    from app.review_learning import compute_review_effectiveness
 
                     research_review_effectiveness = await compute_review_effectiveness(
                         project_id=task.project_id,
@@ -4097,6 +4101,40 @@ async def agent_github_get_token(
     }
 
 
+@router.get("/github/check-runs")
+@limiter.limit("200/minute")
+async def agent_github_get_check_runs(
+    request: Request,
+    commit_sha: str,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """
+    Agent proxy endpoint to retrieve check-run results for a commit SHA.
+    Returns only read-only check-run data; the raw GitHub token is never
+    forwarded to the caller.
+    """
+    task_id_str = token.get("sub")
+    if not task_id_str:
+        raise HTTPException(status_code=403, detail="Invalid token: missing sub")
+    task_id = uuid.UUID(task_id_str)
+    if not _COMMIT_SHA_PATTERN.fullmatch(commit_sha):
+        raise HTTPException(status_code=422, detail="Invalid commit_sha")
+
+    gh_token, owner, repo = await get_github_token_for_task(task_id, session)
+    result = await get_check_runs(
+        token=gh_token, owner=owner, repo=repo, ref=commit_sha
+    )
+    return {
+        "status": "success",
+        "data": {
+            "status": result.get("status"),
+            "conclusion": result.get("conclusion"),
+            "details": result.get("details", []),
+        },
+    }
+
+
 @router.post("/github/commit-status")
 @limiter.limit("500/minute")
 async def agent_github_commit_status(
@@ -4439,25 +4477,18 @@ async def agent_fetch_playbook_entry(
     content. Used when ``playbook_summary`` was dropped from the strategic
     payload but the agent needs to consult a specific entry."""
     project = await _resolve_agent_project(project_id, token, session)
+    my_task_id = token.get("sub") or ""
     design_doc = project.design_doc or {}
     full_key = f"playbook/{key}" if not key.startswith("playbook/") else key
     entry = design_doc.get(full_key)
     if entry is None:
-        # Also try the operator-only archive — agent can still read closed
-        # entries when investigating historical patterns.
-        archive = design_doc.get("playbook_archive") or []
-        if isinstance(archive, list):
-            archived = next(
-                (
-                    e
-                    for e in archive
-                    if isinstance(e, dict) and e.get("key") == full_key
-                ),
-                None,
-            )
-            if archived is not None:
-                return {"status": "success", "data": archived, "from_archive": True}
         raise HTTPException(status_code=404, detail="Playbook entry not found")
+    # Enforce pending_source visibility: hide entries written by other in-flight
+    # tasks (same rule as claim-time loader and /api/agent/playbook get/list).
+    if isinstance(entry, dict):
+        pending_source = entry.get("pending_source")
+        if pending_source and pending_source != my_task_id:
+            raise HTTPException(status_code=404, detail="Playbook entry not found")
     return {"status": "success", "data": {"key": full_key, "entry": entry}}
 
 

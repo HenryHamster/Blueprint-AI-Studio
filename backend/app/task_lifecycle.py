@@ -3000,7 +3000,7 @@ async def _process_post_commit(
                                         # Extract review feedback as persistent playbook entries
                                         # on every merge (captures first-attempt data at any iteration)
                                         try:
-                                            from app.playbook_learning import (
+                                            from app.review_learning import (
                                                 extract_review_feedback_to_playbook,
                                             )
 
@@ -3795,7 +3795,7 @@ async def _process_post_commit(
                     # (accumulated superset used by all-iterations catch-rate metric).
                     if issues and original_task_id:
                         try:
-                            from app.playbook_learning import (
+                            from app.review_learning import (
                                 cache_first_attempt_classification,
                                 _keyword_from_flat,
                             )

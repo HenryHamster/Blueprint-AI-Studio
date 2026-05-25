@@ -80,8 +80,11 @@ def _archive_least_useful_entry(doc: dict) -> dict:
                 pass
         # Use inverse success rate when enough observations exist so low-performing
         # entries surface before unobserved ones; fall back to raw confirmed_count.
+        # Rate-based entries map to [0, 1] (1 = worst, archived first); raw-count
+        # entries map to [-∞, 0] (0 = untried). Reverse-sorted, this guarantees a
+        # proven low-rate entry archives BEFORE an untried zero-count entry.
         if followed >= _MIN_FOLLOWED_FOR_RATE:
-            effectiveness = -(confirmed / followed)
+            effectiveness = 1.0 - (confirmed / followed)
         else:
             effectiveness = -confirmed
         # Sort: stale first, then least-effective, then oldest, then key

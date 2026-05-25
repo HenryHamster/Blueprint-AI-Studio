@@ -2365,7 +2365,7 @@ from app.playbook_capacity import (
 
 class PlaybookUpdate(BaseModel):
     task_id: uuid.UUID
-    op: str  # "get", "set", "delete", "list"
+    op: str  # "get", "set", "list"
     key: str | None = None  # alphanumeric + hyphens, max 50 chars
     value: str | None = None  # plain text, max 2KB
     applicable_types: List[str] | None = (
@@ -2394,7 +2394,11 @@ async def update_playbook(
         raise HTTPException(status_code=404, detail="Task not found")
 
     op = payload.op
-    if op not in ("get", "set", "delete", "list"):
+    if op == "delete":
+        raise HTTPException(
+            status_code=403, detail="Playbook delete is not allowed for agents"
+        )
+    if op not in ("get", "set", "list"):
         raise HTTPException(status_code=400, detail=f"Unknown op: {op}")
 
     if op == "list":
@@ -2433,9 +2437,9 @@ async def update_playbook(
                 }
         return {"status": "ok", "op": op, "entries": entries}
 
-    # set / delete require a valid key
+    # set requires a valid key
     if not payload.key:
-        raise HTTPException(status_code=400, detail="key is required for set/delete")
+        raise HTTPException(status_code=400, detail="key is required for set")
     key = payload.key.strip()
     if key.startswith("_") or not _PLAYBOOK_KEY_RE.match(key):
         raise HTTPException(
@@ -2504,9 +2508,6 @@ async def update_playbook(
                 status_code=400,
                 detail=f"Playbook too large ({playbook_total} bytes, max {_PLAYBOOK_CAPACITY_BYTES} bytes) and no evictable entries",
             )
-    elif op == "delete":
-        doc.pop(f"playbook/{key}", None)
-
     meta["revision"] = meta.get("revision", 0) + 1
     meta["last_updated"] = _utcnow().isoformat()
     meta["updated_by_task"] = str(task.id)

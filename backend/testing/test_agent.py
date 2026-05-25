@@ -1597,18 +1597,55 @@ async def test_playbook_set_and_get(client: AsyncClient, db_session):
     data4 = resp4.json()
     assert set(data4["keys"]) == {"build-commands", "lint-rules"}
 
-    # Delete one entry
-    resp5 = await client.post(
+    await db_session.refresh(project)
+    assert "playbook/lint-rules" in project.design_doc
+    assert "playbook/build-commands" in project.design_doc
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_playbook_delete_is_rejected_for_agents(client: AsyncClient, db_session):
+    """Agents cannot delete shared playbook entries via POST /api/agent/playbook."""
+    project = Project(name="Playbook Delete Rejection Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Do something"}],
+        vm_instance_id="agent-vm-playbook-delete",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-playbook-delete")
+    headers = {"x-agent-token": token}
+
+    resp = await client.post(
+        "/api/agent/playbook",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "lint-rules",
+            "value": "eslint --max-warnings 0",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    delete_resp = await client.post(
         "/api/agent/playbook",
         json={"task_id": str(task.id), "op": "delete", "key": "lint-rules"},
         headers=headers,
     )
-    assert resp5.status_code == 200
-    assert resp5.json()["status"] == "ok"
+    assert delete_resp.status_code == 403
+    assert "not allowed" in delete_resp.json()["error"]["message"]
 
     await db_session.refresh(project)
-    assert "playbook/lint-rules" not in project.design_doc
-    assert "playbook/build-commands" in project.design_doc
+    assert "playbook/lint-rules" in project.design_doc
 
 
 @pytest.mark.smoketest
@@ -6280,6 +6317,126 @@ async def test_agent_create_pr_returns_cached_when_open(
 
 
 @pytest.mark.asyncio
+async def test_agent_github_check_runs_rejects_invalid_token(client: AsyncClient):
+    resp = await client.get(
+        "/api/agent/github/check-runs",
+        params={"commit_sha": "deadbee"},
+        headers={"x-agent-token": "wrong-token"},
+    )
+
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_agent_github_check_runs_validates_commit_sha(
+    client: AsyncClient, db_session, mocker
+):
+    project = Project(name="Check Runs Validation", user_id="test-user-check-runs-1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "inspect CI"}],
+        vm_instance_id="agent-vm-check-runs-1",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    get_token_mock = mocker.patch(
+        "app.routers.agent.get_github_token_for_task", new=AsyncMock()
+    )
+    get_check_runs_mock = mocker.patch(
+        "app.routers.agent.get_check_runs", new=AsyncMock()
+    )
+
+    token = create_agent_token(str(task.id), "agent-vm-check-runs-1")
+    resp = await client.get(
+        "/api/agent/github/check-runs",
+        params={"commit_sha": "main/../../pulls/1"},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 422
+    get_token_mock.assert_not_called()
+    get_check_runs_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_agent_github_check_runs_response_omits_raw_token(
+    client: AsyncClient, db_session, mocker
+):
+    project = Project(name="Check Runs Response", user_id="test-user-check-runs-2")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "inspect CI"}],
+        vm_instance_id="agent-vm-check-runs-2",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("secret-gh-token", "acme", "widget")),
+    )
+    get_check_runs_mock = mocker.patch(
+        "app.routers.agent.get_check_runs",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [
+                    {
+                        "name": "backend",
+                        "status": "completed",
+                        "conclusion": "failure",
+                    }
+                ],
+                "token": "should-not-leak",
+            }
+        ),
+    )
+
+    token = create_agent_token(str(task.id), "agent-vm-check-runs-2")
+    resp = await client.get(
+        "/api/agent/github/check-runs",
+        params={"commit_sha": "deadbeef"},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "success"
+    assert body["data"] == {
+        "status": "completed",
+        "conclusion": "failure",
+        "details": [
+            {
+                "name": "backend",
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        ],
+    }
+    assert "token" not in body["data"]
+    get_check_runs_mock.assert_awaited_once_with(
+        token="secret-gh-token",
+        owner="acme",
+        repo="widget",
+        ref="deadbeef",
+    )
+
+
+@pytest.mark.asyncio
 async def test_rate_limit_requeue_clears_terminated_cache(
     client: AsyncClient, db_session, mocker
 ):
@@ -8118,6 +8275,111 @@ async def test_agent_fetch_playbook_entry_with_and_without_prefix(
         headers=headers,
     )
     assert r2.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_playbook_entry_pending_source_visibility(
+    client: AsyncClient, db_session
+):
+    """pending_source visibility rules on the fetch-by-key endpoint:
+    - owner task can fetch its own pending entry
+    - peer task gets 404 for that same pending key
+    - archived entries (playbook_archive) are never returned
+    - entries without pending_source are returned to any task in the project
+    """
+    project = Project(
+        name="Playbook Pending Source Test",
+        user_id="test-user-pps",
+        design_doc={},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create the owner task first so we have its real id
+    owner_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="agent-vm-owner",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(owner_task)
+    await db_session.commit()
+    await db_session.refresh(owner_task)
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project.design_doc = {
+        "playbook/pending-entry": {
+            "content": "pending guidance",
+            "pending_source": str(owner_task.id),
+            "confirmed_count": 0,
+        },
+        "playbook/committed-entry": {
+            "content": "committed guidance",
+            "confirmed_count": 1,
+        },
+        "playbook_archive": [
+            {
+                "key": "playbook/old-archived",
+                "content": "archived guidance",
+            }
+        ],
+    }
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Peer task (different id, same project)
+    peer_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="agent-vm-peer",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(peer_task)
+    await db_session.commit()
+    await db_session.refresh(peer_task)
+
+    owner_token = create_agent_token(str(owner_task.id), "agent-vm-owner")
+    peer_token = create_agent_token(str(peer_task.id), "agent-vm-peer")
+    owner_headers = {"x-agent-token": owner_token}
+    peer_headers = {"x-agent-token": peer_token}
+
+    # Owner can fetch its own pending entry
+    r_owner = await client.get(
+        f"/api/agent/projects/{project.id}/playbook/pending-entry",
+        headers=owner_headers,
+    )
+    assert r_owner.status_code == 200, r_owner.text
+    assert r_owner.json()["data"]["entry"]["content"] == "pending guidance"
+
+    # Peer gets 404 for the pending entry
+    r_peer = await client.get(
+        f"/api/agent/projects/{project.id}/playbook/pending-entry",
+        headers=peer_headers,
+    )
+    assert r_peer.status_code == 404, r_peer.text
+
+    # Both tasks can fetch committed (non-pending) entry
+    r_committed_owner = await client.get(
+        f"/api/agent/projects/{project.id}/playbook/committed-entry",
+        headers=owner_headers,
+    )
+    assert r_committed_owner.status_code == 200
+    r_committed_peer = await client.get(
+        f"/api/agent/projects/{project.id}/playbook/committed-entry",
+        headers=peer_headers,
+    )
+    assert r_committed_peer.status_code == 200
+
+    # Archived entries are not exposed via this endpoint
+    r_archived = await client.get(
+        f"/api/agent/projects/{project.id}/playbook/old-archived",
+        headers=owner_headers,
+    )
+    assert r_archived.status_code == 404, r_archived.text
 
 
 @pytest.mark.asyncio

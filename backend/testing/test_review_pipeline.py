@@ -58,14 +58,15 @@ from testing.factories import make_project, make_task
 
 
 class TestGhTokenPromptPattern:
-    """Verify that fix prompts use $(./gh-token) instead of a bare $GITHUB_TOKEN.
+    """Verify that fix prompts use the orchestrator check-runs proxy instead of
+    exposing a raw GitHub token to the agent model.
 
-    $GITHUB_TOKEN is not exported in Claude's env on agent VMs, so any prompt
-    that references it directly produces a 401 on every curl call and forces
-    the reviewer to reject CI-green rebuttals as unverified.
+    The agent must never receive the raw PAT-backed GitHub token. Check-run
+    inspection must go through the /api/agent/github/check-runs proxy endpoint
+    using the agent's own $AGENT_API_TOKEN credential.
     """
 
-    def test_build_ci_failure_fix_prompt_uses_gh_token_helper(self):
+    def test_build_ci_failure_fix_prompt_uses_proxy_endpoint(self):
         prompt = build_ci_failure_fix_prompt(
             pr_number=42,
             base_branch="main",
@@ -73,15 +74,16 @@ class TestGhTokenPromptPattern:
             owner="myorg",
             repo="myrepo",
         )
-        assert "$(./gh-token)" in prompt, (
-            "build_ci_failure_fix_prompt must use $(./gh-token) not a bare $GITHUB_TOKEN "
-            "— $GITHUB_TOKEN is not exported in Claude's env on agent VMs"
+        assert "gh-token" not in prompt, (
+            "build_ci_failure_fix_prompt must not reference ./gh-token — "
+            "raw GitHub token helpers must not be exposed to the agent model"
         )
-        # The pattern must assign the token via the helper before using it in curl,
-        # not reference a pre-existing $GITHUB_TOKEN env var.
-        assert "GITHUB_TOKEN=$(./gh-token)" in prompt, (
-            "Expected the pattern 'GITHUB_TOKEN=$(./gh-token)' so the token is "
-            "fetched via the helper and then used in curl"
+        assert "/api/agent/github/check-runs" in prompt, (
+            "build_ci_failure_fix_prompt must use the orchestrator check-runs proxy "
+            "endpoint so the model never sees the raw GitHub token"
+        )
+        assert "$AGENT_API_TOKEN" in prompt, (
+            "check-runs proxy call must authenticate via $AGENT_API_TOKEN"
         )
 
     def test_build_ci_failure_fix_prompt_no_check_runs_hint_when_no_owner(self):
@@ -92,7 +94,8 @@ class TestGhTokenPromptPattern:
             owner=None,
             repo=None,
         )
-        assert "$GITHUB_TOKEN" not in prompt
+        assert "check-runs" not in prompt
+        assert "gh-token" not in prompt
 
 
 # ── _max_review_iterations ────────────────────────────────────────────────────
@@ -7107,7 +7110,9 @@ def test_ci_failure_fix_prompt_check_runs_hint_optional():
         owner="acme",
         repo="widgets",
     )
-    assert "acme/widgets" in with_owner
+    # owner/repo gate the orchestrator check-runs hint (the proxy URL itself no
+    # longer interpolates them — see PR #5840). Verify the hint is present.
+    assert "/api/agent/github/check-runs" in with_owner
     without_owner = build_ci_failure_fix_prompt(
         pr_number=1, base_branch="main", ci_errors="boom"
     )

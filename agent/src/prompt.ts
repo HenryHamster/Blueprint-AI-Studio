@@ -396,7 +396,7 @@ export function formatFixIterationHistory(attempts: FixAttempt[]): string {
 // Agent helper scripts (playbook, messages, note, strategic, design-doc) are
 // written to WORKSPACE for Claude Code to use. Exclude them from git so they
 // don't get committed into PRs via `git add -A`.
-export const AGENT_HELPER_NAMES = ['playbook', 'messages', 'note', 'strategic', 'design-doc', 'check', 'pr', 'done', 'fail', 'fetch', 'blocked', 'gh-token'];
+export const AGENT_HELPER_NAMES = ['playbook', 'messages', 'note', 'strategic', 'design-doc', 'check', 'pr', 'done', 'fail', 'fetch', 'blocked'];
 
 export function excludeAgentHelpers(): void {
   const excludePath = `${WORKSPACE}/.git/info/exclude`;
@@ -415,7 +415,7 @@ export function excludeAgentHelpers(): void {
 
 export function writePlaybookHelper(taskId: string): void {
   const helperScript = `#!/bin/bash
-OP="\${1:?Usage: playbook get|set|list|delete <key> [content]}"
+OP="\${1:?Usage: playbook get|set|list [key] [content]}"
 KEY="$2"
 VALUE="$3"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
@@ -432,15 +432,13 @@ elif [ "$OP" = "set" ]; then
     '{task_id: $tid, op: "set", key: $k, value: $v}' | \\
     curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
       -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
-elif [ "$OP" = "delete" ]; then
-  jq -n --arg tid "$TASK" --arg k "$KEY" \\
-    '{task_id: $tid, op: "delete", key: $k}' | \\
-    curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
 elif [ "$OP" = "list" ]; then
   printf '{"task_id":"%s","op":"list"}' "$TASK" | \\
     curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
       -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+else
+  echo "Error: unsupported playbook operation: $OP" >&2
+  exit 1
 fi
 echo ""
 `;
@@ -522,14 +520,13 @@ interface CodeChangeHelperConfig {
   buildConfig?: BuildConfig;
 }
 
-/** Write ./check, ./pr, ./done, ./fail, ./blocked, ./gh-token to WORKSPACE. Idempotent. */
+/** Write ./check, ./pr, ./done, ./fail, ./blocked to WORKSPACE. Idempotent. */
 export function writeCodeChangeHelpers(cfg: CodeChangeHelperConfig): void {
   writeCheckHelper(cfg);
   writePrHelper(cfg);
   writeDoneHelper(cfg);
   writeFailHelper(cfg);
   writeBlockedHelper(cfg);
-  writeGhTokenHelper(cfg);
   excludeAgentHelpers();
 }
 
@@ -1840,44 +1837,6 @@ echo "[blocked] Strategic agent will be notified — it may spawn a precondition
   fs.writeFileSync(`${WORKSPACE}/blocked`, script, { mode: 0o755 });
 }
 
-function writeGhTokenHelper(cfg: CodeChangeHelperConfig): void {
-  validateCfgShellSafety(cfg);
-  // Fetches a fresh per-task GitHub token from the orchestrator and prints it
-  // to stdout. Designed for use in prompts:
-  //   GITHUB_TOKEN=$(./gh-token)
-  //   curl -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/...
-  // The token is ONLY printed to stdout. Failure messages go to stderr without
-  // the token value so tool output sanitization is not the sole safety net.
-  const script = `#!/bin/bash
-# ./gh-token — fetch a fresh GitHub token scoped to this task and print to stdout.
-# Usage:  GITHUB_TOKEN=$(./gh-token)
-# Exits non-zero with a diagnostic on stderr if the fetch fails.
-# The token is never printed to stderr.
-
-set -uo pipefail
-
-API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
-TASK="${cfg.taskId}"
-
-TOKEN_RESP=$(curl -f -sS --max-time 30 \\
-  -H "X-Agent-Token: $TOKEN" \\
-  "$API/api/agent/github/token?task_id=$TASK" 2>/dev/null) || {
-  echo "[gh-token] Failed to fetch GitHub token from orchestrator (HTTP error)" >&2
-  exit 1
-}
-
-GH_TOKEN=$(printf '%s' "$TOKEN_RESP" | jq -r '.data.token // empty')
-if [ -z "$GH_TOKEN" ]; then
-  echo "[gh-token] orchestrator returned no token" >&2
-  exit 1
-fi
-
-printf '%s\\n' "$GH_TOKEN"
-`;
-  fs.writeFileSync(`${WORKSPACE}/gh-token`, script, { mode: 0o755 });
-}
-
 export interface PlaybookEntry {
   content: string;
   effectiveness_score: number;
@@ -1916,7 +1875,7 @@ export function formatPlaybook(
       return `### ${key}\n${caveat}${content}`;
     })
     .join('\n\n');
-  return `## Operational Playbook (active collective memory)\n\nThese notes are the project's living shared memory — every agent reads and writes them. Treat them as a useful starting point, not gospel: if an entry contradicts what you actually observe in the code, update or delete it (\`./playbook set\` to overwrite, \`./playbook delete <key>\` to remove). The playbook is only as accurate as the latest agent who looked.\n\n${lines}\n\n`;
+  return `## Operational Playbook (active collective memory)\n\nThese notes are the project's living shared memory — every agent reads and writes them. Treat them as a useful starting point, not gospel: if an entry contradicts what you actually observe in the code, overwrite it with \`./playbook set\`. The playbook is only as accurate as the latest agent who looked.\n\n${lines}\n\n`;
 }
 
 // 2026-05-04: appended to every code-change task prompt (create, refactor,
@@ -2454,7 +2413,7 @@ before \`./done\`, triage them: fix what's valid, record false positives in
 
 export const PLAYBOOK_GUIDANCE = `
 ## Operational Playbook — Active Collective Memory
-The playbook is shared, mutable knowledge across all agents in this project — more like a forum than an append-only log. Use \`./playbook set <key> <value>\` to save reusable knowledge OR overwrite an existing entry, \`./playbook get\` to review, and \`./playbook delete <key>\` to remove an entry that turned out to be wrong, stale, or contradicted by the code you just read. If an existing entry led you astray, fixing or removing it helps the next agent more than adding a new one alongside it.
+The playbook is shared, mutable knowledge across all agents in this project — more like a forum than an append-only log. Use \`./playbook set <key> <value>\` to save reusable knowledge OR overwrite an existing entry, and \`./playbook get\` to review. If an existing entry led you astray, overwrite it with corrected guidance so the next agent benefits from the latest version.
 
 **When to save (trigger conditions):**
 - After fixing a lint, build, or test error: save the root cause pattern and fix
