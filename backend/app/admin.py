@@ -953,10 +953,10 @@ async def bulk_action_tasks(
                         )
                         if artifact and artifact.pr_url:
                             pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
-                            branch = (
-                                f"blueprint/task-{str(task.id).replace('-', '')[:8]}"
-                            )
                             task_payload = task.first_payload
+                            branch = _derive_task_branch(
+                                task.id, task_payload.get("type")
+                            )
                             base_branch = task_payload.get("base_branch", "main")
 
                             if ctx.get("touched_critical"):
@@ -1633,8 +1633,8 @@ async def request_changes(
         raise HTTPException(status_code=400, detail="No PR found for this task")
 
     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
-    branch = f"blueprint/task-{str(task.id).replace('-', '')[:8]}"
     task_payload = task.first_payload
+    branch = _derive_task_branch(task.id, task_payload.get("type"))
     base_branch = task_payload.get("base_branch", "main")
 
     from app.review_pipeline import _spawn_pipeline_task
@@ -1681,26 +1681,10 @@ _FRESH_REVIEWER_COOLDOWN_SECS = 3600  # 1 hour
 # (agent/src/handlers/standard.ts: create/qa->task, refactor->refactor,
 # docs->docs, deps->deps; handlers/specialized.ts->migrate). Fix tasks reuse
 # an existing branch carried in the payload, so they never need this fallback.
-_TASK_TYPE_BRANCH_PREFIX = {
-    "create": "task",
-    "qa": "task",
-    "fix": "task",
-    "refactor": "refactor",
-    "docs": "docs",
-    "deps": "deps",
-    "migrate": "migrate",
-}
-
-
-def _derive_task_branch(task_id: uuid.UUID, task_type: str | None) -> str:
-    """Derive an agent work branch name from the task type.
-
-    Mirrors the agent's branch derivation (``blueprint/{prefix}-{8hex}``,
-    agent/src/index.ts and handlers/specialized.ts) where ``8hex`` is the
-    dashless task UUID prefix and ``prefix`` depends on the task type.
-    """
-    prefix = _TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
-    return f"blueprint/{prefix}-{str(task_id).replace('-', '')[:8]}"
+# Branch derivation moved to app.shared_state.derive_task_branch so callers
+# outside admin (rollup_management, task_lifecycle) can share the same map
+# without circular imports.
+from app.shared_state import derive_task_branch as _derive_task_branch
 
 
 @router.post("/tasks/{task_id}/request-fresh-reviewer")
@@ -2257,8 +2241,8 @@ async def modify_task(
                 )
                 if artifact and artifact.pr_url:
                     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
-                    branch = f"blueprint/task-{str(task.id).replace('-', '')[:8]}"
                     task_payload = task.first_payload
+                    branch = _derive_task_branch(task.id, task_payload.get("type"))
                     base_branch = task_payload.get("base_branch", "main")
 
                     if ctx.get("touched_critical"):

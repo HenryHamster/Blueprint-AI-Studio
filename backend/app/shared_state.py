@@ -40,6 +40,33 @@ def scope_to_effort(scope: str | None) -> str:
     return _SCOPE_EFFORT_MAP.get(scope or "", "medium")
 
 
+# Maps a task type to its branch prefix. Must stay in sync with the agent's
+# branch derivation (agent/src/index.ts, handlers/specialized.ts). When an
+# orchestrator path needs to address an agent-pushed branch (review/fix spawn,
+# operator merge), it must derive the name with this map — hardcoding
+# "blueprint/task-{8hex}" silently broke review spawns for non-default task
+# types (refactor → blueprint/refactor-{8hex}, etc.); see 2026-05-25 incident
+# where PRs #5779/#5812/#5815/#5819 all stalled at review cap because the
+# clone targeted blueprint/task-* against agents that had pushed
+# blueprint/refactor-*.
+TASK_TYPE_BRANCH_PREFIX: Dict[str, str] = {
+    "create": "task",
+    "qa": "task",
+    "fix": "task",
+    "refactor": "refactor",
+    "docs": "docs",
+    "deps": "deps",
+    "migrate": "migrate",
+}
+
+
+def derive_task_branch(task_id: Any, task_type: str | None) -> str:
+    """Derive an agent work branch name (``blueprint/{prefix}-{8hex}``)
+    from the task type and id, matching the agent's branch derivation."""
+    prefix = TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
+    return f"blueprint/{prefix}-{str(task_id).replace('-', '')[:8]}"
+
+
 # Rate limiter — shared between main.py and admin.py
 # Only enforced in Cloud Run (K_REVISION set), disabled locally for dev/test
 # Uses Redis for cross-instance coordination when REDIS_URL is set,
