@@ -256,13 +256,13 @@ def _compute_retry_after_escalation_action(
 ) -> str | None:
     """Decide how to escalate a task that keeps cycling through retry_after holds.
 
-    Returns 'fail' once `resets` reaches the secondary `fail_threshold` (auto-fail
-    so the requeue/retry machinery can take over with fresh context), 'alert'
-    when only the WARNING `alert_threshold` is crossed, or None below both bars.
-    The fail check wins ties when both thresholds are crossed.
+    Pool exhaustion is a wait condition, not a terminal one: when every account
+    is rate-limited the right behaviour is to wait for recovery, not to drop the
+    task on the floor. We fire a WARNING once `resets` crosses `alert_threshold`
+    so the situation is visible, and never escalate to 'fail'. `fail_threshold`
+    is accepted for call-site compatibility but ignored.
     """
-    if fail_threshold > 0 and resets >= fail_threshold:
-        return "fail"
+    del fail_threshold
     if alert_threshold > 0 and resets >= alert_threshold:
         return "alert"
     return None
@@ -2957,27 +2957,22 @@ async def orchestrator_worker():
                             stall_ctx = dict(task.context or {})
                             set_retry_after(stall_ctx, stall_delay_minutes)
                             task.context = stall_ctx
-                            # Escalate when a task is stuck cycling through retry_after holds.
-                            # Each reset is up to RETRY_AFTER_MAX_MINUTES (30m), so 8 resets ≈ 4h.
-                            # At the secondary fail_threshold (default 2x alert), auto-fail so the
-                            # requeue/retry machinery can take over with fresh context instead of
-                            # blocking dispatch indefinitely.
-                            _auto_failed = False
+                            # Escalate visibility when a task is stuck cycling through retry_after holds.
+                            # Each reset is up to RETRY_AFTER_MAX_MINUTES (30m). At the alert
+                            # threshold (default 8 resets ≈ 4h) we fire a WARNING so the situation
+                            # is visible, but pool exhaustion is a wait condition — we never
+                            # auto-fail the task; it stays in retry_after until the pool recovers.
                             try:
                                 _resets = int(stall_ctx.get("_retry_after_resets") or 0)
                                 _reset_threshold = _runtime_config.get(
                                     "retry_after_reset_alert_threshold", 8
                                 )
-                                _fail_threshold = _runtime_config.get(
-                                    "retry_after_reset_fail_threshold",
-                                    _reset_threshold * 2,
-                                )
                                 _action = _compute_retry_after_escalation_action(
-                                    _resets, _reset_threshold, _fail_threshold
+                                    _resets, _reset_threshold, 0
                                 )
-                                if _action in ("alert", "fail"):
-                                    from app.models import Alert, AlertSeverity  # noqa: PLC0415
-                                    from app.max_plan_pool import describe_pool_blockage  # noqa: PLC0415
+                                if _action == "alert":
+                                    from app.models import Alert, AlertSeverity
+                                    from app.max_plan_pool import describe_pool_blockage
 
                                     _blockage = describe_pool_blockage(
                                         task_model, user_id=dispatch_user_id
@@ -2988,58 +2983,6 @@ async def orchestrator_worker():
                                         if task.created_at
                                         else 0.0
                                     )
-                                if _action == "fail":
-                                    from app.failure_classification import (
-                                        persist_failure_category,
-                                    )  # noqa: PLC0415
-
-                                    _exhaust_msg = (
-                                        f"Auto-failed after {_resets} retry_after cycles "
-                                        f"(threshold {_fail_threshold}); held {_hold_min:.0f}m. "
-                                        f"Pool state: {_blockage}."
-                                    )
-                                    task.status = TaskStatus.FAILED
-                                    if task.vm_provisioned_at:
-                                        task.vm_stopped_at = _utcnow()
-                                    task.latest_status_message = _exhaust_msg[:500]
-                                    persist_failure_category(
-                                        task, "retry_after_exhausted"
-                                    )
-                                    _acct_id = get_task_llm_account_id(task)
-                                    if _acct_id:
-                                        await release_max_plan_account(_acct_id)
-                                    session.add(task)
-                                    await _maybe_create_failure_alert(
-                                        task, session, _exhaust_msg[:200]
-                                    )
-                                    try:
-                                        record_task_result(
-                                            success=False,
-                                            failure_class="retry_after_exhausted",
-                                            task_id=str(task.id),
-                                            task_type=(task.first_payload or {}).get(
-                                                "type", ""
-                                            ),
-                                        )
-                                    except Exception:
-                                        logger.exception(
-                                            f"[ORCHESTRATOR] Failed to record retry_after_exhausted result for task {task.id}"
-                                        )
-                                    await broadcast_to_project(
-                                        str(task.project_id),
-                                        "task_updated",
-                                        {
-                                            "task_id": str(task.id),
-                                            "status": task.status,
-                                            "message": task.latest_status_message,
-                                        },
-                                    )
-                                    logger.warning(
-                                        f"[ORCHESTRATOR] Task {task.id} auto-failed after {_resets} retry_after cycles "
-                                        f"(threshold={_fail_threshold}, blockage={_blockage})"
-                                    )
-                                    _auto_failed = True
-                                elif _action == "alert":
                                     _stuck_title = f"Task stuck in retry_after cycle: {task.title or str(task.id)[:8]}"
                                     _existing_stuck = (
                                         (
@@ -3085,14 +3028,6 @@ async def orchestrator_worker():
                                 logger.exception(
                                     f"[ORCHESTRATOR] Failed to evaluate retry_after escalation for task {task.id}"
                                 )
-                            if _auto_failed:
-                                await session.commit()
-                                if _pending_warm_pin_clear is not None:
-                                    _shared_state.record_warm_pin_clear(
-                                        *_pending_warm_pin_clear
-                                    )
-                                    _pending_warm_pin_clear = None
-                                continue
                             if task.latest_status_message != stall_msg:
                                 # Update directly on the locked task object (separate session would deadlock)
                                 task.latest_status_message = stall_msg

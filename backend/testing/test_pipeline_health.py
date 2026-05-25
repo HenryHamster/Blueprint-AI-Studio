@@ -3463,33 +3463,35 @@ def test_retry_after_escalation_below_alert_returns_none():
     """Resets below the alert threshold leave the task alone."""
     from app.orchestrator import _compute_retry_after_escalation_action as act
 
-    assert act(resets=0, alert_threshold=8, fail_threshold=16) is None
-    assert act(resets=7, alert_threshold=8, fail_threshold=16) is None
+    assert act(resets=0, alert_threshold=8, fail_threshold=0) is None
+    assert act(resets=7, alert_threshold=8, fail_threshold=0) is None
 
 
 def test_retry_after_escalation_alert_at_threshold():
-    """Reaching the alert threshold (but not the fail threshold) fires a WARNING."""
+    """Reaching the alert threshold fires a WARNING."""
     from app.orchestrator import _compute_retry_after_escalation_action as act
 
-    assert act(resets=8, alert_threshold=8, fail_threshold=16) == "alert"
-    assert act(resets=15, alert_threshold=8, fail_threshold=16) == "alert"
+    assert act(resets=8, alert_threshold=8, fail_threshold=0) == "alert"
+    assert act(resets=15, alert_threshold=8, fail_threshold=0) == "alert"
 
 
-def test_retry_after_escalation_fail_at_secondary_threshold():
-    """At the secondary threshold, the orchestrator must auto-fail the task."""
+def test_retry_after_escalation_never_fails():
+    """Pool exhaustion is a wait condition: escalation must never return 'fail',
+    no matter how many resets accumulate or what fail_threshold is passed."""
     from app.orchestrator import _compute_retry_after_escalation_action as act
 
-    assert act(resets=16, alert_threshold=8, fail_threshold=16) == "fail"
-    assert act(resets=99, alert_threshold=8, fail_threshold=16) == "fail"
+    for resets in (16, 99, 9999):
+        for fail_threshold in (0, 1, 16, 9999):
+            assert (
+                act(resets=resets, alert_threshold=8, fail_threshold=fail_threshold)
+                == "alert"
+            )
 
 
-def test_retry_after_escalation_disabled_thresholds():
-    """A non-positive threshold disables that escalation tier."""
+def test_retry_after_escalation_disabled_alert_threshold():
+    """A non-positive alert threshold disables escalation entirely."""
     from app.orchestrator import _compute_retry_after_escalation_action as act
 
-    # fail disabled — alert still fires above its threshold.
-    assert act(resets=100, alert_threshold=8, fail_threshold=0) == "alert"
-    # both disabled — nothing happens.
     assert act(resets=100, alert_threshold=0, fail_threshold=0) is None
 
 

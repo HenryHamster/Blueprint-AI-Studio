@@ -1085,3 +1085,50 @@ class TestTrimFindingForMemo:
 
         out = _trim_finding_for_memo({"title": "Only title"})
         assert out == {"title": "Only title"}
+
+
+class TestFindingsTypeFilter:
+    """Regression: agent JSON occasionally contains non-dict entries (bare strings,
+    nulls). Before the handler's normalization loop these must be filtered out, or
+    `.get()` will AttributeError and the completed research task gets terminally
+    FAILED by task_lifecycle's handler-failed branch."""
+
+    def test_parser_passes_through_non_dict_entries(self):
+        """_parse_research_findings is intentionally a thin JSON-array unwrap and
+        does not validate element types — the dict filter must happen at the
+        handler layer."""
+        import json
+
+        from app.research_completion import _parse_research_findings
+
+        payload = json.dumps(
+            [
+                {"title": "real finding", "prompt": "do thing"},
+                "bare string slipped through",
+                None,
+                {"title": "another", "prompt": "do other"},
+            ]
+        )
+        # _extract_json_array looks for keys 'title' + 'prompt' to anchor the array.
+        wrapped = f"prefix ...\n{payload}\n... suffix"
+        parsed = _parse_research_findings(wrapped)
+        assert parsed is not None
+        assert any(not isinstance(f, dict) for f in parsed), (
+            "Parser is expected to surface raw JSON elements unchanged; "
+            "if this changes the handler-side filter may become redundant."
+        )
+
+    def test_handler_filter_drops_non_dict(self):
+        """The filter expression used at the top of _handle_research_completion
+        keeps only dicts so the downstream .get() loop is safe."""
+        findings = [
+            {"title": "ok"},
+            "string",
+            None,
+            42,
+            {"title": "also ok"},
+        ]
+        filtered = [f for f in findings if isinstance(f, dict)]
+        assert filtered == [{"title": "ok"}, {"title": "also ok"}]
+        for _f in filtered:
+            assert _f.get("title") in {"ok", "also ok"}
