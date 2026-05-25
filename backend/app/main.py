@@ -2373,7 +2373,7 @@ from app.payload_schemas import (
     ALL_TASK_TYPES as _VALID_TASK_TYPES,
     validate_internal_payload as _validate_internal_payload,
 )
-from app.playbook_capacity import (
+from app.playbook_storage import (
     maybe_archive_for_capacity as _maybe_archive_for_capacity,
     _playbook_size_bytes,
     _PLAYBOOK_CAPACITY_BYTES,

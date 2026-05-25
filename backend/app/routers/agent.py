@@ -830,7 +830,7 @@ async def _refresh_sr_catch_rate(
     Postgres: ``has_key`` hits the GIN index on context; SQLite (standalone
     tests) omits the JSON filter and ``_stats_for_tasks`` skips non-SR rows.
     """
-    from app.playbook_learning import compute_sr_catch_rate_trends
+    from app.sr_analytics import compute_sr_catch_rate_trends
 
     _sr_cutoff = _utcnow() - timedelta(days=28)
     dialect_name = session.bind.dialect.name if session.bind else "postgresql"
@@ -1625,7 +1625,7 @@ async def claim_task(
                     "[AGENT] Failed to compute sr_catch_rate_trends (non-critical)"
                 )
             try:
-                from app.playbook_learning import compute_sr_false_attestation_trends
+                from app.sr_analytics import compute_sr_false_attestation_trends
 
                 await compute_sr_false_attestation_trends(
                     project_id=task.project_id,
@@ -1637,7 +1637,7 @@ async def claim_task(
                     "[AGENT] Failed to compute sr_false_attestation_trends (non-critical)"
                 )
             try:
-                from app.playbook_learning import (
+                from app.sr_analytics import (
                     compute_sr_regression_risk_test_signal_trends,
                 )
 
@@ -1651,7 +1651,7 @@ async def claim_task(
                     "[AGENT] Failed to compute sr_regression_risk_test_signal_trends (non-critical)"
                 )
             try:
-                from app.playbook_learning import compute_fresh_reviewer_trend
+                from app.sr_analytics import compute_fresh_reviewer_trend
 
                 await compute_fresh_reviewer_trend(
                     project_id=task.project_id,
@@ -1663,7 +1663,7 @@ async def claim_task(
                     "[AGENT] Failed to compute fresh_reviewer_trend (non-critical)"
                 )
             try:
-                from app.playbook_learning import compute_edges_trend
+                from app.sr_analytics import compute_edges_trend
 
                 await compute_edges_trend(
                     project_id=task.project_id,
@@ -1681,7 +1681,7 @@ async def claim_task(
                     "[AGENT] Failed to compute reviewer_recovery_after_incomplete_sr_count (non-critical)"
                 )
             try:
-                from app.playbook_learning import compute_sr_reviewer_disagreements
+                from app.sr_analytics import compute_sr_reviewer_disagreements
 
                 await compute_sr_reviewer_disagreements(
                     project_id=task.project_id,
@@ -2597,7 +2597,7 @@ async def claim_task(
                         "[AGENT] Failed to compute research sr_regression_risk_test_signal_trends (non-critical)"
                     )
                 try:
-                    from app.playbook_learning import compute_fresh_reviewer_trend
+                    from app.sr_analytics import compute_fresh_reviewer_trend
 
                     await compute_fresh_reviewer_trend(
                         project_id=task.project_id,
@@ -2609,7 +2609,7 @@ async def claim_task(
                         "[AGENT] Failed to compute research fresh_reviewer_trend (non-critical)"
                     )
                 try:
-                    from app.playbook_learning import compute_edges_trend
+                    from app.sr_analytics import compute_edges_trend
 
                     await compute_edges_trend(
                         project_id=task.project_id,
@@ -2629,7 +2629,7 @@ async def claim_task(
                         "[AGENT] Failed to compute research reviewer_recovery_after_incomplete_sr_count (non-critical)"
                     )
                 try:
-                    from app.playbook_learning import compute_sr_reviewer_disagreements
+                    from app.sr_analytics import compute_sr_reviewer_disagreements
 
                     await compute_sr_reviewer_disagreements(
                         project_id=task.project_id,

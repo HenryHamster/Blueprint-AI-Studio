@@ -138,7 +138,7 @@ async def test_admin_playbook_set_update(
 async def test_admin_playbook_delete(
     client: AsyncClient, db_session, project_with_member
 ):
-    """DELETE /playbook/{key} removes the entry."""
+    """DELETE /playbook/{key} removes the entry and records a tombstone."""
     project = project_with_member
     project.design_doc = {
         "playbook/remove-me": {
@@ -159,7 +159,15 @@ async def test_admin_playbook_delete(
     assert data["key"] == "remove-me"
 
     await db_session.refresh(project)
-    assert "playbook/remove-me" not in (project.design_doc or {})
+    doc = project.design_doc or {}
+    assert "playbook/remove-me" not in doc
+    assert "playbook/remove-me" in (doc.get("playbook_deleted_keys") or [])
+    archive = doc.get("playbook_archive") or []
+    assert any(
+        entry.get("_archived_key") == "playbook/remove-me"
+        and entry.get("_retirement_reason") == "operator_deleted"
+        for entry in archive
+    )
 
 
 @pytest.mark.smoketest

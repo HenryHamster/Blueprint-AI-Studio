@@ -25,6 +25,7 @@ from app.models import Task, TaskStatus, _utcnow
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
 from app.task_locking import lock_project_or_429, with_design_doc_locked
+from app.playbook_storage import archive_playbook_entry
 from app.shared_state import get_project_integration_branch
 
 logger = logging.getLogger(__name__)
@@ -623,12 +624,7 @@ async def update_playbook_entry(
         entry["updated_at"] = now_iso
         doc[full_key] = entry
     elif action == "archive":
-        victim = dict(doc.pop(full_key))
-        victim["_archived_key"] = full_key
-        victim["_archived_at"] = now_iso
-        archive = list(doc.get("playbook_archive") or [])
-        archive.append(victim)
-        doc["playbook_archive"] = archive[-50:]
+        archive_playbook_entry(doc, full_key, archived_at=now_iso)
 
     project.design_doc = doc
     flag_modified(project, "design_doc")

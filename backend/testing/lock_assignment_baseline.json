@@ -5,8 +5,9 @@
     "direction_outcomes.py": 1,
     "efficiency_snapshot.py": 1,
     "main.py": 2,
-    "playbook_learning.py": 18,
+    "playbook_learning.py": 3,
     "playbook_lifecycle.py": 1,
+    "playbook_storage.py": 1,
     "review_learning.py": 2,
     "routers/admin_notifications.py": 3,
     "routers/admin_onboard.py": 1,
@@ -14,6 +15,7 @@
     "routers/admin_projects.py": 1,
     "routers/agent.py": 2,
     "routers/agent_status.py": 3,
+    "sr_analytics.py": 17,
     "task_locking.py": 1
   },
   "directions": {

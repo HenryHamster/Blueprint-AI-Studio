@@ -622,7 +622,7 @@ async def _current_signal_value_for_class(
     regression_class: str,
     project_design_doc: dict | None = None,
 ) -> dict[str, Any] | None:
-    from app.playbook_learning import _MIN_SR_SAMPLE, _TREND_DELTA_THRESHOLD
+    from app.sr_analytics import _MIN_SR_SAMPLE, _TREND_DELTA_THRESHOLD
     from app.models import Task as TaskModel
 
     # Bucket-level checks: tripped=True if any constituent signal is still tripped.
@@ -687,7 +687,7 @@ async def _current_signal_value_for_class(
     _sr_parts = regression_class.split(":", 2)
     if len(_sr_parts) == 3 and _sr_parts[0] == "sr_catch_rate":
         # Per-direction form: sr_catch_rate:{cat}:{direction_id}
-        from app.playbook_learning import _MIN_DIRECTION_SR_SAMPLE
+        from app.sr_analytics import _MIN_DIRECTION_SR_SAMPLE
 
         _, cat, direction_id = _sr_parts
         trends = (project_design_doc or {}).get("sr_catch_rate_trends") or {}
@@ -3166,7 +3166,7 @@ async def _evaluate_sr_below_floor_signal(
     """Trip when any SR category sits below the floor for min-windows consecutively."""
     if spawn_budget_left <= 0:
         return 0
-    from app.playbook_learning import (
+    from app.sr_analytics import (
         _SR_FLOOR_THRESHOLD,
         _FLOOR_MIN_CONSECUTIVE_WINDOWS,
     )
@@ -3255,7 +3255,7 @@ async def _evaluate_sr_pass_engagement_thinning_signal(
     """Trip when PASS reasoning engagement drops below threshold for a category."""
     if spawn_budget_left <= 0:
         return 0
-    from app.playbook_learning import (
+    from app.sr_analytics import (
         _SR_ENGAGEMENT_THRESHOLD,
         _SR_ENGAGEMENT_MIN_PASSES,
     )
@@ -3343,7 +3343,7 @@ async def _evaluate_sr_false_attestation_signal(
     """Trip when SR false-attestation rate exceeds threshold for any category."""
     if spawn_budget_left <= 0:
         return 0
-    from app.playbook_learning import _FALSE_ATTESTATION_RATE_THRESHOLD
+    from app.sr_analytics import _FALSE_ATTESTATION_RATE_THRESHOLD
 
     per_category = (
         (project_design_doc or {}).get("sr_false_attestation_trends") or {}
@@ -3757,7 +3757,7 @@ async def _probe_sr_blind_spot_any_trip(
     project_id: uuid.UUID,
 ) -> bool:
     """Side-effect-free probe: would any sr_blind_spot signal trip right now?"""
-    from app.playbook_learning import _MIN_SR_SAMPLE, _TREND_DELTA_THRESHOLD
+    from app.sr_analytics import _MIN_SR_SAMPLE, _TREND_DELTA_THRESHOLD
     from app.sr_blind_spots import (
         _count_reviewer_disagreement_directions,
         aggregate_sr_blind_spot_themes,
@@ -3828,7 +3828,7 @@ async def _evaluate_sr_blind_spot_signal(
     (b) a recurring blind_spot theme reaches _SR_BLIND_SPOT_THEME_FLOOR
         occurrences in the 14d window.
     """
-    from app.playbook_learning import _MIN_SR_SAMPLE, _TREND_DELTA_THRESHOLD
+    from app.sr_analytics import _MIN_SR_SAMPLE, _TREND_DELTA_THRESHOLD
     from app.sr_blind_spots import (
         _count_reviewer_disagreement_directions,
         aggregate_sr_blind_spot_themes,

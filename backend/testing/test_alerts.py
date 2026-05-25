@@ -920,7 +920,7 @@ class TestSRCatchRateFloorAlert:
 
     @pytest.mark.asyncio
     async def test_floor_alert_fires_when_consistently_below_floor(self, db_session):
-        from app.playbook_learning import compute_sr_catch_rate_trends
+        from app.sr_analytics import compute_sr_catch_rate_trends
 
         # Pre-seed rate_history with 2 below-floor entries (threshold=0.50).
         # computed_at yesterday → is_new_window=False → history preserved.
@@ -975,7 +975,7 @@ class TestSRCatchRateFloorAlert:
     async def test_floor_alert_dedup_does_not_fire_twice_in_same_window(
         self, db_session
     ):
-        from app.playbook_learning import compute_sr_catch_rate_trends
+        from app.sr_analytics import compute_sr_catch_rate_trends
 
         yesterday = (_utcnow() - timedelta(days=1)).isoformat()
         project = make_project(
@@ -1034,7 +1034,7 @@ class TestSRCatchRateFloorAlert:
 
     @pytest.mark.asyncio
     async def test_floor_alert_does_not_fire_when_above_floor(self, db_session):
-        from app.playbook_learning import compute_sr_catch_rate_trends
+        from app.sr_analytics import compute_sr_catch_rate_trends
 
         yesterday = (_utcnow() - timedelta(days=1)).isoformat()
         project = make_project(
@@ -1079,7 +1079,7 @@ class TestSRCatchRateFloorAlert:
         self, db_session
     ):
         """A simultaneous regression and floor violation fires both distinct events."""
-        from app.playbook_learning import compute_sr_catch_rate_trends
+        from app.sr_analytics import compute_sr_catch_rate_trends
 
         yesterday = (_utcnow() - timedelta(days=1)).isoformat()
         # rate_history below floor; current window will also be decreasing vs previous
@@ -1406,7 +1406,7 @@ class TestSRCatchRateRegressionAlertRow:
 
     @pytest.mark.asyncio
     async def test_regression_alert_creates_warning_row(self, db_session):
-        from app.playbook_learning import (
+        from app.sr_analytics import (
             compute_sr_catch_rate_trends,
             _SR_REGRESSION_ALERT_TITLE_PREFIX,
         )
@@ -1452,7 +1452,7 @@ class TestSRCatchRateRegressionAlertRow:
 
     @pytest.mark.asyncio
     async def test_regression_alert_no_duplicate_when_dedup_holds(self, db_session):
-        from app.playbook_learning import (
+        from app.sr_analytics import (
             compute_sr_catch_rate_trends,
             _SR_REGRESSION_ALERT_TITLE_PREFIX,
         )
@@ -1493,7 +1493,7 @@ class TestSRCatchRateRegressionAlertRow:
 
     @pytest.mark.asyncio
     async def test_regression_alert_dismissed_on_clear(self, db_session):
-        from app.playbook_learning import (
+        from app.sr_analytics import (
             compute_sr_catch_rate_trends,
             _SR_REGRESSION_ALERT_TITLE_PREFIX,
         )

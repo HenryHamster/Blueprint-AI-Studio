@@ -6,7 +6,10 @@
   "workspaces": [
     "admin-ui"
   ],
-  "overrides": {},
+  "overrides": {
+    "protobufjs": "^7.6.1",
+    "@protobufjs/utf8": "^1.1.1"
+  },
   "scripts": {
     "dev": "concurrently --raw \"vite --port=3000 --host=localhost\" \"npm run dev --prefix admin-ui\"",
     "dev:root": "vite --port=3000 --host=localhost",

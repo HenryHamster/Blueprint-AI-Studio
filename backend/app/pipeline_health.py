@@ -992,7 +992,7 @@ async def compute_pipeline_health_summary(
     auto_playbook_idle_retired_24h: Optional[int] = None
     auto_playbook_low_success_retired_24h: Optional[int] = None
     if project and project.design_doc:
-        from app.playbook_learning import (  # noqa: PLC0415
+        from app.playbook_storage import (
             count_idle_auto_retired_within,
             count_low_success_retired_within,
         )

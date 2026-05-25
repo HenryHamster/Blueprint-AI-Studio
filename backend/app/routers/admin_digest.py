@@ -55,11 +55,11 @@ from app.retry_budget import failure_class_history_classes
 from app import strategic_cycle as _strategic_cycle
 from app import release_version as _release_version
 from app.strategic_analysis import _compute_prediction_calibration
-from app.playbook_learning import (
+from app.playbook_learning import resolve_sr_miss_human_truth
+from app.sr_analytics import (
     _MIN_DIRECTION_SR_SAMPLE,
     compute_direction_sr_breakdown_for_endpoint,
     compute_sr_quality_by_fingerprint,
-    resolve_sr_miss_human_truth,
 )
 from app.sr_blind_spots import (
     aggregate_sr_blind_spot_envelope,
@@ -4714,7 +4714,7 @@ async def get_sr_alert_drilldown(
             status_code=400, detail="alert_type must be 'trends' or 'floor'"
         )
 
-    from app.playbook_learning import get_sr_alert_drilldown_tasks  # noqa: PLC0415
+    from app.sr_analytics import get_sr_alert_drilldown_tasks  # noqa: PLC0415
 
     project = await session.get(Project, project_id)
     if not project:
