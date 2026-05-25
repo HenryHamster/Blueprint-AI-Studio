@@ -3,7 +3,7 @@
 The dispatcher is in the middle of a multi-cluster split — chunks of its
 former bulk now live in sibling modules (``regression_dispatcher_metrics``,
 ``regression_layer_classifier``, ``dispatcher_formatters``,
-``pipeline_health``). The dispatcher re-exports each extracted symbol so
+``pipeline_health``, ``dispatcher_signal_data``). The dispatcher re-exports each extracted symbol so
 existing ``from app.pipeline_regression_dispatcher import X`` callers keep
 working, but nothing in the test suite has been preventing a future PR from
 re-introducing one of those symbols as a brand-new definition inside the
@@ -60,6 +60,14 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "LAYER_DISPLAY_ORDER",
         "aggregate_targeted_layers",
         "is_recurring_cross_layer_class",
+    ),
+    "app.regression_layer_observations": (
+        "_LAYER_SYMPTOM_BOUND",
+        "_LAYER_SYMPTOM_WINDOW",
+        "_derive_observation_for_layer_classify",
+        "_distinct_recent_layers",
+        "_record_layer_observation",
+        "_representative_per_layer",
     ),
     "app.dispatcher_formatters": (
         "_CROSS_CASE_FINGERPRINT_LOOKBACK",
@@ -134,6 +142,44 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
     "app.viewport_coverage": (
         "compute_viewport_coverage_snapshot",
         "update_viewport_coverage_snapshot_from_diff",
+    ),
+    "app.dispatcher_signal_data": (
+        "_AGENT_VM_RESOURCE_MIN_FAILURES",
+        "_AGENT_VM_RESOURCE_WINDOW_HOURS",
+        "_FIX_LOOP_DIVERGENCE_FINGERPRINT_MIN_TASKS",
+        "_FIX_LOOP_DIVERGENCE_FINGERPRINT_WINDOW_DAYS",
+        "_RECURRING_CLASS_META_PREFIXES",
+        "_VIEWPORT_REGRESSION_MIN_FAILURES",
+        "_VIEWPORT_REGRESSION_WINDOW_DAYS",
+        "_collect_agent_vm_failures",
+        "_collect_fix_loop_divergence_fingerprints",
+        "_collect_viewport_failures",
+        "_current_signal_value_for_class",
+        "_extract_failure_type",
+        "_group_recurring_class_entries",
+        "_index_cross_case_fingerprints",
+        "_signal_higher_is_better",
+    ),
+    "app.regression_layer_backfill": (
+        "_AWAITING_BACKFILL_AGE_THRESHOLD",
+        "_AWAITING_BACKFILL_ALERT_TITLE",
+        "_AWAITING_BACKFILL_COUNT_THRESHOLD",
+        "_AWAITING_BACKFILL_WINDOW",
+        "_LAYER_BACKFILL_PER_TICK",
+        "_OBSERVATION_ALERT_SLA_HOURS",
+        "_OBSERVATION_ALERT_SLA_HOURS_DEFAULT",
+        "_OBSERVATION_ONLY_ALERT_TITLES",
+        "_PATH_CLASSIFIER_COVERAGE_ALERT_TITLE",
+        "_PATH_CLASSIFIER_COVERAGE_MIN_SAMPLE",
+        "_PATH_CLASSIFIER_COVERAGE_RATE_THRESHOLD",
+        "_PATH_CLASSIFIER_COVERAGE_TOP_PATHS",
+        "_UNMATCHED_PATHS_PER_ENTRY_CAP",
+        "_backfill_layers_targeted_once",
+        "_classify_layers_from_paths",
+        "_escalate_stale_observation_alerts",
+        "_evaluate_awaiting_backfill_alert",
+        "_evaluate_path_classifier_coverage",
+        "compute_unclassified_fix_coverage",
     ),
 }
 

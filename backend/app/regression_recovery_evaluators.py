@@ -23,6 +23,15 @@ from app.dispatcher_formatters import (
     _CROSS_CASE_FINGERPRINT_LOOKBACK,
     _extract_evaluating_since,
 )
+from app.dispatcher_signal_data import (
+    _AGENT_VM_RESOURCE_MIN_FAILURES,
+    _AGENT_VM_RESOURCE_WINDOW_HOURS,
+    _collect_agent_vm_failures,
+    _collect_fix_loop_divergence_fingerprints,
+    _collect_viewport_failures,
+    _group_recurring_class_entries,
+    _index_cross_case_fingerprints,
+)
 from app.models import (
     Alert,
     AlertSeverity,
@@ -59,7 +68,7 @@ async def _recover_viewport_regression(
     body = regression_class[len("viewport_regression:") :]
     component, _, rest = body.partition(":")
     failure_type, _, width = rest.partition("@")
-    trips = await _dispatcher_module()._collect_viewport_failures(session, project_id)
+    trips = await _collect_viewport_failures(session, project_id)
     match = next(
         (
             t
@@ -245,7 +254,7 @@ async def _recover_cross_case_fingerprint(
         .scalars()
         .all()
     )
-    by_fp = dispatcher._index_cross_case_fingerprints(all_cases, cutoff)
+    by_fp = _index_cross_case_fingerprints(all_cases, cutoff)
     occurrence_count = 0
     distinct_classes = 0
     for fingerprint, bucket in by_fp.items():
@@ -299,7 +308,7 @@ async def _recover_recurring_class(
         .scalars()
         .all()
     )
-    by_class = dispatcher._group_recurring_class_entries(all_cases)
+    by_class = _group_recurring_class_entries(all_cases)
     entries = by_class.get(original_class, [])
     tripped = bool(entries) and is_recurring_cross_layer_class(
         entries,
@@ -400,10 +409,9 @@ async def _recover_agent_vm_resource(
     regression_class: str,
     project_design_doc: dict | None,
 ) -> dict[str, Any]:
-    dispatcher = _dispatcher_module()
-    failures = await dispatcher._collect_agent_vm_failures(session, project_id)
+    failures = await _collect_agent_vm_failures(session, project_id)
     count = len(failures)
-    tripped = count >= dispatcher._AGENT_VM_RESOURCE_MIN_FAILURES
+    tripped = count >= _AGENT_VM_RESOURCE_MIN_FAILURES
     return {
         "signal_name": "agent_vm_resource",
         "prior_rate": None,
@@ -414,7 +422,7 @@ async def _recover_agent_vm_resource(
         "extras": (
             [
                 f"{count} VM-infrastructure failures in the last "
-                f"{dispatcher._AGENT_VM_RESOURCE_WINDOW_HOURS}h."
+                f"{_AGENT_VM_RESOURCE_WINDOW_HOURS}h."
             ]
             if tripped
             else []
@@ -619,7 +627,7 @@ async def _recover_fix_loop_divergence_fingerprint(
     short_fingerprint = (
         regression_class.split(":", 1)[1] if ":" in regression_class else ""
     )
-    trips = await _dispatcher_module()._collect_fix_loop_divergence_fingerprints(
+    trips = await _collect_fix_loop_divergence_fingerprints(
         session,
         project_id,
     )

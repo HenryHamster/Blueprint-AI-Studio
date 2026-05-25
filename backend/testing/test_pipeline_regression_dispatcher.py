@@ -11270,7 +11270,7 @@ async def test_awaiting_backfill_alert_evaluator_failure_does_not_break_recovery
         raise RuntimeError("simulated transient failure")
 
     monkeypatch.setattr(
-        "app.pipeline_regression_dispatcher._evaluate_awaiting_backfill_alert",
+        "app.regression_recovery_watchdog._evaluate_awaiting_backfill_alert",
         _boom,
     )
 

@@ -26,12 +26,22 @@ from app.models import (
     TaskHistory,
     TaskStatus,
 )
+from app.dispatcher_signal_data import (
+    _current_signal_value_for_class,
+    _signal_higher_is_better,
+)
 from app.payload_schemas import validate_internal_payload
 from app.pipeline_health import (
     _evaluate_lone_checker_alert,
     _evaluate_sr_catch_rate_targets,
 )
 from app.regression_dispatcher_metrics import _compute_recovery_layer_mismatch
+from app.regression_layer_backfill import (
+    _backfill_layers_targeted_once,
+    _escalate_stale_observation_alerts,
+    _evaluate_awaiting_backfill_alert,
+    _evaluate_path_classifier_coverage,
+)
 from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
     runtime_config as _runtime_config,
@@ -242,7 +252,7 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
         if now < merged_at + dispatcher._REGRESSION_RECOVERY_COOLDOWN:
             continue
         try:
-            state = await dispatcher._current_signal_value_for_class(
+            state = await _current_signal_value_for_class(
                 session,
                 project_id,
                 case.regression_class,
@@ -360,7 +370,7 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
         await session.commit()
 
     try:
-        await dispatcher._backfill_layers_targeted_once(session, project_id)
+        await _backfill_layers_targeted_once(session, project_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "[REGRESSION_DISPATCHER] layers_targeted backfill raised for project=%s: %s",
@@ -369,7 +379,7 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
         )
 
     try:
-        await dispatcher._evaluate_path_classifier_coverage(session, project_id)
+        await _evaluate_path_classifier_coverage(session, project_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "[REGRESSION_DISPATCHER] path-classifier coverage evaluation raised "
@@ -379,7 +389,7 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
         )
 
     try:
-        await dispatcher._evaluate_awaiting_backfill_alert(session, project_id)
+        await _evaluate_awaiting_backfill_alert(session, project_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "[REGRESSION_DISPATCHER] awaiting_backfill alert evaluation raised "
@@ -418,7 +428,7 @@ async def run_recovery_once(session: AsyncSession, project_id: uuid.UUID) -> int
         )
 
     try:
-        await dispatcher._escalate_stale_observation_alerts(session, project_id)
+        await _escalate_stale_observation_alerts(session, project_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "[REGRESSION_DISPATCHER] observation-alert SLA escalation raised "
@@ -650,7 +660,6 @@ async def _auto_close_recovered_manual_intervention(
     """Auto-close manual-intervention cases whose signal has recovered."""
     from app.models import Project
 
-    dispatcher = _dispatcher()
     project = await session.get(Project, project_id, populate_existing=True)
     if project is None:
         return 0, 0
@@ -694,7 +703,7 @@ async def _auto_close_recovered_manual_intervention(
         if locked is None:
             continue
 
-        state = await dispatcher._current_signal_value_for_class(
+        state = await _current_signal_value_for_class(
             session, project_id, locked.regression_class, design_doc
         )
         if state is None:
@@ -722,9 +731,7 @@ async def _auto_close_recovered_manual_intervention(
         alert_severity = AlertSeverity.INFO
         marginal = False
         if isinstance(pre_value, (int, float)) and isinstance(post_value, (int, float)):
-            higher_is_better = dispatcher._signal_higher_is_better(
-                locked.regression_class
-            )
+            higher_is_better = _signal_higher_is_better(locked.regression_class)
             improvement = (
                 post_value - pre_value if higher_is_better else pre_value - post_value
             )

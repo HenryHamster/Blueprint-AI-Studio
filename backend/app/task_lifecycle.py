@@ -1020,7 +1020,7 @@ async def _close_loop_regression_case_on_merge(
         try:
             from app.github import get_pr_files, get_repo_installation_token
             from app.models import Project
-            from app.pipeline_regression_dispatcher import _classify_layers_from_paths
+            from app.regression_layer_backfill import _classify_layers_from_paths
 
             project = await session.get(Project, task.project_id)
             if project and project.github_owner and project.github_repo:
