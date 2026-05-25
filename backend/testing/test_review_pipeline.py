@@ -54,6 +54,47 @@ from app.review_pipeline import (
 from testing.factories import make_project, make_task
 
 
+# ── gh-token prompt pattern ────────────────────────────────────────────────────
+
+
+class TestGhTokenPromptPattern:
+    """Verify that fix prompts use $(./gh-token) instead of a bare $GITHUB_TOKEN.
+
+    $GITHUB_TOKEN is not exported in Claude's env on agent VMs, so any prompt
+    that references it directly produces a 401 on every curl call and forces
+    the reviewer to reject CI-green rebuttals as unverified.
+    """
+
+    def test_build_ci_failure_fix_prompt_uses_gh_token_helper(self):
+        prompt = build_ci_failure_fix_prompt(
+            pr_number=42,
+            base_branch="main",
+            ci_errors="some error",
+            owner="myorg",
+            repo="myrepo",
+        )
+        assert "$(./gh-token)" in prompt, (
+            "build_ci_failure_fix_prompt must use $(./gh-token) not a bare $GITHUB_TOKEN "
+            "— $GITHUB_TOKEN is not exported in Claude's env on agent VMs"
+        )
+        # The pattern must assign the token via the helper before using it in curl,
+        # not reference a pre-existing $GITHUB_TOKEN env var.
+        assert "GITHUB_TOKEN=$(./gh-token)" in prompt, (
+            "Expected the pattern 'GITHUB_TOKEN=$(./gh-token)' so the token is "
+            "fetched via the helper and then used in curl"
+        )
+
+    def test_build_ci_failure_fix_prompt_no_check_runs_hint_when_no_owner(self):
+        prompt = build_ci_failure_fix_prompt(
+            pr_number=1,
+            base_branch="main",
+            ci_errors="err",
+            owner=None,
+            repo=None,
+        )
+        assert "$GITHUB_TOKEN" not in prompt
+
+
 # ── _max_review_iterations ────────────────────────────────────────────────────
 
 

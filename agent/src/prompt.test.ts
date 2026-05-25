@@ -5204,3 +5204,78 @@ describe('writeCheckHelper — config-driven build_config path', () => {
     }
   });
 });
+
+// ── writeCodeChangeHelpers — ./gh-token helper ───────────────────────────────
+describe('writeCodeChangeHelpers — gh-token helper', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  const baseCfg = {
+    taskId: 'task-abc123',
+    workBranch: 'blueprint/task-abc123',
+    baseBranch: 'main',
+    owner: 'test-owner',
+    repo: 'test-repo',
+    testsOnMainBranch: false,
+  };
+
+  it('writes ./gh-token script to WORKSPACE', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers(baseCfg);
+    expect(capturedScripts['/tmp/workspace/gh-token']).toBeDefined();
+  });
+
+  it('gh-token script fetches from the orchestrator token endpoint', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers(baseCfg);
+    const script = capturedScripts['/tmp/workspace/gh-token'];
+    expect(script).toContain('/api/agent/github/token?task_id=');
+    expect(script).toContain('task-abc123');
+    expect(script).toContain('X-Agent-Token: $TOKEN');
+  });
+
+  it('gh-token script prints token to stdout only', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers(baseCfg);
+    const script = capturedScripts['/tmp/workspace/gh-token'];
+    // Token output must go to stdout via printf, not echo
+    expect(script).toContain("printf '%s\\n' \"$GH_TOKEN\"");
+    // The token variable must not appear in any >&2 or stderr-redirected line
+    const stderrLines = script.split('\n').filter(l => l.includes('>&2') || l.includes('2>&1'));
+    for (const line of stderrLines) {
+      expect(line).not.toContain('$GH_TOKEN');
+    }
+  });
+
+  it('gh-token script exits non-zero with stderr message on HTTP failure', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers(baseCfg);
+    const script = capturedScripts['/tmp/workspace/gh-token'];
+    // On curl failure, must print a diagnostic and exit 1
+    expect(script).toContain('[gh-token] Failed to fetch GitHub token from orchestrator');
+    expect(script).toContain('>&2');
+    expect(script).toContain('exit 1');
+  });
+
+  it('gh-token script exits non-zero with stderr message when token is empty', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers(baseCfg);
+    const script = capturedScripts['/tmp/workspace/gh-token'];
+    expect(script).toContain('[gh-token] orchestrator returned no token');
+    expect(script).toContain('exit 1');
+  });
+
+  it('gh-token is listed in AGENT_HELPER_NAMES so it is excluded from git', async () => {
+    const { AGENT_HELPER_NAMES } = await import('./prompt.js');
+    expect(AGENT_HELPER_NAMES).toContain('gh-token');
+  });
+});

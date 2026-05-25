@@ -73,7 +73,7 @@ def build_ci_failure_fix_prompt(
     if owner and repo:
         check_runs_hint = (
             f"  2. Inspect the failing checks via the GitHub API "
-            f'(`curl -H "Authorization: Bearer $GITHUB_TOKEN" '
+            f'(`GITHUB_TOKEN=$(./gh-token) && curl -H "Authorization: Bearer $GITHUB_TOKEN" '
             f"https://api.github.com/repos/{owner}/{repo}/commits/$(git rev-parse HEAD)/check-runs`) "
             f"to confirm which checks are still failing on the latest head.\n"
         )

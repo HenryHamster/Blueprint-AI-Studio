@@ -396,7 +396,7 @@ export function formatFixIterationHistory(attempts: FixAttempt[]): string {
 // Agent helper scripts (playbook, messages, note, strategic, design-doc) are
 // written to WORKSPACE for Claude Code to use. Exclude them from git so they
 // don't get committed into PRs via `git add -A`.
-export const AGENT_HELPER_NAMES = ['playbook', 'messages', 'note', 'strategic', 'design-doc', 'check', 'pr', 'done', 'fail', 'fetch', 'blocked'];
+export const AGENT_HELPER_NAMES = ['playbook', 'messages', 'note', 'strategic', 'design-doc', 'check', 'pr', 'done', 'fail', 'fetch', 'blocked', 'gh-token'];
 
 export function excludeAgentHelpers(): void {
   const excludePath = `${WORKSPACE}/.git/info/exclude`;
@@ -522,13 +522,14 @@ interface CodeChangeHelperConfig {
   buildConfig?: BuildConfig;
 }
 
-/** Write ./check, ./pr, ./done, ./fail, ./blocked to WORKSPACE. Idempotent. */
+/** Write ./check, ./pr, ./done, ./fail, ./blocked, ./gh-token to WORKSPACE. Idempotent. */
 export function writeCodeChangeHelpers(cfg: CodeChangeHelperConfig): void {
   writeCheckHelper(cfg);
   writePrHelper(cfg);
   writeDoneHelper(cfg);
   writeFailHelper(cfg);
   writeBlockedHelper(cfg);
+  writeGhTokenHelper(cfg);
   excludeAgentHelpers();
 }
 
@@ -1837,6 +1838,44 @@ echo "[blocked] Posted BLOCKED_PRECONDITION status. Reason: $REASON"
 echo "[blocked] Strategic agent will be notified — it may spawn a precondition-fix direction."
 `;
   fs.writeFileSync(`${WORKSPACE}/blocked`, script, { mode: 0o755 });
+}
+
+function writeGhTokenHelper(cfg: CodeChangeHelperConfig): void {
+  validateCfgShellSafety(cfg);
+  // Fetches a fresh per-task GitHub token from the orchestrator and prints it
+  // to stdout. Designed for use in prompts:
+  //   GITHUB_TOKEN=$(./gh-token)
+  //   curl -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/...
+  // The token is ONLY printed to stdout. Failure messages go to stderr without
+  // the token value so tool output sanitization is not the sole safety net.
+  const script = `#!/bin/bash
+# ./gh-token — fetch a fresh GitHub token scoped to this task and print to stdout.
+# Usage:  GITHUB_TOKEN=$(./gh-token)
+# Exits non-zero with a diagnostic on stderr if the fetch fails.
+# The token is never printed to stderr.
+
+set -uo pipefail
+
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+TASK="${cfg.taskId}"
+
+TOKEN_RESP=$(curl -f -sS --max-time 30 \\
+  -H "X-Agent-Token: $TOKEN" \\
+  "$API/api/agent/github/token?task_id=$TASK" 2>/dev/null) || {
+  echo "[gh-token] Failed to fetch GitHub token from orchestrator (HTTP error)" >&2
+  exit 1
+}
+
+GH_TOKEN=$(printf '%s' "$TOKEN_RESP" | jq -r '.data.token // empty')
+if [ -z "$GH_TOKEN" ]; then
+  echo "[gh-token] orchestrator returned no token" >&2
+  exit 1
+fi
+
+printf '%s\\n' "$GH_TOKEN"
+`;
+  fs.writeFileSync(`${WORKSPACE}/gh-token`, script, { mode: 0o755 });
 }
 
 export interface PlaybookEntry {

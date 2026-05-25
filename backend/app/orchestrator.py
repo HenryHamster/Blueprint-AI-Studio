@@ -4225,7 +4225,7 @@ async def orchestrator_worker():
                                     f"behind state), check `git status` and `git diff --name-only --diff-filter=U` "
                                     f"and resolve them.\n"
                                     f"  3. Re-query the PR's current state via the GitHub API "
-                                    f'(`curl -H "Authorization: Bearer $GITHUB_TOKEN" '
+                                    f'(`GITHUB_TOKEN=$(./gh-token) && curl -H "Authorization: Bearer $GITHUB_TOKEN" '
                                     f"https://api.github.com/repos/{ci_owner}/{ci_repo}/pulls/{ci_pr_number}`) "
                                     f"to confirm what is actually blocking the merge now.\n\n"
                                     f"Primary action: rebase onto `{ci_base}` and force-push so the PR is no longer behind."
@@ -4246,7 +4246,7 @@ async def orchestrator_worker():
                                     f"  2. Check `git status` and `git diff --name-only --diff-filter=U` for unmerged paths.\n"
                                     f"  3. If neither shows conflicts, the premise is stale — re-query the PR's "
                                     f"current mergeable state and failing check runs via the GitHub API "
-                                    f'(`curl -H "Authorization: Bearer $GITHUB_TOKEN" '
+                                    f'(`GITHUB_TOKEN=$(./gh-token) && curl -H "Authorization: Bearer $GITHUB_TOKEN" '
                                     f"https://api.github.com/repos/{ci_owner}/{ci_repo}/pulls/{ci_pr_number}`) "
                                     f"and fix whatever is actually blocking the merge now.\n\n"
                                     f"Primary action: rebase onto `{ci_base}` and resolve any conflicts."
