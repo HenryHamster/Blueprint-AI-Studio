@@ -910,6 +910,72 @@ async def test_expire_stale_proposals_serializes_with_concurrent_append(db_sessi
     )
 
 
+@pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
+@pytest.mark.asyncio
+async def test_remediation_direction_stamp_serializes_with_concurrent_writer(
+    db_session,
+):
+    """The direction-stamp in auto_remediation now uses with_directions_locked.
+    A concurrent writer's mutation must survive alongside the stamp fields —
+    no lost update when the remediation task insert races a directions write."""
+    from app.task_completion import _stamp_remediation_spawn_on_direction
+
+    dir_id = "d-target"
+    project = Project(name="remediation-stamp-lock", user_id="user")
+    project.directions = [{"id": dir_id, "status": "active"}]
+    db_session.add(project)
+    await db_session.commit()
+
+    stamp_task = Task(
+        project_id=project.id,
+        title="auto-fix: CI failure",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create"}],
+    )
+    db_session.add(stamp_task)
+    await db_session.commit()
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def stamp_direction() -> None:
+        async with Session() as s:
+
+            def _mutate(directions: list) -> None:
+                target = next((d for d in directions if d.get("id") == dir_id), None)
+                if target is not None:
+                    _stamp_remediation_spawn_on_direction(target, stamp_task)
+
+            await with_directions_locked(s, project.id, _mutate)
+            await s.commit()
+
+    async def concurrent_writer() -> None:
+        async with Session() as s:
+            await with_directions_locked(
+                s,
+                project.id,
+                lambda dirs: next(
+                    (d for d in dirs if d.get("id") == dir_id), {}
+                ).update({"concurrent_key": "set"}),
+            )
+            await s.commit()
+
+    await asyncio.gather(stamp_direction(), concurrent_writer())
+
+    async with Session() as verify:
+        result = await verify.execute(select(Project).where(Project.id == project.id))
+        dirs = result.scalar_one().directions
+    by_id = {d["id"]: d for d in dirs}
+    target = by_id.get(dir_id, {})
+    assert target.get("last_remediation_task_id") == str(stamp_task.id), (
+        f"stamp fields lost in concurrent write: {target}"
+    )
+    assert target.get("concurrent_key") == "set", (
+        f"concurrent writer's update lost: {target}"
+    )
+
+
 # ── with_vision_locked ──────────────────────────────────────────────────
 
 

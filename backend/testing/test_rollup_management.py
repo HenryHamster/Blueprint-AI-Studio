@@ -1,6 +1,10 @@
 """Tests for rollup management: Alembic combined-chain guard and PR title prefix."""
 
+import uuid
+
 import pytest
+from fastapi import HTTPException
+from sqlalchemy.orm.attributes import flag_modified
 from unittest.mock import AsyncMock, MagicMock
 
 from app.models import TaskStatus
@@ -464,6 +468,99 @@ async def test_unfetchable_migration_diff_defers_failsafe(cleanup_db, mocker):
     await cleanup_db.refresh(parent)
     assert parent.status == TaskStatus.EVALUATING
     assert parent.requires_approval is False
+
+
+# ---------------------------------------------------------------------------
+# Race-condition regression: empty-diff note uses with_directions_locked
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_empty_diff_directions_note_survives_concurrent_write(cleanup_db, mocker):
+    """The rollup empty-diff note path must not clobber a pre-existing note.
+
+    Simulates the lost-update race: before the fix, the code did
+    session.get(Project, ...) without FOR UPDATE, so a concurrent writer could
+    have appended a note between the read and the write-back, and that note
+    would be silently dropped. After the fix the write goes through
+    with_directions_locked which reloads the directions list under the lock,
+    so both notes survive."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+    # Target branch exists; staging branch is 404 (already cleaned up)
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new_callable=AsyncMock,
+        side_effect=[
+            "target-sha",
+            HTTPException(status_code=404, detail="Not Found"),
+        ],
+    )
+    mocker.patch("app.github.delete_branch", new_callable=AsyncMock, return_value=True)
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    dir_id = str(uuid.uuid4())
+
+    # Seed the project with a direction that already has one note (simulating
+    # a concurrent write that landed before the rollup path runs).
+    prior_note = {
+        "text": "prior note from concurrent writer",
+        "added_at": "2026-01-01T00:00:00",
+        "source": "concurrent_test",
+    }
+    project.directions = [
+        {"id": dir_id, "text": "test direction", "notes": [prior_note]}
+    ]
+    flag_modified(project, "directions")
+    cleanup_db.add(project)
+    await cleanup_db.commit()
+
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={"research_branch": "research/empty-diff-stg", "parent_base": "main"},
+        plan_output="some plan",
+        payloads=[
+            {"type": "research", "prompt": "test", "current_direction_id": dir_id}
+        ],
+    )
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED
+
+    await cleanup_db.refresh(project)
+    directions = project.directions or []
+    assert directions, "project.directions should not be empty after rollup"
+    matched = next((d for d in directions if d.get("id") == dir_id), None)
+    assert matched is not None, "direction with dir_id not found"
+    notes = matched.get("notes") or []
+    sources = [n.get("source") for n in notes]
+    # Both the pre-existing note and the rollup note must survive — neither clobbers the other
+    assert "concurrent_test" in sources, (
+        "pre-existing note was clobbered by rollup write"
+    )
+    assert "rollup_empty_diff" in sources, "rollup_empty_diff note was not written"
 
 
 # ---------------------------------------------------------------------------

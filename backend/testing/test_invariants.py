@@ -2261,6 +2261,21 @@ def _ast_count_attr_assignments(app_dir: str, attr_name: str) -> dict[str, int]:
     return counts
 
 
+def _file_contains_lock_pattern(file_path: str, patterns: list[str]) -> bool:
+    """Check if a file contains at least one of the given lock-acquisition patterns.
+
+    Uses simple substring matching (not AST) to keep checks conservative and fast.
+    Returns True if any pattern is found, False otherwise.
+    """
+    try:
+        with open(file_path) as f:
+            source = f.read()
+    except (IOError, OSError):
+        return False
+
+    return any(pattern in source for pattern in patterns)
+
+
 def _check_lock_invariant(attr_name: str, baseline_key: str, helper_name: str) -> None:
     """Shared implementation for all three column-lock invariant tests."""
     app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
@@ -2328,6 +2343,63 @@ class TestDirectionsLockInvariant:
 
     def test_no_new_unlocked_directions_writes(self):
         _check_lock_invariant("directions", "directions", "with_directions_locked")
+
+
+class TestDirectionsLockAssignmentGuard:
+    """Positive ratchet: files with non-zero .directions assignments must be
+    wrapped in a project-row-lock acquisition site.
+
+    Complements TestDirectionsLockInvariant (negative ratchet). That test catches
+    NEW direct assignments. This test ensures EXISTING assignments have a surrounding
+    lock — if the lock is removed without migrating the write to with_directions_locked(),
+    this test fails.
+
+    Recognized lock acquisition sites:
+      - with_for_update(...) on Project (or alias)
+      - project_lock(...)
+      - lock_project_or_429(...) or _lock_project_or_429(...)
+      - with_directions_locked(...)
+
+    Failure message suggests either migrating to with_directions_locked or
+    restoring the surrounding lock call.
+    """
+
+    # Recognized patterns that indicate a file has a project-row lock.
+    # Substring matching is sufficient (conservative approach).
+    _LOCK_PATTERNS = [
+        "with_for_update(",
+        "project_lock(",
+        "lock_project_or_429(",
+        "with_directions_locked(",
+    ]
+
+    def test_directions_writes_guarded_by_locks(self):
+        """Every file with .directions writes must contain at least one lock acquisition."""
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        baseline: dict[str, int] = _LOCK_BASELINE.get("directions", {})
+
+        violations: list[str] = []
+        for rel_path, count in sorted(baseline.items()):
+            if count <= 0:
+                continue
+
+            file_path = os.path.join(app_dir, rel_path)
+            if not _file_contains_lock_pattern(file_path, self._LOCK_PATTERNS):
+                violations.append(
+                    f"  {rel_path}: {count} direct assignment(s), no lock guard found"
+                )
+
+        assert not violations, (
+            "Files with .directions assignments lack lock acquisition guards:\n"
+            + "\n".join(violations)
+            + "\n\nEach file must contain at least one of these lock-acquisition patterns:\n"
+            + "\n".join(f"  - {p}" for p in self._LOCK_PATTERNS)
+            + "\n\nEither:\n"
+            "  (a) Migrate the write to with_directions_locked() (in task_locking.py) and "
+            "lower the count in lock_assignment_baseline.json, or\n"
+            "  (b) Restore the surrounding project_lock / with_for_update / "
+            "lock_project_or_429 call that was accidentally removed."
+        )
 
 
 class TestResearchCompletionDirectionsLocked:
