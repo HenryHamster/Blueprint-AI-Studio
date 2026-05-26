@@ -182,7 +182,17 @@ build {
       "sudo -u agent -H bash -c 'find /home/agent/.cache/ms-playwright -name chrome -type f | grep . && echo PACKER_SMOKE_OK || { echo PACKER_SMOKE_FAIL: Chromium binary not found after playwright install; exit 1; }'",
       "# Exercise the shipped memo handler through the runtime TS entrypoint with a",
       "# deterministic dispatcher memo payload and a localhost fetch stub.",
-      "sudo -u agent -H bash -lc 'cd /opt/agent && ORCHESTRATOR_URL=http://127.0.0.1:9 AGENT_TOKEN=packer-smoke node --import tsx --input-type=module --eval \"Object.defineProperty(globalThis, \\\"fetch\\\", { value: async (url, init = {}) => { const target = String(url); if (target.endsWith(\\\"/api/agent/status\\\") && init.method === \\\"POST\\\") { const body = JSON.parse(String(init.body ?? \\\"{}\\\")); if (body.status !== \\\"COMPLETED\\\" || !String(body.logs ?? \\\"\\\").includes(\\\"stale memo runtime\\\")) throw new Error(\\\"unexpected status payload: \\\" + String(body.status) + \\\" \\\" + String(body.logs ?? \\\"\\\").slice(0, 200)); return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { \\\"Content-Type\\\": \\\"application/json\\\" } }); } throw new Error(\\\"unexpected fetch: \\\" + target); }, configurable: true }); const { handlers } = await import(\\\"./src/handlers/index.ts\\\"); await handlers.memo(\\\"packer-memo-smoke\\\", { reasoning_kind: \\\"regression_false_positive\\\", source_task_id: \\\"task-123\\\", source_finding: { verdict_reason: \\\"stale memo runtime\\\", investigation_summary: \\\"smoke check\\\", regression_class: \\\"memo\\\" } }, { title: \\\"Memo smoke\\\", description: \\\"\\\", context: {} }, \\\"gh\\\", \\\"owner\\\", \\\"repo\\\", null, { value: \\\"\\\" });\" && echo PACKER_MEMO_SMOKE_OK'"
+      "sudo -u agent -H bash -lc 'cd /opt/agent && ORCHESTRATOR_URL=http://127.0.0.1:9 AGENT_TOKEN=packer-smoke node --import tsx ./src/handlers/memo-bake-smoke.ts && echo PACKER_MEMO_SMOKE_OK'",
+      "# Second memo smoke: exercise the runClaudeCode + Codex JSONL extractor",
+      "# path that the dispatcher-synth short-circuit above deliberately skips.",
+      "# The smoke stubs runClaudeCode through the __setRunClaudeCodeOverrideForSmoke",
+      "# hook in src/index.ts so no real Claude/Codex subprocess is spawned at",
+      "# bake time, and feeds the handler a Codex item.completed JSONL envelope",
+      "# whose item.text is a >200-char memo JSON — locking in the regression",
+      "# fix for the historical Codex 200-char item.text truncation bug. The",
+      "# smoke prints PACKER_MEMO_CLAUDE_PATH_OK on success; on failure it throws",
+      "# (non-zero exit) and the bake fails before the image is tagged.",
+      "sudo -u agent -H bash -lc 'cd /opt/agent && ORCHESTRATOR_URL=http://127.0.0.1:9 AGENT_TOKEN=packer-smoke node --import tsx ./src/handlers/memo-bake-smoke-codex.ts'"
     ]
   }
 }

@@ -25,6 +25,7 @@ Related bug history (see comments on each check for details):
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -635,12 +636,41 @@ def test_static_script_bash_syntax(path: Path, bash_executable: str | None):
 _PACKER_HCL = (
     Path(__file__).resolve().parent.parent.parent / "infra" / "packer" / "agent.pkr.hcl"
 )
+_AGENT_DIR = Path(__file__).resolve().parent.parent.parent / "agent"
+_PACKER_MEMO_SMOKE = _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke.ts"
+_PACKER_CODEX_SMOKE = _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke-codex.ts"
 
 
 def _read_packer_hcl() -> str:
     if not _PACKER_HCL.exists():
         pytest.skip("infra/packer/agent.pkr.hcl not present (backend-only Docker run)")
     return _PACKER_HCL.read_text(encoding="utf-8")
+
+
+def _read_packer_memo_smoke() -> str:
+    if not _PACKER_MEMO_SMOKE.exists():
+        pytest.skip("agent/src/handlers/memo-bake-smoke.ts not present")
+    return _PACKER_MEMO_SMOKE.read_text(encoding="utf-8")
+
+
+def _read_packer_codex_smoke() -> str:
+    if not _PACKER_CODEX_SMOKE.exists():
+        pytest.skip("agent/src/handlers/memo-bake-smoke-codex.ts not present")
+    return _PACKER_CODEX_SMOKE.read_text(encoding="utf-8")
+
+
+def _read_agent_package_json() -> dict[str, object]:
+    package_json = _AGENT_DIR / "package.json"
+    if not package_json.exists():
+        pytest.skip("agent/package.json not present")
+    return json.loads(package_json.read_text(encoding="utf-8"))
+
+
+def _read_agent_tsconfig() -> dict[str, object]:
+    tsconfig_json = _AGENT_DIR / "tsconfig.json"
+    if not tsconfig_json.exists():
+        pytest.skip("agent/tsconfig.json not present")
+    return json.loads(tsconfig_json.read_text(encoding="utf-8"))
 
 
 class TestPackerMemoBakeContract:
@@ -654,29 +684,176 @@ class TestPackerMemoBakeContract:
             "Restore the step or re-add the sentinel."
         )
 
+    def test_packer_runs_dedicated_smoke_file(self):
+        """The provisioner must execute a repo source file directly so the
+        smoke no longer depends on fragile multi-layer quoting."""
+        hcl = _read_packer_hcl()
+        assert "./src/handlers/memo-bake-smoke.ts" in hcl, (
+            "agent.pkr.hcl must execute ./src/handlers/memo-bake-smoke.ts."
+        )
+        assert "--eval" not in hcl, (
+            "agent.pkr.hcl memo smoke must not use node --eval after extraction."
+        )
+
     def test_smoke_imports_runtime_entrypoint(self):
         """Smoke must exercise src/handlers/index.ts — the actual shipped
         entrypoint — not a test double. Wrong module defeats the purpose."""
-        hcl = _read_packer_hcl()
-        assert "src/handlers/index.ts" in hcl, (
-            "agent.pkr.hcl memo smoke must import src/handlers/index.ts."
+        smoke = _read_packer_memo_smoke()
+        assert "./index.ts" in smoke, (
+            "memo-bake-smoke.ts must import src/handlers/index.ts."
         )
-        assert "handlers.memo(" in hcl, (
-            "agent.pkr.hcl memo smoke must call handlers.memo()."
+        assert "handlers.memo(" in smoke, (
+            "memo-bake-smoke.ts must call handlers.memo()."
         )
 
     def test_smoke_validates_completed_status(self):
         """Fetch stub must assert COMPLETED; accepting any status cannot
         catch a handler that swallows the completion path."""
-        assert "COMPLETED" in _read_packer_hcl(), (
-            "agent.pkr.hcl memo smoke must assert status=COMPLETED."
+        assert "COMPLETED" in _read_packer_memo_smoke(), (
+            "memo-bake-smoke.ts must assert status=COMPLETED."
         )
 
     def test_smoke_validates_log_fragment(self):
         """Fetch stub must also check log content so a handler that posts
         COMPLETED with empty logs is still caught at bake time."""
-        assert "stale memo runtime" in _read_packer_hcl(), (
-            "agent.pkr.hcl memo smoke must validate logs contain 'stale memo runtime'."
+        assert "stale memo runtime" in _read_packer_memo_smoke(), (
+            "memo-bake-smoke.ts must validate logs contain 'stale memo runtime'."
+        )
+
+    def test_smoke_file_is_in_agent_typecheck_surface(self):
+        """The dedicated smoke file must stay inside the existing agent
+        `tsc --noEmit` surface so syntax drift is caught by agent builds."""
+        package_json = _read_agent_package_json()
+        scripts = package_json.get("scripts")
+        assert isinstance(scripts, dict), "agent/package.json must define scripts."
+        build_cmd = scripts.get("build")
+        assert isinstance(build_cmd, str) and "tsc --noEmit" in build_cmd, (
+            "agent/package.json build script must typecheck with `tsc --noEmit`."
+        )
+
+        tsconfig = _read_agent_tsconfig()
+        includes = tsconfig.get("include")
+        assert isinstance(includes, list) and "src" in includes, (
+            "agent/tsconfig.json must include `src` so memo-bake-smoke.ts is typechecked."
+        )
+
+        relative_smoke_path = _PACKER_MEMO_SMOKE.relative_to(_AGENT_DIR).as_posix()
+        assert relative_smoke_path.startswith("src/"), (
+            "memo-bake-smoke.ts must live under agent/src so the agent typecheck covers it."
+        )
+
+    # ── Codex-extractor path (runClaudeCode arm) ────────────────────────────
+    #
+    # The dispatcher-path smoke above never invokes runClaudeCode, so the
+    # historical bug zone (Codex item.text truncation, JSONL envelope parsing,
+    # JSON extractor edge cases) goes uncovered without a second smoke. These
+    # assertions lock in that second smoke; like the dispatcher smoke it lives
+    # under agent/src/handlers/ so the agent typecheck covers it.
+
+    def test_claude_path_smoke_sentinel_present(self):
+        """Build must emit PACKER_MEMO_CLAUDE_PATH_OK so the provisioner can
+        gate on the sentinel; without it a silent failure passes undetected."""
+        assert "PACKER_MEMO_CLAUDE_PATH_OK" in _read_packer_codex_smoke(), (
+            "Codex-extractor memo smoke must emit PACKER_MEMO_CLAUDE_PATH_OK."
+        )
+
+    def test_packer_runs_codex_smoke_file(self):
+        """The provisioner must execute the codex-path smoke source file."""
+        hcl = _read_packer_hcl()
+        assert "./src/handlers/memo-bake-smoke-codex.ts" in hcl, (
+            "agent.pkr.hcl must execute ./src/handlers/memo-bake-smoke-codex.ts."
+        )
+
+    def test_claude_path_smoke_invokes_override_hook(self):
+        """The smoke must replace runClaudeCode with a deterministic stub via
+        the __setRunClaudeCodeOverrideForSmoke hook — otherwise the bake would
+        try to spawn a real Claude/Codex subprocess and fail."""
+        codex = _read_packer_codex_smoke()
+        assert "__setRunClaudeCodeOverrideForSmoke" in codex, (
+            "Codex-extractor memo smoke must stub runClaudeCode via "
+            "__setRunClaudeCodeOverrideForSmoke."
+        )
+
+    def test_claude_path_smoke_emits_codex_jsonl_envelope(self):
+        """Smoke must construct a Codex item.completed agent_message envelope
+        so extractCodexAgentMessageText runs end-to-end at bake time."""
+        codex = _read_packer_codex_smoke()
+        assert "item.completed" in codex, (
+            "Codex-extractor memo smoke must emit a Codex item.completed envelope."
+        )
+        assert "agent_message" in codex, (
+            "Codex-extractor memo smoke must emit a Codex agent_message envelope."
+        )
+
+    def test_claude_path_smoke_exceeds_200_chars(self):
+        """The memo JSON inside the envelope must exceed 200 chars so the
+        historical Codex item.text 200-char truncation regression is exercised
+        on every bake."""
+        codex = _read_packer_codex_smoke()
+        # The smoke guards against accidental shrinkage by throwing if the
+        # serialized memo JSON is <=200 chars. Lock that guard in here.
+        assert "memo JSON must exceed 200 chars" in codex or (
+            "memoJsonString.length <= 200" in codex and "throw" in codex
+        ), (
+            "Codex-extractor memo smoke must enforce memoJsonString length > 200 "
+            "to lock in the Codex item.text 200-char truncation regression fix."
+        )
+
+    def test_claude_path_smoke_bypasses_dispatcher_short_circuit(self):
+        """Payload must NOT match the dispatcher short-circuit conditions
+        (regression_false_positive / investigation_unactionable with a
+        source_finding object) — otherwise the synth path fires and
+        runClaudeCode is never reached."""
+        codex = _read_packer_codex_smoke()
+        # Dispatcher reasoning_kind values that route to _synthesizeDispatcherMemo.
+        assert "regression_false_positive" not in codex, (
+            "Codex-extractor memo smoke payload must NOT use a dispatcher "
+            "reasoning_kind or the synth short-circuit will skip runClaudeCode."
+        )
+        assert "investigation_unactionable" not in codex, (
+            "Codex-extractor memo smoke payload must NOT use a dispatcher "
+            "reasoning_kind or the synth short-circuit will skip runClaudeCode."
+        )
+        # Even with a non-dispatcher reasoning_kind, the short-circuit can also
+        # fire when source_finding is an object with the right shape; cleanest
+        # is to omit source_finding entirely from the payload.
+        assert "source_finding" not in codex, (
+            "Codex-extractor memo smoke payload must omit source_finding to "
+            "guarantee dispatcher short-circuit cannot fire."
+        )
+
+    def test_claude_path_smoke_validates_completed_status(self):
+        """Fetch stub for the Codex-path smoke must also assert COMPLETED."""
+        assert "COMPLETED" in _read_packer_codex_smoke(), (
+            "Codex-extractor memo smoke must assert status=COMPLETED."
+        )
+
+    def test_claude_path_smoke_validates_log_fragment(self):
+        """Fetch stub must check that the memo content sentinel travels all
+        the way from the Codex envelope's item.text into the COMPLETED logs —
+        proving extractCodexAgentMessageText + the JSON extractor ran."""
+        codex = _read_packer_codex_smoke()
+        assert "codex-path memo smoke" in codex, (
+            "Codex-extractor memo smoke must embed a distinct content sentinel "
+            "inside the Codex envelope's item.text and assert it appears in "
+            "the COMPLETED logs."
+        )
+
+    def test_codex_smoke_file_is_in_agent_typecheck_surface(self):
+        """The codex-path smoke must stay inside the agent `tsc --noEmit`
+        surface so syntax drift is caught by agent builds."""
+        relative_smoke_path = _PACKER_CODEX_SMOKE.relative_to(_AGENT_DIR).as_posix()
+        assert relative_smoke_path.startswith("src/"), (
+            "memo-bake-smoke-codex.ts must live under agent/src so the agent typecheck covers it."
+        )
+
+    def test_dispatcher_path_smoke_still_runs(self):
+        """The dispatcher-path smoke must not be regressed by the Codex-path
+        addition. Both cases must run on every bake."""
+        hcl = _read_packer_hcl()
+        assert "PACKER_MEMO_SMOKE_OK" in hcl, (
+            "Dispatcher-path memo smoke sentinel was dropped — both smokes "
+            "must run on every bake."
         )
 
 

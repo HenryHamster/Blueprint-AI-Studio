@@ -3544,9 +3544,26 @@ async function validateProviderAuth(runner: ProviderRunner, reportPreClaimFailur
   }
 }
 
+// Smoke-only override slot. The packer agent image bake substitutes this with
+// a deterministic stub so handlers.memo() can exercise the runClaudeCode +
+// Codex-extractor path without spawning a real Claude/Codex subprocess. Never
+// set this in production — there is no auth on the setter, by design (the
+// bake-time process is the only caller and runs before the VM is tagged).
+type RunClaudeCodeOverride = (
+  prompt: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean,
+) => Promise<{ exitCode: number; allOutput: string; lastResultText: string }>;
+let _runClaudeCodeOverride: RunClaudeCodeOverride | null = null;
+export function __setRunClaudeCodeOverrideForSmoke(fn: RunClaudeCodeOverride | null): void {
+  _runClaudeCodeOverride = fn;
+}
+
 export async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
 }> {
+  if (_runClaudeCodeOverride) {
+    return _runClaudeCodeOverride(prompt, ws, statusRef, model, effort, disallowedTools, enableCheckWatchdog);
+  }
   return runProviderAgent(prompt, ws, statusRef, model, effort, disallowedTools, enableCheckWatchdog);
 }
 
