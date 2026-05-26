@@ -955,14 +955,11 @@ def _agent_auth_body(endpoint: str, task_id: str, vm_instance_id: str) -> dict:
     "endpoint",
     ["status", "heartbeat", "vm-heartbeat", "next-role"],
 )
-@pytest.mark.parametrize(
-    "prewarm_cache", [False, True], ids=["cold_cache", "warm_cache"]
-)
 async def test_agent_token_rejected_when_task_row_missing(
-    client: AsyncClient, db_session, endpoint: str, prewarm_cache: bool
+    client: AsyncClient, db_session, endpoint: str
 ):
-    """Missing task rows must fail closed even when the active-task cache is warm."""
-    from app.routers.agent import _agent_active_cache, _terminated_task_ids
+    """Missing task rows must fail closed on auth check."""
+    from app.routers.agent import _terminated_task_ids
 
     project = Project(name="Missing Row Auth Test", user_id="test-user-123")
     db_session.add(project)
@@ -984,9 +981,6 @@ async def test_agent_token_rejected_when_task_row_missing(
     token = create_agent_token(task_id, vm_instance_id)
 
     _terminated_task_ids.pop(task_id, None)
-    _agent_active_cache.pop(task_id, None)
-    if prewarm_cache:
-        _agent_active_cache[task_id] = 9999999999.0
 
     await db_session.delete(task)
     await db_session.commit()
@@ -1016,7 +1010,6 @@ async def test_agent_token_rejected_when_task_row_missing(
             app.dependency_overrides.pop(get_session, None)
         else:
             app.dependency_overrides[get_session] = previous_override
-        _agent_active_cache.pop(task_id, None)
         _terminated_task_ids.pop(task_id, None)
 
     assert resp.status_code == 401
@@ -1027,14 +1020,11 @@ async def test_agent_token_rejected_when_task_row_missing(
     "endpoint",
     ["status", "heartbeat", "vm-heartbeat", "next-role"],
 )
-@pytest.mark.parametrize(
-    "prewarm_cache", [False, True], ids=["cold_cache", "warm_cache"]
-)
 async def test_agent_token_rejected_on_db_error(
-    client: AsyncClient, db_session, endpoint: str, prewarm_cache: bool
+    client: AsyncClient, db_session, endpoint: str
 ):
-    """DB auth errors must reject writes even when the active-task cache is warm."""
-    from app.routers.agent import _agent_active_cache, _terminated_task_ids
+    """DB auth errors must reject writes on auth check."""
+    from app.routers.agent import _terminated_task_ids
 
     project = Project(name="DB Error Auth Test", user_id="test-user-123")
     db_session.add(project)
@@ -1056,9 +1046,6 @@ async def test_agent_token_rejected_on_db_error(
     token = create_agent_token(task_id, vm_instance_id)
 
     _terminated_task_ids.pop(task_id, None)
-    _agent_active_cache.pop(task_id, None)
-    if prewarm_cache:
-        _agent_active_cache[task_id] = 9999999999.0
 
     class _FailingSession:
         async def get(self, *_args, **_kwargs):
@@ -1085,12 +1072,243 @@ async def test_agent_token_rejected_on_db_error(
             app.dependency_overrides.pop(get_session, None)
         else:
             app.dependency_overrides[get_session] = previous_override
-        _agent_active_cache.pop(task_id, None)
         _terminated_task_ids.pop(task_id, None)
 
     assert resp.status_code == 503
     detail = resp.json().get("detail") or resp.json().get("error", {}).get("message")
     assert detail == "agent_auth_db_unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint",
+    ["heartbeat"],
+)
+@pytest.mark.parametrize(
+    "terminal_status",
+    [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED],
+    ids=["completed", "failed", "cancelled"],
+)
+async def test_agent_token_rejected_when_task_terminal_status(
+    client: AsyncClient, db_session, endpoint: str, terminal_status: TaskStatus
+):
+    """Terminal-status check must reject non-idempotent paths.
+
+    Regression: The 2026-05-24 fix made verify_agent_token always run the DB proof step
+    for terminal-status detection. This test pins that terminal tasks are rejected on
+    non-idempotent paths.
+    """
+    from app.routers.agent import _terminated_task_ids
+
+    project = Project(name="Terminal Status Auth Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-terminal",
+        status=terminal_status,  # Already terminal
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+    vm_instance_id = "agent-vm-terminal"
+    token = create_agent_token(task_id, vm_instance_id)
+
+    _terminated_task_ids.pop(task_id, None)
+
+    try:
+        resp = await client.post(
+            f"/api/agent/{endpoint}",
+            json=_agent_auth_body(endpoint, task_id, vm_instance_id),
+            headers={"x-agent-token": token},
+        )
+    finally:
+        _terminated_task_ids.pop(task_id, None)
+
+    # Non-idempotent paths fail closed with 401 for terminal tasks
+    assert resp.status_code == 401, (
+        f"endpoint {endpoint} should reject with 401 for terminal task, got {resp.status_code}"
+    )
+    resp_json = resp.json()
+    detail = resp_json.get("detail") or resp_json.get("error", {}).get("message")
+    assert detail == "Task is no longer active"
+
+
+@pytest.mark.asyncio
+async def test_agent_idempotent_path_enforces_freshness(
+    client: AsyncClient, db_session
+):
+    """Freshness-window check enforces age on warm-idempotent paths.
+
+    Regression: The 2026-05-24 fix made verify_agent_token always run the DB proof step.
+    This test verifies that for warm-idempotent paths (/next-role, /vm-heartbeat) on
+    terminal tasks, freshness-window check is enforced. A stale JWT (old iat) must be
+    rejected.
+    """
+    from app.routers.agent import (
+        _terminated_task_ids,
+        _TERMINAL_IDEMPOTENT_FRESHNESS_SECS,
+    )
+
+    project = Project(name="Freshness Window Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-freshness",
+        status=TaskStatus.COMPLETED,  # Terminal task
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+    vm_instance_id = "agent-vm-freshness"
+
+    # Create a stale token (iat in the past, outside freshness window)
+    from datetime import datetime, timedelta, timezone
+    from app.auth import AGENT_JWT_SECRET, AGENT_JWT_ALGORITHM
+    import jwt
+
+    stale_iat = datetime.now(timezone.utc) - timedelta(
+        seconds=_TERMINAL_IDEMPOTENT_FRESHNESS_SECS + 60
+    )
+    stale_expire = datetime.now(timezone.utc) + timedelta(hours=8)
+    to_encode = {
+        "sub": task_id,
+        "vm_instance_id": vm_instance_id,
+        "task_type": "",
+        "project_id": "",
+        "exp": stale_expire,
+        "iat": stale_iat,
+    }
+    stale_token = jwt.encode(to_encode, AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM)
+
+    _terminated_task_ids.pop(task_id, None)
+
+    try:
+        resp = await client.post(
+            "/api/agent/vm-heartbeat",
+            json={"vm_instance_id": vm_instance_id},
+            headers={"x-agent-token": stale_token},
+        )
+    finally:
+        _terminated_task_ids.pop(task_id, None)
+
+    # Freshness check must reject stale JWT
+    assert resp.status_code == 401, (
+        "stale JWT on warm-idempotent path should be rejected"
+    )
+    resp_json = resp.json()
+    detail = resp_json.get("detail") or resp_json.get("error", {}).get("message")
+    assert detail == "terminal_token_expired_for_idempotent"
+
+
+@pytest.mark.asyncio
+async def test_agent_token_rejected_on_vm_instance_mismatch(
+    client: AsyncClient, db_session
+):
+    """VM instance mismatch check must reject token when task reassigned.
+
+    Regression: A warm cache should not allow skipping the vm_instance_mismatch check.
+    When a task is requeued and reassigned to a different VM, the original agent's
+    token must be rejected with 403 vm_instance_mismatch.
+    """
+    from app.routers.agent import _terminated_task_ids
+
+    project = Project(name="VM Mismatch Auth Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-requeued",  # Task reassigned to new VM
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+    original_vm = "agent-vm-original"  # Original VM from old assignment
+    token = create_agent_token(task_id, original_vm)
+
+    _terminated_task_ids.pop(task_id, None)
+
+    try:
+        resp = await client.post(
+            "/api/agent/heartbeat",
+            json={"task_id": task_id, "status_message": "still running"},
+            headers={"x-agent-token": token},
+        )
+    finally:
+        _terminated_task_ids.pop(task_id, None)
+
+    assert resp.status_code == 403
+    resp_json = resp.json()
+    detail = resp_json.get("detail") or resp_json.get("error", {}).get("message")
+    assert detail == "vm_instance_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_agent_token_rejected_on_project_mismatch(
+    client: AsyncClient, db_session
+):
+    """Project mismatch check must reject token for cross-project requests.
+
+    Regression: project_id authz check must reject when token carries a mismatched
+    project_id that does not match task.project_id (e.g. cross-project task reassignment).
+    """
+    from app.routers.agent import _terminated_task_ids
+
+    project1 = Project(name="Project 1", user_id="test-user-123")
+    project2 = Project(name="Project 2", user_id="test-user-123")
+    db_session.add(project1)
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project1)
+    await db_session.refresh(project2)
+
+    task = Task(
+        project_id=project2.id,  # Task belongs to project2
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-project",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+    vm_instance_id = "agent-vm-project"
+    # Token carries project1 ID (mismatch)
+    token = create_agent_token(task_id, vm_instance_id, project_id=str(project1.id))
+
+    _terminated_task_ids.pop(task_id, None)
+
+    try:
+        resp = await client.post(
+            "/api/agent/heartbeat",
+            json={"task_id": task_id, "status_message": "still running"},
+            headers={"x-agent-token": token},
+        )
+    finally:
+        _terminated_task_ids.pop(task_id, None)
+
+    assert resp.status_code == 403
+    resp_json = resp.json()
+    detail = resp_json.get("detail") or resp_json.get("error", {}).get("message")
+    assert detail == "project_mismatch"
 
 
 @pytest.mark.asyncio
@@ -9188,7 +9406,7 @@ async def test_vm_heartbeat_fresh_terminal_jwt_accepted(
     client: AsyncClient, db_session
 ):
     """A fresh terminal-task JWT (iat = now-5 min) is allowed on /vm-heartbeat."""
-    from app.routers.agent import _terminated_task_ids, _agent_active_cache
+    from app.routers.agent import _terminated_task_ids
 
     project = Project(name="M3 Fresh Heartbeat", user_id="test-user-123")
     db_session.add(project)
@@ -9206,7 +9424,6 @@ async def test_vm_heartbeat_fresh_terminal_jwt_accepted(
     await db_session.refresh(task)
 
     _terminated_task_ids.pop(str(task.id), None)
-    _agent_active_cache.pop(str(task.id), None)
 
     token = _make_jwt_with_iat(
         str(task.id), "agent-vm-m3-fresh-hb", iat_offset_secs=-300
@@ -9224,7 +9441,7 @@ async def test_vm_heartbeat_stale_terminal_jwt_rejected(
     client: AsyncClient, db_session
 ):
     """A stale terminal-task JWT (iat = now-60 min) is rejected 401 on /vm-heartbeat."""
-    from app.routers.agent import _terminated_task_ids, _agent_active_cache
+    from app.routers.agent import _terminated_task_ids
 
     project = Project(name="M3 Stale Heartbeat", user_id="test-user-123")
     db_session.add(project)
@@ -9242,7 +9459,6 @@ async def test_vm_heartbeat_stale_terminal_jwt_rejected(
     await db_session.refresh(task)
 
     _terminated_task_ids.pop(str(task.id), None)
-    _agent_active_cache.pop(str(task.id), None)
 
     token = _make_jwt_with_iat(
         str(task.id), "agent-vm-m3-stale-hb", iat_offset_secs=-3600
@@ -9265,7 +9481,7 @@ async def test_next_role_stale_terminal_jwt_rejected(client: AsyncClient, db_ses
     Same defense as the heartbeat test — a leaked terminal-task token can't
     spam-claim future warm-pinned tasks once it's outside the freshness window.
     """
-    from app.routers.agent import _terminated_task_ids, _agent_active_cache
+    from app.routers.agent import _terminated_task_ids
 
     project = Project(name="M3 Stale Next-Role", user_id="test-user-123")
     db_session.add(project)
@@ -9283,7 +9499,6 @@ async def test_next_role_stale_terminal_jwt_rejected(client: AsyncClient, db_ses
     await db_session.refresh(task)
 
     _terminated_task_ids.pop(str(task.id), None)
-    _agent_active_cache.pop(str(task.id), None)
 
     token = _make_jwt_with_iat(
         str(task.id), "agent-vm-m3-stale-nr", iat_offset_secs=-3600
@@ -9306,7 +9521,7 @@ async def test_next_role_stale_terminal_jwt_rejected(client: AsyncClient, db_ses
 @pytest.mark.asyncio
 async def test_next_role_fresh_terminal_jwt_accepted(client: AsyncClient, db_session):
     """A fresh terminal-task JWT is allowed on /next-role (returns 204 with no work)."""
-    from app.routers.agent import _terminated_task_ids, _agent_active_cache
+    from app.routers.agent import _terminated_task_ids
 
     project = Project(name="M3 Fresh Next-Role", user_id="test-user-123")
     db_session.add(project)
@@ -9324,7 +9539,6 @@ async def test_next_role_fresh_terminal_jwt_accepted(client: AsyncClient, db_ses
     await db_session.refresh(task)
 
     _terminated_task_ids.pop(str(task.id), None)
-    _agent_active_cache.pop(str(task.id), None)
 
     token = _make_jwt_with_iat(
         str(task.id), "agent-vm-m3-fresh-nr", iat_offset_secs=-300
@@ -9350,7 +9564,7 @@ async def test_active_task_jwt_unaffected_by_freshness_check(
     freshness check — the check applies only to terminal tasks. A long-running
     task posting status with a 60-min-old JWT must still succeed.
     """
-    from app.routers.agent import _terminated_task_ids, _agent_active_cache
+    from app.routers.agent import _terminated_task_ids
 
     project = Project(name="M3 Active JWT Unaffected", user_id="test-user-123")
     db_session.add(project)
@@ -9370,7 +9584,6 @@ async def test_active_task_jwt_unaffected_by_freshness_check(
     # Belt-and-suspenders: ensure cache is clean so the check actually runs
     # against the live DB row.
     _terminated_task_ids.pop(str(task.id), None)
-    _agent_active_cache.pop(str(task.id), None)
 
     token = _make_jwt_with_iat(
         str(task.id), "agent-vm-m3-active", iat_offset_secs=-3600

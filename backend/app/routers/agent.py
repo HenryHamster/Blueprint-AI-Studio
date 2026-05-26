@@ -133,6 +133,7 @@ async def _create_review_check_run_bg(
 # are evicted to prevent unbounded growth (JWTs expire after 8h).
 _terminated_task_ids: dict[str, float] = {}
 _TERMINATED_TTL = 9 * 3600  # 9h — slightly longer than 8h JWT max lifetime
+_TERMINATED_TASK_IDS_MAX = 5000  # evict expired entries when cache exceeds this size
 _on_task_terminal_callbacks.append(
     lambda tid: _terminated_task_ids.__setitem__(tid, time.time())
 )
@@ -157,11 +158,6 @@ _on_task_revive_callbacks.append(lambda tid: _terminated_task_ids.pop(tid, None)
 _TERMINAL_IDEMPOTENT_FRESHNESS_SECS = int(
     os.getenv("AGENT_TERMINAL_IDEMPOTENT_FRESHNESS_SECS", "1800")
 )
-
-# TTL cache for "known active" tasks — avoids DB query per request.
-_agent_active_cache: dict[str, float] = {}
-_AGENT_CACHE_TTL = 60.0  # seconds
-_AGENT_CACHE_MAX = 5000  # evict expired entries when cache exceeds this size
 
 # Retain strong references to fire-and-forget background tasks so the event loop
 # doesn't GC them before completion (asyncio only holds a weak reference).
@@ -266,13 +262,6 @@ async def verify_agent_token(
     # check so we can compare token_vm against task.vm_instance_id (the
     # cache alone doesn't carry that field).
 
-    # Advisory cache: keep recent-active bookkeeping for eviction/telemetry,
-    # but never skip the DB proof step. A warmed cache cannot prove the task
-    # still exists, is still active, or is still assigned to this VM.
-    cached_expiry = _agent_active_cache.get(task_id)
-    if cached_expiry and cached_expiry <= time.time():
-        _agent_active_cache.pop(task_id, None)
-
     # DB proof path: required before every authenticated request so fail-closed
     # behavior applies even when an earlier call warmed the cache.
     # Use app.dependency_overrides to respect test session overrides
@@ -319,14 +308,8 @@ async def verify_agent_token(
         raise HTTPException(status_code=503, detail="agent_auth_db_unavailable") from e
 
     now = time.time()
-    _agent_active_cache[task_id] = now + _AGENT_CACHE_TTL
-    # Evict expired entries to prevent unbounded growth
-    if len(_agent_active_cache) > _AGENT_CACHE_MAX:
-        stale = [k for k, v in _agent_active_cache.items() if v <= now]
-        for k in stale:
-            _agent_active_cache.pop(k, None)
     # Evict stale terminated entries (JWT expired, entry is redundant)
-    if len(_terminated_task_ids) > _AGENT_CACHE_MAX:
+    if len(_terminated_task_ids) > _TERMINATED_TASK_IDS_MAX:
         cutoff = now - _TERMINATED_TTL
         stale = [k for k, v in _terminated_task_ids.items() if v <= cutoff]
         for k in stale:
