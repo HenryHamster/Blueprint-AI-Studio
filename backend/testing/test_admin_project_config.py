@@ -254,6 +254,228 @@ async def test_get_project_promotion_target_helper_legacy_fallback():
 
 
 # ---------------------------------------------------------------------------
+# Task-branch namespace / prefix config tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def project_member(db_session):
+    """Create a project where test-user-123 is a member (not owner)."""
+    project = Project(name="Member Test Project", user_id="some-other-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    member = make_membership(project.id, user_id="test-user-123", role="member")
+    db_session.add(member)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_get_task_branch_namespace_defaults_to_blueprint(
+    client: AsyncClient, db_session, project_owner
+):
+    """GET /task-branch-namespace returns 'blueprint' when no per-project value is set."""
+    project = project_owner
+    original = runtime_config.pop("task_branch_namespace", None)
+    try:
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/task-branch-namespace"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["project_id"] == str(project.id)
+        assert data["task_branch_namespace"] == "blueprint"
+        assert data["is_default"] is True
+    finally:
+        if original is not None:
+            runtime_config["task_branch_namespace"] = original
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_task_branch_namespace_round_trip(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH then GET returns the updated namespace and stores it in build_config."""
+    project = project_owner
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/task-branch-namespace",
+        json={"task_branch_namespace": "autoproj"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["task_branch_namespace"] == "autoproj"
+    assert data["is_default"] is False
+
+    get_resp = await client.get(
+        f"/api/admin/projects/{project.id}/task-branch-namespace"
+    )
+    assert get_resp.status_code == 200
+    assert get_resp.json()["task_branch_namespace"] == "autoproj"
+    assert get_resp.json()["is_default"] is False
+
+    await db_session.refresh(project)
+    assert (project.build_config or {}).get("task_branch_namespace") == "autoproj"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_task_branch_namespace_null_reverts_to_default(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH with null clears the build_config key and reverts to the default."""
+    project = project_owner
+    original = runtime_config.pop("task_branch_namespace", None)
+    try:
+        await client.patch(
+            f"/api/admin/projects/{project.id}/task-branch-namespace",
+            json={"task_branch_namespace": "autoproj"},
+        )
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/task-branch-namespace",
+            json={"task_branch_namespace": None},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["task_branch_namespace"] == "blueprint"
+        assert data["is_default"] is True
+
+        await db_session.refresh(project)
+        assert "task_branch_namespace" not in (project.build_config or {})
+    finally:
+        if original is not None:
+            runtime_config["task_branch_namespace"] = original
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_task_branch_namespace_rejects_invalid_chars(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH rejects namespaces with shell metacharacters or '/'."""
+    project = project_owner
+    for bad in ['ns";id;"', "ns$(cmd)", "ns\nfoo", "ns/with/slash"]:
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/task-branch-namespace",
+            json={"task_branch_namespace": bad},
+        )
+        assert resp.status_code == 422, (
+            f"expected 422 for {bad!r}, got {resp.status_code}"
+        )
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_task_branch_namespace_requires_owner_role(
+    client: AsyncClient, db_session, project_member
+):
+    """A member (non-owner) cannot PATCH task-branch-namespace."""
+    project = project_member
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/task-branch-namespace",
+        json={"task_branch_namespace": "autoproj"},
+    )
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_get_task_branch_prefix_defaults_to_namespace_slash(
+    client: AsyncClient, db_session, project_owner
+):
+    """GET /task-branch-prefix derives ``{namespace}/`` when no explicit prefix is stored."""
+    project = project_owner
+    original = runtime_config.pop("task_branch_namespace", None)
+    try:
+        resp = await client.get(f"/api/admin/projects/{project.id}/task-branch-prefix")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["task_branch_prefix"] == "blueprint/"
+        assert data["is_default"] is True
+
+        # After overriding namespace, the derived prefix follows it.
+        await client.patch(
+            f"/api/admin/projects/{project.id}/task-branch-namespace",
+            json={"task_branch_namespace": "autoproj"},
+        )
+        resp2 = await client.get(f"/api/admin/projects/{project.id}/task-branch-prefix")
+        assert resp2.json()["task_branch_prefix"] == "autoproj/"
+        assert resp2.json()["is_default"] is True
+    finally:
+        if original is not None:
+            runtime_config["task_branch_namespace"] = original
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_task_branch_prefix_round_trip(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH with an explicit prefix overrides the derived default."""
+    project = project_owner
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/task-branch-prefix",
+        json={"task_branch_prefix": "legacy/"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["task_branch_prefix"] == "legacy/"
+    assert data["is_default"] is False
+
+    get_resp = await client.get(f"/api/admin/projects/{project.id}/task-branch-prefix")
+    assert get_resp.json()["task_branch_prefix"] == "legacy/"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_task_branch_prefix_null_reverts_to_derived(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH with null clears the explicit prefix and falls back to ``{namespace}/``."""
+    project = project_owner
+    original = runtime_config.pop("task_branch_namespace", None)
+    try:
+        await client.patch(
+            f"/api/admin/projects/{project.id}/task-branch-prefix",
+            json={"task_branch_prefix": "legacy/"},
+        )
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/task-branch-prefix",
+            json={"task_branch_prefix": None},
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["task_branch_prefix"] == "blueprint/"
+        assert data["is_default"] is True
+
+        await db_session.refresh(project)
+        assert "task_branch_prefix" not in (project.build_config or {})
+    finally:
+        if original is not None:
+            runtime_config["task_branch_namespace"] = original
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_task_branch_prefix_rejects_invalid_chars(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH rejects prefixes with shell metacharacters."""
+    project = project_owner
+    for bad in ['legacy";id;"', "legacy$(cmd)", "legacy\nfoo"]:
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/task-branch-prefix",
+            json={"task_branch_prefix": bad},
+        )
+        assert resp.status_code == 422, (
+            f"expected 422 for {bad!r}, got {resp.status_code}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Broadcast-limit config tests
 # ---------------------------------------------------------------------------
 

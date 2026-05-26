@@ -38,6 +38,8 @@ export interface BuildConfig {
   enable_fresh_reviewer?: boolean;
   enable_parallel_review?: boolean;
   enable_parallel_fix?: boolean;
+  task_branch_namespace?: string;
+  task_branch_prefix?: string;
 }
 
 export interface Project {

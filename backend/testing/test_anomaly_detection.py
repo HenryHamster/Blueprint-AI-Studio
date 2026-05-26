@@ -693,6 +693,16 @@ def _make_proactive_session(active_proactive_count: int = 0):
     session.commit = AsyncMock()
     session.flush = AsyncMock()
 
+    # session.get(Project, pid) is awaited by the proactive-spawn code path
+    # to look up integration_branch via get_project_integration_branch(project).
+    # Return a project stub with integration_branch=None so the helper falls
+    # back to "main" — a real string — and the InvestigatePayload validator
+    # (fail-closed since 3eeb693) sees a str for base_branch rather than an
+    # AsyncMock attribute.
+    project_stub = MagicMock()
+    project_stub.integration_branch = None
+    session.get = AsyncMock(return_value=project_stub)
+
     count_result = MagicMock()
     count_result.all.return_value = [("row",)] * active_proactive_count
 

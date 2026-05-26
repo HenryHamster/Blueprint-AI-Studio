@@ -30,6 +30,7 @@ from app.payload_schemas import pack_under_budget, validate_internal_payload
 import app.shared_state as _shared_state
 from app.shared_state import (
     get_project_integration_branch,
+    get_project_promotion_target,
     runtime_config as _runtime_config,
 )
 from app.time_utils import _utcnow
@@ -1766,13 +1767,14 @@ async def _spawn_strategic_review(
     except Exception:
         logger.exception("[STRATEGIC] drift signal computation failed; continuing")
         drift_summary = {}
-    # LTS version/phase context — active whenever the integration branch is a
-    # real trunk distinct from "main" (i.e. the LTS split is on).  Project-generic:
-    # gated on integration_branch, not project.is_self_repo.  Best-effort.
+    # LTS version/phase context — active whenever the integration branch and
+    # promotion target differ (i.e. the LTS split is on). Project-generic:
+    # gated on the per-project branch pair, not project.is_self_repo. Best-effort.
     _open_version = None
     _version_phase_block: dict | None = None
     _integration_branch = get_project_integration_branch(project)
-    if _integration_branch != "main":
+    _promotion_target = get_project_promotion_target(project)
+    if _integration_branch != _promotion_target:
         try:
             from app.release_version import (
                 count_merged_since,

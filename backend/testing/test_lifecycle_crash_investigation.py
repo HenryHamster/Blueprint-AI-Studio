@@ -24,6 +24,7 @@ from app.models import (
 def _make_project(pid=None):
     p = MagicMock()
     p.id = pid or uuid.uuid4()
+    p.integration_branch = None  # no per-project override; helper falls back to "main"
     return p
 
 
@@ -32,8 +33,8 @@ def _make_session(projects, existing_task=None, existing_case=None):
     `existing_task` for Task dedup queries, and `existing_case` for
     RegressionRemediationCase queries.
 
-    The Project query (`select(Project.id)`) yields scalar UUIDs, so the
-    mock returns each project's `.id` rather than the project object itself.
+    The Project query (`select(Project)`) yields full project objects so the
+    production code can call get_project_integration_branch(project).
     """
     session = AsyncMock()
     session.__aenter__ = AsyncMock(return_value=session)
@@ -51,8 +52,8 @@ def _make_session(projects, existing_task=None, existing_case=None):
             else:
                 result.first.return_value = None
         else:
-            # Project query — select(Project.id) yields scalar UUIDs
-            result.scalars.return_value.all.return_value = [p.id for p in projects]
+            # Project query — select(Project) yields full project objects
+            result.scalars.return_value.all.return_value = list(projects)
         return result
 
     session.execute = execute

@@ -30,6 +30,7 @@ from app.shared_state import (
     external_health as _external_health,
     resolve_retry_budget,
     derive_task_branch as _derive_task_branch,
+    get_project_integration_branch as _get_project_integration_branch,
 )
 from app.failure_classification import (
     classify_failure,
@@ -1999,8 +2000,8 @@ async def reaper_service():
                                     task.id, _task_type, _namespace
                                 )
                                 _base_branch = (task.first_payload or {}).get(
-                                    "base_branch", "main"
-                                )
+                                    "base_branch"
+                                ) or _get_project_integration_branch(_proj)
                                 _original_prompt = (task.first_payload or {}).get(
                                     "prompt", task.description or ""
                                 )

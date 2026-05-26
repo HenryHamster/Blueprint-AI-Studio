@@ -1254,10 +1254,14 @@ async def _attempt_ci_backstop_recovery(
     wait window and skip the hard kill for this tick).
     """
     from app.review_pipeline import _spawn_pipeline_task
+    from app.models import Project
 
     pr_number = review_loop.get("pr_number")
     branch = review_loop.get("branch")
-    base_branch = review_loop.get("base_branch", "main")
+    _proj = await session.get(Project, parent.project_id)
+    base_branch = review_loop.get(
+        "base_branch"
+    ) or _shared_state.get_project_integration_branch(_proj)
     original_task_id = review_loop.get("original_task_id") or str(parent.id)
     if not (pr_number and branch):
         return False
@@ -1511,8 +1515,8 @@ async def _check_evaluating_timeouts():
                                     else "blueprint",
                                 )
                                 base_branch = (task.first_payload or {}).get(
-                                    "base_branch", "main"
-                                )
+                                    "base_branch"
+                                ) or _shared_state.get_project_integration_branch(_proj)
                                 original_prompt = (task.first_payload or {}).get(
                                     "prompt", task.description or ""
                                 )
@@ -2562,7 +2566,9 @@ async def _recover_orphaned_tasks():
                 pr = prs[0]
                 pr_url = pr["html_url"]
                 pr_number = pr["number"]
-                base_branch = task.first_payload.get("base_branch", "main")
+                base_branch = task.first_payload.get(
+                    "base_branch"
+                ) or _shared_state.get_project_integration_branch(_proj)
 
                 # Create the missing artifact
                 artifact = Artifact(
@@ -2717,9 +2723,11 @@ async def _recover_orphaned_tasks():
                     continue
 
                 pr_number = int(pr_url.rstrip("/").split("/")[-1])
-                base_branch = locked.first_payload.get("base_branch", "main")
                 short_id = str(locked.id).replace("-", "")[:8]
                 _proj = await session.get(Project, locked.project_id)
+                base_branch = locked.first_payload.get(
+                    "base_branch"
+                ) or _shared_state.get_project_integration_branch(_proj)
                 branch = _derive_task_branch(
                     locked.id,
                     task_type,

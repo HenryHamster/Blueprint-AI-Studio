@@ -1144,7 +1144,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             len(_batch_cap_deferred),
         )
 
-    original_base = (task.first_payload).get("base_branch", "main")
+    original_base = (task.first_payload).get(
+        "base_branch"
+    ) or _get_project_integration_branch(project_obj)
     short_id = str(task.id).replace("-", "")[:8]
     research_branch = f"research/{short_id}"
 

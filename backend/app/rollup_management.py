@@ -1146,7 +1146,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 branch = (c.context or {}).get("branch") or _derive_task_branch(
                     c.id, c_payload.get("type"), project_namespace
                 )
-                base_branch = c_payload.get("base_branch", "main")
+                base_branch = c_payload.get("base_branch") or _get_project_integration_branch(project)
                 original_prompt = c_payload.get("prompt", c.description or "")
                 review_task, was_spawned = await _spawn_pipeline_task(
                     c,

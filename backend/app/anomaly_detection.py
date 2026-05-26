@@ -1381,6 +1381,9 @@ async def _spawn_proactive_fingerprint_investigations(session: AsyncSession) -> 
             pid = uuid.UUID(proj_key)
         except (TypeError, ValueError):
             continue
+        project = await session.get(Project, pid)
+        if project is None:
+            continue
         for anomaly_key, entry in proj_anomalies.items():
             if per_project_spawned >= _PROACTIVE_INVESTIGATION_PER_PROJECT_CAP:
                 break
@@ -1430,8 +1433,8 @@ async def _spawn_proactive_fingerprint_investigations(session: AsyncSession) -> 
                 {
                     "type": "investigate",
                     "prompt": prompt,
-                    "base_branch": _shared_state.runtime_config.get(
-                        "integration_branch", "main"
+                    "base_branch": _shared_state.get_project_integration_branch(
+                        project
                     ),
                     "recent_changes": recent_changes or {},
                 },
@@ -1526,6 +1529,9 @@ async def _spawn_proactive_intra_direction_investigations(session: AsyncSession)
             pid = uuid.UUID(proj_key)
         except (TypeError, ValueError):
             continue
+        project = await session.get(Project, pid)
+        if project is None:
+            continue
         for anomaly_key, entry in proj_anomalies.items():
             if per_project_spawned >= _PROACTIVE_INVESTIGATION_PER_PROJECT_CAP:
                 break
@@ -1572,8 +1578,8 @@ async def _spawn_proactive_intra_direction_investigations(session: AsyncSession)
                 {
                     "type": "investigate",
                     "prompt": prompt,
-                    "base_branch": _shared_state.runtime_config.get(
-                        "integration_branch", "main"
+                    "base_branch": _shared_state.get_project_integration_branch(
+                        project
                     ),
                     "recent_changes": recent_changes or {},
                 },

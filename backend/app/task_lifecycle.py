@@ -1562,7 +1562,9 @@ async def _process_post_commit(
                     task_type,
                     _project.task_branch_namespace if _project else "blueprint",
                 )
-                base_branch = task_payload.get("base_branch", "main")
+                base_branch = task_payload.get(
+                    "base_branch"
+                ) or _shared_state.get_project_integration_branch(_project)
                 original_prompt = task_payload.get("prompt", task.description or "")
                 is_intermediate = base_branch.startswith(
                     "research/"
@@ -2189,8 +2191,11 @@ async def _process_post_commit(
                     "pr_number"
                 )
                 branch = review_loop.get("branch") or task_payload.get("branch")
-                base_branch = review_loop.get("base_branch") or task_payload.get(
-                    "base_branch", "main"
+                _review_project = await session.get(Project, task.project_id)
+                base_branch = (
+                    review_loop.get("base_branch")
+                    or task_payload.get("base_branch")
+                    or _shared_state.get_project_integration_branch(_review_project)
                 )
                 original_task_id = review_loop.get(
                     "original_task_id", ""
@@ -3923,8 +3928,11 @@ async def _process_post_commit(
                     "pr_number"
                 )
                 branch = review_loop.get("branch") or task_payload.get("branch")
-                base_branch = review_loop.get("base_branch") or task_payload.get(
-                    "base_branch", "main"
+                _fix_project = await session.get(Project, task.project_id)
+                base_branch = (
+                    review_loop.get("base_branch")
+                    or task_payload.get("base_branch")
+                    or _shared_state.get_project_integration_branch(_fix_project)
                 )
                 original_task_id = review_loop.get(
                     "original_task_id", ""

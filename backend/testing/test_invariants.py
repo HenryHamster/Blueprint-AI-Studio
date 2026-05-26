@@ -2312,6 +2312,72 @@ class TestRuntimeConfigProjectBranchBypasses:
 # ── Vision Lock Invariant ─────────────────────────────────────────────────────
 
 
+class TestBasebranchMainFallbackInvariant:
+    """Tripwire: spawn/recovery paths must not hardcode 'main' as the base_branch
+    fallback. Use shared_state.get_project_integration_branch(project) instead.
+
+    Scans the specific spawn/recovery modules whose hardcoded 'main' fallbacks were
+    routed through get_project_integration_branch() in clusters 1–12 of the
+    per-project base_branch fix.  If this test fails, the regression-prone pattern
+    payload.get("base_branch", "main") was reintroduced in one of these files.
+
+    To guard a newly-fixed file, add its relative path to _SPAWN_RECOVERY_MODULES.
+    To register a site that is legitimately global-config (not per-project), add it
+    to _ALLOWED_FILES instead — but only for true global-config defaults, not for
+    unfixed bugs.
+    """
+
+    # Files fixed by clusters 1-12; scanned for the regression-prone pattern.
+    _SPAWN_RECOVERY_MODULES = frozenset(
+        {
+            "anomaly_detection.py",
+            "lifecycle.py",
+            "services.py",
+            "rollup_management.py",
+            "task_lifecycle.py",
+            "task_completion.py",
+            "research_completion.py",
+            "plan_completion.py",
+            "issue_implementation.py",
+            "routers/agent_status.py",
+            "reaper.py",
+        }
+    )
+
+    # Files exempted because they use a global-config default that is intentional
+    # (not a per-project bypass).  Do not add unfixed-bug files here.
+    _ALLOWED_FILES: frozenset[str] = frozenset()
+
+    def test_no_hardcoded_main_base_branch_fallback(self):
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        violations: list[str] = []
+
+        for rel in sorted(self._SPAWN_RECOVERY_MODULES - self._ALLOWED_FILES):
+            py_file = os.path.join(app_dir, rel)
+            if not os.path.exists(py_file):
+                continue
+            with open(py_file) as fh:
+                for lineno, line in enumerate(fh, 1):
+                    stripped = line.strip()
+                    if stripped.startswith("#"):
+                        continue
+                    if (
+                        '"base_branch", "main"' in line
+                        or "'base_branch', 'main'" in line
+                    ):
+                        violations.append(f"  {rel}:{lineno}: {stripped}")
+
+        assert not violations, (
+            "Hardcoded 'main' fallback for base_branch found in fixed spawn/recovery modules:\n"
+            + "\n".join(violations)
+            + "\n\nReplace payload.get('base_branch', 'main') with per-project resolution:\n"
+            "  from app.shared_state import get_project_integration_branch\n"
+            "  base_branch = (payload.get('base_branch')\n"
+            "      or get_project_integration_branch(project))\n"
+            "See shared_state.get_project_integration_branch for the fallback ordering."
+        )
+
+
 class TestVisionLockInvariant:
     """Tripwire: direct <var>.vision attribute assignments must not increase
     above their per-file baseline recorded in lock_assignment_baseline.json.

@@ -29,6 +29,7 @@ from app.playbook_storage import archive_playbook_entry
 from app.shared_state import (
     get_project_integration_branch,
     get_project_promotion_target,
+    get_project_task_branch_namespace,
 )
 
 logger = logging.getLogger(__name__)
@@ -591,6 +592,153 @@ async def update_promotion_target_config(
         "project_id": str(project_id),
         "promotion_target": get_project_promotion_target(project),
         "is_default": project.promotion_target is None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Task-branch namespace / prefix config endpoints
+# ---------------------------------------------------------------------------
+
+
+def _build_config_has_key(project, key: str) -> bool:
+    value = (project.build_config or {}).get(key)
+    return value not in (None, "")
+
+
+@router.get("/projects/{project_id}/task-branch-namespace")
+async def get_task_branch_namespace_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the per-project task-branch namespace (leading segment of agent task branches)."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    return {
+        "project_id": str(project_id),
+        "task_branch_namespace": get_project_task_branch_namespace(project),
+        "is_default": not _build_config_has_key(project, "task_branch_namespace"),
+    }
+
+
+@router.patch("/projects/{project_id}/task-branch-namespace")
+async def update_task_branch_namespace_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Set the per-project task-branch namespace. Pass null to revert to the global default."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if "task_branch_namespace" not in body:
+        raise HTTPException(
+            status_code=422,
+            detail="Request body must include 'task_branch_namespace'",
+        )
+
+    namespace = body["task_branch_namespace"]
+    if namespace is not None:
+        if not isinstance(namespace, str) or not namespace.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="'task_branch_namespace' must be a non-empty string or null",
+            )
+        if not _VALID_BRANCH_RE.match(namespace):
+            raise HTTPException(
+                status_code=422,
+                detail="'task_branch_namespace' contains invalid characters",
+            )
+        if "/" in namespace:
+            raise HTTPException(
+                status_code=422,
+                detail="'task_branch_namespace' must be a single segment (no '/')",
+            )
+
+    project = await lock_project_or_429(session, project_id)
+    build_config = dict(project.build_config or {})
+    if namespace is None:
+        build_config.pop("task_branch_namespace", None)
+    else:
+        build_config["task_branch_namespace"] = namespace
+    project.build_config = build_config
+    flag_modified(project, "build_config")
+    session.add(project)
+    await session.commit()
+
+    return {
+        "project_id": str(project_id),
+        "task_branch_namespace": get_project_task_branch_namespace(project),
+        "is_default": not _build_config_has_key(project, "task_branch_namespace"),
+    }
+
+
+@router.get("/projects/{project_id}/task-branch-prefix")
+async def get_task_branch_prefix_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the per-project task-branch prefix (defaults to ``{namespace}/`` when unset)."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    return {
+        "project_id": str(project_id),
+        "task_branch_prefix": project.task_branch_prefix,
+        "is_default": not _build_config_has_key(project, "task_branch_prefix"),
+    }
+
+
+@router.patch("/projects/{project_id}/task-branch-prefix")
+async def update_task_branch_prefix_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Set the per-project task-branch prefix. Pass null to revert to the derived default."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if "task_branch_prefix" not in body:
+        raise HTTPException(
+            status_code=422,
+            detail="Request body must include 'task_branch_prefix'",
+        )
+
+    prefix = body["task_branch_prefix"]
+    if prefix is not None:
+        if not isinstance(prefix, str) or not prefix.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="'task_branch_prefix' must be a non-empty string or null",
+            )
+        if not _VALID_BRANCH_RE.match(prefix):
+            raise HTTPException(
+                status_code=422,
+                detail="'task_branch_prefix' contains invalid characters",
+            )
+
+    project = await lock_project_or_429(session, project_id)
+    build_config = dict(project.build_config or {})
+    if prefix is None:
+        build_config.pop("task_branch_prefix", None)
+    else:
+        build_config["task_branch_prefix"] = prefix
+    project.build_config = build_config
+    flag_modified(project, "build_config")
+    session.add(project)
+    await session.commit()
+
+    return {
+        "project_id": str(project_id),
+        "task_branch_prefix": project.task_branch_prefix,
+        "is_default": not _build_config_has_key(project, "task_branch_prefix"),
     }
 
 

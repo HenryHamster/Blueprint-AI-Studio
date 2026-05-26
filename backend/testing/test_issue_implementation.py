@@ -354,6 +354,61 @@ async def test_extract_issue_context_caps_body():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
+async def test_base_branch_resolves_from_project(db_session: AsyncSession):
+    """When config has no base_branch, the task payload uses the project's integration_branch."""
+    project = await _create_project(db_session, integration_branch="develop")
+
+    fake_issue = {
+        "title": "Test branch resolution",
+        "body": "Some work.",
+        "labels": [],
+        "number": 77,
+    }
+
+    with (
+        patch(
+            "app.issue_implementation.get_repo_installation_token",
+            new_callable=AsyncMock,
+        ) as mock_token,
+        patch(
+            "app.issue_implementation.get_single_issue", new_callable=AsyncMock
+        ) as mock_issue,
+        patch(
+            "app.issue_implementation.get_issue_comments", new_callable=AsyncMock
+        ) as mock_comments,
+        patch("app.issue_implementation.create_issue_comment", new_callable=AsyncMock),
+        patch(
+            "app.issue_implementation.post_issue_implementation_spawned_message",
+            new_callable=AsyncMock,
+        ) as mock_msg,
+    ):
+        mock_token.return_value = "ghp_fake_token"
+        mock_issue.return_value = fake_issue
+        mock_comments.return_value = []
+        mock_msg.return_value = None
+
+        # Config omits base_branch — should fall back to project.integration_branch
+        await _handle_issue_implementation_inner(
+            owner="acme",
+            repo="webapp",
+            issue_number=77,
+            issue_title="Test branch resolution",
+            project_id=project.id,
+            config={"max_per_hour": 3, "max_concurrent": 3, "default_effort": "high"},
+            session=db_session,
+        )
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    impl_tasks = [t for t in tasks if (t.context or {}).get("issue_implementation")]
+    assert len(impl_tasks) == 1
+    assert impl_tasks[0].first_payload["base_branch"] == "develop"
+
+
 def test_build_issue_prompt():
     """The returned prompt includes the issue title, 'Closes #N', and issue number."""
     context = {

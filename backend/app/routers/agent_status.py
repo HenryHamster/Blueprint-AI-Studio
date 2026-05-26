@@ -1342,7 +1342,6 @@ async def update_agent_status(
                             f"[SMOKETEST] Fix task {existing_fix.id} already exists for smoketest {task.id}, skipping duplicate"
                         )
                     else:
-                        base_branch = (task.first_payload).get("base_branch", "main")
                         # A base_branch==promotion_target smoketest is a post-promotion
                         # (production) failure only when the LTS model is active.
                         # The LTS model is active when the integration trunk and
@@ -1358,6 +1357,9 @@ async def update_agent_status(
                             if _smoketest_project is not None
                             else str(_runtime_config.get("integration_branch", "main"))
                         )
+                        base_branch = (task.first_payload).get(
+                            "base_branch"
+                        ) or _integration_branch
                         is_post_promotion = base_branch == _promotion_target and (
                             _integration_branch != _promotion_target
                         )
@@ -1587,7 +1589,10 @@ async def update_agent_status(
             # If confidence is high, auto-spawn a create task using the fix_prompt
             if debug_data.get("confidence") == "high" and debug_data.get("fix_prompt"):
                 failed_task_id = (task.context or {}).get("failed_task_id", "")
-                base_branch = (task.first_payload).get("base_branch", "main")
+                _debug_project = await session.get(Project, task.project_id)
+                base_branch = (task.first_payload).get(
+                    "base_branch"
+                ) or _get_project_integration_branch(_debug_project)
                 debug_title = task.title or ""
                 fix_title = (
                     debug_title.removeprefix("Debug: ")
@@ -2513,7 +2518,9 @@ async def update_agent_status(
                         _task_type,
                         _proj.task_branch_namespace if _proj else "blueprint",
                     )
-                    _base_branch = (task.first_payload or {}).get("base_branch", "main")
+                    _base_branch = (task.first_payload or {}).get(
+                        "base_branch"
+                    ) or _get_project_integration_branch(_proj)
                     _original_prompt = (task.first_payload or {}).get(
                         "prompt", task.description or ""
                     )
@@ -2993,7 +3000,10 @@ async def update_agent_status(
             )
         )
         if should_auto_debug:
-            base_branch = failed_task_payload.get("base_branch", "main")
+            _auto_debug_project = await session.get(Project, task.project_id)
+            base_branch = failed_task_payload.get(
+                "base_branch"
+            ) or _get_project_integration_branch(_auto_debug_project)
             debug_task = Task(
                 project_id=task.project_id,
                 title=f"Debug: {task.title}",

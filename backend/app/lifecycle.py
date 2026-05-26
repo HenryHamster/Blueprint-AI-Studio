@@ -101,9 +101,10 @@ async def _spawn_crash_investigations(
     )
     spawned_count = 0
     async with AsyncSessionLocal() as session:
-        project_ids = (await session.execute(select(Project.id))).scalars().all()
+        projects = (await session.execute(select(Project))).scalars().all()
 
-        for project_id in project_ids:
+        for project in projects:
+            project_id = project.id
             pid_str = str(project_id)
             if pid_str in inflight:
                 continue
@@ -154,8 +155,8 @@ async def _spawn_crash_investigations(
                 {
                     "type": "investigate",
                     "prompt": prompt,
-                    "base_branch": _shared_state.runtime_config.get(
-                        "integration_branch", "main"
+                    "base_branch": _shared_state.get_project_integration_branch(
+                        project
                     ),
                 },
                 "lifecycle:crash_investigation",

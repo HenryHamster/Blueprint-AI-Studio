@@ -61,6 +61,12 @@ export function ProjectBuildConfigSection({
   const [enableParallelFix, setEnableParallelFix] = useState(
     buildConfig?.enable_parallel_fix ?? false
   );
+  const [taskBranchNamespace, setTaskBranchNamespace] = useState(
+    buildConfig?.task_branch_namespace ?? ''
+  );
+  const [taskBranchPrefix, setTaskBranchPrefix] = useState(
+    buildConfig?.task_branch_prefix ?? ''
+  );
   const [saving, setSaving] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [srTargets, setSrTargets] = useState<Record<string, number>>({});
@@ -73,6 +79,8 @@ export function ProjectBuildConfigSection({
     setEnableFreshReviewer(buildConfig?.enable_fresh_reviewer ?? false);
     setEnableParallelReview(buildConfig?.enable_parallel_review ?? false);
     setEnableParallelFix(buildConfig?.enable_parallel_fix ?? false);
+    setTaskBranchNamespace(buildConfig?.task_branch_namespace ?? '');
+    setTaskBranchPrefix(buildConfig?.task_branch_prefix ?? '');
   }, [buildConfig]);
 
   // Load SR catch-rate targets from the project when projectId changes
@@ -98,6 +106,8 @@ export function ProjectBuildConfigSection({
         enable_fresh_reviewer: enableFreshReviewer,
         enable_parallel_review: enableParallelReview,
         enable_parallel_fix: enableParallelFix,
+        task_branch_namespace: taskBranchNamespace.trim() || undefined,
+        task_branch_prefix: taskBranchPrefix.trim() || undefined,
       });
       if (projectId) {
         await apiFetch(`/api/admin/projects/${projectId}`, {
@@ -401,6 +411,44 @@ export function ProjectBuildConfigSection({
               </p>
             </div>
           </label>
+        </div>
+      )}
+
+      {/* Task Branch Naming */}
+      {hasConfig && (
+        <div>
+          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Task Branch Naming</h3>
+          <p className="text-[11px] text-neutral-600 mb-3">
+            Controls the leading segment of agent task branches. Default namespace is <code className="font-mono text-neutral-400">blueprint</code>.
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs text-neutral-400 mb-1">Namespace</label>
+              <input
+                type="text"
+                value={taskBranchNamespace}
+                onChange={e => setTaskBranchNamespace(e.target.value)}
+                placeholder="blueprint"
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              />
+              <p className="text-[11px] text-neutral-600 mt-1">
+                Leading segment of agent task branches, e.g. <code className="font-mono text-neutral-400">{(taskBranchNamespace.trim() || 'blueprint')}/task-…</code>.
+              </p>
+            </div>
+            <div>
+              <label className="block text-xs text-neutral-400 mb-1">Prefix</label>
+              <input
+                type="text"
+                value={taskBranchPrefix}
+                onChange={e => setTaskBranchPrefix(e.target.value)}
+                placeholder="blueprint/"
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              />
+              <p className="text-[11px] text-neutral-600 mt-1">
+                Legacy override. Leave blank to derive from namespace.
+              </p>
+            </div>
+          </div>
         </div>
       )}
 

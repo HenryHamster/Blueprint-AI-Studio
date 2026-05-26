@@ -1101,7 +1101,10 @@ async def _handle_security_audit_completion(
     session.add(task)
     await session.commit()
 
-    base_branch = (task.first_payload).get("base_branch", "main")
+    project = await session.get(Project, task.project_id)
+    base_branch = (task.first_payload).get(
+        "base_branch", get_project_integration_branch(project)
+    )
 
     # Spawn create tasks for critical and high severity findings
     actionable = [f for f in findings if f.get("severity") in ("critical", "high")]
@@ -1266,7 +1269,10 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
     session.add(task)
     await session.commit()
 
-    base_branch = (task.first_payload).get("base_branch", "main")
+    project = await session.get(Project, task.project_id)
+    base_branch = (task.first_payload).get(
+        "base_branch", get_project_integration_branch(project)
+    )
 
     # Collect high-severity findings (capped at 10 as before)
     actionable = [f for f in findings if f.get("severity") == "high"]
