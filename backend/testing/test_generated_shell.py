@@ -624,6 +624,62 @@ def test_static_script_bash_syntax(path: Path, bash_executable: str | None):
     assert result.returncode == 0, f"bash -n failed on {path}:\n{result.stderr}"
 
 
+# ---------------------------------------------------------------------------
+# Packer bake-time memo smoke contract
+# ---------------------------------------------------------------------------
+# These tests lock in the memo-handler exercise that agent.pkr.hcl runs
+# before tagging blueprint-agent-v2. A future packer edit that silently
+# drops or weakens the smoke step will fail here before any image is tagged.
+
+
+_PACKER_HCL = (
+    Path(__file__).resolve().parent.parent.parent / "infra" / "packer" / "agent.pkr.hcl"
+)
+
+
+def _read_packer_hcl() -> str:
+    if not _PACKER_HCL.exists():
+        pytest.skip("infra/packer/agent.pkr.hcl not present (backend-only Docker run)")
+    return _PACKER_HCL.read_text(encoding="utf-8")
+
+
+class TestPackerMemoBakeContract:
+    """agent.pkr.hcl must gate image tagging on a live memo smoke run."""
+
+    def test_smoke_sentinel_present(self):
+        """Build must emit PACKER_MEMO_SMOKE_OK so the provisioner can gate
+        on the sentinel; without it a silent failure passes undetected."""
+        assert "PACKER_MEMO_SMOKE_OK" in _read_packer_hcl(), (
+            "agent.pkr.hcl must emit PACKER_MEMO_SMOKE_OK after the memo smoke. "
+            "Restore the step or re-add the sentinel."
+        )
+
+    def test_smoke_imports_runtime_entrypoint(self):
+        """Smoke must exercise src/handlers/index.ts — the actual shipped
+        entrypoint — not a test double. Wrong module defeats the purpose."""
+        hcl = _read_packer_hcl()
+        assert "src/handlers/index.ts" in hcl, (
+            "agent.pkr.hcl memo smoke must import src/handlers/index.ts."
+        )
+        assert "handlers.memo(" in hcl, (
+            "agent.pkr.hcl memo smoke must call handlers.memo()."
+        )
+
+    def test_smoke_validates_completed_status(self):
+        """Fetch stub must assert COMPLETED; accepting any status cannot
+        catch a handler that swallows the completion path."""
+        assert "COMPLETED" in _read_packer_hcl(), (
+            "agent.pkr.hcl memo smoke must assert status=COMPLETED."
+        )
+
+    def test_smoke_validates_log_fragment(self):
+        """Fetch stub must also check log content so a handler that posts
+        COMPLETED with empty logs is still caught at bake time."""
+        assert "stale memo runtime" in _read_packer_hcl(), (
+            "agent.pkr.hcl memo smoke must validate logs contain 'stale memo runtime'."
+        )
+
+
 @pytest.mark.parametrize("path", _STATIC_PARAMS)
 def test_static_script_shellcheck(path: Path, shellcheck_available: bool):
     if not shellcheck_available:

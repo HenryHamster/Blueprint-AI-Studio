@@ -111,6 +111,10 @@ build {
       "# npm ci wrapped in a single retry: esbuild's postinstall writes its native",
       "# binary then immediately execs it, which can intermittently race to ETXTBSY.",
       "cd /opt/agent && (npm ci || (sleep 5 && npm ci))",
+      "# Compute a stable content-hash fingerprint of the baked agent source so",
+      "# heartbeats and stale-image diagnostics can identify exactly which runtime",
+      "# revision is running, independent of image name or build timestamp.",
+      "AGENT_FINGERPRINT=$(find /opt/agent/src -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | awk '{print $1}') && echo \"AGENT_RUNTIME_FINGERPRINT=$AGENT_FINGERPRINT\" | sudo tee /opt/agent/AGENT_RUNTIME_FINGERPRINT && echo PACKER_FINGERPRINT_OK",
       "sudo chown -R agent:agent /opt/agent",
       "sudo touch /etc/agent.env",
       "sudo chmod 644 /etc/agent.env",
@@ -175,7 +179,10 @@ build {
       "sudo -u agent -H bash -c 'cd /opt/agent && npx --yes playwright@1.59.1 --version'",
       "# The find runs as the agent user too — the browser cache lives under",
       "# /home/agent and is not readable by the packer provisioner user.",
-      "sudo -u agent -H bash -c 'find /home/agent/.cache/ms-playwright -name chrome -type f | grep . && echo PACKER_SMOKE_OK || { echo PACKER_SMOKE_FAIL: Chromium binary not found after playwright install; exit 1; }'"
+      "sudo -u agent -H bash -c 'find /home/agent/.cache/ms-playwright -name chrome -type f | grep . && echo PACKER_SMOKE_OK || { echo PACKER_SMOKE_FAIL: Chromium binary not found after playwright install; exit 1; }'",
+      "# Exercise the shipped memo handler through the runtime TS entrypoint with a",
+      "# deterministic dispatcher memo payload and a localhost fetch stub.",
+      "sudo -u agent -H bash -lc 'cd /opt/agent && ORCHESTRATOR_URL=http://127.0.0.1:9 AGENT_TOKEN=packer-smoke node --import tsx --input-type=module --eval \"Object.defineProperty(globalThis, \\\"fetch\\\", { value: async (url, init = {}) => { const target = String(url); if (target.endsWith(\\\"/api/agent/status\\\") && init.method === \\\"POST\\\") { const body = JSON.parse(String(init.body ?? \\\"{}\\\")); if (body.status !== \\\"COMPLETED\\\" || !String(body.logs ?? \\\"\\\").includes(\\\"stale memo runtime\\\")) throw new Error(\\\"unexpected status payload: \\\" + String(body.status) + \\\" \\\" + String(body.logs ?? \\\"\\\").slice(0, 200)); return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { \\\"Content-Type\\\": \\\"application/json\\\" } }); } throw new Error(\\\"unexpected fetch: \\\" + target); }, configurable: true }); const { handlers } = await import(\\\"./src/handlers/index.ts\\\"); await handlers.memo(\\\"packer-memo-smoke\\\", { reasoning_kind: \\\"regression_false_positive\\\", source_task_id: \\\"task-123\\\", source_finding: { verdict_reason: \\\"stale memo runtime\\\", investigation_summary: \\\"smoke check\\\", regression_class: \\\"memo\\\" } }, { title: \\\"Memo smoke\\\", description: \\\"\\\", context: {} }, \\\"gh\\\", \\\"owner\\\", \\\"repo\\\", null, { value: \\\"\\\" });\" && echo PACKER_MEMO_SMOKE_OK'"
     ]
   }
 }

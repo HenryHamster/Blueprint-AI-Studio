@@ -64,6 +64,9 @@ _vm_zones: dict[str, str] = {}
 # Track per-VM image identity reported via heartbeats: vm_id -> (image_name, build_ts)
 _vm_images: dict[str, tuple[str | None, int | None]] = {}
 
+# Track per-VM agent runtime fingerprint (64-hex SHA-256) reported via heartbeat.
+_vm_runtime_fingerprints: dict[str, str] = {}
+
 # Track when each VM's provisioning slot was actually acquired (ISO timestamp string).
 # Written by _provision_gcp after both Redis and local semaphore guards are passed;
 # read by the orchestrator to populate _cold_start_stages["provision_slot_acquired_at"].
@@ -524,9 +527,31 @@ def get_vm_image(vm_instance_id: str) -> tuple[str | None, int | None]:
     return _vm_images.get(vm_instance_id, (None, None))
 
 
+def record_vm_runtime_fingerprint(vm_instance_id: str, fingerprint: str) -> None:
+    """Record the agent-runtime SHA-256 fingerprint reported by a VM via heartbeat."""
+    if not vm_instance_id:
+        return
+    _vm_runtime_fingerprints[vm_instance_id] = fingerprint
+    logger.debug(
+        f"[COMPUTE] VM {vm_instance_id} agent_runtime_fingerprint={fingerprint[:12]}…"
+    )
+
+
+def get_vm_runtime_fingerprint(vm_instance_id: str) -> str | None:
+    """Return the agent-runtime fingerprint for a VM, or None if not yet reported."""
+    return _vm_runtime_fingerprints.get(vm_instance_id)
+
+
 def get_provision_slot_acquired_at(vm_instance_id: str) -> str | None:
     """Return the ISO timestamp when this VM's provisioning slot was acquired, or None."""
     return _vm_provision_slot_times.get(vm_instance_id)
+
+
+def _clear_vm_heartbeat_state(vm_instance_id: str) -> None:
+    """Drop heartbeat-derived metadata once a VM is no longer running."""
+    _vm_images.pop(vm_instance_id, None)
+    _vm_runtime_fingerprints.pop(vm_instance_id, None)
+    _vm_provision_slot_times.pop(vm_instance_id, None)
 
 
 def get_stale_image_vms(threshold_hours: int | None = None) -> list[dict]:
@@ -550,6 +575,7 @@ def get_stale_image_vms(threshold_hours: int | None = None) -> list[dict]:
                     "image_name": image_name,
                     "build_ts": build_ts,
                     "age_hours": round((time.time() - build_ts) / 3600, 1),
+                    "agent_runtime_fingerprint": _vm_runtime_fingerprints.get(vm_id),
                 }
             )
     return stale
@@ -731,6 +757,7 @@ async def _provision_local(
                 await asyncio.to_thread(proc.wait)
             finally:
                 _local_processes.pop(vm_instance_id, None)
+                _clear_vm_heartbeat_state(vm_instance_id)
                 logger.info(
                     f"[LOCAL] Agent subprocess exited (PID: {proc.pid}, code: {proc.returncode})"
                 )
@@ -765,6 +792,7 @@ async def _delete_local(vm_instance_id: str):
             shutil.rmtree(local_root, ignore_errors=True)
     except Exception:
         logger.warning(f"[LOCAL] Failed to clean manifest files for {vm_instance_id}")
+    _clear_vm_heartbeat_state(vm_instance_id)
     return True
 
 
@@ -1612,8 +1640,6 @@ async def _delete_gcp(vm_instance_id: str):
         zones_to_try = []
         with _zone_lock:
             known_zone = _vm_zones.pop(vm_instance_id, None)
-        _vm_images.pop(vm_instance_id, None)
-        _vm_provision_slot_times.pop(vm_instance_id, None)
         if known_zone:
             zones_to_try.append(known_zone)
         zones_to_try.extend(z for z, _ in FALLBACK_ZONES if z not in zones_to_try)
@@ -1651,6 +1677,7 @@ async def _delete_gcp(vm_instance_id: str):
             _deleted_zone, serial_tail = await asyncio.wait_for(
                 asyncio.to_thread(_find_capture_and_delete), timeout=240
             )
+        _clear_vm_heartbeat_state(vm_instance_id)
 
         if serial_tail:
             logger.info(f"[VM-SERIAL] {vm_instance_id} last output:\n{serial_tail}")

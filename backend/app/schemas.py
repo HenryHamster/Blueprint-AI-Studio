@@ -125,6 +125,12 @@ class HeartbeatRequest(BaseModel):
     # Unix timestamp (seconds) extracted from the image name suffix, e.g.
     # "blueprint-agent-v2-1730000000" → 1730000000. None when unparseable.
     vm_image_build_ts: int | None = None
+    # SHA-256 fingerprint of the agent source files baked into the VM image,
+    # written to /opt/agent/AGENT_RUNTIME_FINGERPRINT during Packer bake and
+    # read at agent startup. Lets stale-image diagnostics distinguish a
+    # recently-built image with an older agent runtime from the current one.
+    # None on local dev or pre-fingerprint images.
+    agent_runtime_fingerprint: str | None = Field(None, pattern="^[0-9a-f]{64}$")
     # Cumulative per-task LLM telemetry. Optional/backwards-compatible — older
     # agents that don't yet emit these fields silently skip persistence; newer
     # agents send running totals on every heartbeat. Persisted into

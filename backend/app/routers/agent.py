@@ -3588,6 +3588,15 @@ async def agent_heartbeat(
             token.get("vm_instance_id"), req.vm_image_name, req.vm_image_build_ts
         )
 
+    # Record agent runtime fingerprint for stale-image diagnostics. Distinct from
+    # image identity: two images with the same build_ts may ship different agent code.
+    if req.agent_runtime_fingerprint is not None:
+        from app.compute import record_vm_runtime_fingerprint
+
+        record_vm_runtime_fingerprint(
+            token.get("vm_instance_id"), req.agent_runtime_fingerprint
+        )
+
     session.add(task)
     await session.commit()
 
@@ -3626,6 +3635,7 @@ class VmHeartbeatRequest(BaseModel):
     # never run a task heartbeat.
     vm_image_name: str | None = Field(None, max_length=200)
     vm_image_build_ts: int | None = None
+    agent_runtime_fingerprint: str | None = Field(None, pattern="^[0-9a-f]{64}$")
 
 
 @router.post("/vm-heartbeat", status_code=204)
@@ -3651,6 +3661,10 @@ async def vm_heartbeat(
         from app.compute import record_vm_image
 
         record_vm_image(req.vm_instance_id, req.vm_image_name, req.vm_image_build_ts)
+    if req.agent_runtime_fingerprint is not None:
+        from app.compute import record_vm_runtime_fingerprint
+
+        record_vm_runtime_fingerprint(req.vm_instance_id, req.agent_runtime_fingerprint)
     return Response(status_code=204)
 
 

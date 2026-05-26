@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, isViewportBootstrapFailure, isInfrastructureFailure, runViewportSuiteWithFallback, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, TASK_TYPE_BRANCH_PREFIX, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, isViewportBootstrapFailure, isInfrastructureFailure, runViewportSuiteWithFallback, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, TASK_TYPE_BRANCH_PREFIX, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -3858,6 +3858,82 @@ describe('fetchVmImageIdentity', () => {
     const result = await fetchVmImageIdentity();
     expect(result.image_name).toBe('blueprint-agent-v2');
     expect(result.image_ts).toBeNull();
+  });
+});
+
+describe('agent runtime fingerprint heartbeats', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+  const runtimeFingerprint = 'a'.repeat(64);
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    _setAgentRuntimeFingerprintForTesting(runtimeFingerprint);
+  });
+
+  afterEach(() => {
+    _stopHeartbeatForTesting();
+    _setAgentRuntimeFingerprintForTesting(null);
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('includes agent_runtime_fingerprint in /api/agent/vm-heartbeat payloads', async () => {
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      return Promise.resolve({
+        status: 200,
+        json: () => Promise.resolve({ action: 'exit', reason: 'done' }),
+      });
+    });
+
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-runtime-fp',
+      priorTaskId: 'task-runtime-fp',
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'jwt-runtime-fp',
+      pollIntervalMs: 10,
+      timeoutMs: 1000,
+      heartbeatIntervalMs: 60_000,
+    });
+
+    expect(result).toEqual({ action: 'exit', reason: 'done' });
+    const vmHeartbeatCall = fetchMock.mock.calls.find(
+      ([url]) => String(url).endsWith('/api/agent/vm-heartbeat'),
+    );
+    expect(vmHeartbeatCall).toBeDefined();
+    const vmHeartbeatBody = (vmHeartbeatCall?.[1] as RequestInit | undefined)?.body;
+    expect(typeof vmHeartbeatBody).toBe('string');
+    const body = JSON.parse(
+      defined(typeof vmHeartbeatBody === 'string' ? vmHeartbeatBody : undefined),
+    ) as { agent_runtime_fingerprint?: string };
+    expect(body.agent_runtime_fingerprint).toBe(runtimeFingerprint);
+  });
+
+  it('includes agent_runtime_fingerprint in /api/agent/heartbeat payloads', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({}),
+    });
+
+    _startHeartbeatForTesting('task-runtime-fp', () => 'heartbeat-ok');
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const heartbeatCall = fetchMock.mock.calls.find(
+      ([url]) => String(url).endsWith('/api/agent/heartbeat'),
+    );
+    expect(heartbeatCall).toBeDefined();
+    const heartbeatBody = (heartbeatCall?.[1] as RequestInit | undefined)?.body;
+    expect(typeof heartbeatBody).toBe('string');
+    const body = JSON.parse(
+      defined(typeof heartbeatBody === 'string' ? heartbeatBody : undefined),
+    ) as { task_id?: string; agent_runtime_fingerprint?: string };
+    expect(body.task_id).toBe('task-runtime-fp');
+    expect(body.agent_runtime_fingerprint).toBe(runtimeFingerprint);
   });
 });
 

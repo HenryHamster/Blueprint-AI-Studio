@@ -313,6 +313,11 @@ export const GIT_REFERENCE_CACHE_ROOT = process.env.GIT_REFERENCE_CACHE_ROOT || 
 // compute._vm_images and skew get_stale_image_vms accounting).
 let vmImageName: string | null = null;
 let vmImageTs: number | null = null;
+// Content-hash fingerprint of /opt/agent/src baked into the image by packer
+// (see infra/packer/agent.pkr.hcl). Read once at startup and included in
+// vm-heartbeats and task heartbeats so stale-image diagnostics can identify
+// the exact agent runtime revision independently of image name or build timestamp.
+let agentRuntimeFingerprint: string | null = null;
 
 /** Fetch the GCP boot-disk image path from the instance metadata service.
  *  Returns the short image name and extracted unix build timestamp, or
@@ -337,6 +342,20 @@ export async function fetchVmImageIdentity(): Promise<{ image_name: string | nul
     return { image_name: name, image_ts };
   } catch {
     return { image_name: null, image_ts: null };
+  }
+}
+
+/** Read the baked agent-runtime fingerprint from the well-known path written
+ *  by the packer provisioner. Returns null in local dev / test environments
+ *  where the file is absent so callers can distinguish "no fingerprint" from
+ *  a real hash. */
+export function readAgentRuntimeFingerprint(): string | null {
+  try {
+    const raw = fs.readFileSync('/opt/agent/AGENT_RUNTIME_FINGERPRINT', 'utf-8').trim();
+    const m = /^AGENT_RUNTIME_FINGERPRINT=([0-9a-f]{64})$/.exec(raw);
+    return m ? m[1] : null;
+  } catch {
+    return null;
   }
 }
 
@@ -841,7 +860,7 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
         const res = await fetch(`${apiBase}/api/agent/vm-heartbeat`, {
           method: 'POST',
           headers,
-          body: JSON.stringify({ vm_instance_id: vmInstanceId, vm_image_name: vmImageName, vm_image_build_ts: vmImageTs }),
+          body: JSON.stringify({ vm_instance_id: vmInstanceId, vm_image_name: vmImageName, vm_image_build_ts: vmImageTs, agent_runtime_fingerprint: agentRuntimeFingerprint }),
         });
         if (res.status === 401 || res.status === 403) {
           log(`pollForNextRole vm-heartbeat got ${String(res.status)} — auth revoked, will exit poll`);
@@ -862,7 +881,7 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
       const res = await fetch(`${apiBase}/api/agent/vm-heartbeat`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ vm_instance_id: vmInstanceId, vm_image_name: vmImageName, vm_image_build_ts: vmImageTs }),
+        body: JSON.stringify({ vm_instance_id: vmInstanceId, vm_image_name: vmImageName, vm_image_build_ts: vmImageTs, agent_runtime_fingerprint: agentRuntimeFingerprint }),
       });
       if (res.status === 401 || res.status === 403) {
         log(`pollForNextRole initial vm-heartbeat got ${String(res.status)} — auth revoked, will exit poll`);
@@ -1002,6 +1021,11 @@ export function _setWarmStartForTesting(value: boolean): void {
 /** Test-only: read the warm-start flag. */
 export function _getWarmStartForTesting(): boolean {
   return isWarmStart;
+}
+
+/** Test-only: set the baked agent-runtime fingerprint used in heartbeats. */
+export function _setAgentRuntimeFingerprintForTesting(value: string | null): void {
+  agentRuntimeFingerprint = value;
 }
 
 export function snapshotToolTrace(): ToolTraceEntry[] {
@@ -1147,6 +1171,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         tool_trace: snapshotToolTrace(),
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
         ...(currentPromptFingerprint ? { prompt_fingerprint: currentPromptFingerprint } : {}),
+        ...(agentRuntimeFingerprint ? { agent_runtime_fingerprint: agentRuntimeFingerprint } : {}),
         ...getLlmTelemetry(),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('initial', start, Date.now(), 'ok');
@@ -1191,6 +1216,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         tool_trace: snapshotToolTrace(),
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
         ...(currentPromptFingerprint ? { prompt_fingerprint: currentPromptFingerprint } : {}),
+        ...(agentRuntimeFingerprint ? { agent_runtime_fingerprint: agentRuntimeFingerprint } : {}),
         ...getLlmTelemetry(),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('periodic', start, Date.now(), 'ok');
@@ -1254,6 +1280,16 @@ function stopHeartbeat() {
   // a stuck heartbeat at role-end would leave the flag true and the new
   // task's first periodic tick would skip-and-log instead of firing.
   heartbeatInFlight = false;
+}
+
+/** Test-only: drive the heartbeat loop without running main(). */
+export function _startHeartbeatForTesting(taskId: string, getMessage: () => string): void {
+  startHeartbeat(taskId, getMessage);
+}
+
+/** Test-only: stop the heartbeat loop between unit tests. */
+export function _stopHeartbeatForTesting(): void {
+  stopHeartbeat();
 }
 
 /** Synchronous heartbeat — use between blocking execFileSync calls to prevent reaper from killing us.
@@ -4310,6 +4346,8 @@ async function main() {
     vmImageTs = id.image_ts;
     log(`VM image: ${vmImageName ?? '<unknown>'}${vmImageTs ? ` (ts=${vmImageTs})` : ''}`);
   }
+  agentRuntimeFingerprint = readAgentRuntimeFingerprint();
+  log(`Agent runtime fingerprint: ${agentRuntimeFingerprint ?? '<not available>'}`);
 
   // Retry any stale result files from previous runs (network failure / VM kill mid-POST)
   try {
