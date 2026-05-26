@@ -2174,6 +2174,28 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                         f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — update_branch succeeded, skipped merge"
                                     )
                                     return
+                                if _upd.get("not_behind"):
+                                    # GitHub's cached mergeable_state was stale —
+                                    # the PR is not actually behind (no new commits
+                                    # on base). Treat exactly like the
+                                    # pr_is_not_behind=True short-circuit: clear
+                                    # any prior retry counter and defer to the
+                                    # next sweep without escalating to fix-spawn.
+                                    _new_ctx = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
+                                    _new_ctx.pop("_behind_update_retries", None)
+                                    parent.context = _new_ctx
+                                    parent.latest_status_message = (
+                                        f"Rollup PR #{rollup_pr_number} not behind {target_branch} "
+                                        f"(no new commits on base) — cached mergeable_state was stale, "
+                                        f"deferring to next sweep"
+                                    )
+                                    session.add(parent)
+                                    await session.commit()
+                                    logger.info(
+                                        f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — "
+                                        f"update_branch reports no new commits on base, deferring to next sweep"
+                                    )
+                                    return
                                 _behind_retries = parent_ctx.get("_behind_update_retries", 0) + 1
                                 _behind_budget = _runtime_config.get("rollup_behind_update_retries", 3)
                                 _upd_msg = _upd.get("message") or "unknown"
@@ -2435,6 +2457,30 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 await session.commit()
                                 logger.info(
                                     f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — update_branch succeeded, skipped fix spawn"
+                                )
+                                return
+                            if _upd.get("not_behind"):
+                                # GitHub's cached mergeable_state was stale — the PR
+                                # is not actually behind (no new commits on base).
+                                # Treat as a successful no-op: clear any prior retry
+                                # counter and defer to the next sweep.
+                                _new_ctx = {
+                                    **parent_ctx,
+                                    "rollup_pr_url": rollup_pr_url,
+                                    "rollup_pr_number": rollup_pr_number,
+                                }
+                                _new_ctx.pop("_behind_update_retries", None)
+                                parent.context = _new_ctx
+                                parent.latest_status_message = (
+                                    f"Rollup PR #{rollup_pr_number} not behind {target_branch} "
+                                    f"(no new commits on base) — cached mergeable_state was stale, "
+                                    f"deferring to next sweep"
+                                )
+                                session.add(parent)
+                                await session.commit()
+                                logger.info(
+                                    f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — "
+                                    f"update_branch reports no new commits on base, deferring to next sweep"
                                 )
                                 return
                             # update_branch failed — this is a transient GitHub API error,

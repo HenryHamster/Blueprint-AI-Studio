@@ -970,6 +970,127 @@ class TestUpdateProjectOwnerOnlyFields:
         assert (project.build_config or {}).get("pr_title_prefix") == "[bot] "
 
 
+class TestBuildConfigLintWarnings:
+    """Operator-visible warnings when build_config.directories[*].lint_cmd
+    is non-empty but is not a recognized linter prefix.
+
+    The agent's verbatim fallback is intentional — this surface only adds
+    visibility, it must not reject or rewrite the lint command.
+    """
+
+    @pytest.mark.asyncio
+    async def test_patch_returns_warning_for_unrecognized_lint_cmd(
+        self, client: AsyncClient, db_session
+    ):
+        """PATCH /projects/{id} attaches a warning when lint_cmd is unrecognized."""
+        project = await _make_project(db_session, name="warn-test")
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "build_config": {
+                    "directories": [
+                        {
+                            "path": "./backend",
+                            "type": "python",
+                            "lint_cmd": "make lint",
+                        },
+                        {
+                            "path": "./admin-ui",
+                            "type": "node",
+                            "lint_cmd": "npx eslint .",
+                        },
+                    ]
+                }
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        warnings = body.get("build_config_warnings")
+        assert isinstance(warnings, list)
+        assert len(warnings) == 1
+        assert "./backend" in warnings[0]
+        assert "make lint" in warnings[0]
+        # Existing response shape preserved — top-level build_config still present.
+        assert isinstance(body.get("build_config"), dict)
+        assert len(body["build_config"].get("directories", [])) == 2
+
+    @pytest.mark.asyncio
+    async def test_patch_returns_empty_warnings_when_all_recognized(
+        self, client: AsyncClient, db_session
+    ):
+        """All recognized lint_cmd values produce no warnings."""
+        project = await _make_project(db_session, name="warn-test-empty")
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "build_config": {
+                    "directories": [
+                        {
+                            "path": "./backend",
+                            "type": "python",
+                            "lint_cmd": "ruff check .",
+                        },
+                        {
+                            "path": "./admin-ui",
+                            "type": "node",
+                            "lint_cmd": "npx eslint .",
+                        },
+                    ]
+                }
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json().get("build_config_warnings") == []
+
+    @pytest.mark.asyncio
+    async def test_get_project_returns_warnings_from_stored_config(
+        self, client: AsyncClient, db_session
+    ):
+        """GET /projects/{id} surfaces warnings from the persisted build_config."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="warn-get")
+        project.build_config = {
+            "directories": [
+                {"path": "./svc", "type": "python", "lint_cmd": "./lint.sh"}
+            ]
+        }
+        flag_modified(project, "build_config")
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}")
+        assert resp.status_code == 200
+        warnings = resp.json().get("build_config_warnings")
+        assert isinstance(warnings, list)
+        assert len(warnings) == 1
+        assert "./svc" in warnings[0]
+        assert "./lint.sh" in warnings[0]
+
+    @pytest.mark.asyncio
+    async def test_list_projects_returns_warnings_per_item(
+        self, client: AsyncClient, db_session
+    ):
+        """GET /projects (list) attaches warnings on each item."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="warn-list")
+        project.build_config = {
+            "directories": [{"path": "./a", "type": "other", "lint_cmd": "make a-lint"}]
+        }
+        flag_modified(project, "build_config")
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/projects")
+        assert resp.status_code == 200
+        items = resp.json().get("items", [])
+        target = next((p for p in items if p["name"] == "warn-list"), None)
+        assert target is not None
+        warnings = target.get("build_config_warnings")
+        assert isinstance(warnings, list)
+        assert len(warnings) == 1
+        assert "./a" in warnings[0]
+
+
 class TestDeleteProject:
     @pytest.mark.asyncio
     async def test_delete_project_no_active_tasks(

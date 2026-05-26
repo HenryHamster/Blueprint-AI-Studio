@@ -2830,6 +2830,80 @@ async def test_rollup_clean_pr_skips_update_branch_despite_sha_mismatch(
     )
 
 
+@pytest.mark.asyncio
+async def test_rollup_premerge_no_new_commits_clears_counter(rollup_db, mocker):
+    """Pre-merge SHA-mismatch path: when update_branch reports the canonical
+    'no new commits on base' 422 (i.e. not_behind=True), the rollup must clear
+    any prior retry counter and defer to the next sweep without spawning a fix —
+    even when the counter is one short of the budget."""
+    _patch_behind_branch_mocks(
+        mocker,
+        {
+            "updated": False,
+            "not_behind": True,
+            "message": "There are no new commits on the base branch.",
+        },
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, None)),
+    )
+    mock_alert = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+    # Seed counter one short of default budget — even on the edge, a
+    # not_behind result must NOT trip fix-spawn.
+    parent.context = {**(parent.context or {}), "_behind_update_retries": 2}
+    rollup_db.add(parent)
+    await rollup_db.commit()
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+
+    assert "_behind_update_retries" not in (parent.context or {}), (
+        "not_behind result must clear the retry counter"
+    )
+    assert mock_spawn.await_count == 0, (
+        "not_behind result must NOT escalate to fix spawn"
+    )
+    assert mock_alert.await_count == 0
+    msg = (parent.latest_status_message or "").lower()
+    assert "not behind" in msg or "no new commits" in msg
+
+
+@pytest.mark.asyncio
+async def test_rollup_premerge_unrelated_422_still_increments_counter(
+    rollup_db, mocker
+):
+    """Regression guard: a 422 with an UNRELATED message ('Update is not possible')
+    must still increment _behind_update_retries — only the canonical 'no new
+    commits on base' phrase triggers the not_behind short-circuit."""
+    _patch_behind_branch_mocks(
+        mocker,
+        {"updated": False, "message": "Update is not possible"},
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, None)),
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+
+    assert (parent.context or {}).get("_behind_update_retries") == 1, (
+        "unrelated 422 must still bump the retry counter"
+    )
+    assert mock_spawn.await_count == 0
+
+
 # ── Strategic Completion Handler ─────────────────────────────────────────────
 
 

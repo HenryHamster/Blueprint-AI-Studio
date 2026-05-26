@@ -457,6 +457,15 @@ async def _attempt_merge_with_retry_and_escalation(
                 except Exception as e:
                     _upd = {"updated": False, "message": str(e)[:200]}
                     logger.warning(f"[CI] PR #{ci_pr_number} update_branch raised: {e}")
+                else:
+                    # Tag the canonical "no new commits on the base branch" 422
+                    # so the existing `_upd.get("not_behind")` short-circuit in
+                    # the merge-failure branch below treats it as a stale-cache
+                    # signal rather than a transient failure that increments
+                    # update_branch_failures.
+                    from app.github import _tag_not_behind_if_no_new_commits
+
+                    _upd = _tag_not_behind_if_no_new_commits(_upd)
 
     # ── RE-ACQUIRE FOR UPDATE FOR FINAL DB MUTATIONS ──────────────────────
     # All GitHub I/O above ran with no row lock held. Now re-acquire briefly

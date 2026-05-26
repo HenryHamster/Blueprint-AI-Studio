@@ -63,6 +63,7 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
             {
                 "path": "./",
                 "type": "python",
+                "lint_cmd": "ruff check",
                 "test_cmd": "pytest",
             }
         )
@@ -143,6 +144,7 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
                 {
                     "path": f"{subdir}/",
                     "type": "python",
+                    "lint_cmd": "ruff check",
                     "test_cmd": "pytest",
                 }
             )

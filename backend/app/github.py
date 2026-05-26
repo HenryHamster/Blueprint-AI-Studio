@@ -2210,6 +2210,33 @@ async def update_branch(
     )
 
 
+# GitHub's canonical 422 reply when /update-branch is called but the PR's
+# base ref has no commits the head ref doesn't already contain. This is a
+# *positive* signal: the PR is not behind despite a stale cached
+# mergeable_state. We tag the response with `not_behind=True` so callers
+# can short-circuit just like the pr_is_not_behind=True path instead of
+# treating it as a transient update-branch failure that burns a retry.
+_UPDATE_BRANCH_NO_NEW_COMMITS_PHRASE = "no new commits on the base branch"
+
+
+def _is_no_new_commits_message(message: str | None) -> bool:
+    if not message:
+        return False
+    return _UPDATE_BRANCH_NO_NEW_COMMITS_PHRASE in message.strip().lower()
+
+
+def _tag_not_behind_if_no_new_commits(result: dict) -> dict:
+    """Annotate an update_branch result with `not_behind=True` when GitHub's
+    message indicates the PR has nothing on base to incorporate."""
+    if (
+        not result.get("updated")
+        and _is_no_new_commits_message(result.get("message"))
+        and not result.get("not_behind")
+    ):
+        return {**result, "not_behind": True}
+    return result
+
+
 async def update_branch_with_sha_retry(
     token: str,
     owner: str,
@@ -2227,6 +2254,11 @@ async def update_branch_with_sha_retry(
     mismatch and always attempt the refetch+retry path once. If the fresh SHA
     equals the original, no retry is made. The extra API call is trivial compared
     to spawning a fix VM. Returns the same {"updated": bool, "message": str} shape.
+
+    When GitHub responds with the canonical "no new commits on the base branch"
+    message, the PR is not actually behind (cached mergeable_state is stale);
+    the result is tagged with ``not_behind=True`` so callers can skip retry/fix
+    escalation, mirroring the existing ``pr_is_not_behind`` short-circuit.
     """
     try:
         result = await update_branch(
@@ -2243,6 +2275,13 @@ async def update_branch_with_sha_retry(
         return {"updated": False, "message": f"{type(exc).__name__}: {exc}"}
     if result.get("updated"):
         return result
+    result = _tag_not_behind_if_no_new_commits(result)
+    if result.get("not_behind"):
+        logger.info(
+            f"[UPDATE-BRANCH] PR #{pr_number} not-behind (no new commits on base) — "
+            f"skipping retry, deferring to next sweep"
+        )
+        return result
     try:
         fresh = await get_pull_request(
             token, owner, repo, pr_number, project_id=project_id
@@ -2258,7 +2297,7 @@ async def update_branch_with_sha_retry(
         f"(prior failure: {result.get('message')})"
     )
     try:
-        return await update_branch(
+        retry_result = await update_branch(
             token,
             owner,
             repo,
@@ -2270,6 +2309,7 @@ async def update_branch_with_sha_retry(
         return {"updated": False, "message": f"HTTP error on retry: {exc.detail}"}
     except Exception as exc:  # noqa: BLE001
         return {"updated": False, "message": f"{type(exc).__name__} on retry: {exc}"}
+    return _tag_not_behind_if_no_new_commits(retry_result)
 
 
 async def close_pull_request(

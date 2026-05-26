@@ -1705,6 +1705,83 @@ async def test_ci_polling_behind_skips_update_when_pr_is_not_behind(
     assert "updated branch via github api" not in msg
 
 
+@pytest.mark.asyncio
+async def test_ci_polling_behind_no_new_commits_clears_counter(orch_db, mocker):
+    """When the orchestrator's CI polling sees mergeable_state='behind' and
+    update_branch_with_sha_retry returns the canonical not_behind=True (no new
+    commits on base), the orchestrator must clear any prior retry counter and
+    defer to the next sweep without escalating to fix-spawn — even when the
+    counter is already at budget-1."""
+    session, _Session = orch_db
+    task = await _make_ci_waiting_task(
+        session, pr_number=605, project_name="CI Behind NoNewCommits"
+    )
+    rl = dict((task.context or {}).get("review_loop", {}))
+    rl["_behind_update_retries"] = 2  # one short of default budget (3)
+    task.context = {**(task.context or {}), "review_loop": rl}
+    session.add(task)
+    await session.commit()
+    task_id = task.id
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "open",
+            "merged": False,
+            "mergeable": False,
+            "mergeable_state": "behind",
+            "head": {"sha": "sha-behind-5"},
+        },
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="sha-base"),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=False),
+    )
+    update_mock = mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new=AsyncMock(
+            return_value={
+                "updated": False,
+                "not_behind": True,
+                "message": "There are no new commits on the base branch.",
+            }
+        ),
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock
+    )
+    alert_mock = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    await _run_one_cycle(mocker)
+
+    from sqlmodel import select as _select
+
+    async with _Session() as verify:
+        t = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
+    rl = (t.context or {}).get("review_loop", {})
+    assert "_behind_update_retries" not in rl, (
+        f"not_behind result must clear retry counter; got rl={rl!r}"
+    )
+    assert rl.get("ci_waiting") is True
+    assert update_mock.await_count == 1
+    spawn_mock.assert_not_called()
+    alert_mock.assert_not_called()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Test 5d — Rollup parent stays EVALUATING when conflict fix is spawned
 # ══════════════════════════════════════════════════════════════════════════════

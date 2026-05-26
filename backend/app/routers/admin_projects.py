@@ -16,6 +16,7 @@ from app.models import Task, TaskStatus, Project, ProjectMember, _utcnow
 from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
 from app.task_locking import lock_project_or_429
+from app.build_config_lint import build_config_lint_warnings
 
 router = APIRouter(
     prefix="/api/admin",
@@ -88,6 +89,7 @@ async def get_all_projects(
                 "build_config": _redact_build_config(
                     row.build_config or {}, row.my_role
                 ),
+                "build_config_warnings": build_config_lint_warnings(row.build_config),
                 "sr_catch_rate_targets": row.sr_catch_rate_targets or {},
                 "running_update_acknowledged_at": (
                     row.running_update_acknowledged_at.isoformat()
@@ -144,6 +146,7 @@ async def get_project(
         ),
         "self_reflection_log": project.self_reflection_log or [],
         "build_config": _redact_build_config(project.build_config or {}, role),
+        "build_config_warnings": build_config_lint_warnings(project.build_config),
         "autonomous_enabled": project.autonomous_enabled,
         "is_self_repo": project.is_self_repo,
         "sr_catch_rate_targets": project.sr_catch_rate_targets or {},
@@ -371,7 +374,13 @@ async def update_project(
     session.add(project)
     await session.commit()
     await session.refresh(project)
-    return project
+    # Preserve the historical response shape (top-level Project fields) and
+    # add a single advisory key — operators read it from the same payload
+    # they already have. Warnings are computed from the validated, committed
+    # build_config so the value reflects what was actually persisted.
+    response = project.model_dump()
+    response["build_config_warnings"] = build_config_lint_warnings(project.build_config)
+    return response
 
 
 @router.post("/projects/{project_id}/detect-build-config")
@@ -439,7 +448,10 @@ async def detect_project_build_config(
     await session.commit()
     await session.refresh(project)
 
-    return {"build_config": project.build_config or {}}
+    return {
+        "build_config": project.build_config or {},
+        "build_config_warnings": build_config_lint_warnings(project.build_config),
+    }
 
 
 @router.post("/projects/{project_id}/running-update/acknowledge")

@@ -1,4 +1,4 @@
-import { afterEach, describe, test, vi } from 'vitest';
+import { afterEach, describe, test, expect, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
@@ -46,6 +46,57 @@ describe('ProjectBuildConfigSection — viewport regression', () => {
         );
       });
     });
+  });
+
+  test('shows warning for unrecognized lint_cmd', async () => {
+    const warnConfig: BuildConfig = {
+      ...buildConfig,
+      directories: [
+        { path: 'backend/', type: 'python', lint_cmd: 'make lint', test_cmd: 'pytest', build_cmd: '' },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <ProjectBuildConfigSection
+          githubOwner="myorg"
+          githubRepo="myrepo"
+          buildConfig={warnConfig}
+          onSave={vi.fn(async () => {})}
+          onDetect={vi.fn(async () => {})}
+          detectAvailable={true}
+          projectId="test-project"
+        />,
+      );
+    });
+    const warnings = host.querySelectorAll('[data-testid="lint-cmd-warning"]');
+    expect(warnings.length).toBe(1);
+    expect(warnings[0].textContent).toContain('Unrecognized');
+  });
+
+  test('no warning for recognized lint_cmd', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <ProjectBuildConfigSection
+          githubOwner="myorg"
+          githubRepo="myrepo"
+          buildConfig={buildConfig}
+          onSave={vi.fn(async () => {})}
+          onDetect={vi.fn(async () => {})}
+          detectAvailable={true}
+          projectId="test-project"
+        />,
+      );
+    });
+    const warnings = host.querySelectorAll('[data-testid="lint-cmd-warning"]');
+    expect(warnings.length).toBe(0);
   });
 
   test('interactive controls meet 44px touch target at 375px', async () => {

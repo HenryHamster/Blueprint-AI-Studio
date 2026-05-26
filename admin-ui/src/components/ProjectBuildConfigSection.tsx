@@ -1,5 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
-import { Plus, Trash2, RefreshCw } from 'lucide-react';
+import { Plus, Trash2, RefreshCw, AlertTriangle } from 'lucide-react';
+
+function isRecognizedLintCmd(cmd: string): boolean {
+  if (!cmd.trim()) return true;
+  const base = cmd.replace(/^(python3?\s+-m\s+|npx\s+|pnpm\s+exec\s+)/, '');
+  return /^(ruff|eslint|mypy|flake8|pyright)\b/.test(base);
+}
 import type { BuildConfig, BuildConfigDirectory } from '../types/project';
 import { apiFetch } from '../api';
 import { SR_CANONICAL_CATEGORIES } from './SrTrendBreakdown';
@@ -268,6 +274,12 @@ export function ProjectBuildConfigSection({
                       placeholder="(auto-infer by type)"
                       className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
                     />
+                    {!isRecognizedLintCmd(dir.lint_cmd ?? '') && (
+                      <p className="mt-1 flex items-start gap-1 text-[10px] text-yellow-400" data-testid="lint-cmd-warning">
+                        <AlertTriangle className="w-3 h-3 shrink-0 mt-px" />
+                        Unrecognized — runs against full tree. Use ruff, eslint, mypy, flake8, or pyright for scoped lint.
+                      </p>
+                    )}
                   </div>
                   <div>
                     <label className="block text-[10px] text-neutral-500 mb-0.5 uppercase">Test</label>

@@ -102,7 +102,7 @@ async def cost_summary(
 
 _AUTO_REMEDIATION_DEFAULTS: Dict[str, Any] = {
     "enabled": False,
-    "branch_whitelist": ["main", "master"],
+    "branch_whitelist": [],
     "max_per_hour": 2,
     "max_concurrent": 2,
     "require_review": True,

@@ -3889,6 +3889,35 @@ async def orchestrator_worker():
                                         f"[CI] PR #{ci_pr_number} behind base — update_branch succeeded, skipped fix spawn"
                                     )
                                     continue
+                                if _upd.get("not_behind"):
+                                    # GitHub's cached mergeable_state was stale — the
+                                    # PR is not actually behind (no new commits on
+                                    # base). Treat exactly like the pr_is_not_behind
+                                    # short-circuit above: clear any prior retry
+                                    # counter and defer to the next sweep without
+                                    # escalating to fix-spawn.
+                                    ci_task.latest_status_message = (
+                                        f"PR #{ci_pr_number} not behind base "
+                                        f"(no new commits on base) — cached "
+                                        f"mergeable_state was stale, deferring to next CI sweep"
+                                    )
+                                    ci_loop["polls_since_pr_fetch"] = 999
+                                    ci_loop["head_sha"] = ""
+                                    ci_loop.pop("_behind_update_retries", None)
+                                    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+
+                                    ci_task.context = {
+                                        **(ci_task.context or {}),
+                                        "review_loop": ci_loop,
+                                    }
+                                    flag_modified(ci_task, "context")
+                                    session.add(ci_task)
+                                    await session.commit()
+                                    logger.info(
+                                        f"[CI] PR #{ci_pr_number} behind base — "
+                                        f"update_branch reports no new commits on base, deferring to next sweep"
+                                    )
+                                    continue
                                 # update_branch failed — likely a transient GitHub API error,
                                 # not a real merge conflict. Defer to the next CI sweep with a
                                 # bounded retry budget instead of immediately burning a fix

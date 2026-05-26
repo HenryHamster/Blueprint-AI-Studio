@@ -212,6 +212,50 @@ class TestOnboardAutoRemediation:
         assert project.integration_branch == "main"
         assert project.promotion_target == "main"
 
+    @pytest.mark.asyncio
+    async def test_onboard_seeds_ruff_lint_cmd_for_python_directories(
+        self, client: AsyncClient, db_session
+    ):
+        """Onboarding detects Python directories and seeds lint_cmd='ruff check'."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={
+                    "language": "python",
+                    "directories": [
+                        {
+                            "path": "./",
+                            "type": "python",
+                            "lint_cmd": "ruff check",
+                            "test_cmd": "pytest",
+                        }
+                    ],
+                },
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "mypyrepo"},
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        project = await db_session.get(Project, data["project_id"])
+        build_config = project.build_config or {}
+        assert len(build_config.get("directories", [])) > 0
+        assert build_config["directories"][0]["lint_cmd"] == "ruff check"
+
 
 class TestOnboardIssueImplementation:
     @pytest.mark.asyncio

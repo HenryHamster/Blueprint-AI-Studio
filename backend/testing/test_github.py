@@ -2511,6 +2511,116 @@ async def test_update_branch_with_sha_retry_retry_also_fails(mocker):
     assert update_branch_mock.await_count == 2
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "There are no new commits on the base branch.",
+        "there are no new commits on the base branch",
+        "  There are no new commits on the base branch.  ",
+        "There are no new commits on the base branch",
+    ],
+)
+async def test_update_branch_with_sha_retry_no_new_commits_tags_not_behind(mocker, msg):
+    """GitHub's canonical 422 'no new commits on the base branch' must be tagged
+    with not_behind=True so callers can short-circuit instead of treating it as
+    a transient failure. Match is case/whitespace/period-tolerant."""
+    from app import github as gh
+
+    update_branch_mock = mocker.patch.object(
+        gh,
+        "update_branch",
+        new_callable=AsyncMock,
+        return_value={"updated": False, "message": msg},
+    )
+    get_pr_mock = mocker.patch.object(gh, "get_pull_request", new_callable=AsyncMock)
+
+    result = await gh.update_branch_with_sha_retry(
+        "t",
+        "o",
+        "r",
+        1,
+        expected_head_sha="abc",
+    )
+
+    assert result.get("not_behind") is True
+    assert result.get("updated") is False
+    # No retry — the not-behind tag should suppress the refetch+retry path.
+    assert update_branch_mock.await_count == 1
+    get_pr_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_branch_with_sha_retry_unrelated_422_does_not_tag(mocker):
+    """Regression guard: an unrelated 422 message (e.g. 'Merge conflict') must
+    NOT be tagged with not_behind. Only the canonical phrase triggers it."""
+    from app import github as gh
+
+    mocker.patch.object(
+        gh,
+        "update_branch",
+        new_callable=AsyncMock,
+        return_value={"updated": False, "message": "Merge conflict"},
+    )
+    mocker.patch.object(
+        gh,
+        "get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"head": {"sha": "sameSha"}},
+    )
+
+    result = await gh.update_branch_with_sha_retry(
+        "t",
+        "o",
+        "r",
+        1,
+        expected_head_sha="sameSha",
+    )
+
+    assert "not_behind" not in result
+    assert result.get("updated") is False
+
+
+@pytest.mark.asyncio
+async def test_update_branch_with_sha_retry_no_new_commits_on_retry_tags_not_behind(
+    mocker,
+):
+    """When the initial call fails with a generic message but the SHA-retry hits
+    the canonical 'no new commits on base' 422, the retry result must still be
+    tagged with not_behind=True."""
+    from app import github as gh
+
+    mocker.patch.object(
+        gh,
+        "update_branch",
+        new_callable=AsyncMock,
+        side_effect=[
+            {"updated": False, "message": "stale SHA"},
+            {
+                "updated": False,
+                "message": "There are no new commits on the base branch.",
+            },
+        ],
+    )
+    mocker.patch.object(
+        gh,
+        "get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"head": {"sha": "fresh999"}},
+    )
+
+    result = await gh.update_branch_with_sha_retry(
+        "t",
+        "o",
+        "r",
+        1,
+        expected_head_sha="stale",
+    )
+
+    assert result.get("not_behind") is True
+    assert result.get("updated") is False
+
+
 # ---------------------------------------------------------------------------
 # build_merge_summary_body + post_merge_summary_comment
 # ---------------------------------------------------------------------------
