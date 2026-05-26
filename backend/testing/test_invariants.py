@@ -2863,8 +2863,9 @@ class TestBehindRecoveryUpdateBranchGuard:
             # Single guarded call in ci_completion.py inside the CI merge
             # finalization function.
             "ci_completion.py",
-            # Two guarded calls in rollup_management.py (pre-merge SHA-mismatch
-            # and post-merge ancestor checks).
+            # Single guarded call in rollup_management.py (post-merge ancestor
+            # check). The pre-merge SHA-mismatch check was removed in PR #6188
+            # as part of dropping the redundant pre-merge behind path.
             "rollup_management.py",
             # Guarded call in orchestrator.py inside orchestrator_worker for
             # the CI polling behind path.
@@ -2878,10 +2879,10 @@ class TestBehindRecoveryUpdateBranchGuard:
             "guarded_keys=" + ", ".join(sorted(guarded_keys))
         )
 
-        # At least four guarded call sites must be present (1 in
-        # ci_completion + 2 in rollup_management + 1 in orchestrator).
-        assert len(guarded) >= 4, (
-            f"Expected at least 4 guarded update_branch sites, "
+        # At least three guarded call sites must be present (1 in
+        # ci_completion + 1 in rollup_management + 1 in orchestrator).
+        assert len(guarded) >= 3, (
+            f"Expected at least 3 guarded update_branch sites, "
             f"detected {len(guarded)}: {guarded}"
         )
 
