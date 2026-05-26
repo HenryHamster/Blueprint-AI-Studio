@@ -260,6 +260,11 @@ async def test_open_backmerge_pr_conflict_raises_alert_and_spawns_plan(
     assert resolution.context["backmerge_conflict"] is True
     assert resolution.context["hotfix_task_id"] == str(hotfix_id)
     assert resolution.context["backmerge_pr_number"] == 55
+    assert resolution.title == "Resolve back-merge conflict: main -> automain"
+    assert (
+        resolution.description
+        == "The automated main -> automain back-merge PR #55 hit a merge conflict; resolve it on automain so the next promotion does not conflict."
+    )
 
     # A SPAWNED history row was written for the resolution task.
     history = (
@@ -372,6 +377,34 @@ async def test_open_backmerge_pr_conflict_no_duplicate_resolver(db_session, mock
     # But both attempts raised an Alert (the operator sees the recurrence).
     alerts = await _alerts_for(db_session, project.id)
     assert len(alerts) == 2
+
+
+async def test_open_backmerge_pr_conflict_uses_custom_branch_names_for_resolver(
+    db_session, mocker
+):
+    """The spawned resolver task should mirror the configured branch names in
+    its user-facing title and description."""
+    project = await _make_project(db_session)
+    project.integration_branch = "trunk"
+    project.promotion_target = "stable"
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _patch_github(
+        mocker,
+        create_return={"number": 88, "html_url": "http://pr/88"},
+        merge_return={"merged": False, "conflict": True, "message": "conflict"},
+    )
+
+    await hb.open_backmerge_pr(db_session, project.id, hotfix_task_id=uuid.uuid4())
+    await db_session.commit()
+
+    task = (await _tasks_for(db_session, project.id))[0]
+    assert task.title == "Resolve back-merge conflict: stable -> trunk"
+    assert (
+        task.description
+        == "The automated stable -> trunk back-merge PR #88 hit a merge conflict; resolve it on trunk so the next promotion does not conflict."
+    )
 
 
 @pytest.mark.asyncio

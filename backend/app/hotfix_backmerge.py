@@ -82,20 +82,6 @@ from app.shared_state import runtime_config as _runtime_config
 
 logger = logging.getLogger(__name__)
 
-# Title of the conflict-resolution Alert.  Used both when creating the Alert
-# and when checking whether an unresolved one already exists, so a retried /
-# periodic back-merge does not stack duplicate alerts.
-_CONFLICT_ALERT_TITLE = "Back-merge conflict: main -> automain"
-
-# Title of the generic (non-conflict) failure Alert — a 405, a PR-creation
-# failure, or any unexpected exception.  Only raised for one-shot callers
-# (``periodic=False``); the periodic reconciler logs + retries instead.
-_BLOCKED_ALERT_TITLE = "Back-merge failed: main -> automain"
-
-# The conflict-resolution task always targets automain — it is a normal
-# automain-bound fix, NOT a hotfix.  It must NOT carry hotfix:true.
-_RESOLUTION_BASE_BRANCH = "automain"
-
 # Priority for the conflict-resolution task — expedited (design doc:
 # back-merge conflict resolution gates the next promotion; >= 90).
 _RESOLUTION_PRIORITY = 95
@@ -696,10 +682,10 @@ async def _spawn_resolution_task(
 
     task = Task(
         project_id=project_id,
-        title="Resolve back-merge conflict: main -> automain",
+        title=f"Resolve back-merge conflict: {promotion_target} -> {integration_branch}",
         description=(
-            f"The automated main -> automain back-merge PR #{pr_number} hit a "
-            f"merge conflict; resolve it on automain so the next promotion "
+            f"The automated {promotion_target} -> {integration_branch} back-merge PR #{pr_number} hit a "
+            f"merge conflict; resolve it on {integration_branch} so the next promotion "
             f"does not conflict."
         ),
         priority=_RESOLUTION_PRIORITY,

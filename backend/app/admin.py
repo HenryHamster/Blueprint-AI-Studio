@@ -17,6 +17,7 @@ from app.database import get_session
 from app.shared_state import (
     derive_task_branch as _derive_task_branch,
     get_project_integration_branch,
+    get_project_promotion_target as _get_project_promotion_target_for_task,
     limiter,
 )
 from app.models import (
@@ -1433,8 +1434,8 @@ class CreateTaskPayload(BaseModel):
     github_repo: str = Field(..., pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
     title: str = Field(..., min_length=1, max_length=200)
     prompt: str = Field(..., min_length=1, max_length=50000)
-    base_branch: str = Field(
-        default="main", max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
+    base_branch: str | None = Field(
+        default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
     )
     task_type: TaskType = Field(default=TaskType.create)
     pr_number: int | None = None
@@ -1536,11 +1537,16 @@ async def create_task_manually(
     # Auto-generate VM instance ID so orchestrator worker picks up the task
     vm_name = f"agent-vm-{uuid.uuid4().hex}"
 
+    # Resolve base_branch: explicit client value takes precedence; omitted → project promotion_target
+    resolved_base_branch = (
+        payload.base_branch or _get_project_promotion_target_for_task(project)
+    )
+
     # Build payload based on task type
     task_payload = {
         "type": payload.task_type,
         "prompt": payload.prompt,
-        "base_branch": payload.base_branch,
+        "base_branch": resolved_base_branch,
     }
     if payload.model is not None:
         task_payload["model"] = payload.model
@@ -1633,7 +1639,7 @@ async def create_task_manually(
             "created_by": "USER",
             "method": "admin_launcher",
             "github_repo": payload.github_repo,
-            "base_branch": payload.base_branch,
+            "base_branch": resolved_base_branch,
         },
     )
     session.add(history)

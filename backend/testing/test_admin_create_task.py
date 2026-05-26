@@ -119,6 +119,92 @@ async def test_hotfix_plan_task_accepted(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_omitted_base_branch_uses_project_promotion_target(
+    client: AsyncClient, db_session
+):
+    """When base_branch is omitted, the resolved payload uses the project's promotion_target."""
+    owner, name = "acme", "trunk-project"
+    project = Project(
+        name=f"{owner}/{name}",
+        user_id="test-user-123",
+        status=ProjectStatus.DEPLOYING,
+        github_owner=owner,
+        github_repo=name,
+        promotion_target="trunk",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": f"{owner}/{name}",
+            "title": "Task without base_branch",
+            "prompt": "do something useful",
+            "task_type": "create",
+            # base_branch intentionally omitted
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    task_id = resp.json()["id"]
+
+    get_resp = await client.get(f"/api/admin/tasks/{task_id}")
+    assert get_resp.status_code == 200
+    stored_base_branch = get_resp.json()["payloads"][0]["base_branch"]
+    assert stored_base_branch == "trunk", (
+        f"Expected 'trunk' (project promotion_target) but got {stored_base_branch!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_base_branch_preserved(client: AsyncClient, db_session):
+    """When base_branch is explicitly supplied, it overrides the project promotion_target."""
+    owner, name = "acme", "explicit-branch-project"
+    project = Project(
+        name=f"{owner}/{name}",
+        user_id="test-user-123",
+        status=ProjectStatus.DEPLOYING,
+        github_owner=owner,
+        github_repo=name,
+        promotion_target="trunk",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/admin/tasks",
+        json={
+            "github_repo": f"{owner}/{name}",
+            "title": "Task with explicit base_branch",
+            "prompt": "work on main",
+            "task_type": "create",
+            "base_branch": "main",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    task_id = resp.json()["id"]
+
+    get_resp = await client.get(f"/api/admin/tasks/{task_id}")
+    assert get_resp.status_code == 200
+    stored_base_branch = get_resp.json()["payloads"][0]["base_branch"]
+    assert stored_base_branch == "main", (
+        f"Expected explicit 'main' but got {stored_base_branch!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_non_hotfix_create_task_still_works(client: AsyncClient, db_session):
     """Regression guard: the hotfix check must not block an ordinary create
     task. A create task with no hotfix flag succeeds and stores NO hotfix key."""

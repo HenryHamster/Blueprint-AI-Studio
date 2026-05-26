@@ -64,16 +64,16 @@ class TestOnboardAutoRemediation:
         ar = (project.design_doc or {}).get("_auto_remediation")
         assert ar is not None
         assert ar["enabled"] is False
-        assert "main" in ar["branch_whitelist"]
+        assert ar["branch_whitelist"] == ["main"]
         assert ar["max_per_hour"] == 2
         assert ar["max_concurrent"] == 2
         assert ar["require_review"] is True
 
     @pytest.mark.asyncio
-    async def test_onboard_custom_default_branch_added_to_whitelist(
+    async def test_onboard_custom_default_branch_only_in_whitelist(
         self, client: AsyncClient, db_session
     ):
-        """When default branch is not 'main' or 'master', it is prepended to branch_whitelist."""
+        """When default branch is not 'main' or 'master', whitelist contains only that branch."""
         with (
             patch(
                 "app.routers.admin_onboard._detect_build_config",
@@ -88,7 +88,7 @@ class TestOnboardAutoRemediation:
             patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
-                return_value="develop",
+                return_value="trunk",
             ),
         ):
             resp = await client.post(
@@ -101,10 +101,10 @@ class TestOnboardAutoRemediation:
 
         assert resp.status_code == 200
         data = resp.json()
-        assert data["default_branch"] == "develop"
+        assert data["default_branch"] == "trunk"
 
         project = await db_session.get(Project, data["project_id"])
         ar = (project.design_doc or {}).get("_auto_remediation")
-        assert ar["branch_whitelist"][0] == "develop"
-        assert "main" in ar["branch_whitelist"]
-        assert "master" in ar["branch_whitelist"]
+        assert ar["branch_whitelist"] == ["trunk"]
+        assert "main" not in ar["branch_whitelist"]
+        assert "master" not in ar["branch_whitelist"]

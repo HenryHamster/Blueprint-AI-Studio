@@ -258,9 +258,16 @@ async def onboard_project(
     except Exception as e:
         logger.warning(f"[ONBOARD] Default branch detection failed: {e}")
 
-    branch_whitelist = ["main", "master"]
-    if default_branch and default_branch not in branch_whitelist:
-        branch_whitelist.insert(0, default_branch)
+    branch_whitelist: list[str] = []
+    if default_branch:
+        branch_whitelist.append(default_branch)
+    if (
+        project.integration_branch
+        and project.integration_branch not in branch_whitelist
+    ):
+        branch_whitelist.append(project.integration_branch)
+    if project.promotion_target and project.promotion_target not in branch_whitelist:
+        branch_whitelist.append(project.promotion_target)
     design_doc = dict(project.design_doc or {})
     design_doc["_auto_remediation"] = {
         "enabled": False,
