@@ -284,6 +284,7 @@ class OnboardPayload(BaseModel):
     github_repo: str = Field(..., min_length=1, pattern="^[a-zA-Z0-9_.-]+$")
     name: str | None = None
     build_config_override: Dict[str, Any] | None = None
+    promotion_target: str | None = None
 
 
 # --- Pipeline Efficiency ---

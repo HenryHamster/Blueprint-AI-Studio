@@ -257,6 +257,46 @@ class TestOnboardAutoRemediation:
         assert len(build_config.get("directories", [])) > 0
         assert build_config["directories"][0]["lint_cmd"] == "ruff check"
 
+    @pytest.mark.asyncio
+    async def test_onboard_explicit_promotion_target_overrides_default(
+        self, client: AsyncClient, db_session
+    ):
+        """When promotion_target is passed, it is stored separately from integration_branch."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="automain",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={
+                    "github_owner": "acme",
+                    "github_repo": "lts-repo",
+                    "promotion_target": "main",
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        project = await db_session.get(Project, data["project_id"])
+        assert project.integration_branch == "automain"
+        assert project.promotion_target == "main"
+        ar = (project.design_doc or {}).get("_auto_remediation")
+        assert "automain" in ar["branch_whitelist"]
+        assert "main" in ar["branch_whitelist"]
+
 
 class TestOnboardIssueImplementation:
     @pytest.mark.asyncio
