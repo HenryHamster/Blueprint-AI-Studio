@@ -95,6 +95,49 @@ Rules:
   setCurrentPromptFingerprint(fingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: fingerprint });
 
+  const requiredKeys = ['summary', 'reasoning', 'citations', 'tags'];
+
+  // Try to extract a valid memo object from any of the given text sources.
+  // Returns the parsed object on first match, or null if no source yields one.
+  const tryExtractMemoObject = (
+    sources: Array<{ label: string; text: string }>,
+  ): Record<string, unknown> | null => {
+    for (const src of sources) {
+      if (!src.text.includes('"summary"') || !src.text.includes('"reasoning"')) continue;
+      try {
+        const res = extractJsonObjectDetailed(src.text, 'summary', 'reasoning');
+        if (!res.ok) {
+          sendLog(ws, `[WARNING] Could not parse memo JSON from ${src.label}: ${describeJsonExtractionResult(res)}\n`);
+          continue;
+        }
+        const obj = res.value;
+        const missing = requiredKeys.filter(k => !(k in obj));
+        if (missing.length > 0) {
+          sendLog(ws, `[WARNING] Memo JSON from ${src.label} missing required keys: ${missing.join(', ')}\n`);
+          continue;
+        }
+        return obj;
+      } catch (e) {
+        sendLog(ws, `[WARNING] Memo JSON extraction from ${src.label} failed: ${e instanceof JsonExtractionError ? e.message : String(e)}\n`);
+      }
+    }
+    return null;
+  };
+
+  const buildSources = (
+    lastResultText: string,
+    allOutput: string,
+  ): Array<{ label: string; text: string }> => {
+    const sources: Array<{ label: string; text: string }> = [];
+    if (lastResultText) sources.push({ label: 'lastResultText', text: lastResultText });
+    if (allOutput) sources.push({ label: 'allOutput', text: allOutput });
+    if (allOutput) {
+      const codexText = extractCodexAgentMessageText(allOutput);
+      if (codexText) sources.push({ label: 'allOutput[codex-agent_message]', text: codexText });
+    }
+    return sources;
+  };
+
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(
     memoPrompt + `\n\n${DEFAULT_TOOL_GUIDANCE}`,
     ws, statusRef, model, effort, disallowedTools,
@@ -102,42 +145,51 @@ Rules:
 
   // Prefer the final result text (cheapest, usually clean JSON) and fall
   // back to scanning the full transcript for the schema's required keys.
-  let memoObj: Record<string, unknown> | null = null;
-  const requiredKeys = ['summary', 'reasoning', 'citations', 'tags'];
-  const sources: Array<{ label: string; text: string }> = [];
-  if (lastResultText) sources.push({ label: 'lastResultText', text: lastResultText });
-  if (allOutput) sources.push({ label: 'allOutput', text: allOutput });
-  // If allOutput contains raw Codex JSONL, the memo JSON is embedded as an
-  // escaped string in item.text and the normal extractor cannot reach it.
-  // Parse the envelopes to recover the unescaped inner text as a third source.
-  if (allOutput) {
-    const codexText = extractCodexAgentMessageText(allOutput);
-    if (codexText) sources.push({ label: 'allOutput[codex-agent_message]', text: codexText });
-  }
+  let memoObj = tryExtractMemoObject(buildSources(lastResultText, allOutput));
+  let retryExitCode: number | null = null;
+  let retryAllOutput = '';
 
-  for (const src of sources) {
-    if (!src.text.includes('"summary"') || !src.text.includes('"reasoning"')) continue;
-    try {
-      const res = extractJsonObjectDetailed(src.text, 'summary', 'reasoning');
-      if (!res.ok) {
-        sendLog(ws, `[WARNING] Could not parse memo JSON from ${src.label}: ${describeJsonExtractionResult(res)}\n`);
-        continue;
-      }
-      const obj = res.value;
-      const missing = requiredKeys.filter(k => !(k in obj));
-      if (missing.length > 0) {
-        sendLog(ws, `[WARNING] Memo JSON from ${src.label} missing required keys: ${missing.join(', ')}\n`);
-        continue;
-      }
-      memoObj = obj;
-      break;
-    } catch (e) {
-      sendLog(ws, `[WARNING] Memo JSON extraction from ${src.label} failed: ${e instanceof JsonExtractionError ? e.message : String(e)}\n`);
-    }
+  // Reopen path: the agent often produces a clean exit (exitCode=0, ~2KB of
+  // narrative) but drifts off-spec and never emits the JSON object. Instead
+  // of FAILing on the first such drift, reopen with a focused continuation
+  // prompt that re-states the schema and asks for ONLY the JSON. The retry
+  // is itself a fresh Claude session (stateless), so we hand it the prior
+  // reasoning as context to fill the schema fields from.
+  if (memoObj === null && exitCode === 0) {
+    const priorText = (lastResultText || allOutput || '').slice(-8000);
+    sendLog(ws, `[INFO] First memo attempt produced no JSON (allOutput=${(allOutput || '').length}b, lastResultText=${(lastResultText || '').length}b). Reopening with focused continuation.\n`);
+    statusRef.value = 'Writing memo (retry)...';
+    const reopenPrompt = `You were asked to produce a memo as a single JSON object. Your previous response contained reasoning but did NOT include the required JSON object as the final part. The memo schema is:
+
+{
+  "summary": "One- to two-sentence summary of the reasoning.",
+  "reasoning": "Detailed reasoning (a few paragraphs at most).",
+  "citations": ["task:<id>", "direction:<id>", "file:path/to/x.py", ...],
+  "tags": ["tag-1", "tag-2", ...]
+}
+
+Your previous reasoning (use this verbatim or condense as needed to fill the schema):
+---
+${priorText}
+---
+
+Output ONLY the JSON object now — no preamble, no markdown code fences, no additional commentary. All four keys are required. summary and reasoning must be non-empty strings; citations and tags must be arrays of strings (empty arrays allowed).`;
+    const retryRun = await runClaudeCode(
+      reopenPrompt + `\n\n${DEFAULT_TOOL_GUIDANCE}`,
+      ws, statusRef, model, effort, disallowedTools,
+    );
+    retryExitCode = retryRun.exitCode;
+    retryAllOutput = retryRun.allOutput;
+    memoObj = tryExtractMemoObject(
+      buildSources(retryRun.lastResultText, retryRun.allOutput),
+    );
   }
 
   if (memoObj === null) {
-    const tail = (allOutput || '').slice(-2000);
+    const tail = (retryAllOutput || allOutput || '').slice(-2000);
+    const retrySuffix = retryExitCode !== null
+      ? `, retryExitCode=${retryExitCode}, retryAllOutput=${(retryAllOutput || '').length}b`
+      : '';
     await persistAndPostStatus(taskId, {
       task_id: taskId,
       status: 'FAILED',
@@ -147,8 +199,8 @@ Rules:
         `Memo handler could not extract a JSON object with all required keys ` +
         `(summary, reasoning, citations, tags). exitCode=${exitCode}, ` +
         `allOutput=${(allOutput || '').length}b, ` +
-        `lastResultText=${(lastResultText || '').length}b\n` +
-        `--- allOutput tail ---\n${tail}`,
+        `lastResultText=${(lastResultText || '').length}b${retrySuffix}\n` +
+        `--- output tail ---\n${tail}`,
     });
     return;
   }
