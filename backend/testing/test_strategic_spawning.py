@@ -2932,7 +2932,7 @@ def test_success_pattern_biases_medium_to_small():
             "success_count": 4,
         },
     }
-    scope, note, evidence = _build_failure_feedback_mitigation(
+    scope, _note, evidence = _build_failure_feedback_mitigation(
         direction, "medium", "create", design_doc
     )
     assert scope == "small"
@@ -2951,7 +2951,7 @@ def test_success_pattern_insufficient_count_no_bias():
             "success_count": 2,
         },
     }
-    scope, note, evidence = _build_failure_feedback_mitigation(
+    scope, _note, evidence = _build_failure_feedback_mitigation(
         direction, "medium", "create", design_doc
     )
     assert scope == "medium"
@@ -3512,6 +3512,155 @@ async def test_stabilize_hint_points_at_carried_audit_findings(
         {"severity": "high", "summary": "Token baked into VM image."},
         {"severity": "low", "summary": "Private cross-module import."},
     ]
+
+
+@pytest.mark.asyncio
+async def test_post_promote_handoff_hint_fires_on_fresh_version(
+    db_session, mocker, _lts_split_active
+):
+    """A version that just opened from a promotion (version_number > 1, never
+    qualified) gets a prompt_suffix telling the agent to refresh problem_model
+    so the inherited goal narrative doesn't get read as current status."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="build",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification=None,
+        qualification_attempts=0,
+        goal="v1 milestone narrative carried forward as v2 goal",
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "Version handoff" in suffix, (
+        f"Expected post-promotion handoff hint; got: {suffix}"
+    )
+    assert "intent.current_focus" in suffix
+    assert "v2" in suffix and "v1" in suffix
+
+
+@pytest.mark.asyncio
+async def test_post_promote_handoff_hint_self_clears_after_first_qualification(
+    db_session, mocker, _lts_split_active
+):
+    """Once a version has been qualified at least once, the handoff hint must
+    no longer fire — the agent should be reading real verdict data, not
+    refreshing the carried narrative."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={"status": "not_promoted", "confidence": 0.85},
+        qualification_attempts=1,
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "Version handoff" not in suffix, (
+        f"Handoff hint must self-clear once a verdict exists; got: {suffix}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_promote_handoff_hint_skipped_for_bootstrap_version(
+    db_session, mocker, _lts_split_active
+):
+    """The bootstrap version (v1) didn't open from any prior promotion, so
+    the handoff hint must NOT fire even when last_qualification is null."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification=None,
+        qualification_attempts=0,
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "Version handoff" not in suffix, (
+        f"v1 has no prior promotion; handoff hint must not fire. Got: {suffix}"
+    )
 
 
 @pytest.mark.asyncio
