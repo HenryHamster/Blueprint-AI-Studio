@@ -4,7 +4,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 vi.mock('../index.js', () => ({
   WORKSPACE: '/tmp/workspace',
   sendLog: vi.fn(),
-  runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
+  runClaudeCode: vi.fn().mockResolvedValue({
+    exitCode: 0, allOutput: '', lastResultText: '',
+    codexTurnCompleted: false, stderrTail: '',
+  }),
   persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
   strVal: (v: unknown, def = '') => (typeof v === 'string' ? v : def),
   sanitize: (s: string) => s,
@@ -61,6 +64,7 @@ describe('handleMemo', () => {
     vi.clearAllMocks();
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0, allOutput: '', lastResultText: VALID_MEMO_JSON,
+      codexTurnCompleted: true, stderrTail: '',
     });
   });
 
@@ -76,6 +80,7 @@ describe('handleMemo', () => {
   it('posts FAILED with claude_code_failed when exitCode non-zero but JSON is parseable', async () => {
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 1, allOutput: '', lastResultText: VALID_MEMO_JSON,
+      codexTurnCompleted: false, stderrTail: '',
     });
 
     await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -91,6 +96,7 @@ describe('handleMemo', () => {
       exitCode: 0,
       allOutput: `Some preamble\n${VALID_MEMO_JSON}`,
       lastResultText: 'Here is my analysis (no JSON object).',
+      codexTurnCompleted: true, stderrTail: '',
     });
 
     await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -100,11 +106,18 @@ describe('handleMemo', () => {
     expect(call.artifact_type).toBeUndefined();
   });
 
-  it('posts FAILED with parse_failed when neither source contains valid JSON', async () => {
+  it('posts FAILED with incomplete when neither source contains the schema markers', async () => {
+    // Layer B (2026-05-26): parse_failed should only fire when the agent
+    // actually tried to emit the schema (`"summary"` / `"reasoning"`
+    // present somewhere). Output that is pure prose with no schema markers
+    // means the agent silently bailed — `incomplete` is the canonical
+    // wrapper-fallback label so analytics can separate "agent bailed" from
+    // "agent emitted bad JSON".
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0,
       allOutput: 'no json here',
       lastResultText: 'no json here either',
+      codexTurnCompleted: true, stderrTail: '',
     });
 
     await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -112,13 +125,18 @@ describe('handleMemo', () => {
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('ERROR_LOG');
-    expect(call.failure_category).toBe('parse_failed');
+    expect(call.failure_category).toBe('incomplete');
   });
 
   it('posts FAILED with parse_failed when JSON is missing required keys (citations, tags)', async () => {
+    // The agent DID try to emit the schema (output contains `"summary"`
+    // and `"reasoning"`) — Layer B keeps the `parse_failed` label here
+    // because the diagnostic value is real: the agent produced malformed
+    // JSON, not silently bailed.
     const incomplete = JSON.stringify({ summary: 'ok', reasoning: 'ok' });
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0, allOutput: '', lastResultText: incomplete,
+      codexTurnCompleted: true, stderrTail: '',
     });
 
     await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -128,11 +146,12 @@ describe('handleMemo', () => {
     expect(call.failure_category).toBe('parse_failed');
   });
 
-  it('includes the output tail in the parse_failed error logs', async () => {
+  it('includes the output tail in the failure error logs', async () => {
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0,
       allOutput: 'agent output without valid json',
       lastResultText: '',
+      codexTurnCompleted: true, stderrTail: '',
     });
 
     await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -159,11 +178,13 @@ describe('handleMemo', () => {
         exitCode: 0,
         allOutput: 'prose without any valid JSON object emitted',
         lastResultText: '',
+        codexTurnCompleted: true, stderrTail: '',
       })
       .mockResolvedValueOnce({
         exitCode: 0,
         allOutput: validJson,
         lastResultText: validJson,
+        codexTurnCompleted: true, stderrTail: '',
       });
 
     await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -190,6 +211,7 @@ describe('handleMemo', () => {
       exitCode: 1,
       allOutput: 'Claude init banner only',
       lastResultText: '',
+      codexTurnCompleted: false, stderrTail: '',
     });
 
     await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -376,6 +398,7 @@ describe('handleMemo', () => {
       exitCode: 0,
       allOutput: '',
       lastResultText: longMemoJson,
+      codexTurnCompleted: true, stderrTail: '',
     });
 
     await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -408,6 +431,7 @@ describe('handleMemo', () => {
       // lastResultText is truncated (simulating the pre-fix behaviour)
       lastResultText: fullMemoJson.slice(0, 200),
       allOutput: `[codex] turn.started\n${codexJsonlLine}\n[codex] turn.completed\n`,
+      codexTurnCompleted: true, stderrTail: '',
     });
 
     await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
@@ -416,5 +440,72 @@ describe('handleMemo', () => {
     expect(call.status).toBe('COMPLETED');
     expect(call.artifact_type).toBeUndefined();
     expect(call.logs).toContain('direction-retired');
+  });
+
+  // ── Layer A: cause-C reclassification (2026-05-26) ───────────────────────
+  // Regression for the Codex mid-turn silent-success failure mode. The
+  // CLI emits {"type":"thread.started"} + {"type":"turn.started"}, then
+  // exits clean (exitCode=0) before reaching turn.completed. The handler
+  // previously labeled this `parse_failed` → backend classified as
+  // CODE_ERROR → 3 retries → terminal FAIL on a transient provider issue.
+
+  it('reclassifies as claude_code_failed when Codex exits clean before turn.completed', async () => {
+    // Both runs simulate the cause-C pattern: thread.started + turn.started,
+    // no turn.completed, exitCode=0. The retry runs because exitCode=0
+    // satisfies the existing reopen gate, but the same provider drop
+    // happens again. The reclassification should fire on the retry's
+    // codexTurnCompleted=false (the most recent run's signal).
+    const codexPartial = (
+      `{"type":"thread.started","thread_id":"t1"}\n`
+      + `{"type":"turn.started"}\n`
+    );
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: codexPartial,
+        lastResultText: '',
+        codexTurnCompleted: false,
+        stderrTail: 'stream closed unexpectedly',
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: codexPartial,
+        lastResultText: '',
+        codexTurnCompleted: false,
+        stderrTail: 'stream closed unexpectedly',
+      });
+
+    await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('claude_code_failed');
+    // Diagnostic surface should include the codex completion marker AND
+    // the stderr tail so future investigators don't have to guess.
+    expect(call.logs).toContain('codexTurnCompleted=false');
+    expect(call.logs).toContain('stderr tail');
+    expect(call.logs).toContain('stream closed unexpectedly');
+  });
+
+  it('uses parse_failed when Codex DID complete its turn but emitted malformed JSON', async () => {
+    // Control case for the reclassification: if Codex finished its turn
+    // (turn.completed observed) but emitted JSON that fails the extractor,
+    // that is a genuine `parse_failed` — the agent owned the output.
+    const malformedJson = `{"summary": "ok", "reasoning": `; // truncated
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: `{"type":"thread.started"}\n{"type":"turn.completed"}\n`,
+      lastResultText: malformedJson,
+      codexTurnCompleted: true,
+      stderrTail: '',
+    });
+
+    await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    // turn.completed was seen + the output contains "summary"/"reasoning",
+    // so this is a real parse failure, not a silent CLI death.
+    expect(call.failure_category).toBe('parse_failed');
   });
 });

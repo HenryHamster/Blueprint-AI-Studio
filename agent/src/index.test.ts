@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, TASK_TYPE_BRANCH_PREFIX, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -3412,5 +3412,56 @@ describe('cross-language classification contracts', () => {
   it('_VIEWPORT_PATTERNS still matches expectMinTouchTargetAt function name', () => {
     // viewport.ts throws errors containing 'expectMinTouchTargetAt(...)'.
     expect(classifierSrc).toContain('"expectmintouchtargetat("');
+  });
+});
+
+// ── codexStreamHasTurnCompleted (cause-C sentinel, 2026-05-26) ───────────────
+// The Codex CLI emits `{"type":"turn.completed"}` only when the turn actually
+// finished. Absent that event, exitCode=0 means the upstream provider died
+// silently (token cap / refusal / 5xx the CLI swallowed). The memo handler
+// reclassifies on this signal — see agent/src/handlers/memo.ts. These tests
+// pin the pure parser the live drainer (drainCodexChunks) mirrors.
+describe('codexStreamHasTurnCompleted', () => {
+  it('returns false for a stream that started but never completed (cause C)', () => {
+    const stream =
+      '{"type":"thread.started","thread_id":"t1"}\n'
+      + '{"type":"turn.started"}\n';
+    expect(codexStreamHasTurnCompleted(stream)).toBe(false);
+  });
+
+  it('returns true for a stream containing a turn.completed event', () => {
+    const stream =
+      '{"type":"thread.started","thread_id":"t1"}\n'
+      + '{"type":"turn.started"}\n'
+      + '{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}\n'
+      + '{"type":"turn.completed","usage":{"input_tokens":42}}\n';
+    expect(codexStreamHasTurnCompleted(stream)).toBe(true);
+  });
+
+  it('ignores non-JSON noise (codex auth error log lines)', () => {
+    const stream =
+      '2026-05-26T10:00:00Z ERROR codex_login: token invalid\n'
+      + '{"type":"thread.started"}\n';
+    expect(codexStreamHasTurnCompleted(stream)).toBe(false);
+  });
+
+  it('ignores malformed JSONL lines without crashing', () => {
+    const stream =
+      '{"type":"thread.started"}\n'
+      + '{this is not valid json\n'
+      + '{"type":"turn.completed"}\n';
+    expect(codexStreamHasTurnCompleted(stream)).toBe(true);
+  });
+
+  it('returns false on an empty stream', () => {
+    expect(codexStreamHasTurnCompleted('')).toBe(false);
+  });
+
+  it('does not match substrings outside the type field', () => {
+    // Defensive: a tool argument that mentions "turn.completed" must not
+    // false-positive the sentinel. The check is gated on `obj.type` equality.
+    const stream =
+      '{"type":"item.completed","item":{"type":"agent_message","text":"the turn.completed event was missing"}}\n';
+    expect(codexStreamHasTurnCompleted(stream)).toBe(false);
   });
 });

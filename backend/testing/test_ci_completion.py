@@ -2451,3 +2451,117 @@ async def test_behind_skipped_when_pr_is_not_behind(db_session, mocker):
         "behind must not increment retry counter"
     )
     assert review_loop.get("update_branch_failures", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# In-progress reset cap (Fix 2B item 3)
+# ---------------------------------------------------------------------------
+#
+# Each "checks in progress" merge-API response used to unconditionally reset
+# ``ci_wait_started`` to now — bumping the CI-wait deadline by another full
+# backstop window every cycle.  A PR whose required checks never resolved
+# would spin on this path until the 6-hour parent timeout.  The cap stops
+# the reset after N attempts; the normal backstop then runs out on schedule.
+
+
+@pytest.mark.asyncio
+async def test_in_progress_reset_cap_honored(db_session, mocker):
+    """
+    Once ``merge_in_progress_resets`` reaches the cap (default 3), subsequent
+    "checks in progress" merge responses MUST NOT reset ``ci_wait_started``
+    nor increment the counter.  Without the cap a PR with permanently-pending
+    checks polls forever until the 6-hour parent timeout fires.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={
+            "merged": False,
+            "message": "Required status check is in progress",
+        },
+    )
+
+    project = Project(name="in-progress cap test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    pinned_ts = "2026-01-01T00:00:00+00:00"
+    # Task already at the cap — the next in-progress response must NOT reset.
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "ci_wait_started": pinned_ts,
+            "merge_in_progress_resets": 3,
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    review_loop = (task.context or {}).get("review_loop", {})
+    # ci_wait_started must be UNCHANGED — the cap stops the reset so the
+    # backstop runs out on schedule rather than rolling forward forever.
+    assert review_loop.get("ci_wait_started") == pinned_ts, (
+        "ci_wait_started must not be reset once the in-progress cap is reached"
+    )
+    # Counter not incremented past the cap.
+    assert review_loop.get("merge_in_progress_resets") == 3
+    # Diagnostics for the EVALUATING-timeout reason-picker are persisted.
+    assert review_loop.get("last_merge_msg")
+    assert "mergeable_state" in review_loop
+
+
+@pytest.mark.asyncio
+async def test_in_progress_reset_increments_under_cap(db_session, mocker):
+    """
+    Under the cap, an in-progress response resets ``ci_wait_started`` AND
+    increments ``merge_in_progress_resets`` so the counter is observable for
+    the next cap check.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={
+            "merged": False,
+            "message": "Required status check is in progress",
+        },
+    )
+
+    project = Project(name="in-progress cap increment", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    stale_ts = "2020-01-01T00:00:00+00:00"
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={
+            "ci_wait_started": stale_ts,
+            "merge_in_progress_resets": 1,
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_in_progress_resets") == 2
+    assert review_loop.get("ci_wait_started") != stale_ts

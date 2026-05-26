@@ -1148,12 +1148,13 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # (incident 2026-05-25, PRs #5779/#5812/#5815/#5819 all hit
                 # the review cap because the clone targeted blueprint/task-*
                 # while the agent had pushed blueprint/refactor-*).
+                # For fix children, the real branch lives in
+                # review_loop.branch or first_payload.branch — synthesizing
+                # blueprint/task-{fix_id} yields a name no agent ever pushed,
+                # so respawned reviews would fail at `git clone --branch`.
+                from app.shared_state import resolve_task_branch
+                branch = resolve_task_branch(c)
                 project = await session.get(Project, c.project_id)
-                branch = (c.context or {}).get("branch") or _derive_task_branch(
-                    c.id,
-                    c_payload.get("type"),
-                    _get_project_task_branch_namespace(project),
-                )
                 base_branch = c_payload.get("base_branch") or _get_project_integration_branch(project)
                 original_prompt = c_payload.get("prompt", c.description or "")
                 review_task, was_spawned = await _spawn_pipeline_task(
@@ -1855,7 +1856,6 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     )
                     lines_changed = 999  # assume large if we can't check
                     pr_detail = None
-                head_sha = (pr_detail.get("head") or {}).get("sha") if pr_detail else None
 
                 # Zero-diff guard: squash-merged commits can produce a PR with commits
                 # but no file changes. Close before spawning review/fix VMs.
@@ -2118,137 +2118,16 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
                     # Release lock around the actual merge call (slowest of all).
                     pre_actual_merge_snapshot = await _release_parent_lock(parent, session)
-                    if head_sha:
-                        try:
-                            target_tip_sha = await get_branch_sha(
-                                gh_token, owner, repo, target_branch,
-                            )
-                        except Exception as tip_err:
-                            logger.warning(f"[ROLLUP] Failed to fetch target tip for PR #{rollup_pr_number}: {tip_err}")
-                            return
-                        if target_tip_sha != head_sha:
-                            # A rollup PR whose head already contains the base
-                            # tip will have a different SHA from target_tip but
-                            # is NOT behind — either GitHub reports
-                            # mergeable_state=clean, or the base tip is already
-                            # reachable from the head (ancestor check). Either
-                            # signal lets us skip update-branch recovery.
-                            _pre_ms = (pr_detail.get("mergeable_state") or "") if pr_detail else ""
-                            _not_behind = await pr_is_not_behind_for(
-                                gh_token, owner, repo,
-                                pr_detail=pr_detail,
-                                base_tip_sha=target_tip_sha,
-                                project_id=project_id_str,
-                                call_site="rollup_pre_merge",
-                            )
-                            if _not_behind is True:
-                                logger.info(
-                                    f"[ROLLUP] PR #{rollup_pr_number} head/base SHA mismatch "
-                                    f"but pr_is_not_behind=True (mergeable_state={_pre_ms!r}) — "
-                                    f"proceeding to merge without update-branch"
-                                )
-                            else:
-                                _upd = await update_branch_with_sha_retry(
-                                    gh_token, owner, repo, rollup_pr_number,
-                                    expected_head_sha=head_sha,
-                                    project_id=project_id_str,
-                                )
-                                parent = await _relock_parent(
-                                    session, parent_id_local, pre_actual_merge_snapshot,
-                                    parent_in_session=parent,
-                                )
-                                if parent is None:
-                                    return
-                                parent_ctx = parent.context or {}
-                                if _upd.get("updated"):
-                                    _new_ctx = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
-                                    _new_ctx.pop("_behind_update_retries", None)
-                                    parent.context = _new_ctx
-                                    parent.latest_status_message = (
-                                        f"Rollup PR #{rollup_pr_number} was behind {target_branch} — updated branch, "
-                                        f"awaiting fresh CI; next rollup sweep will re-attempt merge"
-                                    )
-                                    session.add(parent)
-                                    await session.commit()
-                                    logger.info(
-                                        f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — update_branch succeeded, skipped merge"
-                                    )
-                                    return
-                                if _upd.get("not_behind"):
-                                    # GitHub's cached mergeable_state was stale —
-                                    # the PR is not actually behind (no new commits
-                                    # on base). Treat exactly like the
-                                    # pr_is_not_behind=True short-circuit: clear
-                                    # any prior retry counter and defer to the
-                                    # next sweep without escalating to fix-spawn.
-                                    _new_ctx = {**parent_ctx, "rollup_pr_url": rollup_pr_url, "rollup_pr_number": rollup_pr_number}
-                                    _new_ctx.pop("_behind_update_retries", None)
-                                    parent.context = _new_ctx
-                                    parent.latest_status_message = (
-                                        f"Rollup PR #{rollup_pr_number} not behind {target_branch} "
-                                        f"(no new commits on base) — cached mergeable_state was stale, "
-                                        f"deferring to next sweep"
-                                    )
-                                    session.add(parent)
-                                    await session.commit()
-                                    logger.info(
-                                        f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — "
-                                        f"update_branch reports no new commits on base, deferring to next sweep"
-                                    )
-                                    return
-                                _behind_retries = parent_ctx.get("_behind_update_retries", 0) + 1
-                                _behind_budget = _runtime_config.get("rollup_behind_update_retries", 3)
-                                _upd_msg = _upd.get("message") or "unknown"
-                                if _behind_retries < _behind_budget:
-                                    parent.context = {
-                                        **parent_ctx,
-                                        "rollup_pr_url": rollup_pr_url,
-                                        "rollup_pr_number": rollup_pr_number,
-                                        "_behind_update_retries": _behind_retries,
-                                    }
-                                    parent.latest_status_message = (
-                                        f"Rollup PR #{rollup_pr_number} behind {target_branch} — update_branch failed "
-                                        f"({_upd_msg}); retrying next sweep ({_behind_retries}/{_behind_budget})"
-                                    )
-                                    session.add(parent)
-                                    await session.commit()
-                                    logger.info(
-                                        f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — update_branch failed "
-                                        f"(attempt {_behind_retries}/{_behind_budget}): {_upd_msg} — deferring merge"
-                                    )
-                                    return
-                                await _maybe_create_failure_alert(
-                                    parent, session,
-                                    f"Rollup PR #{rollup_pr_number} behind {target_branch} — update_branch failed "
-                                    f"{_behind_retries} consecutive sweeps ({_upd_msg}); spawning fix",
-                                )
-                                _ctx_cleared = {k: v for k, v in parent_ctx.items() if k != "_behind_update_retries"}
-                                parent.context = {
-                                    **_ctx_cleared,
-                                    "rollup_pr_url": rollup_pr_url,
-                                    "rollup_pr_number": rollup_pr_number,
-                                }
-                                parent.latest_status_message = (
-                                    f"Rollup PR #{rollup_pr_number} behind {target_branch} — update_branch exhausted "
-                                    f"after {_behind_retries} sweeps; spawning fix"
-                                )
-                                session.add(parent)
-                                await session.commit()
-                                _fix_prompt = (
-                                    f"Rollup PR #{rollup_pr_number} merging {staging_branch} into {target_branch} "
-                                    f"is behind the target branch and update_branch failed {_behind_retries} consecutive "
-                                    f"sweeps ({_upd_msg}). Rebase manually onto origin/{target_branch} and force-push."
-                                )
-                                await _spawn_pipeline_task(
-                                    parent, "fix", session, rollup_pr_number, staging_branch, target_branch,
-                                    fix_prompt=_fix_prompt,
-                                    original_task_id=str(parent.id),
-                                )
-                                logger.warning(
-                                    f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — update_branch exhausted "
-                                    f"({_behind_retries} sweeps): {_upd_msg} — spawned fix"
-                                )
-                                return
+                    # NOTE: A pre-merge "is the PR behind base?" check used to live
+                    # here, gated on (target_tip_sha != head_sha). That gate was
+                    # always true for any PR with commits (head is by definition
+                    # ≥1 commit ahead of base), so it triggered update_branch on
+                    # every sweep → GitHub 422 "no new commits on base" → counted
+                    # as failure → spawned fix tasks with the false premise that
+                    # the PR was behind. The authoritative "behind" check lives
+                    # post-merge at the `_ms == "behind"` branch below — GitHub's
+                    # mergeable_state distinguishes real behind from
+                    # head-ahead-of-base. Removed 2026-05-26 (PR #6096 incident).
                     merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number, project_id=str(parent.project_id))
                     parent = await _relock_parent(
                         session,

@@ -691,6 +691,103 @@ class TestClassifyFailureRateLimit:
         )
         assert classify_failure(task, logs=logs) == RATE_LIMIT
 
+    def test_codex_cause_c_silent_mid_turn_death_preempts_to_external_api(self):
+        """Regression (2026-05-26, cause C): the Codex CLI (gpt-5.4-mini)
+        emits ``{"type":"thread.started"}`` + ``{"type":"turn.started"}``,
+        then exits CLEAN (exitCode=0) before reaching ``turn.completed``.
+        Upstream OpenAI-side disconnect (token cap / silent refusal / 5xx
+        the CLI swallows as success). The memo handler reclassifies
+        agent-side now (see agent/src/handlers/memo.ts), but a backend
+        belt-and-suspenders check mirrors the override so any OTHER Codex
+        consumer that forgets the agent-side fix still routes through
+        EXTERNAL_API (proper backoff) instead of CODE_ERROR (burns retries).
+
+        Bounded by len < 8KB so real CLI deaths (init banner only) trip the
+        override while normal-sized output with these substrings does not.
+        """
+        # Synthetic agent output: thread.started + turn.started, NO
+        # turn.completed, exitCode=0. Pre-fix this would fall through to
+        # the agent_category fast-path with `failure_category=parse_failed`
+        # → CODE_ERROR → 3 retries → terminal FAIL on a transient issue.
+        all_output = (
+            '{"type":"thread.started","thread_id":"t-abc"}\n'
+            '{"type":"turn.started"}\n'
+        )
+        msg = (
+            "Memo handler could not extract a JSON object with all required "
+            "keys (summary, reasoning, citations, tags). exitCode=0, "
+            f"allOutput={len(all_output)}b, lastResultText=0b\n"
+            "--- output tail ---\n"
+            f"{all_output}"
+        )
+        assert len(msg) < 8192, "test fixture must stay under the 8KB bound"
+        # Even a generic parse_failed agent_category in context must NOT
+        # win the fast-path here — the preempt fires first.
+        task = _task(msg, ctx={"failure_category": "parse_failed"})
+        assert classify_failure(task) == EXTERNAL_API, (
+            "Codex thread.started + no turn.completed + exitCode=0 + "
+            "<8KB output is the cause-C silent-mid-turn-death pattern; "
+            "must route to EXTERNAL_API so the rate-limit/backoff path "
+            "runs instead of burning code-error retries."
+        )
+
+    def test_codex_cause_c_does_not_fire_when_turn_completed_present(self):
+        """Control: a stream with BOTH thread.started AND turn.completed is
+        a normal Codex run — the preempt must not steal it from the
+        downstream classification."""
+        all_output = (
+            '{"type":"thread.started"}\n'
+            '{"type":"turn.completed","usage":{"input_tokens":100}}\n'
+        )
+        msg = (
+            "Memo handler could not extract a JSON object. exitCode=0, "
+            f"allOutput={len(all_output)}b\n"
+            "--- output tail ---\n"
+            f"{all_output}"
+        )
+        task = _task(msg, ctx={"failure_category": "parse_failed"})
+        # parse_failed → CODE_ERROR via the agent_category fast-path, NOT
+        # EXTERNAL_API — the agent really did emit a completed turn that
+        # downstream parsing rejected.
+        assert classify_failure(task) == CODE_ERROR
+
+    def test_codex_cause_c_does_not_fire_when_exit_code_nonzero(self):
+        """Control: exitCode != 0 is the cause-A path (Codex/Claude crash),
+        which `claude_code_failed` + the existing override already cover.
+        The new preempt requires exitCode=0 to stay narrowly targeted."""
+        all_output = (
+            '{"type":"thread.started"}\n'
+            '{"type":"turn.started"}\n'
+        )
+        msg = (
+            "Memo handler could not extract a JSON object. exitCode=1, "
+            f"allOutput={len(all_output)}b\n"
+            "--- output tail ---\n"
+            f"{all_output}"
+        )
+        task = _task(msg, ctx={"failure_category": "claude_code_failed"})
+        # claude_code_failed → CODE_ERROR via the existing fast-path; the
+        # cause-C preempt requires exitCode=0 and must not fire here.
+        assert classify_failure(task) != EXTERNAL_API
+
+    def test_codex_cause_c_does_not_fire_on_large_outputs(self):
+        """Control: outputs >= 8KB mean real work was produced — the
+        thread.started/turn.completed delta is unlikely to be a silent
+        provider death and is more likely a genuine parse failure of a
+        large response. The preempt's 8KB bound keeps it conservative."""
+        # Pad to >= 8KB to bypass the bound.
+        padding = "x" * 9000
+        all_output = (
+            '{"type":"thread.started"}\n'
+            '{"type":"turn.started"}\n'
+            f'{padding}\n'
+        )
+        msg = f"exitCode=0\n{all_output}"
+        assert len(msg) >= 8192
+        task = _task(msg, ctx={"failure_category": "parse_failed"})
+        # Falls through to the normal parse_failed fast-path → CODE_ERROR.
+        assert classify_failure(task) == CODE_ERROR
+
     def test_gemini_daily_quota_exhaustion_not_misclassified_as_provision(self):
         """Regression: Gemini CLI quota-exhaustion was being misclassified as
         PROVISION_FAILURE because the provision bank contained a bare 'quota'

@@ -84,6 +84,37 @@ def derive_task_branch(
     return f"{namespace}/{prefix}-{str(task_id).replace('-', '')[:8]}"
 
 
+def resolve_task_branch(task: Any) -> str:
+    """Return the branch a task's agent actually pushed to.
+
+    Precedence:
+      1. ``task.context["review_loop"]["branch"]`` — set by review/fix spawn
+      2. ``task.first_payload["branch"]`` — set when an agent claims a task
+      3. ``task.context["branch"]`` — legacy fallback
+      4. ``derive_task_branch(task.id, task_type)`` — last-resort synthesis
+
+    Fix tasks reuse the parent's PR branch — synthesizing
+    ``blueprint/task-{fix_id}`` from a fix child's own id yields a name no
+    agent ever pushed, breaking downstream review respawns that try to clone
+    it. The first three sources carry the real branch; derivation is only
+    safe when none of them are present (a freshly-spawned create/refactor
+    task with no payload-provided branch yet).
+    """
+    ctx = getattr(task, "context", None) or {}
+    review_loop = ctx.get("review_loop") or {}
+    branch = review_loop.get("branch")
+    if branch:
+        return branch
+    payload = getattr(task, "first_payload", None) or {}
+    branch = payload.get("branch")
+    if branch:
+        return branch
+    branch = ctx.get("branch")
+    if branch:
+        return branch
+    return derive_task_branch(getattr(task, "id", None), payload.get("type"))
+
+
 # Rate limiter — shared between main.py and admin.py
 # Only enforced in Cloud Run (K_REVISION set), disabled locally for dev/test
 # Uses Redis for cross-instance coordination when REDIS_URL is set,
@@ -149,6 +180,24 @@ runtime_config: Dict = {
     # a single review-fix iteration (5-15 min agent + queueing) so multi-pass
     # cycles don't trigger a premature kill of in-flight children.
     "ci_backstop_timeout_minutes": int(os.getenv("CI_BACKSTOP_TIMEOUT_MINUTES", "60")),
+    # Orchestrator CI-poll resolution mode. True (default) routes through
+    # ``ci_resolution.resolve_pr_ci_status`` — strict check-runs on branch HEAD,
+    # PR-event merge SHA fallback when HEAD is bare, and a refusal to mark CI
+    # green from the mere absence of checks.  False reverts to the legacy
+    # ``get_check_runs_cached(treat_missing_as_success=True)`` lenient path; kept
+    # as the operator-side rollback handle if the strict mode causes false
+    # negatives in prod.
+    "ci_resolution_strict_mode": os.getenv(
+        "CI_RESOLUTION_STRICT_MODE", "true"
+    ).lower()
+    not in ("0", "false", "no"),
+    # Hard cap on ``ci_wait_started`` clock resets when GitHub responds with
+    # "checks in progress" / "status check pending" to a merge attempt.  Each
+    # reset bumps the CI-wait deadline by another full backstop window; without
+    # a cap, a PR whose required checks never resolve can spin on this reset
+    # path until the 6-hour parent timeout fires.  After the cap the resets stop
+    # and the normal backstop runs out on schedule.
+    "ci_in_progress_reset_cap": int(os.getenv("CI_IN_PROGRESS_RESET_CAP", "3")),
     # Hard EVALUATING-state backstop for parents not in CI-wait. The 6h legacy
     # default cascade-killed otherwise-recoverable children during operator-
     # intervention windows; bumped to 48h while silent-death stabilizes.
