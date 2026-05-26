@@ -4409,3 +4409,81 @@ async def test_close_loop_merge_advances_when_ancestry_confirmed(tl_db, mocker):
     assert case.status == RegressionCaseStatus.MERGED, (
         "case must advance to MERGED when fix PR merge commit is confirmed on integration branch"
     )
+
+
+# _spawn_ci_auto_remediation_followup — per-project promotion target dedup (R4-C3)
+# ══════════════════════════════════════════════════════════════════════════════
+# When ci_failure_branch is absent from context the dedup key must be the
+# project's promotion_target, NOT the literal 'main'.  A project with
+# promotion_target='production' must dedup against 'production' so that
+# unrelated main-branch investigations don't suppress it and vice-versa.
+
+
+@pytest.mark.asyncio
+async def test_dedup_uses_project_promotion_target_not_main(tl_db):
+    """ci_failure_branch absent → branch falls back to project.promotion_target.
+
+    First call spawns an investigate task with ci_failure_branch='production'.
+    Second call dedups against that same bucket and returns False.
+    If the fallback were still 'main', the first task would record 'main' in
+    context and the dedup assertion would fail.
+    """
+    from app.task_lifecycle import _spawn_ci_auto_remediation_followup
+
+    session, _ = tl_db
+    project = Project(
+        name="Promo Target Test", user_id="u-promo", promotion_target="production"
+    )
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    def _make_no_branch_task():
+        t = Task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "prompt": "auto-fix"}],
+            status=TaskStatus.FAILED,
+            created_by="ORCHESTRATOR",
+            context={
+                "spawned_by": "ci_auto_remediation",
+                "ci_failure_type": "test_failure",
+                "ci_failure_checks": ["backend-tests"],
+                # deliberately NO ci_failure_branch
+            },
+            latest_status_message="auto-fix failed",
+        )
+        return t
+
+    task1 = _make_no_branch_task()
+    session.add(task1)
+    await session.commit()
+    await session.refresh(task1)
+
+    spawned = await _spawn_ci_auto_remediation_followup(task1, session)
+    await session.commit()
+    assert spawned is True
+
+    result = await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != task1.id,
+        )
+    )
+    followup = result.scalars().one()
+    assert followup.context["ci_failure_branch"] == "production", (
+        "ci_failure_branch must fall back to project.promotion_target ('production'), "
+        "not the literal 'main'"
+    )
+
+    # Second call must dedup against 'production' bucket, not 'main'
+    task2 = _make_no_branch_task()
+    session.add(task2)
+    await session.commit()
+    await session.refresh(task2)
+
+    spawned2 = await _spawn_ci_auto_remediation_followup(task2, session)
+    await session.commit()
+    assert spawned2 is False, (
+        "second call must be deduped against the 'production' investigation, "
+        "not slip through into a separate 'main' bucket"
+    )

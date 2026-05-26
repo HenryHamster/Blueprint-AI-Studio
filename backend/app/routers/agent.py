@@ -47,7 +47,11 @@ from app.schemas import (
 )
 from pydantic import BaseModel, ConfigDict, Field
 from app.payload_schemas import validate_task_payload
-from app.shared_state import limiter
+from app.shared_state import (
+    limiter,
+    get_project_promotion_target,
+    get_project_integration_branch,
+)
 import app.shared_state as _shared_state
 from app.storage import generate_upload_signed_url, ARTIFACT_BUCKET_NAME
 from app.secrets_manager import get_user_secret
@@ -1009,6 +1013,8 @@ async def claim_task(
             "enable_parallel_review": _build_cfg.get("enable_parallel_review", False),
             "enable_parallel_fix": _build_cfg.get("enable_parallel_fix", False),
             "enable_self_improvement": project.enable_self_improvement,
+            "promotion_target": get_project_promotion_target(project),
+            "integration_branch": get_project_integration_branch(project),
         }
 
     task_type = task.first_payload.get("type", "")

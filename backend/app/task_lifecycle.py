@@ -890,7 +890,15 @@ async def _spawn_ci_auto_remediation_followup(
     from app.main import _utcnow
 
     ctx = task.context or {}
-    branch = ctx.get("ci_failure_branch") or "main"
+    _ci_project = (
+        await session.get(Project, task.project_id) if task.project_id else None
+    )
+    _promotion_target = (
+        _shared_state.get_project_promotion_target(_ci_project)
+        if _ci_project
+        else "main"
+    )
+    branch = ctx.get("ci_failure_branch") or _promotion_target
     fingerprint = ctx.get("_previous_error_fingerprint") or ""
     failed_checks = ctx.get("ci_failure_checks") or []
     failure_type = ctx.get("ci_failure_type") or "(unknown)"
@@ -942,9 +950,6 @@ async def _spawn_ci_auto_remediation_followup(
         "remediation can be spawned. Consider whether the failure is "
         "infrastructure-related, a flaky check, or a deeper code defect "
         "that the original auto-fix prompt mis-scoped."
-    )
-    _ci_project = (
-        await session.get(Project, task.project_id) if task.project_id else None
     )
     inv_payload = validate_internal_payload(
         {

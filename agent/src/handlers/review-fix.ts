@@ -1107,6 +1107,7 @@ export async function handleFix(
   if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Invalid pr_number: ${String(payload.pr_number)}`);
   const originalPrompt = strVal(payload.original_prompt);
   const fixOrigTaskType = strVal(payload.original_task_type || '');
+  const promotionTarget = strVal(payload.promotion_target) || undefined;
 
   if (!prompt) throw new Error('Fix task missing prompt');
 
@@ -1541,7 +1542,7 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
   }
 
   // Run Claude with the review feedback as the prompt
-  const promptFingerprint = computePromptFingerprint('fix', fixBuildConfig, { includeParallelFixGuidance: parallelFixInjected });
+  const promptFingerprint = computePromptFingerprint('fix', fixBuildConfig, { includeParallelFixGuidance: parallelFixInjected, promotionTarget });
   statusRef.value = 'Addressing review feedback...';
   setCurrentPromptFingerprint(promptFingerprint);
   // Emit once before the fix session starts so fast fix/rebase tasks still
@@ -1569,7 +1570,7 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
     owner,
     repo,
     existingPrNumber: prNumber,
-    testsOnMainBranch: baseBranch === 'main',
+    testsOnMainBranch: baseBranch === (promotionTarget ?? 'main'),
     baseCommit: fixBaseCommit,
     model,
     effort,

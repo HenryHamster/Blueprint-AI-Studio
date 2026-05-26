@@ -989,6 +989,32 @@ describe('handleFix — runCodeChangeTask delegation', () => {
     expect(opts.testsOnMainBranch).toBe(false);
   });
 
+  it('sets testsOnMainBranch=true when base_branch matches promotion_target', async () => {
+    await handleFix(
+      'task-fix-promotion-target',
+      { ...basePayload, base_branch: 'automain', promotion_target: 'automain' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const opts = capturedFixOpts();
+    expect(opts.baseBranch).toBe('automain');
+    expect(opts.testsOnMainBranch).toBe(true);
+  });
+
+  it('sets testsOnMainBranch=false when base_branch does not match promotion_target', async () => {
+    await handleFix(
+      'task-fix-non-lts',
+      { ...basePayload, base_branch: 'feature/x', promotion_target: 'automain' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const opts = capturedFixOpts();
+    expect(opts.baseBranch).toBe('feature/x');
+    expect(opts.testsOnMainBranch).toBe(false);
+  });
+
   it('throws when prompt is missing — never calls runCodeChangeTask', async () => {
     await expect(
       handleFix(

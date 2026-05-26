@@ -47,8 +47,13 @@ export interface CodeChangeTaskOpts {
    *  self-review to THIS iteration's diff, not the cumulative PR diff. */
   fixIteration?: number;
   /** When true, ./check test runs the Docker backend test suite when changes
-   *  touch backend/. Set when baseBranch === 'main'. */
+   *  touch backend/. Set when baseBranch === promotionTarget (or 'main' when
+   *  no promotionTarget is known). */
   testsOnMainBranch: boolean;
+  /** Per-project promotion target branch (e.g. 'automain', 'production', 'release/v2').
+   *  When set, forwarded to writeCodeChangeHelpers so the generated ./check and ./pr
+   *  scripts can name the actual LTS branch rather than assuming 'main'. */
+  promotionTarget?: string;
   /** Diff summary captured pre-Claude — used as fallback if Claude exits
    *  without ./done|./fail. */
   baseCommit: string;
@@ -276,6 +281,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     repo: opts.repo,
     existingPrNumber: opts.existingPrNumber,
     testsOnMainBranch: opts.testsOnMainBranch,
+    promotionTarget: opts.promotionTarget,
     regressingCategories: opts.regressingCategories,
     buildConfig: opts.buildConfig,
   });

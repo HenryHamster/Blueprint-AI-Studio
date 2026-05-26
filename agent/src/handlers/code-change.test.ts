@@ -34,6 +34,7 @@ vi.mock('fs', () => {
 // ── Imports under test ────────────────────────────────────────────────────────
 import { augmentSelfReview, runCodeChangeTask } from './code-change.js';
 import { git, persistAndPostStatus, runClaudeCode } from '../index.js';
+import { writeCodeChangeHelpers } from '../prompt.js';
 import * as fs from 'fs';
 
 describe('augmentSelfReview', () => {
@@ -235,5 +236,42 @@ describe('runCodeChangeTask SCOPE_EMPTY guard', () => {
       relatedFiles: ['agent/src/handlers/code-change.ts'],
     });
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalled();
+  });
+});
+
+describe('runCodeChangeTask promotionTarget forwarding', () => {
+  const baseOpts = {
+    taskId: 'task-promo-test',
+    prompt: 'do the thing',
+    ws: null,
+    statusRef: { value: '' },
+    workBranch: 'blueprint/task-promo-test',
+    baseBranch: 'production',
+    owner: 'owner',
+    repo: 'repo',
+    testsOnMainBranch: true,
+    baseCommit: 'abc123',
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.writeFileSync).mockImplementation(() => {});
+    vi.mocked(fs.unlinkSync).mockImplementation(() => {});
+    vi.mocked(git).mockReturnValue('abc123');
+  });
+
+  it('forwards promotionTarget to writeCodeChangeHelpers when provided', async () => {
+    await runCodeChangeTask({ ...baseOpts, promotionTarget: 'production' });
+    expect(vi.mocked(writeCodeChangeHelpers)).toHaveBeenCalledWith(
+      expect.objectContaining({ promotionTarget: 'production' }),
+    );
+  });
+
+  it('forwards undefined promotionTarget when not provided', async () => {
+    await runCodeChangeTask({ ...baseOpts });
+    expect(vi.mocked(writeCodeChangeHelpers)).toHaveBeenCalledWith(
+      expect.objectContaining({ promotionTarget: undefined }),
+    );
   });
 });

@@ -24,6 +24,7 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.url_security import _resolve_safe_external_url
+from app.shared_state import get_project_promotion_target
 
 from app.models import (
     MessageType,
@@ -1064,7 +1065,9 @@ async def post_remediation_result_message(
             pr_number=pr_number,
             task_id=task.id,
         )
-    branch = (task.context or {}).get("ci_failure_branch", "main")
+    _project = await session.get(Project, task.project_id) if task.project_id else None
+    _fallback_branch = get_project_promotion_target(_project) if _project else "main"
+    branch = (task.context or {}).get("ci_failure_branch") or _fallback_branch
     return await post_auto_fix_result_message(
         session,
         task.project_id,

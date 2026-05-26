@@ -237,7 +237,6 @@ async def secret_reconciliation_service():
             break
 
 
-_STALE_BRANCH_PREFIXES = ("blueprint/", "research/", "plan/")
 _DEFAULT_PROTECTED_BRANCHES = ("main", "master", "develop", "dev")
 # Per-cycle caps. The age check costs one GitHub commit-date call per candidate
 # branch (i.e. branches that already passed the terminal-task filter), plus a

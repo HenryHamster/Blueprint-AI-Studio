@@ -178,6 +178,7 @@ export async function handleMigrate(
 ) {
   const rawPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
   const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const migratePromotionTarget = strVal(payload.promotion_target) || undefined;
   const migrateTaskTitle = strVal(task.title);
   const prompt = migrateTaskTitle ? `Task: ${migrateTaskTitle}\n\n${rawPrompt}` : rawPrompt;
 
@@ -303,7 +304,7 @@ ${DEFAULT_TOOL_GUIDANCE}`;
     baseBranch,
     owner,
     repo,
-    testsOnMainBranch: baseBranch === 'main',
+    testsOnMainBranch: baseBranch === (migratePromotionTarget ?? 'main'),
     baseCommit: migrateBaseCommit,
     model,
     effort,

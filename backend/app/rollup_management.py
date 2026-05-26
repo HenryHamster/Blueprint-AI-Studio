@@ -732,11 +732,16 @@ async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
     # Feature branches after PR merge
     if ctx.get("pr_merged"):
         project = await session.get(Project, task.project_id)
-        branch_prefix = project.task_branch_prefix if project else "blueprint/"
-        for payload in task.payloads or []:
-            branch = payload.get("branch")
-            if branch and branch.startswith(branch_prefix):
-                branches_to_delete.append(branch)
+        if not project:
+            # project should never be None in practice (loaded at task creation);
+            # a missing row signals a config bug. Log and skip to avoid silent
+            # cross-project branch mis-cleanup (would occur if using hardcoded 'blueprint/').
+            logger.warning(f"[CLEANUP] Missing project for task {task.id}; skipping branch cleanup")
+        else:
+            for payload in task.payloads or []:
+                branch = payload.get("branch")
+                if branch and branch.startswith(project.task_branch_prefix):
+                    branches_to_delete.append(branch)
 
     for branch in branches_to_delete:
         try:

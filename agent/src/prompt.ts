@@ -124,9 +124,9 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
 ]);
 
 // ── Dynamic Task Type Hints (based on project build configuration) ───────────
-export function getTaskTypeHints(buildConfig?: BuildConfig): Record<string, string> {
+export function getTaskTypeHints(buildConfig?: BuildConfig, promotionTarget?: string): Record<string, string> {
   const dirs = buildConfig?.directories ?? [];
-  if (dirs.length === 0) return TASK_TYPE_HINTS;
+  if (dirs.length === 0 && !promotionTarget) return TASK_TYPE_HINTS;
 
   const pythonDirs = dirs.filter(d => d.type === 'python');
   const nodeDirs = dirs.filter(d => d.type === 'node');
@@ -163,6 +163,11 @@ export function getTaskTypeHints(buildConfig?: BuildConfig): Record<string, stri
   }
   if (pkgManagers.length > 0) {
     hints['deps'] = `Check for breaking changes in major version bumps. This project uses ${pkgManagers.join(', ')}. Run the full test suite after updating to verify compatibility.`;
+  }
+
+  if (promotionTarget) {
+    const lts = promotionTarget;
+    hints['release_audit'] = `You are running on the LTS branch (${lts}) and reviewing the incoming diff against ${lts}'s standards. Run \`git diff <diff_range>\` to obtain the diff. Check for test erosion (deleted test files, net assertion/test-count delta). Score findings into audit_score [0,1]. Do not modify any files — output is a JSON release audit report only.`;
   }
 
   return hints;
@@ -418,9 +423,9 @@ export function assembleFailureGuidanceBlocks(): string {
 export function computePromptFingerprint(
   taskType: string,
   buildConfig?: BuildConfig,
-  options?: { includeParallelFixGuidance?: boolean },
+  options?: { includeParallelFixGuidance?: boolean; promotionTarget?: string },
 ): string {
-  const hints = getTaskTypeHints(buildConfig);
+  const hints = getTaskTypeHints(buildConfig, options?.promotionTarget);
   const taskHint = hints[taskType] ?? '';
   const sections = [taskHint, DEFAULT_TOOL_GUIDANCE, assembleFailureGuidanceBlocks()];
   if (options?.includeParallelFixGuidance) sections.push(PARALLEL_FIX_GUIDANCE);
@@ -581,8 +586,14 @@ interface CodeChangeHelperConfig {
    *  to the existing PR instead of creating a new one. */
   existingPrNumber?: number;
   /** When true, ./check test runs the Docker backend test suite for any
-   *  task whose changes touch ``backend/``. Set when base_branch === 'main'. */
+   *  task whose changes touch ``backend/``. Set when baseBranch === promotionTarget
+   *  (or === 'main' when no promotionTarget is known). */
   testsOnMainBranch: boolean;
+  /** Per-project promotion target branch (e.g. 'automain', 'production', 'release/v2').
+   *  When set, the test gate fires when baseBranch === promotionTarget, overriding
+   *  the testsOnMainBranch boolean. Handlers that read promotion_target from the
+   *  task payload should pass it here. */
+  promotionTarget?: string;
   /** SR categories whose miss-rate is regressing for this task type.
    *  When set, ./done validates that each has a non-trivial `reasoning` field
    *  in check_results before posting COMPLETED. */
@@ -913,7 +924,7 @@ if touches backend/; then
   else
     echo "[check] ruff not installed, skipping backend lint"
   fi
-  if [ "$WITH_TESTS" = "1" ] && [ "${cfg.testsOnMainBranch ? '1' : '0'}" = "1" ]; then
+  if [ "$WITH_TESTS" = "1" ] && [ "${(cfg.promotionTarget !== undefined ? cfg.baseBranch === cfg.promotionTarget : cfg.testsOnMainBranch) ? '1' : '0'}" = "1" ]; then
     # --standalone --no-postgres: agent VM is e2-standard-2 (8 GB) and
     # cannot fit Docker build + Postgres sidecar + full pytest suite +
     # agent + Claude subprocess in memory. The full suite OOMs (exit
@@ -1206,8 +1217,8 @@ if [ -n "$SR_SECTION" ]; then
   BODY=$(printf '%s\\n\\n%s' "$BODY" "$SR_SECTION")
 fi
 
-${cfg.testsOnMainBranch ? `# Mandatory test gate: force WITH_TESTS=1 when the diff touches backend/.
-# The agent must not be able to skip backend tests on main-branch tasks.
+${(cfg.promotionTarget !== undefined ? cfg.baseBranch === cfg.promotionTarget : cfg.testsOnMainBranch) ? `# Mandatory test gate: force WITH_TESTS=1 when the diff touches backend/.
+# The agent must not be able to skip backend tests on LTS-branch tasks.
 _BASE_GATE="${cfg.baseBranch}"
 _CMT_GATE=""
 if git rev-parse --verify "origin/$_BASE_GATE" >/dev/null 2>&1; then
@@ -1218,7 +1229,7 @@ fi
 _UNC_GATE=$(git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
 _CHG_GATE=$(printf '%s\\n%s\\n' "$_CMT_GATE" "$_UNC_GATE" | sort -u | grep -v '^$' || true)
 if printf '%s\\n' "$_CHG_GATE" | grep -q '^backend/'; then
-  echo "[pr] backend/ touched on main — forcing WITH_TESTS=1 (mandatory test gate)"
+  echo "[pr] backend/ touched on LTS branch — forcing WITH_TESTS=1 (mandatory test gate)"
   WITH_TESTS=1
 fi
 ` : ''}

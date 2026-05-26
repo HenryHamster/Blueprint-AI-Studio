@@ -759,6 +759,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const ctx = (task.context as Record<string, unknown> | undefined) || {};
   const rawBaseBranch = strVal(payload.base_branch) || strVal(ctx.research_branch) || strVal(ctx.original_base) || 'main';
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
+  const promotionTarget = strVal(payload.promotion_target) || undefined;
   const rawTitle = strVal(task.title) || strVal(payload.title) || 'automated changes';
   const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
 
@@ -772,7 +773,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const rawPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
   const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   const taskTypeKey = strVal(payload.type);
-  const taskTypeHintsMap = getTaskTypeHints(buildConfig);
+  const taskTypeHintsMap = getTaskTypeHints(buildConfig, promotionTarget);
   const taskTypeHint = includeTaskTypeHints && taskTypeHintsMap[taskTypeKey]
     ? `\n\n${taskTypeHintsMap[taskTypeKey].replace(/\{\{BASE_BRANCH\}\}/g, baseBranch)}`
     : '';
@@ -855,7 +856,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const isAutoRemediation = Boolean(
     (task.context as Record<string, unknown> | undefined)?.auto_remediation
   );
-  if (captureBaseline && runTestFix && baseBranch === 'main' && !isAutoRemediation) {
+  if (captureBaseline && runTestFix && baseBranch === (promotionTarget ?? 'main') && !isAutoRemediation) {
     const relatedFiles = (
       (payload.related_files as string[] | undefined) ||
       ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
@@ -1051,7 +1052,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     baseBranch,
     owner,
     repo,
-    testsOnMainBranch: baseBranch === 'main',
+    testsOnMainBranch: baseBranch === (promotionTarget ?? 'main'),
     baseCommit,
     model,
     effort,

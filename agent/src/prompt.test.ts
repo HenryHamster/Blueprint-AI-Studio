@@ -2093,6 +2093,29 @@ describe('getTaskTypeHints', () => {
     // No npm commands configured for this python-only directory
     expect(result).not.toContain('npm run lint');
   });
+
+  it('substitutes promotionTarget into release_audit hint when provided', () => {
+    const result = getTaskTypeHints(undefined, 'production')['release_audit'];
+    expect(result).toContain('(production)');
+    expect(result).toContain("production's standards");
+    expect(result).not.toContain('(main)');
+  });
+
+  it('substitutes non-main promotionTarget like release/v2 into release_audit hint', () => {
+    const result = getTaskTypeHints(undefined, 'release/v2')['release_audit'];
+    expect(result).toContain('(release/v2)');
+    expect(result).toContain("release/v2's standards");
+  });
+
+  it('keeps (main) in release_audit hint when no promotionTarget provided', () => {
+    const result = getTaskTypeHints(undefined)['release_audit'];
+    expect(result).toContain('(main)');
+  });
+
+  it('keeps (main) in release_audit when promotionTarget is absent and buildConfig has dirs', () => {
+    const result = getTaskTypeHints({ directories: [{ path: 'src', type: 'node' }] })['release_audit'];
+    expect(result).toContain('(main)');
+  });
 });
 
 // ── discoverRelatedTests ──────────────────────────────────────────────────────
@@ -3925,6 +3948,44 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     expect(prScript).toContain('PATCH');
     expect(prScript).toContain('/pulls/42');
     expect(prScript).toContain('SR body update');
+  });
+  it('generates ./check and ./pr with test gate when promotionTarget matches baseBranch', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-promo',
+      workBranch: 'blueprint/test-task-promo',
+      baseBranch: 'production',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+      promotionTarget: 'production',
+    });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    const prScript = capturedScripts['/tmp/workspace/pr'];
+    expect(checkScript).toBeDefined();
+    expect(prScript).toBeDefined();
+    // Test gate fires because baseBranch === promotionTarget === 'production'
+    expect(checkScript).toContain('"1" = "1"');
+    expect(prScript).toContain('LTS branch');
+    expect(prScript).toContain('mandatory test gate');
+  });
+
+  it('does not generate test gate when promotionTarget does not match baseBranch', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-feat',
+      workBranch: 'blueprint/test-task-feat',
+      baseBranch: 'feature/xyz',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+      promotionTarget: 'production',
+    });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    const prScript = capturedScripts['/tmp/workspace/pr'];
+    // baseBranch !== promotionTarget, so no mandatory gate
+    expect(checkScript).toContain('"0" = "1"');
+    expect(prScript).not.toContain('mandatory test gate');
   });
 });
 
