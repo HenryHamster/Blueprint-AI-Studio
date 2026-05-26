@@ -82,9 +82,40 @@ from app.shared_state import runtime_config as _runtime_config
 
 logger = logging.getLogger(__name__)
 
+# Title of the conflict-resolution Alert.  Used both when creating the Alert
+# and when checking whether an unresolved one already exists, so a retried /
+# periodic back-merge does not stack duplicate alerts.
+_CONFLICT_ALERT_TITLE = "Back-merge conflict: main -> automain"
+
+# Title of the generic (non-conflict) failure Alert — a 405, a PR-creation
+# failure, or any unexpected exception.  Only raised for one-shot callers
+# (``periodic=False``); the periodic reconciler logs + retries instead.
+_BLOCKED_ALERT_TITLE = "Back-merge failed: main -> automain"
+
+# The conflict-resolution task always targets automain — it is a normal
+# automain-bound fix, NOT a hotfix.  It must NOT carry hotfix:true.
+_RESOLUTION_BASE_BRANCH = "automain"
+
 # Priority for the conflict-resolution plan task — expedited (design doc:
 # back-merge conflict resolution gates the next promotion; >= 90).
 _RESOLUTION_PRIORITY = 95
+
+# Task type for the conflict-resolution task.  ``create`` (not ``plan``): runs
+# the agent directly against automain so the resolver prompt reaches the
+# executor verbatim.  A plan task would decompose into subtasks via the
+# planner, and the per-conflict guardrails do not survive that indirection
+# (subtask prompts are written by the planner, not copied verbatim).
+#
+# ``create`` over ``refactor``/``fix``:
+#   - ``refactor``'s standard-handler boilerplate forbids behavior changes
+#     ("Do NOT change any observable behavior"), which contradicts the whole
+#     point — absorbing ``main``'s bugfixes IS a behavior change.
+#   - ``fix`` is hard-coded to clone an existing PR branch (the back-merge
+#     PR's head is ``main``, which agents must never push to).
+#   - ``create`` cleanly branches from automain, runs the agent with the
+#     prompt unmodified, pushes a new ``blueprint/task-...`` branch, and
+#     opens a PR back to automain — exactly the shape we want.
+_RESOLUTION_TASK_TYPE = "create"
 
 # Terminal task statuses — a resolution plan in one of these no longer counts
 # as "open" for the duplicate-spawn guard.
@@ -151,10 +182,12 @@ async def open_backmerge_pr(
          ``main`` commit history on ``automain``).
       5. On ``merged`` truthy, return ``{"status": "merged", "pr_url": ...}``.
       6. On ``conflict`` (a 409), raise an ``Alert`` AND spawn a high-priority
-         ``plan`` task instructing a ``git merge origin/main`` conflict
+         ``refactor`` task instructing a ``git merge origin/main`` conflict
          resolution against ``automain``; return ``{"status": "conflict"}``.
-         The plan task does NOT carry ``hotfix:true``.  Alert + plan are
-         deduped project-wide — only one resolution is ever needed at a time.
+         The resolver task does NOT carry ``hotfix:true``.  Alert + resolver
+         are deduped project-wide — only one resolution is ever needed at a
+         time.  The resolver is a single direct task (not a plan/decomposer)
+         so the resolution guardrails reach the executing agent verbatim.
       7. On any other non-merge (a 405) or any exception, raise an ``Alert``
          (``periodic=False``) — a one-shot back-merge that fails must never
          pass silently — and return ``{"status": "blocked"}``.
@@ -163,12 +196,13 @@ async def open_backmerge_pr(
     calls this every scheduler cycle.  A periodic caller dedups its alerting so
     it neither storms (an Alert every cycle) nor goes silent: a blocked
     non-merge (step 7) raises one unresolved Alert per project until dismissed,
-    and the conflict path (step 6) raises one Alert + one plan, both deduped.
+    and the conflict path (step 6) raises one Alert + one resolver task, both
+    deduped.
 
     ``merged_pr_url`` / ``hotfix_task_id`` describe the hotfix that triggered
     this back-merge, when there was one; the periodic reconciler passes
     neither.  They are recorded in the PR body, the Alert message, and the
-    resolution-plan context for traceability.
+    resolver task's context for traceability.
 
     The caller commits the session.  Returns a status dict.
     """
@@ -410,20 +444,20 @@ def _describe_trigger(merged_pr_url: str, hotfix_task_id: str | None) -> str:
     return "hotfix " + " / ".join(parts)
 
 
-async def _resolution_plan_already_open(
+async def _resolution_task_already_open(
     session: AsyncSession,
     project_id: uuid.UUID,
 ) -> bool:
-    """Return True if a back-merge conflict-resolution plan is already open.
+    """Return True if a back-merge conflict-resolution task is already open.
 
-    Only ONE such plan is ever needed at a time: it runs ``git merge
+    Only ONE such task is ever needed at a time: it runs ``git merge
     origin/main`` into ``automain``, which reconciles ALL divergence regardless
     of how many hotfixes or direct pushes caused it.  The guard is therefore
     project-wide (not per-hotfix) — it dedupes the spawn for every trigger: the
     hotfix path retried for one hotfix, a second hotfix, and the periodic
     reconciler called every cycle.
 
-    A resolution plan is identified by ``context["backmerge_conflict"] is
+    A resolution task is identified by ``context["backmerge_conflict"] is
     True``.  Only non-terminal tasks count as "open" — a CANCELLED/FAILED prior
     attempt does not block a fresh spawn.
     """
@@ -454,18 +488,18 @@ async def _handle_conflict(
     periodic: bool,
     project: Project | None = None,
 ) -> None:
-    """Raise a conflict Alert and (if not already open) spawn a resolution plan.
+    """Raise a conflict Alert and (if not already open) spawn a resolution task.
 
     A back-merge conflict needs human/agent resolution — it is never transient
-    — so it always escalates.  Alert + resolution ``plan`` task are spawned
-    together, both gated by :func:`_resolution_plan_already_open`:
+    — so it always escalates.  Alert + resolution task are spawned together,
+    both gated by :func:`_resolution_task_already_open`:
 
       * ``periodic=False`` (one-shot hotfix back-merge) — when a resolution
-        plan is already open the plan is not duplicated, but an Alert is still
+        task is already open the task is not duplicated, but an Alert is still
         raised so the operator sees a recurrence of a one-shot back-merge.
       * ``periodic=True`` (the reconciler retries every cycle) — when a
-        resolution plan is already open NEITHER a duplicate Alert NOR a
-        duplicate plan is created, so a persistent conflict yields one of each
+        resolution task is already open NEITHER a duplicate Alert NOR a
+        duplicate task is created, so a persistent conflict yields one of each
         instead of one per cycle.
 
     Concurrency note: two concurrent callers — the promotion-conflict hook and
@@ -500,15 +534,15 @@ async def _handle_conflict(
         )
         return
 
-    already_open = await _resolution_plan_already_open(session, project_id)
+    already_open = await _resolution_task_already_open(session, project_id)
 
     if periodic and already_open:
-        # The reconciler runs every cycle — a resolution plan is already open
+        # The reconciler runs every cycle — a resolution task is already open
         # and being worked; staying quiet keeps a persistent conflict from
-        # stacking an Alert + plan each cycle.
+        # stacking an Alert + task each cycle.
         logger.info(
             "[BACKMERGE] back-merge conflict for project %s — a resolution "
-            "plan is already open; periodic reconciler stays quiet",
+            "task is already open; periodic reconciler stays quiet",
             project_id,
         )
         return
@@ -525,7 +559,7 @@ async def _handle_conflict(
         message=(
             f"The automated {promotion_target} -> {integration_branch} back-merge "
             f"(PR #{pr_number}{trigger_clause}) hit a merge conflict and "
-            f"could not be merged automatically. A resolution plan task has "
+            f"could not be merged automatically. A resolution task has "
             f"been spawned. Until {integration_branch} absorbs {promotion_target}, the next "
             f"{integration_branch} -> {promotion_target} promotion will conflict. ({message[:160]})"
         ),
@@ -533,15 +567,15 @@ async def _handle_conflict(
     session.add(alert)
     await session.flush()
 
-    spawned_plan: Task | None = None
+    spawned_task: Task | None = None
     if already_open:
         logger.info(
-            "[BACKMERGE] a back-merge conflict-resolution plan is already "
+            "[BACKMERGE] a back-merge conflict-resolution task is already "
             "open for project %s — not spawning a duplicate",
             project_id,
         )
     else:
-        spawned_plan = await _spawn_resolution_plan(
+        spawned_task = await _spawn_resolution_task(
             session,
             project_id,
             pr_number,
@@ -552,15 +586,15 @@ async def _handle_conflict(
         )
 
     await _broadcast_alert(project_id, alert)
-    if spawned_plan is not None:
+    if spawned_task is not None:
         await broadcast_to_project(
             str(project_id),
             "task_updated",
-            {"task_id": str(spawned_plan.id), "status": TaskStatus.QUEUED},
+            {"task_id": str(spawned_task.id), "status": TaskStatus.QUEUED},
         )
 
 
-async def _spawn_resolution_plan(
+async def _spawn_resolution_task(
     session: AsyncSession,
     project_id: uuid.UUID,
     pr_number: int,
@@ -570,51 +604,94 @@ async def _spawn_resolution_plan(
     *,
     project: Project | None = None,
 ) -> Task:
-    """Create + queue a high-priority ``plan`` task to resolve the conflict.
+    """Create + queue a high-priority refactor task to resolve the conflict.
 
-    The plan targets ``automain`` (``base_branch="automain"``) and instructs a
+    The task targets ``automain`` (``base_branch="automain"``) and instructs a
     ``git merge origin/main`` conflict resolution.  It is a NORMAL
     automain-bound fix — it deliberately does NOT carry ``hotfix:true``.
+
+    Single direct task (not a plan/decomposer): the per-conflict reasoning
+    rules in the prompt must reach the executing agent verbatim, and a plan
+    task would route the prompt through the planner-decomposer first — the
+    subtask prompts the planner writes are not guaranteed to carry the parent
+    guardrails.  Refactor matches the semantics (structural integration, no
+    new behavior, branch from automain, push, open PR back to automain) and
+    its branch prefix ``blueprint/refactor-…`` identifies the work clearly.
+
+    ``context["backmerge_conflict"] = True`` is the marker field both for
+    dedup (:func:`_resolution_task_already_open`) and for the merge-method
+    gate in task_lifecycle.py (a back-merge resolution PR must be merged with
+    ``merge_method="merge"``, never squash — otherwise ``main`` does not
+    appear as a parent of ``automain`` and the merge-base never advances).
     """
     integration_branch, promotion_target = _lts_branch_names(project)
     trigger_clause = f" ({trigger_desc})" if trigger_desc else ""
     prompt = (
         f"The automated `{promotion_target} -> {integration_branch}` back-merge PR #{pr_number} "
-        f"({pr_url or 'no URL'}) hit a merge conflict and could not be merged.\n\n"
-        f"A change has landed on `{promotion_target}` that `{integration_branch}` does not have"
-        f"{trigger_clause}, and `{integration_branch}` must absorb it or the next "
+        f"({pr_url or 'no URL'}) hit a merge conflict and could not be merged. "
+        f"`{integration_branch}` must absorb `{promotion_target}`{trigger_clause}, or the next "
         f"`{integration_branch} -> {promotion_target}` promotion will conflict.\n\n"
-        f"Resolve it: from a checkout of `{integration_branch}`, run `git merge origin/{promotion_target}`, "
-        f"resolve every conflict so that `{integration_branch}` contains both the `{promotion_target}` "
-        f"changes and the in-flight integration work, and commit the merge. "
-        f"Do NOT discard the `{promotion_target}` changes and do NOT discard {integration_branch}'s "
-        f"integration work.\n\n"
-        f"IMPORTANT GUARDRAILS:\n"
-        f"- This is a normal {integration_branch}-targeted fix, NOT a hotfix.\n"
+        f"From a fresh branch off `{integration_branch}`, run `git merge origin/{promotion_target}`, "
+        f"resolve every conflict per the policy below, commit the merge, push, "
+        f"and open a PR back to `{integration_branch}` so the orchestrator can land it.\n\n"
+        f"## How to reason about each conflict\n"
+        f"1. **Read intent on both sides first.** `{promotion_target}` commits are usually "
+        f"small, targeted bugfixes / hotfixes / behavioral corrections — they "
+        f"were written to fix something specific. `{integration_branch}` changes tend to "
+        f"be wider — decompositions, refactors, new modules being integrated. "
+        f"Use `git log --oneline HEAD..origin/{promotion_target} -- <file>` and the recent "
+        f"`{integration_branch}` commits touching the same file before resolving each hunk.\n"
+        f"2. **Default rule: preserve both intents.** Re-apply `{promotion_target}`'s fix "
+        f"*on top of* `{integration_branch}`'s new structure. If `{integration_branch}` renamed, moved, "
+        f"or decomposed code that `{promotion_target}` then patched, locate the equivalent "
+        f"spot in the new structure and apply the patch there. Don't discard "
+        f"the fix because the surrounding code shifted.\n"
+        f"3. **When intents genuinely conflict** (e.g. `{promotion_target}` reverted a "
+        f"behavior `{integration_branch}` depends on, or `{promotion_target}` deleted code "
+        f"`{integration_branch}` still calls): `{promotion_target}` wins on behavior — it is the "
+        f"human-reviewed LTS branch — and `{integration_branch}`'s dependent code must be "
+        f"updated to match. Call out such cases in the PR body so reviewers can sanity-check.\n"
+        f"4. **Pure additions on disjoint lines:** keep both.\n\n"
+        f"## File-class policies\n"
+        f"- `module_size_limits.json` and other size-cap files: take the "
+        f"higher cap.\n"
+        f"- Lockfiles (`package-lock.json`, `uv.lock`, etc.): regenerate, "
+        f"don't hand-merge.\n"
+        f"- Generated files / snapshots: take `{promotion_target}` and regenerate if a "
+        f"generator exists.\n"
+        f"- Test files: keep both sides' tests; if they conflict on the same "
+        f"assertion, prefer `{promotion_target}`'s assertion and adjust `{integration_branch}`'s test "
+        f"infrastructure to satisfy it.\n\n"
+        f"## Guardrails\n"
+        f"- This is a normal {integration_branch}-targeted task, NOT a hotfix.\n"
         f"- Do NOT delete or skip tests just to make the merge build pass.\n"
-        f"- Keep both sides of every conflict reconciled — a `{promotion_target}` line and an "
-        f"integration line that touch the same code must be merged, not "
-        f"clobbered.\n"
-        f"- Produce subtasks that land the resolved merge on `{integration_branch}`."
+        f"- Do NOT clobber either side wholesale — every conflict needs a "
+        f"per-hunk decision per the rules above.\n"
+        f"- In the PR body, list each non-trivial conflict and which side won "
+        f"(or how you synthesized)."
     )
 
     payload: dict[str, Any] = {
-        "type": "plan",
+        "type": _RESOLUTION_TASK_TYPE,
         "prompt": prompt,
         "base_branch": integration_branch,
     }
-    type_model = (_runtime_config.get("task_type_models", {}) or {}).get("plan")
+    type_model = (_runtime_config.get("task_type_models", {}) or {}).get(
+        _RESOLUTION_TASK_TYPE
+    )
     if type_model:
         payload["model"] = type_model
-    type_effort = (_runtime_config.get("task_type_efforts", {}) or {}).get("plan")
+    type_effort = (_runtime_config.get("task_type_efforts", {}) or {}).get(
+        _RESOLUTION_TASK_TYPE
+    )
     if type_effort:
         payload["effort"] = type_effort
     try:
         payload = validate_internal_payload(
-            payload, "hotfix_backmerge:conflict_resolution_plan"
+            payload, "hotfix_backmerge:conflict_resolution_task"
         )
     except PayloadTooLargeError:
-        # The resolution-plan payload is tiny; a too-large error is a real bug.
+        # The resolution-task payload is tiny; a too-large error is a real bug.
         raise
 
     task = Task(
@@ -628,7 +705,9 @@ async def _spawn_resolution_plan(
         priority=_RESOLUTION_PRIORITY,
         payloads=[payload],
         context={
-            # Marker field — _resolution_plan_already_open dedupes on this.
+            # Marker field — _resolution_task_already_open dedupes on this AND
+            # the merge sites in task_lifecycle.py read it to pick
+            # merge_method="merge" instead of the default squash.
             "backmerge_conflict": True,
             # Traceability only (the dedup is project-wide, not keyed on this).
             "hotfix_task_id": hotfix_task_id,
@@ -654,10 +733,11 @@ async def _spawn_resolution_plan(
         )
     )
     logger.warning(
-        "[BACKMERGE] spawned conflict-resolution plan task %s "
-        "(priority=%d) for back-merge PR #%s",
+        "[BACKMERGE] spawned conflict-resolution task %s "
+        "(priority=%d, type=%s) for back-merge PR #%s",
         task.id,
         _RESOLUTION_PRIORITY,
+        _RESOLUTION_TASK_TYPE,
         pr_number,
     )
     return task
