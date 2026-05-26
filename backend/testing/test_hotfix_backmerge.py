@@ -8,10 +8,10 @@ back-merge PR to close that gap.  It is the exact inverse of
 Covers:
   * success — the back-merge PR is opened and merged.
   * empty_diff — ``main == automain`` is a no-op (no merge attempted).
-  * conflict (409) — an ``Alert`` is raised AND a high-priority ``plan`` task
-    is spawned to resolve the conflict; the plan targets ``automain`` and does
-    NOT carry ``hotfix:true``; a second resolution plan is NOT spawned when one
-    is already open for the same hotfix.
+  * conflict (409) — an ``Alert`` is raised AND a high-priority ``create``
+    task is spawned to resolve the conflict; the task targets ``automain`` and
+    does NOT carry ``hotfix:true``; a second resolution task is NOT spawned
+    when one is already open for the same hotfix.
   * 405 / error — a non-merge or an exception raises an ``Alert`` (a failed
     back-merge must never pass silently) and spawns no fix task.
 """
@@ -199,8 +199,8 @@ async def test_open_backmerge_pr_empty_diff_is_noop(db_session, mocker):
 async def test_open_backmerge_pr_conflict_raises_alert_and_spawns_plan(
     db_session, mocker
 ):
-    """A 409 conflict raises an ERROR Alert AND spawns a high-priority plan
-    task targeting automain. The plan must NOT carry hotfix:true."""
+    """A 409 conflict raises an ERROR Alert AND spawns a high-priority create
+    task targeting automain. The task must NOT carry hotfix:true."""
     project = await _make_project(db_session)
     hotfix_id = uuid.uuid4()
     _patch_github(
@@ -230,31 +230,39 @@ async def test_open_backmerge_pr_conflict_raises_alert_and_spawns_plan(
     assert alerts[0].severity == AlertSeverity.ERROR
     assert alerts[0].title == "Back-merge conflict: main -> automain"
 
-    # Exactly one plan task was spawned.
+    # Exactly one resolution task was spawned.
     tasks = await _tasks_for(db_session, project.id)
     assert len(tasks) == 1
-    plan = tasks[0]
-    payload = plan.first_payload
-    assert payload["type"] == "plan"
-    # The resolution plan targets automain — it is a normal automain fix.
+    resolution = tasks[0]
+    payload = resolution.first_payload
+    # ``create`` (not ``plan``): single direct task so resolver guardrails
+    # reach the executing agent verbatim, no planner-decomposer indirection.
+    # Not ``refactor`` because the refactor handler forbids behavior changes
+    # (which contradicts absorbing main's bugfixes); not ``fix`` because
+    # handleFix is hard-coded to clone an existing PR branch.
+    assert payload["type"] == "create"
+    # The resolution task targets automain — it is a normal automain fix.
     assert payload["base_branch"] == "automain"
     # It must NOT be marked as a hotfix.
     assert "hotfix" not in payload
     # The prompt instructs a git merge origin/main conflict resolution.
     assert "git merge origin/main" in payload["prompt"]
+    # The prompt carries the asymmetric resolver policy — main wins on
+    # behavior in genuine conflicts, automain's structural work is preserved.
+    assert "human-reviewed LTS branch" in payload["prompt"]
     # High priority (>= 90), so it is dispatched expedited.
-    assert plan.priority >= 90
-    assert plan.status == TaskStatus.QUEUED
-    # Context carries the dedup markers.
-    assert plan.context["backmerge_conflict"] is True
-    assert plan.context["hotfix_task_id"] == str(hotfix_id)
-    assert plan.context["backmerge_pr_number"] == 55
+    assert resolution.priority >= 90
+    assert resolution.status == TaskStatus.QUEUED
+    # Context carries the dedup + merge-method markers.
+    assert resolution.context["backmerge_conflict"] is True
+    assert resolution.context["hotfix_task_id"] == str(hotfix_id)
+    assert resolution.context["backmerge_pr_number"] == 55
 
-    # A SPAWNED history row was written for the plan task.
+    # A SPAWNED history row was written for the resolution task.
     history = (
         (
             await db_session.execute(
-                select(TaskHistory).where(TaskHistory.task_id == plan.id)
+                select(TaskHistory).where(TaskHistory.task_id == resolution.id)
             )
         )
         .scalars()
@@ -264,14 +272,14 @@ async def test_open_backmerge_pr_conflict_raises_alert_and_spawns_plan(
 
 
 @pytest.mark.asyncio
-async def test_open_backmerge_pr_dirty_pr_detected_as_conflict_spawns_plan(
+async def test_open_backmerge_pr_dirty_pr_detected_as_conflict_spawns_resolver(
     db_session, mocker
 ):
     """An ALREADY-dirty/conflicting PR returns 405 "not mergeable" (so
     merge_pull_request does NOT set conflict=True).  open_backmerge_pr must
     still detect it via the PR's mergeable_state == "dirty" and route to the
-    conflict-resolution path (Alert + plan) — NOT spin forever in the generic
-    "blocked" branch.  Regression for the stuck PR #5277 case."""
+    conflict-resolution path (Alert + resolver task) — NOT spin forever in the
+    generic "blocked" branch.  Regression for the stuck PR #5277 case."""
     project = await _make_project(db_session)
     _patch_github(
         mocker,
@@ -292,19 +300,21 @@ async def test_open_backmerge_pr_dirty_pr_detected_as_conflict_spawns_plan(
     # Detected as a conflict despite the missing conflict flag.
     assert result["status"] == "conflict"
 
-    # A resolution plan was spawned (the whole point — not a silent "blocked").
+    # A resolution task was spawned (the whole point — not a silent "blocked").
     tasks = await _tasks_for(db_session, project.id)
-    plans = [t for t in tasks if (t.first_payload or {}).get("type") == "plan"]
-    assert len(plans) == 1
-    assert plans[0].context["backmerge_conflict"] is True
-    assert plans[0].first_payload["base_branch"] == "automain"
+    resolvers = [
+        t for t in tasks if (t.first_payload or {}).get("type") == "create"
+    ]
+    assert len(resolvers) == 1
+    assert resolvers[0].context["backmerge_conflict"] is True
+    assert resolvers[0].first_payload["base_branch"] == "automain"
 
 
 @pytest.mark.asyncio
 async def test_open_backmerge_pr_blocked_when_not_dirty(db_session, mocker):
     """A non-merge that is NOT a conflict (e.g. pending required checks —
-    mergeable_state "blocked") stays in the "blocked" path and does NOT spawn a
-    resolution plan (a conflict resolver can't fix a checks block)."""
+    mergeable_state "blocked") stays in the "blocked" path and does NOT spawn
+    a resolution task (a conflict resolver can't fix a checks block)."""
     project = await _make_project(db_session)
     _patch_github(
         mocker,
@@ -321,14 +331,16 @@ async def test_open_backmerge_pr_blocked_when_not_dirty(db_session, mocker):
 
     assert result["status"] == "blocked"
     tasks = await _tasks_for(db_session, project.id)
-    plans = [t for t in tasks if (t.first_payload or {}).get("type") == "plan"]
-    assert len(plans) == 0
+    resolvers = [
+        t for t in tasks if (t.first_payload or {}).get("type") == "create"
+    ]
+    assert len(resolvers) == 0
 
 
 @pytest.mark.asyncio
-async def test_open_backmerge_pr_conflict_no_duplicate_plan(db_session, mocker):
+async def test_open_backmerge_pr_conflict_no_duplicate_resolver(db_session, mocker):
     """A second back-merge attempt for the SAME hotfix must raise another Alert
-    but must NOT spawn a second resolution plan (dedupe guard)."""
+    but must NOT spawn a second resolution task (dedupe guard)."""
     project = await _make_project(db_session)
     hotfix_id = uuid.uuid4()
     _patch_github(
@@ -341,21 +353,21 @@ async def test_open_backmerge_pr_conflict_no_duplicate_plan(db_session, mocker):
         },
     )
 
-    # First attempt — spawns the resolution plan.
+    # First attempt — spawns the resolution task.
     r1 = await hb.open_backmerge_pr(
         db_session, project.id, hotfix_task_id=hotfix_id
     )
     await db_session.commit()
     assert r1["status"] == "conflict"
 
-    # Second attempt for the same hotfix — the resolution plan is still open.
+    # Second attempt for the same hotfix — the resolution task is still open.
     r2 = await hb.open_backmerge_pr(
         db_session, project.id, hotfix_task_id=hotfix_id
     )
     await db_session.commit()
     assert r2["status"] == "conflict"
 
-    # Still exactly ONE plan task — no duplicate spawned.
+    # Still exactly ONE resolution task — no duplicate spawned.
     tasks = await _tasks_for(db_session, project.id)
     assert len(tasks) == 1
 
@@ -364,11 +376,11 @@ async def test_open_backmerge_pr_conflict_no_duplicate_plan(db_session, mocker):
     assert len(alerts) == 2
 
 
-async def test_open_backmerge_pr_conflict_respawns_after_plan_terminal(
+async def test_open_backmerge_pr_conflict_respawns_after_resolver_terminal(
     db_session, mocker
 ):
-    """If the prior resolution plan has terminated (e.g. CANCELLED), a fresh
-    conflict for the same hotfix DOES spawn a new resolution plan — a terminal
+    """If the prior resolution task has terminated (e.g. CANCELLED), a fresh
+    conflict for the same hotfix DOES spawn a new resolution task — a terminal
     task no longer counts as 'open'."""
     project = await _make_project(db_session)
     hotfix_id = uuid.uuid4()
@@ -384,14 +396,14 @@ async def test_open_backmerge_pr_conflict_respawns_after_plan_terminal(
     await db_session.commit()
     assert r1["status"] == "conflict"
 
-    # Mark the spawned plan terminal (as if it was cancelled / failed).
+    # Mark the spawned resolver terminal (as if it was cancelled / failed).
     tasks = await _tasks_for(db_session, project.id)
     assert len(tasks) == 1
     tasks[0].status = TaskStatus.CANCELLED
     db_session.add(tasks[0])
     await db_session.commit()
 
-    # A fresh conflict for the same hotfix now spawns a NEW plan.
+    # A fresh conflict for the same hotfix now spawns a NEW resolver.
     r2 = await hb.open_backmerge_pr(
         db_session, project.id, hotfix_task_id=hotfix_id
     )

@@ -1337,18 +1337,29 @@ async def _merge_with_retry(
     pr_number: int,
     project_id: str,
     max_attempts: int = 3,
+    merge_method: str = "squash",
 ) -> dict:
     """Call merge_pull_request with exponential backoff for transient 5xx errors.
 
     Returns the merge result dict on success/conflict (same semantics as
     merge_pull_request).  Only retries on raised exceptions — non-200 merge
     results (405/409) are returned as-is without retrying.
+
+    ``merge_method`` defaults to ``"squash"`` (the orchestrator's normal mode);
+    callers pass ``"merge"`` for PRs whose ancestry must be preserved on the
+    target branch (e.g. back-merge conflict resolutions — see
+    :func:`_pick_merge_method`).
     """
     last_exc = None
     for attempt in range(max_attempts):
         try:
             return await merge_pull_request_fn(
-                gh_token, owner, repo, pr_number, project_id=project_id
+                gh_token,
+                owner,
+                repo,
+                pr_number,
+                merge_method=merge_method,
+                project_id=project_id,
             )
         except Exception as exc:  # noqa: PERF203 — per-attempt try is required for the retry loop
             last_exc = exc
@@ -1360,6 +1371,23 @@ async def _merge_with_retry(
                 )
                 await asyncio.sleep(backoff)
     raise last_exc  # type: ignore[misc]
+
+
+def _pick_merge_method(task: Task) -> str:
+    """Choose ``"merge"`` vs ``"squash"`` for ``task``'s PR auto-merge.
+
+    Default is ``"squash"`` — the orchestrator collapses each task's PR into a
+    single commit on the base branch.  Back-merge conflict-resolution tasks
+    (``context["backmerge_conflict"] is True``, spawned by
+    ``hotfix_backmerge._spawn_resolution_task``) override to ``"merge"`` so the
+    PR lands as a real two-parent merge commit on ``automain``.  Without that,
+    ``main`` never becomes an ancestor of ``automain``, the merge-base never
+    advances, and every future back-merge / promotion has to content-replay
+    the same commits.
+    """
+    if (task.context or {}).get("backmerge_conflict"):
+        return "merge"
+    return "squash"
 
 
 async def _comment_with_retry(
@@ -2274,6 +2302,7 @@ async def _process_post_commit(
                             repo,
                             pr_number,
                             project_id=str(task.project_id),
+                            merge_method=_pick_merge_method(task),
                         )
                         if merge_result.get("merged"):
                             task.context = {**(task.context or {}), "pr_merged": True}
@@ -3401,6 +3430,7 @@ async def _process_post_commit(
                             repo,
                             pr_number,
                             project_id=str(task.project_id),
+                            merge_method=_pick_merge_method(task),
                         )
 
                         if merge_result.get("merged"):

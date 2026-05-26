@@ -10770,7 +10770,7 @@ async def test_hotfix_backmerge_trigger_commits_conflict_alert_and_task(
             Task(
                 project_id=project_id,
                 title=resolution_task_title,
-                payloads=[{"type": "plan", "base_branch": "automain"}],
+                payloads=[{"type": "create", "base_branch": "automain"}],
                 priority=95,
                 vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
                 status=TaskStatus.QUEUED,
