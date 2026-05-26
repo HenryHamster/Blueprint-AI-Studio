@@ -30,6 +30,10 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "_resolve_candidate_ci",
         "_resolve_ci_at_finalize",
     ),
+    "app.release_qualifier_finalize": (
+        "_BLOCKER_LABELS",
+        "_finalize_qualification",
+    ),
     "app.release_qualifier_infra": (
         "_MIN_INFRA_ERROR_STREAK",
         "_handle_infra_failure",

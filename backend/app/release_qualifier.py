@@ -75,7 +75,6 @@ from sqlalchemy.orm.attributes import flag_modified
 from app import github, release_version
 from app.database import AsyncSessionLocal
 from app.models import (
-    ArtifactType,
     Project,
     Task,
     TaskStatus,
@@ -97,13 +96,13 @@ from app.release_promotion import (
     _candidate_already_on_main,  # noqa: F401 — tests access via rq.*
     _idempotent_pr_url,  # noqa: F401 — tests access via rq.*
     _lts_branch_names,
-    _notify_operator,
+    _notify_operator,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*
     _record_promotion_failure,  # noqa: F401 — tests access via rq.*
     _record_promotion_success,  # noqa: F401 — tests access via rq.*
-    _record_qualification_verdict,
+    _record_qualification_verdict,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*
     _relock_version_for_promotion_write,  # noqa: F401 — tests access via rq.*
     _resolve_github_with_session,
-    promote,
+    promote,  # noqa: F401 — re-exported for tests + release_qualifier_finalize (calls via rq.promote)
 )
 from app.release_qualifier_ci import (
     # Re-exports — release_qualifier is the canonical import + test-patch
@@ -114,7 +113,7 @@ from app.release_qualifier_ci import (
     # via the same local name.  Tests also access these via ``rq.*``.  The
     # implementations live in release_qualifier_ci.py.
     _resolve_candidate_ci,
-    _resolve_ci_at_finalize,
+    _resolve_ci_at_finalize,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*
 )
 from app.release_qualifier_infra import (
     # Re-exports — release_qualifier is the canonical import + test-patch
@@ -166,18 +165,18 @@ from app.release_scoring import (
     _CI_GREEN,  # noqa: F401 — re-exported for tests/back-compat
     _CI_NO_CHECKS,  # noqa: F401
     _CI_PENDING,  # noqa: F401 — re-exported for tests/back-compat
-    _CI_RED,
+    _CI_RED,  # noqa: F401 — re-exported; release_qualifier_finalize reads via rq.*
     _DEFAULT_POLICY,
     _FINDING_SUMMARY_MAX,  # noqa: F401
     _MAX_CARRIED_FINDINGS,  # noqa: F401
     _SEVERITY_RANK,  # noqa: F401
     _clamp01,  # noqa: F401
     _classify_check_runs,  # noqa: F401 — re-exported for tests/back-compat
-    _extract_audit_findings,
-    _fmt_sub_scores,
-    _score_audit,
-    _score_smoketest,
-    compute_composite,
+    _extract_audit_findings,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*
+    _fmt_sub_scores,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*
+    _score_audit,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*
+    _score_smoketest,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*
+    compute_composite,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*
 )
 from app.release_stall_alerts import (
     _AUTO_MERGE_STALL_SECONDS,  # noqa: F401 — re-exported for back-compat
@@ -193,6 +192,17 @@ from app.release_stall_alerts import (
     _check_version_stabilize_stall,  # noqa: F401 — re-exported for tests
     _is_build_stalled,  # noqa: F401 — re-exported for back-compat
     _MIN_CALCIFICATION_ATTEMPTS,  # noqa: F401 — re-exported for back-compat
+)
+from app.release_qualifier_finalize import (
+    # Re-exports — release_qualifier is the canonical import + test-patch
+    # surface for the finalize decision pipeline (tests call
+    # ``rq._finalize_qualification`` and patch ``rq._BLOCKER_LABELS``).
+    # ``_finalize_locked_version`` (still here) reaches _finalize_qualification
+    # via the module-global lookup, so the re-export keeps test patches that
+    # rebind ``rq._finalize_qualification`` effective.  The implementations
+    # live in release_qualifier_finalize.py.
+    _BLOCKER_LABELS,  # noqa: F401 — re-exported for tests + back-compat
+    _finalize_qualification,  # noqa: F401 — re-exported for tests + back-compat
 )
 from app.release_qualifier_sweep import (
     # Re-exports — release_qualifier is the canonical import + test-patch
@@ -790,362 +800,12 @@ async def run_qualification(
 
 
 # ---------------------------------------------------------------------------
-# _finalize_qualification — the coordinator (phase 2: collect + decide).
+# _finalize_qualification — phase 2: collect + decide.
+# Moved to release_qualifier_finalize.py; re-exported above so tests that call
+# ``rq._finalize_qualification`` and patch ``rq._BLOCKER_LABELS`` keep working
+# and ``_finalize_locked_version`` (still here) reaches the function via the
+# module-global lookup.  Operator-notification rendering lives there too.
 # ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Operator notifications — the calibration instrument.  Every qualifier verdict
-# posts a system ProjectMessage so the operator sees promotions, blocks and
-# below-threshold near-misses without polling, and can tune promotion_policy.yaml
-# from real outcomes.  Best-effort: a messaging failure never affects a release.
-# ---------------------------------------------------------------------------
-
-# Human-readable rendering of the compute_composite() hard-blocker codes.
-_BLOCKER_LABELS: dict[str, str] = {
-    "ci_not_green": "CI is not green on the candidate",
-    "ci_unresolved": "CI state could not be evaluated (pending, no check-runs, or GitHub I/O degraded)",
-    "smoketest_startup_failed": "the smoketest startup suite failed",
-    "audit_missing": "the release audit produced no usable report",
-    "test_file_deleted": "the diff deleted a test file",
-}
-
-
-async def _finalize_qualification(
-    session: AsyncSession,
-    version: release_version.ReleaseVersion,
-) -> dict[str, Any]:
-    """Finalize qualification once the qualifier children have terminated.
-
-    Invoked by the Phase 3 batch-3 completion handlers (not wired here) after
-    the release_audit child — and the qualify-smoketest child, when the
-    smoketest subsystem was enabled for this run (audit H3) — for ``version``
-    have reached a terminal state.
-
-    Re-resolves CI for the candidate commit (``_resolve_ci_at_finalize``)
-    rather than trusting the boolean frozen at spawn, reads the
-    RELEASE_AUDIT_REPORT and (when the smoketest subsystem was
-    enabled) SMOKETEST_RESULT artifacts, computes the composite, then:
-      * promote == True  and promotion_enabled ⇒ ``promote()``.
-      * promote == True  but promotion_enabled is False ⇒ dry-run: log the
-        composite, record it, leave the version open.
-      * promote == False ⇒ record the blocker, keep the version open, set
-        ``phase = "stabilize"``.
-
-    Audit H3: when the qualifying run recorded ``smoketest_enabled == False``
-    the smoketest dimension is dropped — no SMOKETEST_RESULT is read and
-    ``compute_composite`` renormalizes the audit + test-erosion weights with no
-    smoketest hard blocker.
-
-    Runs on whatever ``session`` it is given and does NOT commit it (the
-    non-promote paths just mutate ``version.last_qualification``); the promote
-    path delegates to ``promote()``, which issues its own intermediate commit.
-    The caller (``_finalize_in_dedicated_session``) commits the dedicated
-    session afterwards.  Returns a result dict.
-    """
-    qual = dict(version.last_qualification or {})
-    candidate_sha = qual.get("candidate_sha")
-    audit_task_id = qual.get("audit_task_id")
-    smoketest_task_id = qual.get("smoketest_task_id")
-    # Audit H3: whether the qualifying run had the smoketest subsystem enabled.
-    # Read from the recorded qualification (NOT live runtime_config) — the
-    # config could have flipped between spawn and finalize, and the composite
-    # must match the children that actually ran.  Legacy records that predate
-    # the flag default to True (the old always-spawn behaviour).
-    smoketest_enabled = bool(qual.get("smoketest_enabled", True))
-
-    # Re-resolve CI for the candidate commit NOW rather than reusing the
-    # boolean frozen at spawn — a candidate whose checks were merely pending
-    # when run_qualification ran recorded ci_green=False, and trusting that
-    # stale value would re-block the same commit forever.  Re-resolution lets a
-    # now-completed green build pass and keeps a still-pending build not-green
-    # without a permanent dead-end.  Graceful: a credential / GitHub failure
-    # degrades to not-green for this attempt (never crashes the finalize).
-    ci_green, ci_resolution = await _resolve_ci_at_finalize(
-        session, version, candidate_sha
-    )
-
-    policy = _load_policy()
-
-    # --- Infra-failure detection: check required child terminal statuses ------
-    # A FAILED or CANCELLED required child means the qualifier pipeline itself
-    # broke (agent VM crash, timeout, clone failure) — NOT a quality finding.
-    # Route these to _handle_infra_failure BEFORE reading artifacts so the
-    # quality-verdict path only sees COMPLETED children.  A COMPLETED child
-    # whose artifact is absent or unparseable still routes through the normal
-    # compute_composite path (audit_missing quality blocker — the real report
-    # was expected but absent, which is a candidate-scoring concern, not infra).
-    if audit_task_id:
-        try:
-            _audit_task_obj = await session.get(Task, uuid.UUID(str(audit_task_id)))
-            if _audit_task_obj is not None and _audit_task_obj.status in (
-                TaskStatus.FAILED,
-                TaskStatus.CANCELLED,
-            ):
-                return await _handle_infra_failure(
-                    session,
-                    version,
-                    qual,
-                    f"audit_task_{_audit_task_obj.status.lower()}",
-                )
-        except (ValueError, TypeError):
-            logger.warning(
-                "[RELEASE_QUALIFIER] invalid audit_task_id %s on version v%d "
-                "(skipping infra-failure check)",
-                audit_task_id,
-                version.version_number,
-            )
-
-    if smoketest_enabled and smoketest_task_id:
-        try:
-            _smoke_task_obj = await session.get(Task, uuid.UUID(str(smoketest_task_id)))
-            if _smoke_task_obj is not None and _smoke_task_obj.status in (
-                TaskStatus.FAILED,
-                TaskStatus.CANCELLED,
-            ):
-                return await _handle_infra_failure(
-                    session,
-                    version,
-                    qual,
-                    f"smoketest_task_{_smoke_task_obj.status.lower()}",
-                )
-        except (ValueError, TypeError):
-            logger.warning(
-                "[RELEASE_QUALIFIER] invalid smoketest_task_id %s on version v%d "
-                "(skipping infra-failure check)",
-                smoketest_task_id,
-                version.version_number,
-            )
-
-    # --- Read the release_audit report -------------------------------------
-    audit_report: dict[str, Any] | None = None
-    if audit_task_id:
-        try:
-            audit_report = await _latest_artifact_logs(
-                session,
-                uuid.UUID(str(audit_task_id)),
-                ArtifactType.RELEASE_AUDIT_REPORT,
-            )
-        except (ValueError, TypeError):
-            logger.warning(
-                "[RELEASE_QUALIFIER] invalid audit_task_id %s on version v%d",
-                audit_task_id,
-                version.version_number,
-            )
-    audit_score, test_erosion_score = _score_audit(audit_report)
-    # Carry the findings (not just the score) into last_qualification so the
-    # strategic agent can target them — otherwise the audit sub-score, usually
-    # the binding constraint, is opaque to the loop.
-    audit_findings = _extract_audit_findings(audit_report)
-
-    # --- Read the smoketest result -----------------------------------------
-    # Audit H3: only when the smoketest subsystem was enabled — a disabled run
-    # spawned no qualifier-smoketest child, so there is no SMOKETEST_RESULT to
-    # read and smoketest_score stays None (compute_composite drops the
-    # dimension rather than hard-blocking on it).
-    smoketest_result: dict[str, Any] | None = None
-    if smoketest_enabled and smoketest_task_id:
-        try:
-            smoketest_result = await _latest_artifact_logs(
-                session,
-                uuid.UUID(str(smoketest_task_id)),
-                ArtifactType.SMOKETEST_RESULT,
-            )
-        except (ValueError, TypeError):
-            logger.warning(
-                "[RELEASE_QUALIFIER] invalid smoketest_task_id %s on version v%d",
-                smoketest_task_id,
-                version.version_number,
-            )
-    smoketest_score = _score_smoketest(smoketest_result)
-
-    # --- Compute the composite ---------------------------------------------
-    composite = compute_composite(
-        ci_green=ci_green,
-        audit_score=audit_score,
-        test_erosion=test_erosion_score,
-        smoketest_score=smoketest_score,
-        policy=policy,
-        smoketest_enabled=smoketest_enabled,
-        ci_state=ci_resolution.get("state", _CI_RED),
-    )
-
-    finalized_at = _utcnow().isoformat()
-    base_record: dict[str, Any] = {
-        "candidate_sha": candidate_sha,
-        "ci_green": ci_green,
-        "ci_resolution": ci_resolution,
-        "smoketest_enabled": smoketest_enabled,
-        "confidence": composite["confidence"],
-        "sub_scores": composite["sub_scores"],
-        "blocker": composite["blocker"],
-        "threshold": policy.get("threshold"),
-        "started_at": qual.get("started_at"),
-        "finalized_at": finalized_at,
-        "audit_task_id": audit_task_id,
-        "smoketest_task_id": smoketest_task_id,
-        "audit_findings": audit_findings,
-    }
-
-    promotion_enabled = bool(_runtime_config.get("promotion_enabled"))
-
-    logger.info(
-        "[RELEASE_QUALIFIER] v%d composite=%.4f promote=%s blocker=%s "
-        "sub_scores=%s promotion_enabled=%s",
-        version.version_number,
-        composite["confidence"],
-        composite["promote"],
-        composite["blocker"],
-        composite["sub_scores"],
-        promotion_enabled,
-    )
-
-    # --- Decide -------------------------------------------------------------
-    if not composite["promote"]:
-        # Below threshold (or a hard blocker fired): keep the version open and
-        # send it back to stabilize so the next strategic cycle targets the
-        # blocker.  A failed qualifier only ever blocks — which is safe.
-        record = {**base_record, "status": "not_promoted"}
-        version.last_qualification = record
-        flag_modified(version, "last_qualification")
-        reason = (
-            f"qualification v{version.version_number}: "
-            f"confidence {composite['confidence']:.2f} < "
-            f"{policy.get('threshold')}"
-        )
-        if composite["blocker"]:
-            reason = (
-                f"qualification v{version.version_number} blocked: "
-                f"{composite['blocker']}"
-            )
-        release_version.set_version_phase(version, "stabilize", reasoning=reason)
-        session.add(version)
-        await _record_qualification_verdict(
-            session,
-            version,
-            record,
-            terminal_status="not_promoted",
-            would_promote=False,
-            promotion_enabled=promotion_enabled,
-        )
-        scores_str = _fmt_sub_scores(
-            composite["sub_scores"], smoketest_enabled=smoketest_enabled
-        )
-        if composite["blocker"]:
-            blocker_label = _BLOCKER_LABELS.get(
-                composite["blocker"], composite["blocker"]
-            )
-            notify_event = "release_blocked"
-            notify_summary = (
-                f"v{version.version_number} blocked from promotion — "
-                f"{blocker_label}. Not promoted; staying in stabilize."
-            )
-        else:
-            notify_event = "release_below_threshold"
-            notify_summary = (
-                f"v{version.version_number} qualified at confidence "
-                f"{composite['confidence']:.2f}, below the "
-                f"{policy.get('threshold')} promotion bar — not promoted, "
-                f"staying in stabilize. Sub-scores: {scores_str}."
-            )
-        await _notify_operator(
-            session,
-            version,
-            notify_event,
-            notify_summary,
-            extra={
-                "confidence": composite["confidence"],
-                "threshold": policy.get("threshold"),
-                "sub_scores": composite["sub_scores"],
-                "blocker": composite["blocker"],
-            },
-        )
-        return {
-            "status": "not_promoted",
-            "confidence": composite["confidence"],
-            "blocker": composite["blocker"],
-        }
-
-    if not promotion_enabled:
-        # Dry-run: the candidate would promote, but Phase 3 ships dark.  Record
-        # the composite and leave the version open — interim-manual promotion
-        # continues elsewhere.
-        record = {**base_record, "status": "dry_run", "would_promote": True}
-        version.last_qualification = record
-        flag_modified(version, "last_qualification")
-        session.add(version)
-        await _record_qualification_verdict(
-            session,
-            version,
-            record,
-            terminal_status="dry_run",
-            would_promote=True,
-            promotion_enabled=False,
-        )
-        logger.info(
-            "[RELEASE_QUALIFIER] v%d would promote (confidence=%.4f) but "
-            "promotion_enabled=False — dry-run, not promoting",
-            version.version_number,
-            composite["confidence"],
-        )
-        await _notify_operator(
-            session,
-            version,
-            "release_dry_run",
-            (
-                f"v{version.version_number} would promote (confidence "
-                f"{composite['confidence']:.2f}) but promotion is disabled — "
-                f"dry-run only, main not advanced."
-            ),
-            extra={
-                "confidence": composite["confidence"],
-                "threshold": policy.get("threshold"),
-                "sub_scores": composite["sub_scores"],
-            },
-        )
-        return {
-            "status": "dry_run",
-            "confidence": composite["confidence"],
-            "would_promote": True,
-        }
-
-    # --- Promote ------------------------------------------------------------
-    if not candidate_sha:
-        # Should not happen — run_qualification always records it — but guard
-        # so a missing SHA degrades to stabilize rather than a crash.
-        record = {**base_record, "status": "error", "error": "missing_candidate_sha"}
-        version.last_qualification = record
-        flag_modified(version, "last_qualification")
-        release_version.set_version_phase(
-            version,
-            "stabilize",
-            reasoning=f"qualification v{version.version_number}: missing SHA",
-        )
-        session.add(version)
-        await _notify_operator(
-            session,
-            version,
-            "release_error",
-            (
-                f"v{version.version_number} qualification could not complete "
-                f"— candidate SHA missing. Returned to stabilize."
-            ),
-            extra={"error": "missing_candidate_sha"},
-        )
-        return {"status": "error", "error": "missing_candidate_sha"}
-
-    # Delegate to promote().  Credentials are NOT pre-resolved here on purpose
-    # (concern 2): credential resolution is GitHub I/O, and at this point the
-    # dedicated session still holds the ReleaseVersion FOR UPDATE lock.
-    # promote() releases that lock via its intermediate commit and then resolves
-    # the token unlocked — so no GitHub round-trip ever runs under the row lock.
-    return await promote(
-        session,
-        version,
-        candidate_sha,
-        composite=composite,
-        base_record=base_record,
-    )
 
 
 # ---------------------------------------------------------------------------

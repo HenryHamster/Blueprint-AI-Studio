@@ -34,6 +34,7 @@
     "pipeline_regression_dispatcher.py": 9200,
     "release_qualifier.py": 2700,
     "release_qualifier_ci.py": 350,
+    "release_qualifier_finalize.py": 450,
     "release_qualifier_infra.py": 300,
     "release_qualifier_io.py": 500,
     "release_qualifier_readiness.py": 300,
