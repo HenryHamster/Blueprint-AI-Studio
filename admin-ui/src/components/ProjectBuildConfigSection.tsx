@@ -213,7 +213,7 @@ export function ProjectBuildConfigSection({
             </div>
           </div>
           <p className="text-[11px] text-neutral-600 mb-3">
-            Configure lint, test, and build commands per directory. The agent runs these in CI validation.
+            Configure lint, test, and build commands per directory. The agent runs these in CI validation. Leave <code className="font-mono text-neutral-400">lint</code> empty to auto-infer from directory type and scope to changed files.
           </p>
           <div className="space-y-3">
             {dirs.map((dir, i) => (
@@ -256,7 +256,7 @@ export function ProjectBuildConfigSection({
                       type="text"
                       value={dir.lint_cmd ?? ''}
                       onChange={e => updateDir(i, 'lint_cmd', e.target.value)}
-                      placeholder="ruff check ."
+                      placeholder="(auto-infer by type)"
                       className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
                     />
                   </div>

@@ -554,6 +554,30 @@ describe('handleReview — medium-scope subsystem hint integration', () => {
     expect(prompt).toContain('deprioritize SQL injection');
   });
 
+  it('scopes build_config lint guidance to changed files in the review prompt', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce({
+      directories: [{ path: 'svc', type: 'python', lint_cmd: 'ruff check .' }],
+    } as ReturnType<typeof resolveBuildConfig>);
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return 'M\tsvc/a.py';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      'task-review-lint-scope',
+      { pr_number: 51, branch: 'feature/lint', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('svc/a.py');
+    expect(prompt).not.toContain('ruff check .');
+    expect(prompt).not.toContain('grep \'.py$\'');
+  });
+
   it('injects cross-system hint for multi-subsystem medium-scope PRs', async () => {
     vi.mocked(resolveBuildConfig).mockReturnValueOnce(BLUEPRINT_CONFIG as ReturnType<typeof resolveBuildConfig>);
     vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {

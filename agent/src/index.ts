@@ -1877,6 +1877,17 @@ export function runViewportSuiteWithFallback(
 }
 
 // ── Lint / Build Checks ─────────────────────────────────────────────────────
+// Mirrors detectLinterKind in prompt.ts (kept local to avoid cross-module deps).
+function _detectLinterKind(cmd: string): 'ruff' | 'eslint' | 'mypy' | 'flake8' | 'pyright' | null {
+  const base = cmd.replace(/^(python3?\s+-m\s+|npx\s+|pnpm\s+exec\s+)/, '');
+  if (/^ruff\b/.test(base)) return 'ruff';
+  if (/^eslint\b/.test(base)) return 'eslint';
+  if (/^mypy\b/.test(base)) return 'mypy';
+  if (/^flake8\b/.test(base)) return 'flake8';
+  if (/^pyright\b/.test(base)) return 'pyright';
+  return null;
+}
+
 /** Run lint/build checks on changed files. Throws with error details on failure.
  *  Each blocking execFileSync starves the event loop (and heartbeat setInterval),
  *  so we inject sendHeartbeatSync between operations to prevent the reaper from
@@ -1902,8 +1913,28 @@ export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | nul
       if (dir.lint_cmd) {
         sendLog(ws, `Running lint in ${dirPrefix}...\n`);
         sendHeartbeatSync(taskId, `${dir.lint_cmd} (${dirPrefix})...`);
-        const [cmd, ...args] = dir.lint_cmd.split(' ');
-        execFileSync(cmd, args, { cwd, encoding: 'utf-8', timeout: FRONTEND_ESLINT_TIMEOUT, env: extraEnv });
+        const lintKind = _detectLinterKind(dir.lint_cmd);
+        if (lintKind) {
+          const isPy = lintKind !== 'eslint';
+          const extRe = isPy ? /\.py$/ : /\.(ts|tsx|js|jsx|cjs|mjs)$/;
+          const lintFiles = changedPaths
+            .filter(p => p.startsWith(dirPrefix + '/') && extRe.test(p))
+            .map(p => p.slice(dirPrefix.length + 1))
+            .filter(p => fs.existsSync(`${cwd}/${p}`));
+          if (lintFiles.length === 0) {
+            sendLog(ws, `No changed ${isPy ? 'Python' : 'JS/TS'} files in ${dirPrefix}, skipping lint.\n`);
+          } else {
+            const toks = dir.lint_cmd.trim().split(/\s+/);
+            while (toks.length > 1 && (toks[toks.length - 1] === '.' || toks[toks.length - 1] === './')) toks.pop();
+            const lintArgs = lintKind === 'ruff'
+              ? ['python3', '-m', 'ruff', 'check', '--select', 'E,F,W', '--ignore', 'E501', ...lintFiles]
+              : [...toks, ...lintFiles];
+            execFileSync(lintArgs[0], lintArgs.slice(1), { cwd, encoding: 'utf-8', timeout: FRONTEND_ESLINT_TIMEOUT, env: extraEnv });
+          }
+        } else {
+          const [cmd, ...args] = dir.lint_cmd.split(' ');
+          execFileSync(cmd, args, { cwd, encoding: 'utf-8', timeout: FRONTEND_ESLINT_TIMEOUT, env: extraEnv });
+        }
       }
       if (dir.build_cmd) {
         sendLog(ws, `Running build in ${dirPrefix}...\n`);

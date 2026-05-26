@@ -449,6 +449,50 @@ describe('runProjectLintChecks', () => {
     expect(lintBuildCalls.length).toBe(0);
   });
 
+  it('scopes ruff lint to changed .py files with narrow ruleset when buildConfig is provided', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    runProjectLintChecks(['svc/app.py', 'svc/tests/test_main.py'], null, {
+      directories: [{ path: 'svc', type: 'python', lint_cmd: 'ruff check .' }],
+    });
+    const ruffCall = vi.mocked(execFileSync).mock.calls.find(
+      ([cmd, args]) => cmd === 'python3' && Array.isArray(args) && (args as string[]).includes('ruff'),
+    );
+    expect(ruffCall).toBeDefined();
+    const ruffArgs = (ruffCall as [string, string[]])[1];
+    expect(ruffArgs).toContain('--select');
+    expect(ruffArgs).toContain('E,F,W');
+    expect(ruffArgs).toContain('--ignore');
+    expect(ruffArgs).toContain('E501');
+    expect(ruffArgs).toContain('app.py');
+    expect(ruffArgs).toContain('tests/test_main.py');
+  });
+
+  it('scopes eslint lint to changed JS/TS files without a bare dot positional', () => {
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    runProjectLintChecks(['svc/a.ts', 'svc/README.md'], null, {
+      directories: [{ path: 'svc', type: 'node', lint_cmd: 'npx eslint .' }],
+    });
+    const eslintCall = vi.mocked(execFileSync).mock.calls.find(
+      ([cmd, args]) => cmd === 'npx' && Array.isArray(args) && (args as string[]).includes('eslint'),
+    );
+    expect(eslintCall).toBeDefined();
+    const eslintArgs = (eslintCall as [string, string[]])[1];
+    expect(eslintArgs).toContain('eslint');
+    expect(eslintArgs).toContain('a.ts');
+    expect(eslintArgs).not.toContain('.');
+  });
+
+  it('skips ruff lint when no .py files changed in the directory', () => {
+    vi.mocked(execFileSync).mockClear();
+    runProjectLintChecks(['svc/README.md'], null, {
+      directories: [{ path: 'svc', type: 'python', lint_cmd: 'ruff check .' }],
+    });
+    const ruffCall = vi.mocked(execFileSync).mock.calls.find(
+      ([cmd, args]) => cmd === 'python3' && Array.isArray(args) && (args as string[]).includes('ruff'),
+    );
+    expect(ruffCall).toBeUndefined();
+  });
+
   it('falls back to hardcoded admin-ui checks when buildConfig is undefined and admin-ui touched', () => {
     runProjectLintChecks(['admin-ui/src/App.tsx'], null, undefined);
     const adminUiCalls = vi.mocked(execFileSync).mock.calls
@@ -1166,6 +1210,7 @@ describe('lintFixLoop infrastructure failure detection', () => {
     vi.mocked(execFileSync).mockReset();
     vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
     vi.mocked(spawn).mockReset();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
   });
 
   it('detects docker unavailable and abandons without invoking Claude', async () => {
@@ -1209,6 +1254,7 @@ describe('lintFixLoop infrastructure failure detection', () => {
   it('detects ENOENT (command not found) and abandons without invoking Claude', async () => {
     const infraError = 'Command failed: ruff\nError: spawn ruff ENOENT';
     const buildConfig = { directories: [{ path: 'backend', type: 'python', lint_cmd: 'python3 -m ruff check' }] };
+    vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
       if (cmd === 'python3') throw new Error(infraError);
       return '' as unknown as ReturnType<typeof execFileSync>;

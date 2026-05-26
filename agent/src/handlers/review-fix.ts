@@ -189,7 +189,7 @@ function buildReviewDiffAccessHint(baseBranch: string): string {
   return `You have full access to the codebase. Read any files you need to understand the changes in context. Use \`git diff origin/${baseBranch}...HEAD\` to see the full diff, or \`git diff origin/${baseBranch}...HEAD -- <file>\` for specific files.`;
 }
 
-function buildReviewChecklistSection(buildConfig?: BuildConfig): string {
+function buildReviewChecklistSection(buildConfig?: BuildConfig, baseBranch?: string): string {
   return `Review the changes thoroughly using this checklist:
 
 **Correctness & Logic:**
@@ -214,7 +214,7 @@ function buildReviewChecklistSection(buildConfig?: BuildConfig): string {
 - Are there tests for the new/changed behavior?
 - Do existing tests still pass given these changes?
 
-${buildTypeCheckInstructions(buildConfig)}`;
+${buildTypeCheckInstructions(buildConfig, baseBranch)}`;
 }
 
 function buildReviewSeverityGuideSection(): string {
@@ -289,8 +289,8 @@ function buildPlannedFilesClassificationGuidance(): string {
 If unsure on edge cases, do not flag — let the operator decide.`;
 }
 
-function buildReviewCoreGuidance(buildConfig: BuildConfig | undefined, taskId: string): string {
-  return `${buildReviewChecklistSection(buildConfig)}
+function buildReviewCoreGuidance(buildConfig: BuildConfig | undefined, taskId: string, baseBranch?: string): string {
+  return `${buildReviewChecklistSection(buildConfig, baseBranch)}
 
 ${buildReviewSeverityGuideSection()}
 
@@ -758,7 +758,7 @@ function preinstallNodeDeps(
 // always has dependencies available — without the prefix, every reviewer on a
 // fresh VM hits "cannot resolve <package>" and flags it as a build-gate
 // failure even when the underlying PR is fine.
-function buildTypeCheckInstructions(buildConfig?: BuildConfig): string {
+function buildTypeCheckInstructions(buildConfig?: BuildConfig, baseBranch?: string): string {
   if (!buildConfig || !buildConfig.directories || buildConfig.directories.length === 0) {
     return `**Build & Type Safety (MUST run these — do not skip):**
 - For TypeScript/JavaScript changes: find the package root for each changed file (the nearest parent directory with a package.json), then run \`npm ci && npm run build\` (or \`npx tsc --noEmit\` for TypeScript-only packages) — report any errors
@@ -767,14 +767,28 @@ function buildTypeCheckInstructions(buildConfig?: BuildConfig): string {
 - Only run checks for the subsystems touched by the changed files. Do not invent additional build invocations.
 - For ANY code changes: run the relevant command above and include results in your verdict. A build failure is an automatic REQUEST_CHANGES — but FIRST verify your workspace is fully installed: a missing-package error like "cannot resolve <foo>" is almost always a stale workspace, not a real defect. Re-run with the install step prefix above before flagging.`;
   }
+  const base = baseBranch ?? 'main';
   const checks = buildConfig.directories
     .filter(d => d.build_cmd || d.lint_cmd)
     .map(d => {
-      const cmd = d.build_cmd || d.lint_cmd;
       const installPrefix = d.type === 'node'
         ? 'npm ci && '
         : d.install_cmd ? `${d.install_cmd} && ` : '';
-      return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && ${installPrefix}${cmd}\` — report any errors`;
+      if (d.build_cmd) {
+        return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && ${installPrefix}${d.build_cmd}\` — report any errors`;
+      }
+      // lint_cmd only: scope recognized linters to changed files so pre-existing
+      // baseline violations don't block clean PRs (mirrors runProjectLintChecks).
+      const lintCmd = d.lint_cmd ?? '';
+      const isPy = lintCmd.replace(/^(python3?\s+-m\s+|npx\s+|pnpm\s+exec\s+)/, '').match(/^(ruff|mypy|flake8|pyright)\b/);
+      const isJs = lintCmd.replace(/^(npx\s+|pnpm\s+exec\s+)/, '').match(/^eslint\b/);
+      if (isPy) {
+        return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && git diff origin/${base}...HEAD --name-only | grep '\\.py$' | xargs -r python3 -m ruff check --select E,F,W --ignore E501\` — report any errors (scoped to changed .py files)`;
+      }
+      if (isJs) {
+        return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && git diff origin/${base}...HEAD --name-only | grep -E '\\.(ts|tsx|js|jsx)$' | sed 's|${d.path}/||' | xargs -r npx eslint\` — report any errors (scoped to changed JS/TS files)`;
+      }
+      return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && ${installPrefix}${lintCmd}\` — report any errors`;
     });
   if (checks.length === 0) {
     return '**Build & Type Safety:** No build commands configured — review code manually for type correctness.';
@@ -1012,7 +1026,7 @@ ${selfReviewBlindSpotsSection}
 ${plannedFilesSection}
 
 ${buildReviewDiffAccessHint(baseBranch)}
-${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCoreGuidance(reviewBuildConfig, taskId)}`;
+${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCoreGuidance(reviewBuildConfig, taskId, baseBranch)}`;
 
   // Parallel-review fan-out gating: per-project flag AND helper-threshold both
   // required. False positives (extra fan-out) are cheap subagent overhead;

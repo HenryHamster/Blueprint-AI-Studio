@@ -63,7 +63,6 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
             {
                 "path": "./",
                 "type": "python",
-                "lint_cmd": "ruff check ." if "pyproject.toml" in root_names else None,
                 "test_cmd": "pytest",
             }
         )
@@ -76,7 +75,6 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
                 "path": "./",
                 "type": "node",
                 "install_cmd": "npm ci",
-                "lint_cmd": "npx eslint .",
                 "build_cmd": "npm run build",
                 "test_cmd": "npm test",
             }
@@ -89,7 +87,6 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
             {
                 "path": "./",
                 "type": "go",
-                "lint_cmd": "go vet ./...",
                 "test_cmd": "go test ./...",
             }
         )
@@ -101,7 +98,6 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
             {
                 "path": "./",
                 "type": "rust",
-                "lint_cmd": "cargo clippy",
                 "build_cmd": "cargo build",
                 "test_cmd": "cargo test",
             }
@@ -147,7 +143,6 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
                 {
                     "path": f"{subdir}/",
                     "type": "python",
-                    "lint_cmd": "ruff check .",
                     "test_cmd": "pytest",
                 }
             )

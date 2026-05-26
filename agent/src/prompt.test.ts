@@ -63,6 +63,7 @@ import {
   formatProjectBlindSpotSummary,
   formatFixIterationHistory,
   formatSelfReviewCalibrationSection,
+  detectLinterKind,
   type FixAttempt,
 } from './prompt.js';
 import { READ_ONLY_TASK_TYPES, WRITE_TASK_TYPES } from './taskCapabilities.js';
@@ -5191,7 +5192,10 @@ describe('writeCheckHelper — config-driven build_config path', () => {
     // Configured directories + commands are present.
     expect(checkScript).toContain('if touches "service/api/"; then');
     expect(checkScript).toContain(`run "service/api install" bash -c 'cd "service/api" && pip install -e .'`);
+    // Recognized ruff lint_cmd is scoped to changed files (FULL_SCOPE=1 runs verbatim).
+    expect(checkScript).toContain('if [ "$FULL_SCOPE" = "1" ]; then');
     expect(checkScript).toContain(`run "service/api lint" bash -c 'cd "service/api" && python3 -m ruff check'`);
+    expect(checkScript).toContain('ruff check --select E,F,W --ignore E501');
     expect(checkScript).toContain(`run "service/api build" bash -c 'cd "service/api" && python3 -m build'`);
     // Trailing slash in the configured path is normalized.
     expect(checkScript).toContain('if touches "web/"; then');
@@ -5266,3 +5270,95 @@ describe('writeCheckHelper — config-driven build_config path', () => {
   });
 });
 
+// ── detectLinterKind ──────────────────────────────────────────────────────────
+describe('detectLinterKind', () => {
+  it.each([
+    ['ruff check .', 'ruff'],
+    ['python3 -m ruff check .', 'ruff'],
+    ['python -m ruff check', 'ruff'],
+    ['npx eslint .', 'eslint'],
+    ['pnpm exec eslint .', 'eslint'],
+    ['mypy .', 'mypy'],
+    ['python3 -m mypy src/', 'mypy'],
+    ['flake8 .', 'flake8'],
+    ['pyright .', 'pyright'],
+    ['npx pyright', 'pyright'],
+  ])('detects %s as %s', (cmd, expected) => {
+    expect(detectLinterKind(cmd)).toBe(expected);
+  });
+
+  it.each([
+    ['npm run lint'],
+    ['custom-lint-script'],
+    ['bash lint.sh'],
+  ])('returns null for unrecognized command %s', (cmd) => {
+    expect(detectLinterKind(cmd)).toBeNull();
+  });
+});
+
+// ── buildConfigDrivenStackBlocks — scoped lint ─────────────────────────────
+describe('writeCheckHelper — config-driven scoped lint', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  const baseCfg = {
+    taskId: 'task-lint-scope-1',
+    workBranch: 'blueprint/task-lint-scope-1',
+    baseBranch: 'main',
+    owner: 'acme',
+    repo: 'my-svc',
+    testsOnMainBranch: false,
+  };
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('scopes ruff check to changed .py files and uses narrow ruleset', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      ...baseCfg,
+      buildConfig: {
+        directories: [{ path: 'svc', type: 'python', lint_cmd: 'ruff check .' }],
+      },
+    });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    // Scoped block: FULL_SCOPE=1 branch has verbatim, else branch has scoped.
+    expect(checkScript).toContain('if [ "$FULL_SCOPE" = "1" ]; then');
+    expect(checkScript).toContain('ruff check --select E,F,W --ignore E501');
+    expect(checkScript).toContain(`grep -E '^svc/.*\\.py$'`);
+    // The verbatim form appears inside the FULL_SCOPE branch (not the default path).
+    expect(checkScript).toContain(`run "svc lint" bash -c 'cd "svc" && ruff check .'`);
+  });
+
+  it('scopes eslint check to changed .ts files and keeps the FULL_SCOPE escape hatch', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      ...baseCfg,
+      buildConfig: {
+        directories: [{ path: 'svc', type: 'node', lint_cmd: 'npx eslint .' }],
+      },
+    });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toContain('if [ "$FULL_SCOPE" = "1" ]; then');
+    expect(checkScript).toContain(`grep -E '^svc/.*\\.(ts|tsx|js|jsx|cjs|mjs)$'`);
+    expect(checkScript).toContain(`run "svc lint" bash -c 'cd "svc" && npx eslint .'`);
+  });
+
+  it('keeps verbatim invocation for unrecognized lint_cmd without adding FULL_SCOPE block', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      ...baseCfg,
+      buildConfig: {
+        directories: [{ path: 'svc', type: 'python', lint_cmd: 'bash custom-lint.sh' }],
+      },
+    });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toContain(`run "svc lint" bash -c 'cd "svc" && bash custom-lint.sh'`);
+    // No per-lint FULL_SCOPE conditional — verbatim commands run as-is.
+    expect(checkScript).not.toContain('if [ "$FULL_SCOPE" = "1" ]; then');
+  });
+});

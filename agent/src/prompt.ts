@@ -963,6 +963,53 @@ fi
   fs.writeFileSync(`${WORKSPACE}/check`, script, { mode: 0o755 });
 }
 
+// Detects the canonical linter kind from a lint_cmd string.
+// Returns null for unrecognized commands — those run verbatim (never silently
+// rewrite something we don't understand).
+export function detectLinterKind(lintCmd: string): 'ruff' | 'eslint' | 'mypy' | 'flake8' | 'pyright' | null {
+  const base = lintCmd.replace(/^(python3?\s+-m\s+|npx\s+|pnpm\s+exec\s+)/, '');
+  if (/^ruff\b/.test(base)) return 'ruff';
+  if (/^eslint\b/.test(base)) return 'eslint';
+  if (/^mypy\b/.test(base)) return 'mypy';
+  if (/^flake8\b/.test(base)) return 'flake8';
+  if (/^pyright\b/.test(base)) return 'pyright';
+  return null;
+}
+
+// Returns the inner bash block for a directory's lint step. Recognized linters
+// are scoped to changed files (FULL_SCOPE=1 runs verbatim for the full tree).
+// Unrecognized commands keep the current verbatim behavior.
+function buildLintInner(dirPrefix: string, lintCmd: string): string {
+  const kind = detectLinterKind(lintCmd);
+  if (!kind) return `  run "${dirPrefix} lint" bash -c 'cd "${dirPrefix}" && ${lintCmd}'`;
+  const slug = dirPrefix.replace(/\//g, '_');
+  const tmpFile = `/tmp/check_${slug}_lint.txt`;
+  const isPy = kind !== 'eslint';
+  const extPat = isPy ? `\\.py` : `\\.(ts|tsx|js|jsx|cjs|mjs)`;
+  const extDesc = isPy ? 'Python' : 'JS/TS';
+  // Strip trailing '.' or './' token — replaced by xargs file list.
+  const toks = lintCmd.trim().split(/\s+/);
+  while (toks.length > 1 && (toks[toks.length - 1] === '.' || toks[toks.length - 1] === './')) toks.pop();
+  // Ruff: always use the narrow agent ruleset (E,F,W --ignore E501) so that
+  // strict pyproject.toml rules don't surface pre-existing baseline violations.
+  const scopedExec = kind === 'ruff'
+    ? `xargs -0 -a ${tmpFile} python3 -m ruff check --select E,F,W --ignore E501 2>&1`
+    : `xargs -0 -a ${tmpFile} ${toks.join(' ')} 2>&1`;
+  return `  if [ "$FULL_SCOPE" = "1" ]; then
+    run "${dirPrefix} lint" bash -c 'cd "${dirPrefix}" && ${lintCmd}'
+  else
+    : > ${tmpFile}
+    printf '%s\\n' "$CHANGED" | grep -E '^${dirPrefix}/.*${extPat}$' | while IFS= read -r f; do
+      [ -f "$f" ] && printf '%s\\0' "\${f#${dirPrefix}/}" >> ${tmpFile}
+    done
+    if [ -s ${tmpFile} ]; then
+      run "${dirPrefix} lint (changed)" bash -c 'cd "${dirPrefix}" && ${scopedExec}'
+    else
+      echo "[check] no changed ${extDesc} files in ${dirPrefix}, skipping lint"
+    fi
+  fi`;
+}
+
 /** Generate config-driven per-directory ./check blocks from a project's
  *  build_config. Mirrors the per-directory loop in runProjectLintChecks
  *  (index.ts): for each configured directory whose files changed, run its
@@ -984,7 +1031,7 @@ function buildConfigDrivenStackBlocks(buildConfig: BuildConfig): string {
     const dirPrefix = dir.path.replace(/\/$/, '');
     const inner: string[] = [];
     if (dir.install_cmd) inner.push(`  run "${dirPrefix} install" bash -c 'cd "${dirPrefix}" && ${dir.install_cmd}'`);
-    if (dir.lint_cmd) inner.push(`  run "${dirPrefix} lint" bash -c 'cd "${dirPrefix}" && ${dir.lint_cmd}'`);
+    if (dir.lint_cmd) inner.push(buildLintInner(dirPrefix, dir.lint_cmd));
     if (dir.build_cmd) inner.push(`  run "${dirPrefix} build" bash -c 'cd "${dirPrefix}" && ${dir.build_cmd}'`);
     if (dir.test_cmd) {
       inner.push(`  if [ "$WITH_TESTS" = "1" ]; then`);
