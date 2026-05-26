@@ -32,6 +32,11 @@ variable "cache_repo" {
   default = "HenryHamster/BlueprintAIStudio"
 }
 
+# Rebuild trigger: memo handler fixes from PR #5792 (extractCodexAgentMessageText,
+# lastResultText full-text capture) and PR #5921 (deferred_findings + memo reopen
+# continuation retry). These commits landed on main before this build trigger was
+# added, so the prior baked image predates the fixes. Merging this file forces the
+# packer-agent.yml workflow to re-bake the image from the current agent/src.
 source "googlecompute" "agent_image" {
   project_id          = var.project_id
   source_image_family = "ubuntu-2204-lts"
