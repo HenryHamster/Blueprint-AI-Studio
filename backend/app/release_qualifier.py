@@ -77,12 +77,9 @@ from app.database import AsyncSessionLocal
 from app.models import (
     Alert,
     AlertSeverity,
-    Artifact,
     ArtifactType,
     Project,
-    QualificationVerdict,
     Task,
-    TaskHistory,
     TaskStatus,
 )
 from app.notification_dispatch import (
@@ -93,7 +90,6 @@ from app.notification_dispatch import (
     post_version_promotion_readiness_message,  # noqa: F401 — re-exported for tests
     post_version_stabilize_stalled_message,  # noqa: F401 — re-exported for tests
 )
-from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
 from app.release_promotion import (
     # Re-exports — release_qualifier is the canonical import + test-patch
     # surface for these symbols (tests access via ``rq.*``; other modules that
@@ -111,9 +107,36 @@ from app.release_promotion import (
     _resolve_github_with_session,
     promote,
 )
+from app.release_qualifier_io import (
+    # Re-exports — release_qualifier is the canonical import + test-patch
+    # surface for the qualifier I/O helpers.  run_qualification calls
+    # _spawn_release_audit_task / _spawn_qualifier_smoketest_task via these
+    # local symbols, _finalize_qualification uses _latest_artifact_logs, and
+    # admin_digest imports get_latest_release_audit_report from here.  Tests
+    # patch via ``rq.<name>``.  The implementations live in
+    # release_qualifier_io.py; noqa pins them so a ruff --fix sweep can't drop
+    # them as "unused" and silently break callers / patch sites.
+    _latest_artifact_logs,  # noqa: F401 — re-exported for tests + callers
+    _spawn_qualifier_smoketest_task,  # noqa: F401 — re-exported for tests + callers
+    _spawn_release_audit_task,  # noqa: F401 — re-exported for tests + callers
+    get_latest_release_audit_report,  # noqa: F401 — re-exported for admin_digest
+)
 from app.release_reconciliation import (
-    _reconcile_if_pending_auto_merge_landed,
-    _reconcile_if_promotion_failed_landed,
+    _reconcile_if_pending_auto_merge_landed,  # noqa: F401 — re-exported for tests
+    _reconcile_if_promotion_failed_landed,  # noqa: F401 — re-exported for tests
+)
+from app.release_qualifier_readiness import (
+    _OUTCOME_LABELS,  # noqa: F401 — re-exported for back-compat
+    _READINESS_CONFIDENCE_STDEV_MAX,  # noqa: F401 — re-exported for back-compat
+    _READINESS_HISTORY_WINDOW,  # noqa: F401 — re-exported for back-compat
+    _READINESS_MIN_CLEAN_STREAK,  # noqa: F401 — re-exported for back-compat
+    _READINESS_MIN_VERDICTS,  # noqa: F401 — re-exported for back-compat
+    _READINESS_MIN_WOULD_PROMOTE_RATE,  # noqa: F401 — re-exported for back-compat
+    _READINESS_RECURRING_BLOCKER_MIN,  # noqa: F401 — re-exported for back-compat
+    _empty_readiness,  # noqa: F401 — re-exported for back-compat
+    compute_promotion_readiness,  # noqa: F401 — re-exported for back-compat
+    format_qualification_for_api,  # noqa: F401 — re-exported for back-compat
+    format_verdict_for_api,  # noqa: F401 — re-exported for back-compat
 )
 from app.release_scoring import (
     # Re-exports — release_qualifier is the canonical import + test-patch
@@ -145,14 +168,26 @@ from app.release_stall_alerts import (
     _BUILD_STALL_MERGED_TASKS,  # noqa: F401 — re-exported for back-compat
     _STABILIZE_STALL_AGE_DAYS,  # noqa: F401 — re-exported for back-compat
     _STABILIZE_STALL_MERGED_TASKS,  # noqa: F401 — re-exported for back-compat
-    _check_version_auto_merge_stall,
-    _check_version_build_stall,
-    _check_version_calcification,
-    _check_version_ci_unresolved_stall,
-    _check_version_promotion_readiness,
-    _check_version_stabilize_stall,
+    _check_version_auto_merge_stall,  # noqa: F401 — re-exported for tests
+    _check_version_build_stall,  # noqa: F401 — re-exported for tests
+    _check_version_calcification,  # noqa: F401 — re-exported for tests
+    _check_version_ci_unresolved_stall,  # noqa: F401 — re-exported for tests
+    _check_version_promotion_readiness,  # noqa: F401 — re-exported for tests
+    _check_version_stabilize_stall,  # noqa: F401 — re-exported for tests
     _is_build_stalled,  # noqa: F401 — re-exported for back-compat
     _MIN_CALCIFICATION_ATTEMPTS,  # noqa: F401 — re-exported for back-compat
+)
+from app.release_qualifier_sweep import (
+    # Re-exports — release_qualifier is the canonical import + test-patch
+    # surface for the sweep machinery (reaper.py calls via
+    # ``release_qualifier.sweep_stuck_qualifications``; tests patch via
+    # ``rq.*``). The implementations live in release_qualifier_sweep.py.
+    _MAX_QUALIFICATION_DURATION_SECONDS,  # noqa: F401 — used by _finalize_locked_version + re-exported
+    _MAX_SWEEP_CRASH_STREAK,  # noqa: F401 — re-exported for tests/back-compat
+    _force_finalize_sweep_crash_loop,  # noqa: F401 — re-exported for tests
+    _force_finalize_timed_out_qualification,  # noqa: F401 — re-exported for tests
+    _parse_started_at,  # noqa: F401 — re-exported for tests
+    sweep_stuck_qualifications,  # noqa: F401 — re-exported; reaper.py calls via rq.*
 )
 from app.shared_state import (
     runtime_config as _runtime_config,
@@ -241,30 +276,11 @@ _TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
     {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 )
 
-# Audit H2: hard wall-clock bound on a single qualification.  A qualification
-# spawns two heavy agent-VM children (release_audit + qualifier-smoketest),
-# each of which may itself retry — but if a child heartbeats-but-hangs, gets
-# stuck in a recovery/requeue loop, or otherwise never reaches a terminal
-# state, the version wedges at last_qualification.status == "pending" forever
-# with no signal.  sweep_stuck_qualifications force-finalizes any pending
-# qualification older than this as a blocked one (blocker
-# "qualification_timeout") and raises an Alert.  Six hours mirrors the
-# EVALUATING wall-clock backstop in services.py — long enough for a genuinely
-# progressing two-task pipeline (including retries) to finish, short enough
-# that a wedged qualification surfaces within a useful operator window.
-_MAX_QUALIFICATION_DURATION_SECONDS = 6 * 60 * 60
-
 # Minimum consecutive qualifier infrastructure errors (FAILED/CANCELLED
 # required child tasks) before raising a dedicated infra-failure alert.
 # Mirrors _MIN_CALCIFICATION_ATTEMPTS: three consecutive infra failures
 # strongly suggest the qualifier pipeline itself (agent VM / clone) is broken.
 _MIN_INFRA_ERROR_STREAK = 3
-
-# Consecutive sweep-finalize crashes before force-finalizing the pending
-# qualification and raising an operator alert.  Mirrors _MIN_INFRA_ERROR_STREAK:
-# three consecutive crashes strongly suggest a persistent bug in the finalize
-# path rather than a transient error, and the loop must self-recover.
-_MAX_SWEEP_CRASH_STREAK = 3
 
 
 async def _qualification_in_flight(
@@ -939,260 +955,12 @@ async def run_qualification(
     }
 
 
-async def _spawn_release_audit_task(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    version_id: uuid.UUID,
-    base_branch: str,
-    diff_range: str,
-    candidate_sha: str,
-) -> Task:
-    """Create + queue a ``release_audit`` task for the qualifier.
-
-    The audit clones ``base_branch`` (``main``) and reviews the ``diff_range``
-    (``main...<candidate_sha>`` — pinned to the exact snapshot commit, audit
-    C4) against main's standards — the differential audit at the heart of the
-    qualifier (design doc §6 gotcha 2: it MUST run on main).  Mirrors the
-    ``_spawn_self_audit_task`` spawn pattern.
-
-    The payload carries ``candidate_sha`` (the full 40-char SHA) so the agent's
-    ``handleReleaseAudit`` checks out exactly that commit rather than whatever
-    ``automain`` has drifted to by the task's runtime (audit C4 contract — the
-    payload field name is exactly ``candidate_sha``).
-    """
-    payload: dict[str, Any] = {
-        "type": "release_audit",
-        "base_branch": base_branch,
-        "diff_range": diff_range,
-        # Audit C4: pin the audit to the exact qualified commit.  The agent
-        # reads this from the payload and checks out this SHA.
-        "candidate_sha": candidate_sha,
-    }
-    type_model = (_runtime_config.get("task_type_models", {}) or {}).get(
-        "release_audit"
-    )
-    if type_model:
-        payload["model"] = type_model
-    type_effort = (_runtime_config.get("task_type_efforts", {}) or {}).get(
-        "release_audit"
-    )
-    if type_effort:
-        payload["effort"] = type_effort
-    try:
-        payload = validate_internal_payload(payload, "release_qualifier:release_audit")
-    except PayloadTooLargeError:
-        # release_audit payloads are tiny; a too-large error here is a real bug.
-        raise
-
-    task = Task(
-        project_id=project_id,
-        title=f"Release audit: main...{candidate_sha[:8]} diff",
-        description=(
-            f"Differential audit of {diff_range} against base_branch "
-            f"standards for the release qualifier"
-        ),
-        payloads=[payload],
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        status=TaskStatus.QUEUED,
-        created_by="ORCHESTRATOR",
-        context={
-            "release_version_id": str(version_id),
-            "candidate_sha": candidate_sha,
-        },
-    )
-    session.add(task)
-    await session.flush()
-    session.add(
-        TaskHistory(
-            task_id=task.id,
-            action="SPAWNED",
-            details={
-                "spawned_by": "RELEASE_QUALIFIER",
-                "task_type": "release_audit",
-                "diff_range": diff_range,
-                "release_version_id": str(version_id),
-            },
-        )
-    )
-    return task
-
-
-async def _spawn_qualifier_smoketest_task(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    version_id: uuid.UUID,
-    candidate_sha: str,
-) -> Task:
-    """Create + queue a qualify-time ``smoketest`` task on the candidate commit.
-
-    The context flag ``qualifier_smoketest=True`` marks this as a
-    pre-promotion qualifier input — distinct from the post-promotion
-    production smoketest — so its failure does NOT spawn a fix task
-    (design doc §6 gotcha 5).
-
-    The payload carries ``candidate_sha`` (the full 40-char SHA, audit C4) so
-    the agent's qualifier-smoketest handler checks out exactly that commit
-    after cloning ``automain`` — the candidate commit is reachable from the
-    ``automain`` branch at spawn time, and pinning to the SHA means the
-    smoketest scores the same commit the audit does even though ``automain``
-    keeps advancing while the task is queued (audit C4 contract — the payload
-    field name is exactly ``candidate_sha``).
-    """
-    project = await session.get(Project, project_id)
-    integration_branch, _promotion_target = _lts_branch_names(project)
-    payload: dict[str, Any] = {
-        "type": "smoketest",
-        "base_branch": integration_branch,
-        # Audit C4: pin the smoketest to the exact qualified commit.  The agent
-        # clones the integration branch then checks out this SHA.
-        "candidate_sha": candidate_sha,
-    }
-    type_model = (_runtime_config.get("task_type_models", {}) or {}).get("smoketest")
-    if type_model:
-        payload["model"] = type_model
-    type_effort = (_runtime_config.get("task_type_efforts", {}) or {}).get("smoketest")
-    if type_effort:
-        payload["effort"] = type_effort
-    health_check_urls = _runtime_config.get("health_check_urls") or []
-    if health_check_urls:
-        payload["health_check_urls"] = health_check_urls
-    try:
-        payload = validate_internal_payload(payload, "release_qualifier:smoketest")
-    except PayloadTooLargeError:
-        raise
-
-    task = Task(
-        project_id=project_id,
-        title=f"Qualifier smoketest: candidate {candidate_sha[:8]}",
-        description=(f"Qualify-time smoketest of release candidate {candidate_sha}"),
-        payloads=[payload],
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        status=TaskStatus.QUEUED,
-        created_by="ORCHESTRATOR",
-        context={
-            "release_version_id": str(version_id),
-            "qualifier_smoketest": True,
-            "candidate_sha": candidate_sha,
-        },
-    )
-    session.add(task)
-    await session.flush()
-    session.add(
-        TaskHistory(
-            task_id=task.id,
-            action="SPAWNED",
-            details={
-                "spawned_by": "RELEASE_QUALIFIER",
-                "task_type": "smoketest",
-                "qualifier_smoketest": True,
-                "release_version_id": str(version_id),
-            },
-        )
-    )
-    return task
-
-
-# ---------------------------------------------------------------------------
-# Artifact parsing — read the children's reports.
-# ---------------------------------------------------------------------------
-
-
-async def _latest_artifact_logs(
-    session: AsyncSession,
-    task_id: uuid.UUID,
-    artifact_type: ArtifactType,
-) -> dict[str, Any] | None:
-    """Return the parsed JSON ``logs`` of the latest artifact of a type.
-
-    Both RELEASE_AUDIT_REPORT and SMOKETEST_RESULT store a JSON document in
-    the ``Artifact.logs`` column.  Returns None when no artifact exists or the
-    logs are not parseable JSON.
-    """
-    import json
-
-    artifact = (
-        (
-            await session.execute(
-                select(Artifact)
-                .where(
-                    Artifact.task_id == task_id,
-                    Artifact.artifact_type == artifact_type,
-                )
-                .order_by(Artifact.created_at.desc())
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if artifact is None or not artifact.logs:
-        return None
-    try:
-        parsed = json.loads(artifact.logs)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        logger.warning(
-            "[RELEASE_QUALIFIER] artifact %s for task %s has unparseable logs",
-            artifact_type,
-            task_id,
-        )
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-async def get_latest_release_audit_report(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-) -> dict[str, Any] | None:
-    """Return the latest ``release_audit`` task's parsed report for a project.
-
-    Observability: a qualification verdict only persists the composite +
-    sub-scores, and the task API strips artifact ``logs`` — so operators are
-    blind to WHY a candidate scored what it did.  This surfaces the audit
-    agent's actual reasoning (``audit_score``, ``findings``, ``test_erosion``)
-    from the most recent ``release_audit`` task's RELEASE_AUDIT_REPORT artifact.
-
-    Returns ``None`` when no ``release_audit`` task exists yet.  ``report`` is
-    ``None`` when the task ran but posted no parseable report (crashed / killed).
-    """
-    audit_task = (
-        (
-            await session.execute(
-                select(Task)
-                .where(
-                    Task.project_id == project_id,
-                    Task.payloads[0]["type"].as_string() == "release_audit",
-                )
-                .order_by(Task.created_at.desc())
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if audit_task is None:
-        return None
-    report = await _latest_artifact_logs(
-        session, audit_task.id, ArtifactType.RELEASE_AUDIT_REPORT
-    )
-    ctx = audit_task.context or {}
-    status_val = (
-        audit_task.status.value
-        if hasattr(audit_task.status, "value")
-        else str(audit_task.status)
-    )
-    return {
-        "audit_task_id": str(audit_task.id),
-        "task_status": status_val,
-        "candidate_sha": ctx.get("candidate_sha"),
-        "created_at": audit_task.created_at.isoformat()
-        if audit_task.created_at
-        else None,
-        "report": report,
-    }
-
-
+# The qualifier I/O surface (_spawn_release_audit_task,
+# _spawn_qualifier_smoketest_task, _latest_artifact_logs,
+# get_latest_release_audit_report) lives in app.release_qualifier_io; the
+# symbols are re-imported at the top of this module so callers and tests still
+# reach them via app.release_qualifier.
+#
 # The audit/findings/smoketest scoring family (_score_audit,
 # _extract_audit_findings, _score_smoketest and their _AUDIT_DEDUCTIONS /
 # _MAX_CARRIED_FINDINGS / _SEVERITY_RANK constants) is pure and lives in
@@ -2199,661 +1967,6 @@ async def maybe_finalize_qualification(
 
 
 # ---------------------------------------------------------------------------
-# sweep_stuck_qualifications — defense-in-depth reaper.
+# sweep_stuck_qualifications — moved to release_qualifier_sweep.py.
+# Re-exported above via `from app.release_qualifier_sweep import ...`.
 # ---------------------------------------------------------------------------
-
-
-def _parse_started_at(qual: dict[str, Any]) -> datetime | None:
-    """Parse ``last_qualification["started_at"]`` to a datetime, or None.
-
-    ``started_at`` is an ISO-8601 string stamped by ``run_qualification``.
-    Returns None when it is missing or unparseable.
-
-    Audit R4-H5: a None return must NOT defeat the qualification-timeout
-    backstop — ``_finalize_locked_version`` falls back to a real row timestamp
-    (``version.updated_at``) when this returns None, so a corrupt
-    ``started_at`` string can never wedge a qualification forever.  The
-    fallback lives in the caller (not here) because this helper has no access
-    to the ``ReleaseVersion`` row.
-    """
-    raw = qual.get("started_at")
-    if not isinstance(raw, str) or not raw:
-        return None
-    try:
-        return datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-
-
-async def _force_finalize_timed_out_qualification(
-    session: AsyncSession,
-    version: release_version.ReleaseVersion,
-    age_seconds: float,
-) -> None:
-    """Force-finalize a qualification that has been ``pending`` too long.
-
-    Audit H2: a qualifier child that heartbeats-but-hangs (or is stuck in a
-    recovery/requeue loop) never reaches a terminal state, so neither
-    ``maybe_finalize_qualification`` nor the both-children-terminal branch of
-    the sweep ever fires and the version wedges at ``pending`` forever.  This
-    is the unconditional escape hatch — called regardless of child state once
-    the qualification exceeds ``_MAX_QUALIFICATION_DURATION_SECONDS``.
-
-    Records ``last_qualification.status = "not_promoted"`` with
-    ``blocker = "qualification_timeout"``, sends the version back to the
-    ``stabilize`` phase (so the next strategic cycle re-targets it), and raises
-    an ``Alert`` so the stuck qualification is operator-visible.  The version
-    stays ``open`` — a timed-out qualification only ever blocks, never
-    promotes, which is always safe.  The caller commits the session.
-    """
-    qual = dict(version.last_qualification or {})
-    age_minutes = age_seconds / 60.0
-    detail = (
-        f"qualification pending {age_minutes:.0f} min "
-        f"(> {_MAX_QUALIFICATION_DURATION_SECONDS // 60} min limit) — a "
-        f"qualifier child never reached a terminal state"
-    )
-    record = {
-        **qual,
-        "status": "not_promoted",
-        "blocker": "qualification_timeout",
-        "detail": detail,
-        "finalized_at": _utcnow().isoformat(),
-    }
-    version.last_qualification = record
-    flag_modified(version, "last_qualification")
-    release_version.set_version_phase(
-        version,
-        "stabilize",
-        reasoning=(
-            f"qualification v{version.version_number} timed out "
-            f"({age_minutes:.0f} min) — returning to stabilize"
-        ),
-    )
-    session.add(version)
-
-    session.add(
-        Alert(
-            project_id=version.project_id,
-            severity=AlertSeverity.WARNING,
-            title=(f"Release qualification v{version.version_number} timed out"),
-            message=(
-                f"Qualification for release v{version.version_number} was "
-                f"stuck pending for {age_minutes:.0f} minutes — a qualifier "
-                f"child (release_audit / qualifier-smoketest) never reached a "
-                f"terminal state. Force-finalized as a blocked qualification "
-                f"(blocker=qualification_timeout); the version returns to the "
-                f"stabilize phase for the next strategic cycle."
-            ),
-        )
-    )
-    logger.warning(
-        "[RELEASE_QUALIFIER] sweep: version v%d qualification timed out "
-        "(pending %.0f min) — force-finalized as qualification_timeout",
-        version.version_number,
-        age_minutes,
-    )
-
-
-async def _force_finalize_sweep_crash_loop(
-    session: AsyncSession,
-    version: release_version.ReleaseVersion,
-    streak: int,
-) -> None:
-    """Force-finalize a qualification whose sweep finalize has crash-looped.
-
-    Called when _finalize_in_dedicated_session has raised on every consecutive
-    sweep attempt for this version (_MAX_SWEEP_CRASH_STREAK times).  Records
-    last_qualification.status='not_promoted' with
-    blocker='sweep_finalize_crash_loop', resets the version to stabilize phase,
-    raises an Alert, and notifies the operator.  The caller commits the session.
-    """
-    qual = dict(version.last_qualification or {})
-    record = {
-        **qual,
-        "status": "not_promoted",
-        "blocker": "sweep_finalize_crash_loop",
-        "detail": (
-            f"sweep finalize raised on {streak} consecutive sweep(s) — "
-            "force-finalized to unblock the qualification loop"
-        ),
-        "finalized_at": _utcnow().isoformat(),
-        "sweep_crash_streak": 0,
-    }
-    version.last_qualification = record
-    flag_modified(version, "last_qualification")
-    release_version.set_version_phase(
-        version,
-        "stabilize",
-        reasoning=(
-            f"qualification v{version.version_number} sweep crash-looped "
-            f"({streak} consecutive finalize errors) — returning to stabilize"
-        ),
-    )
-    session.add(version)
-    session.add(
-        Alert(
-            project_id=version.project_id,
-            severity=AlertSeverity.WARNING,
-            title=f"Release qualification v{version.version_number} sweep crash-loop",
-            message=(
-                f"The qualification sweep for release v{version.version_number} "
-                f"has raised {streak} consecutive finalize errors. "
-                f"Force-finalized as sweep_finalize_crash_loop; the version "
-                f"returns to the stabilize phase. Inspect the release_qualifier "
-                f"logs for the root cause."
-            ),
-        )
-    )
-    await _notify_operator(
-        session,
-        version,
-        "release_qualification_crash_loop",
-        (
-            f"v{version.version_number} qualification sweep crash-looped "
-            f"({streak} consecutive finalize errors) — force-finalized, "
-            f"returned to stabilize."
-        ),
-        extra={"consecutive_finalize_errors": streak},
-    )
-    logger.warning(
-        "[RELEASE_QUALIFIER] sweep: version v%d finalize crash-looped "
-        "(%d consecutive errors) — force-finalized as sweep_finalize_crash_loop",
-        version.version_number,
-        streak,
-    )
-
-
-async def sweep_stuck_qualifications(
-    session: AsyncSession,
-    *,
-    session_factory=None,
-) -> int:
-    """Finalize qualifications stuck ``pending`` past the normal completion path.
-
-    ``maybe_finalize_qualification`` is the normal path: a child terminating
-    fires a completion handler that finalizes the version once its sibling is
-    also terminal.  But if a child dies *without* its handler running — handler
-    exception, orchestrator restart between the child's terminal write and the
-    handler, a child that was force-cancelled out of band — the version is left
-    with ``last_qualification.status == "pending"`` forever even though its
-    children have finished.
-
-    This sweep is the defense-in-depth reaper for that case.  For every
-    ``ReleaseVersion`` whose ``last_qualification.status == "pending"`` it
-    handles two situations:
-
-      * **Both required children terminal** (``COMPLETED`` / ``FAILED`` /
-        ``CANCELLED``) — finalizes the version.  The qualifier-smoketest child
-        is optional (audit H3): when the qualifying run recorded
-        ``smoketest_enabled == False`` only the audit child gates this branch.
-
-      * **Pending longer than ``_MAX_QUALIFICATION_DURATION_SECONDS``** (audit
-        H2) — force-finalizes the qualification as blocked (blocker
-        ``qualification_timeout``) regardless of child state and raises an
-        Alert.  This is the escape hatch for a child that heartbeats-but-hangs
-        and so never reaches a terminal state.
-
-    **Per-version session isolation (replaces the old per-version commit —
-    audit H5).**  ``session`` is used ONLY for the read-only scan that lists the
-    candidate version ids; the sweep never writes through it.  Each version is
-    then finalized via ``_finalize_in_dedicated_session``, which opens its OWN
-    session, locks that one version, finalizes it, and commits — in complete
-    isolation.  A failure (or a real GitHub merge) on version B therefore
-    cannot roll back version A's already-committed finalization: they were
-    never in the same transaction.  This is strictly stronger than the old
-    "commit after each version on the shared session" pattern and removes the
-    shared-session rollback/expire bookkeeping entirely.
-
-    Idempotent and safe to call repeatedly: a version already finalized (or not
-    actually ready) is no-op'd by ``_finalize_in_dedicated_session``'s own
-    under-lock guards.  Returns the number of versions actually finalized.
-    """
-    # Only ``open`` versions can be mid-qualification — a promoted/abandoned
-    # version is terminal.  This keeps the scan bounded (≈ one open version per
-    # project) and avoids a JSONB-path WHERE clause that differs across the
-    # Postgres / SQLite-test dialects; the pending filter is applied inside the
-    # per-version dedicated session under the row lock.
-    open_versions = list(
-        (
-            await session.execute(
-                select(release_version.ReleaseVersion).where(
-                    release_version.ReleaseVersion.status == "open"
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    # Snapshot just the IDs — each version is re-fetched under its own
-    # FOR UPDATE lock in its own dedicated session, so the id is all that is
-    # carried out of the scan.
-    version_ids = [v.id for v in open_versions]
-
-    now = _utcnow()
-    finalized = 0
-    for version_id in version_ids:
-        # Each version finalizes in its own dedicated session (concern d + the
-        # audit-H5 isolation guarantee): a failure here is contained and cannot
-        # touch another version's already-committed work.
-        try:
-            result = await _finalize_in_dedicated_session(
-                version_id,
-                session_factory=session_factory,
-                timeout_now=now,
-            )
-        except Exception:
-            logger.exception(
-                "[RELEASE_QUALIFIER] sweep: failed to finalize stuck "
-                "qualification for version %s",
-                version_id,
-            )
-            # Track consecutive sweep crashes on this version.  When the streak
-            # reaches _MAX_SWEEP_CRASH_STREAK, force-finalize to unblock the loop
-            # so the same crash cannot recur on every subsequent sweep.
-            _factory = session_factory or AsyncSessionLocal
-            try:
-                async with _factory() as crash_session:
-                    locked_v = (
-                        (
-                            await crash_session.execute(
-                                select(release_version.ReleaseVersion)
-                                .where(release_version.ReleaseVersion.id == version_id)
-                                .with_for_update()
-                            )
-                        )
-                        .scalars()
-                        .first()
-                    )
-                    if (
-                        locked_v is not None
-                        and isinstance(locked_v.last_qualification, dict)
-                        and locked_v.last_qualification.get("status") == "pending"
-                    ):
-                        streak = (
-                            locked_v.last_qualification.get("sweep_crash_streak") or 0
-                        ) + 1
-                        if streak >= _MAX_SWEEP_CRASH_STREAK:
-                            await _force_finalize_sweep_crash_loop(
-                                crash_session, locked_v, streak
-                            )
-                        else:
-                            locked_v.last_qualification = {
-                                **locked_v.last_qualification,
-                                "sweep_crash_streak": streak,
-                            }
-                            flag_modified(locked_v, "last_qualification")
-                            crash_session.add(locked_v)
-                        await crash_session.commit()
-            except Exception:
-                logger.exception(
-                    "[RELEASE_QUALIFIER] sweep: crash-streak update failed "
-                    "for version %s",
-                    version_id,
-                )
-            continue
-        if result is not None:
-            finalized += 1
-
-    if finalized:
-        logger.info(
-            "[RELEASE_QUALIFIER] sweep finalized %d stuck qualification(s)",
-            finalized,
-        )
-
-    # Reconcile open versions whose promotion-failure candidate is already on
-    # main.  A promotion_failed version is kept open so the next strategic cycle
-    # can retry, but if the blocked PR later lands out-of-band (operator merge,
-    # a stalled auto-merge fires, a transient CI block clears) nothing calls the
-    # idempotency check again.  This loop fills that gap: for each open version
-    # with last_qualification.status=="promotion_failed" it checks whether the
-    # candidate is now reachable from main and, if so, records the promotion as
-    # successful and opens the next version.
-    for version_id in version_ids:
-        try:
-            reconciled = await _reconcile_if_promotion_failed_landed(
-                version_id,
-                session_factory=session_factory,
-            )
-        except Exception:
-            logger.exception(
-                "[RELEASE_QUALIFIER] sweep: reconcile check failed for version %s",
-                version_id,
-            )
-            continue
-        if reconciled:
-            finalized += 1
-            logger.info(
-                "[RELEASE_QUALIFIER] sweep reconciled version %s "
-                "(promotion_failed candidate landed on main)",
-                version_id,
-            )
-
-    # Reconcile open versions whose promotion PR is awaiting auto-merge but
-    # has already landed on main (normal path: required CI passed, auto-merge
-    # fired) or was closed without merging (can never auto-merge, drives
-    # version to promotion_failed so retry machinery applies).
-    for version_id in version_ids:
-        try:
-            reconciled = await _reconcile_if_pending_auto_merge_landed(
-                version_id,
-                session_factory=session_factory,
-            )
-        except Exception:
-            logger.exception(
-                "[RELEASE_QUALIFIER] sweep: pending_auto_merge reconcile check "
-                "failed for version %s",
-                version_id,
-            )
-            continue
-        if reconciled:
-            finalized += 1
-            logger.info(
-                "[RELEASE_QUALIFIER] sweep reconciled version %s "
-                "(pending_auto_merge drove to terminal state)",
-                version_id,
-            )
-
-    # Lifecycle-stall checks: alert when an open version is stuck at either end
-    # of the lifecycle — calcifying in stabilize (repeated hard-blocker
-    # failures) or stalled in build (sitting too long without advancing).  The
-    # two checks are mutually exclusive per version (each early-returns on the
-    # wrong phase) but both run so whichever applies fires.  Each version gets
-    # its own dedicated session (same isolation pattern as the finalize loop
-    # above) so a messaging failure on one version can't affect another.
-    factory = session_factory or AsyncSessionLocal
-    for version in open_versions:
-        try:
-            async with factory() as alert_session:
-                v = await alert_session.get(release_version.ReleaseVersion, version.id)
-                if v is None:
-                    continue
-                alerted = await _check_version_calcification(alert_session, v)
-                alerted = (
-                    await _check_version_ci_unresolved_stall(alert_session, v)
-                    or alerted
-                )
-                alerted = await _check_version_build_stall(alert_session, v) or alerted
-                alerted = (
-                    await _check_version_stabilize_stall(alert_session, v) or alerted
-                )
-                alerted = (
-                    await _check_version_promotion_readiness(alert_session, v)
-                    or alerted
-                )
-                alerted = (
-                    await _check_version_auto_merge_stall(alert_session, v) or alerted
-                )
-                if alerted:
-                    await alert_session.commit()
-        except Exception:
-            logger.exception(
-                "[RELEASE_QUALIFIER] lifecycle-stall check failed for version %s",
-                version.id,
-            )
-
-    return finalized
-
-
-# ---------------------------------------------------------------------------
-# Public display helpers — stable API for the operator lifecycle panel.
-# (promote() and its helpers live in app.release_promotion — imported above.)
-# ---------------------------------------------------------------------------
-
-# Maps the internal last_qualification status code to a human-readable label
-# for the version-lifecycle panel.
-_OUTCOME_LABELS: dict[str, str] = {
-    "pending": "In progress",
-    "dry_run": "Dry-run (would promote)",
-    "promoted": "Promoted",
-    "not_promoted": "Below threshold",
-    "error": "Error",
-}
-
-
-def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
-    """Return an operator-facing summary of a ``last_qualification`` record.
-
-    Normalizes the raw qualification dict stored on ``ReleaseVersion`` into
-    a stable shape suitable for the version-lifecycle panel.  Adds a
-    human-readable ``outcome`` label alongside the raw ``status`` code.
-
-    Safe to call with an empty dict — all fields default to ``None``.
-    """
-    status = qual.get("status")
-    return {
-        "status": status,
-        "outcome": _OUTCOME_LABELS.get(status, status),
-        "confidence": qual.get("confidence"),
-        "threshold": qual.get("threshold"),
-        "sub_scores": qual.get("sub_scores"),
-        "blocker": qual.get("blocker"),
-        "started_at": qual.get("started_at"),
-        "finalized_at": qual.get("finalized_at"),
-    }
-
-
-def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
-    """Return an operator-facing dict for a single QualificationVerdict row.
-
-    Serializes the ORM row into a stable, JSON-safe shape for the
-    qualification-verdict history endpoint.  Adds a human-readable ``outcome``
-    label alongside the raw ``terminal_status`` code so the UI can render
-    both without a second lookup.
-    """
-    return {
-        "id": str(verdict.id),
-        "release_version_id": str(verdict.release_version_id),
-        "candidate_sha": verdict.candidate_sha,
-        "confidence": verdict.confidence,
-        "sub_scores": verdict.sub_scores,
-        "blocker": verdict.blocker,
-        "would_promote": verdict.would_promote,
-        "promotion_enabled": verdict.promotion_enabled,
-        "terminal_status": verdict.terminal_status,
-        "outcome": _OUTCOME_LABELS.get(
-            verdict.terminal_status, verdict.terminal_status
-        ),
-        "threshold": verdict.threshold,
-        "started_at": verdict.started_at.isoformat() if verdict.started_at else None,
-        "finalized_at": verdict.finalized_at.isoformat()
-        if verdict.finalized_at
-        else None,
-        "created_at": verdict.created_at.isoformat(),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Promotion-readiness aggregation — the calibration evidence (design Phase 4).
-# ---------------------------------------------------------------------------
-#
-# These constants gate the human-facing recommendation only.  Per design
-# decision D2 the recommendation NEVER auto-flips runtime_config["promotion_
-# enabled"] — it summarizes the durable dry-run track record so an operator can
-# answer "is the qualifier trustworthy enough to enable autonomous promotion
-# yet?" from real data and flip the switch themselves.  Kept deliberately
-# CONSERVATIVE: signalling ready prematurely is the costly error (it invites a
-# human to hand the qualifier the keys to production main).
-
-# How many most-recent dry-run-regime verdicts to consider.
-_READINESS_HISTORY_WINDOW = 50
-# Minimum number of evaluated dry-run-regime verdicts before any "ready" signal.
-# A handful of passes is not yet a track record.
-_READINESS_MIN_VERDICTS = 5
-# Minimum run of the MOST-RECENT consecutive clean would-promote verdicts (no
-# blocker) — recent stability matters more than a good-then-bad history.
-_READINESS_MIN_CLEAN_STREAK = 3
-# Minimum would-promote rate across the evaluated window.
-_READINESS_MIN_WOULD_PROMOTE_RATE = 0.80
-# A blocker code seen at least this many times in the window is "recurring" —
-# the qualifier keeps tripping on the same hard problem, so NOT ready.
-_READINESS_RECURRING_BLOCKER_MIN = 2
-# Confidence-spread ceiling for the advisory "stable" flag (evidence only — not
-# a hard readiness gate).
-_READINESS_CONFIDENCE_STDEV_MAX = 0.15
-
-
-def _empty_readiness(thresholds: dict[str, Any]) -> dict[str, Any]:
-    """The not-ready summary returned when there is no verdict history yet."""
-    return {
-        "ready": False,
-        "reason": "no qualification verdicts recorded yet — nothing to evaluate",
-        "verdicts_evaluated": 0,
-        "would_promote_count": 0,
-        "would_promote_rate": 0.0,
-        "consecutive_clean_passes": 0,
-        "confidence": {
-            "mean": None,
-            "stdev": None,
-            "min": None,
-            "max": None,
-            "stable": False,
-        },
-        "recurring_blockers": {},
-        "blocker_counts": {},
-        "thresholds": thresholds,
-    }
-
-
-async def compute_promotion_readiness(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-) -> dict[str, Any]:
-    """Summarize the dry-run qualification track record into a readiness verdict.
-
-    Reads the durable :class:`QualificationVerdict` history (the most recent
-    ``_READINESS_HISTORY_WINDOW`` verdicts recorded while promotion was DISABLED
-    — the dry-run regime, where every finalize lands as ``dry_run`` /
-    ``not_promoted``) and returns a conservative ``ready`` / not-ready
-    recommendation plus the supporting evidence.
-
-    EVIDENCE + RECOMMENDATION ONLY (design decision D2): this NEVER flips
-    ``promotion_enabled``.  ``ready=True`` requires ALL of:
-
-      * at least ``_READINESS_MIN_VERDICTS`` evaluated verdicts, AND
-      * a most-recent consecutive-clean would-promote streak of at least
-        ``_READINESS_MIN_CLEAN_STREAK``, AND
-      * a would-promote rate >= ``_READINESS_MIN_WOULD_PROMOTE_RATE``, AND
-      * NO recurring hard blocker (a blocker code seen
-        >= ``_READINESS_RECURRING_BLOCKER_MIN`` times in the window).
-
-    Returns a dict with ``ready``, a human-readable ``reason``, the raw evidence
-    (``verdicts_evaluated``, ``would_promote_count``, ``would_promote_rate``,
-    ``consecutive_clean_passes``, a ``confidence`` distribution + advisory
-    ``stable`` flag, ``blocker_counts`` and the subset that is ``recurring_
-    blockers``) and the ``thresholds`` used so the recommendation is auditable.
-    """
-    thresholds: dict[str, Any] = {
-        "min_verdicts": _READINESS_MIN_VERDICTS,
-        "min_clean_streak": _READINESS_MIN_CLEAN_STREAK,
-        "min_would_promote_rate": _READINESS_MIN_WOULD_PROMOTE_RATE,
-        "recurring_blocker_min": _READINESS_RECURRING_BLOCKER_MIN,
-        "history_window": _READINESS_HISTORY_WINDOW,
-    }
-
-    # Only the dry-run regime (promotion_enabled is False) is evidence for
-    # whether to flip the switch — verdicts recorded after promotion was enabled
-    # are post-decision and excluded.  Newest-first so the leading run is the
-    # most-recent consecutive-clean streak.
-    stmt = (
-        select(QualificationVerdict)
-        .where(
-            QualificationVerdict.project_id == project_id,
-            QualificationVerdict.promotion_enabled.is_(False),
-        )
-        .order_by(QualificationVerdict.created_at.desc())
-        .limit(_READINESS_HISTORY_WINDOW)
-    )
-    verdicts = list((await session.execute(stmt)).scalars().all())
-
-    evaluated = len(verdicts)
-    if evaluated == 0:
-        return _empty_readiness(thresholds)
-
-    would_promote_count = sum(1 for v in verdicts if v.would_promote)
-    would_promote_rate = round(would_promote_count / evaluated, 4)
-
-    # Leading run of clean would-promote passes (would_promote AND no blocker).
-    consecutive_clean = 0
-    for v in verdicts:
-        if v.would_promote and not v.blocker:
-            consecutive_clean += 1
-        else:
-            break
-
-    # Blocker frequency across the window (only non-promote verdicts carry one).
-    # ci_unresolved is a resolution/infrastructure concern and must not be counted
-    # as a quality recurring blocker — it would pollute the readiness signal and
-    # misdirect the strategic agent toward a non-existent build problem.
-    blocker_counts: dict[str, int] = {}
-    for v in verdicts:
-        if v.blocker and v.blocker != "ci_unresolved":
-            blocker_counts[v.blocker] = blocker_counts.get(v.blocker, 0) + 1
-    recurring_blockers = {
-        code: n
-        for code, n in blocker_counts.items()
-        if n >= _READINESS_RECURRING_BLOCKER_MIN
-    }
-
-    # Confidence distribution + an advisory stability measure (population stdev).
-    confidences = [float(v.confidence) for v in verdicts]
-    conf_mean = round(sum(confidences) / evaluated, 4)
-    conf_min = round(min(confidences), 4)
-    conf_max = round(max(confidences), 4)
-    if evaluated > 1:
-        variance = sum((c - conf_mean) ** 2 for c in confidences) / evaluated
-        conf_stdev = round(variance**0.5, 4)
-    else:
-        conf_stdev = 0.0
-    conf_stable = conf_stdev <= _READINESS_CONFIDENCE_STDEV_MAX
-
-    reasons: list[str] = []
-    if evaluated < _READINESS_MIN_VERDICTS:
-        reasons.append(
-            f"only {evaluated} dry-run verdict(s) evaluated "
-            f"(need >= {_READINESS_MIN_VERDICTS})"
-        )
-    if consecutive_clean < _READINESS_MIN_CLEAN_STREAK:
-        reasons.append(
-            f"consecutive-clean streak is {consecutive_clean} "
-            f"(need >= {_READINESS_MIN_CLEAN_STREAK})"
-        )
-    if would_promote_rate < _READINESS_MIN_WOULD_PROMOTE_RATE:
-        reasons.append(
-            f"would-promote rate is {would_promote_rate:.2f} "
-            f"(need >= {_READINESS_MIN_WOULD_PROMOTE_RATE:.2f})"
-        )
-    if recurring_blockers:
-        formatted = ", ".join(
-            f"{code}x{n}" for code, n in sorted(recurring_blockers.items())
-        )
-        reasons.append(f"recurring hard blocker(s): {formatted}")
-
-    ready = not reasons
-    if ready:
-        reason = (
-            f"qualifier looks trustworthy: {would_promote_count}/{evaluated} "
-            f"would-promote (rate {would_promote_rate:.2f}), {consecutive_clean} "
-            f"consecutive clean passes, no recurring blockers"
-        )
-    else:
-        reason = "; ".join(reasons)
-
-    return {
-        "ready": ready,
-        "reason": reason,
-        "verdicts_evaluated": evaluated,
-        "would_promote_count": would_promote_count,
-        "would_promote_rate": would_promote_rate,
-        "consecutive_clean_passes": consecutive_clean,
-        "confidence": {
-            "mean": conf_mean,
-            "stdev": conf_stdev,
-            "min": conf_min,
-            "max": conf_max,
-            "stable": conf_stable,
-        },
-        "recurring_blockers": recurring_blockers,
-        "blocker_counts": blocker_counts,
-        "thresholds": thresholds,
-    }

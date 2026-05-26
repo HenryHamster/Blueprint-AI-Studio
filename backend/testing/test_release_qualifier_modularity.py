@@ -26,6 +26,31 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "_reconcile_if_pending_auto_merge_landed",
         "_reconcile_if_promotion_failed_landed",
     ),
+    "app.release_qualifier_io": (
+        "_spawn_release_audit_task",
+        "_spawn_qualifier_smoketest_task",
+        "_latest_artifact_logs",
+        "get_latest_release_audit_report",
+    ),
+    "app.release_qualifier_readiness": (
+        "_OUTCOME_LABELS",
+        "_READINESS_CONFIDENCE_STDEV_MAX",
+        "_READINESS_HISTORY_WINDOW",
+        "_READINESS_MIN_CLEAN_STREAK",
+        "_READINESS_MIN_VERDICTS",
+        "_READINESS_MIN_WOULD_PROMOTE_RATE",
+        "_READINESS_RECURRING_BLOCKER_MIN",
+        "_empty_readiness",
+        "compute_promotion_readiness",
+        "format_qualification_for_api",
+        "format_verdict_for_api",
+    ),
+    "app.release_qualifier_sweep": (
+        "sweep_stuck_qualifications",
+        "_force_finalize_timed_out_qualification",
+        "_force_finalize_sweep_crash_loop",
+        "_parse_started_at",
+    ),
 }
 
 
