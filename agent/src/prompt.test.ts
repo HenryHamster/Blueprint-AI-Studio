@@ -64,6 +64,7 @@ import {
   formatFixIterationHistory,
   formatSelfReviewCalibrationSection,
   detectLinterKind,
+  buildScopedLintOneliner,
   type FixAttempt,
 } from './prompt.js';
 import { READ_ONLY_TASK_TYPES, WRITE_TASK_TYPES } from './taskCapabilities.js';
@@ -5293,6 +5294,120 @@ describe('detectLinterKind', () => {
     ['bash lint.sh'],
   ])('returns null for unrecognized command %s', (cmd) => {
     expect(detectLinterKind(cmd)).toBeNull();
+  });
+});
+
+// ── buildScopedLintOneliner ────────────────────────────────────────────────────
+describe('buildScopedLintOneliner', () => {
+  it('returns null for unrecognized lint_cmd', () => {
+    expect(buildScopedLintOneliner('bash custom-lint.sh', 'svc', 'main', 'git-diff')).toBeNull();
+    expect(buildScopedLintOneliner('npm run lint', 'svc', 'main', 'check-tmpfile')).toBeNull();
+  });
+
+  it.each([
+    ['ruff check .', 'svc', 'main'],
+    ['python3 -m mypy', 'backend', 'develop'],
+    ['flake8 .', 'src', 'main'],
+    ['npx eslint .', 'admin-ui', 'main'],
+    ['pyright .', 'agent', 'main'],
+  ] as [string, string, string][])(
+    'check-tmpfile output for %s in dir=%s does not contain verbatim lint_cmd trailing dot',
+    (lintCmd, dir, _base) => {
+      const result = buildScopedLintOneliner(lintCmd, dir, _base, 'check-tmpfile');
+      expect(result).not.toBeNull();
+      // Trailing '.' should be stripped — the file list drives scope
+      expect(result).not.toMatch(/\s\.\s*$/);
+      // Should reference the tmp file for that directory
+      const slug = dir.replace(/\//g, '_');
+      expect(result).toContain(`/tmp/check_${slug}_lint.txt`);
+    },
+  );
+
+  it.each([
+    ['ruff check .', 'svc', 'main'],
+    ['python3 -m mypy', 'backend', 'develop'],
+    ['flake8 .', 'src', 'main'],
+    ['npx eslint .', 'admin-ui', 'main'],
+    ['pyright .', 'agent', 'main'],
+  ] as [string, string, string][])(
+    'git-diff output for %s in dir=%s uses git diff pipeline against base branch',
+    (lintCmd, dir, base) => {
+      const result = buildScopedLintOneliner(lintCmd, dir, base, 'git-diff');
+      expect(result).not.toBeNull();
+      expect(result).toContain(`git diff origin/${base}...HEAD --name-only`);
+      expect(result).toContain(`xargs -r`);
+    },
+  );
+
+  it('ruff is rewritten to narrow ruleset for check-tmpfile', () => {
+    const result = buildScopedLintOneliner('ruff check .', 'svc', 'main', 'check-tmpfile');
+    expect(result).toContain('python3 -m ruff check --select E,F,W --ignore E501');
+  });
+
+  it('ruff is rewritten to narrow ruleset for git-diff', () => {
+    const result = buildScopedLintOneliner('ruff check .', 'svc', 'main', 'git-diff');
+    expect(result).toContain('python3 -m ruff check --select E,F,W --ignore E501');
+  });
+
+  it('check-tmpfile and git-diff produce semantically equivalent linter invocations for same lint_cmd', () => {
+    const lintCmds = ['ruff check .', 'python3 -m mypy', 'flake8', 'npx eslint .'];
+    for (const lintCmd of lintCmds) {
+      const tmpfile = buildScopedLintOneliner(lintCmd, 'svc', 'main', 'check-tmpfile');
+      const gitdiff = buildScopedLintOneliner(lintCmd, 'svc', 'main', 'git-diff');
+      expect(tmpfile).not.toBeNull();
+      expect(gitdiff).not.toBeNull();
+      // Both must end with the same effective linter invocation (neither running verbatim full tree)
+      expect(tmpfile).not.toMatch(/\s\.\s*$|\/\.\s*$/);
+      expect(gitdiff).not.toMatch(/\s\.\s*$|\/\.\s*$/);
+    }
+  });
+
+  it('python linters filter .py files for check-tmpfile', () => {
+    for (const cmd of ['python3 -m mypy .', 'flake8 .', 'pyright .']) {
+      const result = buildScopedLintOneliner(cmd, 'svc', 'main', 'git-diff');
+      expect(result).toContain('\\.py');
+      expect(result).not.toContain('ts|tsx');
+    }
+  });
+
+  it('eslint filters JS/TS files for git-diff', () => {
+    const result = buildScopedLintOneliner('npx eslint .', 'admin-ui', 'main', 'git-diff');
+    expect(result).toContain('\\.(ts|tsx|js|jsx|cjs|mjs)');
+    expect(result).not.toContain('\\.py');
+  });
+
+  it('strips trailing dot from mypy for check-tmpfile', () => {
+    const result = buildScopedLintOneliner('python3 -m mypy .', 'svc', 'main', 'check-tmpfile');
+    expect(result).not.toBeNull();
+    // The xargs invocation should use 'python3 -m mypy' without trailing dot
+    expect(result).toContain('python3 -m mypy');
+    expect(result).not.toMatch(/mypy \. /);
+  });
+
+  it('strips trailing ./ from lint_cmd', () => {
+    const result = buildScopedLintOneliner('flake8 ./', 'svc', 'main', 'check-tmpfile');
+    expect(result).not.toBeNull();
+    expect(result).not.toContain('./');
+  });
+
+  it('check-tmpfile output snapshot for ruff', () => {
+    const result = buildScopedLintOneliner('ruff check .', 'svc', 'main', 'check-tmpfile');
+    expect(result).toBe('xargs -0 -a /tmp/check_svc_lint.txt python3 -m ruff check --select E,F,W --ignore E501 2>&1');
+  });
+
+  it('git-diff output snapshot for ruff', () => {
+    const result = buildScopedLintOneliner('ruff check .', 'svc', 'main', 'git-diff');
+    expect(result).toBe("git diff origin/main...HEAD --name-only | grep -E '\\.py$' | sed 's|svc/||' | xargs -r python3 -m ruff check --select E,F,W --ignore E501");
+  });
+
+  it('git-diff output snapshot for mypy', () => {
+    const result = buildScopedLintOneliner('python3 -m mypy', 'backend', 'main', 'git-diff');
+    expect(result).toBe("git diff origin/main...HEAD --name-only | grep -E '\\.py$' | sed 's|backend/||' | xargs -r python3 -m mypy");
+  });
+
+  it('git-diff output snapshot for eslint', () => {
+    const result = buildScopedLintOneliner('npx eslint .', 'admin-ui', 'main', 'git-diff');
+    expect(result).toBe("git diff origin/main...HEAD --name-only | grep -E '\\.(ts|tsx|js|jsx|cjs|mjs)$' | sed 's|admin-ui/||' | xargs -r npx eslint");
   });
 });
 

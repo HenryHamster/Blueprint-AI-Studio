@@ -20,6 +20,7 @@ import {
   assembleFailureGuidanceBlocks,
   readClaudeMd, formatProjectContext, configureAgentPermissions, computePromptFingerprint,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, type PlaybookEntry,
+  buildScopedLintOneliner, detectLinterKind,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 
@@ -758,7 +759,7 @@ function preinstallNodeDeps(
 // always has dependencies available — without the prefix, every reviewer on a
 // fresh VM hits "cannot resolve <package>" and flags it as a build-gate
 // failure even when the underlying PR is fine.
-function buildTypeCheckInstructions(buildConfig?: BuildConfig, baseBranch?: string): string {
+export function buildTypeCheckInstructions(buildConfig?: BuildConfig, baseBranch?: string): string {
   if (!buildConfig || !buildConfig.directories || buildConfig.directories.length === 0) {
     return `**Build & Type Safety (MUST run these — do not skip):**
 - For TypeScript/JavaScript changes: find the package root for each changed file (the nearest parent directory with a package.json), then run \`npm ci && npm run build\` (or \`npx tsc --noEmit\` for TypeScript-only packages) — report any errors
@@ -777,20 +778,14 @@ function buildTypeCheckInstructions(buildConfig?: BuildConfig, baseBranch?: stri
       if (d.build_cmd) {
         return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && ${installPrefix}${d.build_cmd}\` — report any errors`;
       }
-      // lint_cmd only: scope recognized linters to changed files so pre-existing
-      // baseline violations don't block clean PRs (mirrors runProjectLintChecks).
+      // lint_cmd only: delegate to shared helper so scoping logic stays in sync
+      // with the ./check fix path (buildScopedLintOneliner in prompt.ts).
       const lintCmd = d.lint_cmd ?? '';
-      const lintBase = lintCmd.replace(/^(python3?\s+-m\s+|npx\s+|pnpm\s+exec\s+)/, '');
-      const isPy = lintBase.match(/^(ruff|mypy|flake8|pyright)\b/);
-      const isJs = lintCmd.replace(/^(npx\s+|pnpm\s+exec\s+)/, '').match(/^eslint\b/);
-      if (isPy) {
-        const scopedLint = lintBase.startsWith('ruff ')
-          ? 'python3 -m ruff check --select E,F,W --ignore E501'
-          : lintCmd;
-        return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && git diff origin/${base}...HEAD --name-only | grep '\\.py$' | sed 's|${d.path}/||' | xargs -r ${scopedLint}\` — report any errors (scoped to changed .py files)`;
-      }
-      if (isJs) {
-        return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && git diff origin/${base}...HEAD --name-only | grep -E '\\.(ts|tsx|js|jsx)$' | sed 's|${d.path}/||' | xargs -r npx eslint\` — report any errors (scoped to changed JS/TS files)`;
+      const scopedOneliner = buildScopedLintOneliner(lintCmd, d.path, base, 'git-diff');
+      if (scopedOneliner) {
+        const kind = detectLinterKind(lintCmd);
+        const fileDesc = kind === 'eslint' ? 'JS/TS' : '.py';
+        return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && ${scopedOneliner}\` — report any errors (scoped to changed ${fileDesc} files)`;
       }
       return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && ${installPrefix}${lintCmd}\` — report any errors`;
     });

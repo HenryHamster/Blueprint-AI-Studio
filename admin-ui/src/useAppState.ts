@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import type { Task } from './types/task';
-import type { Project, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, AutoReviewConfig } from './types/project';
+import type { Project, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, IssueImplementationConfigUpdate, AutoReviewConfig } from './types/project';
 import type { Alert } from './types/alert';
 import { API_BASE_URL, apiFetch, authHeaders, authGet } from './api';
 import { useToasts } from './components/Toasts';
@@ -1013,15 +1013,17 @@ export function useAppState() {
       .catch(() => {});
   }, [selectedProjectId]);
 
-  const handleUpdateIssueImplementationConfig = async (config: IssueImplementationConfig) => {
+  const handleUpdateIssueImplementationConfig = async (update: IssueImplementationConfigUpdate) => {
     if (!selectedProjectId) return;
     const prev = issueImplementationConfig;
-    setIssueImplementationConfig(config);
+    // Optimistic update: preserve server-derived base_branch from prev/default.
+    if (prev) setIssueImplementationConfig({ ...prev, ...update });
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/issue-implementation`, {
         method: 'PATCH',
         headers: await authHeaders(),
-        body: JSON.stringify(config),
+        // base_branch is server-derived from project.integration_branch and rejected by the PATCH validator.
+        body: JSON.stringify(update),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();

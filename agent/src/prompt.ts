@@ -976,6 +976,49 @@ export function detectLinterKind(lintCmd: string): 'ruff' | 'eslint' | 'mypy' | 
   return null;
 }
 
+/**
+ * Builds the scoped lint bash one-liner for a recognized linter.
+ *
+ * source='check-tmpfile': returns the xargs invocation that reads null-delimited
+ *   paths from /tmp/check_<slug>_lint.txt (populated upstream by grep over
+ *   $CHANGED). Used inside the ./check generator (buildLintInner).
+ *
+ * source='git-diff': returns a git diff pipeline that filters changed files in
+ *   dirPath and strips the directory prefix before passing to the linter.
+ *   Used inside review prompt instruction strings (buildTypeCheckInstructions).
+ *
+ * Canonical behaviors shared across both call sites:
+ * - Strips trailing '.' / './' token (replaced by the scoped file list)
+ * - Recognizes python3 -m / npx / pnpm exec prefixes
+ * - Hardcodes ruff to --select E,F,W --ignore E501 with python3 -m
+ * - Returns null for unrecognized linters — callers must fall back to verbatim
+ */
+export function buildScopedLintOneliner(
+  lintCmd: string,
+  dirPath: string,
+  baseBranch: string,
+  source: 'check-tmpfile' | 'git-diff',
+): string | null {
+  const kind = detectLinterKind(lintCmd);
+  if (!kind) return null;
+
+  const toks = lintCmd.trim().split(/\s+/);
+  while (toks.length > 1 && (toks[toks.length - 1] === '.' || toks[toks.length - 1] === './')) toks.pop();
+  const execCmd = kind === 'ruff'
+    ? 'python3 -m ruff check --select E,F,W --ignore E501'
+    : toks.join(' ');
+
+  const dir = dirPath.replace(/\/$/, '');
+  const isPy = kind !== 'eslint';
+  const extPat = isPy ? '\\.py' : '\\.(ts|tsx|js|jsx|cjs|mjs)';
+
+  if (source === 'check-tmpfile') {
+    const slug = dir.replace(/\//g, '_');
+    return `xargs -0 -a /tmp/check_${slug}_lint.txt ${execCmd} 2>&1`;
+  }
+  return `git diff origin/${baseBranch}...HEAD --name-only | grep -E '${extPat}$' | sed 's|${dir}/||' | xargs -r ${execCmd}`;
+}
+
 // Returns the inner bash block for a directory's lint step. Recognized linters
 // are scoped to changed files (FULL_SCOPE=1 runs verbatim for the full tree).
 // Unrecognized commands keep the current verbatim behavior.
@@ -987,14 +1030,9 @@ function buildLintInner(dirPrefix: string, lintCmd: string): string {
   const isPy = kind !== 'eslint';
   const extPat = isPy ? `\\.py` : `\\.(ts|tsx|js|jsx|cjs|mjs)`;
   const extDesc = isPy ? 'Python' : 'JS/TS';
-  // Strip trailing '.' or './' token — replaced by xargs file list.
-  const toks = lintCmd.trim().split(/\s+/);
-  while (toks.length > 1 && (toks[toks.length - 1] === '.' || toks[toks.length - 1] === './')) toks.pop();
-  // Ruff: always use the narrow agent ruleset (E,F,W --ignore E501) so that
-  // strict pyproject.toml rules don't surface pre-existing baseline violations.
-  const scopedExec = kind === 'ruff'
-    ? `xargs -0 -a ${tmpFile} python3 -m ruff check --select E,F,W --ignore E501 2>&1`
-    : `xargs -0 -a ${tmpFile} ${toks.join(' ')} 2>&1`;
+  // kind !== null is already confirmed above; buildScopedLintOneliner returns null
+  // only for unrecognized linters, so the fallback here is unreachable.
+  const scopedExec = buildScopedLintOneliner(lintCmd, dirPrefix, '', 'check-tmpfile') ?? '';
   return `  if [ "$FULL_SCOPE" = "1" ]; then
     run "${dirPrefix} lint" bash -c 'cd "${dirPrefix}" && ${lintCmd}'
   else

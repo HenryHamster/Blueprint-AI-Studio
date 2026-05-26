@@ -687,15 +687,13 @@ async def test_get_issue_implementation_defaults_for_custom_branch_project(
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
-async def test_get_issue_implementation_stored_value_overrides_computed_default(
+async def test_patch_issue_implementation_rejects_base_branch(
     client: AsyncClient, db_session, project_owner
 ):
-    """Stored base_branch takes precedence over the computed default."""
+    """base_branch is not an allowed PATCH field — must be rejected with 422."""
     project = project_owner
-    await client.patch(
+    resp = await client.patch(
         f"/api/admin/projects/{project.id}/issue-implementation",
         json={"base_branch": "release"},
     )
-    resp = await client.get(f"/api/admin/projects/{project.id}/issue-implementation")
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["config"]["base_branch"] == "release"
+    assert resp.status_code == 422, resp.text

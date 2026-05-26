@@ -203,8 +203,7 @@ async def _handle_issue_implementation_inner(
             {
                 "type": "create",
                 "effort": config.get("default_effort", "high"),
-                "base_branch": config.get("base_branch")
-                or _get_project_integration_branch(project_obj),
+                "base_branch": _get_project_integration_branch(project_obj),
                 "title": f"feat: {issue_title[:60]}",
                 "prompt": prompt,
             }

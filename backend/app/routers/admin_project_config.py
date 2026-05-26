@@ -282,7 +282,6 @@ _ISSUE_IMPLEMENTATION_DEFAULTS: Dict[str, Any] = {
     "trigger_label": "auto:implement",
     "max_per_hour": 3,
     "max_concurrent": 3,
-    "base_branch": "main",
     "default_effort": "high",
 }
 
@@ -304,7 +303,11 @@ async def get_issue_implementation_config(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
-    stored = (project.design_doc or {}).get("_issue_implementation", {})
+    stored = {
+        k: v
+        for k, v in (project.design_doc or {}).get("_issue_implementation", {}).items()
+        if k != "base_branch"
+    }
     config = {**_build_issue_implementation_defaults(project), **stored}
     return {"project_id": str(project_id), "config": config}
 
@@ -355,13 +358,6 @@ async def update_issue_implementation_config(
                 detail="'max_concurrent' must be an integer between 1 and 5",
             )
 
-    if "base_branch" in body:
-        v = body["base_branch"]
-        if not isinstance(v, str) or not v.strip():
-            raise HTTPException(
-                status_code=422, detail="'base_branch' must be a non-empty string"
-            )
-
     if "default_effort" in body:
         v = body["default_effort"]
         if not isinstance(v, str) or v not in ("low", "medium", "high"):
@@ -373,7 +369,11 @@ async def update_issue_implementation_config(
     # Lock project row before read-modify-write to prevent lost updates.
     project = await lock_project_or_429(session, project_id)
     design_doc = dict(project.design_doc or {})
-    stored = dict(design_doc.get("_issue_implementation", {}))
+    stored = {
+        k: v
+        for k, v in design_doc.get("_issue_implementation", {}).items()
+        if k != "base_branch"
+    }
     stored.update(body)
     design_doc["_issue_implementation"] = stored
     project.design_doc = design_doc

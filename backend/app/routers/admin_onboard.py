@@ -278,7 +278,6 @@ async def onboard_project(
         "trigger_label": "auto:implement",
         "max_per_hour": 3,
         "max_concurrent": 3,
-        "base_branch": default_branch or "main",
         "default_effort": "high",
     }
     design_doc["_auto_review"] = {

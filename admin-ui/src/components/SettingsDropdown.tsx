@@ -10,7 +10,7 @@ import { ProjectIssueImplementationSection } from './ProjectIssueImplementationS
 import { ProjectAutoReviewSection } from './ProjectAutoReviewSection';
 import { ProjectIntegrationBranchSection } from './ProjectIntegrationBranchSection';
 import { ProjectPromotionTargetSection } from './ProjectPromotionTargetSection';
-import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, AutoReviewConfig } from '../types/project';
+import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, IssueImplementationConfigUpdate, AutoReviewConfig } from '../types/project';
 import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks, Server, User, FileDown, LogOut, Users, Bell, Wrench, Tag, HelpCircle, Plus, ChevronDown, ChevronUp, RefreshCw } from 'lucide-react';
 import { timeAgo, parseTimestamp } from '../utils/time';
 import { USER_LAUNCHABLE_TASK_TYPE_OPTIONS } from '../taskCapabilities';
@@ -161,7 +161,7 @@ interface SettingsDropdownProps {
   onUpdateAutoRemediationConfig: (config: AutoRemediationConfig) => Promise<void>;
   // Issue implementation config (project-scoped)
   issueImplementationConfig: IssueImplementationConfig | null;
-  onUpdateIssueImplementationConfig: (config: IssueImplementationConfig) => Promise<void>;
+  onUpdateIssueImplementationConfig: (config: IssueImplementationConfigUpdate) => Promise<void>;
   // Auto-review config (project-scoped)
   selectedProjectRole?: 'owner' | 'member' | 'viewer' | null;
   autoReviewConfig: AutoReviewConfig | null;

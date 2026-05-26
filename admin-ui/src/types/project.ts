@@ -89,9 +89,13 @@ export interface IssueImplementationConfig {
   trigger_label: string;
   max_per_hour: number;
   max_concurrent: number;
-  base_branch: string;
+  /** Live-derived from project.integration_branch. Returned by GET; rejected by PATCH. */
+  readonly base_branch: string;
   default_effort: 'low' | 'medium' | 'high';
 }
+
+/** Fields admin-ui may PATCH on issue-implementation config — base_branch excluded (server-derived). */
+export type IssueImplementationConfigUpdate = Omit<IssueImplementationConfig, 'base_branch'>;
 
 export interface AutoReviewConfig {
   enabled: boolean;

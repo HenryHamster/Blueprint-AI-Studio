@@ -356,7 +356,7 @@ async def test_extract_issue_context_caps_body():
 
 @pytest.mark.asyncio
 async def test_base_branch_resolves_from_project(db_session: AsyncSession):
-    """When config has no base_branch, the task payload uses the project's integration_branch."""
+    """base_branch always derives from project.integration_branch, even if config has a stale value."""
     project = await _create_project(db_session, integration_branch="develop")
 
     fake_issue = {
@@ -388,14 +388,19 @@ async def test_base_branch_resolves_from_project(db_session: AsyncSession):
         mock_comments.return_value = []
         mock_msg.return_value = None
 
-        # Config omits base_branch — should fall back to project.integration_branch
+        # Even when config has a stale base_branch snapshot, project.integration_branch wins
         await _handle_issue_implementation_inner(
             owner="acme",
             repo="webapp",
             issue_number=77,
             issue_title="Test branch resolution",
             project_id=project.id,
-            config={"max_per_hour": 3, "max_concurrent": 3, "default_effort": "high"},
+            config={
+                "max_per_hour": 3,
+                "max_concurrent": 3,
+                "default_effort": "high",
+                "base_branch": "stale-main",
+            },
             session=db_session,
         )
 

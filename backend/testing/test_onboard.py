@@ -211,3 +211,42 @@ class TestOnboardAutoRemediation:
         project = await db_session.get(Project, data["project_id"])
         assert project.integration_branch == "main"
         assert project.promotion_target == "main"
+
+
+class TestOnboardIssueImplementation:
+    @pytest.mark.asyncio
+    async def test_onboard_does_not_seed_base_branch_in_issue_implementation(
+        self, client: AsyncClient, db_session
+    ):
+        """Onboarding must not store base_branch in _issue_implementation — it's always live-derived."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="trunk",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={
+                    "github_owner": "acme",
+                    "github_repo": "myrepo6",
+                },
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        project = await db_session.get(Project, data["project_id"])
+        ii = (project.design_doc or {}).get("_issue_implementation")
+        assert ii is not None
+        assert "base_branch" not in ii
