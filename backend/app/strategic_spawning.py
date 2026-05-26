@@ -1895,6 +1895,46 @@ async def _spawn_strategic_review(
             _efficiency_snapshot = _summarize_efficiency_snapshot(_raw_snapshot)
     except Exception:
         logger.exception("[STRATEGIC] efficiency snapshot fetch failed; continuing")
+    # Post-promotion handoff — when a fresh version has just opened from a
+    # successful promotion, its `goal` field was snapshotted verbatim from
+    # `problem_model.intent.current_focus` at the moment the prior version
+    # promoted, so it typically describes the prior version's milestone rather
+    # than the new version's mission. Without an explicit prompt the agent
+    # tends to read the carried narrative as current status (e.g. quoting the
+    # prior version's qualification score as if it were this version's). This
+    # hint fires only on the first cycles after promotion (never qualified +
+    # not the bootstrap version) so the agent refreshes the free-form text
+    # fields once; it self-clears as soon as the first verdict lands.
+    if (
+        _open_version is not None
+        and _open_version.version_number > 1
+        and _open_version.last_qualification is None
+        and (_open_version.qualification_attempts or 0) == 0
+    ):
+        _prior_n = _open_version.version_number - 1
+        _post_promote_hint = (
+            f"Version handoff: v{_open_version.version_number} just opened from "
+            f"the promotion of v{_prior_n} and has never been qualified. The "
+            f"`goal` field and other free-form text in `problem_model` carry "
+            f"forward from v{_prior_n}'s final state — they may still describe "
+            f"that milestone or cite its scores, SHAs, and candidates as if "
+            f"current. As your first action this cycle, refresh the problem "
+            f"model for v{_open_version.version_number}: rewrite "
+            f"`intent.current_focus` to state what v{_open_version.version_number} "
+            f"is for (not what v{_prior_n} achieved); review active directions — "
+            f"retire those v{_prior_n} already satisfied, update wording that "
+            f"references superseded work, propose new directions the next "
+            f"milestone needs. The `goal` field itself is an immutable "
+            f"version-open snapshot by design; `version_phase.last_qualification` "
+            f"is the source of truth for current qualification state (null = "
+            f"unqualified). Free-form text is valuable — it just needs to stay "
+            f"current."
+        )
+        prompt_suffix = (
+            f"{prompt_suffix}\n{_post_promote_hint}"
+            if prompt_suffix
+            else _post_promote_hint
+        )
     # Stabilize phase directive — when the open version is in stabilize, bias the
     # strategic agent's work-mix toward audit/cleanup/hardening so the version
     # converges toward qualification rather than accumulating net-new feature work.
