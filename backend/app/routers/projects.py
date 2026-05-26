@@ -485,6 +485,29 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
         if not task:
             await _safe_ws_close(websocket, code=1008)
             return
+
+        from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
+
+        if str(task.id) in _terminated_task_ids or task.status in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ):
+            await _safe_ws_close(
+                websocket, code=1008, reason="Task is no longer active"
+            )
+            return
+
+        token_project = payload.get("project_id")
+        if token_project and token_project != str(task.project_id):
+            await _safe_ws_close(websocket, code=1008, reason="Project mismatch")
+            return
+
+        token_vm = payload.get("vm_instance_id")
+        if token_vm and task.vm_instance_id and token_vm != task.vm_instance_id:
+            await _safe_ws_close(websocket, code=1008, reason="VM instance mismatch")
+            return
+
         project_id = str(task.project_id)
 
     if not await manager.check_and_add_ip(websocket):

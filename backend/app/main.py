@@ -14,8 +14,6 @@ from fastapi import (
     Depends,
     HTTPException,
     Request,
-    WebSocket,
-    WebSocketDisconnect,
 )
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -42,7 +40,7 @@ from app.models import (
     RegressionCaseStatus,
 )
 from app.compute import delete_agent_vm, provision_agent_vm  # noqa: F401  (provision_agent_vm re-exported for test patches; see main.py:108 docstring)
-from app.auth import get_current_user, verify_agent_jwt
+from app.auth import get_current_user
 from app.telemetry import setup_telemetry
 from app.admin import router as admin_router
 from app.routers.admin_projects import router as admin_projects_router
@@ -79,7 +77,7 @@ from app.shared_state import (
 from app import orchestrator as _orch
 from app.lifecycle import lifespan
 from app.time_utils import _utcnow
-from app.broadcast import manager, broadcast_to_project, _sanitize_log
+from app.broadcast import broadcast_to_project
 
 logger = logging.getLogger(__name__)
 
@@ -2141,92 +2139,6 @@ app.add_middleware(
 @app.get("/")
 def read_root():
     return {"status": "online", "service": "Blueprint Orchestrator"}
-
-
-# --- Agent APIs ---
-
-
-@app.websocket("/api/agent/ws/{task_id}")
-async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
-    """
-    WebSocket endpoint for agents to stream high-throughput logs and real-time events.
-    """
-    await websocket.accept()
-
-    # Require the client to send the token as the first message
-    try:
-        auth_message = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
-        token = auth_message.get("token")
-        if not token:
-            await websocket.close(code=1008, reason="Missing token")
-            return
-
-        payload = verify_agent_jwt(token)
-        if payload.get("sub") != str(task_id):
-            await websocket.close(code=1008, reason="Task ID mismatch")
-            return
-    except asyncio.TimeoutError:
-        await websocket.close(code=1008, reason="Authentication timeout")
-        return
-    except Exception:
-        await websocket.close(code=1008, reason="Authentication failed")
-        return
-
-    # Get project_id for this task
-    async with AsyncSessionLocal() as session:
-        stmt = select(Task).where(Task.id == task_id)
-        task = (await session.execute(stmt)).scalars().first()
-        if not task:
-            await websocket.close(code=1008)
-            return
-        project_id = str(task.project_id)
-
-    if not await manager.check_and_add_ip(websocket):
-        return
-
-    try:
-        import time
-
-        last_message_time = time.time()
-        message_count = 0
-        while True:
-            text_data = await websocket.receive_text()
-            if len(text_data) > 100000:  # 100KB limit for agent logs
-                await websocket.close(code=1009, reason="Message too big")
-                return
-
-            # Simple rate limiting: 20 messages per second
-            current_time = time.time()
-            if current_time - last_message_time < 1.0:
-                message_count += 1
-                if message_count > 20:
-                    await websocket.close(code=1008, reason="Rate limit exceeded")
-                    return
-            else:
-                last_message_time = current_time
-                message_count = 1
-
-            try:
-                data = json.loads(text_data)
-            except json.JSONDecodeError:
-                continue
-
-            if data.get("type") == "log":
-                await broadcast_to_project(
-                    project_id,
-                    "agent_log",
-                    {
-                        "task_id": str(task_id),
-                        "log": _sanitize_log(data.get("content", "")),
-                    },
-                )
-            elif data.get("type") == "status":
-                # Optionally handle status updates via WS too
-                pass
-    except WebSocketDisconnect:
-        pass
-    finally:
-        manager.remove_ip(websocket)
 
 
 from app.strategic_completion import (
