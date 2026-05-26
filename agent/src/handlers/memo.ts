@@ -111,6 +111,8 @@ Rules:
           continue;
         }
         const obj = res.value;
+        // Defense-in-depth: extractJsonObjectDetailed now validates own-property
+        // membership as the primary gate, so this path is rarely reached.
         const missing = requiredKeys.filter(k => !(k in obj));
         if (missing.length > 0) {
           sendLog(ws, `[WARNING] Memo JSON from ${src.label} missing required keys: ${missing.join(', ')}\n`);
