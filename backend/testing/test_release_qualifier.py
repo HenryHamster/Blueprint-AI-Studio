@@ -6910,7 +6910,7 @@ async def test_notify_operator_swallows_failure(db_session, mocker):
     release verdict is already decided by the time it runs."""
     _project, version = await _make_project_and_version(db_session)
     mocker.patch(
-        "app.release_qualifier.post_event_message",
+        "app.release_promotion.post_event_message",
         new=AsyncMock(side_effect=RuntimeError("messaging is down")),
     )
     # Must return normally despite post_event_message raising.
@@ -7928,7 +7928,7 @@ async def test_verdict_recording_failure_does_not_propagate(db_session, mocker):
 
     # Make the verdict-row construction blow up — recording must swallow it.
     mocker.patch(
-        "app.release_qualifier.QualificationVerdict",
+        "app.release_promotion.QualificationVerdict",
         side_effect=RuntimeError("boom — cannot build verdict row"),
     )
 
