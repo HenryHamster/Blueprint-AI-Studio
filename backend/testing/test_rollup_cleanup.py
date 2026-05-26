@@ -2550,3 +2550,118 @@ async def test_malformed_pr_url_artifact_force_merges_in_rollup(cleanup_db, mock
     assert (child.context or {}).get("pr_merged") is True, (
         "Malformed pr_url must force-set pr_merged=True so rollup progresses"
     )
+
+
+# ── ci_waiting seed gate for the spawn-review path ────────────────────────────
+# Covers rollup_management.py:2584 — the "large rollup, spawn review" branch.
+# .github/workflows/ci.yml triggers only on PRs into [main, automain]. A
+# large intermediate-target rollup (research/* or plan/*) used to seed
+# review_loop.ci_waiting=True, which the orchestrator then polled forever
+# until the 1h CI-wait backstop killed the parent (incident: task
+# 3d48cc53 / PR #6192, 2026-05-26). Intermediate rollups now skip the CI
+# wait and rely on review-approval-only merge; the integration-branch
+# path still gates on CI.
+
+
+@pytest.mark.asyncio
+async def test_large_intermediate_rollup_skips_ci_waiting(cleanup_db, mocker):
+    """A >100-line rollup into research/* must NOT seed ci_waiting=True.
+
+    ci.yml does not run on PRs into intermediate branches, so a CI wait
+    is unsatisfiable and times out at the 1h backstop. The review task's
+    APPROVE path merges directly (its is_ci_gated_merge check correctly
+    skips CI for non-integration targets) and the next rollup sweep
+    completes the parent.
+    """
+    _mock_high_risk_gate_deps(
+        mocker,
+        get_pull_request_responses=[
+            {"merged": False, "state": "open"},  # resume validation
+            {
+                "additions": 200,
+                "deletions": 0,
+                "merged": False,
+                "state": "open",
+            },  # diff size — large
+        ],
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(MagicMock(id="review-task-id"), None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    # _make_rollup_parent_with_pr uses parent_base="research/conflict-base"
+    # (intermediate target).
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_spawn.assert_awaited_once()
+    assert mock_spawn.await_args.args[1] == "review"
+    await cleanup_db.refresh(parent)
+    review_loop = (parent.context or {}).get("review_loop") or {}
+    assert review_loop.get("ci_waiting") is not True
+    assert "ci_wait_started" not in review_loop
+    assert review_loop.get("pr_number") == 4242
+    assert review_loop.get("base_branch") == "research/conflict-base"
+    assert (parent.context or {}).get("_is_rollup_review") is True
+
+
+@pytest.mark.asyncio
+async def test_large_main_rollup_keeps_ci_waiting(cleanup_db, mocker):
+    """A >100-line rollup into main must still seed ci_waiting=True.
+
+    Integration-branch rollups have CI workflows that actually trigger, so
+    the dual gate (ci_passed + review_approved) is needed to prevent a
+    review-only merge from bypassing CI.
+    """
+    _mock_high_risk_gate_deps(
+        mocker,
+        get_pull_request_responses=[
+            {"merged": False, "state": "open"},
+            {
+                "additions": 200,
+                "deletions": 0,
+                "merged": False,
+                "state": "open",
+            },
+        ],
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(MagicMock(id="review-task-id"), None),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_to_main(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_spawn.assert_awaited_once()
+    assert mock_spawn.await_args.args[1] == "review"
+    await cleanup_db.refresh(parent)
+    review_loop = (parent.context or {}).get("review_loop") or {}
+    assert review_loop.get("ci_waiting") is True
+    assert review_loop.get("ci_wait_started")
+    assert review_loop.get("base_branch") == "main"
