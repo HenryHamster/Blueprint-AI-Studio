@@ -3199,3 +3199,52 @@ async def test_pr_is_not_behind_no_shas_no_state_returns_none():
 
     result = await pr_is_not_behind("tok", "owner", "repo")
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_repo_default_branch_returns_branch_on_200(mocker):
+    """200 with default_branch in JSON returns the branch name."""
+    from app.github import get_repo_default_branch
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(200, {"default_branch": "trunk"}),
+    )
+
+    result = await get_repo_default_branch("tok", "acme", "repo")
+    assert result == "trunk"
+
+
+@pytest.mark.asyncio
+async def test_get_repo_default_branch_non200_raises_502(mocker):
+    """Non-200 GitHub API response raises HTTPException(502) instead of silently returning 'main'."""
+    from app.github import get_repo_default_branch
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(403, text="Forbidden"),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_repo_default_branch("tok", "acme", "repo")
+    assert exc_info.value.status_code == 502
+    assert "HTTP 403" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_get_repo_default_branch_missing_key_raises_502(mocker):
+    """200 response missing default_branch field raises HTTPException(502) instead of substituting 'main'."""
+    from app.github import get_repo_default_branch
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(200, {"name": "repo", "owner": {"login": "acme"}}),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_repo_default_branch("tok", "acme", "repo")
+    assert exc_info.value.status_code == 502
+    assert "default_branch" in exc_info.value.detail

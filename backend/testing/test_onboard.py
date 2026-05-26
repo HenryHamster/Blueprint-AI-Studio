@@ -297,6 +297,261 @@ class TestOnboardIssueImplementation:
         assert "base_branch" not in ii
 
 
+class TestOnboardDefaultBranchErrors:
+    @pytest.mark.asyncio
+    async def test_onboard_github_non200_raises_502(
+        self, client: AsyncClient, db_session
+    ):
+        """Non-200 GitHub response during default-branch detection surfaces as 502."""
+        from fastapi import HTTPException
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                side_effect=HTTPException(
+                    status_code=502,
+                    detail="GitHub API error detecting default branch (HTTP 403).",
+                ),
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "err-repo1"},
+            )
+
+        assert resp.status_code == 502
+        # No project should be created
+        from sqlalchemy import select
+        from app.models import Project as ProjectModel
+
+        result = await db_session.execute(
+            select(ProjectModel).where(
+                ProjectModel.github_owner == "acme",
+                ProjectModel.github_repo == "err-repo1",
+            )
+        )
+        assert result.scalars().first() is None
+
+    @pytest.mark.asyncio
+    async def test_onboard_github_missing_default_branch_key_raises_502(
+        self, client: AsyncClient, db_session
+    ):
+        """Missing default_branch key in GitHub 200 response surfaces as 502."""
+        from fastapi import HTTPException
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                side_effect=HTTPException(
+                    status_code=502,
+                    detail="GitHub API response missing default_branch field.",
+                ),
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "err-repo2"},
+            )
+
+        assert resp.status_code == 502
+        from sqlalchemy import select
+        from app.models import Project as ProjectModel
+
+        result = await db_session.execute(
+            select(ProjectModel).where(
+                ProjectModel.github_owner == "acme",
+                ProjectModel.github_repo == "err-repo2",
+            )
+        )
+        assert result.scalars().first() is None
+
+    @pytest.mark.asyncio
+    async def test_onboard_no_token_raises_422(self, client: AsyncClient, db_session):
+        """When no installation token is available, onboarding raises 422 rather than silently defaulting."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "err-repo3"},
+            )
+
+        assert resp.status_code == 422
+        from sqlalchemy import select
+        from app.models import Project as ProjectModel
+
+        result = await db_session.execute(
+            select(ProjectModel).where(
+                ProjectModel.github_owner == "acme",
+                ProjectModel.github_repo == "err-repo3",
+            )
+        )
+        assert result.scalars().first() is None
+
+
+class TestOnboardTaskBranchNamespace:
+    """Onboarding seeds task_branch_namespace in build_config."""
+
+    @pytest.mark.asyncio
+    async def test_typical_repo_gets_derived_namespace(
+        self, client: AsyncClient, db_session
+    ):
+        """A typical repo name is lowercased and non-alphanumeric chars replaced with '-'."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "my-cool-repo"},
+            )
+        assert resp.status_code == 200
+        project = await db_session.get(Project, resp.json()["project_id"])
+        assert (project.build_config or {}).get(
+            "task_branch_namespace"
+        ) == "my-cool-repo"
+
+    @pytest.mark.asyncio
+    async def test_uppercase_and_special_chars_are_normalized(
+        self, client: AsyncClient, db_session
+    ):
+        """Uppercase letters are lowercased; non-alphanumeric chars become '-'."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "MyAwesome_Repo.v2"},
+            )
+        assert resp.status_code == 200
+        project = await db_session.get(Project, resp.json()["project_id"])
+        ns = (project.build_config or {}).get("task_branch_namespace")
+        assert ns == "myawesome-repo-v2"
+
+    @pytest.mark.asyncio
+    async def test_self_repo_gets_blueprint_namespace(
+        self, client: AsyncClient, db_session
+    ):
+        """The Blueprint self-repo (BlueprintAIStudio) maps to 'blueprint' namespace."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={
+                    "github_owner": "HenryHamster",
+                    "github_repo": "BlueprintAIStudio",
+                },
+            )
+        assert resp.status_code == 200
+        project = await db_session.get(Project, resp.json()["project_id"])
+        assert (project.build_config or {}).get("task_branch_namespace") == "blueprint"
+
+    @pytest.mark.asyncio
+    async def test_build_config_override_wins(self, client: AsyncClient, db_session):
+        """Explicit task_branch_namespace in build_config_override overrides derived value."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={
+                    "github_owner": "acme",
+                    "github_repo": "some-repo",
+                    "build_config_override": {"task_branch_namespace": "custom-ns"},
+                },
+            )
+        assert resp.status_code == 200
+        project = await db_session.get(Project, resp.json()["project_id"])
+        assert (project.build_config or {}).get("task_branch_namespace") == "custom-ns"
+
+
 class TestBuildConfigDetection:
     @pytest.mark.asyncio
     async def test_detect_build_config_seeds_lint_cmd_for_root_python(self):
