@@ -780,10 +780,14 @@ function buildTypeCheckInstructions(buildConfig?: BuildConfig, baseBranch?: stri
       // lint_cmd only: scope recognized linters to changed files so pre-existing
       // baseline violations don't block clean PRs (mirrors runProjectLintChecks).
       const lintCmd = d.lint_cmd ?? '';
-      const isPy = lintCmd.replace(/^(python3?\s+-m\s+|npx\s+|pnpm\s+exec\s+)/, '').match(/^(ruff|mypy|flake8|pyright)\b/);
+      const lintBase = lintCmd.replace(/^(python3?\s+-m\s+|npx\s+|pnpm\s+exec\s+)/, '');
+      const isPy = lintBase.match(/^(ruff|mypy|flake8|pyright)\b/);
       const isJs = lintCmd.replace(/^(npx\s+|pnpm\s+exec\s+)/, '').match(/^eslint\b/);
       if (isPy) {
-        return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && git diff origin/${base}...HEAD --name-only | grep '\\.py$' | xargs -r python3 -m ruff check --select E,F,W --ignore E501\` — report any errors (scoped to changed .py files)`;
+        const scopedLint = lintBase.startsWith('ruff ')
+          ? 'python3 -m ruff check --select E,F,W --ignore E501'
+          : lintCmd;
+        return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && git diff origin/${base}...HEAD --name-only | grep '\\.py$' | sed 's|${d.path}/||' | xargs -r ${scopedLint}\` — report any errors (scoped to changed .py files)`;
       }
       if (isJs) {
         return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && git diff origin/${base}...HEAD --name-only | grep -E '\\.(ts|tsx|js|jsx)$' | sed 's|${d.path}/||' | xargs -r npx eslint\` — report any errors (scoped to changed JS/TS files)`;

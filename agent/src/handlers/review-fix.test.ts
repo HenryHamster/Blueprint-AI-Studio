@@ -586,6 +586,35 @@ describe('handleReview — medium-scope subsystem hint integration', () => {
     expect(prompt).not.toContain('grep \'.py$\'');
   });
 
+  it.each([
+    ['mypy', 'python3 -m mypy'],
+    ['flake8', 'flake8'],
+    ['pyright', 'pnpm exec pyright'],
+  ])('scopes %s build_config lint guidance to changed Python files with the configured binary', async (_label, lintCmd) => {
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce({
+      directories: [{ path: 'svc', type: 'python', lint_cmd: lintCmd }],
+    } as ReturnType<typeof resolveBuildConfig>);
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return 'M\tsvc/a.py';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      'task-review-py-lint-scope',
+      { pr_number: 52, branch: 'feature/lint-py', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('svc/a.py');
+    expect(prompt).toContain(`xargs -r ${lintCmd}`);
+    expect(prompt).not.toContain('python3 -m ruff check --select E,F,W --ignore E501');
+    expect(prompt).not.toContain('ruff check .');
+  });
+
   it('injects cross-system hint for multi-subsystem medium-scope PRs', async () => {
     vi.mocked(resolveBuildConfig).mockReturnValueOnce(BLUEPRINT_CONFIG as ReturnType<typeof resolveBuildConfig>);
     vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {

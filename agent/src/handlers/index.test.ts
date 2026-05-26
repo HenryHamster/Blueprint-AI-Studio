@@ -20,7 +20,6 @@ vi.mock('../index.js', async (importOriginal) => {
     setupWorkspace: vi.fn(),
     pushAndCreatePR: vi.fn(),
     runClaudeCode: vi.fn(),
-    lintFixLoop: vi.fn(),
     testFixLoop: vi.fn(),
     cloneWithRetry: vi.fn(),
     sendHeartbeatSync: vi.fn(),
