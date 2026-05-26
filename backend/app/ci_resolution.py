@@ -177,16 +177,12 @@ async def resolve_pr_ci_status(
     explicit_pr: list[dict] = []
     if pr_number is not None:
         explicit_pr = [
-            pr
-            for pr in prs
-            if isinstance(pr, dict) and pr.get("number") == pr_number
+            pr for pr in prs if isinstance(pr, dict) and pr.get("number") == pr_number
         ]
     if explicit_pr:
         use_prs = explicit_pr
     else:
-        merged_prs = [
-            pr for pr in prs if isinstance(pr, dict) and pr.get("merged_at")
-        ]
+        merged_prs = [pr for pr in prs if isinstance(pr, dict) and pr.get("merged_at")]
         use_prs = merged_prs or [pr for pr in prs if isinstance(pr, dict)]
 
     head_shas: list[str] = []
@@ -224,8 +220,7 @@ async def resolve_pr_ci_status(
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[CI_RESOLUTION] check-runs fetch failed for PR head "
-                "%s/%s@%s: %s",
+                "[CI_RESOLUTION] check-runs fetch failed for PR head %s/%s@%s: %s",
                 owner,
                 repo,
                 head_sha[:8],

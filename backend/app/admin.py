@@ -21,6 +21,7 @@ from app.shared_state import (
     get_project_promotion_target as _get_project_promotion_target_for_task,
     get_project_task_branch_namespace,
     limiter,
+    resolve_task_branch as _resolve_task_branch,
 )
 from app.models import (
     Task,
@@ -1761,7 +1762,6 @@ _FRESH_REVIEWER_COOLDOWN_SECS = 3600  # 1 hour
 # Branch derivation moved to app.shared_state.derive_task_branch so callers
 # outside admin (rollup_management, task_lifecycle) can share the same map
 # without circular imports.
-from app.shared_state import resolve_task_branch as _resolve_task_branch
 
 
 @router.post("/tasks/{task_id}/request-fresh-reviewer")

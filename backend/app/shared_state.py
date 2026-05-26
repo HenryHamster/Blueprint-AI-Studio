@@ -187,9 +187,7 @@ runtime_config: Dict = {
     # ``get_check_runs_cached(treat_missing_as_success=True)`` lenient path; kept
     # as the operator-side rollback handle if the strict mode causes false
     # negatives in prod.
-    "ci_resolution_strict_mode": os.getenv(
-        "CI_RESOLUTION_STRICT_MODE", "true"
-    ).lower()
+    "ci_resolution_strict_mode": os.getenv("CI_RESOLUTION_STRICT_MODE", "true").lower()
     not in ("0", "false", "no"),
     # Hard cap on ``ci_wait_started`` clock resets when GitHub responds with
     # "checks in progress" / "status check pending" to a merge attempt.  Each

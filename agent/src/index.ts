@@ -3139,13 +3139,13 @@ export function __setRunClaudeCodeOverrideForSmoke(fn: RunClaudeCodeOverride | n
 export function codexStreamHasTurnCompleted(transcript: string): boolean {
   for (const line of transcript.split('\n')) {
     if (!line.startsWith('{')) continue;
-    let obj: Record<string, unknown> | null = null;
+    let obj: Record<string, unknown>;
     try {
       obj = JSON.parse(line) as Record<string, unknown>;
     } catch {
       continue;
     }
-    if (obj && typeof obj.type === 'string' && obj.type === 'turn.completed') {
+    if (typeof obj.type === 'string' && obj.type === 'turn.completed') {
       return true;
     }
   }

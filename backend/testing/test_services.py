@@ -2131,17 +2131,14 @@ def test_ci_backstop_reason_existing_branches_unaffected():
     )
 
     # Review approved, CI never completed.
-    assert (
-        "review approved but CI never completed"
-        in _ci_backstop_timeout_reason(
-            ci_ws_val="2026-01-01T00:00:00",
-            ci_ws_valid=True,
-            ci_passed=False,
-            review_approved=True,
-            was_escalated=True,
-            review_summary=None,
-            review_loop={},
-        )
+    assert "review approved but CI never completed" in _ci_backstop_timeout_reason(
+        ci_ws_val="2026-01-01T00:00:00",
+        ci_ws_valid=True,
+        ci_passed=False,
+        review_approved=True,
+        was_escalated=True,
+        review_summary=None,
+        review_loop={},
     )
 
     # Neither gate, escalated.

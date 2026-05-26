@@ -297,9 +297,7 @@ async def test_respawn_uses_task_type_branch_prefix(rollup_db, mocker):
 
 
 @pytest.mark.asyncio
-async def test_respawn_prefers_review_loop_branch_over_synthesized(
-    rollup_db, mocker
-):
+async def test_respawn_prefers_review_loop_branch_over_synthesized(rollup_db, mocker):
     """The respawn now goes through ``resolve_task_branch``, which prefers
     ``context.review_loop.branch`` over ``context.branch`` and the synthesized
     fallback. Regression for the 2026-05-26 fix-task respawn bug where the

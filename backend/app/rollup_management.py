@@ -40,8 +40,6 @@ from app.shared_state import (
     runtime_config as _runtime_config,
     get_project_integration_branch as _get_project_integration_branch,
     get_project_pr_title_prefix as _get_project_pr_title_prefix,
-    get_project_task_branch_namespace as _get_project_task_branch_namespace,
-    derive_task_branch as _derive_task_branch,
 )
 from app.task_locking import with_directions_locked
 

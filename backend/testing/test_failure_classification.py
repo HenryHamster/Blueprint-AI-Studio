@@ -710,8 +710,7 @@ class TestClassifyFailureRateLimit:
         # the agent_category fast-path with `failure_category=parse_failed`
         # → CODE_ERROR → 3 retries → terminal FAIL on a transient issue.
         all_output = (
-            '{"type":"thread.started","thread_id":"t-abc"}\n'
-            '{"type":"turn.started"}\n'
+            '{"type":"thread.started","thread_id":"t-abc"}\n{"type":"turn.started"}\n'
         )
         msg = (
             "Memo handler could not extract a JSON object with all required "
@@ -755,10 +754,7 @@ class TestClassifyFailureRateLimit:
         """Control: exitCode != 0 is the cause-A path (Codex/Claude crash),
         which `claude_code_failed` + the existing override already cover.
         The new preempt requires exitCode=0 to stay narrowly targeted."""
-        all_output = (
-            '{"type":"thread.started"}\n'
-            '{"type":"turn.started"}\n'
-        )
+        all_output = '{"type":"thread.started"}\n{"type":"turn.started"}\n'
         msg = (
             "Memo handler could not extract a JSON object. exitCode=1, "
             f"allOutput={len(all_output)}b\n"
@@ -778,9 +774,7 @@ class TestClassifyFailureRateLimit:
         # Pad to >= 8KB to bypass the bound.
         padding = "x" * 9000
         all_output = (
-            '{"type":"thread.started"}\n'
-            '{"type":"turn.started"}\n'
-            f'{padding}\n'
+            f'{{"type":"thread.started"}}\n{{"type":"turn.started"}}\n{padding}\n'
         )
         msg = f"exitCode=0\n{all_output}"
         assert len(msg) >= 8192
