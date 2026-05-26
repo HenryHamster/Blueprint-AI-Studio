@@ -35,6 +35,24 @@ from app.spawn_calibration import (
 logger = logging.getLogger(__name__)
 
 
+# Goal framing for review-fix tasks: the cited issues are necessary
+# changes, but the goal is shipping the PR cleanly. Without this framing,
+# fix agents narrowly edit the cited line and silently drop adjacent
+# guarantees the function used to enforce, which the next reviewer
+# surfaces as a new MAJOR — a divergent review-fix loop.
+REVIEW_FIX_GOAL_PREAMBLE = (
+    "Your goal: make this PR mergeable. That means the cited issues below "
+    "are addressed AND every function you touch still enforces every "
+    "invariant it currently enforces. Before editing a function, read what "
+    "it does end-to-end (callers, error paths, related branches) so you know "
+    "what it guarantees; after editing, confirm each guarantee still holds. "
+    "A regression in adjacent behavior costs more iterations than the "
+    "original finding — if a narrow patch can't satisfy both the cited "
+    "issue and the existing guarantees, a wider, well-justified change is "
+    "the right call.\n\n"
+)
+
+
 def build_ci_failure_fix_prompt(
     *,
     pr_number: int,

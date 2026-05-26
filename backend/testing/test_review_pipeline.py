@@ -7193,3 +7193,29 @@ def test_ci_failure_fix_prompt_check_runs_hint_optional():
         pr_number=1, base_branch="main", ci_errors="boom"
     )
     assert "check-runs" not in without_owner
+
+
+# ---------------------------------------------------------------------------
+# REVIEW_FIX_GOAL_PREAMBLE — goal framing for review-fix tasks.
+#
+# Regression guard for PR #6061 (2026-05-26): the auto-review fix prompt used
+# to say only "A code review requested changes. Address the following issues:"
+# which framed the agent's job as "patch the cited line." Each fix narrowly
+# edited the cited spot and silently dropped invariants the function used to
+# enforce; the next reviewer surfaced the dropped invariant as a new MAJOR.
+# Seven cycles, no convergence — auto-closed at the iteration cap.
+# ---------------------------------------------------------------------------
+
+from app.review_pipeline import REVIEW_FIX_GOAL_PREAMBLE
+
+
+def test_review_fix_goal_preamble_frames_goal_as_mergeable_pr():
+    assert "make this PR mergeable" in REVIEW_FIX_GOAL_PREAMBLE
+    assert "invariant" in REVIEW_FIX_GOAL_PREAMBLE
+
+
+def test_review_fix_goal_preamble_warns_against_dropping_adjacent_guarantees():
+    # The preamble must explicitly tell the agent that adjacent regressions
+    # cost more iterations than the cited finding — otherwise narrow-patching
+    # remains the implicit default.
+    assert "regression in adjacent behavior" in REVIEW_FIX_GOAL_PREAMBLE

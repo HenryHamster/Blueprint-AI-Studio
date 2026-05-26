@@ -1654,7 +1654,7 @@ async def request_changes(
     branch = _resolve_task_branch(task)
     base_branch = task_payload.get("base_branch", "main")
 
-    from app.review_pipeline import _spawn_pipeline_task
+    from app.review_pipeline import REVIEW_FIX_GOAL_PREAMBLE, _spawn_pipeline_task
 
     if payload.action == "fix":
         spawned, _ = await _spawn_pipeline_task(
@@ -1664,7 +1664,7 @@ async def request_changes(
             pr_number,
             branch,
             base_branch,
-            fix_prompt=f"Human reviewer requested changes:\n\n{payload.feedback}",
+            fix_prompt=f"{REVIEW_FIX_GOAL_PREAMBLE}A human reviewer flagged this PR. Feedback:\n\n{payload.feedback}",
             original_task_id=str(task.id),
         )
     else:
