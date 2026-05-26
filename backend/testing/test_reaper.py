@@ -5175,3 +5175,63 @@ async def test_half_open_hard_halt_after_probe_limit(
     assert _reaper_halt_state["halted"] is True
     assert _reaper_halt_state.get("half_open_failures") == probe_limit
     assert is_reaper_halted() is True
+
+
+# ── reaper review-respawn uses per-project task_branch_namespace ───────────
+
+
+@pytest.mark.asyncio
+async def test_reap_with_open_pr_uses_project_namespace(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Reaper review-respawn derives branches under the project's task_branch_namespace.
+
+    A project with namespace='autoproj' must produce 'autoproj/*' branch names
+    instead of the Blueprint-hardcoded 'blueprint/*'.
+    """
+    mock_spawn = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, True),
+    )
+
+    project = Project(
+        name="AutoProj",
+        user_id="user1",
+        build_config={"task_branch_namespace": "autoproj"},
+    )
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-with-pr-ns",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"scope": "small"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    reaper_db.add(
+        Artifact(
+            task_id=t.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/autoproj/pull/99",
+        )
+    )
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.EVALUATING
+    mock_spawn.assert_called_once()
+    _spawned_branch = mock_spawn.call_args[0][4]
+    assert _spawned_branch.startswith("autoproj/"), (
+        f"expected autoproj/* branch, got {_spawned_branch!r}"
+    )

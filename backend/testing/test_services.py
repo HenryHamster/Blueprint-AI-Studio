@@ -317,6 +317,53 @@ async def test_orphan_recovery_skips_too_recent_tasks(svc_db, mocker):
     mock_get_token.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_orphan_recovery_uses_project_namespace(svc_db, mocker):
+    """review-respawn derives branches under the project's task_branch_namespace, not hardcoded 'blueprint'."""
+    project = Project(
+        name="AutoProj",
+        user_id="user1",
+        build_config={"task_branch_namespace": "autoproj"},
+    )
+    svc_db.add(project)
+    await svc_db.commit()
+    await svc_db.refresh(project)
+
+    await _make_completed_task(svc_db, project.id, task_type="create")
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh_token", "owner", "repo"),
+    )
+
+    pr_url = "https://github.com/owner/repo/pull/42"
+    mock_gh_resp = MagicMock()
+    mock_gh_resp.status_code = 200
+    mock_gh_resp.json.return_value = [{"html_url": pr_url, "number": 42}]
+    mocker.patch("app.github._github_request", AsyncMock(return_value=mock_gh_resp))
+
+    mock_review_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review"}],
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    mock_spawn = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(mock_review_task, True),
+    )
+
+    await _recover_orphaned_tasks()
+
+    mock_spawn.assert_called_once()
+    _spawned_branch = mock_spawn.call_args[0][4]
+    assert _spawned_branch.startswith("autoproj/"), (
+        f"expected autoproj/* branch, got {_spawned_branch!r}"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # _persist_circuit_breakers
 # ══════════════════════════════════════════════════════════════════════════════

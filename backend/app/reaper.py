@@ -1987,9 +1987,17 @@ async def reaper_service():
                                 # branch is recorded — without this, reaped fix tasks
                                 # spawn review tasks pointing at non-existent branches
                                 # and the review fails on `git clone --branch`.
+                                _proj = await session.get(Project, task.project_id)
+                                _namespace = (
+                                    _proj.task_branch_namespace
+                                    if _proj
+                                    else "blueprint"
+                                )
                                 _branch = (task.first_payload or {}).get(
                                     "branch"
-                                ) or _derive_task_branch(task.id, _task_type)
+                                ) or _derive_task_branch(
+                                    task.id, _task_type, _namespace
+                                )
                                 _base_branch = (task.first_payload or {}).get(
                                     "base_branch", "main"
                                 )

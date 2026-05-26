@@ -915,11 +915,14 @@ async def _spawn_ci_auto_remediation_followup(
         "infrastructure-related, a flaky check, or a deeper code defect "
         "that the original auto-fix prompt mis-scoped."
     )
+    _ci_project = (
+        await session.get(Project, task.project_id) if task.project_id else None
+    )
     inv_payload = validate_internal_payload(
         {
             "type": "investigate",
             "prompt": "\n".join(prompt_lines)[:20000],
-            "base_branch": _runtime_config.get("integration_branch", "main"),
+            "base_branch": _shared_state.get_project_integration_branch(_ci_project),
         },
         "task_lifecycle:ci_auto_remediation_followup",
     )
@@ -1080,8 +1083,8 @@ async def _close_loop_regression_case_on_merge(
                 )
                 _merge_sha = (_pr_data or {}).get("merge_commit_sha")
                 if _merge_sha:
-                    _integration_branch = _runtime_config.get(
-                        "integration_branch", "main"
+                    _integration_branch = _shared_state.get_project_integration_branch(
+                        _anc_project
                     )
                     _is_anc = await _is_ancestor_of(
                         _anc_token,
@@ -1525,7 +1528,12 @@ async def _process_post_commit(
                 and payload.artifact_type == ArtifactType.PULL_REQUEST
             ):
                 pr_number = int(payload.pr_url.rstrip("/").split("/")[-1])
-                branch = _derive_task_branch(task.id, task_type)
+                _project = await session.get(Project, task.project_id)
+                branch = _derive_task_branch(
+                    task.id,
+                    task_type,
+                    _project.task_branch_namespace if _project else "blueprint",
+                )
                 base_branch = task_payload.get("base_branch", "main")
                 original_prompt = task_payload.get("prompt", task.description or "")
                 is_intermediate = base_branch.startswith(
@@ -2675,8 +2683,8 @@ async def _process_post_commit(
                             if task.project_id
                             else None
                         )
-                        _integration_branch = _runtime_config.get(
-                            "integration_branch", "main"
+                        _integration_branch = (
+                            _shared_state.get_project_integration_branch(project)
                         )
                         _promotion_target = _shared_state.get_project_promotion_target(
                             project

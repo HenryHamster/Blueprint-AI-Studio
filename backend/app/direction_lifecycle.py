@@ -16,7 +16,11 @@ from sqlmodel import select
 from app.failure_classification import classify_failure, classify_failure_taxonomy
 from app.models import Project, Task, TaskStatus
 from app.payload_schemas import validate_internal_payload
-from app.shared_state import get_circuit_breaker, runtime_config as _runtime_config
+from app.shared_state import (
+    get_circuit_breaker,
+    get_project_integration_branch,
+    runtime_config as _runtime_config,
+)
 from app.strategic_completion import _is_code_failure_pause_reason
 from app.time_utils import _utcnow
 
@@ -440,7 +444,7 @@ async def _spawn_direction_diagnosis(
         {
             "type": "investigate",
             "prompt": prompt,
-            "base_branch": _runtime_config.get("integration_branch", "main"),
+            "base_branch": get_project_integration_branch(project),
         },
         "direction_lifecycle:auto_pause_diagnosis",
     )

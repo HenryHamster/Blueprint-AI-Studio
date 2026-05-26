@@ -383,10 +383,20 @@ class Project(SQLModel, table=True):
     def task_branch_prefix(self) -> str:
         """Namespace prefix for task branch names (e.g. 'blueprint/').
 
-        Reads from build_config.task_branch_prefix if set; otherwise returns
-        Blueprint's conventional default ('blueprint/').
+        By default this tracks ``task_branch_namespace`` so a project that
+        overrides only the namespace (e.g. ``'autoproj'``) gets the matching
+        prefix (``'autoproj/'``) automatically — keeping cleanup loops in
+        sync with the project's actual branch naming.
+
+        Precedence: an explicit ``build_config.task_branch_prefix`` wins
+        (legacy escape hatch so any project pinned to the older key keeps
+        working byte-for-byte); otherwise the prefix is derived as
+        ``f"{task_branch_namespace}/"``.
         """
-        return (self.build_config or {}).get("task_branch_prefix") or "blueprint/"
+        explicit = (self.build_config or {}).get("task_branch_prefix")
+        if explicit:
+            return str(explicit)
+        return f"{self.task_branch_namespace}/"
 
     @property
     def alembic_versions_path(self) -> str:

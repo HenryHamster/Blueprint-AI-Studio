@@ -1497,11 +1497,19 @@ async def _check_evaluating_timeouts():
                             task.last_heartbeat = None
                             try:
                                 from app.review_pipeline import _spawn_pipeline_task
+                                from app.models import Project
 
                                 task_type_str = (task.first_payload or {}).get(
                                     "type", ""
                                 ) or ""
-                                branch = _derive_task_branch(task.id, task_type_str)
+                                _proj = await session.get(Project, task.project_id)
+                                branch = _derive_task_branch(
+                                    task.id,
+                                    task_type_str,
+                                    _proj.task_branch_namespace
+                                    if _proj
+                                    else "blueprint",
+                                )
                                 base_branch = (task.first_payload or {}).get(
                                     "base_branch", "main"
                                 )
@@ -2402,6 +2410,7 @@ async def _recover_orphaned_tasks():
     """Detect COMPLETED tasks with no PR artifact and no review child. Look up PR on GitHub and spawn review."""
     from app.routers.agent import get_github_token_for_task
     from app.review_pipeline import _spawn_pipeline_task
+    from app.models import Project
 
     try:
         async with AsyncSessionLocal() as session:
@@ -2512,7 +2521,12 @@ async def _recover_orphaned_tasks():
                     )
                     continue
 
-                branch = _derive_task_branch(task.id, task_type)
+                _proj = await session.get(Project, task.project_id)
+                branch = _derive_task_branch(
+                    task.id,
+                    task_type,
+                    _proj.task_branch_namespace if _proj else "blueprint",
+                )
 
                 try:
                     from app.github import _github_request
@@ -2705,7 +2719,12 @@ async def _recover_orphaned_tasks():
                 pr_number = int(pr_url.rstrip("/").split("/")[-1])
                 base_branch = locked.first_payload.get("base_branch", "main")
                 short_id = str(locked.id).replace("-", "")[:8]
-                branch = _derive_task_branch(locked.id, task_type)
+                _proj = await session.get(Project, locked.project_id)
+                branch = _derive_task_branch(
+                    locked.id,
+                    task_type,
+                    _proj.task_branch_namespace if _proj else "blueprint",
+                )
                 original_prompt = locked.first_payload.get(
                     "prompt", locked.description or ""
                 )

@@ -757,6 +757,9 @@ async def create_direction_research_task(
     if not direction:
         raise HTTPException(status_code=404, detail="Direction not found")
 
+    from app.shared_state import (
+        get_project_integration_branch as _get_project_integration_branch,
+    )
     from app.shared_state import runtime_config as _runtime_config
 
     if not bypass_cooldown:
@@ -785,7 +788,7 @@ async def create_direction_research_task(
         {
             "type": "research",
             "directions": [direction],
-            "base_branch": _runtime_config.get("integration_branch", "main"),
+            "base_branch": _get_project_integration_branch(project),
             "is_self_repo": bool(project.is_self_repo),
             "enable_self_improvement": project.enable_self_improvement,
         },

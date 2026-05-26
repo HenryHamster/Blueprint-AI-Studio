@@ -7473,6 +7473,14 @@ async def test_smoketest_post_promotion_detection_uses_promotion_target_config(
     assert spawned[0].first_payload.get("type") == "plan"
 
 
+def test_smoketest_project_none_fallback_uses_main_integration_branch():
+    source = (
+        Path(__file__).resolve().parent.parent / "app" / "routers" / "agent_status.py"
+    ).read_text()
+    assert '_runtime_config.get("integration_branch", "main")' in source
+    assert '"automain"' not in source
+
+
 @pytest.mark.asyncio
 async def test_smoketest_passing_does_not_spawn_plan_task(
     client: AsyncClient, db_session, mocker

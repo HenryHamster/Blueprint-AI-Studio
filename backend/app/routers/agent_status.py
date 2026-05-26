@@ -1356,9 +1356,7 @@ async def update_agent_status(
                         _integration_branch = (
                             _get_project_integration_branch(_smoketest_project)
                             if _smoketest_project is not None
-                            else str(
-                                _runtime_config.get("integration_branch", "automain")
-                            )
+                            else str(_runtime_config.get("integration_branch", "main"))
                         )
                         is_post_promotion = base_branch == _promotion_target and (
                             _integration_branch != _promotion_target
@@ -2509,7 +2507,12 @@ async def update_agent_status(
                     )
 
                     _task_type = (task.first_payload or {}).get("type", "") or ""
-                    _branch = _derive_task_branch(task.id, _task_type)
+                    _proj = await session.get(Project, task.project_id)
+                    _branch = _derive_task_branch(
+                        task.id,
+                        _task_type,
+                        _proj.task_branch_namespace if _proj else "blueprint",
+                    )
                     _base_branch = (task.first_payload or {}).get("base_branch", "main")
                     _original_prompt = (task.first_payload or {}).get(
                         "prompt", task.description or ""

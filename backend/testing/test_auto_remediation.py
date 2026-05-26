@@ -479,7 +479,7 @@ async def test_integration_branch_triggers_auto_remediation(
 ):
     """CI failure on the configured integration branch triggers auto-remediation
     even when that branch is NOT in the stored branch_whitelist."""
-    await _create_project(db_session)
+    await _create_project(db_session, integration_branch="automain")
     await db_session.commit()
 
     payload_dict = _build_check_run_webhook_payload(
@@ -488,11 +488,8 @@ async def test_integration_branch_triggers_auto_remediation(
     payload_bytes = json.dumps(payload_dict).encode()
     signature = _sign_webhook_payload(payload_bytes)
 
-    patched_runtime = {"integration_branch": "automain"}
-
     with (
         patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET),
-        patch("app.routers.github._runtime_config", patched_runtime),
         patch("app.auto_remediation._handle_main_branch_ci_failure_inner", AsyncMock()),
     ):
         response = await client.post(
@@ -516,7 +513,7 @@ async def test_feature_branch_not_in_integration_branch_ignored(
 ):
     """CI failure on an unrelated feature branch (not in whitelist, not the
     integration branch) still returns ignored_auto_remediation_disabled."""
-    await _create_project(db_session)
+    await _create_project(db_session, integration_branch="automain")
     await db_session.commit()
 
     payload_dict = _build_check_run_webhook_payload(
@@ -525,11 +522,8 @@ async def test_feature_branch_not_in_integration_branch_ignored(
     payload_bytes = json.dumps(payload_dict).encode()
     signature = _sign_webhook_payload(payload_bytes)
 
-    patched_runtime = {"integration_branch": "automain"}
-
     with (
         patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET),
-        patch("app.routers.github._runtime_config", patched_runtime),
     ):
         response = await client.post(
             "/api/github/webhook",

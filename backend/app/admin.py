@@ -16,6 +16,7 @@ from sqlalchemy.orm import load_only
 from app.database import get_session
 from app.shared_state import (
     derive_task_branch as _derive_task_branch,
+    get_project_integration_branch,
     limiter,
 )
 from app.models import (
@@ -2606,11 +2607,9 @@ async def trigger_self_audit(
         project_id, current_user["user_id"], session, "member"
     )
 
-    from app.shared_state import runtime_config as _runtime_config
-
     payload_dict: dict = {
         "type": "self_audit",
-        "base_branch": _runtime_config.get("integration_branch", "main"),
+        "base_branch": get_project_integration_branch(project),
     }
     if body is not None:
         if body.focus_systems is not None:

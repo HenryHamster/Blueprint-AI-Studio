@@ -316,3 +316,18 @@ def test_task_branch_prefix_falls_back_when_build_config_is_none():
 def test_task_branch_prefix_falls_back_when_key_absent_in_build_config():
     project = _make_project(build_config={"other_key": "value"})
     assert project.task_branch_prefix == "blueprint/"
+
+
+def test_task_branch_prefix_derives_from_task_branch_namespace():
+    project = _make_project(build_config={"task_branch_namespace": "autoproj"})
+    assert project.task_branch_prefix == "autoproj/"
+
+
+def test_task_branch_prefix_explicit_override_wins_over_namespace_derivation():
+    project = _make_project(
+        build_config={
+            "task_branch_namespace": "autoproj",
+            "task_branch_prefix": "legacy/",
+        }
+    )
+    assert project.task_branch_prefix == "legacy/"

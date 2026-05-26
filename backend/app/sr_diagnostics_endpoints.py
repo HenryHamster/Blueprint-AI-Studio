@@ -32,7 +32,7 @@ from app.models import (
 )
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import get_project_integration_branch
 from app.digest_metrics import (
     _SR_CODE_CHANGE_TYPES,
     _author_sr_failed_categories,
@@ -888,7 +888,7 @@ async def spawn_sr_investigation(
     agent task, consistent with request_fresh_reviewer and other task-spawning
     admin endpoints.
     """
-    await _get_user_project_with_role(
+    project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
 
@@ -933,7 +933,7 @@ async def spawn_sr_investigation(
             {
                 "type": "investigate",
                 "prompt": prompt,
-                "base_branch": _runtime_config.get("integration_branch", "main"),
+                "base_branch": get_project_integration_branch(project),
                 "effort": "low",
             }
         ],

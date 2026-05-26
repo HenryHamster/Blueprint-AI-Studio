@@ -38,6 +38,7 @@ from app.models import (
     ESCALATION_REASON_ESCALATED_CROSS_LAYER,
     ESCALATION_REASON_ESCALATED_LAYER_CONCENTRATION,
     ESCALATION_REASON_ESCALATED_RECURRENCE,
+    Project,
     RegressionCaseStatus,
     RegressionRemediationCase,
     Task,
@@ -1405,6 +1406,7 @@ async def _spawn_auto_escalation_meta_investigate(
             prior_status_line = (
                 f"Prior remediation task: {prior.id} (status={prior.status}). "
             )
+    project = await session.get(Project, project_id)
     prompt_lines = [
         f"A remediation for regression class '{case.regression_class}' has been "
         f"ACTIVE for >24h without resolving the underlying signal. "
@@ -1424,7 +1426,7 @@ async def _spawn_auto_escalation_meta_investigate(
         {
             "type": "investigate",
             "prompt": prompt,
-            "base_branch": _runtime_config.get("integration_branch", "main"),
+            "base_branch": _get_project_integration_branch(project),
             "effort": "low",
         },
         "pipeline_regression_dispatcher:auto_escalation_meta_investigate",

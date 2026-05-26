@@ -2260,6 +2260,55 @@ class TestResearchCompletionDirectionsLocked:
         )
 
 
+class TestRuntimeConfigProjectBranchBypasses:
+    _ALLOWED_FILES = frozenset(
+        {"shared_state.py", "routers/admin_settings.py", "routers/agent_status.py"}
+    )
+    _KEYS = ("integration_branch", "promotion_target", "task_branch_namespace")
+
+    def test_no_new_direct_project_branch_runtime_config_reads(self):
+        import ast
+        import glob as globmod
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        violations: list[str] = []
+
+        for py_file in globmod.glob(
+            os.path.join(app_dir, "**", "*.py"), recursive=True
+        ):
+            rel = os.path.relpath(py_file, app_dir)
+            if rel in self._ALLOWED_FILES:
+                continue
+            with open(py_file) as fh:
+                source = fh.read()
+            try:
+                tree = ast.parse(source, filename=py_file)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if not (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "get"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "_runtime_config"
+                ):
+                    continue
+                if (
+                    node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value in self._KEYS
+                ):
+                    violations.append(f"  {rel}:{node.lineno}:{node.args[0].value}")
+
+        assert not violations, (
+            "Direct _runtime_config.get(...) project-branch reads found outside the allowlist:\n"
+            + "\n".join(violations)
+        )
+
+
 # ── Vision Lock Invariant ─────────────────────────────────────────────────────
 
 

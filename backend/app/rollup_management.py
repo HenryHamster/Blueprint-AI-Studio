@@ -39,6 +39,7 @@ from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/
 from app.shared_state import (
     runtime_config as _runtime_config,
     derive_task_branch as _derive_task_branch,
+    get_project_integration_branch as _get_project_integration_branch,
 )
 
 logger = logging.getLogger(__name__)
@@ -1132,6 +1133,10 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     continue
 
                 c_payload = c.first_payload
+                project = await session.get(Project, c.project_id)
+                project_namespace = (
+                    project.task_branch_namespace if project else "blueprint"
+                )
                 # Branch must respect the child's task type — agents use
                 # `blueprint/refactor-*` for refactor tasks, etc. Hardcoding
                 # `task-` here stalled review respawns on refactor children
@@ -1139,7 +1144,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # the review cap because the clone targeted blueprint/task-*
                 # while the agent had pushed blueprint/refactor-*).
                 branch = (c.context or {}).get("branch") or _derive_task_branch(
-                    c.id, c_payload.get("type")
+                    c.id, c_payload.get("type"), project_namespace
                 )
                 base_branch = c_payload.get("base_branch", "main")
                 original_prompt = c_payload.get("prompt", c.description or "")
@@ -1357,6 +1362,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
         if staging_branch and target_branch and staging_branch != target_branch:
             gh_token = owner = repo = None
+            project = await session.get(Project, parent.project_id)
             # Track the rollup PR number/url across the try block so the
             # exception handler can rescue a newly-created PR whose marker
             # commit failed (see orphan-PR rescue below).
@@ -1597,7 +1603,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             logger.info(
                                 f"[ROLLUP] PR #{existing_pr} already merged — marking COMPLETED"
                             )
-                            _integration_br = _runtime_config.get("integration_branch", "main")
+                            _integration_br = _get_project_integration_branch(project)
                             _landed = target_branch == _integration_br
                             parent.status = TaskStatus.COMPLETED
                             parent.context = {
@@ -2208,7 +2214,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         return
                     parent_ctx = parent.context or {}
                     if merge_result.get("merged"):
-                        _integration_br = _runtime_config.get("integration_branch", "main")
+                        _integration_br = _get_project_integration_branch(project)
                         _landed = target_branch == _integration_br
                         parent.status = TaskStatus.COMPLETED
                         parent.context = {
