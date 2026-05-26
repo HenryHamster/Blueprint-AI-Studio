@@ -38,8 +38,8 @@ from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/
 )
 from app.shared_state import (
     runtime_config as _runtime_config,
-    derive_task_branch as _derive_task_branch,
     get_project_integration_branch as _get_project_integration_branch,
+    derive_task_branch as _derive_task_branch,
 )
 
 logger = logging.getLogger(__name__)
@@ -1133,18 +1133,17 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                     continue
 
                 c_payload = c.first_payload
-                project = await session.get(Project, c.project_id)
-                project_namespace = (
-                    project.task_branch_namespace if project else "blueprint"
-                )
                 # Branch must respect the child's task type — agents use
                 # `blueprint/refactor-*` for refactor tasks, etc. Hardcoding
                 # `task-` here stalled review respawns on refactor children
                 # (incident 2026-05-25, PRs #5779/#5812/#5815/#5819 all hit
                 # the review cap because the clone targeted blueprint/task-*
                 # while the agent had pushed blueprint/refactor-*).
+                project = await session.get(Project, c.project_id)
                 branch = (c.context or {}).get("branch") or _derive_task_branch(
-                    c.id, c_payload.get("type"), project_namespace
+                    c.id,
+                    c_payload.get("type"),
+                    project.task_branch_namespace,
                 )
                 base_branch = c_payload.get("base_branch") or _get_project_integration_branch(project)
                 original_prompt = c_payload.get("prompt", c.description or "")
