@@ -673,11 +673,13 @@ export async function onboardProject(
   owner: string,
   repo: string,
   name?: string,
-  buildConfigOverride?: Record<string, unknown>
+  buildConfigOverride?: Record<string, unknown>,
+  promotionTarget?: string,
 ): Promise<{ project_id: string; build_config: Record<string, unknown> }> {
   const body: Record<string, unknown> = { github_owner: owner, github_repo: repo };
   if (name) body.name = name;
   if (buildConfigOverride) body.build_config_override = buildConfigOverride;
+  if (promotionTarget) body.promotion_target = promotionTarget;
   const res = await apiFetch('/api/admin/projects/onboard', { method: 'POST', body: JSON.stringify(body) });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
