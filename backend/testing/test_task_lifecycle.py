@@ -4487,3 +4487,202 @@ async def test_dedup_uses_project_promotion_target_not_main(tl_db):
         "second call must be deduped against the 'production' investigation, "
         "not slip through into a separate 'main' bucket"
     )
+
+
+# ---------------------------------------------------------------------------
+# Orphan-PR cleanup on cancellation
+# ---------------------------------------------------------------------------
+#
+# Regression for c56fa118 / PR #5983 (2026-05-26): a duplicate task was
+# cancelled (twin shipped the same finding via rollup) but its open PR
+# stayed orphaned and blocked the parent's rollup gate.
+#
+# An earlier rev wired this through the Task.status terminal-transition
+# event listener as a fire-and-forget; that broke ~20 requeue tests by
+# racing a second session on the test fixture's StaticPool SQLite engine.
+# The current design exposes `close_orphan_pr_if_any` as an explicit
+# helper called from each cancel site with the site's own session.
+
+
+class TestCloseOrphanPrIfAny:
+    """close_orphan_pr_if_any: best-effort GitHub PR close given a task and
+    a session. Cancel-site callers invoke it after setting CANCELLED to
+    keep the originating site's session in scope."""
+
+    @pytest.mark.asyncio
+    async def test_closes_open_pr(self, tl_db, mocker):
+        from app import task_lifecycle as tl
+
+        session, _ = tl_db
+        project = Project(name="p", user_id="u")
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "refactor"}],
+            status=TaskStatus.CANCELLED,
+            context={"_pr_url": "https://github.com/Owner/Repo/pull/5983"},
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new=AsyncMock(return_value=("tok", "Owner", "Repo")),
+        )
+        mocker.patch(
+            "app.github.get_pull_request",
+            new=AsyncMock(return_value={"state": "open", "merged": False}),
+        )
+        close_mock = AsyncMock(return_value=True)
+        mocker.patch("app.github.close_pull_request", new=close_mock)
+
+        closed = await tl.close_orphan_pr_if_any(task, session, reason="dedup")
+
+        assert closed is True
+        close_mock.assert_awaited_once()
+        # pr_number is the 4th positional arg (token, owner, repo, pr_number)
+        assert close_mock.await_args.args[3] == 5983
+
+    @pytest.mark.asyncio
+    async def test_noop_when_no_pr_url(self, tl_db, mocker):
+        from app import task_lifecycle as tl
+
+        session, _ = tl_db
+        project = Project(name="p", user_id="u")
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "research"}],
+            status=TaskStatus.CANCELLED,
+            context={},
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+
+        close_mock = AsyncMock()
+        mocker.patch("app.github.close_pull_request", new=close_mock)
+
+        closed = await tl.close_orphan_pr_if_any(task, session, reason="dedup")
+
+        assert closed is False
+        close_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_noop_when_pr_already_merged(self, tl_db, mocker):
+        """If the PR somehow merged after the task was cancelled (race),
+        don't try to re-close it."""
+        from app import task_lifecycle as tl
+
+        session, _ = tl_db
+        project = Project(name="p", user_id="u")
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "refactor"}],
+            status=TaskStatus.CANCELLED,
+            context={"_pr_url": "https://github.com/Owner/Repo/pull/42"},
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new=AsyncMock(return_value=("tok", "Owner", "Repo")),
+        )
+        mocker.patch(
+            "app.github.get_pull_request",
+            new=AsyncMock(return_value={"state": "closed", "merged": True}),
+        )
+        close_mock = AsyncMock()
+        mocker.patch("app.github.close_pull_request", new=close_mock)
+
+        closed = await tl.close_orphan_pr_if_any(task, session, reason="dedup")
+
+        assert closed is False
+        close_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_noop_when_pr_already_closed(self, tl_db, mocker):
+        from app import task_lifecycle as tl
+
+        session, _ = tl_db
+        project = Project(name="p", user_id="u")
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "refactor"}],
+            status=TaskStatus.CANCELLED,
+            context={"_pr_url": "https://github.com/Owner/Repo/pull/77"},
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new=AsyncMock(return_value=("tok", "Owner", "Repo")),
+        )
+        mocker.patch(
+            "app.github.get_pull_request",
+            new=AsyncMock(return_value={"state": "closed", "merged": False}),
+        )
+        close_mock = AsyncMock()
+        mocker.patch("app.github.close_pull_request", new=close_mock)
+
+        closed = await tl.close_orphan_pr_if_any(task, session, reason="dedup")
+
+        assert closed is False
+        close_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_swallows_github_errors(self, tl_db, mocker):
+        """GitHub 5xx / network errors during the close PATCH must be logged
+        and swallowed so the cancel itself completes."""
+        from app import task_lifecycle as tl
+
+        session, _ = tl_db
+        project = Project(name="p", user_id="u")
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "refactor"}],
+            status=TaskStatus.CANCELLED,
+            context={"_pr_url": "https://github.com/Owner/Repo/pull/99"},
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+
+        mocker.patch(
+            "app.routers.agent.get_github_token_for_task",
+            new=AsyncMock(return_value=("tok", "Owner", "Repo")),
+        )
+        mocker.patch(
+            "app.github.get_pull_request",
+            new=AsyncMock(return_value={"state": "open", "merged": False}),
+        )
+        mocker.patch(
+            "app.github.close_pull_request",
+            new=AsyncMock(side_effect=RuntimeError("github down")),
+        )
+
+        closed = await tl.close_orphan_pr_if_any(task, session, reason="dedup")
+        assert closed is False  # swallowed, not raised

@@ -537,6 +537,16 @@ async def filter_scope_empty(
         persist_failure_category(candidate, SCOPE_EMPTY)
         session.add(candidate)
         pre_empted.add(candidate.id)
+        # Same root cause as the dispatch dedup branches below — see
+        # c56fa118 / PR #5983 (2026-05-26). SCOPE_EMPTY here fires
+        # pre-dispatch so the candidate hasn't opened a PR yet in the
+        # common case, but call the helper anyway: it's idempotent if
+        # there's no _pr_url in context.
+        from app.task_lifecycle import close_orphan_pr_if_any
+
+        await close_orphan_pr_if_any(
+            candidate, session, reason="dispatch_scope_empty_preempt"
+        )
         try:
             await broadcast_fn(
                 str(candidate.project_id),
@@ -664,6 +674,15 @@ async def filter_pipeline_duplicates(
             )
             persist_failure_category(candidate, AGENT_TIMEOUT)
             session.add(candidate)
+            # If the dedup loser already opened a PR (race: candidate had run
+            # past the spawn-time dedup window before this filter caught it),
+            # close that PR so it doesn't hang the parent rollup gate.
+            # Regression for c56fa118 / PR #5983 (2026-05-26).
+            from app.task_lifecycle import close_orphan_pr_if_any
+
+            await close_orphan_pr_if_any(
+                candidate, session, reason="dispatch_dedup_running_sibling"
+            )
             try:
                 await broadcast_fn(
                     str(candidate.project_id),
@@ -706,6 +725,12 @@ async def filter_pipeline_duplicates(
                 )
                 persist_failure_category(candidate, AGENT_TIMEOUT)
                 session.add(candidate)
+                # See comment above re: c56fa118 / PR #5983.
+                from app.task_lifecycle import close_orphan_pr_if_any
+
+                await close_orphan_pr_if_any(
+                    candidate, session, reason="dispatch_dedup_queued_sibling"
+                )
                 try:
                     await broadcast_fn(
                         str(candidate.project_id),

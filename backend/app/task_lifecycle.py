@@ -14,6 +14,7 @@ import copy
 import json
 import logging
 import random as _random
+import re
 import uuid
 from typing import Dict
 
@@ -4535,3 +4536,89 @@ async def _process_post_commit(
             "status": "received",
             "message": f"Status update for task {payload.task_id} recorded.",
         }
+
+
+# ---------------------------------------------------------------------------
+# Orphan-PR cleanup on cancellation
+# ---------------------------------------------------------------------------
+#
+# When a task is cancelled, any PR it opened is left orphaned: the work is
+# no longer wanted, but the PR sits there blocking the rollup gate (parent
+# stays EVALUATING waiting on an open PR that nobody will merge). Most
+# common cause is duplicate-dedup — a task's twin shipped the same finding,
+# the twin merged via rollup, the duplicate was cancelled, but its PR
+# stayed open. See c56fa118 / PR #5983 incident on 2026-05-26.
+#
+# We expose `close_orphan_pr_if_any` as an explicit helper that cancel-site
+# callers invoke with their already-open session + the task being cancelled.
+# An earlier rev tried to wire this into the Task.status terminal-transition
+# event listener as a fire-and-forget; that opened a second session on the
+# StaticPool SQLite engine the test fixtures share, racing the test's own
+# session and breaking ~20 unrelated requeue tests. Explicit calls at known
+# cancel sites are noisier but safer.
+async def close_orphan_pr_if_any(
+    task: Task, session: AsyncSession, *, reason: str = "task_cancelled"
+) -> bool:
+    """Best-effort: close the open PR associated with `task` if any.
+
+    Returns True if a PR was closed, False otherwise. Skips merged PRs
+    (state=closed,merged=true) and already-closed PRs. Failures (no token,
+    GitHub 5xx, PR vanished) are logged but never raised — the caller's
+    cancel must always complete.
+
+    Caller should invoke this AFTER setting task.status to CANCELLED but
+    BEFORE the session.commit() that persists the cancel — the GitHub PATCH
+    is independent of the DB transaction either way, and grouping them
+    lets the caller bail cleanly if the GitHub call hangs.
+    """
+    ctx = task.context or {}
+    pr_url = ctx.get("_pr_url") or ctx.get("pr_url") or ""
+    if not pr_url:
+        return False
+    m = re.search(r"/pull/(\d+)", pr_url)
+    if not m:
+        return False
+    pr_number = int(m.group(1))
+
+    from app.github import close_pull_request, get_pull_request
+    from app.routers.agent import get_github_token_for_task
+
+    try:
+        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+    except Exception:
+        logger.exception(
+            f"[CANCEL-PR-CLEANUP] get_github_token_for_task failed for "
+            f"task {task.id} (reason={reason})"
+        )
+        return False
+    try:
+        pr = await get_pull_request(
+            gh_token, owner, repo, pr_number, project_id=str(task.project_id)
+        )
+    except Exception:
+        logger.warning(
+            f"[CANCEL-PR-CLEANUP] get_pull_request failed for task "
+            f"{task.id} PR #{pr_number} (reason={reason}) — likely already "
+            f"closed or GitHub transient; skipping"
+        )
+        return False
+    if pr.get("merged"):
+        return False
+    if pr.get("state") != "open":
+        return False
+    try:
+        ok = await close_pull_request(
+            gh_token, owner, repo, pr_number, project_id=str(task.project_id)
+        )
+    except Exception:
+        logger.exception(
+            f"[CANCEL-PR-CLEANUP] close_pull_request raised for task "
+            f"{task.id} PR #{pr_number} (reason={reason})"
+        )
+        return False
+    if ok:
+        logger.info(
+            f"[CANCEL-PR-CLEANUP] Closed orphan PR #{pr_number} for "
+            f"cancelled task {task.id} (reason={reason})"
+        )
+    return ok

@@ -359,7 +359,6 @@ describe('handleMemo', () => {
   });
 
 
-
   // ── Codex JSONL path regression tests ────────────────────────────────────
 
   it('succeeds when memo JSON in lastResultText exceeds 200 characters', async () => {

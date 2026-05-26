@@ -237,6 +237,11 @@ async def test_open_backmerge_pr_conflict_raises_alert_and_spawns_plan(
     tasks = await _tasks_for(db_session, project.id)
     assert len(tasks) == 1
     resolution = tasks[0]
+    assert resolution.title == "Resolve back-merge conflict: main -> automain"
+    assert (
+        resolution.description
+        == "The automated main -> automain back-merge PR #55 hit a merge conflict; resolve it on automain so the next promotion does not conflict."
+    )
     payload = resolution.first_payload
     # ``create`` (not ``plan``): single direct task so resolver guardrails
     # reach the executing agent verbatim, no planner-decomposer indirection.
@@ -260,11 +265,6 @@ async def test_open_backmerge_pr_conflict_raises_alert_and_spawns_plan(
     assert resolution.context["backmerge_conflict"] is True
     assert resolution.context["hotfix_task_id"] == str(hotfix_id)
     assert resolution.context["backmerge_pr_number"] == 55
-    assert resolution.title == "Resolve back-merge conflict: main -> automain"
-    assert (
-        resolution.description
-        == "The automated main -> automain back-merge PR #55 hit a merge conflict; resolve it on automain so the next promotion does not conflict."
-    )
 
     # A SPAWNED history row was written for the resolution task.
     history = (

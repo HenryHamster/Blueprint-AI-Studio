@@ -1141,6 +1141,13 @@ async def bulk_action_tasks(
                     task.vm_stopped_at = _utcnow()
                 task.requires_approval = False
 
+                # Close any PR the cancelled task opened. Without this, the
+                # PR sits open and blocks the parent's rollup gate. See
+                # c56fa118 / PR #5983 incident (2026-05-26).
+                from app.task_lifecycle import close_orphan_pr_if_any
+
+                await close_orphan_pr_if_any(task, session, reason="admin_bulk_cancel")
+
                 # Suppress low-priority tasks with finding_hash for 180 days
                 if task.context and task.context.get("finding_hash"):
                     task_priority = task.priority if task.priority is not None else 50
@@ -1207,6 +1214,16 @@ async def bulk_action_tasks(
                         child.vm_stopped_at = _utcnow()
                     child.requires_approval = False
                     session.add(child)
+                # Close orphan PRs on each cascaded child too. Done before
+                # commit so the GitHub call is grouped with the cancel.
+                from app.task_lifecycle import (
+                    close_orphan_pr_if_any,
+                )
+
+                for child in active_children:
+                    await close_orphan_pr_if_any(
+                        child, session, reason="admin_bulk_cancel_cascade"
+                    )
                 await session.commit()
                 for child in active_children:
                     if child.vm_instance_id:
@@ -2002,6 +2019,17 @@ async def modify_task(
             if new_status in (TaskStatus.CANCELLED, TaskStatus.FAILED):
                 task.requires_approval = False
 
+            # Operator-driven CANCELLED on the parent: close any open PR it
+            # opened so we don't hang the rollup gate. c56fa118 / PR #5983.
+            if new_status == TaskStatus.CANCELLED:
+                from app.task_lifecycle import (
+                    close_orphan_pr_if_any,
+                )
+
+                await close_orphan_pr_if_any(
+                    task, session, reason="admin_status_change"
+                )
+
             # Capture cleanup info for terminal transitions; the actual VM delete
             # + account release happens in the background after the response is
             # sent, so the request handler doesn't hold its DB session through
@@ -2071,7 +2099,16 @@ async def modify_task(
                         )
                     )
                     session.add(child)
+                # Close orphan PRs on cascaded children — c56fa118 / PR #5983.
                 if active_children:
+                    from app.task_lifecycle import (
+                        close_orphan_pr_if_any,
+                    )
+
+                    for child in active_children:
+                        await close_orphan_pr_if_any(
+                            child, session, reason="admin_status_change_cascade"
+                        )
                     logger.info(
                         f"[ADMIN] Cascaded CANCELLED to {len(active_children)} children of task {task.id}"
                     )
