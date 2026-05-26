@@ -1765,6 +1765,7 @@ async def test_post_commit_sweep_bump_failure_does_not_poison_batch(svc_db, mock
 
 # ══════════════════════════════════════════════════════════════════════════════
 # stale_branch_prefixes (project-driven branch cleanup)
+# stale_branch_prefixes (project-driven branch cleanup)
 # ══════════════════════════════════════════════════════════════════════════════
 
 
