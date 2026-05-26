@@ -1165,6 +1165,7 @@ class TestSynthesizeDeferredFindingMemo:
         assert len(result["summary"]) == 200
 
 
+
 class TestFindingsTypeFilter:
     """Regression: agent JSON occasionally contains non-dict entries (bare strings,
     nulls). Before the handler's normalization loop these must be filtered out, or
