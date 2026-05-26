@@ -2815,28 +2815,38 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             # NOTE: Do NOT delete staging_branch here — it contains
                             # all merged child work and requeueing should be possible.
                 else:
-                    # Rollup-to-main / large rollup: review and CI run in parallel.
-                    # ci_waiting=True only tells the orchestrator to poll CI; it is
-                    # NOT permission to merge. Both ci_passed and review_approved
-                    # must be set on this review_loop before the merge gate fires
-                    # (see app.ci_completion._review_approved + the rollup gate
-                    # handoff in app.task_lifecycle's verdict==APPROVE branch).
+                    # Large rollup → review path. Two flavours:
+                    #   • integration-branch target (automain/main): ci.yml runs
+                    #     on the PR, so we set ci_waiting=True. Both ci_passed
+                    #     and review_approved must land on review_loop before
+                    #     the merge gate fires (see app.ci_completion._review_approved
+                    #     + the rollup gate handoff in app.task_lifecycle's
+                    #     verdict==APPROVE branch).
+                    #   • intermediate target (research/*, plan/*): ci.yml does
+                    #     NOT trigger (its branches list is [main, automain]),
+                    #     so a CI wait is unsatisfiable and times out at the
+                    #     1h backstop. Skip ci_waiting; the review task's
+                    #     verdict==APPROVE branch falls through to the direct
+                    #     merge path, and the next rollup sweep marks this parent
+                    #     COMPLETED when it sees the PR merged.
                     # Do NOT pre-seed review_approved here — the spawned review task
                     # writes it back to this parent's review_loop on APPROVE.
+                    review_loop_seed = {
+                        "pr_number": rollup_pr_number,
+                        "branch": staging_branch,
+                        "base_branch": target_branch,
+                        "original_task_id": str(parent.id),
+                    }
+                    if not is_target_intermediate:
+                        review_loop_seed["ci_waiting"] = True
+                        review_loop_seed["ci_wait_started"] = _utcnow().isoformat()
                     parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR #{rollup_pr_number} awaiting review"
                     parent.context = {
                         **parent_ctx,
                         "rollup_pr_url": rollup_pr_url,
                         "rollup_pr_number": rollup_pr_number,
                         "_is_rollup_review": True,
-                        "review_loop": {
-                            "ci_waiting": True,
-                            "pr_number": rollup_pr_number,
-                            "branch": staging_branch,
-                            "base_branch": target_branch,
-                            "original_task_id": str(parent.id),
-                            "ci_wait_started": _utcnow().isoformat(),
-                        },
+                        "review_loop": review_loop_seed,
                     }
                     review_task, _ = await _spawn_pipeline_task(
                         parent,
