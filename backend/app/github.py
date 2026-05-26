@@ -1565,6 +1565,50 @@ async def is_ancestor_of(
     return compare_status in ("identical", "ahead")
 
 
+async def pr_is_not_behind(
+    token: str,
+    owner: str,
+    repo: str,
+    *,
+    head_sha: str | None = None,
+    base_tip_sha: str | None = None,
+    mergeable_state: str | None = None,
+    project_id: str | None = None,
+) -> bool | None:
+    """Return True iff a PR is NOT behind its base branch.
+
+    Two signals are checked in order (short-circuit on first conclusive result):
+
+    1. ``mergeable_state == "clean"`` — GitHub's authoritative signal.  A clean
+       PR is not behind regardless of SHA comparison.
+    2. Ancestry check — if ``base_tip_sha`` is already reachable from
+       ``head_sha`` the PR head already contains the base tip, so it is not
+       behind even when the two SHAs differ and GitHub has not yet recomputed
+       mergeable_state.
+
+    Returns ``True`` (not behind — safe to attempt merge without update-branch),
+    ``False`` (behind — base tip not yet in PR head), or ``None`` (indeterminate:
+    API error or insufficient information provided).
+    """
+    if (mergeable_state or "").lower() == "clean":
+        return True
+
+    if head_sha and base_tip_sha:
+        ancestor = await is_ancestor_of(
+            token, owner, repo, base_tip_sha, head_sha, project_id=project_id
+        )
+        if ancestor is True:
+            return True
+        if ancestor is False:
+            return False
+        # ancestor is None (API error) — fall through to mergeable_state signal
+
+    if (mergeable_state or "").lower() == "behind":
+        return False
+
+    return None
+
+
 async def get_files_changed_between_refs(
     token: str,
     owner: str,

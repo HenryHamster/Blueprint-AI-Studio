@@ -2917,3 +2917,135 @@ async def test_is_ancestor_of_returns_none_on_unparseable_response(mocker):
 
     result = await is_ancestor_of("tok", "owner", "repo", "abc123", "automain")
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# pr_is_not_behind — GitHub-clean / ancestor-of-base detector
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pr_is_not_behind_clean_mergeable_state_returns_true():
+    """mergeable_state='clean' is the authoritative GitHub signal — returns True
+    immediately without any API call, even when head and base SHAs differ."""
+    from app.github import pr_is_not_behind
+
+    result = await pr_is_not_behind(
+        "tok",
+        "owner",
+        "repo",
+        head_sha="head_sha_abc",
+        base_tip_sha="base_tip_xyz",
+        mergeable_state="clean",
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_pr_is_not_behind_clean_state_no_sha_still_returns_true():
+    """mergeable_state='clean' short-circuits even with no SHAs provided."""
+    from app.github import pr_is_not_behind
+
+    result = await pr_is_not_behind("tok", "owner", "repo", mergeable_state="clean")
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_pr_is_not_behind_ancestor_check_true_returns_true(mocker):
+    """base_tip_sha is already reachable from head_sha (status=ahead) → not behind."""
+    from app.github import pr_is_not_behind
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, {"status": "ahead"}),
+    )
+
+    result = await pr_is_not_behind(
+        "tok",
+        "owner",
+        "repo",
+        head_sha="head_abc",
+        base_tip_sha="base_xyz",
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_pr_is_not_behind_ancestor_check_false_returns_false(mocker):
+    """base_tip_sha is NOT reachable from head_sha (status=behind) → PR is behind."""
+    from app.github import pr_is_not_behind
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, {"status": "behind"}),
+    )
+
+    result = await pr_is_not_behind(
+        "tok",
+        "owner",
+        "repo",
+        head_sha="head_abc",
+        base_tip_sha="base_xyz",
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_pr_is_not_behind_api_error_falls_through_to_behind_state(mocker):
+    """When is_ancestor_of returns None (API error) and mergeable_state='behind',
+    falls through to mergeable_state signal and returns False."""
+    from app.github import pr_is_not_behind
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(500, {}),
+    )
+
+    result = await pr_is_not_behind(
+        "tok",
+        "owner",
+        "repo",
+        head_sha="head_abc",
+        base_tip_sha="base_xyz",
+        mergeable_state="behind",
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_pr_is_not_behind_api_error_no_fallback_returns_none(mocker):
+    """When is_ancestor_of returns None (API error) and no other signal is available,
+    returns None (indeterminate) — does not default to False."""
+    from app.github import pr_is_not_behind
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(500, {}),
+    )
+
+    result = await pr_is_not_behind(
+        "tok",
+        "owner",
+        "repo",
+        head_sha="head_abc",
+        base_tip_sha="base_xyz",
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_pr_is_not_behind_no_shas_behind_state_returns_false():
+    """No SHAs provided, mergeable_state='behind' → returns False."""
+    from app.github import pr_is_not_behind
+
+    result = await pr_is_not_behind("tok", "owner", "repo", mergeable_state="behind")
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_pr_is_not_behind_no_shas_no_state_returns_none():
+    """No SHAs, no mergeable_state → indeterminate (None)."""
+    from app.github import pr_is_not_behind
+
+    result = await pr_is_not_behind("tok", "owner", "repo")
+    assert result is None

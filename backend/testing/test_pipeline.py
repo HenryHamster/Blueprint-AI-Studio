@@ -2761,6 +2761,75 @@ async def test_rollup_behind_update_branch_success_clears_retry_counter(
     assert "updated branch" in (parent.latest_status_message or "").lower()
 
 
+@pytest.mark.asyncio
+async def test_rollup_clean_pr_skips_update_branch_despite_sha_mismatch(
+    rollup_db, mocker
+):
+    """Regression: a rollup PR that GitHub reports as mergeable_state=clean must
+    NOT enter the update-branch recovery path even when head SHA differs from the
+    target-branch tip SHA.  Before the fix, any SHA mismatch unconditionally called
+    update_branch_with_sha_retry; rollup PRs whose heads already contain the base
+    tip (ahead-of-base, not behind) would be spuriously rebased on every sweep."""
+    _patch_common_rollup_mocks(mocker)
+    # Override get_branch_sha so head_sha ("abc123") != target_tip ("deadbeef").
+    # Without the fix this would trigger update_branch; with the fix, the
+    # mergeable_state=clean guard must short-circuit before that call.
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="deadbeef"
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "additions": 5,
+            "deletions": 5,
+            "state": "open",
+            "merged": False,
+            "mergeable_state": "clean",
+            "head": {"sha": "abc123"},
+        },
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "ok", "report": ""},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "sha": "newsha"},
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock
+    )
+    mock_update = mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new_callable=AsyncMock,
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, None)),
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+
+    assert mock_update.await_count == 0, (
+        "update_branch_with_sha_retry must NOT be called for a clean rollup PR "
+        "even when head SHA differs from the target-branch tip"
+    )
+    assert mock_spawn.await_count == 0, (
+        "no fix task must be spawned for a GitHub-clean rollup PR"
+    )
+    assert "_behind_update_retries" not in (parent.context or {}), (
+        "behind-update retry counter must not be set for a clean-state PR"
+    )
+
+
 # ── Strategic Completion Handler ─────────────────────────────────────────────
 
 

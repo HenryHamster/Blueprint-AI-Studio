@@ -233,6 +233,178 @@ async def test_two_heads_rollup_blocked(cleanup_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_clean_pr_sha_mismatch_skips_update_branch(cleanup_db, mocker):
+    """A rollup PR whose head SHA differs from the target-tip SHA but whose
+    mergeable_state is 'clean' must proceed directly to merge without calling
+    update_branch_with_sha_retry.  Regression guard for the false-behind trigger
+    that caused clean rollup PRs to enter unnecessary update/rebase recovery."""
+    mock_merge, mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("backend/app/models.py"),
+        diff="",
+    )
+    # Override get_pull_request so the diff-size/pre-merge fetch includes a head
+    # SHA (triggering the branch-tip comparison) and mergeable_state=clean.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            {"merged": False, "state": "open"},
+            {
+                "additions": 10,
+                "deletions": 5,
+                "merged": False,
+                "state": "open",
+                "head": {"sha": "head-sha-111"},
+                "mergeable_state": "clean",
+            },
+        ],
+    )
+    # Return a SHA that differs from head-sha-111 to trigger the mismatch branch.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new_callable=AsyncMock,
+        return_value="base-tip-999",
+    )
+    mock_upd = mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new_callable=AsyncMock,
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_upd.assert_not_called()
+    mock_merge.assert_awaited_once()
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ancestor_of_base_pr_skips_update_branch(cleanup_db, mocker):
+    """A rollup PR whose head SHA differs from the target-tip SHA but whose
+    base tip is already an ancestor of the head (the rollup branch already
+    contains the base) must proceed directly to merge without calling
+    update_branch_with_sha_retry. This exercises the ancestor-of-base signal
+    in pr_is_not_behind() — mergeable_state is anything other than 'clean'
+    (e.g. 'unknown' from a not-yet-recomputed GitHub state) so the SHA-only
+    half of the original detector would have escalated to behind-recovery."""
+    mock_merge, mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("backend/app/models.py"),
+        diff="",
+    )
+    # mergeable_state is 'unknown' so the clean-only branch of the detector
+    # would NOT short-circuit. ancestor-of-base must carry the decision.
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            {"merged": False, "state": "open"},
+            {
+                "additions": 10,
+                "deletions": 5,
+                "merged": False,
+                "state": "open",
+                "head": {"sha": "head-sha-222"},
+                "mergeable_state": "unknown",
+            },
+        ],
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new_callable=AsyncMock,
+        return_value="base-tip-888",
+    )
+    # base-tip-888 IS reachable from head-sha-222 — the rollup branch already
+    # contains the base tip, so it is NOT behind.
+    mock_ancestor = mocker.patch(
+        "app.github.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mock_upd = mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new_callable=AsyncMock,
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_ancestor.assert_awaited()
+    mock_upd.assert_not_called()
+    mock_merge.assert_awaited_once()
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_genuinely_behind_pr_still_updates_branch(cleanup_db, mocker):
+    """Negative-control for the ancestor-of-base path: a rollup PR whose
+    head/base SHAs differ, whose mergeable_state is NOT 'clean', AND whose
+    base tip is NOT an ancestor of the head must still escalate to
+    update_branch_with_sha_retry. Guards against a regression where
+    pr_is_not_behind() accidentally returns True for genuinely-behind PRs."""
+    mock_merge, mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("backend/app/models.py"),
+        diff="",
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            {"merged": False, "state": "open"},
+            {
+                "additions": 10,
+                "deletions": 5,
+                "merged": False,
+                "state": "open",
+                "head": {"sha": "head-sha-333"},
+                "mergeable_state": "behind",
+            },
+        ],
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new_callable=AsyncMock,
+        return_value="base-tip-777",
+    )
+    # base-tip-777 is NOT an ancestor of head-sha-333 → behind.
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+    mock_upd = mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new_callable=AsyncMock,
+        return_value={"updated": True},
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_upd.assert_awaited_once()
+    # update-branch succeeded → defer merge, no fix spawn.
+    mock_merge.assert_not_awaited()
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_unfetchable_migration_diff_defers_failsafe(cleanup_db, mocker):
     """Fail-safe: a rollup touches alembic/versions but the diff cannot be
     fetched (empty response) → the guard defers; the merge is NOT performed and

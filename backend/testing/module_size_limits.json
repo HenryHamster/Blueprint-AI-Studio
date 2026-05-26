@@ -10,7 +10,7 @@
     "orchestrator_health.py": 500,
     "admin.py": 3100,
     "compute.py": 2500,
-    "github.py": 2800,
+    "github.py": 2850,
     "routers/admin_settings.py": 3000,
     "routers/admin_analytics.py": 800,
     "routers/admin_digest.py": 10300,
