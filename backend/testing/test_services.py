@@ -2026,3 +2026,156 @@ def test_build_branch_short_id_re_default_staging_prefixes_preserved():
     assert pattern.match("research/abcdef12").group(1) == "abcdef12"
     assert pattern.match("plan/abcdef12").group(1) == "abcdef12"
     assert pattern.match("blueprint/task-abcdef12").group(1) == "abcdef12"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _ci_backstop_timeout_reason — reason-picker for the CI-wait backstop.
+#
+# Contract test for Fix 2A: when both pipeline gates are open
+# (ci_passed=True, review_approved=True) the parent is still EVALUATING
+# because the downstream merge gate is blocked.  The reason MUST surface the
+# merge-side state (mergeable_state / merge_attempts / last_merge_msg) and
+# MUST NOT fall through to the historical "both gates unmet" message — that
+# message is the opposite of the truth and made 5 stuck tasks invisible in
+# prod.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def test_ci_backstop_reason_both_gates_open_surfaces_merge_block():
+    """ci_passed=True, review_approved=True, escalated=True must yield a
+    merge-block reason mentioning mergeable_state, NOT the legacy
+    'both gates unmet' lie."""
+    from app.services import _ci_backstop_timeout_reason
+
+    review_loop = {
+        "ci_wait_started": "2026-01-01T00:00:00",
+        "ci_passed": True,
+        "review_approved": True,
+        "escalated": True,
+        "mergeable_state": "blocked",
+        "merge_in_progress_resets": 3,
+        "merge_last_error": "Required status check is in progress",
+    }
+    reason = _ci_backstop_timeout_reason(
+        ci_ws_val="2026-01-01T00:00:00",
+        ci_ws_valid=True,
+        ci_passed=True,
+        review_approved=True,
+        was_escalated=True,
+        review_summary=None,
+        review_loop=review_loop,
+    )
+
+    # MUST mention the merge gate's actual state.
+    assert "merge blocked" in reason.lower()
+    assert "mergeable_state" in reason
+    assert "blocked" in reason
+    # MUST surface the in-progress reset counter (this is the field the
+    # downstream merge-gate failure exposes — the bug was that the reason
+    # didn't print it).
+    assert "merge_attempts=3" in reason
+    # The last-merge-msg snippet rides through too.
+    assert "Required status check" in reason
+
+    # Anti-regression: the historical fall-through message must NOT appear.
+    assert "both gates unmet" not in reason.lower()
+
+
+def test_ci_backstop_reason_both_gates_open_no_merge_diagnostics_still_named_correctly():
+    """Even when the merge-side fields are absent (older parking task whose
+    review_loop predates the merge-state persistence), the (ci_passed AND
+    review_approved) branch MUST still report 'merge blocked' rather than
+    falling through to the gates-unmet message."""
+    from app.services import _ci_backstop_timeout_reason
+
+    review_loop = {
+        "ci_wait_started": "2026-01-01T00:00:00",
+        "ci_passed": True,
+        "review_approved": True,
+        "escalated": True,
+        # No mergeable_state / merge_in_progress_resets / merge_last_error.
+    }
+    reason = _ci_backstop_timeout_reason(
+        ci_ws_val="2026-01-01T00:00:00",
+        ci_ws_valid=True,
+        ci_passed=True,
+        review_approved=True,
+        was_escalated=True,
+        review_summary=None,
+        review_loop=review_loop,
+    )
+
+    assert "merge blocked" in reason.lower()
+    assert "both gates unmet" not in reason.lower()
+
+
+def test_ci_backstop_reason_existing_branches_unaffected():
+    """The pre-existing branches (CI-only, review-only, escalated-only,
+    neither, corrupt/missing ci_wait_started) must keep their original
+    messages — this is a strictly additive fix."""
+    from app.services import _ci_backstop_timeout_reason
+
+    # CI passed, review pending, no review task surfaced.
+    assert (
+        _ci_backstop_timeout_reason(
+            ci_ws_val="2026-01-01T00:00:00",
+            ci_ws_valid=True,
+            ci_passed=True,
+            review_approved=False,
+            was_escalated=False,
+            review_summary=None,
+            review_loop={},
+        )
+        == "CI passed but no review task exists for this chain"
+    )
+
+    # Review approved, CI never completed.
+    assert "review approved but CI never completed" in _ci_backstop_timeout_reason(
+        ci_ws_val="2026-01-01T00:00:00",
+        ci_ws_valid=True,
+        ci_passed=False,
+        review_approved=True,
+        was_escalated=True,
+        review_summary=None,
+        review_loop={},
+    )
+
+    # Neither gate, escalated.
+    assert (
+        _ci_backstop_timeout_reason(
+            ci_ws_val="2026-01-01T00:00:00",
+            ci_ws_valid=True,
+            ci_passed=False,
+            review_approved=False,
+            was_escalated=True,
+            review_summary=None,
+            review_loop={},
+        )
+        == "both gates unmet after 20-min escalation"
+    )
+
+    # Missing ci_wait_started.
+    assert (
+        _ci_backstop_timeout_reason(
+            ci_ws_val=None,
+            ci_ws_valid=False,
+            ci_passed=False,
+            review_approved=False,
+            was_escalated=False,
+            review_summary=None,
+            review_loop={},
+        )
+        == "ci_wait_started missing from review_loop"
+    )
+
+    # Corrupt ci_wait_started.
+    corrupt = _ci_backstop_timeout_reason(
+        ci_ws_val="garbage",
+        ci_ws_valid=False,
+        ci_passed=False,
+        review_approved=False,
+        was_escalated=False,
+        review_summary=None,
+        review_loop={},
+    )
+    assert corrupt.startswith("ci_wait_started corrupt")

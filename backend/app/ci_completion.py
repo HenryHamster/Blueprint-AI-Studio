@@ -514,16 +514,58 @@ async def _attempt_merge_with_retry_and_escalation(
 
     if _in_progress:
         from app import pause_clock
+        from app.shared_state import runtime_config as _rt_cfg
 
-        ci_loop["ci_poll_interval"] = 10
-        ci_loop["ci_last_polled"] = _utcnow().isoformat()
-        ci_loop["ci_wait_started"] = _utcnow().isoformat()
-        ci_loop["ci_wait_pause_baseline"] = await pause_clock.current_baseline(session)
-        task.context = {**(task.context or {}), "review_loop": ci_loop}
-        task.latest_status_message = f"Merge blocked (checks re-running on PR #{ci_pr_number}) — back to CI polling"
-        logger.warning(
-            f"[CI] PR #{ci_pr_number} merge blocked by in-progress checks — returning to CI wait ({source})"
-        )
+        # Cap repeated ``ci_wait_started`` resets so a PR whose required checks
+        # never resolve cannot spin on this path until the 6-hour parent
+        # timeout fires.  Each reset bumps the CI-wait deadline by another
+        # full backstop window; without a cap the orchestrator polls forever
+        # while logging "in progress" responses every cycle.  After the cap
+        # we stop resetting (still log + persist the last-merge state) so the
+        # normal CI backstop runs out on schedule and the parent fails with a
+        # message that names the real blocker.
+        _reset_cap = int(_rt_cfg.get("ci_in_progress_reset_cap", 3))
+        _resets_so_far = int(ci_loop.get("merge_in_progress_resets", 0))
+        # Persist the merge-side diagnostics so the EVALUATING-timeout reason-
+        # picker in services.py can surface the real blocker instead of the
+        # historical "both gates unmet" lie.
+        ci_loop["mergeable_state"] = _ms or "unknown"
+        ci_loop["last_merge_msg"] = merge_msg
+        if _resets_so_far < _reset_cap:
+            ci_loop["ci_poll_interval"] = 10
+            ci_loop["ci_last_polled"] = _utcnow().isoformat()
+            ci_loop["ci_wait_started"] = _utcnow().isoformat()
+            ci_loop["ci_wait_pause_baseline"] = await pause_clock.current_baseline(
+                session
+            )
+            ci_loop["merge_in_progress_resets"] = _resets_so_far + 1
+            task.context = {**(task.context or {}), "review_loop": ci_loop}
+            flag_modified(task, "context")
+            task.latest_status_message = (
+                f"Merge blocked (checks re-running on PR #{ci_pr_number}) — back to CI polling "
+                f"({_resets_so_far + 1}/{_reset_cap})"
+            )
+            logger.warning(
+                f"[CI] PR #{ci_pr_number} merge blocked by in-progress checks — "
+                f"returning to CI wait ({source}, reset {_resets_so_far + 1}/{_reset_cap})"
+            )
+        else:
+            # Cap reached — stop resetting the CI-wait clock.  The normal
+            # backstop runs out on schedule and services.py surfaces the
+            # mergeable_state / last_merge_msg in the timeout reason.
+            ci_loop["ci_poll_interval"] = 30
+            ci_loop["ci_last_polled"] = _utcnow().isoformat()
+            task.context = {**(task.context or {}), "review_loop": ci_loop}
+            flag_modified(task, "context")
+            task.latest_status_message = (
+                f"Merge blocked on PR #{ci_pr_number} (in-progress reset cap "
+                f"{_reset_cap} reached) — letting backstop run out"
+            )
+            logger.warning(
+                f"[CI] PR #{ci_pr_number} merge in-progress reset cap "
+                f"({_reset_cap}) reached — ci_wait_started no longer being reset "
+                f"({source})"
+            )
         return False
 
     try:

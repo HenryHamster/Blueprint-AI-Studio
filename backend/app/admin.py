@@ -21,6 +21,7 @@ from app.shared_state import (
     get_project_promotion_target as _get_project_promotion_target_for_task,
     get_project_task_branch_namespace,
     limiter,
+    resolve_task_branch as _resolve_task_branch,
 )
 from app.models import (
     Task,
@@ -1006,11 +1007,7 @@ async def bulk_action_tasks(
                             pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
                             task_payload = task.first_payload
                             _project = await session.get(Project, task.project_id)
-                            branch = _derive_task_branch(
-                                task.id,
-                                task_payload.get("type"),
-                                get_project_task_branch_namespace(_project),
-                            )
+                            branch = _resolve_task_branch(task)
                             base_branch = task_payload.get(
                                 "base_branch"
                             ) or get_project_integration_branch(_project)
@@ -1713,9 +1710,7 @@ async def request_changes(
     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
     task_payload = task.first_payload
     _project = await session.get(Project, task.project_id)
-    branch = _derive_task_branch(
-        task.id, task_payload.get("type"), get_project_task_branch_namespace(_project)
-    )
+    branch = _resolve_task_branch(task)
     base_branch = task_payload.get("base_branch") or get_project_integration_branch(
         _project
     )
@@ -2359,11 +2354,7 @@ async def modify_task(
                     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
                     task_payload = task.first_payload
                     _project = await session.get(Project, task.project_id)
-                    branch = _derive_task_branch(
-                        task.id,
-                        task_payload.get("type"),
-                        get_project_task_branch_namespace(_project),
-                    )
+                    branch = _resolve_task_branch(task)
                     base_branch = task_payload.get(
                         "base_branch"
                     ) or get_project_integration_branch(_project)

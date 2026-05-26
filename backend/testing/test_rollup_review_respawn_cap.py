@@ -297,6 +297,79 @@ async def test_respawn_uses_task_type_branch_prefix(rollup_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_respawn_prefers_review_loop_branch_over_synthesized(rollup_db, mocker):
+    """The respawn now goes through ``resolve_task_branch``, which prefers
+    ``context.review_loop.branch`` over ``context.branch`` and the synthesized
+    fallback. Regression for the 2026-05-26 fix-task respawn bug where the
+    fallback ``derive_task_branch(c.id, "fix")`` produced a branch no agent
+    ever pushed -- when an agent re-uses a parent's branch (review_loop
+    carries it), the synthesized name diverges and the spawned review fails
+    at ``git clone --branch``.
+
+    Verified here against a create-type child (the only type the rollup
+    respawn loop actually iterates) seeded with a review_loop.branch that
+    differs from what context.branch / derivation would produce, so the
+    precedence is observable.
+    """
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._verify_pr_merged",
+        new=AsyncMock(return_value=False),
+    )
+    spawned_review = Task(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        payloads=[{"type": "review", "prompt": "review"}],
+        status=TaskStatus.QUEUED,
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(spawned_review, True),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    _parent, child = await _make_respawn_scenario(
+        rollup_db, child_respawn_count=0, payload_type="create"
+    )
+    # Seed the child's context with a review_loop.branch that does NOT
+    # equal what synthesizing from id+type would produce. The helper
+    # must prefer review_loop.branch.
+    canonical_branch = "blueprint/task-fromreviewloop"
+    child.context = {
+        **(child.context or {}),
+        # No context.branch on purpose -- the bug was the fallback chain
+        # ignoring review_loop and going straight to derivation.
+        "review_loop": {"branch": canonical_branch, "iteration": 2},
+    }
+    # Re-stamp updated_at as stale; the commit below would otherwise refresh
+    # it to now via onupdate=_utcnow and the >10min staleness gate would skip
+    # the respawn.
+    child.updated_at = _naive_utc_ago(minutes=30)
+    rollup_db.add(child)
+    await rollup_db.commit()
+
+    await _check_and_trigger_rollup(child, rollup_db)
+
+    mock_spawn.assert_awaited_once()
+    spawn_kwargs = mock_spawn.call_args.kwargs
+    spawn_args = mock_spawn.call_args.args
+    branch_passed = spawn_kwargs.get("branch") or spawn_args[4]
+    # Must read from review_loop.branch, not synthesize from id+type.
+    assert branch_passed == canonical_branch, (
+        f"respawn used wrong branch: got {branch_passed!r}, "
+        f"expected {canonical_branch!r} (must read review_loop.branch)"
+    )
+    # Sanity: this is NOT what plain derivation would have produced.
+    from app.shared_state import derive_task_branch as _derive
+
+    synthesized = _derive(child.id, "create")
+    assert branch_passed != synthesized
+
+
+@pytest.mark.asyncio
 async def test_dedup_hit_does_not_increment_counter(rollup_db, mocker):
     """When _spawn_pipeline_task returns was_spawned=False (an idempotency
     dedup hit — an existing review task was reused, not created), the

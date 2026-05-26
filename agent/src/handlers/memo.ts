@@ -184,7 +184,10 @@ Rules:
     return sources;
   };
 
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(
+  const {
+    exitCode, allOutput, lastResultText,
+    codexTurnCompleted, stderrTail,
+  } = await runClaudeCode(
     memoPrompt + `\n\n${DEFAULT_TOOL_GUIDANCE}`,
     ws, statusRef, model, effort, disallowedTools,
   );
@@ -194,6 +197,12 @@ Rules:
   let memoObj = tryExtractMemoObject(buildSources(lastResultText, allOutput));
   let retryExitCode: number | null = null;
   let retryAllOutput = '';
+  let retryLastResultText = '';
+  // `undefined` means "no retry ran"; a real Codex run may return either
+  // boolean (turn observed or not). Non-Codex runners return undefined too,
+  // which collapses to "no cause-C evidence" in the classifier below.
+  let retryCodexTurnCompleted: boolean | undefined;
+  let retryStderrTail = '';
 
   // Reopen path: the agent often produces a clean exit (exitCode=0, ~2KB of
   // narrative) but drifts off-spec and never emits the JSON object. Instead
@@ -226,6 +235,9 @@ Output ONLY the JSON object now — no preamble, no markdown code fences, no add
     );
     retryExitCode = retryRun.exitCode;
     retryAllOutput = retryRun.allOutput;
+    retryLastResultText = retryRun.lastResultText;
+    retryCodexTurnCompleted = retryRun.codexTurnCompleted;
+    retryStderrTail = retryRun.stderrTail || '';
     memoObj = tryExtractMemoObject(
       buildSources(retryRun.lastResultText, retryRun.allOutput),
     );
@@ -236,17 +248,87 @@ Output ONLY the JSON object now — no preamble, no markdown code fences, no add
     const retrySuffix = retryExitCode !== null
       ? `, retryExitCode=${retryExitCode}, retryAllOutput=${(retryAllOutput || '').length}b`
       : '';
+
+    // ── Failure-category selection ──────────────────────────────────────────
+    // Three distinct memo-extraction failures exist as of 2026-05-26:
+    //   (1) exitCode !== 0           — Claude/Codex CLI crash. The downstream
+    //       backend already has rate-limit/account-rotation overrides for
+    //       `claude_code_failed` (see _ALL_GENERIC_CODE_ERROR_LABELS in
+    //       backend/app/failure_classification.py).
+    //   (2) exitCode == 0 + Codex stream missing `turn.completed` — provider
+    //       silently disconnected mid-turn (token cap, content refusal,
+    //       upstream 5xx that Codex swallows as success). The agent never
+    //       had a chance to emit JSON — labeling this `parse_failed` was
+    //       misleading and bypassed rate-limit overrides. Reclassify to
+    //       `claude_code_failed` so account-state correlation kicks in.
+    //   (3) exitCode == 0 + agent emitted output WITHOUT the schema markers
+    //       (`"summary"` / `"reasoning"`) — wrapper-fallback territory; the
+    //       agent never tried to produce the JSON. Emit `incomplete` so
+    //       analytics can separate it from genuine parse failures.
+    //   (4) otherwise — agent did emit schema-shaped text but it didn't
+    //       parse / was missing keys — keep the historical `parse_failed`.
+    //
+    // Use the most recent run's signals when a retry ran; fall back to the
+    // first run otherwise. retryExitCode === null means no retry happened
+    // (e.g. exitCode !== 0 path skipped the reopen).
+    const retryRan = retryExitCode !== null;
+    const finalExitCode = retryRan ? (retryExitCode as number) : exitCode;
+    // codexTurnCompleted is undefined for non-Codex runners and for test
+    // stubs. We treat undefined as "no evidence either way" — only an
+    // explicit `false` plus a thread.started marker triggers cause-C.
+    const finalCodexTurnCompleted = retryRan ? retryCodexTurnCompleted : codexTurnCompleted;
+    // Cause-C detection: only the latest run's stream tells us whether THIS
+    // run reached turn.completed. Use retry's allOutput when a retry ran.
+    const causeCAllOutput = retryRan ? retryAllOutput : allOutput;
+    // Schema-attempt detection (Layer B): union of BOTH runs' outputs, so a
+    // schema-shaped attempt in the first run that produced incomplete JSON
+    // doesn't get downgraded to `incomplete` just because the retry was
+    // silent. The `parse_failed` label is informative when EITHER run tried
+    // to emit the schema.
+    const schemaAttemptText =
+      `${lastResultText || ''}\n${allOutput || ''}\n`
+      + `${retryLastResultText || ''}\n${retryAllOutput || ''}`;
+    const finalStderrTail = retryStderrTail || stderrTail || '';
+
+    let failureCategory: 'parse_failed' | 'claude_code_failed' | 'incomplete';
+    if (finalExitCode !== 0) {
+      failureCategory = 'claude_code_failed';
+    } else if (
+      finalCodexTurnCompleted === false
+      && causeCAllOutput.includes('"type":"thread.started"')
+    ) {
+      // Cause-C: Codex emitted thread.started but never turn.completed
+      // despite exitCode=0. Treat as a CLI-side failure so the backend's
+      // rate-limit / account-rotation overrides apply. Explicit `=== false`
+      // gate: undefined (non-Codex / test stub) is NOT treated as evidence.
+      failureCategory = 'claude_code_failed';
+    } else {
+      // Layer B: parse_failed should only fire when the agent actually
+      // tried to emit the schema. Otherwise the agent silently bailed —
+      // `incomplete` is the canonical wrapper-fallback label.
+      const looksLikeMemoAttempt =
+        schemaAttemptText.includes('"summary"') || schemaAttemptText.includes('"reasoning"');
+      failureCategory = looksLikeMemoAttempt ? 'parse_failed' : 'incomplete';
+    }
+
+    const stderrSuffix = finalStderrTail
+      ? `\n--- stderr tail (${finalStderrTail.length}b) ---\n${finalStderrTail}`
+      : '';
+    const codexSuffix = causeCAllOutput.includes('"type":"thread.started"')
+      ? `, codexTurnCompleted=${String(finalCodexTurnCompleted)}`
+      : '';
+
     await persistAndPostStatus(taskId, {
       task_id: taskId,
       status: 'FAILED',
       artifact_type: 'ERROR_LOG',
-      failure_category: 'parse_failed',
+      failure_category: failureCategory,
       logs:
         `Memo handler could not extract a JSON object with all required keys ` +
         `(summary, reasoning, citations, tags). exitCode=${exitCode}, ` +
         `allOutput=${(allOutput || '').length}b, ` +
-        `lastResultText=${(lastResultText || '').length}b${retrySuffix}\n` +
-        `--- output tail ---\n${tail}`,
+        `lastResultText=${(lastResultText || '').length}b${retrySuffix}${codexSuffix}\n` +
+        `--- output tail ---\n${tail}${stderrSuffix}`,
     });
     return;
   }
