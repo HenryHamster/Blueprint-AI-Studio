@@ -1,6 +1,7 @@
 """Integration tests for /api/admin/digest and /api/admin/activity endpoints."""
 
 from datetime import datetime, timedelta
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
@@ -25,9 +26,11 @@ from app.digest_metrics import (
     compute_digest_cost_economics,
     compute_digest_trend_history,
     compute_failure_grouping,
+    compute_narrative_summary,
     compute_recurring_error_clusters,
     compute_remediation_and_patterns,
     compute_remediation_funnel,
+    compute_retry_analytics,
     compute_review_quality_metrics,
     compute_scope_mismatch_summary,
     compute_sr_prediction_accuracy,
@@ -2709,6 +2712,164 @@ async def test_narrative_taxonomy_insight_code_defect(client: AsyncClient, db_se
 
     assert data["failure_taxonomy_distribution"]["dominant_category"] == "code_defect"
     assert "Code defects dominate failures" in data["narrative_summary"]
+
+
+def _build_narrative_summary(**overrides):
+    base = dict(
+        hours=24,
+        project_id=None,
+        completed_count=0,
+        failed_count=0,
+        pending_approval_count=0,
+        needs_attention=[],
+        failure_groups=[],
+        failure_taxonomy_distribution={
+            "categories": {},
+            "total_failures": 0,
+            "dominant_category": None,
+        },
+        trend=None,
+        completed_delta=0,
+        prev_completed_count=0,
+        sorted_completions=[],
+        sorted_failures=[],
+        direction_progress_list=[],
+        running_count=0,
+        queued_count=0,
+        pr_count=0,
+        error_log_map={},
+        failed_tasks=[],
+    )
+    base.update(overrides)
+    return compute_narrative_summary(**base)
+
+
+def test_compute_narrative_summary_all_clear():
+    completed = [make_task(title="Completed Alpha", status=TaskStatus.COMPLETED)]
+    assert (
+        _build_narrative_summary(
+            completed_count=1,
+            sorted_completions=completed,
+            pr_count=1,
+        )
+        == "All clear — 1 task completed with 1 PR merged, no action needed."
+    )
+
+
+def test_compute_narrative_summary_approval_only():
+    assert (
+        _build_narrative_summary(
+            pending_approval_count=1,
+            needs_attention=[{"reason": "approval_required", "waiting_hours": 2}],
+        )
+        == "1 task awaiting your approval (2h)."
+    )
+
+
+def test_compute_narrative_summary_dominant_code_error_refined():
+    failed_tasks = [
+        make_task(
+            title="Lint Fail 1",
+            status=TaskStatus.FAILED,
+            context={"failure_category": "test_failed"},
+            latest_status_message="pytest failed on test_foo",
+        ),
+        make_task(
+            title="Lint Fail 2",
+            status=TaskStatus.FAILED,
+            context={"failure_category": "test_failed"},
+            latest_status_message="pytest failed on test_bar",
+        ),
+        make_task(
+            title="Lint Fail 3",
+            status=TaskStatus.FAILED,
+            context={"failure_category": "test_failed"},
+            latest_status_message="pytest failed on test_baz",
+        ),
+    ]
+    assert (
+        _build_narrative_summary(
+            failed_count=5,
+            failure_groups=[{"failure_class": "CODE_ERROR", "count": 3}],
+            failure_taxonomy_distribution={
+                "categories": {"review_quality": {"count": 1}},
+                "total_failures": 1,
+                "dominant_category": "review_quality",
+            },
+            failed_tasks=failed_tasks,
+        )
+        == "Most failures (3/5) are code errors from test/lint failures — strengthen self-review before PR creation."
+    )
+
+
+def test_compute_narrative_summary_no_dominant_failure_class():
+    failed_tasks = [
+        make_task(title="Fail A", status=TaskStatus.FAILED),
+        make_task(title="Fail B", status=TaskStatus.FAILED),
+    ]
+    assert (
+        _build_narrative_summary(
+            failed_count=2,
+            failure_groups=[{"failure_class": "CODE_ERROR", "count": 1}],
+            failure_taxonomy_distribution={
+                "categories": {"code_defect": {"count": 1}},
+                "total_failures": 1,
+                "dominant_category": "code_defect",
+            },
+            sorted_failures=failed_tasks,
+            failed_tasks=failed_tasks,
+        )
+        == "2 tasks failed (Fail A, Fail B)."
+    )
+
+
+def test_compute_narrative_summary_completion_trend_prefix():
+    completed = [
+        make_task(title="Completed Alpha", status=TaskStatus.COMPLETED),
+        make_task(title="Completed Beta", status=TaskStatus.COMPLETED),
+    ]
+    failed_tasks = [make_task(title="Failed Task", status=TaskStatus.FAILED)]
+    assert _build_narrative_summary(
+        completed_count=2,
+        failed_count=1,
+        failure_groups=[{"failure_class": "CODE_ERROR", "count": 1}],
+        failure_taxonomy_distribution={
+            "categories": {"code_defect": {"count": 1}},
+            "total_failures": 1,
+            "dominant_category": "code_defect",
+        },
+        trend="improving",
+        completed_delta=1,
+        prev_completed_count=1,
+        sorted_completions=completed,
+        sorted_failures=failed_tasks,
+        failed_tasks=failed_tasks,
+    ) == (
+        "1 task failed (Failed Task). "
+        "Good progress — 2 tasks completed including Completed Alpha, Completed Beta (up from 1 last period)."
+    )
+
+
+def test_compute_narrative_summary_direction_taxonomy_hint():
+    assert (
+        _build_narrative_summary(
+            project_id=uuid4(),
+            direction_progress_list=[
+                {
+                    "direction_text": "Team Alpha",
+                    "prs_merged": 2,
+                    "possibly_saturated": False,
+                    "tasks_created": 0,
+                    "taxonomy_summary": {"review_quality": 2, "code_defect": 1},
+                }
+            ],
+        )
+        == "Research: Team Alpha: 2 PRs merged (mostly review-quality failures)."
+    )
+
+
+def test_compute_narrative_summary_empty_window_fallback():
+    assert _build_narrative_summary() == "All quiet — no activity in the last 24h."
 
 
 # ---------------------------------------------------------------------------
@@ -17889,3 +18050,148 @@ async def test_warm_reuse_funnel_requires_auth(unauthenticated_client: AsyncClie
         f"/api/admin/projects/{fake_id}/warm-reuse-funnel"
     )
     assert response.status_code in (401, 403)
+
+
+# ---------------------------------------------------------------------------
+# compute_retry_analytics unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestComputeRetryAnalytics:
+    """Unit tests for the extracted compute_retry_analytics helper."""
+
+    def _make_task(self, **kwargs):
+        """Minimal Task-like object for unit tests (no DB needed)."""
+        t = make_task(**kwargs)
+        return t
+
+    def test_no_retry_history(self):
+        """Tasks with _attempt_number <= 1 (or absent) produce zero/None counts."""
+        now = _utcnow()
+        window_start = now - timedelta(hours=24)
+        failed = [
+            make_task(status=TaskStatus.FAILED, context={}),
+            make_task(status=TaskStatus.FAILED, context={"_attempt_number": 1}),
+        ]
+        completed = [
+            make_task(status=TaskStatus.COMPLETED, context={}),
+        ]
+        result = compute_retry_analytics(
+            failed_tasks=failed,
+            completed_tasks=completed,
+            dir_id_to_text={},
+            window_start=window_start,
+        )
+        assert result["retry_task_count"] == 0
+        assert result["retry_success_count"] == 0
+        assert result["retry_overhead_cost_usd"] == 0.0
+        assert result["retry_recovery_cost_usd"] == 0.0
+        assert result["retry_waste_by_direction"] == []
+        assert result["avg_retries_before_failure"] is None
+        assert result["retry_success_rate_by_class"] == {}
+        assert result["retry_wasted_rate"] is None
+
+    def test_retried_and_succeeded(self):
+        """Completed tasks with _attempt_number > 1 count toward retry_success_count
+        and retry_recovery_cost_usd; retry_success_rate_by_class is populated."""
+        now = _utcnow()
+        window_start = now - timedelta(hours=24)
+        completed = [
+            make_task(
+                status=TaskStatus.COMPLETED,
+                context={
+                    "_attempt_number": 2,
+                    "_previous_failure_class": "CODE_ERROR",
+                    "_prior_attempts_cost": 1.5,
+                },
+            ),
+            make_task(
+                status=TaskStatus.COMPLETED,
+                context={
+                    "_attempt_number": 3,
+                    "_previous_failure_class": "CODE_ERROR",
+                    "_prior_attempts_cost": 0.75,
+                },
+            ),
+        ]
+        result = compute_retry_analytics(
+            failed_tasks=[],
+            completed_tasks=completed,
+            dir_id_to_text={},
+            window_start=window_start,
+        )
+        assert result["retry_success_count"] == 2
+        assert result["retry_recovery_cost_usd"] == round(1.5 + 0.75, 4)
+        assert "CODE_ERROR" in result["retry_success_rate_by_class"]
+        cls_entry = result["retry_success_rate_by_class"]["CODE_ERROR"]
+        assert cls_entry["merged"] == 2
+        assert cls_entry["failed"] == 0
+        assert cls_entry["success_rate"] == 1.0
+        # No failed retries → retry_wasted_rate denominator is 0+2=2, waste=0
+        assert result["retry_wasted_rate"] == 0.0
+
+    def test_retried_and_failed(self):
+        """Failed tasks with _attempt_number > 1 contribute to retry_overhead_cost_usd
+        and retry_waste_by_direction with top-5 truncation."""
+        now = _utcnow()
+        window_start = now - timedelta(hours=24)
+        # 6 directions — only top 5 by cost should appear
+        failed = []
+        dir_id_to_text = {}
+        for i in range(6):
+            did = f"dir-{i}"
+            dir_id_to_text[did] = f"Direction {i}"
+            duration_hours = i + 1  # dir-0=1h, dir-5=6h so dir-5 is most expensive
+            t = make_task(
+                status=TaskStatus.FAILED,
+                context={"_attempt_number": 2, "direction_id": did},
+                vm_provisioned_at=now - timedelta(hours=duration_hours + 1),
+                vm_stopped_at=now - timedelta(minutes=1),
+                vm_spot=False,
+            )
+            failed.append(t)
+
+        result = compute_retry_analytics(
+            failed_tasks=failed,
+            completed_tasks=[],
+            dir_id_to_text=dir_id_to_text,
+            window_start=window_start,
+        )
+        assert result["retry_task_count"] == 6
+        # Top-5 truncation: only 5 directions returned, sorted descending by cost
+        assert len(result["retry_waste_by_direction"]) == 5
+        costs = [e["retry_cost_usd"] for e in result["retry_waste_by_direction"]]
+        assert costs == sorted(costs, reverse=True)
+        # Overhead cost is positive
+        assert result["retry_overhead_cost_usd"] > 0
+
+    def test_retry_wasted_rate_denominator(self):
+        """retry_wasted_rate = failed_retries / (failed_retries + succeeded_retries)."""
+        now = _utcnow()
+        window_start = now - timedelta(hours=24)
+        failed = [
+            make_task(
+                status=TaskStatus.FAILED,
+                context={"_attempt_number": 2},
+            ),
+        ]
+        completed = [
+            make_task(
+                status=TaskStatus.COMPLETED,
+                context={"_attempt_number": 2, "_previous_failure_class": "CODE_ERROR"},
+            ),
+            make_task(
+                status=TaskStatus.COMPLETED,
+                context={"_attempt_number": 2, "_previous_failure_class": "CODE_ERROR"},
+            ),
+        ]
+        result = compute_retry_analytics(
+            failed_tasks=failed,
+            completed_tasks=completed,
+            dir_id_to_text={},
+            window_start=window_start,
+        )
+        # 1 failed retry, 2 succeeded retries → wasted_rate = 1/3
+        assert result["retry_task_count"] == 1
+        assert result["retry_success_count"] == 2
+        assert result["retry_wasted_rate"] == round(1 / 3, 4)

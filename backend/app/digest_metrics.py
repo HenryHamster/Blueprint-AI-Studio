@@ -2155,6 +2155,185 @@ def compute_digest_cost_economics(
     }
 
 
+def compute_narrative_summary(
+    *,
+    hours: int,
+    project_id: uuid.UUID | None,
+    completed_count: int,
+    failed_count: int,
+    pending_approval_count: int,
+    needs_attention: List[Dict[str, Any]],
+    failure_groups: List[Dict[str, Any]],
+    failure_taxonomy_distribution: Dict[str, Any],
+    trend: str | None,
+    completed_delta: int,
+    prev_completed_count: int,
+    sorted_completions: List[Task],
+    sorted_failures: List[Task],
+    direction_progress_list: List[Dict[str, Any]],
+    running_count: int,
+    queued_count: int,
+    pr_count: int,
+    error_log_map: Dict[str, str],
+    failed_tasks: List[Task],
+) -> str:
+    """Build the human-readable digest narrative from precomputed metrics."""
+    from app.failure_classification import (
+        classify_failure as _classify_failure,
+        classify_failure_taxonomy as _classify_taxonomy,
+        TAXONOMY_REVIEW_QUALITY,
+        TAXONOMY_SCOPE_RELATED,
+        TAXONOMY_CODE_DEFECT,
+    )
+
+    narrative_parts = []
+
+    if pending_approval_count == 0 and failed_count == 0 and completed_count > 0:
+        all_clear = f"All clear — {completed_count} task{'s' if completed_count != 1 else ''} completed"
+        if pr_count > 0:
+            all_clear += f" with {pr_count} PR{'s' if pr_count != 1 else ''} merged"
+        all_clear += ", no action needed."
+        return all_clear
+
+    if pending_approval_count > 0:
+        approval_items = [
+            x for x in needs_attention if x["reason"] == "approval_required"
+        ]
+        max_wait = max((x.get("waiting_hours") or 0 for x in approval_items), default=0)
+        approval_str = f"{pending_approval_count} task{'s' if pending_approval_count != 1 else ''} awaiting your approval"
+        if max_wait > 0:
+            approval_str += f" ({max_wait}h)"
+        narrative_parts.append(approval_str + ".")
+
+    if failed_count > 0:
+        dominant_group = failure_groups[0] if failure_groups else None
+        dominant_msg = None
+        if (
+            dominant_group
+            and dominant_group["count"] >= 2
+            and dominant_group["count"] / failed_count >= 0.6
+        ):
+            cls = dominant_group["failure_class"]
+            cnt = dominant_group["count"]
+            _root_cause_msgs = {
+                "RATE_LIMIT": f"Most failures ({cnt}/{failed_count}) are rate-limit errors — consider pausing until account recovery.",
+                "PROVISION_FAILURE": f"Most failures ({cnt}/{failed_count}) are provisioning issues — check GCP quota and zone health.",
+                "EXTERNAL_API": f"Most failures ({cnt}/{failed_count}) are external API errors — GitHub/Claude API may be experiencing issues.",
+                "AGENT_TIMEOUT": f"Most failures ({cnt}/{failed_count}) are agent timeouts — tasks may need complexity reduction.",
+                "CODE_ERROR": f"Most failures ({cnt}/{failed_count}) are code errors in agent-written code.",
+                "SCOPE_OVERFLOW": f"Most failures ({cnt}/{failed_count}) exceeded scope budget (touched more files than scope allows) — consider task decomposition or scope escalation.",
+            }
+            if cls == "CODE_ERROR":
+                _ce_tax: Dict[str, int] = {}
+                for _t in failed_tasks:
+                    if (
+                        _classify_failure(_t, error_log_map.get(str(_t.id)))
+                        == "CODE_ERROR"
+                    ):
+                        _sub = _classify_taxonomy(_t)
+                        _ce_tax[_sub] = _ce_tax.get(_sub, 0) + 1
+                if _ce_tax:
+                    _sub_dom, _sub_cnt = max(_ce_tax.items(), key=lambda kv: kv[1])
+                    if _sub_cnt / cnt >= 0.6:
+                        _sub_msgs = {
+                            TAXONOMY_SCOPE_RELATED: f"Most failures ({cnt}/{failed_count}) are code errors driven by scope budget overruns — consider task decomposition or scope escalation.",
+                            TAXONOMY_REVIEW_QUALITY: f"Most failures ({cnt}/{failed_count}) are code errors from test/lint failures — strengthen self-review before PR creation.",
+                            TAXONOMY_CODE_DEFECT: f"Most failures ({cnt}/{failed_count}) are logical code defects in agent-written code.",
+                        }
+                        _refined = _sub_msgs.get(_sub_dom)
+                        if _refined:
+                            _root_cause_msgs["CODE_ERROR"] = _refined
+            dominant_msg = _root_cause_msgs.get(cls)
+        if dominant_msg:
+            narrative_parts.append(dominant_msg)
+        else:
+            failure_titles = [t.title or "Failed task" for t in sorted_failures[:2]]
+            failed_str = f"{failed_count} task{'s' if failed_count != 1 else ''} failed"
+            if failure_titles:
+                failed_str += f" ({', '.join(failure_titles)})"
+            narrative_parts.append(failed_str + ".")
+
+        _dom_cat = failure_taxonomy_distribution.get("dominant_category")
+        _tax_tot = failure_taxonomy_distribution.get("total_failures") or 0
+        if _dom_cat and _tax_tot >= 2:
+            _dom_count = failure_taxonomy_distribution["categories"][_dom_cat]["count"]
+            if _dom_count / _tax_tot >= 0.5:
+                _taxonomy_msgs = {
+                    "review_quality": "Review quality issues dominate failures — improving lint/test coverage may help.",
+                    "scope_related": "Scope mismatch is the top failure pattern — consider task decomposition.",
+                    "infra_related": "Infrastructure issues dominate — check provisioning and rate limits.",
+                    "code_defect": "Code defects dominate failures — strengthening self-review may help.",
+                }
+                _tax_msg = _taxonomy_msgs.get(_dom_cat)
+                if _tax_msg:
+                    narrative_parts.append(_tax_msg)
+
+    if completed_count > 0:
+        trend_prefix = ""
+        if trend == "declining":
+            trend_prefix = "Pipeline health declining — "
+        elif trend == "improving":
+            trend_prefix = "Good progress — "
+        shipped = f"{trend_prefix}{completed_count} task{'s' if completed_count != 1 else ''} completed"
+        if pr_count > 0:
+            shipped += f" with {pr_count} PR{'s' if pr_count != 1 else ''} opened"
+        completion_titles = [
+            t.title or "Completed task" for t in sorted_completions[:2]
+        ]
+        completion_titles = [
+            t[:50] + "..." if len(t) > 50 else t for t in completion_titles
+        ]
+        if completion_titles:
+            shipped += f" including {', '.join(completion_titles)}"
+        if completed_delta > 0:
+            shipped += f" (up from {prev_completed_count} last period)"
+        elif completed_delta < 0:
+            shipped += f" (down from {prev_completed_count} last period)"
+        narrative_parts.append(shipped + ".")
+
+    if project_id and direction_progress_list:
+        _dir_tax_hints = {
+            "review_quality": "mostly review-quality failures",
+            "scope_related": "mostly scope-related failures",
+            "infra_related": "mostly infra-related failures",
+            "code_defect": "mostly code-defect failures",
+        }
+        dir_summaries = []
+        for dp in direction_progress_list:
+            dt = (dp["direction_text"] or "")[:40]
+            if dp["prs_merged"] > 0:
+                entry = f"{dt}: {dp['prs_merged']} PR{'s' if dp['prs_merged'] != 1 else ''} merged"
+            elif dp.get("possibly_saturated"):
+                entry = f"{dt}: may be saturated"
+            elif dp["tasks_created"] > 0:
+                entry = f"{dt}: {dp['tasks_created']} task{'s' if dp['tasks_created'] != 1 else ''} in progress"
+            else:
+                continue
+            _tax: Dict[str, int] = dp.get("taxonomy_summary") or {}
+            _tax_total = sum(_tax.values())
+            if _tax_total >= 2:
+                _dom = max(_tax, key=lambda k: _tax[k])
+                if _tax[_dom] / _tax_total >= 0.5:
+                    _hint = _dir_tax_hints.get(_dom)
+                    if _hint:
+                        entry += f" ({_hint})"
+            dir_summaries.append(entry)
+        if dir_summaries:
+            narrative_parts.append("Research: " + "; ".join(dir_summaries) + ".")
+
+    if running_count > 0 or queued_count > 0:
+        pipeline_parts = []
+        if running_count > 0:
+            pipeline_parts.append(f"{running_count} running")
+        if queued_count > 0:
+            pipeline_parts.append(f"{queued_count} queued")
+        narrative_parts.append(", ".join(pipeline_parts) + ".")
+
+    if narrative_parts:
+        return " ".join(narrative_parts)
+    return f"All quiet — no activity in the last {hours}h."
+
+
 def compute_scope_mismatch_summary(
     *,
     completed_tasks: List[Task],
@@ -3306,3 +3485,127 @@ async def compute_direction_progress(
         dir_id_to_text,
         budget_alert_fired,
     )
+
+
+def compute_retry_analytics(
+    *,
+    failed_tasks: List[Task],
+    completed_tasks: List[Task],
+    dir_id_to_text: Dict[str, str],
+    window_start: "datetime",
+) -> Dict[str, Any]:
+    """Aggregate retry-pattern cost and outcome analytics from task lists.
+
+    Pure function — no database calls. Walks failed_tasks and completed_tasks
+    reading context fields _attempt_number, _previous_failure_class, and
+    _prior_attempts_cost to produce retry cost, waste, and success metrics.
+
+    Returns a dict with keys:
+      retry_overhead_cost_usd, retry_recovery_cost_usd,
+      retry_waste_by_direction (top-5), retry_task_count,
+      retry_success_count, avg_retries_before_failure,
+      retry_success_rate_by_class, retry_wasted_rate.
+    """
+    from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+
+    _retry_overhead_cost = 0.0
+    _retry_task_count = 0
+    _retry_attempt_sum = 0
+    _retry_waste_by_dir: Dict[str, Dict[str, Any]] = {}
+    for t in failed_tasks:
+        _attempt = (t.context or {}).get("_attempt_number") or 0
+        if _attempt > 1:
+            _retry_task_count += 1
+            _retry_attempt_sum += _attempt
+            _task_retry_cost = 0.0
+            if (
+                t.vm_provisioned_at
+                and t.vm_stopped_at
+                and t.vm_stopped_at >= window_start
+            ):
+                _rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
+                _task_retry_cost = (
+                    _rate * (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
+                )
+                _retry_overhead_cost += _task_retry_cost
+            _rw_did = (t.context or {}).get("direction_id")
+            if _rw_did:
+                _key = str(_rw_did)
+                _entry = _retry_waste_by_dir.setdefault(
+                    _key,
+                    {
+                        "direction_id": _key,
+                        "direction_text": dir_id_to_text.get(_key, ""),
+                        "retry_cost_usd": 0.0,
+                        "retry_task_count": 0,
+                    },
+                )
+                _entry["retry_cost_usd"] += _task_retry_cost
+                _entry["retry_task_count"] += 1
+
+    retry_overhead_cost_usd = round(_retry_overhead_cost, 4)
+    retry_waste_by_direction = sorted(
+        [
+            {**e, "retry_cost_usd": round(e["retry_cost_usd"], 4)}
+            for e in _retry_waste_by_dir.values()
+        ],
+        key=lambda x: x["retry_cost_usd"],
+        reverse=True,
+    )[:5]
+    retry_task_count = _retry_task_count
+    avg_retries_before_failure = (
+        round(_retry_attempt_sum / _retry_task_count, 2) if _retry_task_count else None
+    )
+
+    _retry_success_by_class: Dict[str, int] = {}
+    _retry_failure_by_class: Dict[str, int] = {}
+    _retry_success_count = 0
+    _retry_recovery_cost = 0.0
+    for t in completed_tasks:
+        _ctx = t.context or {}
+        if (_ctx.get("_attempt_number") or 0) > 1:
+            _retry_success_count += 1
+            _cls = _ctx.get("_previous_failure_class") or "UNKNOWN"
+            _retry_success_by_class[_cls] = _retry_success_by_class.get(_cls, 0) + 1
+            try:
+                _retry_recovery_cost += float(_ctx.get("_prior_attempts_cost") or 0.0)
+            except (TypeError, ValueError):
+                pass
+    retry_recovery_cost_usd = round(_retry_recovery_cost, 4)
+    for t in failed_tasks:
+        _ctx = t.context or {}
+        if (_ctx.get("_attempt_number") or 0) > 1:
+            _cls = _ctx.get("_previous_failure_class") or "UNKNOWN"
+            _retry_failure_by_class[_cls] = _retry_failure_by_class.get(_cls, 0) + 1
+    _retry_classes = set(_retry_success_by_class) | set(_retry_failure_by_class)
+    retry_success_rate_by_class = {
+        _cls: {
+            "merged": _retry_success_by_class.get(_cls, 0),
+            "failed": _retry_failure_by_class.get(_cls, 0),
+            "success_rate": round(
+                _retry_success_by_class.get(_cls, 0)
+                / (
+                    _retry_success_by_class.get(_cls, 0)
+                    + _retry_failure_by_class.get(_cls, 0)
+                ),
+                4,
+            ),
+        }
+        for _cls in _retry_classes
+    }
+    retry_success_count = _retry_success_count
+    _total_retried = _retry_success_count + _retry_task_count
+    retry_wasted_rate = (
+        round(_retry_task_count / _total_retried, 4) if _total_retried else None
+    )
+
+    return {
+        "retry_overhead_cost_usd": retry_overhead_cost_usd,
+        "retry_recovery_cost_usd": retry_recovery_cost_usd,
+        "retry_waste_by_direction": retry_waste_by_direction,
+        "retry_task_count": retry_task_count,
+        "retry_success_count": retry_success_count,
+        "avg_retries_before_failure": avg_retries_before_failure,
+        "retry_success_rate_by_class": retry_success_rate_by_class,
+        "retry_wasted_rate": retry_wasted_rate,
+    }
