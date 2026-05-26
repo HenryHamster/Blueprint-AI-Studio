@@ -1148,7 +1148,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         "base_branch"
     ) or _get_project_integration_branch(project_obj)
     short_id = str(task.id).replace("-", "")[:8]
-    research_branch = f"research/{short_id}"
+    research_branch_prefix = getattr(project_obj, "research_branch_prefix", "research/")
+    research_branch = f"{research_branch_prefix}{short_id}"
 
     # Create staging branch for this research batch.
     # Round 4 W1 (audit C2): _ensure_branch now returns Task | None.

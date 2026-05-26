@@ -590,10 +590,8 @@ async def _run_stale_branch_cleanup():
 
             # Batch-load task metadata for every branch whose name matches our
             # known short_id shape. One SQL query replaces ~N GitHub calls.
-            project_staging_prefixes = tuple(
-                (project.build_config or {}).get(
-                    "staging_branch_prefixes", _DEFAULT_STAGING_PREFIXES
-                )
+            project_staging_prefixes = getattr(
+                project, "staging_branch_prefixes", _DEFAULT_STAGING_PREFIXES
             )
             project_branch_re = _build_branch_short_id_re(
                 project_namespace, project_staging_prefixes

@@ -213,7 +213,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     ) or get_project_integration_branch(project)
     parent_hotfix = bool(task.first_payload.get("hotfix"))
     short_id = str(task.id).replace("-", "")[:8]
-    plan_branch = f"plan/{short_id}"
+    plan_branch_prefix = getattr(project, "plan_branch_prefix", "plan/")
+    plan_branch = f"{plan_branch_prefix}{short_id}"
 
     # Round 4 W1 (audit C2): _ensure_branch now returns Task | None.
     # On success, returns the freshly-locked Task (caller mutates under

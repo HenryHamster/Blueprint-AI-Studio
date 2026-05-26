@@ -341,18 +341,46 @@ class Project(SQLModel, table=True):
         return "blueprint"
 
     @property
+    def staging_branch_prefixes(self) -> tuple[str, ...]:
+        """Ordered staging branch prefixes for research/plan rollups.
+
+        Reads from ``build_config.staging_branch_prefixes`` if set; otherwise
+        returns Blueprint's conventional pair (``research/``, ``plan/``).
+        """
+        configured = (self.build_config or {}).get("staging_branch_prefixes")
+        if configured is not None:
+            prefixes = tuple(str(prefix) for prefix in configured if prefix)
+            if prefixes:
+                return prefixes
+        return ("research/", "plan/")
+
+    @property
+    def research_branch_prefix(self) -> str:
+        """Prefix for research staging branches."""
+        return self.staging_branch_prefixes[0]
+
+    @property
+    def plan_branch_prefix(self) -> str:
+        """Prefix for plan staging branches."""
+        return (
+            self.staging_branch_prefixes[1]
+            if len(self.staging_branch_prefixes) > 1
+            else "plan/"
+        )
+
+    @property
     def stale_branch_prefixes(self) -> tuple[str, ...]:
         """Branch name prefixes eligible for stale cleanup.
 
         Reads from build_config.stale_branch_prefixes if set; otherwise returns
-        the project's task-branch namespace alongside Blueprint's conventional
-        staging prefixes (``{namespace}/, research/, plan/``). An empty list in
-        build_config disables cleanup for this project.
+        the project's task-branch namespace alongside the project's staging
+        branch prefixes. An empty list in build_config disables cleanup for this
+        project.
         """
         configured = (self.build_config or {}).get("stale_branch_prefixes")
         if configured is not None:
             return tuple(configured)
-        return (f"{self.task_branch_namespace}/", "research/", "plan/")
+        return (f"{self.task_branch_namespace}/", *self.staging_branch_prefixes)
 
     @property
     def protected_branches(self) -> frozenset[str]:

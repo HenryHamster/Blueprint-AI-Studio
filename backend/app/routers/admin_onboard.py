@@ -251,6 +251,10 @@ async def onboard_project(
     except Exception as e:
         logger.warning(f"[ONBOARD] Default branch detection failed: {e}")
 
+    if default_branch:
+        project.integration_branch = default_branch
+        project.promotion_target = default_branch
+
     branch_whitelist: list[str] = []
     if default_branch:
         branch_whitelist.append(default_branch)
