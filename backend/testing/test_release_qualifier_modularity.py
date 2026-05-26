@@ -26,6 +26,14 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "_reconcile_if_pending_auto_merge_landed",
         "_reconcile_if_promotion_failed_landed",
     ),
+    "app.release_qualifier_ci": (
+        "_resolve_candidate_ci",
+        "_resolve_ci_at_finalize",
+    ),
+    "app.release_qualifier_infra": (
+        "_MIN_INFRA_ERROR_STREAK",
+        "_handle_infra_failure",
+    ),
     "app.release_qualifier_io": (
         "_spawn_release_audit_task",
         "_spawn_qualifier_smoketest_task",
