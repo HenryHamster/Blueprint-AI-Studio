@@ -11,7 +11,7 @@ import type { IssueImplementationConfig } from '../types/project';
 
 const config: IssueImplementationConfig = {
   enabled: true,
-  trigger_label: 'blueprint:implement',
+  trigger_label: 'auto:implement',
   max_per_hour: 4,
   max_concurrent: 3,
   base_branch: 'main',

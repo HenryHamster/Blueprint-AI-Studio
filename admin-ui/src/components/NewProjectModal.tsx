@@ -571,7 +571,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                             <div className="text-[10px] text-neutral-500 mt-0.5">
                               Label an issue{' '}
                               <code className="font-mono text-[9px] bg-neutral-700 px-1 py-0.5 rounded">
-                                {issueImplementationConfig?.trigger_label ?? 'blueprint:implement'}
+                                {issueImplementationConfig?.trigger_label ?? 'auto:implement'}
                               </code>
                               {' '}to spawn a task
                             </div>

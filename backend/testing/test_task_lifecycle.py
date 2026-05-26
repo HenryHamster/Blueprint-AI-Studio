@@ -4019,7 +4019,7 @@ async def test_close_loop_failure_no_status_message_leaves_summary_none(tl_db):
 #
 # The follow-up investigation is an autonomous Task (created_by=ORCHESTRATOR,
 # parent_task_id=None). Its spawn-time base_branch default MUST route through
-# runtime_config["integration_branch"] so that after the automain Phase-1
+# the project integration_branch column so that after the automain Phase-1
 # cutover the follow-up branches from automain, not the frozen LTS main.
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -4050,25 +4050,19 @@ async def _make_ci_remediation_task(session, project_id) -> Task:
 
 @pytest.mark.asyncio
 async def test_ci_auto_remediation_followup_uses_integration_branch(tl_db):
-    """When integration_branch is flipped to 'automain', the spawned follow-up
+    """When the project integration_branch is 'automain', the spawned follow-up
     investigation must set base_branch='automain' (not the hardcoded 'main')."""
-    import app.shared_state as _shared_state
     from app.task_lifecycle import _spawn_ci_auto_remediation_followup
 
     session, _ = tl_db
     project = await _make_project(session)
+    project.integration_branch = "automain"
+    await session.commit()
+    await session.refresh(project)
     task = await _make_ci_remediation_task(session, project.id)
 
-    original = _shared_state.runtime_config.get("integration_branch")
-    _shared_state.runtime_config["integration_branch"] = "automain"
-    try:
-        spawned = await _spawn_ci_auto_remediation_followup(task, session)
-        await session.commit()
-    finally:
-        if original is None:
-            _shared_state.runtime_config.pop("integration_branch", None)
-        else:
-            _shared_state.runtime_config["integration_branch"] = original
+    spawned = await _spawn_ci_auto_remediation_followup(task, session)
+    await session.commit()
 
     assert spawned is True
     result = await session.execute(
@@ -4079,31 +4073,21 @@ async def test_ci_auto_remediation_followup_uses_integration_branch(tl_db):
     assert followup.parent_task_id is None
     assert followup.first_payload.get("type") == "investigate"
     assert followup.first_payload.get("base_branch") == "automain", (
-        "CI auto-remediation follow-up bypassed the integration_branch knob"
+        "CI auto-remediation follow-up bypassed the integration_branch column"
     )
 
 
 @pytest.mark.asyncio
 async def test_ci_auto_remediation_followup_defaults_to_main(tl_db):
-    """With integration_branch at its default 'main', the follow-up branches
-    from 'main' — preserving pre-cutover behavior."""
-    import app.shared_state as _shared_state
+    """With no project override, the follow-up branches from 'main'."""
     from app.task_lifecycle import _spawn_ci_auto_remediation_followup
 
     session, _ = tl_db
     project = await _make_project(session)
     task = await _make_ci_remediation_task(session, project.id)
 
-    original = _shared_state.runtime_config.get("integration_branch")
-    _shared_state.runtime_config["integration_branch"] = "main"
-    try:
-        spawned = await _spawn_ci_auto_remediation_followup(task, session)
-        await session.commit()
-    finally:
-        if original is None:
-            _shared_state.runtime_config.pop("integration_branch", None)
-        else:
-            _shared_state.runtime_config["integration_branch"] = original
+    spawned = await _spawn_ci_auto_remediation_followup(task, session)
+    await session.commit()
 
     assert spawned is True
     result = await session.execute(

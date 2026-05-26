@@ -247,8 +247,6 @@ _previously_failing_types: set[str] = set()
 _all_accounts_blocked_alerted: bool = False
 
 
-
-
 async def _emit_all_accounts_blocked_stall(
     session: AsyncSession,
     earliest_recovery: datetime | None,
@@ -3959,8 +3957,17 @@ async def orchestrator_worker():
                             ci_branch = ci_loop.get("branch", "") or ci_payload.get(
                                 "branch", ""
                             )
-                            ci_base = ci_loop.get("base_branch", "") or ci_payload.get(
-                                "base_branch", "main"
+                            _orch_ci_project = (
+                                await session.get(Project, ci_task.project_id)
+                                if ci_task.project_id
+                                else None
+                            )
+                            ci_base = (
+                                ci_loop.get("base_branch", "")
+                                or ci_payload.get("base_branch", "")
+                                or _shared_state.get_project_integration_branch(
+                                    _orch_ci_project
+                                )
                             )
                             ci_orig_id = ci_loop.get(
                                 "original_task_id", ""

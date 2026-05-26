@@ -291,6 +291,8 @@ async def _attempt_merge_with_retry_and_escalation(
     """
     from app.github import merge_pull_request, create_pr_comment, get_pull_request
     from app.main import _maybe_create_failure_alert
+    from app.models import Project
+    from app.shared_state import get_project_integration_branch
 
     ci_loop = (task.context or {}).get("review_loop", {})
     ci_pr_number = ci_loop.get("pr_number")
@@ -299,7 +301,14 @@ async def _attempt_merge_with_retry_and_escalation(
         "original_task_id", ""
     )
     ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
-    ci_base = ci_loop.get("base_branch", "") or ci_payload.get("base_branch", "main")
+    _merge_project = (
+        await session.get(Project, task.project_id) if task.project_id else None
+    )
+    ci_base = (
+        ci_loop.get("base_branch", "")
+        or ci_payload.get("base_branch", "")
+        or get_project_integration_branch(_merge_project)
+    )
 
     # Round 4 W1: capture a content snapshot BEFORE releasing the lock.
     # ``parent_id_local`` mirrors the snapshot-stale convention from
@@ -1180,6 +1189,8 @@ async def handle_ci_completion(
     from app.github import create_pr_comment
     from app.main import _maybe_create_failure_alert
     from app.broadcast import broadcast_to_project
+    from app.models import Project
+    from app.shared_state import get_project_integration_branch
 
     # Serialize concurrent callers (webhook + poller) by locking the task row.
     # skip_locked: if another handler already holds the lock, exit — it will
@@ -1218,7 +1229,14 @@ async def handle_ci_completion(
     ci_pr_number = ci_loop.get("pr_number")
     ci_payload = task.first_payload
     ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
-    ci_base = ci_loop.get("base_branch", "") or ci_payload.get("base_branch", "main")
+    _ci_project = (
+        await session.get(Project, task.project_id) if task.project_id else None
+    )
+    ci_base = (
+        ci_loop.get("base_branch", "")
+        or ci_payload.get("base_branch", "")
+        or get_project_integration_branch(_ci_project)
+    )
     ci_orig_id = ci_loop.get("original_task_id", "") or ci_payload.get(
         "original_task_id", ""
     )

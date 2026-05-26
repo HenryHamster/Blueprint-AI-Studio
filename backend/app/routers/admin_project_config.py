@@ -279,7 +279,7 @@ async def update_auto_remediation_config(
 
 _ISSUE_IMPLEMENTATION_DEFAULTS: Dict[str, Any] = {
     "enabled": False,
-    "trigger_label": "blueprint:implement",
+    "trigger_label": "auto:implement",
     "max_per_hour": 3,
     "max_concurrent": 3,
     "base_branch": "main",

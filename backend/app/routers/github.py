@@ -899,7 +899,7 @@ async def github_webhook(
                 if project:
                     config = (project.design_doc or {}).get("_issue_implementation", {})
                     if config.get("enabled") and label_name == config.get(
-                        "trigger_label", "blueprint:implement"
+                        "trigger_label", "auto:implement"
                     ):
                         from app.issue_implementation import (
                             _handle_issue_implementation,

@@ -469,23 +469,11 @@ runtime_config: Dict = {
     # window and the typical role transition cadence; tunable down for
     # tighter slot budgets.
     "next_role_poll_timeout_secs": 180,
-    # Integration trunk branch. Autonomous spawn-time base_branch defaults
-    # route through this value so Phase 1 can retarget all pipeline work
-    # from "main" to "automain" with a single config flip. Default "main"
-    # preserves existing behavior until Phase 1 activates.
-    # Operator-tunable via runtime_config_json; persisted across restarts.
-    "integration_branch": "main",
     # Task-branch namespace (the leading segment of ``{namespace}/{prefix}-{8hex}``
     # agent work branches). DEPRECATED transitional global fallback — per-project
     # ``build_config.task_branch_namespace`` is the real source of truth. Default
     # ``"blueprint"`` preserves byte-identical behavior for the self-repo.
     "task_branch_namespace": "blueprint",
-    # Promotion/deploy target branch — the LTS branch that integration_branch
-    # promotes INTO and that hotfixes land on. Defaults to "main" so self-repo
-    # behavior is byte-for-byte identical. The LTS model is considered active
-    # whenever integration_branch and promotion_target are distinct branches.
-    # Operator-tunable via runtime_config_json; persisted across restarts.
-    "promotion_target": "main",
     # Release qualifier (Phase 3+). promotion_enabled gates whether the
     # qualifier may promote a qualified automain candidate to main — default
     # False ships the qualifier in dry-run (score + log, never promote).
@@ -525,17 +513,12 @@ def get_project_integration_branch(project) -> str:
 
     Fallback chain:
       1. project.integration_branch (per-project column, added by migration 0122+)
-      2. runtime_config["integration_branch"] (DEPRECATED global — transitional fallback for one release)
-      3. "main"
+      2. "main"
 
-    Using getattr so this helper is safe to call before the model migration lands
-    (cluster 2/9 adds the column; until then the attribute will not exist).
+    The deprecated runtime_config bridge was removed after the per-project
+    column stabilized across the migration/backfill rollout.
     """
-    per_project = getattr(project, "integration_branch", None)
-    if per_project:
-        return per_project
-    # DEPRECATED: global runtime_config fallback — remove after per-project column is stable
-    return runtime_config.get("integration_branch", "main")
+    return getattr(project, "integration_branch", None) or "main"
 
 
 def get_project_task_branch_namespace(project) -> str:
@@ -558,22 +541,36 @@ def get_project_task_branch_namespace(project) -> str:
     return runtime_config.get("task_branch_namespace", TASK_BRANCH_NAMESPACE_DEFAULT)
 
 
+def get_project_pr_title_prefix(project) -> str:
+    """Return the PR title prefix string for a project, with a trailing space.
+
+    Reads ``build_config['pr_title_prefix']``.  If set, returns the value with
+    a single trailing space so callers can write ``f"{prefix}Rollup: ..."``
+    directly.  If absent or empty, returns ``""`` so no prefix is injected.
+
+    Example ``build_config`` entry::
+
+        {"pr_title_prefix": "[Blueprint]"}
+    """
+    if project is not None:
+        build_config = getattr(project, "build_config", None) or {}
+        per_project = build_config.get("pr_title_prefix")
+        if per_project:
+            return f"{per_project} "
+    return ""
+
+
 def get_project_promotion_target(project) -> str:
     """Return the promotion target branch for a project.
 
     Fallback chain:
       1. project.promotion_target (per-project column, added by migration 0125+)
-      2. runtime_config["promotion_target"] (DEPRECATED global — transitional fallback for one release)
-      3. "main"
+      2. "main"
 
-    Using getattr so this helper is safe to call before the model migration lands
-    (cluster 1/6 adds the column; until then the attribute will not exist).
+    The deprecated runtime_config bridge was removed after the per-project
+    column stabilized across the migration/backfill rollout.
     """
-    per_project = getattr(project, "promotion_target", None)
-    if per_project:
-        return per_project
-    # DEPRECATED: global runtime_config fallback — remove after per-project column is stable
-    return runtime_config.get("promotion_target", "main")
+    return getattr(project, "promotion_target", None) or "main"
 
 
 def get_project_broadcast_limit(project) -> int:
@@ -854,10 +851,6 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "reserved_slots_for_types",
                         config_json["reserved_slots_for_types"],
                     )
-                if "integration_branch" in config_json:
-                    _set("integration_branch", str(config_json["integration_branch"]))
-                if "promotion_target" in config_json:
-                    _set("promotion_target", str(config_json["promotion_target"]))
                 if "promotion_enabled" in config_json:
                     _set(
                         "promotion_enabled",

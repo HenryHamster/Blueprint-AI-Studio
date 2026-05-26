@@ -732,6 +732,60 @@ class TestSecurityIntegrity:
         )
 
 
+# ── Base-branch fallback hardening ─────────────────────────────────────────
+
+
+class TestBaseBranchFallback:
+    """Guard against re-introduction of hardcoded 'main' base_branch fallbacks.
+
+    Every CI-fail → fix-spawn path must resolve base_branch through
+    get_project_integration_branch() so projects whose LTS branch is not
+    literally 'main' get the correct target.
+    """
+
+    def test_no_hardcoded_main_base_branch_fallback(self):
+        """No production module under backend/app/ may use .get('base_branch', 'main').
+
+        The only correct pattern is the three-chain:
+          ci_loop.get('base_branch', '') or payload.get('base_branch', '') or
+          get_project_integration_branch(project)
+
+        payload_schemas.py line 90 uses Field(default='main') for the schema
+        default — every spawn site overrides this, so it's explicitly allowed.
+        """
+        import os
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        # Files where the pattern is legitimately present (schema defaults, not
+        # defensive fallbacks in CI-completion paths).
+        # admin.py: sibling task (feat: per-project PR title prefix) is
+        # migrating those sites to get_project_integration_branch — exempt
+        # until that PR merges.
+        allow_list = {"payload_schemas.py", "admin.py"}
+
+        pattern = re.compile(r'\.get\(["\']base_branch["\'],\s*["\']main["\']')
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in files:
+                if not fname.endswith(".py"):
+                    continue
+                if fname in allow_list:
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    for lineno, line in enumerate(f, start=1):
+                        if pattern.search(line):
+                            rel = os.path.relpath(fpath, app_dir)
+                            offenders.append(f"  {rel}:{lineno}: {line.rstrip()}")
+        assert not offenders, (
+            "Found hardcoded .get('base_branch', 'main') fallbacks in backend/app/.\n"
+            "Replace with the three-chain pattern:\n"
+            "  ci_loop.get('base_branch', '') or payload.get('base_branch', '') or\n"
+            "  get_project_integration_branch(project)\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
+
 # ── Deployment State Model ──────────────────────────────────────────────────
 
 

@@ -138,22 +138,13 @@ async def test_two_projects_independent_integration_branches(
 
 
 @pytest.mark.asyncio
-async def test_get_project_integration_branch_helper_legacy_fallback():
-    """The helper falls back to runtime_config when project has no integration_branch set."""
-    original = runtime_config.get("integration_branch")
-    try:
-        runtime_config["integration_branch"] = "legacy-trunk"
+async def test_get_project_integration_branch_helper_defaults_to_main():
+    """The helper falls back to the per-project default of 'main'."""
 
-        class _FakeProject:
-            integration_branch = None
+    class _FakeProject:
+        integration_branch = None
 
-        result = get_project_integration_branch(_FakeProject())
-        assert result == "legacy-trunk"
-    finally:
-        if original is None:
-            runtime_config.pop("integration_branch", None)
-        else:
-            runtime_config["integration_branch"] = original
+    assert get_project_integration_branch(_FakeProject()) == "main"
 
 
 # ---------------------------------------------------------------------------
@@ -235,22 +226,13 @@ async def test_patch_promotion_target_rejects_invalid_chars(
 
 
 @pytest.mark.asyncio
-async def test_get_project_promotion_target_helper_legacy_fallback():
-    """The helper falls back to runtime_config when project has no promotion_target set."""
-    original = runtime_config.get("promotion_target")
-    try:
-        runtime_config["promotion_target"] = "legacy-lts"
+async def test_get_project_promotion_target_helper_defaults_to_main():
+    """The helper falls back to the per-project default of 'main'."""
 
-        class _FakeProject:
-            promotion_target = None
+    class _FakeProject:
+        promotion_target = None
 
-        result = get_project_promotion_target(_FakeProject())
-        assert result == "legacy-lts"
-    finally:
-        if original is None:
-            runtime_config.pop("promotion_target", None)
-        else:
-            runtime_config["promotion_target"] = original
+    assert get_project_promotion_target(_FakeProject()) == "main"
 
 
 # ---------------------------------------------------------------------------

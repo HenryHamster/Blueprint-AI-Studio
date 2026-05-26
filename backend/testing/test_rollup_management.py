@@ -1,14 +1,4 @@
-"""Integration tests for the Alembic combined-chain guard wired into the
-rollup auto-merge decision in ``_check_and_trigger_rollup``.
-
-The DB-free chain helpers and the ``_validate_rollup_migration_chain`` guard
-itself are unit-tested in ``test_migration_chain.py``. These tests exercise the
-call site: a small rollup PR targeting an intermediate branch must auto-merge
-when the combined migration chain is clean (or untouched), and must be HELD for
-approval + routed to a re-chain fix when the chain is invalid — never merged.
-The guard is fail-safe: an unfetchable/unparseable migration diff defers rather
-than waving the merge through.
-"""
+"""Tests for rollup management: Alembic combined-chain guard and PR title prefix."""
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -428,3 +418,60 @@ async def test_unfetchable_migration_diff_defers_failsafe(cleanup_db, mocker):
     await cleanup_db.refresh(parent)
     assert parent.status == TaskStatus.EVALUATING
     assert parent.requires_approval is False
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: get_project_pr_title_prefix
+# ---------------------------------------------------------------------------
+
+
+class TestGetProjectPrTitlePrefix:
+    """Unit tests for the per-project PR title prefix helper."""
+
+    def _make_mock_project(self, build_config):
+        p = MagicMock()
+        p.build_config = build_config
+        return p
+
+    def test_prefix_configured_returns_value_with_trailing_space(self):
+        from app.shared_state import get_project_pr_title_prefix
+
+        project = self._make_mock_project({"pr_title_prefix": "[Blueprint]"})
+        assert get_project_pr_title_prefix(project) == "[Blueprint] "
+
+    def test_prefix_absent_returns_empty_string(self):
+        from app.shared_state import get_project_pr_title_prefix
+
+        project = self._make_mock_project({})
+        assert get_project_pr_title_prefix(project) == ""
+
+    def test_prefix_empty_string_returns_empty_string(self):
+        from app.shared_state import get_project_pr_title_prefix
+
+        project = self._make_mock_project({"pr_title_prefix": ""})
+        assert get_project_pr_title_prefix(project) == ""
+
+    def test_none_project_returns_empty_string(self):
+        from app.shared_state import get_project_pr_title_prefix
+
+        assert get_project_pr_title_prefix(None) == ""
+
+    def test_none_build_config_returns_empty_string(self):
+        from app.shared_state import get_project_pr_title_prefix
+
+        project = self._make_mock_project(None)
+        assert get_project_pr_title_prefix(project) == ""
+
+    def test_custom_prefix_produces_correct_rollup_title(self):
+        from app.shared_state import get_project_pr_title_prefix
+
+        project = self._make_mock_project({"pr_title_prefix": "MyBrand"})
+        prefix = get_project_pr_title_prefix(project)
+        assert f"{prefix}Rollup: My Feature" == "MyBrand Rollup: My Feature"
+
+    def test_absent_prefix_produces_brand_neutral_rollup_title(self):
+        from app.shared_state import get_project_pr_title_prefix
+
+        project = self._make_mock_project({})
+        prefix = get_project_pr_title_prefix(project)
+        assert f"{prefix}Rollup: My Feature" == "Rollup: My Feature"

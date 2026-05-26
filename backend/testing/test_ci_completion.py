@@ -2263,3 +2263,132 @@ async def test_ci_failure_spawn_extracts_failing_test_names_into_prompt(
     )
     # And the broken-on-main fix-as-part-of-PR guidance should be there.
     assert "broken on `main`" in fix_prompt
+
+
+# ---------------------------------------------------------------------------
+# Per-project base_branch resolution
+# ---------------------------------------------------------------------------
+
+
+def _make_task_no_base(db_session, project, pr_number: int = 77):
+    """Create a minimal EVALUATING task whose payload and context omit base_branch."""
+    task = Task(
+        project_id=project.id,
+        title="CI base-branch test task",
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": pr_number,
+                "branch": "blueprint/feature-x",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": pr_number,
+                "branch": "blueprint/feature-x",
+                "iteration": 1,
+                "review_approved": True,
+            }
+        },
+        vm_instance_id=f"agent-vm-base-{uuid.uuid4().hex[:8]}",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_handle_ci_completion_uses_project_integration_branch(db_session, mocker):
+    """handle_ci_completion resolves base_branch from project.integration_branch
+    when neither review_loop nor payload carry one.
+    """
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+    mocker.patch(
+        "app.review_pipeline.build_ci_failure_fix_prompt",
+        return_value="fix prompt",
+    )
+
+    project = Project(
+        name="automain-project",
+        user_id="test-user",
+        integration_branch="automain",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task_no_base(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "failure", "failed_logs": "error"}
+    await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    spawn_mock.assert_called_once()
+    # Third positional arg to _spawn_pipeline_task is ci_base
+    called_base = spawn_mock.call_args.args[5]
+    assert called_base == "automain", (
+        f"Expected ci_base='automain' from project.integration_branch, got {called_base!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_conflict_spawn_uses_project_integration_branch(db_session, mocker):
+    """_attempt_merge_with_retry_and_escalation resolves ci_base from
+    project.integration_branch when payload and review_loop both omit base_branch.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open", "mergeable_state": "dirty"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "merge failed"},
+    )
+
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+
+    project = Project(
+        name="automain-merge-test",
+        user_id="test-user",
+        integration_branch="automain",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task_no_base(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    spawn_mock.assert_called_once()
+    called_base = spawn_mock.call_args.args[5]
+    assert called_base == "automain", (
+        f"Expected ci_base='automain' from project.integration_branch, got {called_base!r}"
+    )

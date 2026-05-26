@@ -10,7 +10,7 @@ interface ProjectIssueImplementationSectionProps {
 
 const DEFAULT_CONFIG: IssueImplementationConfig = {
   enabled: false,
-  trigger_label: 'blueprint:implement',
+  trigger_label: 'auto:implement',
   max_per_hour: 2,
   max_concurrent: 2,
   base_branch: '',
@@ -101,7 +101,7 @@ export function ProjectIssueImplementationSection({
           type="text"
           value={triggerLabel}
           onChange={e => setTriggerLabel(e.target.value)}
-          placeholder="blueprint:implement"
+          placeholder="auto:implement"
           className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
         />
       </div>

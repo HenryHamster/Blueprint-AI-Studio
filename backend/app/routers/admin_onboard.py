@@ -278,7 +278,7 @@ async def onboard_project(
     }
     design_doc["_issue_implementation"] = {
         "enabled": False,
-        "trigger_label": "blueprint:implement",
+        "trigger_label": "auto:implement",
         "max_per_hour": 3,
         "max_concurrent": 3,
         "base_branch": default_branch or "main",

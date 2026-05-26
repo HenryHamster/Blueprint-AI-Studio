@@ -1893,14 +1893,13 @@ async def test_protected_branches_always_includes_promotion_target(svc_db):
     project = Project(
         name="Promotion Target Project",
         user_id="user1",
+        promotion_target="release-lts",
         build_config={"protected_branches": ["trunk"]},
     )
     svc_db.add(project)
     await svc_db.commit()
     await svc_db.refresh(project)
-    with patch.dict(_shared_state.runtime_config, {"promotion_target": "release-lts"}):
-        protected = project.protected_branches
-    assert "release-lts" in protected
+    assert "release-lts" in project.protected_branches
 
 
 # ── _derive_task_branch: task-type -> branch prefix mapping ──────────────────

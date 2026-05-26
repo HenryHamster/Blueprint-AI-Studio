@@ -1,6 +1,6 @@
 """Issue-to-implementation: spawn create tasks when issues are labeled.
 
-When a GitHub issue receives the configured trigger label (default: 'blueprint:implement'),
+When a GitHub issue receives the configured trigger label (default: 'auto:implement'),
 this module fetches issue context and spawns a create-type task.  Guard rails prevent
 runaway spawning (rate limit, duplicate detection, concurrent limit).
 """

@@ -6441,7 +6441,7 @@ async def test_tiered_unproductive_cooldown_escalates_with_consecutive_failures(
 #
 # The manual /research and /strategic-cycle endpoints produce the SAME task
 # types as the autonomous strategic/research spawns. Their spawn-time
-# base_branch default MUST route through runtime_config["integration_branch"]
+# base_branch default MUST route through the project integration_branch column
 # so that after the automain Phase-1 cutover an operator-triggered cycle
 # drives the version lifecycle from automain, not the frozen LTS main.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6470,14 +6470,13 @@ async def _make_strategic_project(db_session, name: str):
 
 @pytest.mark.asyncio
 async def test_research_endpoint_uses_integration_branch(
-    client: AsyncClient, db_session, mocker, monkeypatch
+    client: AsyncClient, db_session, mocker
 ):
-    """When integration_branch is flipped to 'automain', the manual direction
-    /research endpoint must spawn with base_branch='automain'."""
-    import app.shared_state as _shared_state
-
-    monkeypatch.setitem(_shared_state.runtime_config, "integration_branch", "automain")
+    """When the project integration_branch is 'automain', /research must spawn with that base branch."""
     project_id = await _deploy_project(client, mocker)
+    project = await db_session.get(Project, uuid.UUID(project_id))
+    project.integration_branch = "automain"
+    await db_session.commit()
     direction = await _add_direction(client, project_id, text="Routed research")
     direction_id = direction["id"]
 
@@ -6500,19 +6499,15 @@ async def test_research_endpoint_uses_integration_branch(
     assert len(research_tasks) == 1, "expected exactly one research task to be created"
     for t in research_tasks:
         assert t.first_payload.get("base_branch") == "automain", (
-            "manual /research endpoint bypassed the integration_branch knob"
+            "manual /research endpoint bypassed the integration_branch column"
         )
 
 
 @pytest.mark.asyncio
 async def test_research_endpoint_defaults_to_main(
-    client: AsyncClient, db_session, mocker, monkeypatch
+    client: AsyncClient, db_session, mocker
 ):
-    """With integration_branch at its default 'main', the manual /research
-    endpoint spawns from 'main' — preserving pre-cutover behavior."""
-    import app.shared_state as _shared_state
-
-    monkeypatch.setitem(_shared_state.runtime_config, "integration_branch", "main")
+    """With no project override, the manual /research endpoint spawns from 'main'."""
     project_id = await _deploy_project(client, mocker)
     direction = await _add_direction(client, project_id, text="Default research")
     direction_id = direction["id"]
@@ -6547,14 +6542,12 @@ async def test_research_endpoint_defaults_to_main(
     ],
 )
 async def test_strategic_cycle_endpoint_uses_integration_branch(
-    client: AsyncClient, db_session, monkeypatch, phase, expected_type
+    client: AsyncClient, db_session, phase, expected_type
 ):
-    """When integration_branch is flipped to 'automain', both phases of the
-    manual /strategic-cycle endpoint must spawn with base_branch='automain'."""
-    import app.shared_state as _shared_state
-
-    monkeypatch.setitem(_shared_state.runtime_config, "integration_branch", "automain")
+    """When the project integration_branch is 'automain', both phases must use that base branch."""
     project = await _make_strategic_project(db_session, f"automain strategic {phase}")
+    project.integration_branch = "automain"
+    await db_session.commit()
 
     resp = await client.post(
         f"/api/admin/projects/{project.id}/strategic-cycle",
@@ -6568,20 +6561,16 @@ async def test_strategic_cycle_endpoint_uses_integration_branch(
     for t in tasks:
         assert t.first_payload.get("type") == expected_type
         assert t.first_payload.get("base_branch") == "automain", (
-            f"manual /strategic-cycle ({phase}) bypassed the integration_branch knob"
+            f"manual /strategic-cycle ({phase}) bypassed the integration_branch column"
         )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["design_doc", "strategic_review"])
 async def test_strategic_cycle_endpoint_defaults_to_main(
-    client: AsyncClient, db_session, monkeypatch, phase
+    client: AsyncClient, db_session, phase
 ):
-    """With integration_branch at its default 'main', both phases of the
-    manual /strategic-cycle endpoint spawn from 'main'."""
-    import app.shared_state as _shared_state
-
-    monkeypatch.setitem(_shared_state.runtime_config, "integration_branch", "main")
+    """With no project override, both phases of the manual /strategic-cycle endpoint spawn from 'main'."""
     project = await _make_strategic_project(db_session, f"main strategic {phase}")
 
     resp = await client.post(
@@ -6600,7 +6589,7 @@ async def test_strategic_cycle_endpoint_defaults_to_main(
 def test_no_hardcoded_main_base_branch_in_directions_router():
     """Static guard: spawn payloads in routers/directions.py must never
     hardcode {"base_branch": "main"} — they must route through
-    runtime_config.get("integration_branch", "main") so the automain cutover
+    the project integration_branch column so the automain cutover
     takes effect. Inheritance reads `.get("base_branch", "main")` (a "(" or
     "," precedes the key) are a different, correct pattern and are allowed.
     """

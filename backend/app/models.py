@@ -306,16 +306,16 @@ class Project(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
     # Per-project trunk branch for autonomous task spawning.
-    # NULL means "use the global runtime_config fallback then 'main'".
+    # NULL means "fall back to 'main'".
     # Blueprint's own repo uses 'automain'; most other projects use 'main'.
-    # See shared_state.get_project_integration_branch for the full fallback chain.
+    # See shared_state.get_project_integration_branch.
     integration_branch: str | None = Field(
         default=None,
         sa_column=Column(String, nullable=True),
     )
-    # Per-project promotion (LTS) branch. NULL means fall back to
-    # runtime_config["promotion_target"] then "main" — identical semantics
-    # to integration_branch. See shared_state.get_project_promotion_target.
+    # Per-project promotion (LTS) branch. NULL means fall back to 'main' —
+    # identical semantics to integration_branch.
+    # See shared_state.get_project_promotion_target.
     promotion_target: str | None = Field(
         default=None,
         sa_column=Column(String, nullable=True),

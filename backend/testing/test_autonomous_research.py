@@ -2975,29 +2975,23 @@ def test_auto_decompose_falls_back_to_path_when_cochange_empty():
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 9. integration_branch routing — autonomous spawns must branch from the
-#    runtime_config integration branch (automain after the cutover), never a
+#    project integration_branch column (automain after the cutover), never a
 #    hardcoded "main", or they bypass the automain release-qualifier flow.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_autonomous_research_spawn_uses_integration_branch(
-    db_session, monkeypatch
-):
-    """When integration_branch is flipped to 'automain', an autonomous research
-    spawn must set base_branch='automain' (not the hardcoded 'main' default).
-
-    This exercises the shared _runtime_config.get("integration_branch", "main")
-    routing contract that every autonomous spawn-time base_branch default
-    relies on. A regression here would silently route autonomous tasks at the
-    frozen LTS main after the Phase-1 cutover."""
-    monkeypatch.setitem(_shared_state.runtime_config, "integration_branch", "automain")
+async def test_autonomous_research_spawn_uses_integration_branch(db_session):
+    """When the project integration_branch is 'automain', autonomous research
+    spawns must set base_branch='automain' (not the hardcoded 'main' default).
+    """
     project = Project(
         name="Integration Branch Routing",
         user_id="test-user-123",
         autonomous_enabled=True,
         directions=[_active_direction("d-intbr01")],
         vision={"purpose": "test"},
+        integration_branch="automain",
     )
     db_session.add(project)
     await db_session.commit()
@@ -3011,15 +3005,13 @@ async def test_autonomous_research_spawn_uses_integration_branch(
     for t in spawned:
         assert (t.payloads or [{}])[0].get("base_branch") == "automain", (
             f"task {t.id} ({(t.payloads or [{}])[0].get('type')}) bypassed the "
-            f"integration_branch knob"
+            f"integration_branch column"
         )
 
 
 @pytest.mark.asyncio
-async def test_autonomous_research_spawn_defaults_to_main(db_session, monkeypatch):
-    """With integration_branch at its default 'main' value, autonomous spawns
-    branch from 'main' — preserving pre-cutover behavior."""
-    monkeypatch.setitem(_shared_state.runtime_config, "integration_branch", "main")
+async def test_autonomous_research_spawn_defaults_to_main(db_session):
+    """With no project override, autonomous spawns branch from 'main'."""
     project = Project(
         name="Integration Branch Default",
         user_id="test-user-123",
@@ -3082,13 +3074,8 @@ def test_no_hardcoded_main_base_branch_in_autonomous_spawns():
 
 
 @pytest.mark.asyncio
-async def test_spawn_uses_project_integration_branch_column(db_session, monkeypatch):
-    """A project-level integration_branch column takes precedence over the global
-    runtime_config value.  Two projects with different values resolve independently.
-    """
-    monkeypatch.setitem(
-        _shared_state.runtime_config, "integration_branch", "global-trunk"
-    )
+async def test_spawn_uses_project_integration_branch_column(db_session):
+    """Two projects with different integration_branch column values resolve independently."""
     project_a = Project(
         name="Project A override",
         user_id="test-user-123",
@@ -3133,14 +3120,9 @@ async def test_spawn_uses_project_integration_branch_column(db_session, monkeypa
 
 @pytest.mark.asyncio
 async def test_spawn_falls_back_to_global_when_no_build_config_override(
-    db_session, monkeypatch
+    db_session,
 ):
-    """When build_config has no integration_branch key, the global runtime_config
-    value is used — behavior is byte-for-byte identical to before this change.
-    """
-    monkeypatch.setitem(
-        _shared_state.runtime_config, "integration_branch", "global-branch"
-    )
+    """When build_config has no integration_branch key, the project falls back to 'main'."""
     project = Project(
         name="No override project",
         user_id="test-user-123",
@@ -3159,8 +3141,8 @@ async def test_spawn_falls_back_to_global_when_no_build_config_override(
     spawned = result.scalars().all()
     assert spawned
     for t in spawned:
-        assert t.first_payload.get("base_branch") == "global-branch", (
-            f"task {t.id} should use global fallback, got: {t.first_payload.get('base_branch')}"
+        assert t.first_payload.get("base_branch") == "main", (
+            f"task {t.id} should fall back to main, got: {t.first_payload.get('base_branch')}"
         )
 
 

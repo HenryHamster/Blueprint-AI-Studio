@@ -2432,20 +2432,20 @@ class TestNotificationConfigSettings:
 
     @pytest.mark.asyncio
     async def test_release_flags_round_trip_on_get(self, client: AsyncClient):
-        """The automain/LTS release-control flags — integration_branch,
-        promotion_enabled, smoketest_enabled — are settable via PATCH and
-        visible on GET (regression: GET previously omitted them)."""
+        """The automain/LTS release-control flags — promotion_enabled,
+        smoketest_enabled — are settable via PATCH and visible on GET
+        (regression: GET previously omitted them). integration_branch is
+        per-project only; see TestIntegrationBranchConfig in
+        test_admin_project_config.py."""
         resp = await client.patch(
             "/api/admin/settings",
             json={
-                "integration_branch": "automain",
                 "promotion_enabled": True,
                 "smoketest_enabled": False,
             },
         )
         assert resp.status_code == 200
         body = (await client.get("/api/admin/settings")).json()
-        assert body["integration_branch"] == "automain"
         assert body["promotion_enabled"] is True
         assert body["smoketest_enabled"] is False
         # Restore the default so promotion_enabled does not leak to other tests.
@@ -3863,64 +3863,6 @@ class TestViewportDebt:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# admin_settings.py — integration_branch validation
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-class TestIntegrationBranchValidation:
-    """PATCH /api/admin/settings integration_branch must reject shell metacharacters."""
-
-    @pytest.mark.asyncio
-    async def test_integration_branch_rejects_shell_injection(
-        self, client: AsyncClient
-    ):
-        """integration_branch=main\";id;\" must be rejected with HTTP 400."""
-        resp = await client.patch(
-            "/api/admin/settings", json={"integration_branch": 'main";id;"'}
-        )
-        assert resp.status_code == 400
-
-    @pytest.mark.asyncio
-    async def test_integration_branch_accepts_valid(self, client: AsyncClient):
-        """Valid branch names (e.g. main, feature/foo-bar) must be accepted."""
-        resp = await client.patch(
-            "/api/admin/settings", json={"integration_branch": "main"}
-        )
-        assert resp.status_code == 200
-
-        resp2 = await client.patch(
-            "/api/admin/settings", json={"integration_branch": "feature/foo-bar"}
-        )
-        assert resp2.status_code == 200
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "bad_branch",
-        [
-            'main";id;"',  # double-quote + semicolon
-            "main;id",  # semicolon
-            "branch$HOME",  # dollar
-            "branch`id`",  # backtick
-            "branch|cat",  # pipe
-            "branch&id",  # ampersand
-            "branch(id)",  # parentheses
-            ".hidden",  # leading dot
-            "a/..b",  # dotdot
-            "a/.git/b",  # reserved component
-        ],
-    )
-    async def test_integration_branch_rejects_bad_names(
-        self, client: AsyncClient, bad_branch: str
-    ):
-        resp = await client.patch(
-            "/api/admin/settings", json={"integration_branch": bad_branch}
-        )
-        assert resp.status_code == 400, (
-            f"Expected 400 for branch {bad_branch!r}, got {resp.status_code}"
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # admin.py — Set Version Phase
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -4329,3 +4271,45 @@ class TestSrCatchRateHealth:
         assert data["category_count"] == 0
         assert data["last_sufficient_age_hours"] is None
         assert data["signal_age_hours"] is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# deploy.py — Deployment State & Rollback
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestDeployRollback:
+    @pytest.mark.asyncio
+    async def test_rollback_uses_orchestrator_service_name_env_var(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """trigger_rollback uses ORCHESTRATOR_SERVICE_NAME env var for gcloud invocation."""
+        from app.models import DeploymentState, DeploymentStatus
+
+        state = DeploymentState(
+            current_revision="rev-bad",
+            current_sha="sha123bad",
+            last_known_good_revision="rev-good",
+            last_known_good_sha="sha123good",
+            status=DeploymentStatus.STABLE,
+        )
+        db_session.add(state)
+        await db_session.commit()
+
+        monkeypatch.setenv("ORCHESTRATOR_SERVICE_NAME", "custom-service")
+        monkeypatch.setenv("GCP_PROJECT_ID", "test-project")
+        monkeypatch.setenv("GCP_REGION", "us-west1")
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stderr = ""
+
+            resp = await client.post("/api/admin/deploy-state/rollback")
+
+            assert resp.status_code == 200
+            assert mock_run.called
+            call_args = mock_run.call_args[0][0]
+            assert "custom-service" in call_args
+            assert "rev-good=100" in call_args
+            assert "us-west1" in call_args
+            assert "test-project" in call_args

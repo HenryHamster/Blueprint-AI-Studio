@@ -1,5 +1,3 @@
-import re
-
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -186,11 +184,6 @@ async def get_settings(
         "ci_backstop_timeout_minutes": _runtime_config.get(
             "ci_backstop_timeout_minutes", 60
         ),
-        # automain/LTS release-qualifier control flags — kept in sync with the
-        # _apply_settings write path and the runtime_config_json persistence.
-        # DEPRECATED: use per-project integration_branch via /projects/{id}/integration-branch.
-        # This global key remains as a transitional fallback for one release cycle.
-        "integration_branch": _runtime_config.get("integration_branch", "main"),
         "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
         "smoketest_enabled": bool(_runtime_config.get("smoketest_enabled", False)),
         "warm_continuity_enabled": bool(
@@ -428,35 +421,6 @@ async def _apply_settings(
                 detail="ci_backstop_timeout_minutes must be between 1 and 1440",
             )
         _runtime_config["ci_backstop_timeout_minutes"] = val
-    # automain/LTS — release-qualifier control flags (Phase 0/1). Persisted to
-    # runtime_config_json below and synced back into runtime_config every ~15s.
-    # DEPRECATED: integration_branch in global settings is a transitional fallback only.
-    # Per-project values are managed via PATCH /projects/{id}/integration-branch.
-    if "integration_branch" in payload:
-        val = str(payload["integration_branch"] or "").strip()
-        _branch_pattern = re.compile(r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$")
-        if not val or len(val) > 200 or not _branch_pattern.match(val):
-            raise HTTPException(
-                status_code=400,
-                detail="integration_branch must be a valid branch name",
-            )
-        for part in val.split("/"):
-            if part in (".git", ".lock"):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"integration_branch contains reserved component: {part}",
-                )
-            if part.startswith("."):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"integration_branch component cannot start with a dot: {part}",
-                )
-            if ".." in part:
-                raise HTTPException(
-                    status_code=400,
-                    detail="integration_branch component cannot contain '..'",
-                )
-        _runtime_config["integration_branch"] = val
     if "promotion_enabled" in payload:
         _runtime_config["promotion_enabled"] = bool(payload["promotion_enabled"])
     if "smoketest_enabled" in payload:
@@ -1499,10 +1463,6 @@ async def _apply_settings(
                             ],
                             "throttle_seconds": 30,
                         },
-                    ),
-                    # DEPRECATED global fallback — per-project values use Project.integration_branch
-                    "integration_branch": _runtime_config.get(
-                        "integration_branch", "main"
                     ),
                     "promotion_enabled": bool(
                         _runtime_config.get("promotion_enabled", False)

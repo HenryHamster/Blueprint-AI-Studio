@@ -39,6 +39,7 @@ from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/
 from app.shared_state import (
     runtime_config as _runtime_config,
     get_project_integration_branch as _get_project_integration_branch,
+    get_project_pr_title_prefix as _get_project_pr_title_prefix,
     derive_task_branch as _derive_task_branch,
 )
 
@@ -1651,7 +1652,8 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         f"[ROLLUP] Resuming with existing PR #{rollup_pr_number}"
                     )
                 else:
-                    pr_title = f"[Blueprint] Rollup: {parent.title}"
+                    _prefix = _get_project_pr_title_prefix(project)
+                    pr_title = f"{_prefix}Rollup: {parent.title}"
                     _dir_id = parent.first_payload.get(
                         "current_direction_id"
                     ) or parent_ctx.get("direction_id")

@@ -17,6 +17,7 @@ from app.database import get_session
 from app.shared_state import (
     derive_task_branch as _derive_task_branch,
     get_project_integration_branch,
+    get_project_pr_title_prefix as _get_project_pr_title_prefix,
     get_project_promotion_target as _get_project_promotion_target_for_task,
     limiter,
 )
@@ -2794,7 +2795,9 @@ async def trigger_rollup(
 
     from app.rollup_management import _build_rollup_pr_body
 
-    pr_title = f"[Blueprint] Rollup: {task.title}"
+    _project = await session.get(Project, task.project_id)
+    _prefix = _get_project_pr_title_prefix(_project)
+    pr_title = f"{_prefix}Rollup: {task.title}"
     _dir_id = task.first_payload.get("current_direction_id") or ctx.get("direction_id")
     _dir_title = ctx.get("direction_title") or task.title
     pr_body = _build_rollup_pr_body(

@@ -7456,14 +7456,26 @@ async def test_claim_direction_first_attempt_feedback_in_direction_context(
     assert next(iter(fa)) == "test-coverage"  # sorted by count desc
 
 
-async def _setup_smoketest_task(db_session, vm_id: str, base_branch: str = "main"):
+async def _setup_smoketest_task(
+    db_session,
+    vm_id: str,
+    base_branch: str = "main",
+    *,
+    integration_branch: str | None = None,
+    promotion_target: str | None = None,
+):
     """Create a project + IN_PROGRESS smoketest task.
 
     Leaving attempt_count at 0 keeps the task on the normal-retry path on FAILED,
     so the permanent-failure auto-debug spawn does not also fire — isolating the
     SMOKETEST plan-task spawn behavior under test.
     """
-    project = Project(name=f"Smoketest {vm_id}", user_id="test-user-smoketest")
+    project = Project(
+        name=f"Smoketest {vm_id}",
+        user_id="test-user-smoketest",
+        integration_branch=integration_branch,
+        promotion_target=promotion_target,
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -7586,11 +7598,12 @@ async def test_smoketest_main_failure_post_cutover_spawns_hotfix(
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
-    mocker.patch.dict(
-        "app.shared_state.runtime_config", {"integration_branch": "automain"}
-    )
 
-    _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-hotfix")
+    _, task = await _setup_smoketest_task(
+        db_session,
+        "agent-vm-smoke-hotfix",
+        integration_branch="automain",
+    )
 
     import json as _json
 
@@ -7645,13 +7658,13 @@ async def test_smoketest_post_promotion_detection_uses_promotion_target_config(
     mocker.patch("app.main.delete_agent_vm", return_value=None)
     mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
-    mocker.patch.dict(
-        "app.shared_state.runtime_config",
-        {"integration_branch": "develop", "promotion_target": "stable"},
-    )
 
     _, task = await _setup_smoketest_task(
-        db_session, "agent-vm-smoke-promo-cfg", base_branch="stable"
+        db_session,
+        "agent-vm-smoke-promo-cfg",
+        base_branch="stable",
+        integration_branch="develop",
+        promotion_target="stable",
     )
 
     import json as _json
@@ -11533,14 +11546,12 @@ async def test_hotfix_backmerge_runs_for_hotfix_merge_to_main(db_session, mocker
         user_id="hotfix-user",
         github_owner="acme",
         github_repo="widget",
+        integration_branch="automain",
     )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    mocker.patch.dict(
-        "app.shared_state.runtime_config", {"integration_branch": "automain"}
-    )
     mocker.patch(
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="gh-token"),
