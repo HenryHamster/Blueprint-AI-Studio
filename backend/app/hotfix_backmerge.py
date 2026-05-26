@@ -96,7 +96,7 @@ _BLOCKED_ALERT_TITLE = "Back-merge failed: main -> automain"
 # automain-bound fix, NOT a hotfix.  It must NOT carry hotfix:true.
 _RESOLUTION_BASE_BRANCH = "automain"
 
-# Priority for the conflict-resolution plan task — expedited (design doc:
+# Priority for the conflict-resolution task — expedited (design doc:
 # back-merge conflict resolution gates the next promotion; >= 90).
 _RESOLUTION_PRIORITY = 95
 

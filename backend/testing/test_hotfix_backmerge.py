@@ -447,6 +447,7 @@ async def test_advisory_lock_prevents_concurrent_duplicate_resolver(db_session, 
     )
 
 
+@pytest.mark.asyncio
 async def test_open_backmerge_pr_conflict_respawns_after_resolver_terminal(
     db_session, mocker
 ):

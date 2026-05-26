@@ -1690,7 +1690,6 @@ def _classify_failure_class(
     if isinstance(persisted_class, str) and persisted_class:
         return persisted_class
 
-
     # Fast path: agent already reported a structured category — prefer it over regex.
     # Accept both the legacy lowercase labels (pre-normalization writes) and the
     # canonical uppercase names written by normalize_agent_failure_category().
