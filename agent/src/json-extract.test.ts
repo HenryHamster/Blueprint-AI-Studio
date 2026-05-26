@@ -86,6 +86,31 @@ describe('extractJsonObject', () => {
     const text = '{"key": "first"} {"key": "second"}';
     expect(extractJsonObject(text, 'key')).toEqual({ key: 'first' });
   });
+
+  it('rejects Codex envelope where required keys appear only inside a nested escaped string', () => {
+    // Simulates item.completed JSONL: the memo JSON is an escaped string in item.text,
+    // not an own property of the outer object.
+    const envelope =
+      '{"type":"item.completed","item":{"type":"agent_message","text":"{\\"summary\\":\\"x\\",\\"reasoning\\":\\"y\\"}"}}';
+    expect(extractJsonObject(envelope, 'summary', 'reasoning')).toBeNull();
+  });
+
+  it('skips envelope-like object and returns the real memo object that follows', () => {
+    const text = '{"a":"summary in string"} {"summary":1,"reasoning":2}';
+    expect(extractJsonObject(text, 'summary', 'reasoning')).toEqual({ summary: 1, reasoning: 2 });
+  });
+
+  it('surfaces parsed_object_missing_key reason when required keys appear only as values, not own keys', () => {
+    // {"x": "summary", "y": "reasoning"} — both key strings appear in the text as VALUES,
+    // but the parsed object has "x"/"y" as own keys, not "summary"/"reasoning".
+    const text = '{"x": "summary", "y": "reasoning"}';
+    const result = extractJsonObjectDetailed(text, 'summary', 'reasoning');
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toBe('parsed_object_missing_key');
+      expect(describeJsonExtractionResult(result)).toContain('parsed_object_missing_key');
+    }
+  });
 });
 
 describe('extractJsonArray', () => {

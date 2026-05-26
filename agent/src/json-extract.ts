@@ -48,7 +48,9 @@ export type JsonExtractionMissReason =
   | 'missing_required_key'
   | 'no_json_start'
   | 'unbalanced_json'
-  | 'no_matching_candidate';
+  | 'no_matching_candidate'
+  | 'parsed_object_missing_key'
+  | 'parsed_array_missing_key';
 
 export type JsonExtractionResult<T> =
   | { ok: true; value: T }
@@ -89,6 +91,7 @@ export function extractJsonObjectDetailed<T = Record<string, unknown>>(
   const parseErrors: string[] = [];
   let sawStart = false;
   let sawUnbalanced = false;
+  let sawMissingOwnKey = false;
   while (pos < text.length) {
     const start = text.indexOf('{', pos);
     if (start === -1) break;
@@ -101,7 +104,17 @@ export function extractJsonObjectDetailed<T = Record<string, unknown>>(
     const candidate = text.slice(start, end + 1);
     if (requiredKeys.every(k => candidate.includes(`"${k}"`))) {
       try {
-        return { ok: true, value: JSON.parse(candidate) as T };
+        const parsed = JSON.parse(candidate) as Record<string, unknown>;
+        // Guard against envelope-wrapped output (e.g. Codex JSONL item.completed)
+        // where required keys appear as substrings inside a nested string value
+        // but are not own properties of the parsed object.
+        const missingKeys = requiredKeys.filter(k => !(k in parsed));
+        if (missingKeys.length > 0) {
+          sawMissingOwnKey = true;
+          pos = start + 1;
+          continue;
+        }
+        return { ok: true, value: parsed as T };
       } catch (err: unknown) {
         parseErrors.push(err instanceof Error ? err.message : String(err));
       }
@@ -122,6 +135,15 @@ export function extractJsonObjectDetailed<T = Record<string, unknown>>(
       reason: 'no_json_start',
       requiredKeys,
       detail: 'no object opening brace found',
+    };
+  }
+  if (sawMissingOwnKey) {
+    return {
+      ok: false,
+      kind: 'object',
+      reason: 'parsed_object_missing_key',
+      requiredKeys,
+      detail: `object candidate(s) parsed but required keys were not own properties (envelope-wrapping?)`,
     };
   }
   if (sawUnbalanced) {
@@ -171,6 +193,7 @@ export function extractJsonArrayDetailed<T = unknown[]>(
   const parseErrors: string[] = [];
   let sawStart = false;
   let sawUnbalanced = false;
+  let sawMissingOwnKey = false;
   while (pos < text.length) {
     const start = text.indexOf('[', pos);
     if (start === -1) break;
@@ -183,7 +206,26 @@ export function extractJsonArrayDetailed<T = unknown[]>(
     const candidate = text.slice(start, end + 1);
     if (requiredKeys.every(k => candidate.includes(`"${k}"`))) {
       try {
-        return { ok: true, value: JSON.parse(candidate) as T };
+        const parsed = JSON.parse(candidate) as unknown[];
+        // For arrays with required keys, check that at least one top-level element
+        // object actually has all required keys as own properties. This prevents
+        // envelope arrays (where keys appear only in nested string values) from
+        // being returned. If no top-level elements are plain objects, skip this check.
+        if (requiredKeys.length > 0 && Array.isArray(parsed)) {
+          const elementObjects = parsed.filter(
+            (el): el is Record<string, unknown> =>
+              el !== null && typeof el === 'object' && !Array.isArray(el),
+          );
+          if (
+            elementObjects.length > 0 &&
+            !elementObjects.some(el => requiredKeys.every(k => k in el))
+          ) {
+            sawMissingOwnKey = true;
+            pos = start + 1;
+            continue;
+          }
+        }
+        return { ok: true, value: parsed as T };
       } catch (err: unknown) {
         parseErrors.push(err instanceof Error ? err.message : String(err));
       }
@@ -204,6 +246,15 @@ export function extractJsonArrayDetailed<T = unknown[]>(
       reason: 'no_json_start',
       requiredKeys,
       detail: 'no array opening bracket found',
+    };
+  }
+  if (sawMissingOwnKey) {
+    return {
+      ok: false,
+      kind: 'array',
+      reason: 'parsed_array_missing_key',
+      requiredKeys,
+      detail: `array candidate(s) parsed but no element object had all required keys as own properties`,
     };
   }
   if (sawUnbalanced) {
