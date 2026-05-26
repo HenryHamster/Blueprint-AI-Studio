@@ -4066,6 +4066,36 @@ async def orchestrator_worker():
                                 logger.debug(
                                     f"[CI] conflict-fix CI preview fetch failed for PR #{ci_pr_number}: {_ci_preview_exc}"
                                 )
+                            # Pre-spawn ancestor recheck: the PR head may have advanced
+                            # (e.g. a sibling rollup) while update_branch retries were
+                            # running. If it's now not-behind, skip the fix spawn entirely
+                            # and clear the retry counter so the next sweep re-evaluates.
+                            if _behind_fallthrough:
+                                _late_not_behind = await pr_is_not_behind_for(
+                                    ci_gh_token,
+                                    ci_owner,
+                                    ci_repo,
+                                    pr_detail=pr_data,
+                                    base_branch=ci_base,
+                                    project_id=ci_pid_str,
+                                    call_site="orchestrator_ci",
+                                )
+                                if _late_not_behind is True:
+                                    logger.info(
+                                        f"[CI] PR #{ci_pr_number} pr_is_not_behind=True at spawn time "
+                                        f"after update_branch retries exhausted — skipping fix spawn"
+                                    )
+                                    ci_loop.pop("_behind_update_retries", None)
+                                    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+
+                                    ci_task.context = {
+                                        **(ci_task.context or {}),
+                                        "review_loop": ci_loop,
+                                    }
+                                    flag_modified(ci_task, "context")
+                                    session.add(ci_task)
+                                    await session.commit()
+                                    continue
                             if _behind_fallthrough:
                                 # The PR is merely BEHIND base, not conflicting — but the
                                 # GitHub update-branch API failed across the retry budget,
@@ -4081,10 +4111,14 @@ async def orchestrator_worker():
                                     f"IMPORTANT — verify current state before acting. The `mergeable` flag can flip "
                                     f"between spawn and execution. After cloning:\n"
                                     f"  1. Run `git fetch origin && git rebase origin/{ci_base}`.\n"
-                                    f"  2. If the rebase surfaces unexpected conflicts (it shouldn't, given the "
+                                    f"  2. If no conflicts and no commits were replayed (git says 'Current branch "
+                                    f"is up to date'), the PR is already up-to-date — GitHub's mergeability flag "
+                                    f"is just stale. Report no changes needed (don't force-push); retries will "
+                                    f"clear it.\n"
+                                    f"  3. If the rebase surfaces unexpected conflicts (it shouldn't, given the "
                                     f"behind state), check `git status` and `git diff --name-only --diff-filter=U` "
                                     f"and resolve them.\n"
-                                    f"  3. If the branch state changed while you were working, inspect the latest "
+                                    f"  4. If the branch state changed while you were working, inspect the latest "
                                     f"failing checks via the orchestrator's read-only proxy "
                                     f'(`curl -sS -H "X-Agent-Token: $AGENT_API_TOKEN" '
                                     f'"$ORCHESTRATOR_URL/api/agent/github/check-runs?commit_sha=$(git rev-parse HEAD)" '

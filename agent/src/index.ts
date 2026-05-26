@@ -3075,6 +3075,9 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
 }
 
 async function validateProviderAuth(runner: ProviderRunner, reportPreClaimFailure: (reason: string) => void, model?: string): Promise<void> {
+  // Bake-time lifecycle smoke: skip all credential checks so the smoke can
+  // exercise the full claim→dispatch→complete chain without real LLM creds.
+  if (process.env.BLUEPRINT_SMOKE_SKIP_VALIDATION === '1') return;
   const missing = runner.missingCredentials();
   if (missing.length > 0) {
     const reason = `missing provider credentials: ${missing.join(', ')}`;

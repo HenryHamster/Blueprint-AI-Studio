@@ -2300,6 +2300,46 @@ async def test_pr_opened_auto_review_enabled_triggers_review(
 
 
 @pytest.mark.asyncio
+async def test_pr_opened_auto_review_base_branch_fallback_uses_integration_branch(
+    client, db_session, mocker
+):
+    """
+    When the PR payload has an empty base.ref, the auto-review handler should
+    receive base_branch from the project's configured integration_branch, not 'main'.
+    """
+    from app.models import Project
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    auto_review_mock = mocker.patch(
+        "app.auto_review._handle_auto_review",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="Custom Branch Auto Review",
+        user_id="user1",
+        github_owner="customorg",
+        github_repo="customrepo",
+        integration_branch="automain",
+        design_doc={"_auto_review": {"enabled": True}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    # Pass an empty string for base_branch to simulate a missing/empty base.ref
+    payload_bytes = _make_pr_event_payload(
+        "customorg", "customrepo", 99, "opened", base_branch=""
+    )
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "auto_review_triggered"
+    auto_review_mock.assert_called_once()
+    call_kwargs = auto_review_mock.call_args[1]
+    assert call_kwargs["base_branch"] == "automain"
+
+
+@pytest.mark.asyncio
 async def test_pr_synchronize_auto_review_enabled_triggers_review(
     client, db_session, mocker
 ):

@@ -484,7 +484,9 @@ async def github_webhook(
                     )
                     if auto_review_config.get("enabled"):
                         branch = pr_data.get("head", {}).get("ref", "")
-                        base_branch = pr_data.get("base", {}).get("ref", "main")
+                        base_branch = pr_data.get("base", {}).get(
+                            "ref"
+                        ) or get_project_integration_branch(auto_review_project)
                         pr_title = pr_data.get("title", "")
                         from app.auto_review import _handle_auto_review  # noqa: PLC0415
 

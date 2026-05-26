@@ -246,7 +246,18 @@ build {
       "# (triggering the reopen branch at memo.ts:202), call 1 returns valid memo",
       "# JSON containing a distinct sentinel that the fetch stub asserts appears",
       "# in the COMPLETED logs. Prints PACKER_MEMO_REOPEN_RETRY_OK on success.",
-      "sudo -u agent -H bash -lc 'cd /opt/agent && ORCHESTRATOR_URL=http://127.0.0.1:9 AGENT_TOKEN=packer-smoke node --import tsx ./src/handlers/memo-bake-smoke-reopen.ts'"
+      "sudo -u agent -H bash -lc 'cd /opt/agent && ORCHESTRATOR_URL=http://127.0.0.1:9 AGENT_TOKEN=packer-smoke node --import tsx ./src/handlers/memo-bake-smoke-reopen.ts'",
+      "# Fifth memo smoke: exercise the full agent claim → dispatch → complete",
+      "# lifecycle for a memo task. Unlike the per-handler smokes above, this smoke",
+      "# invokes the main agent entry point (src/index.ts) via a thin wrapper that",
+      "# spins up a local HTTP server stubbing /api/agent/claim (returns a memo task",
+      "# fixture), /api/agent/status (asserts COMPLETED), /api/agent/heartbeat (200",
+      "# ok), and /api/agent/github/token. This validates that the dispatcher routing,",
+      "# handler registration, and end-to-end status post chain are intact in the",
+      "# baked image. A rename of the 'memo' task_type constant, a missing handler",
+      "# registration, or a broken dispatch path would cause a non-zero exit and fail",
+      "# the bake before the image is tagged. Prints PACKER_MEMO_LIFECYCLE_OK on success.",
+      "sudo -u agent -H bash -lc 'cd /opt/agent && node --import tsx ./src/handlers/memo-bake-smoke-lifecycle.ts'"
     ]
   }
 }

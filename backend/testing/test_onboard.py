@@ -1,12 +1,13 @@
 """Tests for onboarding endpoint — build config detection and auto_remediation defaults."""
 
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, patch, MagicMock
 from httpx import AsyncClient
 
 from app.main import app
 from app.models import Project
 from app.auth import get_current_user, require_admin
+from app.routers.admin_onboard import _detect_build_config
 
 TEST_USER_ID = "test-user-123"
 
@@ -294,3 +295,62 @@ class TestOnboardIssueImplementation:
         ii = (project.design_doc or {}).get("_issue_implementation")
         assert ii is not None
         assert "base_branch" not in ii
+
+
+class TestBuildConfigDetection:
+    @pytest.mark.asyncio
+    async def test_detect_build_config_seeds_lint_cmd_for_root_python(self):
+        """Root-level Python project detection includes lint_cmd='ruff check'."""
+        root_files = [
+            {"name": "pyproject.toml", "type": "file"},
+        ]
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = root_files
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["language"] == "python"
+        assert len(config["directories"]) == 1
+        dir_config = config["directories"][0]
+        assert dir_config["path"] == "./"
+        assert dir_config["type"] == "python"
+        assert dir_config["lint_cmd"] == "ruff check"
+        assert dir_config["test_cmd"] == "pytest"
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_seeds_lint_cmd_for_subdir_python(self):
+        """Subdirectory Python project detection includes lint_cmd='ruff check'."""
+        root_files = [
+            {"name": "backend", "type": "dir"},
+        ]
+        subdir_files = [
+            {"name": "setup.py", "type": "file"},
+        ]
+        root_resp = MagicMock()
+        root_resp.status_code = 200
+        root_resp.json.return_value = root_files
+
+        subdir_resp = MagicMock()
+        subdir_resp.status_code = 200
+        subdir_resp.json.return_value = subdir_files
+
+        with patch(
+            "app.github._github_request",
+            new_callable=AsyncMock,
+            side_effect=[root_resp, subdir_resp],
+        ):
+            config = await _detect_build_config("fake-token", "owner", "repo")
+
+        assert config["language"] == "python"
+        assert len(config["directories"]) == 1
+        dir_config = config["directories"][0]
+        assert dir_config["path"] == "backend/"
+        assert dir_config["type"] == "python"
+        assert dir_config["lint_cmd"] == "ruff check"
+        assert dir_config["test_cmd"] == "pytest"
