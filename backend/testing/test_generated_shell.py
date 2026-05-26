@@ -1306,6 +1306,45 @@ class TestPackerMemoReopenContract:
         )
 
 
+class TestPackerFingerprintBakeContract:
+    """agent.pkr.hcl must run the production readAgentRuntimeFingerprint()
+    reader at bake time so a drift between the AGENT_RUNTIME_FINGERPRINT
+    write line and the strict regex in agent/src/index.ts fails the bake
+    instead of silently shipping a broken stale-image-detection pipeline."""
+
+    def test_readback_sentinel_present(self):
+        """Build must emit PACKER_FINGERPRINT_READBACK_OK so the provisioner
+        can gate on the sentinel; without it a silent failure passes
+        undetected."""
+        assert "PACKER_FINGERPRINT_READBACK_OK" in _read_packer_hcl(), (
+            "agent.pkr.hcl must emit PACKER_FINGERPRINT_READBACK_OK after the "
+            "fingerprint readback smoke. Restore the step or re-add the sentinel."
+        )
+
+    def test_readback_invokes_smoke_entrypoint(self):
+        """Smoke must invoke the dedicated fingerprint-bake-smoke.ts script
+        via the runtime tsx loader so the production reader path executes."""
+        hcl = _read_packer_hcl()
+        assert "fingerprint-bake-smoke.ts" in hcl, (
+            "agent.pkr.hcl must invoke fingerprint-bake-smoke.ts for the "
+            "readback smoke."
+        )
+        assert "node --import tsx" in hcl, (
+            "agent.pkr.hcl fingerprint smoke must use `node --import tsx` to "
+            "exercise the production TS source path (not a separate compile)."
+        )
+
+    def test_readback_runs_as_agent_user(self):
+        """The fingerprint file is chowned to agent:agent, so the smoke must
+        run as that user (matching production heartbeat reads) — otherwise
+        a permissions regression slips past the bake."""
+        hcl = _read_packer_hcl()
+        assert "sudo -u agent" in hcl and "fingerprint-bake-smoke.ts" in hcl, (
+            "agent.pkr.hcl fingerprint smoke must run as the agent user "
+            "(sudo -u agent) to match post-chown file ownership."
+        )
+
+
 @pytest.mark.parametrize("path", _STATIC_PARAMS)
 def test_static_script_shellcheck(path: Path, shellcheck_available: bool):
     if not shellcheck_available:
