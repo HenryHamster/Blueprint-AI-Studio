@@ -10664,6 +10664,80 @@ async def test_strategic_max_interval_backstop_quiet_within_window(db_session, m
 
 
 @pytest.mark.asyncio
+async def test_strategic_max_interval_backstop_fires_when_all_directions_busy(
+    db_session, mocker
+):
+    """Regression for the 2026-05-26 production gap: when every active direction
+    has an in-flight child task, _process_direction_lifecycle leaves
+    active_directions empty and the function early-returns at the
+    `not active_directions and not force_strategic` guard, BEFORE the backstop
+    runs. The backstop must drive force_strategic so it fires even in this case.
+    """
+    mock_spawn = AsyncMock(return_value=True)
+    mocker.patch("app.strategic_spawning._spawn_strategic_review", mock_spawn)
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.autonomous_research._should_dispatch_self_audit",
+        new=AsyncMock(return_value=None),
+    )
+
+    dir_id = "d-busybackstop01"
+    project = Project(
+        name="Backstop Busy Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction(dir_id, "Busy direction")],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # An IN_PROGRESS research child on the only active direction → direction
+    # is "busy" → _process_direction_lifecycle excludes it → active_directions
+    # becomes empty.
+    busy_child = Task(
+        project_id=project.id,
+        title="Busy Research",
+        payloads=[
+            {
+                "type": "research",
+                "directions": [{"id": dir_id}],
+                "current_direction_id": dir_id,
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(busy_child)
+
+    stale_strategic = Task(
+        project_id=project.id,
+        title="Old Strategic",
+        payloads=[{"type": "strategic_review", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=datetime.utcnow() - timedelta(hours=4),
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(stale_strategic)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert mock_spawn.called, (
+        "Wall-clock backstop must fire even when every active direction is "
+        "busy. The backstop has to drive force_strategic so the function does "
+        "not early-return at the `not active_directions` guard."
+    )
+
+
+@pytest.mark.asyncio
 async def test_strategic_max_interval_backstop_disabled_by_zero(db_session, mocker):
     """Setting strategic_max_interval_minutes=0 disables the backstop entirely."""
     mock_spawn = AsyncMock(return_value=True)
