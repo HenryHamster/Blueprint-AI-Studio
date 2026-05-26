@@ -106,6 +106,21 @@ def build_ci_failure_fix_prompt(
 
 MAX_REVIEW_FIX_ITERATIONS = 16
 
+# Underscore-prefixed context keys are excluded from spawn-time propagation by
+# default because they are per-task internal state (self-review outcomes,
+# scope-pressure latches, etc.) that the child task should compute fresh. The
+# keys below are exceptions: rollup-classifier flags that must survive across
+# every fix/review iteration so the cap policy at `_spawn_pipeline_task`
+# (global_cap / per_chain_cap) keeps resolving to MAX_REVIEW_FIX_ITERATIONS
+# instead of collapsing to the medium-scope base cap (incident: PR #6061
+# auto-closed at iter 12 because the rollup tag was stripped at iter 1).
+_PROPAGATE_UNDERSCORE_KEYS = frozenset(
+    {
+        "_is_rollup_review",
+        "_rollup_retries",
+    }
+)
+
 # Phase 2c (warm-VM continuity): how long after a source task's last heartbeat
 # (or its completion) the warm-VM pin is honored on the spawned task. After
 # this window the orchestrator's provisioning loop clears the pin and
@@ -2025,11 +2040,14 @@ async def _spawn_pipeline_task(
     propagated_scope = source_ctx.get("scope", source_loop.get("scope", "medium"))
     # Carry strategic context (direction_id, related_files, parent_context, scope, …)
     # from source task so fix/review agents see the same direction/intent the create
-    # task had. Skip underscore-prefixed internal flags and override review_loop below.
+    # task had. Skip underscore-prefixed internal flags (per-task transient state)
+    # and override review_loop below; exceptions in _PROPAGATE_UNDERSCORE_KEYS
+    # carry cross-iteration capability classifiers (e.g. rollup tags).
     propagated_ctx = {
         k: v
         for k, v in source_ctx.items()
-        if not k.startswith("_") and k != "review_loop"
+        if k != "review_loop"
+        and (not k.startswith("_") or k in _PROPAGATE_UNDERSCORE_KEYS)
     }
     propagated_ctx["scope"] = propagated_scope
     # Propagate direction title (text snippet) so agent PR-body footers can

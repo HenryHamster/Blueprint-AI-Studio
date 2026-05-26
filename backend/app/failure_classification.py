@@ -1598,6 +1598,26 @@ def _classify_failure_class(
     if '"type":"rate_limit_event"' in _classify_combined_lower:
         return RATE_LIMIT
 
+    # Belt-and-suspenders for the Codex `exitCode=0` mid-turn silent-death
+    # failure mode (cause C, 2026-05-26). The Codex CLI (gpt-5.4-mini) emits
+    # `{"type":"thread.started"}` + `{"type":"turn.started"}` to stdout, then
+    # exits CLEAN before reaching `turn.completed`. This is an upstream
+    # OpenAI-side disconnect (token cap / silent refusal / 5xx) that the CLI
+    # swallows as success. The memo handler now reclassifies on its own
+    # (see agent/src/handlers/memo.ts), but mirror the override here so any
+    # other Codex consumer that forgets the agent-side fix still routes
+    # through EXTERNAL_API (proper backoff) instead of CODE_ERROR (burns
+    # retries). Bounded by len < 8KB because a real CLI death produces only
+    # the Claude/Codex init banner — anything larger means actual work output
+    # and the parse_failed/code_error label is probably correct.
+    if (
+        len(_classify_combined_lower) < 8192
+        and '"type":"thread.started"' in _classify_combined_lower
+        and '"type":"turn.completed"' not in _classify_combined_lower
+        and "exitcode=0" in _classify_combined_lower
+    ):
+        return EXTERNAL_API
+
     # Fast path: agent already reported a structured category — prefer it over regex.
     # Accept both the legacy lowercase labels (pre-normalization writes) and the
     # canonical uppercase names written by normalize_agent_failure_category().

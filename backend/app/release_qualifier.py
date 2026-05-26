@@ -645,19 +645,37 @@ async def _resolve_candidate_ci(
 ) -> dict[str, Any]:
     """Resolve the *real* CI verdict for a release-qualifier candidate commit.
 
+    Thin wrapper over ``ci_resolution.resolve_pr_ci_status`` (the shared
+    strict-mode resolver) that re-shapes the result into the qualifier's
+    historical ``{state, ci_green, resolved_sha, detail}`` shape so the
+    finalize/promote/messaging paths can stay unchanged.
+
     Resolution order:
       1. Inspect check-runs on ``candidate_sha`` itself, in strict mode (an
          empty list is NOT a pass).  A completed green/red build here is
-         authoritative — return it.  Checks still in progress → pending.
+         authoritative.  Checks still in progress → pending.
       2. When the candidate carries no check-runs of its own, look up the PR(s)
          that introduced it (``commits/{sha}/pulls``) and evaluate check-runs
          on the PR head commit — that is where ``pull_request``-triggered CI
          actually ran.
 
-    Returns ``{"state": str, "ci_green": bool, "resolved_sha": str | None,
-    "detail": str}`` — ``ci_green`` is True ONLY for the ``green`` state.
     Never raises: any GitHub I/O failure degrades to the ``pending`` state.
     """
+    from app import ci_resolution
+
+    resolved = await ci_resolution.resolve_pr_ci_status(
+        pr_number=None,
+        branch_sha=candidate_sha,
+        token=token,
+        owner=owner,
+        repo=repo,
+        project_id=project_id,
+    )
+
+    state = resolved["state"]
+    source = resolved["source"]
+    head_sha = resolved["head_sha_resolved"] or None
+
     if not candidate_sha:
         return {
             "state": _CI_PENDING,
@@ -666,40 +684,15 @@ async def _resolve_candidate_ci(
             "detail": "no candidate sha",
         }
 
-    # --- Step 1: check-runs on the candidate commit itself -----------------
-    try:
-        direct = await github.get_check_runs_cached(
-            token,
-            owner,
-            repo,
-            candidate_sha,
-            project_id=project_id,
-            treat_missing_as_success=False,
-        )
-    except Exception as exc:  # noqa: BLE001 — CI fetch failure → not-green/pending
-        logger.warning(
-            "[RELEASE_QUALIFIER] CI check-runs fetch failed for %s/%s@%s: %s",
-            owner,
-            repo,
-            candidate_sha[:8],
-            exc,
-        )
-        return {
-            "state": _CI_PENDING,
-            "ci_green": False,
-            "resolved_sha": candidate_sha,
-            "detail": f"candidate check-runs fetch failed: {exc}",
-        }
-
-    direct_state = _classify_check_runs(direct)
-    if direct_state in (_CI_GREEN, _CI_RED):
-        return {
-            "state": direct_state,
-            "ci_green": direct_state == _CI_GREEN,
-            "resolved_sha": candidate_sha,
-            "detail": f"candidate commit check-runs: {direct_state}",
-        }
-    if direct_state == _CI_PENDING:
+    if source == "branch_head":
+        if state in (_CI_GREEN, _CI_RED):
+            return {
+                "state": state,
+                "ci_green": state == _CI_GREEN,
+                "resolved_sha": candidate_sha,
+                "detail": f"candidate commit check-runs: {state}",
+            }
+        # _CI_PENDING on the candidate itself.
         return {
             "state": _CI_PENDING,
             "ci_green": False,
@@ -707,97 +700,34 @@ async def _resolve_candidate_ci(
             "detail": "check-runs in progress on the candidate commit",
         }
 
-    # --- Step 2: resolve through the PR that introduced the candidate ------
-    # direct_state == _CI_NO_CHECKS: the candidate has no check-runs of its own.
-    try:
-        prs = await github.list_pull_requests_for_commit(
-            token, owner, repo, candidate_sha, project_id=project_id
-        )
-    except Exception as exc:  # noqa: BLE001 — PR lookup failure → not-green/pending
-        logger.warning(
-            "[RELEASE_QUALIFIER] PR-for-commit lookup failed for %s/%s@%s: %s",
-            owner,
-            repo,
-            candidate_sha[:8],
-            exc,
-        )
+    if source == "merge_sha":
+        if state == _CI_RED:
+            return {
+                "state": _CI_RED,
+                "ci_green": False,
+                "resolved_sha": head_sha,
+                "detail": "PR head check-runs failed",
+            }
+        if state == _CI_GREEN:
+            return {
+                "state": _CI_GREEN,
+                "ci_green": True,
+                "resolved_sha": head_sha,
+                "detail": "PR head check-runs passed",
+            }
         return {
             "state": _CI_PENDING,
             "ci_green": False,
-            "resolved_sha": None,
-            "detail": f"pr-for-commit lookup failed: {exc}",
+            "resolved_sha": head_sha,
+            "detail": "PR head check-runs still pending / absent",
         }
 
-    # Prefer merged PRs; fall back to every associated PR when none carry merged_at.
-    merged_prs = [pr for pr in prs if isinstance(pr, dict) and pr.get("merged_at")]
-    use_prs = merged_prs or [pr for pr in prs if isinstance(pr, dict)]
-    head_shas: list[str] = []
-    for pr in use_prs:
-        head = pr.get("head")
-        head_sha = head.get("sha") if isinstance(head, dict) else None
-        if head_sha and head_sha != candidate_sha and head_sha not in head_shas:
-            head_shas.append(head_sha)
-
-    if not head_shas:
-        return {
-            "state": _CI_PENDING,
-            "ci_green": False,
-            "resolved_sha": None,
-            "detail": "no check-runs on candidate and no PR head with CI",
-        }
-
-    # Exhaustive RED-preferring sweep: inspect every PR head before deciding.
-    # A red on ANY head must win over a green on another head regardless of the
-    # order GitHub returns them — return green only when at least one head is
-    # green AND no associated head is red.
-    first_red_sha: str | None = None
-    first_green_sha: str | None = None
-    for head_sha in head_shas:
-        try:
-            pr_checks = await github.get_check_runs_cached(
-                token,
-                owner,
-                repo,
-                head_sha,
-                project_id=project_id,
-                treat_missing_as_success=False,
-            )
-        except Exception as exc:  # noqa: BLE001 — keep trying remaining PR heads
-            logger.warning(
-                "[RELEASE_QUALIFIER] CI check-runs fetch failed for PR head "
-                "%s/%s@%s: %s",
-                owner,
-                repo,
-                head_sha[:8],
-                exc,
-            )
-            continue
-        pr_state = _classify_check_runs(pr_checks)
-        if pr_state == _CI_RED and first_red_sha is None:
-            first_red_sha = head_sha
-        elif pr_state == _CI_GREEN and first_green_sha is None:
-            first_green_sha = head_sha
-        # pending / no_checks — keep inspecting remaining heads.
-
-    if first_red_sha is not None:
-        return {
-            "state": _CI_RED,
-            "ci_green": False,
-            "resolved_sha": first_red_sha,
-            "detail": "PR head check-runs failed",
-        }
-    if first_green_sha is not None:
-        return {
-            "state": _CI_GREEN,
-            "ci_green": True,
-            "resolved_sha": first_green_sha,
-            "detail": "PR head check-runs passed",
-        }
+    # source == "unresolved" — either GitHub I/O failure or no PR head with CI.
     return {
         "state": _CI_PENDING,
         "ci_green": False,
         "resolved_sha": None,
-        "detail": "PR head check-runs still pending / absent",
+        "detail": "no check-runs on candidate and no PR head with CI",
     }
 
 

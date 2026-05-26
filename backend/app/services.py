@@ -1173,6 +1173,56 @@ async def _summarize_latest_review_for_chain(parent: Task, session) -> dict | No
 _QUEUED_PIPELINE_SUPERSEDE_AFTER_SECONDS = 30 * 60
 
 
+def _ci_backstop_timeout_reason(
+    *,
+    ci_ws_val: object,
+    ci_ws_valid: bool,
+    ci_passed: bool,
+    review_approved: bool,
+    was_escalated: bool,
+    review_summary: dict | None,
+    review_loop: dict,
+) -> str:
+    """Compose the EVALUATING-timeout reason string for a CI-waiting parent.
+
+    Pure function so the branching can be unit-tested without spinning a DB.
+    The (ci_passed AND review_approved) branch surfaces the downstream merge-
+    gate state — mergeable_state, in-progress reset count, last merge message —
+    because both pipeline gates being open while the parent is still EVALUATING
+    means the blocker is on the merge side, not the gates.  The historical
+    fall-through used to print "both gates unmet" in that case, which is the
+    opposite of the truth and made these stuck tasks invisible.
+    """
+    if ci_ws_val is None:
+        return "ci_wait_started missing from review_loop"
+    if not ci_ws_valid:
+        return f"ci_wait_started corrupt: {ci_ws_val!r}"
+    if ci_passed and not review_approved:
+        if review_summary:
+            return (
+                f"CI passed but review {review_summary['short_id']} is "
+                f"{review_summary['status']} without verdict callback"
+            )
+        return "CI passed but no review task exists for this chain"
+    if review_approved and not ci_passed:
+        return "review approved but CI never completed within backstop window"
+    if ci_passed and review_approved:
+        mergeable_state = review_loop.get("mergeable_state")
+        merge_in_progress_resets = review_loop.get("merge_in_progress_resets", 0)
+        last_merge_msg = review_loop.get("merge_last_error") or review_loop.get(
+            "last_merge_msg"
+        )
+        return (
+            f"CI green and review approved but merge blocked: "
+            f"mergeable_state={mergeable_state}, "
+            f"merge_attempts={merge_in_progress_resets}, "
+            f"last_merge_msg={(last_merge_msg or '')[:200]}"
+        )
+    if was_escalated:
+        return "both gates unmet after 20-min escalation"
+    return "neither CI nor review completed within backstop window"
+
+
 async def _supersede_long_queued_pipeline_tasks(
     parent: Task,
     session,
@@ -1727,28 +1777,15 @@ async def _check_evaluating_timeouts():
                     # Compose an honest reason. The historic "CI polling stalled after
                     # escalation" was a lie when the actual blocker was a missing review
                     # callback (review VM died silently) — name the gate that is open.
-                    if ci_ws_val is None:
-                        reason = "ci_wait_started missing from review_loop"
-                    elif not ci_ws_valid:
-                        reason = f"ci_wait_started corrupt: {ci_ws_val!r}"
-                    elif ci_passed and not review_approved:
-                        if review_summary:
-                            reason = (
-                                f"CI passed but review {review_summary['short_id']} is "
-                                f"{review_summary['status']} without verdict callback"
-                            )
-                        else:
-                            reason = (
-                                "CI passed but no review task exists for this chain"
-                            )
-                    elif review_approved and not ci_passed:
-                        reason = "review approved but CI never completed within backstop window"
-                    elif was_escalated:
-                        reason = "both gates unmet after 20-min escalation"
-                    else:
-                        reason = (
-                            "neither CI nor review completed within backstop window"
-                        )
+                    reason = _ci_backstop_timeout_reason(
+                        ci_ws_val=ci_ws_val,
+                        ci_ws_valid=ci_ws_valid,
+                        ci_passed=ci_passed,
+                        review_approved=review_approved,
+                        was_escalated=was_escalated,
+                        review_summary=review_summary,
+                        review_loop=rl,
+                    )
 
                     # One-shot recovery: if CI passed but the review-approved gate never
                     # closed (common when the review VM died before POSTing status),

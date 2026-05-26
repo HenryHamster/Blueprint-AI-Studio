@@ -3391,14 +3391,59 @@ async function validateProviderAuth(runner: ProviderRunner, reportPreClaimFailur
   }
 }
 
+/**
+ * Pure scan over a Codex `--json` (JSONL) stdout transcript: returns true iff
+ * any `{"type":"turn.completed", ...}` event is present. Mirrors the
+ * `eventType === 'turn.completed'` branch in `drainCodexChunks` and is exposed
+ * for direct unit-testing the cause-C sentinel without spawning subprocesses.
+ *
+ * The function is deliberately tolerant of non-JSON noise (Codex auth-error
+ * lines, blank lines, partial chunks) — anything that isn't a parseable JSONL
+ * envelope is silently skipped, matching the live parser's behavior.
+ */
+export function codexStreamHasTurnCompleted(transcript: string): boolean {
+  for (const line of transcript.split('\n')) {
+    if (!line.startsWith('{')) continue;
+    let obj: Record<string, unknown> | null = null;
+    try {
+      obj = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (obj && typeof obj.type === 'string' && obj.type === 'turn.completed') {
+      return true;
+    }
+  }
+  return false;
+}
+
 export async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
+  // Codex (gpt-5.4-mini) JSONL stream: true iff a `turn.completed` event was
+  // observed. Declared OPTIONAL so existing test mocks that pre-date the
+  // field keep type-checking — undefined means "no information", which is
+  // the correct semantics for runners that don't emit this event (Claude
+  // stream-json) AND for test stubs that don't care about Codex semantics.
+  // Detects the cause-C silent-success failure mode (2026-05-26): the CLI
+  // emits thread.started + turn.started, then exits cleanly with exitCode=0
+  // before turn.completed — provider disconnect / token cap / silent refusal
+  // swallowed as success. See agent/src/handlers/memo.ts for the
+  // reclassification site.
+  codexTurnCompleted?: boolean;
+  // Last 500 bytes of the Codex subprocess's stderr (sanitized). Empty for
+  // non-Codex runners and for runs that produced no stderr. Surfaced so the
+  // memo handler can append it to the failure_message — investigations of
+  // silent Codex deaths previously had to guess from allOutput alone.
+  // Optional for the same reason as codexTurnCompleted (test stubs).
+  stderrTail?: string;
 }> {
   return runProviderAgent(prompt, ws, statusRef, model, effort, disallowedTools, enableCheckWatchdog);
 }
 
 export async function runProviderAgent(prompt: string, ws: WebSocket | null, statusRef: { value: string }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
+  codexTurnCompleted?: boolean;
+  stderrTail?: string;
 }> {
   const runner = getProviderRunner();
   const runCommand = runner.buildRunCommand(prompt, model, effort, disallowedTools);
@@ -3416,6 +3461,12 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   // Check-runaway watchdog: tracks allOutput offset when a ./check tool_use fires
   // so the outcome can be parsed from the subsequent user (tool_result) event.
   let lastCheckOutputOffset = -1;
+  // Codex JSONL completion sentinel (cause-C detection, 2026-05-26). Flips to
+  // true when drainCodexChunks observes a `turn.completed` event. Stays false
+  // for runners that don't emit this event (Claude stream-json, raw text) —
+  // callers must combine this with a runner check before treating false as
+  // "Codex died silently mid-turn."
+  let codexTurnCompleted = false;
 
   sendLog(ws, `\n--- ${runner.displayName} starting ---\nPrompt: ${prompt.slice(0, 200)}${prompt.length > 200 ? '...' : ''}\nMode: ${LLM_EXECUTION_MODE}\n\n`);
   log(`Spawning ${runner.displayName} CLI...`);
@@ -3898,6 +3949,10 @@ echo ""
               statusRef.value = 'Codex thinking';
             } else if (eventType === 'turn.completed') {
               sendLog(ws, '[codex] turn.completed\n');
+              // Cause-C sentinel (2026-05-26): seeing turn.completed is the
+              // ONLY signal that the Codex CLI actually finished its turn.
+              // exitCode=0 without this event = silent provider death.
+              codexTurnCompleted = true;
               // Codex turn.completed may carry a usage block analogous to
               // Claude's result-event usage. Best-effort — older Codex
               // versions omit it, in which case the counter stays put.
@@ -4099,7 +4154,18 @@ echo ""
     }
   }
 
-  return { exitCode, allOutput, lastResultText: lastResultText || allOutput.trim() };
+  // Surface the last 500 bytes of stderr so failure handlers (memo, audit)
+  // can attach it to their failure_message — silent Codex deaths previously
+  // discarded stderr after inline logging, blind-guessing was the only
+  // diagnosis path. stderrBuffer is already bounded by appendBoundedTail.
+  const stderrTail = stderrBuffer.slice(-500);
+  return {
+    exitCode,
+    allOutput,
+    lastResultText: lastResultText || allOutput.trim(),
+    codexTurnCompleted,
+    stderrTail,
+  };
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────

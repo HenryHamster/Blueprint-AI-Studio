@@ -4659,13 +4659,72 @@ async def orchestrator_worker():
                         await session.commit()
                         # Dedup cached — siblings on the same head_sha collapse
                         # into one underlying GitHub call within the 30s TTL.
-                        ci_result = await get_check_runs_cached(
-                            ci_gh_token,
-                            ci_owner,
-                            ci_repo,
-                            ci_head_sha,
-                            project_id=ci_project_id_str,
+                        #
+                        # Strict mode (default): route through
+                        # ``ci_resolution.resolve_pr_ci_status`` so a bare branch
+                        # HEAD with 0 check-runs no longer fail-opens to
+                        # ``ci_passed=True``.  When the HEAD has no check-runs
+                        # the resolver falls back to the PR-event merge SHA
+                        # where the ``pull_request``-triggered build actually
+                        # ran; when neither path yields a completed build it
+                        # reports unresolved/pending so we keep polling rather
+                        # than try to merge against the absence of a signal.
+                        # ``ci_resolution_strict_mode=False`` is the operator
+                        # rollback handle to the legacy lenient path.
+                        from app.shared_state import (
+                            runtime_config as _rt_cfg,
                         )
+
+                        if _rt_cfg.get("ci_resolution_strict_mode", True):
+                            from app import ci_resolution
+
+                            _resolved = await ci_resolution.resolve_pr_ci_status(
+                                pr_number=ci_pr_number,
+                                branch_sha=ci_head_sha,
+                                token=ci_gh_token,
+                                owner=ci_owner,
+                                repo=ci_repo,
+                                project_id=ci_project_id_str,
+                            )
+                            _r_state = _resolved["state"]
+                            _r_source = _resolved["source"]
+                            if _r_state == "green":
+                                ci_result = {
+                                    "status": "completed",
+                                    "conclusion": "success",
+                                    "details": _resolved.get("details", []),
+                                    "failed_logs": "",
+                                }
+                            elif _r_state == "red":
+                                ci_result = {
+                                    "status": "completed",
+                                    "conclusion": "failure",
+                                    "details": _resolved.get("details", []),
+                                    "failed_logs": "",
+                                }
+                            elif _r_state == "no_checks" or _r_source == "unresolved":
+                                # No real CI signal anywhere — keep polling.
+                                ci_result = {
+                                    "status": "pending",
+                                    "conclusion": None,
+                                    "details": _resolved.get("details", []),
+                                    "failed_logs": "",
+                                }
+                            else:
+                                ci_result = {
+                                    "status": "in_progress",
+                                    "conclusion": None,
+                                    "details": _resolved.get("details", []),
+                                    "failed_logs": "",
+                                }
+                        else:
+                            ci_result = await get_check_runs_cached(
+                                ci_gh_token,
+                                ci_owner,
+                                ci_repo,
+                                ci_head_sha,
+                                project_id=ci_project_id_str,
+                            )
                         # Re-acquire to apply downstream mutations.
                         ci_task = await _lock_task_for_mutation(
                             session,

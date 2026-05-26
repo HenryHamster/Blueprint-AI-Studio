@@ -3105,7 +3105,11 @@ async def test_strategic_context_propagates_to_spawned_fix(db_session, mocker):
     """A spawned fix task must inherit direction_id, related_files, parent_context,
     and scope from the source task's context so downstream agents see the same
     strategic context (direction, intent, relevant files) the create task had.
-    Internal underscore-prefixed flags must not leak into the spawned task."""
+
+    Per-task underscore-prefixed flags must not leak; the rollup-classifier
+    underscore flags (_is_rollup_review, _rollup_retries) DO propagate so the
+    cap policy keeps resolving to the elevated rollup cap on every iteration
+    (see _PROPAGATE_UNDERSCORE_KEYS in review_pipeline.py)."""
     mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
 
     project = await _make_db_project(db_session)
@@ -3132,8 +3136,8 @@ async def test_strategic_context_propagates_to_spawned_fix(db_session, mocker):
             "related_files": related_files,
             "parent_context": parent_context,
             "architecture_context": "Some architecture note",
-            "_is_rollup_review": True,  # internal flag — must NOT propagate
-            "_rollup_retries": 2,  # internal flag — must NOT propagate
+            # Per-task transient internal flag — must NOT propagate
+            "_self_review_internal_state": {"foo": "bar"},
             "review_loop": {"iteration": 0},
         },
     )
@@ -3169,17 +3173,165 @@ async def test_strategic_context_propagates_to_spawned_fix(db_session, mocker):
         "non-private strategic context should also propagate"
     )
 
-    # Internal flags must not leak into the spawned task's context.
-    assert "_is_rollup_review" not in ctx, (
-        "underscore-prefixed internal flags must not propagate"
-    )
-    assert "_rollup_retries" not in ctx, (
-        "underscore-prefixed internal flags must not propagate"
+    # Per-task internal flags must not leak into the spawned task's context.
+    assert "_self_review_internal_state" not in ctx, (
+        "underscore-prefixed internal flags (not on the propagate allowlist) "
+        "must not propagate"
     )
 
     # review_loop is overridden with the pipeline's own iteration state, not carried verbatim.
     assert ctx.get("review_loop", {}).get("iteration") == 1
     assert ctx.get("review_loop", {}).get("pr_number") == 501
+
+
+@pytest.mark.asyncio
+async def test_rollup_classifier_flags_propagate_to_spawned_fix(db_session, mocker):
+    """Rollup-classifier underscore flags (`_is_rollup_review`, `_rollup_retries`)
+    must survive spawn-time propagation so the elevated iteration cap stays in
+    force across every fix/review iteration of a rollup chain.
+
+    Regression for PR #6061 (auto-closed at iter 12 with reason="global"):
+    the underscore-prefix filter at review_pipeline.py was stripping these
+    flags at iter 1, collapsing the cap from MAX_REVIEW_FIX_ITERATIONS=16
+    down to the medium-scope base cap of 12.
+    """
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+
+    project = await _make_db_project(db_session)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "create",
+                "pr_number": 601,
+                "branch": "feat/rollup",
+                "base_branch": "main",
+                "prompt": "Land rollup PR",
+            }
+        ],
+        context={
+            "scope": "medium",
+            "_is_rollup_review": True,
+            "_rollup_retries": 2,
+            "review_loop": {"iteration": 0},
+        },
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    result, created = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=601,
+        branch="feat/rollup",
+        base_branch="main",
+        fix_prompt="Address the review feedback",
+    )
+
+    assert created is True
+    assert result is not None
+
+    ctx = result.context or {}
+    assert ctx.get("_is_rollup_review") is True, (
+        "_is_rollup_review must propagate so cap policy keeps resolving to the "
+        "elevated rollup cap on downstream fix/review iterations"
+    )
+    assert ctx.get("_rollup_retries") == 2, (
+        "_rollup_retries must propagate so cap policy keeps recognising this "
+        "chain as a rollup retry sequence"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollup_chain_at_iter_13_does_not_hit_global_cap(db_session, mocker):
+    """Cap-boundary regression: a rollup chain reaching 13 completed PR iterations
+    on a medium-scope task must NOT hit `_handle_cap_exhaustion` because
+    `_is_rollup_review` propagation keeps the cap at MAX_REVIEW_FIX_ITERATIONS=16,
+    not the medium-scope base_cap of 12.
+    """
+    broadcast_mock = mocker.patch(
+        "app.review_pipeline.broadcast_to_project", new_callable=AsyncMock
+    )
+    cap_exhaustion_mock = mocker.patch(
+        "app.review_pipeline._handle_cap_exhaustion", new_callable=AsyncMock
+    )
+
+    project = await _make_db_project(db_session)
+
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 701,
+                "branch": "feat/rollup-chain",
+                "base_branch": "main",
+            }
+        ],
+        context={
+            "scope": "medium",
+            "_is_rollup_review": True,
+            "review_loop": {"iteration": 12, "pr_number": 701},
+        },
+    )
+    db_session.add(source_task)
+
+    # 13 completed PR iterations — above the medium base_cap (12) but below the
+    # elevated rollup cap (MAX_REVIEW_FIX_ITERATIONS=16).
+    for _ in range(13):
+        t = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[
+                {
+                    "type": "review",
+                    "pr_number": 701,
+                    "branch": "feat/rollup-chain",
+                    "base_branch": "main",
+                }
+            ],
+        )
+        db_session.add(t)
+
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    # Sanity check: MAX_REVIEW_FIX_ITERATIONS must actually exceed our iteration
+    # count, otherwise the test cannot meaningfully distinguish the two caps.
+    assert MAX_REVIEW_FIX_ITERATIONS == 16
+    assert MAX_REVIEW_FIX_ITERATIONS > 13, (
+        "Test premise broken: 13 iterations must be below the rollup cap"
+    )
+
+    result, _ = await _spawn_pipeline_task(
+        source_task,
+        "fix",
+        db_session,
+        pr_number=701,
+        branch="feat/rollup-chain",
+        base_branch="main",
+        fix_prompt="Address the review feedback",
+    )
+
+    assert cap_exhaustion_mock.call_count == 0, (
+        f"Rollup chain at 13 iterations (medium scope) must NOT hit "
+        f"_handle_cap_exhaustion when _is_rollup_review propagated correctly "
+        f"(elevated cap=16). Got {cap_exhaustion_mock.call_count} call(s)."
+    )
+    assert result is not None, (
+        "Rollup chain at iter 13 (medium scope, _is_rollup_review=True) must "
+        "still spawn a fix task because the elevated cap (16) is not exhausted"
+    )
+    # Sanity: the spawned task should still carry the rollup flag forward.
+    assert (result.context or {}).get("_is_rollup_review") is True
+    # broadcast_to_project is invoked for the new task; surface the mock to
+    # keep linters happy and confirm the spawn path completed normally.
+    assert broadcast_mock.await_count >= 1
 
 
 @pytest.mark.asyncio
