@@ -676,6 +676,13 @@ def _read_agent_tsconfig() -> dict[str, object]:
 class TestPackerMemoBakeContract:
     """agent.pkr.hcl must gate image tagging on a live memo smoke run."""
 
+    def test_chromium_smoke_sentinel_present(self):
+        """Build must emit PACKER_CHROMIUM_LAUNCH_OK so the provisioner can
+        gate on a real browser launch, not just a binary lookup."""
+        assert "PACKER_CHROMIUM_LAUNCH_OK" in _read_packer_hcl(), (
+            "agent.pkr.hcl must emit PACKER_CHROMIUM_LAUNCH_OK after the Chromium launch smoke."
+        )
+
     def test_smoke_sentinel_present(self):
         """Build must emit PACKER_MEMO_SMOKE_OK so the provisioner can gate
         on the sentinel; without it a silent failure passes undetected."""

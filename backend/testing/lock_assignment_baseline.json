@@ -23,7 +23,6 @@
   "directions": {
     "anomaly_detection.py": 1,
     "direction_lifecycle.py": 1,
-    "main.py": 5,
     "routers/admin_projects.py": 1,
     "strategic_completion.py": 0,
     "task_locking.py": 1

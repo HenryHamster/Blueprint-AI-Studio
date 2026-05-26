@@ -2581,3 +2581,344 @@ class TestVisionLockInvariant:
 
     def test_no_new_unlocked_vision_writes(self):
         _check_lock_invariant("vision", "vision", "with_vision_locked")
+
+
+# ── Behind-Recovery update_branch Guard ──────────────────────────────────────
+
+
+class TestBehindRecoveryUpdateBranchGuard:
+    """Tripwire: every behind-recovery caller of ``update_branch`` /
+    ``update_branch_with_sha_retry`` (from ``app.github``) must consult the
+    behind-base detector ``pr_is_not_behind`` first.
+
+    Motivation
+    ----------
+    ``pr_is_not_behind`` (defined in ``backend/app/github.py``) lets callers
+    skip an unnecessary GitHub ``update_branch`` write when the PR head is
+    already an ancestor of base, or when ``mergeable_state`` is ``"clean"``.
+    Those writes are not free — they round-trip GitHub, trigger fresh CI, and
+    burn behind-retry budget on PRs that don't need rebasing.
+
+    The pattern was wired into three sites already (one in
+    ``ci_completion.py``, two in ``rollup_management.py``) and is being added
+    to the orchestrator's CI polling site (``backend/app/orchestrator.py``)
+    in a parallel task. This ratchet exists so a future contributor cannot
+    add a new ``update_branch_with_sha_retry`` caller in a behind-recovery
+    context without also wiring the ``pr_is_not_behind`` short-circuit.
+
+    How it works
+    ------------
+    The test walks every ``.py`` file under ``backend/app/`` with ``ast.parse``
+    (skipping ``app/github.py`` itself, which defines both the helper and the
+    short-circuit), finds every ``ast.Call`` whose callee resolves to
+    ``update_branch`` or ``update_branch_with_sha_retry`` (matched by name as
+    ``ast.Name`` or as the attribute of an ``ast.Attribute``, so
+    ``github.update_branch(...)`` is also caught), identifies the smallest
+    enclosing function via a parent map, and asserts that ``pr_is_not_behind``
+    appears as a ``Name`` or ``Attribute`` somewhere in that function's body
+    (excluding nested function scopes). For module-scope calls with no
+    enclosing function, the test falls back to a ±50-line window scan of the
+    source file.
+
+    Allowlisting a non-behind-recovery caller
+    -----------------------------------------
+    If a caller of ``update_branch`` / ``update_branch_with_sha_retry`` is
+    genuinely NOT in a behind-recovery context (e.g. a maintenance script
+    that always wants to rebase regardless of ancestor state, or a test
+    scaffold that mocks the helper), add a ``"<relative_path>:<function>"``
+    entry to ``_ALLOWLIST`` with a comment explaining why the call is not a
+    behind-recovery write. Default behavior is "every call must be guarded";
+    use the allowlist sparingly.
+
+    Pending-fix entries
+    -------------------
+    ``_PENDING_GUARDS`` is a *temporary* allowlist for known unguarded sites
+    that are being fixed in a parallel PR. Each entry MUST carry a TODO
+    referencing the parallel work. A companion test
+    (``test_pending_guards_are_eventually_resolved``) is marked
+    ``pytest.mark.xfail(strict=True)`` so that once the parallel fix lands —
+    making the pending site actually guarded — the test xpasses, strict
+    failure fires, and the maintainer is forced to remove the corresponding
+    ``_PENDING_GUARDS`` entry in the same change.
+    """
+
+    # callee identifier (final segment, whether ``ast.Name`` or
+    # ``ast.Attribute``) → all of these are GitHub writes that should be
+    # gated by ``pr_is_not_behind`` in any behind-recovery context.
+    _TARGET_CALLEES = frozenset({"update_branch", "update_branch_with_sha_retry"})
+
+    # Explicit guard symbol — referenced anywhere in the enclosing function
+    # body satisfies the tripwire.
+    _GUARD_NAME = "pr_is_not_behind"
+
+    # ``app/github.py`` defines both ``update_branch`` and ``pr_is_not_behind``,
+    # and the internal ``update_branch_with_sha_retry -> update_branch`` call
+    # inside that file's helper is by definition not a behind-recovery
+    # caller.  Skip the whole file.
+    _SKIP_FILES = frozenset({"github.py"})
+
+    # ``"<relative_path>:<function_name>"`` entries for callers that are
+    # legitimately NOT behind-recovery writes.  Empty by default — every
+    # entry needs a comment justifying why the caller skips the guard.
+    _ALLOWLIST: frozenset[str] = frozenset()
+
+    # ``"<relative_path>:<function_name>"`` entries for sites currently
+    # being fixed in a parallel PR. Each MUST carry a TODO. The companion
+    # ``test_pending_guards_are_eventually_resolved`` will xpass once the
+    # parallel fix lands, forcing removal of the entry.
+    _PENDING_GUARDS: frozenset[str] = frozenset()
+
+    @staticmethod
+    def _callee_final_name(func):
+        """Return the final identifier of a Call's func, or None if untyped."""
+        import ast
+
+        if isinstance(func, ast.Name):
+            return func.id
+        if isinstance(func, ast.Attribute):
+            return func.attr
+        return None
+
+    @staticmethod
+    def _build_parent_map(tree):
+        """Return id(child) → parent for every node reachable from tree."""
+        import ast
+
+        parents: dict = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[id(child)] = parent
+        return parents
+
+    @classmethod
+    def _enclosing_function(cls, node, parents):
+        """Walk parent chain to find smallest enclosing FunctionDef, or None."""
+        import ast
+
+        cur = parents.get(id(node))
+        while cur is not None:
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return cur
+            cur = parents.get(id(cur))
+        return None
+
+    @classmethod
+    def _function_references_guard(cls, fn) -> bool:
+        """True if the guard symbol is referenced anywhere in fn's body,
+        excluding nested function scopes (each nested function is its own
+        scope and must have its own guard reference)."""
+        import ast
+
+        stack = list(getattr(fn, "body", []) or [])
+        while stack:
+            node = stack.pop()
+            # Skip nested function scopes — they're checked independently if
+            # they contain their own Call to a target.
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if isinstance(node, ast.Name) and node.id == cls._GUARD_NAME:
+                return True
+            if isinstance(node, ast.Attribute) and node.attr == cls._GUARD_NAME:
+                return True
+            stack.extend(ast.iter_child_nodes(node))
+        return False
+
+    @classmethod
+    def _module_window_references_guard(
+        cls, source_lines: list[str], lineno: int, window: int = 50
+    ) -> bool:
+        """Fallback for module-scope calls: scan ±window lines for guard."""
+        lo = max(0, lineno - 1 - window)
+        hi = min(len(source_lines), lineno + window)
+        for line in source_lines[lo:hi]:
+            # Strip-and-skip leading comments to mirror the AST's exclusion of
+            # comments (string literals also won't trip this since the guard
+            # name is unambiguous).
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            if cls._GUARD_NAME in line:
+                return True
+        return False
+
+    @classmethod
+    def _scan_app_tree(cls) -> tuple[list[str], list[tuple[str, str]]]:
+        """Walk ``backend/app/`` and collect (violations, guarded_sites).
+
+        Returns
+        -------
+        violations
+            Human-readable lines describing unguarded callers, suitable for
+            inclusion in an assertion message.
+        guarded_sites
+            ``[(relative_path, function_name), ...]`` for every call site that
+            IS guarded.  Used by the positive-sanity assertion to confirm the
+            known good sites are still detected as guarded.
+        """
+        import ast
+        import glob as globmod
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        violations: list[str] = []
+        guarded_sites: list[tuple[str, str]] = []
+
+        py_files = sorted(
+            globmod.glob(os.path.join(app_dir, "**", "*.py"), recursive=True)
+        )
+        for py_file in py_files:
+            rel = os.path.relpath(py_file, app_dir)
+            if rel in cls._SKIP_FILES:
+                continue
+            try:
+                with open(py_file) as fh:
+                    source = fh.read()
+            except (IOError, OSError):
+                continue
+            try:
+                tree = ast.parse(source, filename=py_file)
+            except SyntaxError:
+                # Skip unparseable files — same conservative posture as
+                # _ast_count_attr_assignments above.
+                print(f"[behind-recovery guard] skipping unparseable: {rel}")
+                continue
+
+            source_lines = source.splitlines()
+            parents = cls._build_parent_map(tree)
+
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                callee = cls._callee_final_name(node.func)
+                if callee not in cls._TARGET_CALLEES:
+                    continue
+
+                fn = cls._enclosing_function(node, parents)
+                fn_name = fn.name if fn is not None else "<module>"
+                allow_key = f"{rel}:{fn_name}"
+
+                if allow_key in cls._ALLOWLIST:
+                    continue
+                if allow_key in cls._PENDING_GUARDS:
+                    # Pending fix — the companion xfail test guards us
+                    # against forgetting to remove this entry.
+                    continue
+
+                if fn is not None:
+                    is_guarded = cls._function_references_guard(fn)
+                else:
+                    is_guarded = cls._module_window_references_guard(
+                        source_lines, node.lineno
+                    )
+
+                if is_guarded:
+                    guarded_sites.append((rel, fn_name))
+                else:
+                    violations.append(
+                        f"New unguarded {callee} call in {rel}:{node.lineno}. "
+                        "Wire pr_is_not_behind first; see "
+                        "backend/app/ci_completion.py:438-468 for the "
+                        "canonical pattern."
+                    )
+
+        return violations, guarded_sites
+
+    def test_no_unguarded_update_branch_callers(self):
+        """Every caller of update_branch / update_branch_with_sha_retry must
+        reference pr_is_not_behind in its enclosing function body."""
+        violations, _guarded = self._scan_app_tree()
+        assert not violations, (
+            "Unguarded behind-recovery update_branch caller(s) detected:\n"
+            + "\n".join(f"  {v}" for v in violations)
+            + "\n\nEach call to update_branch / update_branch_with_sha_retry "
+            "in a behind-recovery context must be preceded by a "
+            "pr_is_not_behind short-circuit. See the docstring on "
+            "TestBehindRecoveryUpdateBranchGuard for how to add an "
+            "_ALLOWLIST entry if the caller is genuinely not behind-recovery."
+        )
+
+    def test_known_guarded_sites_are_detected(self):
+        """Positive sanity: the three currently-wired guarded sites must be
+        detected as guarded. If this assertion fails, the AST walk is broken
+        and the negative ratchet above would silently pass on regressions.
+
+        Once the parallel orchestrator fix lands and
+        ``orchestrator.py:orchestrator_worker`` is removed from
+        ``_PENDING_GUARDS``, it must also appear in this guarded set —
+        update the expected list at that time (the existing ratchet
+        ``test_pending_guards_are_eventually_resolved`` will fire to remind
+        the maintainer).
+        """
+        _violations, guarded = self._scan_app_tree()
+        guarded_keys = {f"{rel}:{fn}" for rel, fn in guarded}
+
+        # We expect at minimum these three currently-wired sites. Each
+        # appears once per Call site, so we use a containment check rather
+        # than equality (the same enclosing function may host multiple
+        # update_branch calls, all of which collapse to the same key).
+        expected_subset = {
+            # Single guarded call in ci_completion.py inside the CI merge
+            # finalization function.
+            "ci_completion.py",
+            # Two guarded calls in rollup_management.py (pre-merge SHA-mismatch
+            # and post-merge ancestor checks).
+            "rollup_management.py",
+            # Guarded call in orchestrator.py inside orchestrator_worker for
+            # the CI polling behind path.
+            "orchestrator.py",
+        }
+        guarded_files = {rel for rel, _fn in guarded}
+        missing = expected_subset - guarded_files
+        assert not missing, (
+            "Positive-sanity check failed — the AST walk did not detect "
+            "known-guarded sites in: " + ", ".join(sorted(missing)) + ".\n"
+            "guarded_keys=" + ", ".join(sorted(guarded_keys))
+        )
+
+        # At least four guarded call sites must be present (1 in
+        # ci_completion + 2 in rollup_management + 1 in orchestrator).
+        assert len(guarded) >= 4, (
+            f"Expected at least 4 guarded update_branch sites, "
+            f"detected {len(guarded)}: {guarded}"
+        )
+
+    def test_pending_guards_are_eventually_resolved(self):
+        """Strict-xfail tripwire that flips once every site in
+        ``_PENDING_GUARDS`` becomes actually guarded in source.
+
+        For each ``"<rel>:<fn>"`` pending entry, this test parses the file,
+        finds the named function, and asserts that ``pr_is_not_behind`` is
+        referenced inside it. While the parallel fix is in flight, the
+        assertion fails (expected). The instant the fix lands the assertion
+        passes — strict xfail then fails the build, forcing the maintainer
+        to remove both the xfail mark and the corresponding
+        ``_PENDING_GUARDS`` entry in the same change.
+        """
+        import ast
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        unresolved: list[str] = []
+        for entry in sorted(self._PENDING_GUARDS):
+            rel, _, fn_name = entry.partition(":")
+            py_file = os.path.join(app_dir, rel)
+            with open(py_file) as fh:
+                source = fh.read()
+            tree = ast.parse(source, filename=py_file)
+            target_fn = None
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == fn_name
+                ):
+                    target_fn = node
+                    break
+            assert target_fn is not None, (
+                f"_PENDING_GUARDS references unknown function {entry}; "
+                "update the entry or remove it."
+            )
+            if not self._function_references_guard(target_fn):
+                unresolved.append(entry)
+
+        assert not unresolved, (
+            "Pending behind-recovery guard fix(es) not yet applied: "
+            + ", ".join(unresolved)
+        )

@@ -2148,7 +2148,10 @@ from app.strategic_completion import (
 )
 
 
-from app.task_locking import lock_project_or_429 as _lock_project_or_429
+from app.task_locking import (
+    lock_project_or_429 as _lock_project_or_429,
+    with_directions_locked as _with_directions_locked,
+)
 # Backward-compat re-export. Canonical home is ``app.task_locking`` (Phase A1).
 
 
@@ -2800,9 +2803,8 @@ async def strategic_operation(
             if mode:
                 new_dir["recommended_mode"] = mode
         directions.append(new_dir)
-        project.directions = directions
-        flag_modified(project, "directions")
-        session.add(project)
+        _d = directions
+        await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
         created_ids = list(ctx.get("_strategic_created_ids", []))
         created_ids.append(new_dir["id"])
@@ -2961,9 +2963,8 @@ async def strategic_operation(
                 break
         if not updated:
             raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
-        project.directions = directions
-        flag_modified(project, "directions")
-        session.add(project)
+        _d = directions
+        await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
         task.context = {**ctx, "_strategic_api_called": True}
         flag_modified(task, "context")
@@ -2998,9 +2999,8 @@ async def strategic_operation(
                 break
         if not retired:
             raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
-        project.directions = directions
-        flag_modified(project, "directions")
-        session.add(project)
+        _d = directions
+        await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
         retired_ids = list(ctx.get("_strategic_retired_ids", []))
         retired_ids.append(dir_id)
@@ -3070,9 +3070,8 @@ async def strategic_operation(
         target["notes"] = _cap_list(
             notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
         )
-        project.directions = directions
-        flag_modified(project, "directions")
-        session.add(project)
+        _d = directions
+        await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
         task.context = {
             **ctx,
@@ -3147,9 +3146,8 @@ async def strategic_operation(
             session.add(t)
             if t.vm_instance_id:
                 vm_ids_to_delete.append(t.vm_instance_id)
-        project.directions = remaining
-        flag_modified(project, "directions")
-        session.add(project)
+        _d = remaining
+        await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
         task.context = {
             **ctx,
