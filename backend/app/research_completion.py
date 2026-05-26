@@ -784,16 +784,29 @@ async def _shelve_findings_for_next_cycle(
     findings: List[Dict[str, Any]],
     reason: str,
 ) -> None:
-    """Append `findings` to a research task's `context.prior_deferred_findings`
-    in a fresh session, so the next research cycle's recovery code (around
-    line 850 in _handle_research_completion) re-processes them.
+    """Append `findings` to a COMPLETED research task's
+    ``context.deferred_findings`` in a fresh session so the next autonomous
+    research spawn picks them up.
+
+    The propagation chain is asymmetric:
+      * `autonomous_research.py:_spawn_research_task` scans recent COMPLETED
+        research tasks for `context.deferred_findings` and, for each hit on the
+        same direction, injects the findings into the NEW task's
+        `context.prior_deferred_findings`.
+      * The recovery loop inside `_handle_research_completion` reads back from
+        `prior_deferred_findings` only — never `deferred_findings`.
+
+    So the write side must use `deferred_findings`. An earlier rev of this
+    helper wrote to `prior_deferred_findings` directly and was caught in PR
+    #5904 review — the data sat on the COMPLETED task forever because nothing
+    scans that key.
 
     Use this from defer/race paths where the in-memory task was detached after
     an unlocked-window break and cannot be safely mutated by the caller (see
-    _ensure_branch docstring). Findings are stamped with deferred_reason,
-    deferred_count, originally_researched_at, and finding_hash so the recovery
-    loop's decay / stale-cutoff / hash filters can act on them like any other
-    deferred entry.
+    `_ensure_branch` docstring). Findings are stamped with deferred_reason,
+    deferred_count, originally_researched_at, and finding_hash so
+    autonomous_research's TTL/dedup/decay filters can act on them like any
+    other deferred entry.
     """
     actionable = [f for f in findings if isinstance(f, dict)]
     if not actionable:
@@ -820,8 +833,8 @@ async def _shelve_findings_for_next_cycle(
                 logger.warning(f"[RESEARCH] shelve_findings: task {task_id} not found")
                 return
             ctx = dict(t.context or {})
-            existing = list(ctx.get("prior_deferred_findings") or [])
-            ctx["prior_deferred_findings"] = existing + stamped
+            existing = list(ctx.get("deferred_findings") or [])
+            ctx["deferred_findings"] = existing + stamped
             t.context = ctx
             flag_modified(t, "context")
             t.latest_status_message = (

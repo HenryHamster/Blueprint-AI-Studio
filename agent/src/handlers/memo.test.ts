@@ -128,7 +128,7 @@ describe('handleMemo', () => {
     expect(call.failure_category).toBe('parse_failed');
   });
 
-  it('includes the allOutput tail in the parse_failed error logs', async () => {
+  it('includes the output tail in the parse_failed error logs', async () => {
     vi.mocked(runClaudeCode).mockResolvedValue({
       exitCode: 0,
       allOutput: 'agent output without valid json',
@@ -138,7 +138,66 @@ describe('handleMemo', () => {
     await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
-    expect(call.logs).toContain('allOutput tail');
+    expect(call.logs).toContain('output tail');
+    // Retry is attempted on exitCode=0 + no JSON, so both run results are
+    // reported in the failure log for diagnosis.
+    expect(call.logs).toContain('retryExitCode=');
+    expect(call.logs).toContain('agent output without valid json');
+  });
+
+  it('reopens with continuation prompt and succeeds if retry emits valid JSON', async () => {
+    // First run: agent drifts, emits prose but no JSON
+    // Second run (the reopen): agent emits valid JSON
+    const validJson = JSON.stringify({
+      summary: 'A concise summary.',
+      reasoning: 'Detailed reasoning.',
+      citations: ['task:abc'],
+      tags: ['tag-a'],
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: 'prose without any valid JSON object emitted',
+        lastResultText: '',
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: validJson,
+        lastResultText: validJson,
+      });
+
+    await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // Two runClaudeCode invocations: initial + reopen retry.
+    expect(vi.mocked(runClaudeCode).mock.calls.length).toBe(2);
+    // Retry prompt must re-state the schema and include the prior reasoning
+    // so a fresh-session Claude can fill the fields from context.
+    const retryPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(retryPrompt).toContain('Output ONLY the JSON object now');
+    expect(retryPrompt).toContain('"summary"');
+    expect(retryPrompt).toContain('prose without any valid JSON object emitted');
+    // Final status should be COMPLETED with the parsed memo, not FAILED.
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.logs).toContain('"summary"');
+    expect(call.logs).toContain('A concise summary.');
+  });
+
+  it('does NOT reopen when first run failed (exitCode !== 0)', async () => {
+    // If the agent itself crashed (rate limit, OOM, etc), retrying with the
+    // same setup wastes a slot. Reopen only fires for exitCode=0 drift.
+    vi.mocked(runClaudeCode).mockResolvedValueOnce({
+      exitCode: 1,
+      allOutput: 'Claude init banner only',
+      lastResultText: '',
+    });
+
+    await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    // Only one runClaudeCode call — no retry on non-zero exit.
+    expect(vi.mocked(runClaudeCode).mock.calls.length).toBe(1);
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
   });
 
   it('logs the serialized memo object on success', async () => {
@@ -298,7 +357,6 @@ describe('handleMemo', () => {
 
     expect(runClaudeCode).toHaveBeenCalledTimes(1);
   });
-
 
   // ── Codex JSONL path regression tests ────────────────────────────────────
 

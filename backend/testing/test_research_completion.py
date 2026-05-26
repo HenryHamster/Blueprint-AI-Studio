@@ -1362,3 +1362,102 @@ class TestBuildPreventiveContext:
         finding = {"related_files": ["backend/app/foo.py"]}
         assert _build_preventive_context(finding, {}, None) is None
         assert _build_preventive_context(finding, {}, {}) is None
+
+
+class TestShelveFindingsForNextCycle:
+    """Regression for PR #5902: the helper must write to `context.deferred_findings`,
+    NOT `prior_deferred_findings`. The propagation scanner in
+    `autonomous_research.py:1196` reads `deferred_findings` from completed
+    research tasks and injects them as `prior_deferred_findings` on the NEXT
+    research task. PR #5904 review caught that writing to
+    `prior_deferred_findings` on a COMPLETED task is a dead letter — nothing
+    scans that key on completed rows."""
+
+    import pytest
+
+    @pytest.mark.asyncio
+    async def test_writes_to_deferred_findings_key_for_propagation(self, monkeypatch):
+        import contextlib
+        import uuid as _uuid
+
+        from app import research_completion as rc
+
+        captured_task = MagicMock()
+        captured_task.context = {"some_other_key": "preserved"}
+
+        # Build a fake session that returns the task on the SELECT
+        fake_session = MagicMock()
+        fake_session.commit = AsyncMock()
+        fake_result = MagicMock()
+        fake_result.scalars.return_value.one_or_none.return_value = captured_task
+        fake_session.execute = AsyncMock(return_value=fake_result)
+        fake_session.add = MagicMock()
+
+        @contextlib.asynccontextmanager
+        async def fake_closing_session():
+            yield fake_session
+
+        monkeypatch.setattr(rc, "closing_session", fake_closing_session)
+
+        findings = [
+            {"title": "f1", "description": "d1", "prompt": "p1"},
+            {"title": "f2", "description": "d2", "prompt": "p2"},
+        ]
+        await rc._shelve_findings_for_next_cycle(
+            _uuid.uuid4(), findings, "branch_creation_defer"
+        )
+
+        # The task's context must carry the data under `deferred_findings` so
+        # autonomous_research.py's propagation picks it up. NEVER under
+        # `prior_deferred_findings` (that key is for in-flight reads only).
+        assert "deferred_findings" in captured_task.context
+        assert "prior_deferred_findings" not in captured_task.context
+        assert len(captured_task.context["deferred_findings"]) == 2
+        # Pre-existing context keys must be preserved (idempotent merge).
+        assert captured_task.context["some_other_key"] == "preserved"
+        # Findings must be stamped for the recovery TTL/decay filters.
+        for f in captured_task.context["deferred_findings"]:
+            assert f["deferred_reason"] == "branch_creation_defer"
+            assert f["deferred_count"] == 1
+            assert "originally_researched_at" in f
+            assert "finding_hash" in f
+        # And the task's latest_status_message must be loud, not the heartbeat.
+        assert "shelved" in captured_task.latest_status_message.lower()
+        fake_session.commit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_appends_to_existing_deferred_findings(self, monkeypatch):
+        """Re-shelving on the same task must append, not replace."""
+        import contextlib
+        import uuid as _uuid
+
+        from app import research_completion as rc
+
+        captured_task = MagicMock()
+        captured_task.context = {
+            "deferred_findings": [{"title": "prior", "finding_hash": "abc"}]
+        }
+        fake_session = MagicMock()
+        fake_session.commit = AsyncMock()
+        fake_result = MagicMock()
+        fake_result.scalars.return_value.one_or_none.return_value = captured_task
+        fake_session.execute = AsyncMock(return_value=fake_result)
+        fake_session.add = MagicMock()
+
+        @contextlib.asynccontextmanager
+        async def fake_closing_session():
+            yield fake_session
+
+        monkeypatch.setattr(rc, "closing_session", fake_closing_session)
+
+        await rc._shelve_findings_for_next_cycle(
+            _uuid.uuid4(),
+            [{"title": "new", "description": "d", "prompt": "p"}],
+            "branch_creation_defer",
+        )
+
+        # Both prior and new entries must be present.
+        deferred = captured_task.context["deferred_findings"]
+        assert len(deferred) == 2
+        assert deferred[0]["title"] == "prior"
+        assert deferred[1]["title"] == "new"

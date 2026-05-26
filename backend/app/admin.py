@@ -1729,6 +1729,15 @@ async def request_changes(
 
 _FRESH_REVIEWER_COOLDOWN_SECS = 3600  # 1 hour
 
+# Maps a task's payload ``type`` to the branch prefix the agent uses when
+# deriving the work branch. Mirrors the agent's branchPrefix wiring
+# (agent/src/handlers/standard.ts: create/qa->task, refactor->refactor,
+# docs->docs, deps->deps; handlers/specialized.ts->migrate). Fix tasks reuse
+# an existing branch carried in the payload, so they never need this fallback.
+# Branch derivation moved to app.shared_state.derive_task_branch so callers
+# outside admin (rollup_management, task_lifecycle) can share the same map
+# without circular imports.
+
 
 @router.post("/tasks/{task_id}/request-fresh-reviewer")
 @limiter.limit("10/minute")
