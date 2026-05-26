@@ -21,7 +21,12 @@ from app.models import (
     _utcnow,
 )
 from app.auth import get_current_user, require_admin
-from app.shared_state import external_health, circuit_breakers, get_circuit_breaker
+from app.shared_state import (
+    external_health,
+    circuit_breakers,
+    get_circuit_breaker,
+    snapshot_pr_is_not_behind_counts,
+)
 import app.shared_state as _shared_state
 from app.compute import get_zone_health_summary
 from app.pipeline_health import compute_pipeline_health_summary
@@ -839,3 +844,18 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
             _shared_state.runtime_config.get("next_role_poll_timeout_secs", 180)
         ),
     }
+
+
+@router.get("/pr-behind-detector-stats")
+async def get_pr_behind_detector_stats(
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """In-process counts of pr_is_not_behind outcomes, keyed by call site.
+
+    Each call-site entry has integer buckets ``true`` / ``false`` / ``none``
+    plus ``total``. Counters are non-persistent (reset on process restart) and
+    track the four canonical call sites listed in
+    ``shared_state.PR_IS_NOT_BEHIND_CALL_SITES`` even when no hits have been
+    recorded yet, so the response shape is stable from process start.
+    """
+    return {"pr_is_not_behind": snapshot_pr_is_not_behind_counts()}

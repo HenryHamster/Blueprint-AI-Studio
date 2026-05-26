@@ -435,24 +435,15 @@ async def _attempt_merge_with_retry_and_escalation(
         # 'behind' path: call update_branch (GitHub write) BEFORE re-acquiring
         # the lock. The result is consumed in the lock-held block below.
         if _recheck_err is None and _ms == "behind":
-            from app.github import get_branch_sha, pr_is_not_behind, update_branch
+            from app.github import pr_is_not_behind_for, update_branch
 
-            _head_sha = (_recheck_pr or {}).get("head", {}).get("sha")
-            _base_tip_sha = None
-            if _head_sha and ci_base:
-                try:
-                    _base_tip_sha = await get_branch_sha(gh_token, owner, repo, ci_base)
-                except Exception as _bts_exc:
-                    logger.warning(
-                        f"[CI] PR #{ci_pr_number} get_branch_sha failed: {_bts_exc}"
-                    )
-            _not_behind = await pr_is_not_behind(
+            _not_behind = await pr_is_not_behind_for(
                 gh_token,
                 owner,
                 repo,
-                head_sha=_head_sha,
-                base_tip_sha=_base_tip_sha,
-                mergeable_state=_ms,
+                pr_detail=_recheck_pr,
+                base_branch=ci_base,
+                call_site="ci_completion",
             )
             if _not_behind:
                 _upd = {"not_behind": True}

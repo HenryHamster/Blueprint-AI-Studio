@@ -1574,6 +1574,7 @@ async def pr_is_not_behind(
     base_tip_sha: str | None = None,
     mergeable_state: str | None = None,
     project_id: str | None = None,
+    call_site: str | None = None,
 ) -> bool | None:
     """Return True iff a PR is NOT behind its base branch.
 
@@ -1589,8 +1590,18 @@ async def pr_is_not_behind(
     Returns ``True`` (not behind — safe to attempt merge without update-branch),
     ``False`` (behind — base tip not yet in PR head), or ``None`` (indeterminate:
     API error or insufficient information provided).
+
+    When ``call_site`` is provided, the outcome (True/False/None) is recorded
+    via ``shared_state.record_pr_is_not_behind`` so the admin diagnostics
+    endpoint can surface short-circuit hit rates. Call-site labels follow a
+    ``<subsystem>[_<sub-phase>]`` convention — see
+    ``shared_state.PR_IS_NOT_BEHIND_CALL_SITES`` for the canonical set.
     """
+    from app.shared_state import record_pr_is_not_behind
+
     if (mergeable_state or "").lower() == "clean":
+        if call_site:
+            record_pr_is_not_behind(call_site, True)
         return True
 
     if head_sha and base_tip_sha:
@@ -1598,15 +1609,71 @@ async def pr_is_not_behind(
             token, owner, repo, base_tip_sha, head_sha, project_id=project_id
         )
         if ancestor is True:
+            if call_site:
+                record_pr_is_not_behind(call_site, True)
             return True
         if ancestor is False:
+            if call_site:
+                record_pr_is_not_behind(call_site, False)
             return False
         # ancestor is None (API error) — fall through to mergeable_state signal
 
     if (mergeable_state or "").lower() == "behind":
+        if call_site:
+            record_pr_is_not_behind(call_site, False)
         return False
 
+    if call_site:
+        record_pr_is_not_behind(call_site, None)
     return None
+
+
+async def pr_is_not_behind_for(
+    token: str,
+    owner: str,
+    repo: str,
+    *,
+    pr_detail: dict | None,
+    base_branch: str | None = None,
+    base_tip_sha: str | None = None,
+    project_id: str | None = None,
+    call_site: str | None = None,
+) -> bool | None:
+    """Convenience wrapper around :func:`pr_is_not_behind` that pulls
+    ``head_sha`` and ``mergeable_state`` from a PR-detail dict and (optionally)
+    fetches the base branch's tip SHA via :func:`get_branch_sha`.
+
+    Every behind-recovery caller of ``update_branch`` / ``update_branch_with_sha_retry``
+    needs to consult :func:`pr_is_not_behind` first. The orchestration boilerplate
+    around that consultation is identical across callers — extract head SHA from
+    the PR dict, fetch the base tip with a defensive try/except, then forward
+    the params. This helper collapses that boilerplate to a single ``await``.
+
+    Pass an already-fetched ``base_tip_sha`` to skip the GitHub round-trip when
+    the caller has it in hand (e.g. the rollup pre-merge site needs the tip SHA
+    independently for its own comparison).
+    """
+    detail = pr_detail or {}
+    head_sha = (detail.get("head") or {}).get("sha")
+    mergeable_state = detail.get("mergeable_state") or ""
+    if base_tip_sha is None and head_sha and base_branch:
+        try:
+            base_tip_sha = await get_branch_sha(token, owner, repo, base_branch)
+        except Exception as exc:  # noqa: BLE001 — mirrors caller-site behavior: any get_branch_sha failure (network, 404, auth) must fall through to pr_is_not_behind with base_tip_sha=None so it can decide based on mergeable_state alone.
+            logger.warning(
+                f"[PR_IS_NOT_BEHIND] get_branch_sha({base_branch}) failed for "
+                f"{owner}/{repo}: {exc}"
+            )
+    return await pr_is_not_behind(
+        token,
+        owner,
+        repo,
+        head_sha=head_sha,
+        base_tip_sha=base_tip_sha,
+        mergeable_state=mergeable_state,
+        project_id=project_id,
+        call_site=call_site,
+    )
 
 
 async def get_files_changed_between_refs(

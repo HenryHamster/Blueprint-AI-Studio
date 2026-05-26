@@ -624,10 +624,9 @@ async def orchestrator_worker():
     from app.routers.agent import get_github_token_for_task
     from app.github import (
         close_pull_request,
-        get_branch_sha,
         get_check_runs_cached,
         get_pull_request,
-        pr_is_not_behind,
+        pr_is_not_behind_for,
         reopen_pull_request,
         update_branch_with_sha_retry,
     )
@@ -3820,27 +3819,14 @@ async def orchestrator_worker():
                                         _orch_ci_project_pre
                                     )
                                 )
-                                _base_tip_sha_pre = None
-                                if _expected_head_sha and _ci_base_pre:
-                                    try:
-                                        _base_tip_sha_pre = await get_branch_sha(
-                                            ci_gh_token,
-                                            ci_owner,
-                                            ci_repo,
-                                            _ci_base_pre,
-                                        )
-                                    except Exception as _bts_exc:
-                                        logger.warning(
-                                            f"[CI] PR #{ci_pr_number} get_branch_sha failed: {_bts_exc}"
-                                        )
-                                _not_behind_pre = await pr_is_not_behind(
+                                _not_behind_pre = await pr_is_not_behind_for(
                                     ci_gh_token,
                                     ci_owner,
                                     ci_repo,
-                                    head_sha=_expected_head_sha,
-                                    base_tip_sha=_base_tip_sha_pre,
-                                    mergeable_state=_ms,
+                                    pr_detail=pr_data,
+                                    base_branch=_ci_base_pre,
                                     project_id=ci_pid_str,
+                                    call_site="orchestrator_ci",
                                 )
                                 if _not_behind_pre is True:
                                     logger.info(

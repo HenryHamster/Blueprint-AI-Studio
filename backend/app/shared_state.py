@@ -1279,6 +1279,55 @@ def count_recent_warm_pin_clears(window_seconds: int = 3600) -> int:
 warm_continuity_suppressed_until: datetime | None = None
 
 
+# Per-call-site counter for pr_is_not_behind() outcomes. Keyed by a stable
+# label that names the calling site (e.g. "ci_completion", "rollup_pre_merge").
+# Each inner dict has integer buckets for the True/False/None outcomes plus a
+# total. Updated synchronously by record_pr_is_not_behind() and snapshotted by
+# the admin diagnostics endpoint. In-process only — not persisted.
+PR_IS_NOT_BEHIND_CALL_SITES: tuple[str, ...] = (
+    "ci_completion",
+    "rollup_pre_merge",
+    "rollup_post_merge",
+    "orchestrator_ci",
+)
+pr_is_not_behind_counts: Dict[str, Dict[str, int]] = {}
+
+
+def _empty_pr_is_not_behind_bucket() -> Dict[str, int]:
+    return {"true": 0, "false": 0, "none": 0, "total": 0}
+
+
+def record_pr_is_not_behind(call_site: str, result: bool | None) -> None:
+    """Increment the bucket matching ``result`` for ``call_site``."""
+    if not call_site:
+        return
+    bucket = pr_is_not_behind_counts.setdefault(
+        call_site, _empty_pr_is_not_behind_bucket()
+    )
+    if result is True:
+        bucket["true"] += 1
+    elif result is False:
+        bucket["false"] += 1
+    else:
+        bucket["none"] += 1
+    bucket["total"] += 1
+
+
+def snapshot_pr_is_not_behind_counts() -> Dict[str, Dict[str, int]]:
+    """Return a deep-copied snapshot keyed by call site.
+
+    Always includes the four canonical call sites with zeroed buckets so the
+    response shape is stable from process start. Any other call sites that have
+    been recorded (future expansions) are included as well.
+    """
+    snapshot: Dict[str, Dict[str, int]] = {
+        site: _empty_pr_is_not_behind_bucket() for site in PR_IS_NOT_BEHIND_CALL_SITES
+    }
+    for site, bucket in pr_is_not_behind_counts.items():
+        snapshot[site] = dict(bucket)
+    return snapshot
+
+
 def is_warm_continuity_suppressed() -> bool:
     """True iff warm continuity is auto-suppressed by the pin-clear circuit breaker.
 

@@ -833,7 +833,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         get_pr_files,
         get_branch_sha,
         close_pull_request,
-        pr_is_not_behind,
+        pr_is_not_behind_for,
         update_branch_with_sha_retry,
     )
 
@@ -2134,12 +2134,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             # reachable from the head (ancestor check). Either
                             # signal lets us skip update-branch recovery.
                             _pre_ms = (pr_detail.get("mergeable_state") or "") if pr_detail else ""
-                            _not_behind = await pr_is_not_behind(
+                            _not_behind = await pr_is_not_behind_for(
                                 gh_token, owner, repo,
-                                head_sha=head_sha,
+                                pr_detail=pr_detail,
                                 base_tip_sha=target_tip_sha,
-                                mergeable_state=_pre_ms,
                                 project_id=project_id_str,
+                                call_site="rollup_pre_merge",
                             )
                             if _not_behind is True:
                                 logger.info(
@@ -2392,34 +2392,23 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             _behind_head_sha = (
                                 _pr_detail.get("head", {}).get("sha") or None
                             )
-                            _behind_base_sha: str | None = None
-                            try:
-                                _behind_base_sha = await get_branch_sha(
-                                    gh_token, owner, repo, target_branch
+                            _post_not_behind = await pr_is_not_behind_for(
+                                gh_token,
+                                owner,
+                                repo,
+                                pr_detail=_pr_detail,
+                                base_branch=target_branch,
+                                project_id=str(parent.project_id),
+                                call_site="rollup_post_merge",
+                            )
+                            if _post_not_behind is True:
+                                logger.info(
+                                    f"[ROLLUP] PR #{rollup_pr_number} "
+                                    f"mergeable_state=behind but "
+                                    f"pr_is_not_behind=True — skipping "
+                                    f"update_branch, deferring to next sweep"
                                 )
-                            except Exception as _tip_err:
-                                logger.debug(
-                                    f"[ROLLUP] Could not fetch base tip for "
-                                    f"behind-check on PR #{rollup_pr_number}: {_tip_err}"
-                                )
-                            if _behind_base_sha:
-                                _post_not_behind = await pr_is_not_behind(
-                                    gh_token,
-                                    owner,
-                                    repo,
-                                    head_sha=_behind_head_sha,
-                                    base_tip_sha=_behind_base_sha,
-                                    mergeable_state=_ms,
-                                    project_id=str(parent.project_id),
-                                )
-                                if _post_not_behind is True:
-                                    logger.info(
-                                        f"[ROLLUP] PR #{rollup_pr_number} "
-                                        f"mergeable_state=behind but "
-                                        f"pr_is_not_behind=True — skipping "
-                                        f"update_branch, deferring to next sweep"
-                                    )
-                                    return
+                                return
                             _upd = await update_branch_with_sha_retry(
                                 gh_token,
                                 owner,

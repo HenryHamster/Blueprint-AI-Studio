@@ -2647,9 +2647,13 @@ class TestBehindRecoveryUpdateBranchGuard:
     # gated by ``pr_is_not_behind`` in any behind-recovery context.
     _TARGET_CALLEES = frozenset({"update_branch", "update_branch_with_sha_retry"})
 
-    # Explicit guard symbol — referenced anywhere in the enclosing function
-    # body satisfies the tripwire.
-    _GUARD_NAME = "pr_is_not_behind"
+    # Explicit guard symbols — referencing ANY of these in the enclosing
+    # function body satisfies the tripwire. ``pr_is_not_behind`` is the
+    # underlying detector; ``pr_is_not_behind_for`` is the convenience
+    # wrapper in ``app/github.py`` that bundles the head_sha extraction +
+    # get_branch_sha fetch boilerplate around it. Either reference is
+    # sufficient evidence that the caller consulted the detector.
+    _GUARD_NAMES = frozenset({"pr_is_not_behind", "pr_is_not_behind_for"})
 
     # ``app/github.py`` defines both ``update_branch`` and ``pr_is_not_behind``,
     # and the internal ``update_branch_with_sha_retry -> update_branch`` call
@@ -2716,9 +2720,9 @@ class TestBehindRecoveryUpdateBranchGuard:
             # they contain their own Call to a target.
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            if isinstance(node, ast.Name) and node.id == cls._GUARD_NAME:
+            if isinstance(node, ast.Name) and node.id in cls._GUARD_NAMES:
                 return True
-            if isinstance(node, ast.Attribute) and node.attr == cls._GUARD_NAME:
+            if isinstance(node, ast.Attribute) and node.attr in cls._GUARD_NAMES:
                 return True
             stack.extend(ast.iter_child_nodes(node))
         return False
@@ -2737,7 +2741,7 @@ class TestBehindRecoveryUpdateBranchGuard:
             stripped = line.lstrip()
             if stripped.startswith("#"):
                 continue
-            if cls._GUARD_NAME in line:
+            if any(name in line for name in cls._GUARD_NAMES):
                 return True
         return False
 
