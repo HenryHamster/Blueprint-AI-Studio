@@ -232,6 +232,9 @@ async def get_settings(
         "architecture_review_frequency": _runtime_config.get(
             "architecture_review_frequency", 3
         ),
+        "strategic_max_interval_minutes": _runtime_config.get(
+            "strategic_max_interval_minutes", 180
+        ),
         "max_active_directions": _runtime_config.get("max_active_directions", 10),
         "webhook_url_configured": bool(os.getenv("PIPELINE_WEBHOOK_URL")),
         "notification_config": _build_notification_config_response(
@@ -1125,6 +1128,20 @@ async def _apply_settings(
                 detail="architecture_review_frequency must be between 0 and 100 (0 = disabled)",
             )
         _runtime_config["architecture_review_frequency"] = val
+    if "strategic_max_interval_minutes" in payload:
+        try:
+            val = int(payload["strategic_max_interval_minutes"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="strategic_max_interval_minutes must be a number",
+            )
+        if not (0 <= val <= 10080):
+            raise HTTPException(
+                status_code=400,
+                detail="strategic_max_interval_minutes must be between 0 and 10080 (0 = disabled, 10080 = 1 week)",
+            )
+        _runtime_config["strategic_max_interval_minutes"] = val
     if "max_active_directions" in payload:
         try:
             val = int(payload["max_active_directions"])
@@ -1424,6 +1441,9 @@ async def _apply_settings(
                     "max_rollup_retries": _runtime_config.get("max_rollup_retries", 5),
                     "architecture_review_frequency": _runtime_config.get(
                         "architecture_review_frequency", 3
+                    ),
+                    "strategic_max_interval_minutes": _runtime_config.get(
+                        "strategic_max_interval_minutes", 180
                     ),
                     "max_active_directions": _runtime_config.get(
                         "max_active_directions", 10

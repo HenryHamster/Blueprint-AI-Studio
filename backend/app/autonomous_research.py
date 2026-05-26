@@ -583,6 +583,40 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         and research_spawn_count > 0
         and research_spawn_count % strategic_frequency == 0
     ) or force_strategic
+    # Wall-clock backstop: research-spawn frequency depends on active-direction
+    # count, so narrowing scope throttles the strategic agent's own decision
+    # cadence (fewer directions -> fewer spawns -> later modulo trigger). If the
+    # agent narrows incorrectly it then has fewer chances to widen back. Force a
+    # cycle if it has been too long since the last one, independent of spawn
+    # count. The existing cooldown guard below still prevents spam.
+    strategic_max_interval = _runtime_config.get("strategic_max_interval_minutes", 60)
+    if not is_strategic and strategic_max_interval > 0:
+        from sqlalchemy import func as _backstop_func
+
+        last_strategic_at = (
+            await session.execute(
+                select(_backstop_func.max(Task.created_at)).where(
+                    Task.project_id == project.id,
+                    Task.payloads[0]["type"]
+                    .as_string()
+                    .in_(["strategic_review", "design_doc_update"]),
+                )
+            )
+        ).scalar()
+        if last_strategic_at is not None:
+            # _utcnow() returns a naive UTC datetime (project convention — see
+            # time_utils.py). Strip tzinfo from the DB value if present so the
+            # subtraction is naive-vs-naive.
+            if last_strategic_at.tzinfo is not None:
+                last_strategic_at = last_strategic_at.replace(tzinfo=None)
+            age_minutes = (_utcnow() - last_strategic_at).total_seconds() / 60.0
+            if age_minutes >= strategic_max_interval:
+                logger.info(
+                    f"[STRATEGIC] Wall-clock backstop firing for project {project.id}: "
+                    f"last strategic task created {age_minutes:.1f}min ago "
+                    f"(threshold {strategic_max_interval}min, active_directions={len(all_active_directions)})"
+                )
+                is_strategic = True
     # 2026-05-03: gate strategic spawn on (a) no-active-strategic AND
     # (b) no recent strategic spawn (regardless of terminal state).
     #

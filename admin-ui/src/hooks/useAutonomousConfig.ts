@@ -16,6 +16,7 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
   const [configResidualRemediationCooldownHours, setConfigResidualRemediationCooldownHours] = useState<number>(24);
   const [configMaxActiveDirections, setConfigMaxActiveDirections] = useState<number>(10);
   const [configArchitectureReviewFrequency, setConfigArchitectureReviewFrequency] = useState<number>(3);
+  const [configStrategicMaxIntervalMinutes, setConfigStrategicMaxIntervalMinutes] = useState<number>(180);
   const [configMaxProvisionRetries, setConfigMaxProvisionRetries] = useState<number>(3);
   const [configMaxRollupRetries, setConfigMaxRollupRetries] = useState<number>(5);
   const [configDriftOverClaimMinClaims, setConfigDriftOverClaimMinClaims] = useState<number>(3);
@@ -54,6 +55,7 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
       if (data.residual_remediation_cooldown_hours != null) setConfigResidualRemediationCooldownHours(data.residual_remediation_cooldown_hours);
       if (data.max_active_directions != null) setConfigMaxActiveDirections(data.max_active_directions);
       if (data.architecture_review_frequency != null) setConfigArchitectureReviewFrequency(data.architecture_review_frequency);
+      if (data.strategic_max_interval_minutes != null) setConfigStrategicMaxIntervalMinutes(data.strategic_max_interval_minutes);
       if (data.max_provision_retries != null) setConfigMaxProvisionRetries(data.max_provision_retries);
       if (data.max_rollup_retries != null) setConfigMaxRollupRetries(data.max_rollup_retries);
       if (data.drift_over_claim_min_claims != null) setConfigDriftOverClaimMinClaims(data.drift_over_claim_min_claims);
@@ -108,6 +110,7 @@ export function useAutonomousConfig({ setError, addToast }: UseAutonomousConfigD
     configResidualRemediationCooldownHours, setConfigResidualRemediationCooldownHours,
     configMaxActiveDirections, setConfigMaxActiveDirections,
     configArchitectureReviewFrequency, setConfigArchitectureReviewFrequency,
+    configStrategicMaxIntervalMinutes, setConfigStrategicMaxIntervalMinutes,
     configMaxProvisionRetries, setConfigMaxProvisionRetries,
     configMaxRollupRetries, setConfigMaxRollupRetries,
     configDriftOverClaimMinClaims, setConfigDriftOverClaimMinClaims,

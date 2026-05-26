@@ -10557,3 +10557,154 @@ async def test_payload_too_large_writes_vision_bloat_marker(db_session, mocker):
     assert len(contributors) >= 1
     assert contributors[0]["key"] == "design_doc"
     assert contributors[0]["size"] == 250000
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Wall-clock strategic backstop
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_strategic_max_interval_backstop_fires_when_stale(db_session, mocker):
+    """Wall-clock backstop forces a strategic spawn when the last strategic task
+    is older than strategic_max_interval_minutes, even though the modulo path
+    (research_spawn_count % strategic_frequency) does not trigger and
+    force_strategic is inactive (purpose set + at least one active direction).
+
+    This decouples steering frequency from research-spawn rate so a narrowed
+    direction count does not throttle the strategic agent's own decision cadence.
+    """
+    mock_spawn = AsyncMock(return_value=True)
+    mocker.patch("app.strategic_spawning._spawn_strategic_review", mock_spawn)
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.autonomous_research._should_dispatch_self_audit",
+        new=AsyncMock(return_value=None),
+    )
+
+    project = Project(
+        name="Backstop Fires Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-backstop01", "Test direction")],
+        # purpose set → not force_strategic; count=1 → 1 % 6 != 0 → modulo inactive
+        vision={"purpose": "test", "_research_spawn_count": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    stale_strategic = Task(
+        project_id=project.id,
+        title="Old Strategic",
+        payloads=[{"type": "strategic_review", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=datetime.utcnow() - timedelta(hours=4),
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(stale_strategic)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert mock_spawn.called, (
+        "Wall-clock backstop must force _spawn_strategic_review when the prior "
+        "strategic task is older than strategic_max_interval_minutes, even though "
+        "the modulo path and force_strategic are both inactive."
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_max_interval_backstop_quiet_within_window(db_session, mocker):
+    """Backstop must NOT fire when the prior strategic is within the window
+    (the existing cooldown also blocks the spawn here)."""
+    mock_spawn = AsyncMock(return_value=True)
+    mocker.patch("app.strategic_spawning._spawn_strategic_review", mock_spawn)
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.autonomous_research._should_dispatch_self_audit",
+        new=AsyncMock(return_value=None),
+    )
+
+    project = Project(
+        name="Backstop Quiet Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-backstop02", "Test direction")],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fresh_strategic = Task(
+        project_id=project.id,
+        title="Fresh Strategic",
+        payloads=[{"type": "strategic_review", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=datetime.utcnow() - timedelta(minutes=30),
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(fresh_strategic)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert not mock_spawn.called, (
+        "Backstop must remain quiet when the prior strategic is within the window."
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_max_interval_backstop_disabled_by_zero(db_session, mocker):
+    """Setting strategic_max_interval_minutes=0 disables the backstop entirely."""
+    mock_spawn = AsyncMock(return_value=True)
+    mocker.patch("app.strategic_spawning._spawn_strategic_review", mock_spawn)
+    mocker.patch(
+        "app.strategic_spawning._spawn_design_doc_update",
+        new=AsyncMock(return_value=True),
+    )
+    mocker.patch(
+        "app.autonomous_research._should_dispatch_self_audit",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch.dict(
+        _shared_state.runtime_config, {"strategic_max_interval_minutes": 0}
+    )
+
+    project = Project(
+        name="Backstop Disabled Project",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-backstop03", "Test direction")],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    stale_strategic = Task(
+        project_id=project.id,
+        title="Old Strategic",
+        payloads=[{"type": "strategic_review", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=datetime.utcnow() - timedelta(days=7),
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(stale_strategic)
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    assert not mock_spawn.called, (
+        "Backstop must stay quiet when strategic_max_interval_minutes is 0 (disabled)."
+    )
