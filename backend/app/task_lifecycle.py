@@ -1245,6 +1245,7 @@ async def _process_post_commit(
         _handle_self_audit_completion,
         _handle_investigation_completion,
         _handle_memo_completion,
+        _try_recover_memo_from_parse_failure,
         _record_remediation_if_terminal,
         _handle_investigation_terminal_failure,
         _record_regression_signal_if_matching,
@@ -1510,6 +1511,32 @@ async def _process_post_commit(
                 logger.warning(
                     f"[REGRESSION-CASE] Failed to re-arm case on task failure {task.id}: {_rc_fail_exc!r}"
                 )
+
+            # FAILED memo recovery: when failure_category='parse_failed', the agent may
+            # have emitted a valid memo JSON inside an item.completed envelope that the
+            # deployed handler couldn't extract. Attempt one last recovery before
+            # permanently marking the task FAILED.
+            if task.first_payload.get("type") == "memo":
+                raw_fc = (task.context or {}).get("agent_failure_category_raw", "")
+                if raw_fc == "parse_failed":
+                    try:
+                        _recovery_logs = (
+                            payload.logs or task.latest_status_message or ""
+                        )
+                        _recovered = await _try_recover_memo_from_parse_failure(
+                            task, _recovery_logs, session
+                        )
+                        if _recovered:
+                            logger.info(
+                                "[MEMO] Promoted parse_failed task %s to COMPLETED via error-log recovery",
+                                task.id,
+                            )
+                    except Exception as _memo_rec_exc:
+                        logger.warning(
+                            "[MEMO] Recovery attempt failed for task %s: %r",
+                            task.id,
+                            _memo_rec_exc,
+                        )
 
         # Anti-poisoning: resolve playbook entries the task wrote while
         # IN_PROGRESS. On COMPLETED, clear pending_source so peers can see

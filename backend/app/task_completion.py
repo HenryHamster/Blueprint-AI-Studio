@@ -1653,6 +1653,70 @@ async def _handle_memo_completion(task: Task, logs: str, session: AsyncSession):
     logger.info(f"[MEMO] Persisted memo artifact {artifact.id} for task {task.id}")
 
 
+async def _try_recover_memo_from_parse_failure(
+    task: Task, logs: str, session: AsyncSession
+) -> bool:
+    """Scan a JSONL error log for a valid memo JSON buried in an agent_message envelope.
+
+    When a memo task fails with failure_category='parse_failed' the Codex agent
+    may have already emitted a schema-valid memo JSON inside an item.completed /
+    item.updated event that the deployed agent handler failed to extract.  Scans
+    ``logs`` line-by-line for those envelopes, tries ``_parse_memo_output`` on
+    the text payload, and on success calls ``_handle_memo_completion`` to persist
+    the MEMO Artifact and promote the task to COMPLETED.
+
+    Returns True on successful recovery, False if no valid memo is found (leaving
+    the task status unchanged so the caller can decide how to proceed).
+    """
+    if not logs:
+        return False
+
+    for raw_line in logs.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") not in ("item.completed", "item.updated"):
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "agent_message":
+            continue
+
+        # text may be a plain string or a list of content blocks
+        raw_text = item.get("text") or item.get("content")
+        if isinstance(raw_text, list):
+            text = " ".join(
+                b.get("text", "") if isinstance(b, dict) else str(b) for b in raw_text
+            )
+        elif isinstance(raw_text, str):
+            text = raw_text
+        else:
+            continue
+
+        parsed = _parse_memo_output(text)
+        if parsed is None:
+            continue
+        if not all(k in parsed for k in _MEMO_REQUIRED_KEYS):
+            continue
+
+        logger.info(
+            "[MEMO] Recovery: found valid memo JSON in agent_message envelope for task %s",
+            task.id,
+        )
+        await _handle_memo_completion(task, text, session)
+        return True
+
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Self audit completion — moved to task_completion_self_audit.
 # Importers should keep using `from app.task_completion import ...`; the
