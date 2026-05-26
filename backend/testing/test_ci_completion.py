@@ -1332,6 +1332,61 @@ async def test_mergeable_state_clean_does_not_escalate_on_keyword(db_session, mo
 
 
 @pytest.mark.asyncio
+async def test_mergeable_state_clean_no_existing_fix_does_not_spawn_rebase(
+    db_session, mocker
+):
+    """
+    When mergeable_state='clean' and there is NO pre-existing fix task, a
+    transient merge API failure must NOT spawn a rebase fix.  GitHub has
+    confirmed the PR is conflict-free, so there is nothing to rebase — the
+    only correct action is to retry the merge.
+
+    Regression guard for the clean-state short-circuit in the rebase-fix
+    spawn block (_ms == 'clean' condition).
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open", "mergeable_state": "clean"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "transient server error"},
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(None, False),
+    )
+
+    project = Project(name="clean no fix spawn", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # No existing fix task — without the clean-state guard, the rebase-fix
+    # spawn path would fire here.
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    spawn_mock.assert_not_called()
+    assert result is False
+    assert task.requires_approval is not True, "clean state must not escalate"
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_failures") == 1, (
+        "clean-state transient failure must still tick the retry counter"
+    )
+
+
+@pytest.mark.asyncio
 async def test_mergeable_state_unknown_falls_back_to_keywords(db_session, mocker):
     """
     When mergeable_state is 'unknown' (GitHub still computing), fall back to
@@ -2043,7 +2098,9 @@ async def test_suppress_warm_handoff_merge_blocked_rebase(db_session, mocker):
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
         "app.github.get_pull_request",
-        return_value={"merged": False, "state": "open", "mergeable_state": "clean"},
+        # Use 'unknown' so keyword-based rule-block detection runs and the
+        # transient path (no clean-state guard) reaches the rebase-fix spawn.
+        return_value={"merged": False, "state": "open", "mergeable_state": "unknown"},
     )
     mocker.patch(
         "app.github.merge_pull_request",
@@ -2193,9 +2250,7 @@ async def test_ci_failure_spawn_extracts_failing_test_names_into_prompt(
     spawn_mock.assert_called_once()
     fix_prompt = spawn_mock.call_args.kwargs.get("fix_prompt") or ""
     assert "Failing tests (extracted from CI summary" in fix_prompt
-    assert (
-        "testing/test_pack_under_budget.py::test_meta_preserved" in fix_prompt
-    )
+    assert "testing/test_pack_under_budget.py::test_meta_preserved" in fix_prompt
     assert (
         "testing/test_anomaly_detection.py::test_proactive_fingerprint_spawns"
         in fix_prompt

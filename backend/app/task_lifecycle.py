@@ -1892,7 +1892,7 @@ async def _process_post_commit(
                                     project_id=str(task.project_id),
                                 )
                                 ms = (pr_detail.get("mergeable_state") or "").lower()
-                                if ms in ("blocked", "unstable"):
+                                if ms in ("blocked", "unstable", "clean"):
                                     am_result = await enable_auto_merge(
                                         gh_token,
                                         owner,
@@ -1908,6 +1908,11 @@ async def _process_post_commit(
                                         logger.info(
                                             f"[PIPELINE] Auto-merge enablement declined for PR #{pr_number}: {am_result.get('message')}"
                                         )
+                                    if ms == "clean":
+                                        # PR is clean/ready — transient API failure, not a real
+                                        # conflict. Skip recovery task spawn; let auto-merge
+                                        # fire when GitHub is ready.
+                                        recovery_type = None
                                 elif ms == "dirty":
                                     recovery_type = "fix"
                             except Exception as _am_exc:
@@ -1917,6 +1922,8 @@ async def _process_post_commit(
                             # Spawn the recovery task. For DIRTY conflicts on cluster
                             # sub-PRs we use `fix` (rebase + resolve); otherwise
                             # `review` (the existing default).
+                            # When recovery_type is None (clean state) no spawn fires —
+                            # auto-merge was re-enabled above and the task parks in CI-wait.
                             #
                             # Pass fix_reason="merge_conflict" so the fix-completion
                             # handler can route straight to security-scan + auto-merge
@@ -1926,49 +1933,24 @@ async def _process_post_commit(
                             # there's no review-worthy logic change to re-assess —
                             # rebase output is mechanical. This keeps the cost model
                             # symmetric with the no-conflict happy path.
-                            spawn_kwargs = {
-                                "original_prompt": original_prompt,
-                                "original_task_id": str(task.id),
-                            }
-                            if recovery_type == "fix":
-                                spawn_kwargs["fix_reason"] = "merge_conflict"
-                                spawn_kwargs["fix_prompt"] = (
-                                    f"PR #{pr_number} cannot merge into `{base_branch}` due to a merge conflict "
-                                    f"(GitHub mergeable_state='dirty'). The code review is already approved — "
-                                    f"focus only on resolving the conflict.\n\n"
-                                    f"After cloning:\n"
-                                    f"  1. Run `git fetch origin {base_branch} && git rebase origin/{base_branch}`.\n"
-                                    f"  2. Resolve every conflict marker — preserve the intent of both branches.\n"
-                                    f"  3. Re-run lint/type/test suites for the affected files.\n"
-                                    f"  4. Commit the resolution and force-push with `--force-with-lease`."
-                                )
-                            recovery_task, was_created = await _spawn_pipeline_task(
-                                task,
-                                recovery_type,
-                                session,
-                                pr_number,
-                                branch,
-                                base_branch,
-                                **spawn_kwargs,
-                            )
-                            if was_created:
+                            if recovery_type is None:
                                 logger.info(
-                                    f"[PIPELINE] Spawned {recovery_type} task {recovery_task.id} for PR #{pr_number} after auto-merge failure"
-                                )
-                            elif recovery_task is not None:
-                                logger.info(
-                                    f"[PIPELINE] Auto-merge failed for PR #{pr_number} — same-chain {recovery_task.first_payload.get('type')} task {recovery_task.id} ({recovery_task.status}) already handling it"
-                                )
-                            else:
-                                logger.warning(
-                                    f"[PIPELINE] Auto-merge failed and no {recovery_type} spawned for PR #{pr_number} (cap hit or guard) — parking in CI-wait"
+                                    f"[PIPELINE] Auto-merge failed for PR #{pr_number} (mergeable_state=clean) — re-enabled auto-merge, parking in CI-wait"
                                 )
                                 task.status = TaskStatus.EVALUATING
-                                task.latest_status_message = f"Auto-merge failed for PR #{pr_number} — parked for CI-wait retry"
+                                task.latest_status_message = f"Auto-merge failed for PR #{pr_number} (clean state) — parked for CI-wait retry"
+                                # Small/medium intermediate (and auto_approve_small) explicitly
+                                # skip review — no review task will ever set review_approved.
+                                # mergeable_state="clean" also implies CI is already green.
+                                # Pre-satisfy both gate flags so handle_ci_completion can merge
+                                # on the next signal instead of stranding the task on
+                                # _review_approved.
                                 task.context = {
                                     **(task.context or {}),
                                     "review_loop": {
                                         "ci_waiting": True,
+                                        "review_approved": True,
+                                        "ci_passed": True,
                                         "pr_number": pr_number,
                                         "branch": branch,
                                         "base_branch": base_branch,
@@ -1978,6 +1960,59 @@ async def _process_post_commit(
                                 }
                                 session.add(task)
                                 await session.commit()
+                            else:
+                                spawn_kwargs = {
+                                    "original_prompt": original_prompt,
+                                    "original_task_id": str(task.id),
+                                }
+                                if recovery_type == "fix":
+                                    spawn_kwargs["fix_reason"] = "merge_conflict"
+                                    spawn_kwargs["fix_prompt"] = (
+                                        f"PR #{pr_number} cannot merge into `{base_branch}` due to a merge conflict "
+                                        f"(GitHub mergeable_state='dirty'). The code review is already approved — "
+                                        f"focus only on resolving the conflict.\n\n"
+                                        f"After cloning:\n"
+                                        f"  1. Run `git fetch origin {base_branch} && git rebase origin/{base_branch}`.\n"
+                                        f"  2. Resolve every conflict marker — preserve the intent of both branches.\n"
+                                        f"  3. Re-run lint/type/test suites for the affected files.\n"
+                                        f"  4. Commit the resolution and force-push with `--force-with-lease`."
+                                    )
+                                recovery_task, was_created = await _spawn_pipeline_task(
+                                    task,
+                                    recovery_type,
+                                    session,
+                                    pr_number,
+                                    branch,
+                                    base_branch,
+                                    **spawn_kwargs,
+                                )
+                                if was_created:
+                                    logger.info(
+                                        f"[PIPELINE] Spawned {recovery_type} task {recovery_task.id} for PR #{pr_number} after auto-merge failure"
+                                    )
+                                elif recovery_task is not None:
+                                    logger.info(
+                                        f"[PIPELINE] Auto-merge failed for PR #{pr_number} — same-chain {recovery_task.first_payload.get('type')} task {recovery_task.id} ({recovery_task.status}) already handling it"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"[PIPELINE] Auto-merge failed and no {recovery_type} spawned for PR #{pr_number} (cap hit or guard) — parking in CI-wait"
+                                    )
+                                    task.status = TaskStatus.EVALUATING
+                                    task.latest_status_message = f"Auto-merge failed for PR #{pr_number} — parked for CI-wait retry"
+                                    task.context = {
+                                        **(task.context or {}),
+                                        "review_loop": {
+                                            "ci_waiting": True,
+                                            "pr_number": pr_number,
+                                            "branch": branch,
+                                            "base_branch": base_branch,
+                                            "original_task_id": str(task.id),
+                                            "ci_wait_started": _utcnow().isoformat(),
+                                        },
+                                    }
+                                    session.add(task)
+                                    await session.commit()
                     except Exception as e:
                         logger.error(
                             f"[PIPELINE] Auto-merge error for PR #{pr_number}: {e}",

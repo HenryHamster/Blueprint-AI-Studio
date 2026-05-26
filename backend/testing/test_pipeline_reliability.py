@@ -1274,7 +1274,7 @@ async def test_ci_polling_unrecognized_state_uses_lower_threshold(orch_db, mocke
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mergeable_state",
-    ["blocked", "unknown", "unstable", "weird_new_state"],
+    ["blocked", "unknown", "unstable", "clean", "weird_new_state"],
 )
 async def test_ci_polling_non_dirty_state_continues_without_fix_spawn(
     orch_db,
@@ -1339,6 +1339,9 @@ async def test_ci_polling_non_dirty_state_continues_without_fix_spawn(
             "head": {"sha": "abc123"},
         },
     )
+    update_mock = mocker.patch(
+        "app.github.update_branch_with_sha_retry", new=AsyncMock()
+    )
     # The orchestrator imports _spawn_pipeline_task from app.review_pipeline at
     # call time; patching the source module catches any invocation.
     spawn_mock = mocker.patch(
@@ -1369,6 +1372,9 @@ async def test_ci_polling_non_dirty_state_continues_without_fix_spawn(
     assert "conflict_fix_spawned" not in rl, (
         f"conflict_fix_spawned must NOT be set for non-dirty state "
         f"{mergeable_state!r}, got rl={rl!r}"
+    )
+    assert update_mock.await_count == 0, (
+        f"mergeable_state={mergeable_state!r} must not escalate to update_branch"
     )
     spawn_mock.assert_not_called()
     assert len(all_tasks) == 1, (

@@ -3781,6 +3781,117 @@ async def test_auto_merge_dirty_spawns_fix_with_prompt(tl_db, mocker):
     assert "research/cycle-1" in fix_prompt, "fix_prompt must reference the base branch"
 
 
+@pytest.mark.asyncio
+async def test_auto_merge_clean_state_enables_auto_merge_not_review(tl_db, mocker):
+    """When auto-merge fails but mergeable_state='clean', no recovery task should be
+    spawned. The PR is in good shape — re-enable auto-merge and park in CI-wait.
+    """
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+
+    spawn_calls: list = []
+
+    async def _capture_spawn(*args, **kwargs):
+        spawn_calls.append((args, kwargs))
+        mock_task = mocker.MagicMock()
+        mock_task.id = uuid.uuid4()
+        mock_task.first_payload = {"type": "review"}
+        mock_task.status = TaskStatus.QUEUED
+        return (mock_task, True)
+
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+    mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "message": "not mergeable"},
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "mergeable_state": "clean",
+            "head": {"sha": "abc123", "ref": "blueprint/task-deadbeef"},
+        },
+    )
+    enable_auto_merge_mock = mocker.patch(
+        "app.github.enable_auto_merge",
+        new_callable=AsyncMock,
+        return_value={"enabled": True},
+    )
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small"},
+    )
+    task.payloads = [
+        {
+            "type": "create",
+            "prompt": "implement feature Y",
+            "base_branch": "research/cycle-1",
+        }
+    ]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/88",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    assert not spawn_calls, (
+        "No review or fix task should be spawned when mergeable_state='clean'"
+    )
+    enable_auto_merge_mock.assert_called_once()
+
+    # Parked task must be able to satisfy the merge gate on the next CI signal.
+    # The small/medium-intermediate path explicitly skips review, so no review
+    # task will ever flip review_approved. If the parked review_loop doesn't
+    # carry review_approved=True (and ci_passed=True given mergeable_state=clean
+    # implies green CI), handle_ci_completion's _review_approved gate at
+    # ci_completion.py:1236 strands the task in EVALUATING forever.
+    from app.ci_completion import _review_approved
+
+    await session.refresh(task)
+    parked_loop = (task.context or {}).get("review_loop", {})
+    assert parked_loop.get("ci_waiting") is True
+    assert parked_loop.get("review_approved") is True, (
+        "parked review_loop must carry review_approved=True so the skip-review "
+        "path can satisfy the merge gate"
+    )
+    assert parked_loop.get("ci_passed") is True, (
+        "mergeable_state='clean' implies CI is green; ci_passed=True lets the "
+        "next CI-completion poll merge immediately without re-waiting on checks"
+    )
+    assert _review_approved(parked_loop), (
+        "_review_approved must return True so handle_ci_completion can merge"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # _close_loop_regression_case_on_failure — failure summary capture
 # ══════════════════════════════════════════════════════════════════════════════

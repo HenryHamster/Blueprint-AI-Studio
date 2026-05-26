@@ -933,9 +933,14 @@ async def _attempt_merge_with_retry_and_escalation(
             # conditions below would FAIL the task anyway (deterministic error,
             # repeated-identical streak, or hard-cap reached) — a rebase can't
             # recover from those and the test suite verifies those paths exit
-            # cleanly without spawning.
+            # cleanly without spawning.  Also skip when GitHub reports the PR as
+            # 'clean' — the merge failure is a transient API hiccup, not a real
+            # conflict; spawning a rebase fix against a clean PR is always wrong.
             if not (
-                _deterministic or _repeated_identical or _merge_failures >= _hard_cap
+                _deterministic
+                or _repeated_identical
+                or _merge_failures >= _hard_cap
+                or _ms == "clean"
             ):
                 from app.review_pipeline import _spawn_pipeline_task
 
