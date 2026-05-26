@@ -68,6 +68,7 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "_compute_symptom_layers_by_class",
         "compute_anomaly_adjustment_summary",
         "compute_digest_trend_history",
+        "compute_direction_progress",
         "compute_failure_grouping",
         "compute_migration_health",
         "compute_rejection_pattern_summary",

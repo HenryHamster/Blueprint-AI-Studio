@@ -3959,7 +3959,7 @@ async def test_digest_direction_progress_cost_budget_fields(
 ):
     """direction_progress exposes budget utilization and fires alert when >=80%."""
     dispatch_mock = mocker.patch(
-        "app.routers.admin_digest.dispatch_external_notification",
+        "app.notification_dispatch.dispatch_external_notification",
         new_callable=mocker.AsyncMock,
     )
     now = _utcnow()
