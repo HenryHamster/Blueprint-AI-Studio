@@ -1909,7 +1909,6 @@ def test_derive_task_branch_known_prefixes():
     """Each task type with a non-default prefix maps correctly."""
     task_id = _uuid.UUID("12345678-abcd-ef01-2345-678abcdef012")
     short = "12345678"
-    assert _derive_task_branch(task_id, "fix") == f"blueprint/fix-{short}"
     assert _derive_task_branch(task_id, "refactor") == f"blueprint/refactor-{short}"
     assert _derive_task_branch(task_id, "docs") == f"blueprint/docs-{short}"
     assert _derive_task_branch(task_id, "deps") == f"blueprint/deps-{short}"
@@ -1923,6 +1922,7 @@ def test_derive_task_branch_default_prefix():
     for task_type in (
         "create",
         "qa",
+        "fix",
         "perf",
         "security_audit",
         "debug",
@@ -1949,10 +1949,13 @@ def test_derive_task_branch_custom_namespace():
     """Passing namespace= overrides the leading 'blueprint/' segment."""
     task_id = _uuid.UUID("12345678-abcd-ef01-2345-678abcdef012")
     short = "12345678"
-    assert _derive_task_branch(task_id, "fix", "autoproj") == f"autoproj/fix-{short}"
-    assert _derive_task_branch(task_id, "refactor", "bot") == f"bot/refactor-{short}"
+    assert (
+        _derive_task_branch(task_id, "refactor", "autoproj")
+        == f"autoproj/refactor-{short}"
+    )
+    assert _derive_task_branch(task_id, "docs", "bot") == f"bot/docs-{short}"
     # Default kw matches pre-namespace call sites byte-for-byte.
-    assert _derive_task_branch(task_id, "fix") == f"blueprint/fix-{short}"
+    assert _derive_task_branch(task_id, "refactor") == f"blueprint/refactor-{short}"
 
 
 def test_get_project_task_branch_namespace_fallback_chain():

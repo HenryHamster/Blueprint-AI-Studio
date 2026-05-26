@@ -261,10 +261,6 @@ describe('deriveTaskBranch', () => {
   const taskId = 'abcdef12-3456-7890-abcd-ef1234567890';
   const shortId = 'abcdef12'; // taskId.replace(/-/g,'').slice(0,8)
 
-  it('maps fix → fix prefix', () => {
-    expect(deriveTaskBranch('fix', taskId)).toBe(`blueprint/fix-${shortId}`);
-  });
-
   it('maps refactor → refactor prefix', () => {
     expect(deriveTaskBranch('refactor', taskId)).toBe(`blueprint/refactor-${shortId}`);
   });
@@ -284,14 +280,14 @@ describe('deriveTaskBranch', () => {
   it('defaults unknown types to task prefix', () => {
     expect(deriveTaskBranch('create', taskId)).toBe(`blueprint/task-${shortId}`);
     expect(deriveTaskBranch('qa', taskId)).toBe(`blueprint/task-${shortId}`);
+    expect(deriveTaskBranch('fix', taskId)).toBe(`blueprint/task-${shortId}`);
     expect(deriveTaskBranch('review', taskId)).toBe(`blueprint/task-${shortId}`);
     expect(deriveTaskBranch('', taskId)).toBe(`blueprint/task-${shortId}`);
   });
 
   it('TASK_TYPE_BRANCH_PREFIX covers all explicitly-mapped types', () => {
-    // Keep in sync with backend/app/services.py _TASK_TYPE_BRANCH_PREFIX
+    // Keep in sync with backend/app/shared_state.py TASK_TYPE_BRANCH_PREFIX
     expect(TASK_TYPE_BRANCH_PREFIX).toEqual({
-      fix: 'fix',
       refactor: 'refactor',
       docs: 'docs',
       deps: 'deps',
@@ -301,15 +297,15 @@ describe('deriveTaskBranch', () => {
 
   it('uses first 8 hex chars of task UUID with dashes removed', () => {
     const id = '11223344-aaaa-bbbb-cccc-ddddeeee0000';
-    expect(deriveTaskBranch('fix', id)).toBe('blueprint/fix-11223344');
+    expect(deriveTaskBranch('refactor', id)).toBe('blueprint/refactor-11223344');
   });
 
   it('accepts a per-project namespace argument', () => {
     const id = '11223344-aaaa-bbbb-cccc-ddddeeee0000';
-    expect(deriveTaskBranch('fix', id, 'autoproj')).toBe('autoproj/fix-11223344');
-    expect(deriveTaskBranch('refactor', id, 'bot')).toBe('bot/refactor-11223344');
+    expect(deriveTaskBranch('refactor', id, 'autoproj')).toBe('autoproj/refactor-11223344');
+    expect(deriveTaskBranch('docs', id, 'bot')).toBe('bot/docs-11223344');
     // Default still matches the Blueprint self-repo namespace byte-for-byte.
-    expect(deriveTaskBranch('fix', id)).toBe('blueprint/fix-11223344');
+    expect(deriveTaskBranch('refactor', id)).toBe('blueprint/refactor-11223344');
   });
 });
 

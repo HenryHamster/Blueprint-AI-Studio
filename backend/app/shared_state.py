@@ -52,12 +52,13 @@ def scope_to_effort(scope: str | None) -> str:
 TASK_TYPE_BRANCH_PREFIX: Dict[str, str] = {
     "create": "task",
     "qa": "task",
-    "fix": "fix",
+    "fix": "task",
     "refactor": "refactor",
     "docs": "docs",
     "deps": "deps",
     "migrate": "migrate",
 }
+
 
 # Default namespace (the "blueprint" segment of ``blueprint/{prefix}-{8hex}``).
 # Per-project overrides come from project.task_branch_namespace (see
