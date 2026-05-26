@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import type React from 'react';
 import { API_BASE_URL, authHeaders, authGet } from '../api';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
@@ -12,13 +12,19 @@ export function useTaskModal(
   defaultTaskType: UserLaunchableTaskType,
   addToast: (msg: string, type: 'success' | 'error') => void,
   fetchTasksRef: React.MutableRefObject<() => void>,
+  defaultTaskBranchRef?: React.MutableRefObject<string>,
+  selectedProjectRepoRef?: React.MutableRefObject<string | null>,
 ) {
+  const getDefaultTaskBranch = () => defaultTaskBranchRef?.current || 'main';
+  const getSelectedProjectRepo = () => selectedProjectRepoRef?.current || null;
+  const defaultTaskBranch = getDefaultTaskBranch();
+
   // Modal visibility
   const [showNewTaskModal, setShowNewTaskModal] = useState(false);
 
   // Form fields
   const [newTaskRepo, setNewTaskRepo] = useState('');
-  const [newTaskBranch, setNewTaskBranch] = useState('main');
+  const [newTaskBranch, setNewTaskBranch] = useState(defaultTaskBranch);
   const [newTaskTitle, setNewTaskTitle] = useState('');
   const [newTaskPrompt, setNewTaskPrompt] = useState('');
   const [newTaskType, setNewTaskType] = useState<UserLaunchableTaskType>('create');
@@ -36,6 +42,22 @@ export function useTaskModal(
   const [branchLoading, setBranchLoading] = useState(false);
   const [branchError, setBranchError] = useState<string | null>(null);
   const [useManualBranch, setUseManualBranch] = useState(false);
+
+  useEffect(() => {
+    if (!showNewTaskModal) {
+      setNewTaskBranch(defaultTaskBranch);
+    }
+  }, [defaultTaskBranch, showNewTaskModal]);
+
+  const getDefaultBranchForRepo = (repo: string) => {
+    const repoMeta = repoOptions.find(r => r.full_name === repo);
+    const selectedProjectRepo = getSelectedProjectRepo();
+    const defaultTaskBranch = getDefaultTaskBranch();
+    if (repo && repo === selectedProjectRepo) {
+      return defaultTaskBranch || repoMeta?.default_branch || 'main';
+    }
+    return repoMeta?.default_branch || defaultTaskBranch || 'main';
+  };
 
   const getDefaultModelForType = (taskType: string) => {
     return JSON.parse(localStorage.getItem(`blueprint-admin:taskTypeModel:${taskType}`) ?? 'null') ??
@@ -105,6 +127,7 @@ export function useTaskModal(
     setNewTaskType(defaultTaskType);
     setNewTaskModel(getDefaultModelForType(defaultTaskType));
     setNewTaskEffort(getDefaultEffortForType(defaultTaskType));
+    setNewTaskBranch(getDefaultTaskBranch());
     setUseManualRepo(false);
     setUseManualBranch(false);
     setBranchOptions([]);
@@ -114,12 +137,7 @@ export function useTaskModal(
 
   const handleRepoChange = (value: string) => {
     setNewTaskRepo(value);
-    const repoMeta = repoOptions.find(r => r.full_name === value);
-    if (repoMeta) {
-      setNewTaskBranch(repoMeta.default_branch || 'main');
-    } else {
-      setNewTaskBranch('main');
-    }
+    setNewTaskBranch(getDefaultBranchForRepo(value));
     if (value && value.includes('/')) {
       fetchBranchOptions(value);
     } else {

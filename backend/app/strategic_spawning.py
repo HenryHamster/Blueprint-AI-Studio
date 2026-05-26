@@ -1823,6 +1823,7 @@ async def _spawn_strategic_review(
                     integration_branch=_integration_branch,
                     base_sha=_bootstrap_sha,
                     goal=_bootstrap_goal,
+                    promotion_target=_promotion_target,
                 )
             if _open_version is not None:
                 _tasks_merged = await count_merged_since(

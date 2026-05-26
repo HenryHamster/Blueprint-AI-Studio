@@ -161,8 +161,6 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
         "language": language,
         "directories": directories,
         "env_vars": {},
-        "git_user_name": "Blueprint Agent",
-        "git_user_email": "blueprint-agent@automated.dev",
         "detected_at": datetime.now(timezone.utc).isoformat(),
     }
 

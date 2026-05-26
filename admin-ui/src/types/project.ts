@@ -40,6 +40,7 @@ export interface BuildConfig {
   enable_parallel_fix?: boolean;
   task_branch_namespace?: string;
   task_branch_prefix?: string;
+  pr_title_prefix?: string;
 }
 
 export interface Project {

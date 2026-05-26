@@ -521,3 +521,92 @@ class TestGetProjectPrTitlePrefix:
         project = self._make_mock_project({})
         prefix = get_project_pr_title_prefix(project)
         assert f"{prefix}Rollup: My Feature" == "Rollup: My Feature"
+
+
+@pytest.mark.asyncio
+async def test_empty_diff_note_uses_directions_lock(cleanup_db, mocker):
+    """Staging-branch-missing empty-diff path appends the note via with_directions_locked.
+
+    Drives _check_and_trigger_rollup to the all-children-completed + staging-branch-gone
+    branch and asserts that the direction-note mutation goes through
+    app.rollup_management.with_directions_locked, not a bare session.get race.
+    """
+    import uuid
+    from fastapi import HTTPException
+    from app.rollup_management import _check_and_trigger_rollup
+    from app.models import TaskStatus
+
+    project = await _make_project(cleanup_db)
+    direction_id = str(uuid.uuid4())
+
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        payloads=[
+            {
+                "type": "research",
+                "prompt": "research",
+                "current_direction_id": direction_id,
+            }
+        ],
+        context={
+            "research_branch": "research/stg-missing",
+            "parent_base": "main",
+        },
+        plan_output="some plan",
+    )
+
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+        context={"pr_merged": True},
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.main._utcnow",
+        return_value=__import__("datetime").datetime(
+            2026, 1, 1, tzinfo=__import__("datetime").timezone.utc
+        ),
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    # Target branch exists, staging branch returns 404
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new_callable=AsyncMock,
+        side_effect=[
+            "abc123",  # target branch check succeeds
+            HTTPException(status_code=404, detail="Not Found"),  # staging branch 404
+        ],
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+
+    mock_lock = mocker.patch(
+        "app.rollup_management.with_directions_locked",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_lock.assert_called_once()
+    call_args = mock_lock.call_args
+    assert call_args.args[1] == project.id
+    # Verify the mutate_fn appends the note when invoked
+    directions = [{"id": direction_id, "notes": []}]
+    mutate_fn = call_args.args[2]
+    mutate_fn(directions)
+    assert directions[0]["notes"][0]["source"] == "rollup_empty_diff"
+    assert "no actionable changes" in directions[0]["notes"][0]["text"]

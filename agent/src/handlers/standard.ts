@@ -78,6 +78,12 @@ export function needsMigrationGeneration(changedPaths: string[]): boolean {
   return !changedPaths.some(p => p.startsWith(ALEMBIC_VERSIONS_DIR) && p.endsWith('.py'));
 }
 
+function resolvePrTitlePrefix(task: Record<string, unknown>): string {
+  const buildConfig = task.build_config as Record<string, unknown> | undefined;
+  const prefix = buildConfig?.pr_title_prefix;
+  return typeof prefix === 'string' ? prefix.trim() : '';
+}
+
 export interface StandardHandlerOpts {
   taskId: string;
   payload: Record<string, unknown>;
@@ -792,7 +798,11 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const coFailurePairsSection = formatSrCoFailurePairsForSrPrompt(coFailurePairs);
   const severityCalibrationHintSection = formatSeverityCalibrationHintForSrPrompt(srCategories);
   const precisionRecallQuadrantHintSection = formatPrecisionRecallQuadrantHintForSrPrompt(srCategories);
-  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
+  const prTitlePrefix = opts.prTitlePrefix.trim();
+  const prTitlePrefixNote = prTitlePrefix
+    ? `\n\nWhen you open the PR with ./pr open, start the title with ${prTitlePrefix}.`
+    : '';
+  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, buildConfig);
   writePlaybookHelper(taskId);
@@ -1254,7 +1264,7 @@ export async function handleCreate(
     branchPrefix: 'task',
     buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${moduleInterfaceContext}${affectedConsumersContext}${relatedTestContext}${overlapWarningText}${mediumScopePlanningNote}${createScopeBudgetNote}${prompt}${siblingNote}`,
     commitPrefix: 'blueprint',
-    prTitlePrefix: '[Blueprint]',
+    prTitlePrefix: resolvePrTitlePrefix(task),
     noChangesMessage: 'No file changes.',
     runLintFix: true,
     runTestFix: true,

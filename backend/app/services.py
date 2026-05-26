@@ -530,7 +530,7 @@ async def _run_stale_branch_cleanup():
                 )
             ).all()
 
-            project_namespace = project.task_branch_namespace
+            project_namespace = _shared_state.get_project_task_branch_namespace(project)
             active_branches: set = set()
             for row in active_task_rows:
                 ctx = row.context or {}
@@ -1509,9 +1509,9 @@ async def _check_evaluating_timeouts():
                                 branch = _derive_task_branch(
                                     task.id,
                                     task_type_str,
-                                    _proj.task_branch_namespace
-                                    if _proj
-                                    else "blueprint",
+                                    _shared_state.get_project_task_branch_namespace(
+                                        _proj
+                                    ),
                                 )
                                 base_branch = (task.first_payload or {}).get(
                                     "base_branch"
@@ -2528,7 +2528,7 @@ async def _recover_orphaned_tasks():
                 branch = _derive_task_branch(
                     task.id,
                     task_type,
-                    _proj.task_branch_namespace if _proj else "blueprint",
+                    _shared_state.get_project_task_branch_namespace(_proj),
                 )
 
                 try:
@@ -2730,7 +2730,7 @@ async def _recover_orphaned_tasks():
                 branch = _derive_task_branch(
                     locked.id,
                     task_type,
-                    _proj.task_branch_namespace if _proj else "blueprint",
+                    _shared_state.get_project_task_branch_namespace(_proj),
                 )
                 original_prompt = locked.first_payload.get(
                     "prompt", locked.description or ""

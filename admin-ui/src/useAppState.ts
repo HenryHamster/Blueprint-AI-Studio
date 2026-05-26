@@ -54,6 +54,8 @@ export function useAppState() {
   } = useArchive(addToast);
 
   const fetchTasksRef = useRef<() => Promise<void>>(async () => {});
+  const defaultTaskBranchRef = useRef('main');
+  const selectedProjectRepoRef = useRef<string | null>(null);
 
   // Moved before useDeploymentState so it can be passed as a parameter
   const [selectedProjectId, setSelectedProjectId] = usePersistedState<string | null>('selectedProject', null);
@@ -100,7 +102,7 @@ export function useAppState() {
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
     openNewTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
-  } = useTaskModal(defaultTaskType, addToast, fetchTasksRef);
+  } = useTaskModal(defaultTaskType, addToast, fetchTasksRef, defaultTaskBranchRef, selectedProjectRepoRef);
 
   const {
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour,
@@ -1112,6 +1114,12 @@ export function useAppState() {
       .then(data => { if (data?.promotion_target !== undefined) setPromotionTargetData({ promotion_target: data.promotion_target, is_default: data.is_default }); })
       .catch(() => {});
   }, [selectedProjectId]);
+
+  useEffect(() => {
+    const project = projects.find(p => p.id === selectedProjectId) ?? null;
+    selectedProjectRepoRef.current = project ? `${project.github_owner}/${project.github_repo}` : null;
+    defaultTaskBranchRef.current = promotionTargetData?.promotion_target || integrationBranchData?.integration_branch || 'main';
+  }, [projects, selectedProjectId, promotionTargetData, integrationBranchData]);
 
   const handleUpdatePromotionTarget = async (branch: string | null) => {
     if (!selectedProjectId) return;

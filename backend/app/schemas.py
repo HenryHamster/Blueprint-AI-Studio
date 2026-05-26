@@ -253,8 +253,8 @@ class BuildConfig(BaseModel):
     language: str | None = Field(None, pattern="^(python|typescript|go|rust|mixed)$")
     directories: List[BuildConfigDirectoryEntry] = Field(default_factory=list)
     env_vars: Dict[str, str] = Field(default_factory=dict)
-    git_user_name: str = "Blueprint Agent"
-    git_user_email: str = "blueprint-agent@automated.dev"
+    git_user_name: str | None = None
+    git_user_email: str | None = None
     detected_at: str | None = None
     enable_fresh_reviewer: bool = False
     enable_parallel_review: bool = False
@@ -265,6 +265,16 @@ class BuildConfig(BaseModel):
     task_branch_namespace: str | None = None
     task_branch_prefix: str | None = None
     pr_title_prefix: str | None = None
+
+    @field_validator(
+        "task_branch_namespace", "task_branch_prefix", "pr_title_prefix", mode="before"
+    )
+    @classmethod
+    def _coerce_empty_to_none(cls, v: object) -> object:
+        """Normalize empty/whitespace strings to None so they fall back to project defaults."""
+        if isinstance(v, str) and not v.strip():
+            return None
+        return v
 
 
 class OnboardPayload(BaseModel):

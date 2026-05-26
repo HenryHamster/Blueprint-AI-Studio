@@ -40,8 +40,10 @@ from app.shared_state import (
     runtime_config as _runtime_config,
     get_project_integration_branch as _get_project_integration_branch,
     get_project_pr_title_prefix as _get_project_pr_title_prefix,
+    get_project_task_branch_namespace as _get_project_task_branch_namespace,
     derive_task_branch as _derive_task_branch,
 )
+from app.task_locking import with_directions_locked
 
 logger = logging.getLogger(__name__)
 
@@ -1150,7 +1152,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 branch = (c.context or {}).get("branch") or _derive_task_branch(
                     c.id,
                     c_payload.get("type"),
-                    project.task_branch_namespace,
+                    _get_project_task_branch_namespace(project),
                 )
                 base_branch = c_payload.get("base_branch") or _get_project_integration_branch(project)
                 original_prompt = c_payload.get("prompt", c.description or "")
@@ -1535,9 +1537,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         research_payload = parent.first_payload
                         dir_id = research_payload.get("current_direction_id")
                         if dir_id:
-                            project = await session.get(Project, parent.project_id)
-                            if project and project.directions:
-                                directions = list(project.directions)
+                            def _append_empty_diff_note(directions: list) -> None:
                                 for d in directions:
                                     if d.get("id") == dir_id:
                                         notes = d.get("notes") or []
@@ -1550,9 +1550,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                         )
                                         d["notes"] = notes[-10:]  # Keep last 10
                                         break
-                                project.directions = directions
-                                flag_modified(project, "directions")
-                                session.add(project)
+                            await with_directions_locked(session, parent.project_id, _append_empty_diff_note, skip_locked=False)
                         session.add(parent)
                         await session.commit()
                         await _cleanup_branches(parent, session)

@@ -302,7 +302,18 @@ async def update_project(
         from app.schemas import BuildConfig as BuildConfigSchema
 
         try:
-            merged = {**(project.build_config or {}), **payload.build_config}
+            existing_bc = project.build_config or {}
+            incoming = dict(payload.build_config)
+            # Preserve task-branch naming when incoming clears them — operators
+            # configure these once and expect them to survive normal config saves.
+            for _field in (
+                "task_branch_namespace",
+                "task_branch_prefix",
+                "pr_title_prefix",
+            ):
+                if not incoming.get(_field) and existing_bc.get(_field):
+                    incoming[_field] = existing_bc[_field]
+            merged = {**existing_bc, **incoming}
             validated = BuildConfigSchema(**merged) if merged else BuildConfigSchema()
             project.build_config = validated.model_dump(exclude_none=True)
         except ValidationError as e:

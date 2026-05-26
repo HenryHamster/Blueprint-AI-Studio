@@ -2516,7 +2516,7 @@ async def update_agent_status(
                     _branch = _derive_task_branch(
                         task.id,
                         _task_type,
-                        _proj.task_branch_namespace if _proj else "blueprint",
+                        _shared_state.get_project_task_branch_namespace(_proj),
                     )
                     _base_branch = (task.first_payload or {}).get(
                         "base_branch"

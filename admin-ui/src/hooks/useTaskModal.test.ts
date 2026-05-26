@@ -98,6 +98,21 @@ describe('useTaskModal', () => {
     expect(result.current.newTaskType).toBe('research');
   });
 
+  it('openNewTaskModal uses the selected project branch default', async () => {
+    const defaultTaskBranchRef = { current: 'automain' };
+    const selectedProjectRepoRef = { current: 'owner/repo' };
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }, defaultTaskBranchRef, selectedProjectRepoRef),
+    );
+    act(() => {
+      result.current.setNewTaskBranch('feature/custom');
+    });
+    await act(async () => {
+      result.current.openNewTaskModal();
+    });
+    expect(result.current.newTaskBranch).toBe('automain');
+  });
+
   it('setShowNewTaskModal(false) closes the modal', async () => {
     const { result } = renderHook(() =>
       useTaskModal('create', vi.fn(), { current: vi.fn() }),
@@ -255,6 +270,22 @@ describe('useTaskModal', () => {
       result.current.handleRepoChange('owner/repo');
     });
     expect(result.current.newTaskBranch).toBe('develop');
+  });
+
+  it('handleRepoChange uses the selected project branch for the selected project repo', async () => {
+    const defaultTaskBranchRef = { current: 'automain' };
+    const selectedProjectRepoRef = { current: 'owner/repo' };
+    mockAuthGet.mockImplementation((url: string) => {
+      if (url.includes('/branches')) return okGet({ branches: ['automain', 'main'] });
+      return okGet({ repositories: [] });
+    });
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }, defaultTaskBranchRef, selectedProjectRepoRef),
+    );
+    await act(async () => {
+      result.current.handleRepoChange('owner/repo');
+    });
+    expect(result.current.newTaskBranch).toBe('automain');
   });
 
   it('handleRepoChange clears branch options when repo has no slash', async () => {

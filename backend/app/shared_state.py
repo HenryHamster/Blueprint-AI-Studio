@@ -561,6 +561,27 @@ def get_project_pr_title_prefix(project) -> str:
     return ""
 
 
+def ensure_project_pr_title_prefix(project, title: str) -> str:
+    """Return *title* with the project's PR title prefix prepended if absent.
+
+    Used by the backend PR-creation endpoint (``/api/agent/github/pull-requests``)
+    to normalise agent-authored PR titles so they carry the project's configured
+    branding prefix even when the agent's prompt did not include it explicitly.
+
+    Idempotent: if *title* already starts with the prefix token (ignoring the
+    trailing space that :func:`get_project_pr_title_prefix` appends), returns
+    *title* unchanged.  When no prefix is configured returns *title* as-is.
+    """
+    prefix = get_project_pr_title_prefix(project)
+    if not prefix:
+        return title
+    # prefix already carries a trailing space (e.g. "[Blueprint] ").
+    # Compare against the bare token so "[Blueprint] feat: x" is not re-prefixed.
+    if title.startswith(prefix.rstrip()):
+        return title
+    return f"{prefix}{title}"
+
+
 def get_project_promotion_target(project) -> str:
     """Return the promotion target branch for a project.
 

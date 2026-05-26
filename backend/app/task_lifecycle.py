@@ -1566,7 +1566,7 @@ async def _process_post_commit(
                 branch = _derive_task_branch(
                     task.id,
                     task_type,
-                    _project.task_branch_namespace if _project else "blueprint",
+                    _shared_state.get_project_task_branch_namespace(_project),
                 )
                 base_branch = task_payload.get(
                     "base_branch"

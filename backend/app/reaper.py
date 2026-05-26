@@ -31,6 +31,7 @@ from app.shared_state import (
     resolve_retry_budget,
     derive_task_branch as _derive_task_branch,
     get_project_integration_branch as _get_project_integration_branch,
+    get_project_task_branch_namespace as _get_project_task_branch_namespace,
 )
 from app.failure_classification import (
     classify_failure,
@@ -1989,15 +1990,12 @@ async def reaper_service():
                                 # spawn review tasks pointing at non-existent branches
                                 # and the review fails on `git clone --branch`.
                                 _proj = await session.get(Project, task.project_id)
-                                _namespace = (
-                                    _proj.task_branch_namespace
-                                    if _proj
-                                    else "blueprint"
-                                )
                                 _branch = (task.first_payload or {}).get(
                                     "branch"
                                 ) or _derive_task_branch(
-                                    task.id, _task_type, _namespace
+                                    task.id,
+                                    _task_type,
+                                    _get_project_task_branch_namespace(_proj),
                                 )
                                 _base_branch = (task.first_payload or {}).get(
                                     "base_branch"

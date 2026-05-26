@@ -3765,6 +3765,40 @@ async def test_version_phase_uses_promotion_target_gate(db_session, mocker):
 
     assert await _spawn_strategic_review(active_project, db_session) is True
     assert current_open_version.call_count == 1
+    assert ensure_initial_release_version.call_args.kwargs["promotion_target"] == "main"
+
+
+@pytest.mark.asyncio
+async def test_version_phase_bootstrap_passes_custom_promotion_target(
+    db_session, mocker
+):
+    """Bootstrap uses the project promotion target even when integration_branch is main."""
+    await _ensure_releaseversion_table(db_session)
+
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.release_version.current_open_version",
+        new=AsyncMock(return_value=None),
+    )
+    ensure_initial_release_version = mocker.patch(
+        "app.release_version.ensure_initial_release_version",
+        new=AsyncMock(return_value=None),
+    )
+
+    project = _make_project(
+        integration_branch="main",
+        promotion_target="deploy",
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert await _spawn_strategic_review(project, db_session) is True
+    assert ensure_initial_release_version.call_count == 1
+    assert (
+        ensure_initial_release_version.call_args.kwargs["promotion_target"] == "deploy"
+    )
 
 
 # ── stabilize-stall strategic nudge ──────────────────────────────────────────

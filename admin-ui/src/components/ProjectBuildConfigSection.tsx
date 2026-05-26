@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Plus, Trash2, RefreshCw } from 'lucide-react';
 import type { BuildConfig, BuildConfigDirectory } from '../types/project';
 import { apiFetch } from '../api';
@@ -67,9 +67,13 @@ export function ProjectBuildConfigSection({
   const [taskBranchPrefix, setTaskBranchPrefix] = useState(
     buildConfig?.task_branch_prefix ?? ''
   );
+  const [prTitlePrefix, setPrTitlePrefix] = useState(
+    buildConfig?.pr_title_prefix ?? ''
+  );
   const [saving, setSaving] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [srTargets, setSrTargets] = useState<Record<string, number>>({});
+  const preservedBranchOnDetect = useRef<{ namespace: string; prefix: string; prTitlePrefix: string } | null>(null);
 
   // Sync state when buildConfig prop changes (e.g. after detect or project switch)
   useEffect(() => {
@@ -79,8 +83,11 @@ export function ProjectBuildConfigSection({
     setEnableFreshReviewer(buildConfig?.enable_fresh_reviewer ?? false);
     setEnableParallelReview(buildConfig?.enable_parallel_review ?? false);
     setEnableParallelFix(buildConfig?.enable_parallel_fix ?? false);
-    setTaskBranchNamespace(buildConfig?.task_branch_namespace ?? '');
-    setTaskBranchPrefix(buildConfig?.task_branch_prefix ?? '');
+    const preserved = preservedBranchOnDetect.current;
+    setTaskBranchNamespace(buildConfig?.task_branch_namespace ?? preserved?.namespace ?? '');
+    setTaskBranchPrefix(buildConfig?.task_branch_prefix ?? preserved?.prefix ?? '');
+    setPrTitlePrefix(buildConfig?.pr_title_prefix ?? preserved?.prTitlePrefix ?? '');
+    preservedBranchOnDetect.current = null;
   }, [buildConfig]);
 
   // Load SR catch-rate targets from the project when projectId changes
@@ -108,6 +115,7 @@ export function ProjectBuildConfigSection({
         enable_parallel_fix: enableParallelFix,
         task_branch_namespace: taskBranchNamespace.trim() || undefined,
         task_branch_prefix: taskBranchPrefix.trim() || undefined,
+        pr_title_prefix: prTitlePrefix.trim() || undefined,
       });
       if (projectId) {
         await apiFetch(`/api/admin/projects/${projectId}`, {
@@ -121,6 +129,7 @@ export function ProjectBuildConfigSection({
   };
 
   const handleDetect = async () => {
+    preservedBranchOnDetect.current = { namespace: taskBranchNamespace, prefix: taskBranchPrefix, prTitlePrefix };
     setDetecting(true);
     try {
       await onDetect();
@@ -448,6 +457,29 @@ export function ProjectBuildConfigSection({
                 Legacy override. Leave blank to derive from namespace.
               </p>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* PR Title Prefix */}
+      {hasConfig && (
+        <div>
+          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Pull Request</h3>
+          <p className="text-[11px] text-neutral-600 mb-3">
+            Optional prefix prepended to agent-authored PR titles. Leave blank to use no prefix.
+          </p>
+          <div>
+            <label className="block text-xs text-neutral-400 mb-1">PR Title Prefix</label>
+            <input
+              type="text"
+              value={prTitlePrefix}
+              onChange={e => setPrTitlePrefix(e.target.value)}
+              placeholder="[Bot]"
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+            <p className="text-[11px] text-neutral-600 mt-1">
+              e.g. <code className="font-mono text-neutral-400">{prTitlePrefix.trim() || '[Bot]'}</code>{' '}feat: add new feature
+            </p>
           </div>
         </div>
       )}
