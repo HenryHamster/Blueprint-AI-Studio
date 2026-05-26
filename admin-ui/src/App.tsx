@@ -720,6 +720,7 @@ export default function App() {
         <MessagesPanel
           selectedProjectId={s.selectedProjectId}
           githubRepo={selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : undefined}
+          defaultBranch={s.promotionTargetData?.promotion_target || s.integrationBranchData?.integration_branch || undefined}
           onClose={() => s.setShowMessages(false)}
           addToast={s.addToast}
           onMessageCountChange={handleMessageCountChange}

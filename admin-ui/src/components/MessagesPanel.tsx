@@ -70,6 +70,7 @@ interface WebhookStats {
 interface MessagesPanelProps {
   selectedProjectId: string | null;
   githubRepo?: string | null;
+  defaultBranch?: string;
   onClose: () => void;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onMessageCountChange?: (count: number) => void;
@@ -251,7 +252,7 @@ async function postBackendLastSeen(projectId: string, timestamp: number): Promis
   } catch { /* ignore — localStorage already saved */ }
 }
 
-export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast, onMessageCountChange, onOpenTask }: MessagesPanelProps) {
+export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask }: MessagesPanelProps) {
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [loading, setLoading] = useState(true);
   // Compose
@@ -1078,7 +1079,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
           github_repo: githubRepo,
           title,
           prompt,
-          base_branch: 'main',
+          ...(defaultBranch ? { base_branch: defaultBranch } : {}),
           task_type: 'investigate',
         }),
       });

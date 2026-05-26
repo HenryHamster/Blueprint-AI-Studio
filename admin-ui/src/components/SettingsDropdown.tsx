@@ -1456,6 +1456,8 @@ export function SettingsDropdown({
         config={autoRemediationConfig}
         stats={autoRemediationStats}
         onSave={onUpdateAutoRemediationConfig}
+        integrationBranch={integrationBranchData?.integration_branch}
+        promotionTarget={promotionTargetData?.promotion_target}
       />
     );
   }

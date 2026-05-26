@@ -36,7 +36,11 @@ from app.models import (
     UserIntegration,
 )
 from app.secrets_manager import store_user_secret
-from app.shared_state import get_project_integration_branch, limiter
+from app.shared_state import (
+    get_project_integration_branch,
+    get_project_promotion_target,
+    limiter,
+)
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -642,7 +646,8 @@ async def github_webhook(
                 # Always include the configured integration branch so CI failures
                 # on the working trunk are self-healed without manual whitelist edits.
                 effective_whitelist = set(branch_whitelist) | {
-                    get_project_integration_branch(project)
+                    get_project_integration_branch(project),
+                    get_project_promotion_target(project),
                 }
 
                 if not enabled or head_branch not in effective_whitelist:

@@ -2109,14 +2109,16 @@ describe('getTaskTypeHints', () => {
     expect(result).toContain("release/v2's standards");
   });
 
-  it('keeps (main) in release_audit hint when no promotionTarget provided', () => {
+  it('uses generic LTS / promotion branch wording in release_audit hint when no promotionTarget provided', () => {
     const result = getTaskTypeHints(undefined)['release_audit'];
-    expect(result).toContain('(main)');
+    expect(result).toContain('LTS / promotion branch');
+    expect(result).not.toContain('(main)');
   });
 
-  it('keeps (main) in release_audit when promotionTarget is absent and buildConfig has dirs', () => {
+  it('keeps generic LTS / promotion branch wording in release_audit when promotionTarget is absent and buildConfig has dirs', () => {
     const result = getTaskTypeHints({ directories: [{ path: 'src', type: 'node' }] })['release_audit'];
-    expect(result).toContain('(main)');
+    expect(result).toContain('LTS / promotion branch');
+    expect(result).not.toContain('(main)');
   });
 });
 

@@ -508,6 +508,41 @@ async def test_integration_branch_triggers_auto_remediation(
 
 
 @pytest.mark.asyncio
+async def test_promotion_target_triggers_auto_remediation(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """CI failure on the configured promotion_target triggers auto-remediation."""
+    await _create_project(
+        db_session, integration_branch="dev", promotion_target="release"
+    )
+    await db_session.commit()
+
+    payload_dict = _build_check_run_webhook_payload(
+        head_branch="release", conclusion="failure"
+    )
+    payload_bytes = json.dumps(payload_dict).encode()
+    signature = _sign_webhook_payload(payload_bytes)
+
+    with (
+        patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET),
+        patch("app.auto_remediation._handle_main_branch_ci_failure_inner", AsyncMock()),
+    ):
+        response = await client.post(
+            "/api/github/webhook",
+            content=payload_bytes,
+            headers={
+                "x-hub-signature-256": signature,
+                "x-github-event": "check_run",
+                "x-github-delivery": f"test-{uuid.uuid4()}",
+                "content-type": "application/json",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "auto_remediation_triggered"
+
+
+@pytest.mark.asyncio
 async def test_feature_branch_not_in_integration_branch_ignored(
     client: AsyncClient, db_session: AsyncSession
 ):

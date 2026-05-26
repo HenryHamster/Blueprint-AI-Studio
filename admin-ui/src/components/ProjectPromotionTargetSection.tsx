@@ -81,7 +81,7 @@ export function ProjectPromotionTargetSection({ data, canSave, onSave }: Project
               type="text"
               value={branchInput}
               onChange={e => { setBranchInput(e.target.value); setError(null); }}
-              placeholder={data?.promotion_target ?? 'main'}
+              placeholder={data?.promotion_target ?? 'e.g. main/master/trunk'}
               className={`w-full bg-neutral-950 border ${isValid ? 'border-neutral-700' : 'border-red-600'} text-neutral-100 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600`}
             />
             {!isValid && (

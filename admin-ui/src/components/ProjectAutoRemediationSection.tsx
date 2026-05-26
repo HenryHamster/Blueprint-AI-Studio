@@ -8,15 +8,20 @@ interface ProjectAutoRemediationSectionProps {
   config: AutoRemediationConfig | null;
   stats: AutoRemediationStats | null;
   onSave: (config: AutoRemediationConfig) => Promise<void>;
+  integrationBranch?: string | null;
+  promotionTarget?: string | null;
 }
 
-const DEFAULT_CONFIG: AutoRemediationConfig = {
+const DEFAULT_CONFIG_BASE: Omit<AutoRemediationConfig, 'branch_whitelist'> = {
   enabled: false,
-  branch_whitelist: ['main', 'master'],
   max_per_hour: 2,
   max_concurrent: 2,
   require_review: true,
 };
+
+function defaultBranchWhitelist(integrationBranch?: string | null, promotionTarget?: string | null): string[] {
+  return [integrationBranch, promotionTarget].filter((b): b is string => Boolean(b));
+}
 
 const STATUS_BADGE: Record<string, string> = {
   COMPLETED: 'bg-emerald-900/50 text-emerald-400',
@@ -34,8 +39,11 @@ export function ProjectAutoRemediationSection({
   config,
   stats,
   onSave,
+  integrationBranch,
+  promotionTarget,
 }: ProjectAutoRemediationSectionProps) {
-  const effective = config ?? DEFAULT_CONFIG;
+  const defaultWhitelist = defaultBranchWhitelist(integrationBranch, promotionTarget);
+  const effective = config ?? { ...DEFAULT_CONFIG_BASE, branch_whitelist: defaultWhitelist };
 
   const [enabled, setEnabled] = useState(effective.enabled);
   const [branchWhitelist, setBranchWhitelist] = useState<string[]>(effective.branch_whitelist);
@@ -46,13 +54,13 @@ export function ProjectAutoRemediationSection({
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    const e = config ?? DEFAULT_CONFIG;
+    const e = config ?? { ...DEFAULT_CONFIG_BASE, branch_whitelist: defaultBranchWhitelist(integrationBranch, promotionTarget) };
     setEnabled(e.enabled);
     setBranchWhitelist(e.branch_whitelist);
     setMaxPerHour(e.max_per_hour);
     setMaxConcurrent(e.max_concurrent);
     setRequireReview(e.require_review);
-  }, [config]);
+  }, [config, integrationBranch, promotionTarget]);
 
   const handleSave = async () => {
     setSaving(true);

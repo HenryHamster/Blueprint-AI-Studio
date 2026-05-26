@@ -604,10 +604,10 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                     <ArrowRight className="w-3 h-3 text-neutral-600 mt-0.5 shrink-0" />
                     <span>Open a PR and Blueprint will automatically review it in the Checks tab</span>
                   </li>
-                  {autoRemediationConfig?.enabled && (
+                  {autoRemediationConfig?.enabled && detectedDefaultBranch && (
                     <li className="flex items-start gap-2">
                       <ArrowRight className="w-3 h-3 text-neutral-600 mt-0.5 shrink-0" />
-                      <span>CI failures on <span className="font-mono text-neutral-300">{detectedDefaultBranch || 'main'}</span> will trigger an automatic fix PR</span>
+                      <span>CI failures on <span className="font-mono text-neutral-300">{detectedDefaultBranch}</span> will trigger an automatic fix PR</span>
                     </li>
                   )}
                   {issueImplementationConfig?.enabled && (

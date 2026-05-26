@@ -87,7 +87,7 @@ class BasePayload(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    base_branch: str = Field(default="main")
+    base_branch: str | None = Field(default=None)
     model: str | None = None
     effort: str | None = Field(default=None, pattern=r"^(low|medium|high|max)$")
     prompt_suffix: str | None = None
@@ -95,8 +95,8 @@ class BasePayload(BaseModel):
 
     @field_validator("base_branch")
     @classmethod
-    def _check_base_branch(cls, v: str) -> str:
-        return _validate_branch_name(v)  # type: ignore[return-value]
+    def _check_base_branch(cls, v: str | None) -> str | None:
+        return _validate_branch_name(v)
 
 
 # ---------------------------------------------------------------------------
