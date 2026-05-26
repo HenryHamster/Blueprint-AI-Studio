@@ -864,6 +864,63 @@ class TestAgentRestrictions:
         )
 
 
+# ── Agent Router Task-State Cache Invariants ───────────────────────────
+
+
+class TestAgentRouterInvariants:
+    def test_agent_router_only_has_deny_list_task_cache(self):
+        """Enforce that agent.py only keeps _terminated_task_ids as a task-state cache.
+
+        Regression guard for PR #6038 which removed _agent_active_cache. That cache
+        was dead (no longer consulted by verify_agent_token), but its presence as
+        module-level state was a latent footgun: a future agent could mistakenly
+        believe it was load-bearing and gate the DB recheck on it again, silently
+        re-creating the auth bug (deleted/terminal task authorized via stale cache hit).
+
+        This tripwire enforces: the only task-ID-keyed module-level mutable mapping
+        in agent.py is _terminated_task_ids (the deny-list). Any attempt to add back
+        a 'known active tasks' cache will fail this test.
+
+        Suspicious patterns (names hinting at task auth/active state):
+        - _task_*_cache, _*active*, _authorized_*, _agent_*_cache
+        """
+        from app.routers import agent
+
+        # Task-auth-state suspicious name patterns.
+        # These patterns catch attempts to cache active/authorized task state by ID.
+        SUSPICIOUS_PATTERNS = [
+            r"_.*task.*cache",  # _task_cache, _task_auth_cache, etc.
+            r"_.*active.*",  # _active_*, _agent_active_*, etc.
+            r"_authorized.*",  # _authorized_task_ids, etc.
+            r"_agent.*cache",  # _agent_*_cache, etc.
+        ]
+
+        # The only allowed task-state dict
+        ALLOWED = {"_terminated_task_ids"}
+
+        offenders = []
+        for name, obj in agent.__dict__.items():
+            # Only inspect dicts that start with underscore (module-level private state)
+            if not isinstance(obj, dict) or not name.startswith("_"):
+                continue
+
+            # Check if name matches any suspicious pattern (case-insensitive)
+            if any(
+                re.match(pattern, name, re.IGNORECASE)
+                for pattern in SUSPICIOUS_PATTERNS
+            ):
+                if name not in ALLOWED:
+                    offenders.append(name)
+
+        assert not offenders, (
+            f"Task-auth-state cache(s) found in agent.py: {', '.join(offenders)}. "
+            "Only _terminated_task_ids is permitted as a task-ID-keyed dict. "
+            "See PR #6038: dead caches are latent footguns. The DB recheck is the "
+            "authoritative gate — caching 'known active' tasks risks stale "
+            "authorization of deleted/terminal tasks."
+        )
+
+
 # -- Direction Lifecycle Regression Guards --
 
 

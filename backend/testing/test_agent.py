@@ -4846,6 +4846,71 @@ def test_agent_ws_invalid_token_closes_with_1008(mocker):
 
 
 @pytest.mark.asyncio
+async def test_agent_ws_receive_loop_rejects_terminated_task(mocker):
+    """
+    Regression: WS receive loop must close with 1008 when task appears in the
+    terminated-task deny-list between auth and the next received message.
+
+    Simulates: agent opens a WS connection, the task is cancelled (injected into
+    the deny-list), then sends a follow-up message — the loop must reject it.
+    """
+    import time as time_module
+    import app.routers.agent as agent_module
+    from app.routers.projects import agent_websocket_endpoint
+    from unittest.mock import AsyncMock, MagicMock
+
+    task_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+
+    token = create_agent_token(str(task_id), str(project_id))
+
+    # Mock task returned by initial DB auth lookup
+    mock_task = MagicMock()
+    mock_task.id = task_id
+    mock_task.project_id = project_id
+    mock_task.vm_instance_id = None
+    mock_task.status = TaskStatus.IN_PROGRESS
+
+    mock_execute_result = MagicMock()
+    mock_execute_result.scalars.return_value.first.return_value = mock_task
+
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(return_value=mock_execute_result)
+
+    mock_session_cm = AsyncMock()
+    mock_session_cm.__aenter__.return_value = mock_session
+    mock_session_cm.__aexit__.return_value = None
+
+    mocker.patch("app.routers.projects.AsyncSessionLocal", return_value=mock_session_cm)
+    mocker.patch(
+        "app.routers.projects.manager.check_and_add_ip",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch("app.routers.projects.manager.remove_ip")
+    mocker.patch("app.routers.projects.broadcast_to_project", new_callable=AsyncMock)
+
+    ws = AsyncMock()
+    ws.receive_json = AsyncMock(return_value={"token": token})
+
+    # Inject task into deny-list inside receive_text so the in-loop check fires
+    async def _inject_and_return():
+        agent_module._terminated_task_ids[str(task_id)] = time_module.time()
+        return '{"type": "log", "content": "hello"}'
+
+    ws.receive_text = AsyncMock(side_effect=_inject_and_return)
+    ws.close = AsyncMock()
+
+    await agent_websocket_endpoint(ws, task_id)
+
+    # Connection must be closed with 1008 (Task is no longer active)
+    ws.close.assert_called_once_with(code=1008, reason="Task is no longer active")
+
+    # Clean up deny-list entry
+    agent_module._terminated_task_ids.pop(str(task_id), None)
+
+
+@pytest.mark.asyncio
 async def test_external_api_requeue_sets_exponential_backoff(
     client: AsyncClient, db_session, mocker
 ):

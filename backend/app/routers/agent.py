@@ -728,7 +728,7 @@ async def agent_refresh_token(
     token: dict = Depends(verify_agent_token),
 ):
     """
-    Accepts a valid (non-expired) agent JWT and returns a new one with a fresh 8-hour TTL.
+    Accepts a valid (non-expired) agent JWT and returns a new one with a fresh 2-hour TTL.
 
     Audit 2026-04-25 (W3/E1/E2): refresh now also validates that the task
     is still assigned to this VM — a stale agent whose task has been

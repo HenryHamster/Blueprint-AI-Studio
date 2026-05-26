@@ -37,7 +37,7 @@ import {
   STALE_RESULT_MAX_ATTEMPTS, STALE_RESULT_MAX_AGE_MS, STDERR_TAIL_BYTES,
   PROCESS_KILL_GRACE_MS, CLAUDE_RESULT_GRACE_MS, CLAUDE_STREAM_STALL_MS, LOG_TAIL_BYTES,
   HEARTBEAT_INTERVAL, MAX_LOG_BUFFER,
-  HEARTBEAT_API_TIMEOUT, HEARTBEAT_API_MAX_RETRIES,
+  HEARTBEAT_API_TIMEOUT, HEARTBEAT_API_MAX_RETRIES, TOKEN_PROACTIVE_REFRESH_MS,
   WITHIN_CHUNK_YIELD_LINES, WITHIN_CHUNK_YIELD_MS,
   GIT_CLONE_TIMEOUT, CLONE_MAX_RETRIES, CLONE_RETRY_BASE_DELAY,
   CONFLICT_CHECK_TIMEOUT,
@@ -1067,6 +1067,28 @@ export function extractInvestigatedFiles(trace: ToolTraceEntry[]): string[] {
 // ── Heartbeat ───────────────────────────────────────────────────────────────
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
+// Proactive JWT refresh — fires at TOKEN_PROACTIVE_REFRESH_MS (90 min) so the
+// 2h agent token is always renewed well before expiry.
+let tokenRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
+function startProactiveTokenRefresh(): void {
+  tokenRefreshTimer = setInterval(() => {
+    void (async () => {
+      log('Proactive token refresh: refreshing agent JWT before expiry');
+      const ok = await tryRefreshToken();
+      if (ok) {
+        log('Proactive token refresh: succeeded');
+      } else {
+        log('Proactive token refresh: failed — reactive 401 path will retry');
+      }
+    })();
+  }, TOKEN_PROACTIVE_REFRESH_MS);
+}
+
+function stopProactiveTokenRefresh(): void {
+  if (tokenRefreshTimer) { clearInterval(tokenRefreshTimer); tokenRefreshTimer = null; }
+}
+
 function collectMetrics(): { rss_mb: number; heap_used_mb: number; cgroup_mb?: number; cgroup_limit_mb?: number; disk_free_mb?: number; disk_total_mb?: number } {
   const mem = process.memoryUsage();
   const rss_mb = Math.round(mem.rss / 1024 / 1024 * 10) / 10;
@@ -1226,6 +1248,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
 
 function stopHeartbeat() {
   if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+  stopProactiveTokenRefresh();
   // Reset mutex so warm-VM continuity (one agent process, multiple sequential
   // tasks) starts the next task with a clean in-flight state. Without this,
   // a stuck heartbeat at role-end would leave the flag true and the new
@@ -4562,6 +4585,7 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   // Start heartbeat & log stream
   const statusRef = { value: 'Initializing...' };
   startHeartbeat(taskId, () => statusRef.value);
+  startProactiveTokenRefresh();
   const ws = await connectLogStream(taskId);
   if (!ws) {
     log('WARNING: WebSocket log stream unavailable — logs will be sent via status updates only');

@@ -377,6 +377,9 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
         await _safe_ws_close(websocket, code=1008, reason="Authentication failed")
         return
 
+    user_id = payload.get("sub")
+    last_membership_check = time.time()
+
     if not await manager.connect(websocket, project_id):
         return
     try:
@@ -442,6 +445,22 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
             else:
                 last_message_time = current_time
                 message_count = 1
+
+            # Re-validate project membership at most once per minute
+            if (time.time() - last_membership_check) >= 60:
+                async with AsyncSessionLocal() as ms:
+                    member = (
+                        await ms.execute(
+                            select(ProjectMember).where(
+                                ProjectMember.project_id == project_id,
+                                ProjectMember.user_id == user_id,
+                            )
+                        )
+                    ).scalar_one_or_none()
+                if not member:
+                    await _safe_ws_close(websocket, code=1008, reason="Access revoked")
+                    return
+                last_membership_check = time.time()
             # We can handle client-to-server messages here if needed
     except WebSocketDisconnect:
         pass
@@ -513,11 +532,47 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
     if not await manager.check_and_add_ip(websocket):
         return
 
+    _terminated_task_ids_ref = _terminated_task_ids
+    _RECHECK_INTERVAL = 30  # seconds between periodic DB rechecks
+    last_recheck = time.time()
+
     try:
         last_message_time = time.time()
         message_count = 0
         while True:
             text_data = await websocket.receive_text()
+
+            # Periodic task-termination recheck: deny-list fast path + DB fallback
+            if str(task_id) in _terminated_task_ids_ref:
+                await _safe_ws_close(
+                    websocket, code=1008, reason="Task is no longer active"
+                )
+                return
+            now = time.time()
+            if now - last_recheck >= _RECHECK_INTERVAL:
+                async with AsyncSessionLocal() as rs:
+                    fresh = await rs.get(Task, task_id)
+                if (
+                    fresh is None
+                    or fresh.status
+                    in (
+                        TaskStatus.COMPLETED,
+                        TaskStatus.FAILED,
+                        TaskStatus.CANCELLED,
+                    )
+                    or (
+                        payload.get("vm_instance_id")
+                        and fresh is not None
+                        and fresh.vm_instance_id
+                        and fresh.vm_instance_id != payload.get("vm_instance_id")
+                    )
+                ):
+                    await _safe_ws_close(
+                        websocket, code=1008, reason="Task is no longer active"
+                    )
+                    return
+                last_recheck = now
+
             if len(text_data) > 100000:  # 100KB limit for agent logs
                 await _safe_ws_close(websocket, code=1009, reason="Message too big")
                 return

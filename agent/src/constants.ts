@@ -51,6 +51,11 @@ export const LOG_TAIL_BYTES = 5_000;
 // Heartbeat
 export const HEARTBEAT_INTERVAL = 30_000;
 
+// Proactive agent-JWT refresh: fire at 75% of the 2h TTL (90 min) so the
+// token is always renewed well before it expires. Matches AGENT_TOKEN_TTL_HOURS
+// in backend/app/auth.py — if that value changes, adjust this accordingly.
+export const TOKEN_PROACTIVE_REFRESH_MS = 90 * 60_000;
+
 // WebSocket log buffer
 export const MAX_LOG_BUFFER = 1_000;
 
