@@ -2401,32 +2401,12 @@ class TestCrossLanguageClassificationContracts:
             "the new function name, or update viewport.ts to keep the same name."
         )
 
-    # ------------------------------------------------------------------
-    # Viewport bootstrap-failure signatures (cross-layer contract)
-    # ------------------------------------------------------------------
-
-    def test_viewport_bootstrap_patterns_in_agent_source(self):
-        """_VIEWPORT_INFRA_UNAVAILABLE_PATTERNS includes the same bootstrap
-        signatures as agent/src/index.ts VIEWPORT_BOOTSTRAP_PATTERNS.
-        If agent renames or removes any of these, the backend classifier would
-        fall back to CODE_ERROR for bootstrap failures it can no longer recognize.
-        """
-        src = self._src(_AGENT_INDEX)
-        for expected in (
-            "libatk",
-            "libgbm",
-            "libxkbcommon",
-            "libxcomposite",
-            "libasound",
-            "cannot open shared object file",
-            "host system is missing dependencies",
-            "executable doesn't exist at",
-        ):
-            assert expected in src, (
-                f"agent/src/index.ts VIEWPORT_BOOTSTRAP_PATTERNS no longer contains {expected!r}; "
-                "update _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS in failure_classification.py "
-                "to match the new pattern, or update the agent to keep the same string."
-            )
+    # The viewport bootstrap cross-layer contract test was removed when the
+    # agent-side VIEWPORT_BOOTSTRAP_PATTERNS array was dropped from
+    # agent/src/index.ts (commit 96590c9 — dead lintFixLoop / Playwright
+    # bootstrap scaffolding cleanup). The backend's
+    # _VIEWPORT_INFRA_UNAVAILABLE_PATTERNS is now standalone (no agent-side
+    # mirror), so there is no cross-language contract to enforce.
 
 
 class TestAccountStateRateLimitCorrelation:

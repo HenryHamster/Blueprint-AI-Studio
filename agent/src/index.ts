@@ -3142,7 +3142,7 @@ export function __setRunClaudeCodeOverrideForSmoke(fn: RunClaudeCodeOverride | n
 export function codexStreamHasTurnCompleted(transcript: string): boolean {
   for (const line of transcript.split('\n')) {
     if (!line.startsWith('{')) continue;
-    let obj: Record<string, unknown>;
+    let obj: Record<string, unknown> | null = null;
     try {
       obj = JSON.parse(line) as Record<string, unknown>;
     } catch {
