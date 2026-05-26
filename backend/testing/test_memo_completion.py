@@ -22,6 +22,7 @@ from app.task_completion import (
     _normalize_memo,
     _parse_memo_output,
     _synthesize_memo_from_source_finding,
+    _try_recover_memo_from_parse_failure,
 )
 from testing.factories import make_project, make_task
 
@@ -421,3 +422,195 @@ def test_synthesize_memo_from_source_finding_returns_none_without_key_data():
         _synthesize_memo_from_source_finding("investigation_unactionable", {}, "t-2")
         is None
     )
+
+
+# ── _try_recover_memo_from_parse_failure ────────────────────────────────────
+
+
+def _make_codex_jsonl(memo: dict) -> str:
+    """Build the Codex JSONL output that contains a memo JSON inside an
+    item.completed agent_message envelope — the exact shape the failing task had."""
+    return "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "tid-001"}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": json.dumps(memo),
+                    },
+                }
+            ),
+            json.dumps({"type": "turn.ended"}),
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_recover_memo_from_parse_failure_success(db_session, _quiet_broadcast):
+    """Recovery succeeds when the JSONL error log contains a valid memo JSON
+    inside an item.completed agent_message envelope; task is promoted to
+    COMPLETED with a MEMO Artifact."""
+    project = make_project(name="RecoveryProj")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Memo: recovery test",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "memo", "topic": "Y", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        context={"agent_failure_category_raw": "parse_failed"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    memo = {
+        "summary": "Recovered summary",
+        "reasoning": "Recovered reasoning explaining the finding.",
+        "citations": ["task:abc123", "direction:d-9999"],
+        "tags": ["recovery", "test"],
+    }
+    logs = _make_codex_jsonl(memo)
+
+    recovered = await _try_recover_memo_from_parse_failure(task, logs, db_session)
+
+    assert recovered is True
+
+    # Task promoted to COMPLETED
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+    # Exactly one MEMO Artifact written
+    artifacts = (
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1
+    assert artifacts[0].artifact_type == ArtifactType.MEMO
+    persisted = json.loads(artifacts[0].logs)
+    assert persisted["summary"] == memo["summary"]
+    assert persisted["citations"] == memo["citations"]
+    assert persisted["tags"] == memo["tags"]
+
+    # plan_output mirrors the memo
+    assert task.plan_output["memo"]["summary"] == memo["summary"]
+
+
+@pytest.mark.asyncio
+async def test_recover_memo_from_parse_failure_no_envelope(
+    db_session, _quiet_broadcast
+):
+    """When the JSONL log contains no item.completed agent_message envelope,
+    recovery returns False and leaves the task FAILED without creating an artifact."""
+    project = make_project(name="RecoveryNoEnvProj")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Memo: no envelope",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "memo", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": "tid-002"}),
+            "some plain text that is not JSON",
+            json.dumps({"type": "turn.ended"}),
+        ]
+    )
+
+    recovered = await _try_recover_memo_from_parse_failure(task, logs, db_session)
+
+    assert recovered is False
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+
+    artifacts = (
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert artifacts == []
+
+
+@pytest.mark.asyncio
+async def test_recover_memo_from_parse_failure_missing_keys(
+    db_session, _quiet_broadcast
+):
+    """When the agent_message text contains JSON but is missing required memo keys,
+    recovery returns False and the task remains FAILED."""
+    project = make_project(name="RecoveryMissingKeys")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Memo: missing keys",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "memo", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    incomplete_memo = {"summary": "only summary", "reasoning": "only reasoning"}
+    logs = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": json.dumps(incomplete_memo),
+                    },
+                }
+            ),
+        ]
+    )
+
+    recovered = await _try_recover_memo_from_parse_failure(task, logs, db_session)
+
+    assert recovered is False
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_recover_memo_from_parse_failure_empty_logs(db_session, _quiet_broadcast):
+    """Empty or None logs return False immediately without touching the task."""
+    project = make_project(name="RecoveryEmpty")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Memo: empty logs",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "memo", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert await _try_recover_memo_from_parse_failure(task, "", db_session) is False
+    assert await _try_recover_memo_from_parse_failure(task, None, db_session) is False  # type: ignore[arg-type]
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
