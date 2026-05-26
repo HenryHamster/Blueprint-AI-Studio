@@ -2387,13 +2387,47 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 f"— skipping state-classification, falling through to fix-spawn"
                             )
                         elif _ms == "behind":
+                            # Before escalating to update_branch, check if the
+                            # ancestor test already considers this PR clean.
+                            # mergeable_state="behind" doesn't short-circuit
+                            # pr_is_not_behind so is_ancestor_of is consulted.
+                            _behind_head_sha = (
+                                _pr_detail.get("head", {}).get("sha") or None
+                            )
+                            _behind_base_sha: str | None = None
+                            try:
+                                _behind_base_sha = await get_branch_sha(
+                                    gh_token, owner, repo, target_branch
+                                )
+                            except Exception as _tip_err:
+                                logger.debug(
+                                    f"[ROLLUP] Could not fetch base tip for "
+                                    f"behind-check on PR #{rollup_pr_number}: {_tip_err}"
+                                )
+                            if _behind_base_sha:
+                                _post_not_behind = await pr_is_not_behind(
+                                    gh_token,
+                                    owner,
+                                    repo,
+                                    head_sha=_behind_head_sha,
+                                    base_tip_sha=_behind_base_sha,
+                                    mergeable_state=_ms,
+                                    project_id=str(parent.project_id),
+                                )
+                                if _post_not_behind is True:
+                                    logger.info(
+                                        f"[ROLLUP] PR #{rollup_pr_number} "
+                                        f"mergeable_state=behind but "
+                                        f"pr_is_not_behind=True — skipping "
+                                        f"update_branch, deferring to next sweep"
+                                    )
+                                    return
                             _upd = await update_branch_with_sha_retry(
                                 gh_token,
                                 owner,
                                 repo,
                                 rollup_pr_number,
-                                expected_head_sha=_pr_detail.get("head", {}).get("sha")
-                                or None,
+                                expected_head_sha=_behind_head_sha,
                                 project_id=str(parent.project_id),
                             )
                             if _upd.get("updated"):

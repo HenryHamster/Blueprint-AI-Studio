@@ -24,7 +24,7 @@
     "autonomous_research.py": 2750,
     "research_completion.py": 2850,
     "strategic_completion.py": 3200,
-    "rollup_management.py": 3150,
+    "rollup_management.py": 3250,
     "reaper.py": 4200,
     "review_pipeline.py": 2450,
     "deploy_health.py": 1250,

@@ -1772,6 +1772,13 @@ def _mock_rollup_merge_conflict_deps(mocker, *, mergeable_state, head_sha="deadb
             {"mergeable_state": mergeable_state, "head": {"sha": head_sha}},
         ],
     )
+    # Ensure pr_is_not_behind's ancestor check treats the PR as genuinely
+    # behind so existing behind-path tests retain their update_branch assertion.
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
 
 
 @pytest.mark.asyncio

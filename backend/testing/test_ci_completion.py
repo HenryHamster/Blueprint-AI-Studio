@@ -2392,3 +2392,62 @@ async def test_merge_conflict_spawn_uses_project_integration_branch(db_session, 
     assert called_base == "automain", (
         f"Expected ci_base='automain' from project.integration_branch, got {called_base!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_behind_skipped_when_pr_is_not_behind(db_session, mocker):
+    """
+    When mergeable_state='behind' but pr_is_not_behind returns True (base tip is
+    already reachable from PR head), update_branch must NOT be called.
+    The task re-enters CI polling with ci_passed=False and no update_branch_failures
+    increment.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "merged": False,
+            "state": "open",
+            "mergeable_state": "behind",
+            "head": {"sha": "abc123def456"},
+        },
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "Base branch was modified"},
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        return_value="base456tip789",
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        return_value=True,
+    )
+    update_mock = mocker.patch("app.github.update_branch")
+
+    project = Project(name="Not-behind skip test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project, ci_loop_extra={"ci_passed": True})
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    update_mock.assert_not_called()
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("ci_passed") is False, "ci_passed must be reset for re-poll"
+    assert review_loop.get("merge_failures", 0) == 0, (
+        "behind must not increment retry counter"
+    )
+    assert review_loop.get("update_branch_failures", 0) == 0

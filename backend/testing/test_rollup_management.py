@@ -10,6 +10,7 @@ from testing.test_rollup_cleanup import (
     _make_project,
     _make_rollup_parent_with_pr,
     _make_task,
+    _mock_rollup_merge_conflict_deps,
 )
 
 # Reuse the diff builders so the guard parses exactly what the invariant tests
@@ -391,6 +392,51 @@ async def test_genuinely_behind_pr_still_updates_branch(cleanup_db, mocker):
     mock_upd.assert_awaited_once()
     # update-branch succeeded → defer merge, no fix spawn.
     mock_merge.assert_not_awaited()
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_merge_behind_ancestor_skips_update_branch(cleanup_db, mocker):
+    """Post-merge-failure path: if GitHub reports mergeable_state='behind' but
+    is_ancestor_of returns True (base tip already reachable from head), the new
+    pr_is_not_behind guard should skip update_branch_with_sha_retry and defer
+    to the next rollup sweep instead of escalating to behind-recovery."""
+    _mock_rollup_merge_conflict_deps(
+        mocker, mergeable_state="behind", head_sha="head-555"
+    )
+    # Override is_ancestor_of to True so pr_is_not_behind returns True.
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mock_upd = mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new_callable=AsyncMock,
+        return_value={"updated": True},
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(MagicMock(id="fix-task-id"), True),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    # pr_is_not_behind returned True → skip update_branch, no fix spawn.
+    mock_upd.assert_not_awaited()
     mock_spawn.assert_not_called()
 
 

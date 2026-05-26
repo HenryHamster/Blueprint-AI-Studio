@@ -435,13 +435,37 @@ async def _attempt_merge_with_retry_and_escalation(
         # 'behind' path: call update_branch (GitHub write) BEFORE re-acquiring
         # the lock. The result is consumed in the lock-held block below.
         if _recheck_err is None and _ms == "behind":
-            from app.github import update_branch
+            from app.github import get_branch_sha, pr_is_not_behind, update_branch
 
-            try:
-                _upd = await update_branch(gh_token, owner, repo, ci_pr_number)
-            except Exception as e:
-                _upd = {"updated": False, "message": str(e)[:200]}
-                logger.warning(f"[CI] PR #{ci_pr_number} update_branch raised: {e}")
+            _head_sha = (_recheck_pr or {}).get("head", {}).get("sha")
+            _base_tip_sha = None
+            if _head_sha and ci_base:
+                try:
+                    _base_tip_sha = await get_branch_sha(gh_token, owner, repo, ci_base)
+                except Exception as _bts_exc:
+                    logger.warning(
+                        f"[CI] PR #{ci_pr_number} get_branch_sha failed: {_bts_exc}"
+                    )
+            _not_behind = await pr_is_not_behind(
+                gh_token,
+                owner,
+                repo,
+                head_sha=_head_sha,
+                base_tip_sha=_base_tip_sha,
+                mergeable_state=_ms,
+            )
+            if _not_behind:
+                _upd = {"not_behind": True}
+                logger.info(
+                    f"[CI] PR #{ci_pr_number} mergeable_state='behind' but "
+                    f"pr_is_not_behind=True — skipping update_branch"
+                )
+            else:
+                try:
+                    _upd = await update_branch(gh_token, owner, repo, ci_pr_number)
+                except Exception as e:
+                    _upd = {"updated": False, "message": str(e)[:200]}
+                    logger.warning(f"[CI] PR #{ci_pr_number} update_branch raised: {e}")
 
     # ── RE-ACQUIRE FOR UPDATE FOR FINAL DB MUTATIONS ──────────────────────
     # All GitHub I/O above ran with no row lock held. Now re-acquire briefly
@@ -577,6 +601,20 @@ async def _attempt_merge_with_retry_and_escalation(
             ci_loop["ci_wait_pause_baseline"] = await pause_clock.current_baseline(
                 session
             )
+            if _upd.get("not_behind"):
+                # pr_is_not_behind confirmed head already contains base tip —
+                # skip update_branch, re-enter CI polling for a fresh merge attempt.
+                ci_loop["update_branch_failures"] = 0
+                task.context = {**(task.context or {}), "review_loop": ci_loop}
+                flag_modified(task, "context")
+                task.latest_status_message = (
+                    f"PR #{ci_pr_number} reports 'behind' but head already contains"
+                    f" base tip — re-entering CI polling without update"
+                )
+                logger.info(
+                    f"[CI] PR #{ci_pr_number} not-behind — skipped update_branch ({source})"
+                )
+                return False
             if _upd.get("updated"):
                 ci_loop["update_branch_failures"] = 0
                 task.context = {**(task.context or {}), "review_loop": ci_loop}
