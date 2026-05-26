@@ -195,6 +195,72 @@ class TestRequestFreshReviewer:
         resp = await client.post(f"/api/admin/tasks/{task.id}/request-fresh-reviewer")
         assert resp.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_per_project_namespace_used_for_branch(self, client, db_session):
+        """Branch derivation uses project build_config.task_branch_namespace, not 'blueprint'."""
+        project = make_project(
+            user_id="test-user-123",
+            build_config={"task_branch_namespace": "acme"},
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        db_session.add(
+            make_membership(project.id, user_id="test-user-123", role="owner")
+        )
+        await db_session.commit()
+        task = await _task_with_pr(db_session, project.id, "create")
+
+        resp = await client.post(f"/api/admin/tasks/{task.id}/request-fresh-reviewer")
+        assert resp.status_code == 200
+        spawned_id = uuid.UUID(resp.json()["spawned_task_id"])
+        spawned = (
+            await db_session.execute(select(Task).where(Task.id == spawned_id))
+        ).scalar_one()
+        assert spawned.payloads[0]["branch"] == f"acme/task-{_hex8(task.id)}"
+
+    @pytest.mark.asyncio
+    async def test_per_project_integration_branch_used_as_base(
+        self, client, db_session
+    ):
+        """base_branch falls back to project.integration_branch, not hardcoded 'main'."""
+        project = make_project(
+            user_id="test-user-123",
+            integration_branch="develop",
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        db_session.add(
+            make_membership(project.id, user_id="test-user-123", role="owner")
+        )
+        await db_session.commit()
+        # Task payload intentionally omits base_branch to exercise the fallback
+        task = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create", "prompt": "do the thing"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        db_session.add(
+            Artifact(
+                task_id=task.id,
+                artifact_type=ArtifactType.PULL_REQUEST,
+                pr_url="https://github.com/acme/repo/pull/99",
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.post(f"/api/admin/tasks/{task.id}/request-fresh-reviewer")
+        assert resp.status_code == 200
+        spawned_id = uuid.UUID(resp.json()["spawned_task_id"])
+        spawned = (
+            await db_session.execute(select(Task).where(Task.id == spawned_id))
+        ).scalar_one()
+        assert spawned.payloads[0]["base_branch"] == "develop"
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # POST /api/agent/tasks/{original_task_id}/reviewer-merge

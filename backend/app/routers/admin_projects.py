@@ -409,6 +409,14 @@ async def detect_project_build_config(
         detected["enable_parallel_review"] = existing["enable_parallel_review"]
     if "enable_parallel_fix" in existing:
         detected["enable_parallel_fix"] = existing["enable_parallel_fix"]
+    # Per-project branch/PR naming overrides are user-set and not detectable from repo contents;
+    # preserve them across re-detect so an operator does not silently lose them.
+    if "task_branch_namespace" in existing:
+        detected["task_branch_namespace"] = existing["task_branch_namespace"]
+    if "task_branch_prefix" in existing:
+        detected["task_branch_prefix"] = existing["task_branch_prefix"]
+    if "pr_title_prefix" in existing:
+        detected["pr_title_prefix"] = existing["pr_title_prefix"]
 
     try:
         validated = BuildConfigSchema(**detected) if detected else BuildConfigSchema()

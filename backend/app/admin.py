@@ -19,6 +19,7 @@ from app.shared_state import (
     get_project_integration_branch,
     get_project_pr_title_prefix as _get_project_pr_title_prefix,
     get_project_promotion_target as _get_project_promotion_target_for_task,
+    get_project_task_branch_namespace,
     limiter,
 )
 from app.models import (
@@ -883,10 +884,10 @@ async def bulk_action_tasks(
                                 session.add(task)
                                 await session.commit()
                                 await _cleanup_branches(task, session)
-                                base_branch = (task.first_payload).get(
-                                    "base_branch", "main"
-                                )
                                 _project = await session.get(Project, task.project_id)
+                                base_branch = (task.first_payload).get(
+                                    "base_branch"
+                                ) or get_project_integration_branch(_project)
                                 _promotion_target = _get_project_promotion_target(
                                     _project
                                 )
@@ -1008,9 +1009,11 @@ async def bulk_action_tasks(
                             branch = _derive_task_branch(
                                 task.id,
                                 task_payload.get("type"),
-                                _project.task_branch_namespace,
+                                get_project_task_branch_namespace(_project),
                             )
-                            base_branch = task_payload.get("base_branch", "main")
+                            base_branch = task_payload.get(
+                                "base_branch"
+                            ) or get_project_integration_branch(_project)
 
                             if ctx.get("touched_critical"):
                                 try:
@@ -1711,9 +1714,11 @@ async def request_changes(
     task_payload = task.first_payload
     _project = await session.get(Project, task.project_id)
     branch = _derive_task_branch(
-        task.id, task_payload.get("type"), _project.task_branch_namespace
+        task.id, task_payload.get("type"), get_project_task_branch_namespace(_project)
     )
-    base_branch = task_payload.get("base_branch", "main")
+    base_branch = task_payload.get("base_branch") or get_project_integration_branch(
+        _project
+    )
 
     from app.review_pipeline import _spawn_pipeline_task
 
@@ -1812,10 +1817,14 @@ async def request_fresh_reviewer(
         review_loop.get("branch")
         or task_payload.get("branch")
         or _derive_task_branch(
-            task_id, task_payload.get("type"), _project.task_branch_namespace
+            task_id,
+            task_payload.get("type"),
+            get_project_task_branch_namespace(_project),
         )
     )
-    base_branch = task_payload.get("base_branch", "main")
+    base_branch = task_payload.get("base_branch") or get_project_integration_branch(
+        _project
+    )
     related_files = task_payload.get("related_files") or ctx.get("related_files") or []
 
     reviewer_task = Task(
@@ -2232,8 +2241,10 @@ async def modify_task(
                         await session.commit()
                         # Post-merge cleanup: branches + smoketest (mirrors webhook merge path)
                         await _cleanup_branches(task, session)
-                        base_branch = (task.first_payload).get("base_branch", "main")
                         _project = await session.get(Project, task.project_id)
+                        base_branch = (task.first_payload).get(
+                            "base_branch"
+                        ) or get_project_integration_branch(_project)
                         _promotion_target = _get_project_promotion_target(_project)
                         if base_branch == _promotion_target and _runtime_config.get(
                             "smoketest_enabled"
@@ -2351,9 +2362,11 @@ async def modify_task(
                     branch = _derive_task_branch(
                         task.id,
                         task_payload.get("type"),
-                        _project.task_branch_namespace,
+                        get_project_task_branch_namespace(_project),
                     )
-                    base_branch = task_payload.get("base_branch", "main")
+                    base_branch = task_payload.get(
+                        "base_branch"
+                    ) or get_project_integration_branch(_project)
 
                     if ctx.get("touched_critical"):
                         # Critical file approval: review already passed, merge the PR

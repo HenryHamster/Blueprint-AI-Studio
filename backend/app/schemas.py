@@ -259,6 +259,12 @@ class BuildConfig(BaseModel):
     enable_fresh_reviewer: bool = False
     enable_parallel_review: bool = False
     enable_parallel_fix: bool = False
+    # Per-project branch and PR metadata — must be preserved through
+    # detect/save/patch round-trips so project-specific branch naming and
+    # PR title prefixes survive schema validation.
+    task_branch_namespace: str | None = None
+    task_branch_prefix: str | None = None
+    pr_title_prefix: str | None = None
 
 
 class OnboardPayload(BaseModel):

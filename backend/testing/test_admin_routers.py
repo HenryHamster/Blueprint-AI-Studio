@@ -924,6 +924,9 @@ class TestUpdateProjectOwnerOnlyFields:
             "enable_fresh_reviewer": True,
             "enable_parallel_review": True,
             "enable_parallel_fix": False,
+            "task_branch_namespace": "agents",
+            "task_branch_prefix": "bot/",
+            "pr_title_prefix": "[bot] ",
         }
         db_session.add(project)
         await db_session.commit()
@@ -951,6 +954,9 @@ class TestUpdateProjectOwnerOnlyFields:
         assert build_config.get("enable_fresh_reviewer") is True
         assert build_config.get("enable_parallel_review") is True
         assert build_config.get("enable_parallel_fix") is False
+        assert build_config.get("task_branch_namespace") == "agents"
+        assert build_config.get("task_branch_prefix") == "bot/"
+        assert build_config.get("pr_title_prefix") == "[bot] "
 
         await db_session.refresh(project)
         assert (project.build_config or {}).get("env_vars", {}).get("TOKEN") == (
@@ -959,6 +965,9 @@ class TestUpdateProjectOwnerOnlyFields:
         assert (project.build_config or {}).get("enable_fresh_reviewer") is True
         assert (project.build_config or {}).get("enable_parallel_review") is True
         assert (project.build_config or {}).get("enable_parallel_fix") is False
+        assert (project.build_config or {}).get("task_branch_namespace") == "agents"
+        assert (project.build_config or {}).get("task_branch_prefix") == "bot/"
+        assert (project.build_config or {}).get("pr_title_prefix") == "[bot] "
 
 
 class TestDeleteProject:
