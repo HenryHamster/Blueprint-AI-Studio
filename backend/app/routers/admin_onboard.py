@@ -1,10 +1,11 @@
 """Project onboarding endpoint with build config auto-detection."""
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Dict, Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -21,6 +22,20 @@ router = APIRouter(
     tags=["admin-onboard"],
     dependencies=[Depends(get_current_user)],
 )
+
+
+def _derive_task_branch_namespace(github_repo: str) -> str:
+    """Derive a branch-name-safe namespace from the GitHub repo name.
+
+    Lowercases, replaces non-alphanumeric characters with '-', strips
+    leading/trailing dashes, and caps at 40 characters.  The Blueprint
+    self-repo ('BlueprintAIStudio') maps to 'blueprint' to preserve existing
+    branch conventions.
+    """
+    if github_repo.lower() == "blueprintaistudio":
+        return "blueprint"
+    slug = re.sub(r"[^a-z0-9]+", "-", github_repo.lower()).strip("-")
+    return slug[:40] if slug else "blueprint"
 
 
 async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, Any]:
@@ -222,6 +237,12 @@ async def onboard_project(
             exc_info=True,
         )
 
+    # Seed per-project task-branch namespace (override may overwrite this below)
+    build_config.setdefault(
+        "task_branch_namespace",
+        _derive_task_branch_namespace(payload.github_repo),
+    )
+
     # Merge override on top of detected config (validate shape)
     if payload.build_config_override:
         build_config.update(payload.build_config_override)
@@ -242,16 +263,25 @@ async def onboard_project(
     session.add(project)
 
     # Detect default branch and initialize auto_remediation config
-    default_branch = "main"
-    try:
-        from app.github import get_repo_default_branch
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No installation token available — cannot detect default branch.",
+        )
+    from app.github import get_repo_default_branch
 
-        if token:
-            default_branch = await get_repo_default_branch(
-                token, payload.github_owner, payload.github_repo
-            )
+    try:
+        default_branch = await get_repo_default_branch(
+            token, payload.github_owner, payload.github_repo
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.warning(f"[ONBOARD] Default branch detection failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Default branch detection failed: {e}",
+        ) from e
 
     if default_branch:
         project.integration_branch = default_branch

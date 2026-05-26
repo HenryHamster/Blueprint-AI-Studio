@@ -1306,6 +1306,92 @@ class TestPackerMemoReopenContract:
         )
 
 
+_PACKER_LIFECYCLE_SMOKE = (
+    _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke-lifecycle.ts"
+)
+
+
+def _read_packer_lifecycle_smoke() -> str:
+    if not _PACKER_LIFECYCLE_SMOKE.exists():
+        pytest.skip("agent/src/handlers/memo-bake-smoke-lifecycle.ts not present")
+    return _PACKER_LIFECYCLE_SMOKE.read_text(encoding="utf-8")
+
+
+class TestPackerMemoLifecycleContract:
+    """agent.pkr.hcl must gate tagging on a full claim→dispatch→complete lifecycle smoke.
+
+    Unlike the per-handler smokes that call handlers.memo() directly, this smoke
+    spawns the main agent entry point (src/index.ts) as a subprocess so the
+    dispatcher routing, handler registration, and end-to-end status post chain
+    are all validated at bake time.
+    """
+
+    def test_packer_runs_lifecycle_smoke_file(self):
+        """The provisioner must invoke the lifecycle smoke source file directly."""
+        assert "./src/handlers/memo-bake-smoke-lifecycle.ts" in _read_packer_hcl(), (
+            "agent.pkr.hcl must execute ./src/handlers/memo-bake-smoke-lifecycle.ts "
+            "so the full agent claim/dispatch/complete cycle is validated at bake time."
+        )
+
+    def test_lifecycle_smoke_sentinel_present(self):
+        """Smoke must print PACKER_MEMO_LIFECYCLE_OK so a silent failure is detectable."""
+        assert "PACKER_MEMO_LIFECYCLE_OK" in _read_packer_lifecycle_smoke(), (
+            "memo-bake-smoke-lifecycle.ts must emit PACKER_MEMO_LIFECYCLE_OK on success."
+        )
+
+    def test_lifecycle_smoke_spawns_agent_entry_point(self):
+        """Smoke must spawn src/index.ts as a subprocess, not call handlers directly."""
+        smoke = _read_packer_lifecycle_smoke()
+        assert "index.ts" in smoke, (
+            "memo-bake-smoke-lifecycle.ts must reference the main agent entry point "
+            "(src/index.ts) so dispatcher routing and handler registration are exercised."
+        )
+        assert "spawn" in smoke, (
+            "memo-bake-smoke-lifecycle.ts must spawn a subprocess, not call handlers directly."
+        )
+
+    def test_lifecycle_smoke_validates_completed_status_and_sentinel(self):
+        """Stub server must assert COMPLETED status and a round-trip sentinel in logs."""
+        smoke = _read_packer_lifecycle_smoke()
+        assert "COMPLETED" in smoke, (
+            "memo-bake-smoke-lifecycle.ts must assert status=COMPLETED."
+        )
+        assert "memo-lifecycle-bake-smoke" in smoke or "LIFECYCLE_SENTINEL" in smoke, (
+            "memo-bake-smoke-lifecycle.ts must assert a content sentinel appears in "
+            "the COMPLETED logs, proving the payload round-tripped through the handler."
+        )
+
+    def test_lifecycle_smoke_bypasses_secret_token_validation(self):
+        """Smoke must set BLUEPRINT_SMOKE_SKIP_VALIDATION so the agent startup
+        secret-token check does not block execution at bake time."""
+        assert "BLUEPRINT_SMOKE_SKIP_VALIDATION" in _read_packer_lifecycle_smoke(), (
+            "memo-bake-smoke-lifecycle.ts must set BLUEPRINT_SMOKE_SKIP_VALIDATION=1 "
+            "so the agent entry point skips the VM secret-token check at bake time."
+        )
+
+    def test_prior_smokes_still_run_after_lifecycle_addition(self):
+        """All prior smoke sentinels must remain in the bake after the lifecycle addition."""
+        hcl = _read_packer_hcl()
+        for sentinel in (
+            "PACKER_MEMO_SMOKE_OK",
+            "PACKER_MEMO_INVESTIGATION_OK",
+            "./src/handlers/memo-bake-smoke-reopen.ts",
+        ):
+            assert sentinel in hcl, (
+                f"Prior memo smoke marker {sentinel!r} was dropped — all memo "
+                "smokes must run on every bake."
+            )
+
+    def test_lifecycle_smoke_file_is_in_agent_typecheck_surface(self):
+        """The lifecycle smoke must live under agent/src so the existing tsc --noEmit
+        build covers it."""
+        relative_smoke_path = _PACKER_LIFECYCLE_SMOKE.relative_to(_AGENT_DIR).as_posix()
+        assert relative_smoke_path.startswith("src/"), (
+            "memo-bake-smoke-lifecycle.ts must live under agent/src so the agent "
+            "typecheck covers it."
+        )
+
+
 class TestPackerFingerprintBakeContract:
     """agent.pkr.hcl must run the production readAgentRuntimeFingerprint()
     reader at bake time so a drift between the AGENT_RUNTIME_FINGERPRINT

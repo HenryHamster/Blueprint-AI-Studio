@@ -1339,8 +1339,17 @@ async def get_repo_default_branch(token: str, owner: str, repo: str) -> str:
         "GET", f"https://api.github.com/repos/{owner}/{repo}", headers
     )
     if response.status_code != 200:
-        return "main"  # Safe fallback
-    return response.json().get("default_branch", "main")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"GitHub API error detecting default branch (HTTP {response.status_code}).",
+        )
+    data = response.json()
+    if "default_branch" not in data:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="GitHub API response missing default_branch field.",
+        )
+    return data["default_branch"]
 
 
 async def delete_branch(token: str, owner: str, repo: str, branch: str) -> bool:

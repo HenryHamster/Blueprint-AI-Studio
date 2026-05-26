@@ -2715,20 +2715,37 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 "- Update `EXPECTED_SCHEMA_REVISION` in backend/app/main.py to match the final (highest) migration's revision."
                             )
                         parent_goal = (parent.description or parent.title or "")[:500]
-                        fix_prompt = (
-                            f"This rollup PR (#{rollup_pr_number}) merging {staging_branch} into {target_branch} has conflicts.\n"
-                            f"Error: {merge_msg}\n\n"
-                            f"Rollup goal: {parent_goal}\n\n"
-                            f"Files in this PR:\n{files_list}\n\n"
-                            f"Steps to resolve:\n"
-                            f"1. Run: git fetch origin {target_branch}\n"
-                            f"2. Run: git rebase origin/{target_branch}\n"
-                            f"3. Resolve any conflicts — {target_branch} is the source of truth. Keep its refactors and restructuring.\n"
-                            f"   Re-apply only the changes that serve the rollup goal (described above) on top of {target_branch}'s current state.\n"
-                            f"   If files were heavily rewritten on {target_branch}, adapt the rollup changes to the new structure.\n"
-                            f"4. Run: git rebase --continue after resolving each file"
-                            f"{migration_guidance}"
-                        )
+                        if _ms == "behind":
+                            # Budget-exhausted behind path: no real conflicts, just a stale
+                            # GitHub flag. The no-op guidance is critical — if the PR head is
+                            # already ancestor of base, git rebase will be a no-op and the
+                            # fix agent must not treat that as failure (PR #6153 incident).
+                            fix_prompt = (
+                                f"Rollup PR #{rollup_pr_number} merging {staging_branch} into {target_branch} "
+                                f"is behind the target branch and the GitHub update-branch API failed across "
+                                f"the retry budget ({_upd_msg}). Rebase manually onto origin/{target_branch}:\n\n"
+                                f"1. git fetch origin {target_branch}\n"
+                                f"2. git rebase origin/{target_branch}\n"
+                                f"3. If no conflicts and no commits were replayed, the PR is already "
+                                f"up-to-date — GitHub's mergeability flag is just stale. Report no "
+                                f"changes needed (don't force-push); retries will clear it.\n"
+                                f"4. Otherwise resolve conflicts and git push --force-with-lease."
+                            )
+                        else:
+                            fix_prompt = (
+                                f"This rollup PR (#{rollup_pr_number}) merging {staging_branch} into {target_branch} has conflicts.\n"
+                                f"Error: {merge_msg}\n\n"
+                                f"Rollup goal: {parent_goal}\n\n"
+                                f"Files in this PR:\n{files_list}\n\n"
+                                f"Steps to resolve:\n"
+                                f"1. Run: git fetch origin {target_branch}\n"
+                                f"2. Run: git rebase origin/{target_branch}\n"
+                                f"3. Resolve any conflicts — {target_branch} is the source of truth. Keep its refactors and restructuring.\n"
+                                f"   Re-apply only the changes that serve the rollup goal (described above) on top of {target_branch}'s current state.\n"
+                                f"   If files were heavily rewritten on {target_branch}, adapt the rollup changes to the new structure.\n"
+                                f"4. Run: git rebase --continue after resolving each file"
+                                f"{migration_guidance}"
+                            )
                         fix_task, _ = await _spawn_pipeline_task(
                             parent,
                             "fix",

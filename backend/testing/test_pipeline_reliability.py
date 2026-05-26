@@ -1558,6 +1558,11 @@ async def test_ci_polling_behind_update_branch_exhausted_spawns_fix_with_alert(
     assert "gh-token" not in fix_prompt
     assert "/api/agent/github/check-runs" in fix_prompt
     assert "$AGENT_API_TOKEN" in fix_prompt
+    # No-op rebase must be recognised as success so a stale mergeability flag
+    # does not cause the fix agent to report BLOCKED_PRECONDITION (PR #6153).
+    assert "up-to-date" in fix_prompt, fix_prompt
+    assert "don't force-push" in fix_prompt, fix_prompt
+    assert "changes needed" in fix_prompt, fix_prompt
 
 
 @pytest.mark.asyncio

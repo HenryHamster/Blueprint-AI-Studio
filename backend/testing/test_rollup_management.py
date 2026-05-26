@@ -445,6 +445,102 @@ async def test_post_merge_behind_ancestor_skips_update_branch(cleanup_db, mocker
 
 
 @pytest.mark.asyncio
+async def test_behind_update_exhausted_but_not_behind_at_spawn_skips_fix(
+    cleanup_db, mocker
+):
+    """Late-skip: update_branch fails enough times to exhaust the budget, but the
+    pre-spawn ancestor recheck (pr_is_not_behind_for) returns True — no fix task
+    should be spawned and the retry counter should be cleared."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.main._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new_callable=AsyncMock,
+        return_value=_files("backend/app/models.py"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request_diff", new_callable=AsyncMock, return_value=""
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            {"merged": False, "state": "open"},
+            {
+                "additions": 10,
+                "deletions": 5,
+                "merged": False,
+                "state": "open",
+                "head": {"sha": "head-sha-late"},
+                "mergeable_state": "behind",
+            },
+        ],
+    )
+    # base tip differs from head — triggers the behind-update path.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new_callable=AsyncMock,
+        return_value="base-tip-late",
+    )
+    # update_branch always fails — exhaust the budget on the first sweep.
+    mock_upd = mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new_callable=AsyncMock,
+        return_value={"updated": False, "message": "conflict"},
+    )
+    # is_ancestor_of: first call (pre-update check) returns False so we proceed
+    # to update_branch; second call (late-spawn recheck) returns True so we skip.
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new_callable=AsyncMock,
+        side_effect=[False, True],
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(MagicMock(id="fix-task-id"), True),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    # Seed the counter at budget-1 so a single failed update exhausts it.
+    # cleanup_db IS the session (not a factory), so use it directly.
+    parent_obj = await cleanup_db.get(type(parent), parent.id)
+    parent_obj.context = {**(parent_obj.context or {}), "_behind_update_retries": 2}
+    flag_modified(parent_obj, "context")
+    cleanup_db.add(parent_obj)
+    await cleanup_db.commit()
+
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    # update_branch was attempted but the late recheck prevented a fix spawn.
+    mock_upd.assert_awaited_once()
+    mock_spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_unfetchable_migration_diff_defers_failsafe(cleanup_db, mocker):
     """Fail-safe: a rollup touches alembic/versions but the diff cannot be
     fetched (empty response) → the guard defers; the merge is NOT performed and
@@ -707,3 +803,46 @@ async def test_empty_diff_note_uses_directions_lock(cleanup_db, mocker):
     mutate_fn(directions)
     assert directions[0]["notes"][0]["source"] == "rollup_empty_diff"
     assert "no actionable changes" in directions[0]["notes"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_rollup_behind_fix_prompt_includes_noop_guidance(cleanup_db, mocker):
+    """fix_prompt spawned when update_branch budget is exhausted must include
+    no-op rebase guidance so the fix agent treats 'Current branch is up to date'
+    as success rather than BLOCKED_PRECONDITION (motivating incident: PR #6153)."""
+    _mock_rollup_merge_conflict_deps(mocker, mergeable_state="behind")
+    mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new_callable=AsyncMock,
+        return_value={"updated": False, "message": "503 Service Unavailable"},
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(MagicMock(id="fix-task-id"), True),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    # Pre-seed retries at 2 so the next increment == budget (3) → fix spawn.
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db, project.id, extra_context={"_behind_update_retries": 2}
+    )
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_spawn.assert_awaited_once()
+    assert mock_spawn.await_args.args[1] == "fix"
+    fix_prompt = mock_spawn.await_args.kwargs.get("fix_prompt", "")
+    # No-op rebase must be recognised as success, not failure.
+    assert "up-to-date" in fix_prompt, fix_prompt
+    assert "don't force-push" in fix_prompt, fix_prompt
+    assert "changes needed" in fix_prompt, fix_prompt

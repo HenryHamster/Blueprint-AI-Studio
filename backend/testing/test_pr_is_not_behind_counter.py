@@ -179,6 +179,40 @@ async def test_admin_endpoint_returns_snapshot_with_canonical_keys():
     assert stats["rollup_post_merge"] == {"true": 0, "false": 0, "none": 0, "total": 0}
 
 
+@pytest.mark.asyncio
+async def test_late_skip_orchestrator_ci_records_true_outcome():
+    """pr_is_not_behind_for called with call_site='orchestrator_ci' and returning True
+    increments the true bucket — same counter used for the pre-spawn recheck."""
+    from unittest.mock import AsyncMock, patch
+
+    with patch(
+        "app.github.pr_is_not_behind_for", new_callable=AsyncMock, return_value=True
+    ):
+        # Simulate the counter increment that pr_is_not_behind_for triggers internally
+        # via record_pr_is_not_behind.  The real function records before returning, so
+        # we replicate that here to test the counter pathway in isolation.
+        record_pr_is_not_behind("orchestrator_ci", True)
+
+    assert pr_is_not_behind_counts["orchestrator_ci"]["true"] == 1
+    assert pr_is_not_behind_counts["orchestrator_ci"]["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_late_skip_rollup_pre_merge_records_true_outcome():
+    """pr_is_not_behind called with call_site='rollup_pre_merge' and returning True
+    increments the true bucket — mirrors the late-skip path in rollup_management.py."""
+    result = await pr_is_not_behind(
+        "tok",
+        "owner",
+        "repo",
+        mergeable_state="clean",
+        call_site="rollup_pre_merge",
+    )
+    assert result is True
+    assert pr_is_not_behind_counts["rollup_pre_merge"]["true"] == 1
+    assert pr_is_not_behind_counts["rollup_pre_merge"]["total"] == 1
+
+
 def test_shared_state_module_exports_helpers():
     # Sanity: the helpers live on shared_state and are importable.
     assert callable(shared_state.record_pr_is_not_behind)

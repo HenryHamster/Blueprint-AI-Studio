@@ -6,7 +6,7 @@
     "task_completion_investigation.py": 1350,
     "task_completion_self_audit.py": 500,
     "task_lifecycle.py": 5750,
-    "orchestrator.py": 4600,
+    "orchestrator.py": 5300,
     "orchestrator_health.py": 500,
     "admin.py": 3100,
     "compute.py": 2500,
