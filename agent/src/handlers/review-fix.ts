@@ -823,6 +823,30 @@ export async function handleReview(
   statusRef.value = `Cloning ${owner}/${repo} (PR #${prNumber})...`;
   sendLog(ws, `Reviewing PR #${prNumber} on branch ${branch} (iteration ${iteration})\n`);
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  // Check the branch still exists before cloning — auto-delete-on-merge removes
+  // the head branch as soon as the PR is merged, making clone fatal. This is a
+  // permanent state (not a transient error), so short-circuit cleanly.
+  let reviewBranchExists = false;
+  try {
+    const lsOut = execFileSync('git', ['ls-remote', '--heads', cloneUrl, branch], { timeout: 30000 });
+    reviewBranchExists = lsOut.toString().trim().length > 0;
+  } catch {
+    // ls-remote itself failed (auth error, network, etc.) — let the clone attempt
+    // proceed and fail loudly so non-branch errors still surface.
+    reviewBranchExists = true;
+  }
+  if (!reviewBranchExists) {
+    const skipMsg = `PR head branch '${branch}' no longer exists on ${owner}/${repo} — likely merged and auto-deleted. Skipping review (nothing to review).`;
+    sendLog(ws, skipMsg + '\n');
+    await persistAndPostStatus(taskId, {
+      task_id: taskId,
+      status: 'COMPLETED',
+      artifact_type: 'ERROR_LOG',
+      logs: skipMsg,
+      failure_category: 'PR_BRANCH_DELETED',
+    });
+    return;
+  }
   // Shallow clone of the PR branch directly — avoids fetch+checkout issues with --single-branch
   await prepareWorkspaceForRole({
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,

@@ -149,7 +149,15 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(fs.existsSync).mockReturnValue(false);
   vi.mocked(fs.readFileSync).mockReturnValue('');
-  vi.mocked(execFileSync).mockReturnValue('');
+  // Default: ls-remote returns a ref line (branch exists) so handleReview tests
+  // that don't care about the deleted-branch path proceed normally. Tests that
+  // need the branch-missing or transport-error behavior override this per-test.
+  vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+    if (cmd === 'git' && Array.isArray(args) && args.includes('ls-remote')) {
+      return 'abc123\trefs/heads/feature\n';
+    }
+    return '';
+  }) as unknown as typeof execFileSync);
   vi.mocked(indexMod.git).mockReturnValue('');
   vi.mocked(indexMod.gitAsync).mockResolvedValue('');
   vi.mocked(indexMod.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
@@ -959,6 +967,88 @@ describe('handleReview — verdict file parsing', () => {
       'Running code review...',
       { prompt_fingerprint: fingerprint },
     );
+  });
+});
+
+// ── handleReview: deleted-head-branch protection ─────────────────────────────
+describe('handleReview — deleted head branch short-circuit', () => {
+  const basePayload = {
+    pr_number: 999,
+    branch: 'feature/deleted',
+    base_branch: 'main',
+    original_prompt: '',
+  };
+
+  it('completes cleanly with PR_BRANCH_DELETED when branch no longer exists on remote', async () => {
+    // ls-remote returns empty string = branch does not exist
+    vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+      if (cmd === 'git' && Array.isArray(args) && args.includes('ls-remote')) {
+        return '';
+      }
+      return '';
+    }) as unknown as typeof execFileSync);
+
+    const { prepareWorkspaceForRole } = await import('../workspacePrep.js');
+
+    await handleReview(
+      'task-deleted-branch', basePayload, { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    // Must not have cloned or run Claude
+    expect(vi.mocked(prepareWorkspaceForRole)).not.toHaveBeenCalled();
+    expect(vi.mocked(indexMod.runClaudeCode)).not.toHaveBeenCalled();
+
+    const statusCalls = vi.mocked(indexMod.persistAndPostStatus).mock.calls;
+    expect(statusCalls.length).toBeGreaterThanOrEqual(1);
+    const status = statusCalls[0][1];
+    expect(status.status).toBe('COMPLETED');
+    expect(status.failure_category).toBe('PR_BRANCH_DELETED');
+    expect(String(status.logs)).toContain('feature/deleted');
+  });
+
+  it('proceeds to clone and review when branch exists on remote', async () => {
+    // ls-remote returns a ref line = branch exists
+    vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+      if (cmd === 'git' && Array.isArray(args) && args.includes('ls-remote')) {
+        return 'abc123\trefs/heads/feature/deleted\n';
+      }
+      return '';
+    }) as unknown as typeof execFileSync);
+
+    const { prepareWorkspaceForRole } = await import('../workspacePrep.js');
+
+    await handleReview(
+      'task-existing-branch',
+      { pr_number: 100, branch: 'feature/existing', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(vi.mocked(prepareWorkspaceForRole)).toHaveBeenCalled();
+    expect(vi.mocked(indexMod.runClaudeCode)).toHaveBeenCalled();
+  });
+
+  it('falls through to clone when ls-remote throws (transport/auth failure)', async () => {
+    // ls-remote throws = network/auth error; clone should still be attempted
+    vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+      if (cmd === 'git' && Array.isArray(args) && args.includes('ls-remote')) {
+        throw new Error('fatal: unable to look up github.com');
+      }
+      return '';
+    }) as unknown as typeof execFileSync);
+
+    const { prepareWorkspaceForRole } = await import('../workspacePrep.js');
+
+    await handleReview(
+      'task-ls-remote-failure',
+      { pr_number: 200, branch: 'feature/transport-fail', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    // Clone is still attempted despite ls-remote failure
+    expect(vi.mocked(prepareWorkspaceForRole)).toHaveBeenCalled();
   });
 });
 
