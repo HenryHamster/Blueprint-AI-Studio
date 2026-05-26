@@ -172,6 +172,8 @@ export interface HeaderBarProps {
   onUpdateAutoReviewConfig: (patch: Partial<AutoReviewConfig>) => Promise<void>;
   integrationBranchData: { integration_branch: string; is_default: boolean } | null;
   onUpdateIntegrationBranch: (branch: string | null) => Promise<void>;
+  promotionTargetData: { promotion_target: string; is_default: boolean } | null;
+  onUpdatePromotionTarget: (branch: string | null) => Promise<void>;
 }
 
 
@@ -538,6 +540,8 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateAutoReviewConfig={props.onUpdateAutoReviewConfig}
           integrationBranchData={props.integrationBranchData}
           onUpdateIntegrationBranch={props.onUpdateIntegrationBranch}
+          promotionTargetData={props.promotionTargetData}
+          onUpdatePromotionTarget={props.onUpdatePromotionTarget}
         />
 
         {/* More secondary buttons — desktop only */}

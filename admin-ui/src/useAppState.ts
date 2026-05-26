@@ -1068,6 +1068,9 @@ export function useAppState() {
   // ── Integration branch config (project-scoped) ───────────────────────────
   const [integrationBranchData, setIntegrationBranchData] = useState<{ integration_branch: string; is_default: boolean } | null>(null);
 
+  // ── Promotion target config (project-scoped) ─────────────────────────────
+  const [promotionTargetData, setPromotionTargetData] = useState<{ promotion_target: string; is_default: boolean } | null>(null);
+
   useEffect(() => {
     if (!selectedProjectId) {
       setIntegrationBranchData(null);
@@ -1096,6 +1099,37 @@ export function useAppState() {
       setIntegrationBranchData(prev);
       addToast('Failed to save integration branch', 'error');
       throw new Error('Failed to save integration branch');
+    }
+  };
+
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setPromotionTargetData(null);
+      return;
+    }
+    authGet(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/promotion-target`)
+      .then(res => res.ok ? res.json() : null)
+      .then(data => { if (data?.promotion_target !== undefined) setPromotionTargetData({ promotion_target: data.promotion_target, is_default: data.is_default }); })
+      .catch(() => {});
+  }, [selectedProjectId]);
+
+  const handleUpdatePromotionTarget = async (branch: string | null) => {
+    if (!selectedProjectId) return;
+    const prev = promotionTargetData;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/promotion-target`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify({ promotion_target: branch }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setPromotionTargetData({ promotion_target: data.promotion_target, is_default: data.is_default });
+      addToast('Promotion target saved', 'success');
+    } catch {
+      setPromotionTargetData(prev);
+      addToast('Failed to save promotion target', 'error');
+      throw new Error('Failed to save promotion target');
     }
   };
 
@@ -1166,6 +1200,7 @@ export function useAppState() {
     issueImplementationConfig, handleUpdateIssueImplementationConfig,
     autoReviewConfig, handleUpdateAutoReviewConfig,
     integrationBranchData, handleUpdateIntegrationBranch,
+    promotionTargetData, handleUpdatePromotionTarget,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountProvider, setNewAccountProvider,
     newAccountAuthMode, setNewAccountAuthMode, newAccountToken, setNewAccountToken,

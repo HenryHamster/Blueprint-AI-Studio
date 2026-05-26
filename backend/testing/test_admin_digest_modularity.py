@@ -72,6 +72,7 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "compute_failure_grouping",
         "compute_migration_health",
         "compute_rejection_pattern_summary",
+        "compute_remediation_and_patterns",
         "compute_resurrection_outcome_summary",
         "compute_retry_pattern_summary",
         "compute_review_cap_exhaustion_summary",
@@ -96,6 +97,16 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "get_llm_cost_breakdown",
     ),
     "app.regression_case_endpoints": ("clear_regression_manual_intervention",),
+    "app.routers.admin_release_version": (
+        "_MAX_RETIREMENT_CRITIQUES",
+        "_SetVersionPhaseBody",
+        "_VERDICT_HISTORY_LIMIT",
+        "_format_qualification",
+        "get_retirement_critiques",
+        "get_version_lifecycle",
+        "list_qualification_verdicts",
+        "set_version_phase",
+    ),
 }
 
 
@@ -506,4 +517,57 @@ class TestPipelineObsEndpointsExtracted:
         assert not missing_paths, (
             "pipeline_observability routes are not all reachable via admin_digest:\n"
             f"  Missing paths: {sorted(missing_paths)}"
+        )
+
+
+class TestAdminReleaseVersionSubRouterMounted:
+    """Tripwire — the ``admin_release_version`` sub-router is mounted on admin_digest.
+
+    The release version lifecycle endpoints live in their own module
+    (``app.routers.admin_release_version``) but are exposed under the
+    ``/api/admin`` prefix by mounting ``admin_release_version.router`` onto
+    ``admin_digest.router``.  Removing that line would silently drop the
+    ``/api/admin/projects/{project_id}/retirement-critiques``,
+    ``/api/admin/projects/{project_id}/version-lifecycle``,
+    ``/api/admin/projects/{project_id}/version-phase``, and
+    ``/api/admin/projects/{project_id}/qualification-verdicts`` endpoints.
+    """
+
+    def test_admin_release_version_router_is_mounted_on_admin_digest(self):
+        admin_digest = importlib.import_module("app.routers.admin_digest")
+        admin_release_version = importlib.import_module(
+            "app.routers.admin_release_version"
+        )
+
+        api_routes = [r for r in admin_digest.router.routes if isinstance(r, APIRoute)]
+        assert api_routes, "app.routers.admin_digest.router has no APIRoute entries."
+
+        endpoint_modules = {r.endpoint.__module__ for r in api_routes}
+        assert "app.routers.admin_release_version" in endpoint_modules, (
+            "app.routers.admin_digest.router does not include any routes "
+            "whose endpoint comes from app.routers.admin_release_version. The "
+            "admin_release_version sub-router is no longer mounted. "
+            "Restore the include:\n"
+            "    from app.routers.admin_release_version import router as "
+            "_release_version_router  # noqa: E402\n"
+            "    router.include_router(_release_version_router)\n"
+            f"Routes currently come from modules: {sorted(endpoint_modules)}"
+        )
+
+        release_paths = [
+            r.path
+            for r in admin_release_version.router.routes
+            if isinstance(r, APIRoute)
+        ]
+        admin_digest_paths = [r.path for r in api_routes]
+        missing = [
+            p
+            for p in release_paths
+            if not any(adp.endswith(p) for adp in admin_digest_paths)
+        ]
+        assert not missing, (
+            "admin_release_version routes are not all mounted on admin_digest.\n"
+            f"  Missing paths: {sorted(missing)}\n"
+            "Ensure `router.include_router(_release_version_router)` is "
+            "present in app/routers/admin_digest.py."
         )

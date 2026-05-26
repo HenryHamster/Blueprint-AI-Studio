@@ -590,6 +590,8 @@ export default function App() {
         onUpdateAutoReviewConfig={s.handleUpdateAutoReviewConfig}
         integrationBranchData={s.integrationBranchData}
         onUpdateIntegrationBranch={s.handleUpdateIntegrationBranch}
+        promotionTargetData={s.promotionTargetData}
+        onUpdatePromotionTarget={s.handleUpdatePromotionTarget}
       />
 
       <div

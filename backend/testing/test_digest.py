@@ -26,6 +26,7 @@ from app.digest_metrics import (
     compute_digest_trend_history,
     compute_failure_grouping,
     compute_recurring_error_clusters,
+    compute_remediation_and_patterns,
     compute_remediation_funnel,
     compute_review_quality_metrics,
     compute_scope_mismatch_summary,
@@ -5435,6 +5436,44 @@ async def test_compute_remediation_funnel_helper_direct(db_session):
     assert investigation_conversion["parseable"] == 1
     assert investigation_conversion["actionable"] == 1
     assert investigation_conversion["remediation_spawned"] == 1
+
+
+@pytest.mark.asyncio
+async def test_compute_remediation_and_patterns_helper_direct(db_session):
+    """compute_remediation_and_patterns returns all four expected top-level keys.
+
+    Exercises the extracted helper in isolation (no FastAPI layer) and confirms
+    it returns a dict with remediation_funnel, investigation_conversion,
+    recurring_patterns, and early_warnings.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+
+    result = await compute_remediation_and_patterns(
+        session=db_session,
+        project_id=project.id,
+        window_start=window_start,
+        failed_tasks=[],
+        all_tasks=[],
+        active_tasks_all=[],
+        dir_id_to_text={},
+    )
+
+    assert set(result.keys()) == {
+        "remediation_funnel",
+        "investigation_conversion",
+        "recurring_patterns",
+        "early_warnings",
+    }
+    assert isinstance(result["recurring_patterns"], list)
+    assert isinstance(result["early_warnings"], list)
+    assert isinstance(result["remediation_funnel"], dict)
+    assert isinstance(result["investigation_conversion"], dict)
 
 
 @pytest.mark.asyncio

@@ -19,12 +19,22 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.time_utils import _to_naive_utc
-from app.models import Project, Task, TaskStatus, RegressionRemediationCase, _utcnow
+from app.models import (
+    Project,
+    Task,
+    TaskStatus,
+    RegressionRemediationCase,
+    _utcnow,
+)
 from app.sr_blind_spots import (
     _REVIEWER_ORIGINS,
     is_skipped_sr_outcome as _is_skipped_sr_outcome_shared,
 )
 from app.review_learning import _categorize_review_issues
+
+# Remediation funnel + recurring-failure-pattern helper relocated to its own
+# module. Re-exported here so existing import paths are unchanged.
+from app.digest_remediation import compute_remediation_and_patterns  # noqa: F401
 
 logger = logging.getLogger(__name__)
 

@@ -5,8 +5,7 @@ import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, Query, HTTPException
-from pydantic import BaseModel, Field as _Field
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -22,21 +21,15 @@ from app.models import (
     Artifact,
     ArtifactType,
     _utcnow,
-    ResidualRemediationCase,
-    ResidualRemediationCaseStatus,
     RegressionRemediationCase,
-    ReleaseVersion,
     StrategicCycle,
     CYCLE_META_MEMOS_AVAILABLE,
     CYCLE_META_MEMOS_CITED,
-    QualificationVerdict,
 )
 from app.auth import get_current_user, require_admin
-from app.admin import _get_user_project_with_role
 from app.shared_state import runtime_config as _runtime_config
 from app.routers.admin_analytics import _derive_completed_at, ON_DEMAND_RATE, SPOT_RATE
 from app import strategic_cycle as _strategic_cycle
-from app import release_version as _release_version
 from app.strategic_analysis import _compute_prediction_calibration
 from app.digest_metrics import (
     _compute_edges_considered_metrics,  # noqa: F401  re-exported for external importers
@@ -59,7 +52,8 @@ from app.digest_metrics import (
     compute_migration_health,  # noqa: F401  re-exported for external importers
     compute_recurring_error_clusters,
     compute_rejection_pattern_summary,  # noqa: F401  re-exported for external importers
-    compute_remediation_funnel,
+    compute_remediation_and_patterns,  # noqa: F401  re-exported for external importers
+    compute_remediation_funnel,  # noqa: F401  re-exported for external importers
     compute_resurrection_outcome_summary,  # noqa: F401  re-exported for external importers
     compute_retry_pattern_summary,  # noqa: F401  re-exported for external importers
     compute_review_cap_exhaustion_summary,  # noqa: F401  re-exported for external importers
@@ -85,12 +79,14 @@ from app.sr_diagnostics_endpoints import router as _sr_diagnostics_router  # noq
 from app.anomaly_detection import router as _anomaly_detection_router  # noqa: E402
 from app.efficiency_snapshot import router as _efficiency_snapshot_router  # noqa: E402
 from app.routers.admin_pipeline_observability import router as _pipeline_obs_router  # noqa: E402
+from app.routers.admin_release_version import router as _release_version_router  # noqa: E402
 
 router.include_router(_viewport_debt_router)
 router.include_router(_sr_diagnostics_router)
 router.include_router(_anomaly_detection_router)
 router.include_router(_efficiency_snapshot_router)
 router.include_router(_pipeline_obs_router)
+router.include_router(_release_version_router)
 
 # Residual/regression-case CRUD endpoints relocated to app.regression_case_endpoints.
 # Re-exported here so existing call sites keep working.
@@ -100,6 +96,19 @@ from app.regression_case_endpoints import (  # noqa: E402
 )
 
 router.include_router(_regression_case_router)
+
+# Release version lifecycle endpoints relocated to app.routers.admin_release_version.
+# Re-exported here so existing call sites keep working.
+from app.routers.admin_release_version import (  # noqa: E402, F401
+    _MAX_RETIREMENT_CRITIQUES,
+    _SetVersionPhaseBody,
+    _VERDICT_HISTORY_LIMIT,
+    _format_qualification,
+    get_retirement_critiques,
+    get_version_lifecycle,
+    list_qualification_verdicts,
+    set_version_phase,
+)
 
 _SIGNAL_STALENESS_TITLE_PREFIX = "Signal staleness: "
 _ACTIVE_TASKS_QUERY_LIMIT = 500
@@ -1310,225 +1319,22 @@ async def _compute_digest(
         completed_tasks, failed_tasks
     )
 
-    # --- Residual remediation funnel (sourced from ResidualRemediationCase rows) ---
-    # A separate responsibility from the task/CI remediation funnel; computed here
-    # and passed into compute_remediation_funnel so it lands at its original position
-    # in the assembled remediation_funnel dict.
-    _rr_spawned_filters = [ResidualRemediationCase.last_spawned_at >= window_start]
-    if project_id:
-        _rr_spawned_filters.append(ResidualRemediationCase.project_id == project_id)
-    _rr_spawned_result = await session.execute(
-        select(ResidualRemediationCase).where(*_rr_spawned_filters).limit(500)
-    )
-    _rr_cases = list(_rr_spawned_result.scalars().all())
-    _rr_active_filters = [
-        ResidualRemediationCase.status == ResidualRemediationCaseStatus.REMEDIATING,
-    ]
-    if project_id:
-        _rr_active_filters.append(ResidualRemediationCase.project_id == project_id)
-    _rr_active_result = await session.execute(
-        select(ResidualRemediationCase).where(*_rr_active_filters)
-    )
-    _rr_open_filters = [
-        ResidualRemediationCase.status.in_(
-            [
-                ResidualRemediationCaseStatus.ACTIVE,
-                ResidualRemediationCaseStatus.REMEDIATING,
-                ResidualRemediationCaseStatus.SUSPENDED,
-            ]
-        ),
-    ]
-    if project_id:
-        _rr_open_filters.append(ResidualRemediationCase.project_id == project_id)
-    _rr_open_result = await session.execute(
-        select(ResidualRemediationCase)
-        .where(*_rr_open_filters)
-        .order_by(ResidualRemediationCase.last_seen_at.desc())
-        .limit(500)
-    )
-    _rr_open_cases = list(_rr_open_result.scalars().all())
-    residual_remediation_funnel: Dict[str, Any] = {
-        "spawned": len(_rr_cases),
-        "merged": sum(
-            1 for c in _rr_cases if c.status == ResidualRemediationCaseStatus.MERGED
-        ),
-        "failed": sum(
-            1
-            for c in _rr_cases
-            if c.status
-            in (
-                ResidualRemediationCaseStatus.FAILED,
-                ResidualRemediationCaseStatus.SUSPENDED,
-            )
-        ),
-        "remediating": len(list(_rr_active_result.scalars().all())),
-        "open_cases_by_error_class": [
-            {
-                "error_class": "CODE_ERROR",
-                "count": len(_rr_open_cases),
-                "most_recent_at": _rr_open_cases[0].last_seen_at.isoformat()
-                if _rr_open_cases
-                else None,
-                "cases": [
-                    {
-                        "fingerprint": c.fingerprint,
-                        "status": c.status,
-                        "hit_count": c.hit_count,
-                        "last_seen_at": c.last_seen_at.isoformat()
-                        if c.last_seen_at
-                        else None,
-                        "last_spawned_at": c.last_spawned_at.isoformat()
-                        if c.last_spawned_at
-                        else None,
-                        "sample_message": c.sample_message,
-                        "consecutive_failure_count": c.consecutive_failure_count,
-                    }
-                    for c in _rr_open_cases[:30]
-                ],
-            }
-        ]
-        if _rr_open_cases
-        else [],
-    }
-
-    remediation_funnel, investigation_conversion = await compute_remediation_funnel(
-        session,
+    _remediation_result = await compute_remediation_and_patterns(
+        session=session,
         project_id=project_id,
         window_start=window_start,
-        residual_remediation_funnel=residual_remediation_funnel,
+        failed_tasks=failed_tasks,
+        all_tasks=all_tasks,
+        active_tasks_all=active_tasks_all,
+        dir_id_to_text=dir_id_to_text,
     )
+    remediation_funnel = _remediation_result["remediation_funnel"]
+    investigation_conversion = _remediation_result["investigation_conversion"]
+    recurring_patterns = _remediation_result["recurring_patterns"]
+    early_warnings = _remediation_result["early_warnings"]
 
     # --- Anomaly-driven pipeline adjustment snapshot ---
     anomaly_adjustment_summary = compute_anomaly_adjustment_summary()
-
-    # --- Recurring failure patterns (from persistent_anomalies) ---
-    from app.shared_state import persistent_anomalies as _persistent_anomalies  # noqa: PLC0415
-    from app.anomaly_detection import _error_fingerprint  # noqa: PLC0415
-
-    _fp_48h_cutoff = _utcnow() - timedelta(hours=48)
-    _fp_dirs_48h: Dict[str, set] = {}
-    _fp_count_48h: Dict[str, int] = {}
-    for _t in failed_tasks:
-        if _derive_completed_at(_t) < _fp_48h_cutoff:
-            continue
-        _msg = _t.latest_status_message or ""
-        if not _msg:
-            continue
-        _fp_ = _error_fingerprint(_msg)
-        _did = (_t.context or {}).get("direction_id")
-        if _did:
-            _fp_dirs_48h.setdefault(_fp_, set()).add(str(_did))
-        _fp_count_48h[_fp_] = _fp_count_48h.get(_fp_, 0) + 1
-
-    _fp_task_states: Dict[str, Dict[str, Any]] = {}
-    _inflight_statuses = {
-        TaskStatus.QUEUED,
-        TaskStatus.PROVISIONING,
-        TaskStatus.IN_PROGRESS,
-        TaskStatus.EVALUATING,
-    }
-    for _t in list(all_tasks) + list(active_tasks_all):
-        _ctx = _t.context or {}
-        # Audit W1: previous_error_fingerprint is a column.
-        _fp_ = (
-            _ctx.get("diagnosis_fingerprint")
-            or _ctx.get("error_fingerprint")
-            or _t.previous_error_fingerprint
-        )
-        if not _fp_:
-            continue
-        _entry = _fp_task_states.setdefault(
-            str(_fp_), {"inflight": False, "merged": False, "proactive": False}
-        )
-        if _t.status == TaskStatus.COMPLETED and _ctx.get("pr_url"):
-            _entry["merged"] = True
-        if _t.status in _inflight_statuses:
-            _entry["inflight"] = True
-        if _ctx.get("proactive") or _ctx.get("proactive_investigation"):
-            _entry["proactive"] = True
-
-    recurring_patterns: List[Dict[str, Any]] = []
-    early_warnings: List[Dict[str, Any]] = []
-    _anoms_map = (
-        {str(project_id): _persistent_anomalies.get(str(project_id), {})}
-        if project_id
-        else _persistent_anomalies
-    )
-    import re as _re  # noqa: PLC0415
-
-    _momentum_rate_re = _re.compile(r"(\d+)%")
-    _recent_24h_cutoff = _utcnow() - timedelta(hours=24)
-    _dirs_last_24h = {
-        str((_t.context or {}).get("direction_id"))
-        for _t in failed_tasks
-        if (_t.context or {}).get("direction_id")
-        and _derive_completed_at(_t) >= _recent_24h_cutoff
-    }
-    for _proj_anoms in _anoms_map.values():
-        for _key, _info in _proj_anoms.items():
-            if not isinstance(_info, dict):
-                continue
-            if _info.get("occurrence_count", 0) < 2:
-                continue
-            if _key.startswith("FailureRateMomentum"):
-                _pcts = _momentum_rate_re.findall(_info.get("latest_details") or "")[:3]
-                early_warnings.append(
-                    {
-                        "failure_class": _key,
-                        "rate_progression": [int(p) / 100 for p in _pcts]
-                        if len(_pcts) == 3
-                        else [],
-                        "occurrence_count": _info.get("occurrence_count", 0),
-                        "first_seen": _info.get("first_seen"),
-                        "last_seen": _info.get("last_seen"),
-                        "severity": _info.get("severity"),
-                        "details": _info.get("latest_details") or "",
-                        "affected_direction_count": len(_dirs_last_24h),
-                        "suggested_action": (
-                            "Investigate the upward trend before it trips the surge "
-                            "threshold — check recent deploys, infra health, and "
-                            "direction-level failure patterns."
-                        ),
-                    }
-                )
-                continue
-            _fp_key = (
-                _key[len("CrossDirectionFingerprint_") :]
-                if _key.startswith("CrossDirectionFingerprint_")
-                else _key
-            )
-            _state = _fp_task_states.get(_fp_key, {})
-            _recent = _fp_count_48h.get(_fp_key, 0)
-            if _state.get("merged") and _recent == 0:
-                _status = "fix_verified"
-            elif _state.get("merged"):
-                _status = "fix_shipped"
-            elif _state.get("inflight"):
-                _status = "investigating"
-            else:
-                _status = "unaddressed"
-            _affected_dir_ids = sorted(_fp_dirs_48h.get(_fp_key, set()))
-            recurring_patterns.append(
-                {
-                    "fingerprint": _fp_key,
-                    "occurrence_count": _info.get("occurrence_count", 0),
-                    "first_seen": _info.get("first_seen"),
-                    "last_seen": _info.get("last_seen"),
-                    "severity": _info.get("severity"),
-                    "example_message": (_info.get("latest_details") or "")[:240],
-                    "affected_direction_count": len(_affected_dir_ids),
-                    "affected_directions": [
-                        {
-                            "direction_id": _did,
-                            "direction_text": dir_id_to_text.get(_did, ""),
-                        }
-                        for _did in _affected_dir_ids
-                    ],
-                    "remediation_status": _status,
-                    "proactive": bool(_state.get("proactive", False)),
-                }
-            )
-    recurring_patterns.sort(key=lambda x: x["occurrence_count"], reverse=True)
 
     _review_quality = compute_review_quality_metrics(completed_tasks + failed_tasks)
     _self_review_skip_rate = _compute_sr_skip_rate(completed_tasks + failed_tasks)
@@ -1658,292 +1464,4 @@ async def _compute_digest(
         "prediction_calibration_sample_count": prediction_calibration["sample_count"]
         if prediction_calibration
         else None,
-    }
-
-
-_MAX_RETIREMENT_CRITIQUES = 100
-
-
-@router.get("/projects/{project_id}/retirement-critiques")
-async def get_retirement_critiques(
-    project_id: uuid.UUID,
-    limit: int = Query(default=25, ge=1, le=_MAX_RETIREMENT_CRITIQUES),
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
-) -> Dict[str, Any]:
-    """Return recent retirement critiques stored across StrategicCycle rows.
-
-    Each StrategicCycle may carry a list of retirement critiques written by the
-    strategic agent when it retires directions. Returns the most recent `limit`
-    critiques across the last 20 completed cycles, ordered newest-cycle-first.
-    """
-    await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "viewer"
-    )
-
-    result = await session.execute(
-        select(StrategicCycle)
-        .options(
-            load_only(
-                StrategicCycle.id,
-                StrategicCycle.cycle_metadata,
-                StrategicCycle.created_at,
-            )
-        )
-        .where(StrategicCycle.project_id == project_id)
-        .order_by(StrategicCycle.created_at.desc())
-        .limit(20)
-    )
-    cycles = result.scalars().all()
-
-    critiques_out: list[dict] = []
-    for cycle in cycles:
-        if len(critiques_out) >= limit:
-            break
-        raw = cycle.cycle_metadata or {}
-        critiques = raw.get("retirement_critiques", [])
-        if not isinstance(critiques, list):
-            continue
-        for c in critiques:
-            if not isinstance(c, dict):
-                continue
-            if c.get("no_eligible_retirements"):
-                continue
-            critiques_out.append(
-                {
-                    "direction_id": c.get("direction_id"),
-                    "what_it_addressed": c.get("what_it_addressed", ""),
-                    "pattern_that_produced_it": c.get("pattern_that_produced_it", ""),
-                    "lesson": c.get("lesson", ""),
-                    "cycle_id": cycle.id,
-                    "cycle_created_at": cycle.created_at.isoformat()
-                    if cycle.created_at
-                    else None,
-                }
-            )
-            if len(critiques_out) >= limit:
-                break
-
-    return {"critiques": critiques_out, "total": len(critiques_out)}
-
-
-# ---------------------------------------------------------------------------
-# /projects/{project_id}/version-lifecycle
-# ---------------------------------------------------------------------------
-
-
-def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract operator-facing fields from a last_qualification record."""
-    return {
-        "status": qual.get("status"),
-        "confidence": qual.get("confidence"),
-        "threshold": qual.get("threshold"),
-        "sub_scores": qual.get("sub_scores"),
-        "ci_resolution": qual.get("ci_resolution"),
-        "blocker": qual.get("blocker"),
-        "finalized_at": qual.get("finalized_at"),
-    }
-
-
-@router.get("/projects/{project_id}/version-lifecycle")
-async def get_version_lifecycle(
-    project_id: uuid.UUID,
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
-) -> Dict[str, Any]:
-    """Return the release version lifecycle state for a project.
-
-    Exposes the current open version (phase, qualification verdicts, merged-task
-    count) and a short history of recent closed versions for calibration.
-    Projects with no version lifecycle return ``null`` for ``current_version``
-    and an empty ``recent_versions`` list.
-    """
-    from app.release_version import count_merged_since  # noqa: PLC0415
-    from app.release_qualifier import (  # noqa: PLC0415
-        compute_promotion_readiness,
-        get_latest_release_audit_report,
-    )
-
-    await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, min_role="viewer"
-    )
-
-    open_row = (
-        (
-            await session.execute(
-                select(ReleaseVersion)
-                .where(
-                    ReleaseVersion.project_id == project_id,
-                    ReleaseVersion.status == "open",
-                )
-                .order_by(ReleaseVersion.opened_at.desc())
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
-    )
-
-    current_version_out: Optional[Dict[str, Any]] = None
-    if open_row is not None:
-        merged_count = await count_merged_since(session, project_id, open_row.opened_at)
-        qual = open_row.last_qualification or {}
-        # Surface the latest release_audit's actual findings/score so a verdict
-        # is explainable (the verdict record only keeps the composite, and the
-        # task API strips artifact logs — otherwise operators are blind to WHY).
-        latest_audit = await get_latest_release_audit_report(session, project_id)
-        current_version_out = {
-            "version_number": open_row.version_number,
-            "phase": open_row.phase,
-            "phase_changed_at": open_row.phase_changed_at.isoformat()
-            if open_row.phase_changed_at
-            else None,
-            "phase_reasoning": open_row.phase_reasoning,
-            "goal": open_row.goal,
-            "opened_at": open_row.opened_at.isoformat(),
-            "qualification_attempts": open_row.qualification_attempts,
-            "merged_task_count": merged_count,
-            "last_qualification": _format_qualification(qual) if qual else None,
-            "latest_audit": latest_audit,
-        }
-
-    history_rows = (
-        (
-            await session.execute(
-                select(ReleaseVersion)
-                .where(
-                    ReleaseVersion.project_id == project_id,
-                    ReleaseVersion.status != "open",
-                )
-                .order_by(ReleaseVersion.opened_at.desc())
-                .limit(5)
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    promotion_readiness = await compute_promotion_readiness(session, project_id)
-
-    return {
-        "current_version": current_version_out,
-        "recent_versions": [
-            {
-                "version_number": v.version_number,
-                "status": v.status,
-                "opened_at": v.opened_at.isoformat(),
-                "promoted_at": v.promoted_at.isoformat() if v.promoted_at else None,
-                "qualification_attempts": v.qualification_attempts,
-                "last_qualification": _format_qualification(v.last_qualification)
-                if v.last_qualification
-                else None,
-            }
-            for v in history_rows
-        ],
-        "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
-        "promotion_readiness": promotion_readiness,
-    }
-
-
-class _SetVersionPhaseBody(BaseModel):
-    phase: str = _Field(..., pattern=r"^(build|stabilize)$")
-    reasoning: str = _Field(default="", max_length=500)
-
-
-@router.post("/projects/{project_id}/version-phase")
-async def set_version_phase(
-    project_id: uuid.UUID,
-    payload: _SetVersionPhaseBody,
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
-) -> Dict[str, Any]:
-    """Set the phase of the open release version for a project.
-
-    Member+ role required.  Returns 404 when there is no open version.
-    Combined with POST /qualify this gives the operator a direct lever to
-    advance a version to stabilize and trigger the release gate end-to-end,
-    producing a dry-run QualificationVerdict without waiting for the strategic
-    agent's conservative stall threshold (~14 days).
-    """
-    await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
-    )
-
-    open_ver = await _release_version.current_open_version(session, project_id)
-    if open_ver is None:
-        raise HTTPException(
-            status_code=404,
-            detail="No open release version found for this project.",
-        )
-
-    operator_id = current_user.get("email") or current_user["user_id"]
-    full_reasoning = (
-        f"[operator:{operator_id}] {payload.reasoning}".strip()
-        if payload.reasoning
-        else f"[operator:{operator_id}]"
-    )
-    _release_version.set_version_phase(
-        open_ver, payload.phase, reasoning=full_reasoning
-    )
-    session.add(open_ver)
-    await session.commit()
-    await session.refresh(open_ver)
-    return {
-        "version_number": open_ver.version_number,
-        "phase": open_ver.phase,
-        "phase_changed_at": open_ver.phase_changed_at.isoformat()
-        if open_ver.phase_changed_at
-        else None,
-        "phase_reasoning": open_ver.phase_reasoning,
-    }
-
-
-_VERDICT_HISTORY_LIMIT = 50
-
-
-@router.get("/projects/{project_id}/qualification-verdicts")
-async def list_qualification_verdicts(
-    project_id: uuid.UUID,
-    limit: int = Query(default=20, ge=1, le=_VERDICT_HISTORY_LIMIT),
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
-) -> Dict[str, Any]:
-    """Return recent QualificationVerdict rows for a project, newest-first.
-
-    Viewer+ role required.  Returns a bounded list (max 50) of per-verdict
-    history rows covering both dry-run and promotion-enabled regimes, giving
-    operators a live view of qualifier behavior across the full history.
-    """
-    await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "viewer"
-    )
-
-    stmt = (
-        select(QualificationVerdict)
-        .where(QualificationVerdict.project_id == project_id)
-        .order_by(QualificationVerdict.created_at.desc())
-        .limit(limit)
-    )
-    rows = list((await session.execute(stmt)).scalars().all())
-
-    return {
-        "verdicts": [
-            {
-                "id": str(v.id),
-                "release_version_id": str(v.release_version_id),
-                "candidate_sha": v.candidate_sha,
-                "confidence": v.confidence,
-                "sub_scores": v.sub_scores,
-                "blocker": v.blocker,
-                "would_promote": v.would_promote,
-                "promotion_enabled": v.promotion_enabled,
-                "terminal_status": v.terminal_status,
-                "threshold": v.threshold,
-                "started_at": v.started_at.isoformat() if v.started_at else None,
-                "finalized_at": v.finalized_at.isoformat() if v.finalized_at else None,
-                "created_at": v.created_at.isoformat(),
-            }
-            for v in rows
-        ],
-        "total": len(rows),
     }

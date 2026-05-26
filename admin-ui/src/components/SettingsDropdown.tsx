@@ -9,6 +9,7 @@ import { ProjectAutoRemediationSection } from './ProjectAutoRemediationSection';
 import { ProjectIssueImplementationSection } from './ProjectIssueImplementationSection';
 import { ProjectAutoReviewSection } from './ProjectAutoReviewSection';
 import { ProjectIntegrationBranchSection } from './ProjectIntegrationBranchSection';
+import { ProjectPromotionTargetSection } from './ProjectPromotionTargetSection';
 import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, AutoReviewConfig } from '../types/project';
 import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks, Server, User, FileDown, LogOut, Users, Bell, Wrench, Tag, HelpCircle, Plus, ChevronDown, ChevronUp, RefreshCw } from 'lucide-react';
 import { timeAgo, parseTimestamp } from '../utils/time';
@@ -168,6 +169,9 @@ interface SettingsDropdownProps {
   // Integration branch config (project-scoped)
   integrationBranchData: { integration_branch: string; is_default: boolean } | null;
   onUpdateIntegrationBranch: (branch: string | null) => Promise<void>;
+  // Promotion target config (project-scoped)
+  promotionTargetData: { promotion_target: string; is_default: boolean } | null;
+  onUpdatePromotionTarget: (branch: string | null) => Promise<void>;
 }
 
 
@@ -246,7 +250,7 @@ const CREDENTIAL_GUIDES: Record<string, CredentialGuide> = {
   },
 };
 
-export type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation' | 'auto-review' | 'integration-branch';
+export type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation' | 'auto-review' | 'integration-branch' | 'promotion-target';
 
 const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean; projectOnly?: boolean }[] = [
   { id: 'general', label: 'General', icon: Sliders },
@@ -261,6 +265,7 @@ const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly
   { id: 'auto-remediation', label: 'Auto-Remediation', icon: Settings, projectOnly: true },
   { id: 'issue-implementation', label: 'Issue Implementation', icon: Tag, projectOnly: true },
   { id: 'integration-branch', label: 'Integration Branch', icon: GitBranch, projectOnly: true },
+  { id: 'promotion-target', label: 'Promotion Target', icon: GitBranch, projectOnly: true },
   { id: 'advanced', label: 'Advanced', icon: FileDown },
 ];
 
@@ -409,6 +414,8 @@ export function SettingsDropdown({
   onUpdateAutoReviewConfig,
   integrationBranchData,
   onUpdateIntegrationBranch,
+  promotionTargetData,
+  onUpdatePromotionTarget,
 }: SettingsDropdownProps) {
   const [, setTick] = useState(0);
   const [activeSection, setActiveSection] = useState<SectionId>('general');
@@ -1473,6 +1480,16 @@ export function SettingsDropdown({
     );
   }
 
+  function renderPromotionTarget() {
+    return (
+      <ProjectPromotionTargetSection
+        data={promotionTargetData}
+        canSave={selectedProjectRole === 'owner'}
+        onSave={onUpdatePromotionTarget}
+      />
+    );
+  }
+
   function renderIssueImplementation() {
     return (
       <ProjectIssueImplementationSection
@@ -1529,6 +1546,7 @@ export function SettingsDropdown({
       case 'auto-remediation': return renderAutoRemediation();
       case 'issue-implementation': return renderIssueImplementation();
       case 'integration-branch': return renderIntegrationBranch();
+      case 'promotion-target': return renderPromotionTarget();
       case 'advanced': return renderAdvanced();
     }
   }

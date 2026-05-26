@@ -14,6 +14,7 @@
     "routers/admin_settings.py": 3000,
     "routers/admin_analytics.py": 800,
     "routers/admin_digest.py": 10300,
+    "routers/admin_release_version.py": 350,
     "routers/admin_pool_accounts.py": 1200,
     "max_plan_pool.py": 2750,
     "anomaly_detection.py": 2050,
