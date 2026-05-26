@@ -9,11 +9,13 @@ interface ProjectPromotionTargetSectionProps {
   data: PromotionTargetData | null;
   canSave: boolean;
   onSave: (branch: string | null) => Promise<void>;
+  /** When provided and different from promotion_target, displays LTS workflow context. */
+  relatedIntegrationBranch?: string;
 }
 
 const VALID_BRANCH_RE = /^[a-zA-Z0-9._/-]+$/;
 
-export function ProjectPromotionTargetSection({ data, canSave, onSave }: ProjectPromotionTargetSectionProps) {
+export function ProjectPromotionTargetSection({ data, canSave, onSave, relatedIntegrationBranch }: ProjectPromotionTargetSectionProps) {
   const [branchInput, setBranchInput] = useState(data?.promotion_target ?? '');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -72,6 +74,16 @@ export function ProjectPromotionTargetSection({ data, canSave, onSave }: Project
               <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-cyan-950/40 text-cyan-400 border border-cyan-900/50 shrink-0">override</span>
             )}
           </div>
+
+          {relatedIntegrationBranch && relatedIntegrationBranch !== (data?.promotion_target ?? '') && (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-neutral-400 shrink-0 w-24">Integration</span>
+              <span className="font-mono text-xs text-neutral-300 bg-neutral-900 border border-neutral-800 rounded px-2 py-1 flex-1 truncate">
+                {relatedIntegrationBranch}
+              </span>
+              <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-400 border border-amber-900/50 shrink-0">LTS</span>
+            </div>
+          )}
 
           <div>
             <label className="block text-xs text-neutral-400 mb-1">

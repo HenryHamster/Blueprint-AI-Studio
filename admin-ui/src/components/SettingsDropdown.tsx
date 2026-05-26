@@ -1478,6 +1478,7 @@ export function SettingsDropdown({
         data={integrationBranchData}
         canSave={selectedProjectRole === 'owner'}
         onSave={onUpdateIntegrationBranch}
+        relatedPromotionTarget={promotionTargetData?.promotion_target}
       />
     );
   }
@@ -1488,6 +1489,7 @@ export function SettingsDropdown({
         data={promotionTargetData}
         canSave={selectedProjectRole === 'owner'}
         onSave={onUpdatePromotionTarget}
+        relatedIntegrationBranch={integrationBranchData?.integration_branch}
       />
     );
   }
