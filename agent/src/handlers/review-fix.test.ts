@@ -2270,6 +2270,16 @@ describe('handleReview structural prompt invariants', () => {
     expect(await captureReviewPrompt()).toContain('Do NOT emit "COMMENT", "NEUTRAL", "ADVISORY"');
   });
 
+  it('handleReview prompt instructs exhaustive enumeration of blocking issues', async () => {
+    // One-blocker-per-iteration drip burned PR #6061 through 7 review cycles
+    // before the iteration cap auto-closed it. The verdict instructions now
+    // tell the reviewer to enumerate every blocker in one pass so the fix
+    // agent can converge instead of chasing a moving target.
+    const prompt = await captureReviewPrompt();
+    expect(prompt).toContain('Exhaustiveness');
+    expect(prompt).toContain('enumerate every blocker');
+  });
+
   it('handleReview prompt contains Severity Classification Guide', async () => {
     expect(await captureReviewPrompt()).toContain('**Severity Classification Guide:**');
   });

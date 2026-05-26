@@ -20,6 +20,8 @@ export interface AutonomousConfigSectionProps {
   setConfigMaxActiveDirections: (v: number) => void;
   configArchitectureReviewFrequency: number;
   setConfigArchitectureReviewFrequency: (v: number) => void;
+  configStrategicMaxIntervalMinutes: number;
+  setConfigStrategicMaxIntervalMinutes: (v: number) => void;
   configMaxProvisionRetries: number;
   setConfigMaxProvisionRetries: (v: number) => void;
   configMaxRollupRetries: number;
@@ -47,6 +49,7 @@ export function AutonomousConfigSection({
   configResidualRemediationCooldownHours, setConfigResidualRemediationCooldownHours,
   configMaxActiveDirections, setConfigMaxActiveDirections,
   configArchitectureReviewFrequency, setConfigArchitectureReviewFrequency,
+  configStrategicMaxIntervalMinutes, setConfigStrategicMaxIntervalMinutes,
   configMaxProvisionRetries, setConfigMaxProvisionRetries,
   configMaxRollupRetries, setConfigMaxRollupRetries,
   configDriftOverClaimMinClaims, setConfigDriftOverClaimMinClaims,
@@ -258,6 +261,27 @@ export function AutonomousConfigSection({
             <button
               onClick={() => saveConfigField('architecture_review_frequency', configArchitectureReviewFrequency)}
               disabled={savingConfigField === 'architecture_review_frequency'}
+              className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
+              title="Save"
+            >
+              <Check className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {/* Strategic wall-clock backstop */}
+          <div className="flex items-center gap-2">
+            <label className="text-[11px] text-neutral-400 w-32 shrink-0" title="Force a strategic cycle if this many minutes have elapsed since the last one, regardless of research-spawn count. Prevents the strategic agent's steering frequency from collapsing when it narrows direction count. 0 = disabled.">Strategic max gap (min)</label>
+            <input
+              type="number"
+              min={0}
+              max={10080}
+              value={configStrategicMaxIntervalMinutes}
+              onChange={e => setConfigStrategicMaxIntervalMinutes(Number(e.target.value))}
+              className="flex-1 bg-neutral-900 border border-neutral-700 text-neutral-100 rounded px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+            <button
+              onClick={() => saveConfigField('strategic_max_interval_minutes', configStrategicMaxIntervalMinutes)}
+              disabled={savingConfigField === 'strategic_max_interval_minutes'}
               className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50 transition-colors shrink-0"
               title="Save"
             >

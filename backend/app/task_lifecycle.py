@@ -45,7 +45,11 @@ from app.shared_state import (
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project
 from app.payload_schemas import validate_internal_payload
-from app.review_pipeline import _spawn_pipeline_task, build_ci_failure_fix_prompt
+from app.review_pipeline import (
+    REVIEW_FIX_GOAL_PREAMBLE,
+    _spawn_pipeline_task,
+    build_ci_failure_fix_prompt,
+)
 from app.rollup_management import _check_and_trigger_rollup, _cleanup_branches
 from app.notification_dispatch import (
     is_residual_remediation_task,
@@ -3764,9 +3768,9 @@ async def _process_post_commit(
                             structured += "\n\nMinor issues:\n" + "\n".join(
                                 _fmt_issue(i) for i in minor
                             )
-                        fix_prompt_text = f"{disagreement_hint}A code review requested changes. Address the following issues:{structured}{ci_errors_text}"
+                        fix_prompt_text = f"{disagreement_hint}{REVIEW_FIX_GOAL_PREAMBLE}A code review flagged this PR. Issues to address:{structured}{ci_errors_text}"
                     else:
-                        fix_prompt_text = f"{disagreement_hint}A code review requested changes. Please address the following feedback:\n\n{feedback}{ci_errors_text}"
+                        fix_prompt_text = f"{disagreement_hint}{REVIEW_FIX_GOAL_PREAMBLE}A code review flagged this PR. Reviewer feedback:\n\n{feedback}{ci_errors_text}"
                     # First-pass minor-only verdict: when every blocking finding
                     # from the initial review is minor-severity, the spawned fix
                     # only addresses nits. Mark the fix so its completion handler
