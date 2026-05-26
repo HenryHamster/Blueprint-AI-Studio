@@ -247,6 +247,11 @@ function buildReviewVerdictInstructions(taskId: string): string {
 **REQUEST_CHANGES** — something actionable must change before this merges. Use this for any bug, missing test, broken invariant, merge conflict, failing CI signal, or behavior that would surprise a reader. If you are uncertain between APPROVE and REQUEST_CHANGES, pick REQUEST_CHANGES — another round is cheap; a missed regression is expensive.
 {"verdict": "REQUEST_CHANGES", "feedback": "What needs fixing and why it blocks merge.", "issues": [{"severity": "critical|major|minor", "description": "...", "file": "path/to/file.py", "line": 42}]}
 
+**Exhaustiveness — list every blocking change this PR needs, not just the most prominent one.** When you choose REQUEST_CHANGES, the \`issues\` array must enumerate every blocker you can identify in this pass. The fix agent will address each item; if you surface them one-per-iteration, the PR burns N review-fix cycles for what could have converged in one. Concretely:
+- Before finalizing your verdict, re-scan the diff and the touched call sites for additional blockers in adjacent files / sister call sites / invariants the touched functions used to enforce. A single conceptual change often spans multiple files — flag every place that needs to change, not just the first one you noticed.
+- If the cited issue is one instance of a pattern (e.g., a missing check at one call site), list every other call site that needs the same fix.
+- It is far better to over-list (the fix agent can dedupe) than to surface a new MAJOR each iteration. The goal is convergence, not paced disclosure.
+
 Do NOT emit "COMMENT", "NEUTRAL", "ADVISORY", or any other verdict — they are not accepted and will be normalized to REQUEST_CHANGES. There is no informational-only path: if the change is acceptable → APPROVE (put observations in \`feedback\`); if anything needs changing → REQUEST_CHANGES.
 
 For each issue in the \`issues\` array:

@@ -678,6 +678,8 @@ export function DirectionsPanel({ onClose, addToast, onViewFindings, onNavigateT
                 setConfigMaxActiveDirections={config.setConfigMaxActiveDirections}
                 configArchitectureReviewFrequency={config.configArchitectureReviewFrequency}
                 setConfigArchitectureReviewFrequency={config.setConfigArchitectureReviewFrequency}
+                configStrategicMaxIntervalMinutes={config.configStrategicMaxIntervalMinutes}
+                setConfigStrategicMaxIntervalMinutes={config.setConfigStrategicMaxIntervalMinutes}
                 configMaxProvisionRetries={config.configMaxProvisionRetries}
                 setConfigMaxProvisionRetries={config.setConfigMaxProvisionRetries}
                 configMaxRollupRetries={config.configMaxRollupRetries}

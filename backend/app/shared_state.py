@@ -377,6 +377,12 @@ runtime_config: Dict = {
     "direction_outcome_progress_stall_run": 6,
     "direction_outcome_progress_history_max": 20,
     "strategic_research_frequency": 6,  # Every Nth research cycle is a strategic vision review
+    # Wall-clock backstop for strategic cycles: if it has been this long since the
+    # last strategic_review/design_doc_update task was created (regardless of
+    # outcome), force a strategic spawn. Decouples steering frequency from research
+    # spawn rate so narrowing direction count does not throttle the agent's own
+    # decision cadence. 0 disables the fallback. Cooldown still gates duplicates.
+    "strategic_max_interval_minutes": 180,
     "architecture_review_frequency": 3,  # Every Nth strategic cycle includes architecture (design doc) review
     "max_active_directions": 10,
     "max_parallel_research_per_project": 6,
@@ -854,6 +860,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "strategic_research_frequency",
                         int(config_json["strategic_research_frequency"]),
+                    )
+                if "strategic_max_interval_minutes" in config_json:
+                    _set(
+                        "strategic_max_interval_minutes",
+                        int(config_json["strategic_max_interval_minutes"]),
                     )
                 if "require_approval_gates" in config_json:
                     _set(
