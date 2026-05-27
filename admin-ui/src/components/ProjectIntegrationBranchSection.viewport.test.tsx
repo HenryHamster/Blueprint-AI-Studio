@@ -102,4 +102,24 @@ describe('ProjectIntegrationBranchSection — viewport regression', () => {
       });
     }, { selector: 'button, a[href]' });
   });
+
+  test('renders LTS context without overflow at 375px when promotion target differs', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <ProjectIntegrationBranchSection
+            data={{ integration_branch: 'automain', is_default: false }}
+            canSave={true}
+            onSave={vi.fn(async () => {})}
+            relatedPromotionTarget="main"
+          />,
+        );
+      });
+    });
+  });
 });

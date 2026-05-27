@@ -850,6 +850,93 @@ async def test_agent_claim_project_metadata_empty_build_config(
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_injects_promotion_target_into_payloads(
+    client: AsyncClient, db_session
+):
+    """promotion_target/integration_branch from per-project config flow into
+    every payload entry the agent receives.
+
+    Agent code-change handlers read payload.promotion_target (not
+    project_metadata.promotion_target) to drive LTS-aware behavior. Without
+    this injection, a project with promotion_target='production' running on
+    base_branch='production' silently compares 'production' === 'main' and
+    skips baseline capture / the on-LTS test gate.
+    """
+    project = Project(
+        name="Non-Main Promotion Target",
+        user_id="test-user-123",
+        integration_branch="develop",
+        promotion_target="production",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "create", "prompt": "do something", "base_branch": "production"},
+            {"type": "noop"},
+        ],
+        vm_instance_id="agent-vm-promo-1",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-promo-1")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["project_metadata"]["promotion_target"] == "production"
+    assert data["project_metadata"]["integration_branch"] == "develop"
+
+    assert len(data["payloads"]) == 2
+    for entry in data["payloads"]:
+        assert entry["promotion_target"] == "production"
+        assert entry["integration_branch"] == "develop"
+
+    # task.payloads in the DB is NOT mutated — the injection is response-only.
+    await db_session.refresh(task)
+    for entry in task.payloads:
+        assert "promotion_target" not in entry
+        assert "integration_branch" not in entry
+
+
+@pytest.mark.asyncio
+async def test_agent_claim_preserves_payload_promotion_target_override(
+    client: AsyncClient, db_session
+):
+    """A payload that already specifies promotion_target is not overwritten."""
+    project = Project(
+        name="Override Promotion Target",
+        user_id="test-user-123",
+        promotion_target="production",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "promotion_target": "staging"}],
+        vm_instance_id="agent-vm-promo-2",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-promo-2")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["payloads"][0]["promotion_target"] == "staging"
+    assert data["project_metadata"]["promotion_target"] == "production"
+
+
+@pytest.mark.asyncio
 async def test_agent_status_already_completed_returns_200_idempotent(
     client: AsyncClient, db_session, mocker
 ):

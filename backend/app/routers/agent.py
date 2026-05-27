@@ -974,16 +974,41 @@ async def claim_task(
         for k, v in (task.context or {}).items()
         if not k.startswith("max_plan_") and not k.startswith("llm_")
     }
+    # Resolve per-project branch metadata once so we can inject it into both
+    # project_metadata and each payload entry the agent sees. Agent handlers
+    # (standard.ts, review-fix.ts, specialized.ts/migrate) read
+    # payload.promotion_target to drive LTS-aware behavior; without injection
+    # here they silently fall back to comparing base_branch to 'main' and get
+    # the wrong answer for any project whose promotion_target != 'main'.
+    project = await session.get(Project, task.project_id)
+    project_promotion_target = (
+        get_project_promotion_target(project) if project else None
+    )
+    project_integration_branch = (
+        get_project_integration_branch(project) if project else None
+    )
+
+    response_payloads: list = []
+    for entry in task.payloads or []:
+        if isinstance(entry, dict):
+            patched = dict(entry)
+            if project_promotion_target and not patched.get("promotion_target"):
+                patched["promotion_target"] = project_promotion_target
+            if project_integration_branch and not patched.get("integration_branch"):
+                patched["integration_branch"] = project_integration_branch
+            response_payloads.append(patched)
+        else:
+            response_payloads.append(entry)
+
     response = {
         "task_id": str(task.id),
         "title": task.title,
         "description": task.description,
-        "payloads": task.payloads,
+        "payloads": response_payloads,
         "context": safe_context,
     }
 
     # Add project metadata so agents can adapt to different project structures
-    project = await session.get(Project, task.project_id)
     if project:
         _build_cfg = project.build_config or {}
         response["project_metadata"] = {
@@ -996,8 +1021,8 @@ async def claim_task(
             "enable_parallel_review": _build_cfg.get("enable_parallel_review", False),
             "enable_parallel_fix": _build_cfg.get("enable_parallel_fix", False),
             "enable_self_improvement": project.enable_self_improvement,
-            "promotion_target": get_project_promotion_target(project),
-            "integration_branch": get_project_integration_branch(project),
+            "promotion_target": project_promotion_target,
+            "integration_branch": project_integration_branch,
         }
 
     task_type = task.first_payload.get("type", "")

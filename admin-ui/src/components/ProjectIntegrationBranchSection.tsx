@@ -9,11 +9,13 @@ interface ProjectIntegrationBranchSectionProps {
   data: IntegrationBranchData | null;
   canSave: boolean;
   onSave: (branch: string | null) => Promise<void>;
+  /** When provided and different from integration_branch, displays LTS workflow context. */
+  relatedPromotionTarget?: string;
 }
 
 const VALID_BRANCH_RE = /^[a-zA-Z0-9._/-]+$/;
 
-export function ProjectIntegrationBranchSection({ data, canSave, onSave }: ProjectIntegrationBranchSectionProps) {
+export function ProjectIntegrationBranchSection({ data, canSave, onSave, relatedPromotionTarget }: ProjectIntegrationBranchSectionProps) {
   const [branchInput, setBranchInput] = useState(data?.integration_branch ?? '');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -57,7 +59,7 @@ export function ProjectIntegrationBranchSection({ data, canSave, onSave }: Proje
       <div>
         <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Integration Branch</h3>
         <p className="text-[11px] text-neutral-600 mb-3">
-          The trunk branch autonomous tasks target for spawning and merging. Overrides the global default for this project.
+          The trunk branch autonomous tasks target for spawning and merging. Overrides the global default for this project. For LTS workflows, pair with a distinct Promotion Target.
         </p>
 
         <div className="space-y-3">
@@ -72,6 +74,16 @@ export function ProjectIntegrationBranchSection({ data, canSave, onSave }: Proje
               <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-cyan-950/40 text-cyan-400 border border-cyan-900/50 shrink-0">override</span>
             )}
           </div>
+
+          {relatedPromotionTarget && relatedPromotionTarget !== (data?.integration_branch ?? '') && (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-neutral-400 shrink-0 w-24">Promotion target</span>
+              <span className="font-mono text-xs text-neutral-300 bg-neutral-900 border border-neutral-800 rounded px-2 py-1 flex-1 truncate">
+                {relatedPromotionTarget}
+              </span>
+              <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-400 border border-amber-900/50 shrink-0">LTS</span>
+            </div>
+          )}
 
           <div>
             <label className="block text-xs text-neutral-400 mb-1">

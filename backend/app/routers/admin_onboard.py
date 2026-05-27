@@ -287,6 +287,9 @@ async def onboard_project(
         project.integration_branch = default_branch
         project.promotion_target = default_branch
 
+    if payload.promotion_target:
+        project.promotion_target = payload.promotion_target
+
     branch_whitelist: list[str] = []
     if default_branch:
         branch_whitelist.append(default_branch)
