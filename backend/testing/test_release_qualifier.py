@@ -3575,6 +3575,45 @@ class TestFinalizeInfraFailure:
         assert count == 0
 
     @pytest.mark.asyncio
+    async def test_audit_completed_empty_artifact_reclassified_as_infra_failure(
+        self, db_session
+    ):
+        """A COMPLETED audit task with an empty JSON artifact is infra_failure."""
+        project, version = await _make_project_and_version(db_session)
+        audit_task, _ = await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.COMPLETED,
+            smoke_status=TaskStatus.COMPLETED,
+            smoketest_enabled=True,
+        )
+        db_session.add(
+            Artifact(
+                task_id=audit_task.id,
+                artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+                logs="{}",
+            )
+        )
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_report_empty_dict"
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
     async def test_audit_completed_unparseable_artifact_reclassified_as_infra_failure(
         self, db_session
     ):
@@ -4146,6 +4185,242 @@ class TestFinalizeInfraFailure:
         dispatch_mock.assert_called_once()
         payload = dispatch_mock.call_args[0][2]
         assert payload["consecutive_infra_errors"] == 2
+
+    # -----------------------------------------------------------------------
+    # Malformed audit artifact shapes — each must produce either a real verdict
+    # OR an infra_failure; never both, never neither, never a silent clean score.
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_empty_dict_audit_report_routes_to_infra_failure(self, db_session):
+        """audit_report = {} (empty dict) must route to infra_failure.
+
+        Without the empty-dict guard _score_audit() returns (1.0, 1.0) with no
+        deductions applied — a silent clean score.  Verify infra_failure is
+        returned and no QualificationVerdict row is written."""
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={},
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "smoke-ok", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_report_empty_dict"
+
+        await db_session.refresh(version)
+        assert version.last_qualification["status"] == "infra_failure"
+        assert version.last_qualification["error"] == "audit_report_empty_dict"
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_findings_list_no_audit_score_field_reaches_verdict(self, db_session):
+        """audit_report = {"findings": []} with no audit_score field reaches a verdict.
+
+        An empty findings list with no self-reported score is a legitimately
+        clean audit — _audit_missing_reason returns "audit_score_null_no_findings"
+        which does NOT trigger infra_failure.  A QualificationVerdict row is
+        written and the audit sub-score is 1.0 (no deductions applied)."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={
+                # Deliberately omit "audit_score" — this is the variant under test.
+                "findings": [],
+                "test_erosion": {
+                    "deleted_test_files": [],
+                    "assertion_delta": 0,
+                    "test_count_delta": 0,
+                },
+            },
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "smoke-ok", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] != "infra_failure", (
+            f"empty-findings-no-score mis-routed as infra_failure: {result}"
+        )
+
+        await db_session.refresh(version)
+        qual = version.last_qualification
+        assert qual.get("audit_missing_reason") == "audit_score_null_no_findings"
+        assert qual["sub_scores"]["audit"] == 1.0
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 1, f"expected 1 QualificationVerdict row, got {count}"
+
+    @pytest.mark.asyncio
+    async def test_findings_entries_no_severity_routes_to_infra_failure(
+        self, db_session
+    ):
+        """audit_report with findings that have no severity/level field → infra_failure.
+
+        A single finding dict missing severity/level is "parseable_but_unscoreable" —
+        the agent produced structured output but _score_audit() cannot apply any
+        deduction.  No QualificationVerdict row is written."""
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={
+                "findings": [{"description": "finding with no severity field"}],
+                "test_erosion": {"deleted_test_files": [], "assertion_delta": 0},
+            },
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "smoke-ok", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_report_parseable_but_unscoreable"
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_issues_key_equivalent_to_findings_reaches_verdict(self, db_session):
+        """audit_report with "issues" key (not "findings") reaches a real verdict.
+
+        The "issues" fallback is recognized by _score_audit and _audit_missing_reason.
+        A low-severity finding applies a deduction so audit_score < 1.0 (not a
+        silent clean score).  A QualificationVerdict row is written."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={
+                "issues": [{"severity": "low", "description": "minor style nit"}],
+                "test_erosion": {
+                    "deleted_test_files": [],
+                    "assertion_delta": 0,
+                    "test_count_delta": 0,
+                },
+            },
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "smoke-ok", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] != "infra_failure", (
+            f"issues-key audit incorrectly routed as infra_failure: {result}"
+        )
+
+        await db_session.refresh(version)
+        qual = version.last_qualification
+        # Low-severity finding deducts 0.02 → audit score 0.98 < 1.0.
+        assert qual["sub_scores"]["audit"] < 1.0, (
+            f"expected deduction from low-severity finding, "
+            f"got {qual['sub_scores']['audit']}"
+        )
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 1, f"expected 1 QualificationVerdict row, got {count}"
+
+    @pytest.mark.asyncio
+    async def test_findings_wrong_type_routes_to_infra_failure(self, db_session):
+        """audit_report = {"findings": "not-a-list"} routes to infra_failure.
+
+        A "findings" key whose value is not a list causes _score_audit() to fall
+        through to the "issues" fallback (also absent here), yielding a silent
+        clean 1.0 without the wrong-type guard.  Verify infra_failure is returned
+        and no QualificationVerdict row is written."""
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={
+                "findings": "not-a-list",
+                "test_erosion": {"deleted_test_files": [], "assertion_delta": 0},
+            },
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "smoke-ok", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_report_findings_wrong_type"
+
+        await db_session.refresh(version)
+        assert version.last_qualification["status"] == "infra_failure"
+        assert version.last_qualification["error"] == "audit_report_findings_wrong_type"
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
 
 
 # ===========================================================================

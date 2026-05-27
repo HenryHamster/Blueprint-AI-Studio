@@ -15,6 +15,7 @@ interface SearchFilterBarProps {
   onDateRangeChange: (range: DateRange) => void;
   blockedFilter: boolean;
   onBlockedFilterChange: (v: boolean) => void;
+  onDownloadCsv: () => void;
   inputRef?: RefObject<HTMLInputElement | null>;
 }
 
@@ -173,7 +174,7 @@ const DATE_RANGE_OPTIONS: { label: string; value: DateRange }[] = [
 
 const DATE_RANGE_SELECT_OPTIONS: { label: string; value: string }[] = DATE_RANGE_OPTIONS.map(o => ({ label: o.label, value: o.value }));
 
-export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, dateRange, onDateRangeChange, blockedFilter, onBlockedFilterChange, inputRef }: SearchFilterBarProps) {
+export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, dateRange, onDateRangeChange, blockedFilter, onBlockedFilterChange, onDownloadCsv, inputRef }: SearchFilterBarProps) {
   const [inputValue, setInputValue] = useState(searchQuery);
   const typeOptions = FILTER_TASK_TYPE_OPTIONS;
   useEffect(() => {
@@ -241,6 +242,14 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
       >
         <GitFork className="w-3 h-3" />
         <span>Blocked</span>
+      </button>
+
+      <button
+        onClick={onDownloadCsv}
+        title="Download CSV"
+        className="px-3 py-1.5 min-h-11 rounded-full text-xs font-medium border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300 transition-colors"
+      >
+        CSV
       </button>
 
       {hasActiveFilters && (

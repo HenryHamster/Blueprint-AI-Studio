@@ -590,6 +590,7 @@ async def test_ensure_initial_release_version_creates_stabilize_version(db_sessi
         project.id,
         integration_branch="automain",
         base_sha="deadbeef",
+        promotion_target="main",
     )
     await db_session.commit()
     await db_session.refresh(version)
@@ -611,6 +612,7 @@ async def test_ensure_initial_release_version_snapshots_goal(db_session):
         integration_branch="automain",
         base_sha="deadbeef",
         goal="Bootstrap the LTS release line",
+        promotion_target="main",
     )
     await db_session.commit()
     await db_session.refresh(version)
@@ -628,6 +630,7 @@ async def test_ensure_initial_release_version_noop_when_main_branch(db_session):
         project.id,
         integration_branch="main",
         base_sha="abc123",
+        promotion_target="main",
     )
     await db_session.commit()
 
@@ -647,6 +650,7 @@ async def test_ensure_initial_release_version_idempotent_open_exists(db_session)
         project.id,
         integration_branch="automain",
         base_sha="sha2",
+        promotion_target="main",
     )
     assert result is None
 
@@ -677,9 +681,23 @@ async def test_ensure_initial_release_version_noop_when_history_exists(db_sessio
         project.id,
         integration_branch="automain",
         base_sha="newsha",
+        promotion_target="main",
     )
     assert result is None
     assert await rv.current_open_version(db_session, project.id) is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_initial_release_version_requires_promotion_target(db_session):
+    """Omitting promotion_target raises TypeError — it is a required keyword arg."""
+    project = await _make_project(db_session)
+    with pytest.raises(TypeError):
+        await rv.ensure_initial_release_version(
+            db_session,
+            project.id,
+            integration_branch="automain",
+            base_sha="abc123",
+        )
 
 
 @pytest.mark.asyncio

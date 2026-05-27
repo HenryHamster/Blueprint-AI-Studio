@@ -1613,7 +1613,7 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
     owner,
     repo,
     existingPrNumber: prNumber,
-    testsOnMainBranch: baseBranch === (promotionTarget ?? 'main'),
+    testsOnMainBranch: baseBranch === (promotionTarget ?? resolveBaseBranch({}, task)),
     baseCommit: fixBaseCommit,
     model,
     effort,

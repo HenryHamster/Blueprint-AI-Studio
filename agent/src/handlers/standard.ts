@@ -879,7 +879,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const isAutoRemediation = Boolean(
     (task.context as Record<string, unknown> | undefined)?.auto_remediation
   );
-  if (captureBaseline && runTestFix && baseBranch === (promotionTarget ?? 'main') && !isAutoRemediation) {
+  if (captureBaseline && runTestFix && baseBranch === (promotionTarget ?? resolveBaseBranch({}, task)) && !isAutoRemediation) {
     const relatedFiles = (
       (payload.related_files as string[] | undefined) ||
       ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
@@ -1075,7 +1075,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     baseBranch,
     owner,
     repo,
-    testsOnMainBranch: baseBranch === (promotionTarget ?? 'main'),
+    testsOnMainBranch: baseBranch === (promotionTarget ?? resolveBaseBranch({}, task)),
     baseCommit,
     model,
     effort,

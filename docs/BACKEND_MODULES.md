@@ -532,6 +532,254 @@ Admin UI endpoints (all require `ADMIN_API_KEY` or Firebase admin token).
 
 ---
 
+## Supporting & Integration Modules
+
+### CI/PR Integration
+
+#### `ci_completion.py`
+
+Processes CI check results for tasks. Handles merge decisions based on CI status.
+
+**Concepts:**
+- **Merge gate** — Requires both CI passing (`ci_passed: True`) AND review approval (`review_approved: True`)
+- **PR parking** — Task waits for CI before attempting merge
+- Handles edge cases: merge conflicts, race conditions, stale checks
+
+**Key functions:**
+- `handle_ci_completion()` — Process CI result webhook/poll
+- `_pr_number_match()` — Query payload by PR number (dialect-aware for Postgres/SQLite)
+
+---
+
+#### `ci_resolution.py`
+
+Detects and classifies CI failures; spawns fix tasks for analysis and remediation.
+
+---
+
+#### `auto_remediation.py`
+
+Detects failed checks on protected branches (main/master) and spawns fix tasks automatically.
+
+**Protections:**
+- Rate limiting — prevents spam
+- Duplicate detection — avoids re-spawning for same failure
+- Concurrency limits — caps fix-task spawning per project
+- Suspension mechanism — temporarily halts remediation after repeated failures (exponential backoff)
+
+**Key constants:**
+- `SUSPENSION_BASE_COOLDOWN_HOURS` = 24 (initial; doubles per retry)
+- `MAX_AUTO_RECOVERY_ATTEMPTS` = 3
+
+---
+
+### Issue Management
+
+#### `issue_implementation.py`
+
+GitHub issue integration: when an issue receives a trigger label (default: `auto:implement`), spawns a create task.
+
+**Features:**
+- Fetches issue context and comments
+- Creates implementation task from issue body
+- Posts status comment on issue
+- Guard rails: rate limit, duplicate detection, concurrent-task limit
+
+---
+
+## Advanced Modules
+
+### Release Qualification & Promotion
+
+#### `release_qualifier.py`
+
+Audit-driven release readiness assessment.
+
+**Workflow:**
+1. Evaluate code quality, test coverage, CI health
+2. Score sub-categories (infra, audit, readiness)
+3. Compute promotion score (0–1 range)
+4. Decide: promote, hold, or remediate
+
+**Key functions:**
+- `run_qualification()` — Score entire release
+- Score uses sub-modules: `release_qualifier_infra.py`, `release_qualifier_readiness.py`, etc.
+
+#### `release_promotion.py`
+
+Executes promotion after qualification passes.
+
+---
+
+#### `release_scoring.py`
+
+Computes readiness scores from test results, metrics, and heuristics.
+
+---
+
+### Failure & Anomaly Detection
+
+#### `failure_classification.py`
+
+Categorizes task failures: `network_error`, `timeout`, `resource_exhaustion`, `user_error`, etc.
+
+Used by orchestrator to decide: retry, halt, or escalate.
+
+---
+
+#### `anomaly_detection.py`
+
+Detects anomalous task behavior (hangs, resource spikes, unusual latencies).
+
+---
+
+### GitHub Integration
+
+#### `github.py`
+
+GitHub API client (async, with caching and retry logic).
+
+**Functions:**
+- `get_pull_request()`, `create_pull_request()`, `get_check_runs()`
+- `get_repo_installation_token()` — OAuth token for repo access
+- `is_ancestor_of()` — Git ancestry check (via API)
+- Caching: `@cache_for_minutes()` decorator (configurable TTL)
+
+**Token management:**
+- Refreshes tokens before expiry
+- Caches token per repo to minimize API calls
+
+---
+
+#### `notification_dispatch.py`
+
+Posts status updates, notifications, and diagnostic messages to GitHub.
+
+**Notification types:**
+- `post_auto_fix_spawned_message()` — Notify PR on auto-remediation
+- `post_issue_implementation_spawned_message()` — Notify issue on auto-implement
+- `post_failure_message()` — Diagnostic failure details
+- Batches notifications to avoid spam
+
+---
+
+### Autonomy & Strategic Mode
+
+#### `autonomous_research.py`
+
+Spawns research tasks from strategic directions without manual intervention.
+
+**Workflow:**
+1. Load active directions from project config
+2. For each direction: spawn research task
+3. Collect findings → feed into strategic cycle
+4. Deduplication: avoids re-proposing completed work
+
+**Functions:**
+- `autonomous_research_worker()` — Main background loop
+- `_select_eligible_direction()` — Ranking & conflict-free selection
+- `_spawn_research_task()` — Create task from direction
+
+---
+
+#### `strategic_spawning.py`
+
+Generates strategic directions based on findings and heuristics.
+
+**Inputs:**
+- Research findings
+- Codebase health metrics
+- PR review history
+
+**Outputs:**
+- New Direction objects with recommended actions
+
+---
+
+#### `strategic_completion.py`
+
+Handles completion of strategic-mode tasks (design doc updates, reviews, etc.).
+
+---
+
+### Telemetry & Analytics
+
+#### `telemetry.py`
+
+Collects execution metrics from agent heartbeats.
+
+**Metrics:**
+- Token usage
+- Time per phase (planning, coding, review)
+- Tool invocations
+- Error types and frequencies
+
+Used for cost reporting and performance analysis.
+
+---
+
+#### `digest_metrics.py`
+
+Aggregates metrics over time windows (daily, weekly) for reporting.
+
+---
+
+### State & Storage
+
+#### `shared_state.py`
+
+Holds mutable state shared across background workers (e.g., circuit breaker status, deployment state).
+
+**Pattern:**
+- Redis-backed for distributed workers
+- Falls back to in-memory dict in local mode
+- Key-value store with TTL
+
+---
+
+#### `state_persistence.py`
+
+Persists orchestrator state to database for crash recovery.
+
+---
+
+#### `storage.py`
+
+Cloud Storage client for artifacts (logs, reports, JSON payloads).
+
+---
+
+### Utility Modules
+
+#### `time_utils.py`
+
+Timezone-safe datetime utilities:
+- `_utcnow()` — Current UTC time (naive, without tzinfo)
+- `_naive_from_iso()` — Parse ISO string to naive UTC
+- Prevents timezone mismatches between DB and Python
+
+---
+
+#### `url_security.py`
+
+Validates URLs for safety (prevents SSRF, open redirects).
+
+---
+
+#### `secrets_manager.py`
+
+Encrypts/decrypts sensitive config (API keys, tokens) at rest in database.
+
+---
+
+#### `payload_schemas.py`
+
+Defines task-specific payload schemas and validation logic.
+
+Used by orchestrator to validate incoming task payloads before queueing.
+
+---
+
 ## Testing Patterns
 
 ### `testing/conftest.py`

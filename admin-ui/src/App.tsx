@@ -28,6 +28,7 @@ import { DashboardHome } from './components/DashboardHome';
 import { BulkActionBar } from './components/BulkActionBar';
 import { KanbanBoard } from './components/KanbanBoard';
 import type { KanbanColumn, SortBy } from './components/KanbanBoard';
+import { downloadTaskCsv, orderTasksForKanbanExport } from './utils/taskCsv';
 import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
 import { UserManagement } from './components/UserManagement';
@@ -367,6 +368,17 @@ export default function App() {
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.blockedFilter, s.requiresApproval, s.stuckFilter, s.stuckMinSeconds, stuckTaskIds]);
+
+  const orderedExportTasks = useMemo(() => {
+    if (s.viewMode !== 'kanban') return filteredTasks;
+    if (visibleColumns.length === 0) return filteredTasks;
+    return orderTasksForKanbanExport(filteredTasks, visibleColumns, sortBy);
+  }, [filteredTasks, visibleColumns, s.viewMode, sortBy]);
+
+  const handleDownloadTasksCsv = useCallback(() => {
+    const projectName = selectedProject?.name ?? selectedProject?.github_repo ?? (s.selectedProjectId ?? 'all-projects');
+    downloadTaskCsv(orderedExportTasks, projectName);
+  }, [orderedExportTasks, selectedProject?.github_repo, selectedProject?.name, s.selectedProjectId]);
 
   const hasActiveFilters = s.tasks.length > 0 && filteredTasks.length < s.tasks.length;
 
@@ -765,6 +777,7 @@ export default function App() {
               onDateRangeChange={s.setDateRange}
               blockedFilter={s.blockedFilter}
               onBlockedFilterChange={s.setBlockedFilter}
+              onDownloadCsv={handleDownloadTasksCsv}
               inputRef={searchInputRef}
             />
             {s.viewMode === 'kanban' && (

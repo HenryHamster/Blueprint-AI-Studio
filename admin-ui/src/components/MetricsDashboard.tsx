@@ -1,5 +1,6 @@
 import { useMemo, useState, useEffect } from 'react';
 import { parseTimestamp } from '../utils/time';
+import { downloadText, escapeCsv } from '../utils/taskCsv';
 import type { Task } from './TaskCard';
 import { apiFetch } from '../api';
 import {
@@ -60,21 +61,6 @@ function formatTime(ts: number, windowMs?: number): string {
     return `${month}/${day} ${time}`;
   }
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-function escapeCsv(value: string | number): string {
-  const text = String(value);
-  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-}
-
-function downloadText(filename: string, mimeType: string, text: string) {
-  const blob = new Blob([text], { type: mimeType });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
 }
 
 function NoDataMessage() {

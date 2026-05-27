@@ -249,6 +249,22 @@ async def _finalize_qualification(
         return await rq._handle_infra_failure(
             session, version, qual, "audit_report_parseable_but_unscoreable"
         )
+    # An empty artifact dict has no scoring signal at all — _score_audit()
+    # returns a silent clean 1.0 because no deductions ever apply.
+    if isinstance(audit_report, dict) and not audit_report:
+        return await rq._handle_infra_failure(
+            session, version, qual, "audit_report_empty_dict"
+        )
+    # A "findings" key whose value is not a list is a malformed artifact shape.
+    # _score_audit() falls through to the "issues" fallback; if that is also
+    # absent or not a list, derived=1.0 with no deductions — treat as infra_failure.
+    if isinstance(audit_report, dict):
+        _findings_raw = audit_report.get("findings")
+        if _findings_raw is not None and not isinstance(_findings_raw, list):
+            if not isinstance(audit_report.get("issues"), list):
+                return await rq._handle_infra_failure(
+                    session, version, qual, "audit_report_findings_wrong_type"
+                )
 
     # --- Read the smoketest result -----------------------------------------
     # Audit H3: only when the smoketest subsystem was enabled — a disabled run

@@ -18,7 +18,8 @@ Public API:
   ensure_initial_release_version(session, project_id, *, integration_branch, base_sha, goal, promotion_target)
       Bootstrap version 1 in the ``stabilize`` phase when no version row
       exists for the project and the integration branch differs from the
-      promotion target (default "main").
+      promotion target.  ``promotion_target`` is required — callers must
+      resolve the project's configured deploy branch explicitly.
       Idempotent: no-op if any version row already exists.  Caller must commit.
 
   count_merged_since(session, project_id, since)
@@ -154,7 +155,7 @@ async def ensure_initial_release_version(
     integration_branch: str,
     base_sha: str | None = None,
     goal: str | None = None,
-    promotion_target: str = "main",
+    promotion_target: str,
 ) -> ReleaseVersion | None:
     """Bootstrap version 1 when no ReleaseVersion row exists for the project.
 
@@ -170,9 +171,10 @@ async def ensure_initial_release_version(
     - Any ``ReleaseVersion`` row already exists — the lifecycle has already
       started (either open, or previously promoted / abandoned).
 
-    ``promotion_target`` is the configured deploy/LTS branch (default ``"main"``).
-    Callers should pass the project's resolved promotion target so the degenerate
-    check is correct for repos whose deploy branch is not literally ``"main"``.
+    ``promotion_target`` is the configured deploy/LTS branch (required — no
+    default).  Callers must resolve the project's promotion target explicitly
+    so the degenerate check is correct for repos whose deploy branch is not
+    literally ``"main"``.
 
     ``goal`` snapshots ``ProblemModel.intent.current_focus`` onto the new
     version (see :func:`open_version`).

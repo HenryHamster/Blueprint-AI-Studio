@@ -302,6 +302,22 @@ describe('handleCreate configuration', () => {
     const opts = capturedOpts();
     expect(opts.testsOnMainBranch).toBe(true);
   });
+
+  it('sets testsOnMainBranch=true via integration_branch cascade when promotion_target absent and baseBranch=master', async () => {
+    const task = { title: 'Task', description: '', project_metadata: { integration_branch: 'master' } };
+    await handleCreate(TASK_ID, { prompt: 'Do something', base_branch: 'master' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const opts = capturedOpts();
+    expect(opts.baseBranch).toBe('master');
+    expect(opts.testsOnMainBranch).toBe(true);
+  });
+
+  it('sets testsOnMainBranch=false when baseBranch does not match integration_branch', async () => {
+    const task = { title: 'Task', description: '', project_metadata: { integration_branch: 'master' } };
+    await handleCreate(TASK_ID, { prompt: 'Do something', base_branch: 'feature/x' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const opts = capturedOpts();
+    expect(opts.baseBranch).toBe('feature/x');
+    expect(opts.testsOnMainBranch).toBe(false);
+  });
 });
 
 describe('handleRefactor configuration', () => {

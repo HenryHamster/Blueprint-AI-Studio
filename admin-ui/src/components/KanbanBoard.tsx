@@ -12,7 +12,7 @@ import type { DragEndEvent, DragStartEvent } from '@dnd-kit/core';
 import { arrayMove, SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { TASK_TYPE_STYLES } from './TaskCard';
 import type { Task, TaskStatus } from './TaskCard';
-import { parseTimestamp } from '../utils/time';
+import { sortTasks, type TaskSortBy } from '../utils/taskCsv';
 import type { Project } from './ProjectDashboard';
 import {
   KanbanColumn as KanbanColumnComponent,
@@ -21,7 +21,7 @@ import {
   ColumnSelectCheckbox,
 } from './KanbanColumn';
 
-export type SortBy = 'newest' | 'oldest' | 'type' | 'title' | 'duration' | 'attempts';
+export type SortBy = TaskSortBy;
 
 const COLLAPSED_COLUMNS_KEY = 'kanban_collapsed_columns';
 
@@ -51,29 +51,6 @@ const SORT_LABELS: Record<SortBy, string> = {
   duration: 'Longest running',
   attempts: 'Most retried',
 };
-
-function sortTasks(tasks: Task[], sortBy: SortBy): Task[] {
-  return [...tasks].sort((a, b) => {
-    switch (sortBy) {
-      case 'newest':
-        return parseTimestamp(b.created_at).getTime() - parseTimestamp(a.created_at).getTime();
-      case 'oldest':
-        return parseTimestamp(a.created_at).getTime() - parseTimestamp(b.created_at).getTime();
-      case 'type':
-        return (a.task_type ?? '').localeCompare(b.task_type ?? '');
-      case 'title':
-        return (a.title ?? '').localeCompare(b.title ?? '');
-      case 'duration': {
-        const now = Date.now();
-        const aDur = now - parseTimestamp(a.started_at ?? a.created_at).getTime();
-        const bDur = now - parseTimestamp(b.started_at ?? b.created_at).getTime();
-        return bDur - aDur;
-      }
-      case 'attempts':
-        return (b.attempt_count ?? 0) - (a.attempt_count ?? 0);
-    }
-  });
-}
 
 interface KanbanBoardProps {
   tasks: Task[];
