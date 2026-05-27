@@ -29,11 +29,9 @@ def _derive_task_branch_namespace(github_repo: str) -> str:
 
     Lowercases, replaces non-alphanumeric characters with '-', strips
     leading/trailing dashes, and caps at 40 characters.  The Blueprint
-    self-repo ('BlueprintAIStudio') maps to 'blueprint' to preserve existing
-    branch conventions.
+    self-repo maps to 'blueprint' via the is_self_repo flag at the DB layer;
+    this function slugifies all repo names uniformly.
     """
-    if github_repo.lower() == "blueprintaistudio":
-        return "blueprint"
     slug = re.sub(r"[^a-z0-9]+", "-", github_repo.lower()).strip("-")
     return slug[:40] if slug else "blueprint"
 

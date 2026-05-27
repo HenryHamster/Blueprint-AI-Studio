@@ -615,10 +615,10 @@ class TestOnboardTaskBranchNamespace:
         assert ns == "myawesome-repo-v2"
 
     @pytest.mark.asyncio
-    async def test_self_repo_gets_blueprint_namespace(
+    async def test_blueprintaistudio_repo_slugifies_normally(
         self, client: AsyncClient, db_session
     ):
-        """The Blueprint self-repo (BlueprintAIStudio) maps to 'blueprint' namespace."""
+        """A repo named 'BlueprintAIStudio' that is not the self-repo gets a slugified namespace."""
         with (
             patch(
                 "app.routers.admin_onboard._detect_build_config",
@@ -645,7 +645,9 @@ class TestOnboardTaskBranchNamespace:
             )
         assert resp.status_code == 200
         project = await db_session.get(Project, resp.json()["project_id"])
-        assert (project.build_config or {}).get("task_branch_namespace") == "blueprint"
+        assert (project.build_config or {}).get(
+            "task_branch_namespace"
+        ) == "blueprintaistudio"
 
     @pytest.mark.asyncio
     async def test_build_config_override_wins(self, client: AsyncClient, db_session):

@@ -1,31 +1,30 @@
-"""``main → automain`` back-merge — keep the integration trunk in sync with ``main``.
+"""Periodic back-merge of the LTS branch into the integration trunk.
 
-Phase 5 of the automain LTS design (docs/plans/automain-lts-plan-v1.md), since
-generalised so the back-merge runs for ANY advance of ``main``, not only
-hotfixes.
+Ensures the integration trunk stays in sync with the LTS branch. In Blueprint's
+case, this is a ``main → automain`` back-merge; in other repos with different
+branch configuration, the back-merge adapts to the configured ``promotion_target``
+and ``integration_branch`` names.
 
-``main`` is the human-grade LTS branch; ``automain`` is the pipeline's
-integration trunk.  ``main`` advances two ways the integration trunk does not
-automatically pick up:
+The integration trunk and LTS branch can diverge when:
 
-  * a **hotfix** — an expedited fix branched off ``main`` that merges straight
-    to ``main`` so ``deploy.yml`` fires (the post-rollup-merge handler in
-    task_lifecycle.py calls :func:`open_backmerge_pr` once per hotfix);
-  * a **direct push** to ``main`` — a human landing a fix straight on the LTS
-    branch, which carries no task and no ``hotfix:true`` marker at all.
+  * a **hotfix** — an expedited fix branched off the LTS branch that merges
+    straight back (the post-rollup-merge handler in task_lifecycle.py calls
+    :func:`open_backmerge_pr` once per hotfix);
+  * a **direct push** to the LTS branch — a human landing a fix straight on the
+    LTS branch, which carries no task and no ``hotfix:true`` marker.
 
-Either way ``main`` diverges past ``automain``.  A missed back-merge makes the
-next ``automain → main`` promotion conflict — so every advance of ``main`` MUST
-be followed by a ``main → automain`` back-merge.
+Either way, the branches diverge. A missed back-merge makes the next
+promotion from integration trunk to LTS conflict — so every advance of the LTS
+branch MUST be followed by a back-merge into the integration trunk.
 
 Two entry points:
 
-  * :func:`open_backmerge_pr` — opens + merges one ``main → automain`` PR.  The
-    exact inverse of ``release_qualifier.promote()``.  Called once by the
+  * :func:`open_backmerge_pr` — opens + merges one back-merge PR. The exact
+    inverse of ``release_qualifier.promote()``. Called once by the
     hotfix-merge handler (``periodic=False``).
-  * :func:`reconcile_main_into_automain` — the periodic reconciler.  Runs every
+  * :func:`reconcile_main_into_automain` — the periodic reconciler. Runs every
     scheduler cycle and catches whatever the hotfix trigger missed — most
-    importantly direct pushes, which have no marker to trigger on.  Delegates
+    importantly direct pushes, which have no marker to trigger on. Delegates
     to :func:`open_backmerge_pr` with ``periodic=True``.
 
 It deliberately reuses ``promote``'s structure and the same GitHub helpers
@@ -34,7 +33,7 @@ It deliberately reuses ``promote``'s structure and the same GitHub helpers
 
 Failure philosophy (design doc §6 gotcha 6 — "the back-merge conflict-alert is
 mandatory, not optional"): a back-merge that does not complete must never pass
-silently.  The behaviour differs by caller:
+silently. The behaviour differs by caller:
 
   * ``periodic=False`` (a one-shot hotfix back-merge) — every non-merge raises
     an Alert; the operator must see a stuck one-shot back-merge.
@@ -42,7 +41,7 @@ silently.  The behaviour differs by caller:
     deduped, never suppressed: a blocked back-merge raises exactly one
     unresolved Alert per project (the first stuck cycle escalates; later cycles
     stay quiet until it is dismissed), and a genuine conflict's Alert +
-    resolution plan are likewise deduped project-wide.  So a persistent failure
+    resolution plan are likewise deduped project-wide. So a persistent failure
     surfaces once — not never, and not every cycle.
 
 ``open_backmerge_pr`` is idempotent: ``github.create_pull_request`` returns the
@@ -114,26 +113,25 @@ async def reconcile_main_into_automain(
     session: AsyncSession,
     project_id: uuid.UUID,
 ) -> dict[str, Any]:
-    """Periodically back-merge ``main`` into ``automain`` — the catch-all sync.
+    """Periodically back-merge the LTS branch into the integration trunk.
 
     The hotfix-triggered back-merge (:func:`open_backmerge_pr` from the
-    post-rollup-merge handler) only fires for tasks marked ``hotfix:true``.  A
-    *direct push* to ``main`` — a human landing a fix straight on the LTS
+    post-rollup-merge handler) only fires for tasks marked ``hotfix:true``. A
+    *direct push* to the LTS branch — a human landing a fix straight on the LTS
     branch — carries no such marker, so nothing back-merges it and the branches
-    silently diverge until the next ``automain → main`` promotion conflicts.
-    This reconciler closes that gap: it runs every scheduler cycle regardless
-    of HOW ``main`` advanced.
+    silently diverge until the next promotion conflicts. This reconciler closes
+    that gap: it runs every scheduler cycle regardless of HOW the LTS branch
+    advanced.
 
-    No-op unless ``integration_branch == "automain"`` — when the pipeline still
-    builds on ``main`` there is no separate trunk to reconcile (and a
-    ``main → main`` PR would be nonsense).
+    No-op when ``integration_branch == promotion_target`` (LTS model is inactive).
+    When these branches are the same, there is no separate trunk to reconcile.
 
     Delegates to :func:`open_backmerge_pr` with ``periodic=True``: a back-merge
     merely waiting on CI is logged and retried next cycle rather than raising
     an Alert every cycle; a genuine conflict still raises one Alert and spawns
     one resolution plan (deduped project-wide).
 
-    The caller commits the session.  Returns a status dict — ``open_backmerge_pr``'s
+    The caller commits the session. Returns a status dict — ``open_backmerge_pr``'s
     result, or ``{"status": "skipped", "reason": "lts_inactive"}`` when the LTS
     branch model is not active.
     """
@@ -154,32 +152,30 @@ async def open_backmerge_pr(
     hotfix_task_id: uuid.UUID | str | None = None,
     periodic: bool = False,
 ) -> dict[str, Any]:
-    """Open and merge a ``main → automain`` back-merge PR.
+    """Open and merge a back-merge PR from the LTS branch into the integration trunk.
 
-    The inverse of ``release_qualifier.promote()``.  Steps:
+    The inverse of ``release_qualifier.promote()``. Steps:
 
       1. Load the project; resolve ``(token, owner, repo)``.
-      2. ``create_pull_request`` ``main → automain``.  Idempotent — on a 422
-         "already exists" ``create_pull_request`` returns the existing open PR,
-         so a repeated (periodic) call reuses the in-flight PR.
-      3. If the PR result has ``empty_diff`` truthy (``main == automain`` —
-         nothing to back-merge), return ``{"status": "noop_empty_diff"}``.
-      4. ``merge_pull_request`` with ``merge_method="merge"`` (preserve the
-         ``main`` commit history on ``automain``).
+      2. ``create_pull_request`` from promotion_target to integration_branch.
+         Idempotent — on a 422 "already exists" ``create_pull_request`` returns
+         the existing open PR, so a repeated (periodic) call reuses the in-flight PR.
+      3. If the PR result has ``empty_diff`` truthy (no differences to back-merge),
+         return ``{"status": "noop_empty_diff"}``.
+      4. ``merge_pull_request`` with ``merge_method="merge"`` (preserve commit history).
       5. On ``merged`` truthy, return ``{"status": "merged", "pr_url": ...}``.
       6. On ``conflict`` (a 409), raise an ``Alert`` AND spawn a high-priority
-         ``refactor`` task instructing a ``git merge origin/main`` conflict
-         resolution against ``automain``; return ``{"status": "conflict"}``.
-         The resolver task does NOT carry ``hotfix:true``.  Alert + resolver
+         ``create`` task instructing conflict resolution; return ``{"status": "conflict"}``.
+         The resolver task does NOT carry ``hotfix:true``. Alert + resolver
          are deduped project-wide — only one resolution is ever needed at a
-         time.  The resolver is a single direct task (not a plan/decomposer)
+         time. The resolver is a single direct task (not a plan/decomposer)
          so the resolution guardrails reach the executing agent verbatim.
       7. On any other non-merge (a 405) or any exception, raise an ``Alert``
          (``periodic=False``) — a one-shot back-merge that fails must never
          pass silently — and return ``{"status": "blocked"}``.
 
     ``periodic`` — set ``True`` by :func:`reconcile_main_into_automain`, which
-    calls this every scheduler cycle.  A periodic caller dedups its alerting so
+    calls this every scheduler cycle. A periodic caller dedups its alerting so
     it neither storms (an Alert every cycle) nor goes silent: a blocked
     non-merge (step 7) raises one unresolved Alert per project until dismissed,
     and the conflict path (step 6) raises one Alert + one resolver task, both
@@ -187,10 +183,10 @@ async def open_backmerge_pr(
 
     ``merged_pr_url`` / ``hotfix_task_id`` describe the hotfix that triggered
     this back-merge, when there was one; the periodic reconciler passes
-    neither.  They are recorded in the PR body, the Alert message, and the
+    neither. They are recorded in the PR body, the Alert message, and the
     resolver task's context for traceability.
 
-    The caller commits the session.  Returns a status dict.
+    The caller commits the session. Returns a status dict.
     """
     hotfix_task_id_str = str(hotfix_task_id) if hotfix_task_id is not None else None
     trigger_desc = _describe_trigger(merged_pr_url, hotfix_task_id_str)

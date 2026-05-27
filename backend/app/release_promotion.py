@@ -60,9 +60,7 @@ def _lts_branch_names(project=None) -> tuple[str, str]:
     promotion_target   — the LTS/deploy branch promotions land on (default "main").
     LTS model is considered active when these two differ.
 
-    Both values resolve per-project when possible, then fall back to
-    runtime_config, then to "main" so a NULL per-project column with no global
-    override resolves identically regardless of which branch is taken.
+    Both values resolve per-project when available, otherwise fall back to "main".
     """
     return (
         _get_project_integration_branch(project),

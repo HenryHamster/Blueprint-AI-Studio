@@ -875,7 +875,7 @@ async def backfill_task_branch_namespace(session, project_id=None) -> dict:
             continue
 
         github_repo = getattr(project, "github_repo", "") or ""
-        if project.is_self_repo or github_repo.lower() == "blueprintaistudio":
+        if project.is_self_repo:
             namespace = "blueprint"
         else:
             slug = _re.sub(r"[^a-z0-9]+", "-", github_repo.lower()).strip("-")

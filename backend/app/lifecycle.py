@@ -669,15 +669,12 @@ async def lifespan(app):
 
     # Start the Branch Reconciliation service — keeps automain in sync with main.
     async def _branch_reconciliation_service():
-        """Periodic leader-only scan: back-merge main -> automain for all
-        projects so the integration trunk never silently falls behind the LTS
-        branch.  Per project this is a no-op unless integration_branch is set —
-        the gate lives in reconcile_main_into_automain.
+        """Periodic leader-only scan: back-merge the LTS branch into the
+        integration trunk for all projects so the integration trunk never
+        silently falls behind the LTS branch.
 
-        A hotfix or a direct push to main otherwise diverges the two branches
-        and the next automain -> main promotion conflicts.  Per project this is
-        a no-op unless integration_branch == "automain" — that gate lives in
-        reconcile_main_into_automain.
+        Per project this is a no-op when integration_branch == promotion_target
+        (LTS model is inactive) — the gate lives in reconcile_main_into_automain.
         """
         from app.hotfix_backmerge import reconcile_main_into_automain
 

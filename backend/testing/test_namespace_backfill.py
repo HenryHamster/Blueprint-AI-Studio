@@ -77,15 +77,15 @@ class TestBackfillTaskBranchNamespace:
         assert project.build_config["task_branch_namespace"] == "blueprint"
 
     @pytest.mark.asyncio
-    async def test_blueprintaistudio_repo_maps_to_blueprint(self):
-        """github_repo='BlueprintAIStudio' maps to 'blueprint' (non-self-repo path)."""
+    async def test_blueprintaistudio_repo_slugifies_normally(self):
+        """github_repo='BlueprintAIStudio' that is NOT the self-repo gets slugified namespace."""
         project = _project(github_repo="BlueprintAIStudio", is_self_repo=False)
         session = _make_session([project])
 
         summary = await backfill_task_branch_namespace(session)
 
         assert summary["namespace_filled"] == 1
-        assert project.build_config["task_branch_namespace"] == "blueprint"
+        assert project.build_config["task_branch_namespace"] == "blueprintaistudio"
 
     @pytest.mark.asyncio
     async def test_idempotent_second_call_skips(self):
