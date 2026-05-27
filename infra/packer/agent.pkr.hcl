@@ -43,6 +43,7 @@ variable "cache_repo" {
 #   that caused memo tasks to stall without emitting turn.completed.
 # - Current HEAD memo handler state: full extraction path and reopen retry are correct
 #   on main; this rebuild bakes these fixes into the deployed agent image.
+# Rebuild trigger 2026-05-27: redeploy after memo task c461ab10 failed on stale handler — ensure PR #5792 / #5921 / #6138 are in active VM image.
 source "googlecompute" "agent_image" {
   project_id          = var.project_id
   source_image_family = "ubuntu-2204-lts"

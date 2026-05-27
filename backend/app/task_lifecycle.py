@@ -1516,13 +1516,15 @@ async def _process_post_commit(
                     f"[REGRESSION-CASE] Failed to re-arm case on task failure {task.id}: {_rc_fail_exc!r}"
                 )
 
-            # FAILED memo recovery: when failure_category='parse_failed', the agent may
-            # have emitted a valid memo JSON inside an item.completed envelope that the
-            # deployed handler couldn't extract. Attempt one last recovery before
-            # permanently marking the task FAILED.
+            # FAILED memo recovery: when a memo task fails with any of the recoverable
+            # failure categories, the agent may have emitted a valid memo JSON inside an
+            # item.completed envelope that the deployed handler couldn't extract.
+            # We widen the trigger beyond 'parse_failed' to also cover 'incomplete' and
+            # 'claude_code_failed' — the recovery function is defensive (returns False
+            # when no valid envelope is found) so widening is safe.
             if task.first_payload.get("type") == "memo":
                 raw_fc = (task.context or {}).get("agent_failure_category_raw", "")
-                if raw_fc == "parse_failed":
+                if raw_fc in ("parse_failed", "incomplete", "claude_code_failed"):
                     try:
                         _recovery_logs = (
                             payload.logs or task.latest_status_message or ""
