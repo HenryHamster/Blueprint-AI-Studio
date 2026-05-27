@@ -323,6 +323,17 @@ async def update_project(
             ):
                 if not incoming.get(_field) and existing_bc.get(_field):
                     incoming[_field] = existing_bc[_field]
+            # Preserve per-project branch config using key-absence semantics:
+            # an explicit empty list [] means "disable" and must not be lost,
+            # so we check key presence rather than falsiness.
+            for _field in (
+                "staging_branch_prefixes",
+                "stale_branch_prefixes",
+                "protected_branches",
+                "enable_self_improvement",
+            ):
+                if _field not in incoming and _field in existing_bc:
+                    incoming[_field] = existing_bc[_field]
             merged = {**existing_bc, **incoming}
             validated = BuildConfigSchema(**merged) if merged else BuildConfigSchema()
             project.build_config = validated.model_dump(exclude_none=True)
@@ -444,6 +455,14 @@ async def detect_project_build_config(
         detected["task_branch_prefix"] = existing["task_branch_prefix"]
     if "pr_title_prefix" in existing:
         detected["pr_title_prefix"] = existing["pr_title_prefix"]
+    if "staging_branch_prefixes" in existing:
+        detected["staging_branch_prefixes"] = existing["staging_branch_prefixes"]
+    if "stale_branch_prefixes" in existing:
+        detected["stale_branch_prefixes"] = existing["stale_branch_prefixes"]
+    if "protected_branches" in existing:
+        detected["protected_branches"] = existing["protected_branches"]
+    if "enable_self_improvement" in existing:
+        detected["enable_self_improvement"] = existing["enable_self_improvement"]
 
     try:
         validated = BuildConfigSchema(**detected) if detected else BuildConfigSchema()

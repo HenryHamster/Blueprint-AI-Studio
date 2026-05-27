@@ -1,5 +1,6 @@
 """Pydantic request/response schemas for Blueprint API endpoints."""
 
+import re
 import uuid
 from typing import List, Dict, Any
 
@@ -265,6 +266,15 @@ class BuildConfig(BaseModel):
     task_branch_namespace: str | None = None
     task_branch_prefix: str | None = None
     pr_title_prefix: str | None = None
+    # Per-project staging/cleanup branch config. None means "use project defaults".
+    # An explicit empty list [] is semantically meaningful for stale_branch_prefixes
+    # (disables cleanup for the project) — do NOT coerce [] to None.
+    staging_branch_prefixes: List[str] | None = None
+    stale_branch_prefixes: List[str] | None = None
+    protected_branches: List[str] | None = None
+    enable_self_improvement: bool = False
+    # Per-project alembic versions directory path. None means "use the project default".
+    alembic_versions_path: str | None = None
 
     @field_validator(
         "task_branch_namespace", "task_branch_prefix", "pr_title_prefix", mode="before"
@@ -274,6 +284,31 @@ class BuildConfig(BaseModel):
         """Normalize empty/whitespace strings to None so they fall back to project defaults."""
         if isinstance(v, str) and not v.strip():
             return None
+        return v
+
+    @field_validator(
+        "staging_branch_prefixes",
+        "stale_branch_prefixes",
+        "protected_branches",
+        mode="before",
+    )
+    @classmethod
+    def _validate_branch_list(cls, v: object) -> object:
+        """Validate each entry in a branch-name list: safe charset, no '..', no leading '/' or '-'."""
+        if v is None:
+            return v
+        if not isinstance(v, list):
+            raise ValueError("must be a list of strings")
+        _safe = re.compile(r"^[a-zA-Z0-9_./-]+$")
+        for item in v:
+            if not isinstance(item, str) or not item:
+                raise ValueError("branch list entries must be non-empty strings")
+            if not _safe.match(item):
+                raise ValueError(f"branch entry {item!r} contains invalid characters")
+            if ".." in item:
+                raise ValueError(f"branch entry {item!r} cannot contain '..'")
+            if item.startswith("/") or item.startswith("-"):
+                raise ValueError(f"branch entry {item!r} cannot start with '/' or '-'")
         return v
 
 

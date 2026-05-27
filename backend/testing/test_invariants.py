@@ -2915,3 +2915,47 @@ class TestBehindRecoveryUpdateBranchGuard:
             "Pending behind-recovery guard fix(es) not yet applied: "
             + ", ".join(unresolved)
         )
+
+
+# ── BuildConfig Schema Coverage ───────────────────────────────────────────────
+
+
+class TestBuildConfigSchemaCoverage:
+    """Guard: every build_config key read by a Project property must be declared
+    in BuildConfig so schema-validated saves do not silently strip the key.
+
+    Scans models.py for `(self.build_config or {}).get("key")` patterns inside
+    Project property methods and asserts each extracted key name appears as a
+    field in BuildConfig.model_fields. A CI failure here means a new property
+    was added to Project without a corresponding schema field — the round-trip
+    through the admin PATCH endpoint would silently drop the key on save.
+    """
+
+    def test_build_config_model_properties_declared_in_schema(self) -> None:
+        models_path = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "app", "models.py")
+        )
+        with open(models_path) as f:
+            source = f.read()
+
+        consumed_keys = set(
+            re.findall(
+                r"\(self\.build_config\s+or\s+\{\}\)\.get\(\s*['\"]([^'\"]+)['\"]",
+                source,
+            )
+        )
+        assert consumed_keys, (
+            "No build_config .get() calls found in models.py — "
+            "the regex may need updating if the access pattern changed."
+        )
+
+        from app.schemas import BuildConfig
+
+        declared_keys = set(BuildConfig.model_fields.keys())
+        undeclared = consumed_keys - declared_keys
+        assert not undeclared, (
+            "build_config keys read by Project properties but not declared in "
+            "BuildConfig schema (they will be silently stripped on save):\n"
+            + "\n".join(f"  - {k}" for k in sorted(undeclared))
+            + "\n\nAdd each missing key to BuildConfig in backend/app/schemas.py."
+        )

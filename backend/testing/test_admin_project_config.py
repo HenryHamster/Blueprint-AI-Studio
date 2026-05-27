@@ -962,3 +962,90 @@ async def test_patch_promotion_target_null_skips_remote_check(
         )
     assert resp.status_code == 200, resp.text
     mock_token.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Per-project staging/cleanup branch config round-trip tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_build_config_branch_keys_round_trip(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH build_config with the 4 per-project branch keys survives validation unchanged."""
+    project = project_owner
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}",
+        json={
+            "build_config": {
+                "staging_branch_prefixes": ["feat/", "exp/"],
+                "stale_branch_prefixes": ["feat/"],
+                "protected_branches": ["main", "release"],
+                "enable_self_improvement": True,
+            }
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(project)
+    bc = project.build_config or {}
+    assert bc.get("staging_branch_prefixes") == ["feat/", "exp/"]
+    assert bc.get("stale_branch_prefixes") == ["feat/"]
+    assert bc.get("protected_branches") == ["main", "release"]
+    assert bc.get("enable_self_improvement") is True
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_build_config_omitting_branch_keys_preserves_existing(
+    client: AsyncClient, db_session, project_owner
+):
+    """Subsequent PATCH that omits the 4 branch keys does not wipe previously stored values."""
+    project = project_owner
+    # First PATCH: store the 4 keys
+    await client.patch(
+        f"/api/admin/projects/{project.id}",
+        json={
+            "build_config": {
+                "staging_branch_prefixes": ["research/", "plan/"],
+                "stale_branch_prefixes": ["research/"],
+                "protected_branches": ["main"],
+                "enable_self_improvement": True,
+            }
+        },
+    )
+    # Second PATCH: update language only, omit all 4 keys
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}",
+        json={"build_config": {"language": "python"}},
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(project)
+    bc = project.build_config or {}
+    assert bc.get("staging_branch_prefixes") == ["research/", "plan/"]
+    assert bc.get("stale_branch_prefixes") == ["research/"]
+    assert bc.get("protected_branches") == ["main"]
+    assert bc.get("enable_self_improvement") is True
+    assert bc.get("language") == "python"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_build_config_empty_stale_prefixes_preserved(
+    client: AsyncClient, db_session, project_owner
+):
+    """An explicit empty stale_branch_prefixes=[] survives round-trip (disables cleanup)."""
+    project = project_owner
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}",
+        json={"build_config": {"stale_branch_prefixes": []}},
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(project)
+    bc = project.build_config or {}
+    assert "stale_branch_prefixes" in bc
+    assert bc["stale_branch_prefixes"] == []

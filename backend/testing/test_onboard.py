@@ -337,6 +337,94 @@ class TestOnboardIssueImplementation:
         assert "base_branch" not in ii
 
 
+class TestOnboardBranchConfig:
+    @pytest.mark.asyncio
+    async def test_onboard_build_config_override_branch_keys_survive_validation(
+        self, client: AsyncClient, db_session
+    ):
+        """build_config_override with staging/stale/protected/self-improvement keys survives schema validation."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"language": "python"},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={
+                    "github_owner": "acme",
+                    "github_repo": "branch-config-repo",
+                    "build_config_override": {
+                        "staging_branch_prefixes": ["feat/", "research/"],
+                        "stale_branch_prefixes": ["feat/"],
+                        "protected_branches": ["main", "release"],
+                        "enable_self_improvement": True,
+                    },
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        project = await db_session.get(Project, data["project_id"])
+        bc = project.build_config or {}
+        assert bc.get("staging_branch_prefixes") == ["feat/", "research/"]
+        assert bc.get("stale_branch_prefixes") == ["feat/"]
+        assert bc.get("protected_branches") == ["main", "release"]
+        assert bc.get("enable_self_improvement") is True
+
+    @pytest.mark.asyncio
+    async def test_onboard_build_config_override_empty_stale_prefixes_survives(
+        self, client: AsyncClient, db_session
+    ):
+        """An explicit empty stale_branch_prefixes=[] in the override survives — it means 'disable cleanup'."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={
+                    "github_owner": "acme",
+                    "github_repo": "no-stale-repo",
+                    "build_config_override": {
+                        "stale_branch_prefixes": [],
+                    },
+                },
+            )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        project = await db_session.get(Project, data["project_id"])
+        bc = project.build_config or {}
+        # Empty list is a meaningful "disable" signal — must be preserved, not dropped.
+        assert "stale_branch_prefixes" in bc
+        assert bc["stale_branch_prefixes"] == []
+
+
 class TestOnboardDefaultBranchErrors:
     @pytest.mark.asyncio
     async def test_onboard_github_non200_raises_502(
