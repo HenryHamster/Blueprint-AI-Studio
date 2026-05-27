@@ -123,7 +123,7 @@ from app.strategic_constants import (
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0126"
+EXPECTED_SCHEMA_REVISION = "0127"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.

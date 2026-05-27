@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Mapping
 from sqlmodel import SQLModel, Field, Relationship
 from sqlmodel.sql.sqltypes import GUID
 from sqlalchemy import (
@@ -26,6 +26,7 @@ import logging
 import uuid
 from datetime import datetime, timezone
 from app.time_utils import _utcnow
+from app.vm_cost_rates import get_vm_rate_per_second
 
 
 class NaiveUTCDateTime(TypeDecorator):
@@ -62,6 +63,13 @@ class NaiveUTCDateTime(TypeDecorator):
 
 
 logger = logging.getLogger(__name__)
+_UNLOADED = object()
+
+_TASK_BANKED_VM_RUNTIME_COST_KEY = "vm_runtime_cost_banked"
+_TASK_BANKED_LLM_INPUT_TOKENS_KEY = "llm_input_tokens_banked"
+_TASK_BANKED_LLM_OUTPUT_TOKENS_KEY = "llm_output_tokens_banked"
+_TASK_BANKED_LLM_CALL_COUNT_KEY = "llm_call_count_banked"
+_TASK_ATTEMPT_HISTORY_KEY = "attempt_history"
 
 
 class ProjectStatus(str, Enum):
@@ -777,6 +785,29 @@ class Task(SQLModel, table=True):
     api_call_summary: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
+    # Retry-attribution banking now has dedicated nullable columns. The
+    # accessors below still fall back to legacy context keys so in-flight rows
+    # written before the migration keep their banked totals during rollout.
+    vm_runtime_cost_banked_db: float | None = Field(
+        default=None,
+        sa_column=Column("vm_runtime_cost_banked", Float, nullable=True),
+    )
+    llm_input_tokens_banked_db: int | None = Field(
+        default=None,
+        sa_column=Column("llm_input_tokens_banked", Integer, nullable=True),
+    )
+    llm_output_tokens_banked_db: int | None = Field(
+        default=None,
+        sa_column=Column("llm_output_tokens_banked", Integer, nullable=True),
+    )
+    llm_call_count_banked_db: int | None = Field(
+        default=None,
+        sa_column=Column("llm_call_count_banked", Integer, nullable=True),
+    )
+    attempt_history_db: List[Dict[str, Any]] | None = Field(
+        default=None,
+        sa_column=Column("attempt_history", JSONB, nullable=True),
+    )
 
     # Lifecycle flags promoted from JSONB context (audit 2026-04-25 W1).
     # Reading these via SELECT FOR UPDATE returns DB-fresh values without
@@ -1013,6 +1044,238 @@ class Task(SQLModel, table=True):
     history: List["TaskHistory"] = Relationship(
         back_populates="task", sa_relationship_kwargs={"cascade": "all, delete-orphan"}
     )
+
+    def _get_context_backed_value(self, key: str) -> Any:
+        return (self.context or {}).get(key)
+
+    def _set_context_backed_value(self, key: str, value: Any) -> None:
+        ctx = dict(self.context or {})
+        if value is None:
+            ctx.pop(key, None)
+        else:
+            ctx[key] = value
+        self.context = ctx
+
+    @property
+    def vm_runtime_cost_banked(self) -> float | None:
+        db_value = self.__dict__.get("vm_runtime_cost_banked_db", _UNLOADED)
+        if isinstance(db_value, (int, float)):
+            return float(db_value)
+        value = self._get_context_backed_value(_TASK_BANKED_VM_RUNTIME_COST_KEY)
+        return float(value) if isinstance(value, (int, float)) else None
+
+    @vm_runtime_cost_banked.setter
+    def vm_runtime_cost_banked(self, value: float | None) -> None:
+        self.vm_runtime_cost_banked_db = None if value is None else float(value)
+        self._set_context_backed_value(_TASK_BANKED_VM_RUNTIME_COST_KEY, None)
+
+    @property
+    def llm_input_tokens_banked(self) -> int | None:
+        db_value = self.__dict__.get("llm_input_tokens_banked_db", _UNLOADED)
+        if isinstance(db_value, (int, float)) and db_value >= 0:
+            return int(db_value)
+        value = self._get_context_backed_value(_TASK_BANKED_LLM_INPUT_TOKENS_KEY)
+        return int(value) if isinstance(value, (int, float)) and value >= 0 else None
+
+    @llm_input_tokens_banked.setter
+    def llm_input_tokens_banked(self, value: int | None) -> None:
+        self.llm_input_tokens_banked_db = None if value is None else int(value)
+        self._set_context_backed_value(_TASK_BANKED_LLM_INPUT_TOKENS_KEY, None)
+
+    @property
+    def llm_output_tokens_banked(self) -> int | None:
+        db_value = self.__dict__.get("llm_output_tokens_banked_db", _UNLOADED)
+        if isinstance(db_value, (int, float)) and db_value >= 0:
+            return int(db_value)
+        value = self._get_context_backed_value(_TASK_BANKED_LLM_OUTPUT_TOKENS_KEY)
+        return int(value) if isinstance(value, (int, float)) and value >= 0 else None
+
+    @llm_output_tokens_banked.setter
+    def llm_output_tokens_banked(self, value: int | None) -> None:
+        self.llm_output_tokens_banked_db = None if value is None else int(value)
+        self._set_context_backed_value(_TASK_BANKED_LLM_OUTPUT_TOKENS_KEY, None)
+
+    @property
+    def llm_call_count_banked(self) -> int | None:
+        db_value = self.__dict__.get("llm_call_count_banked_db", _UNLOADED)
+        if isinstance(db_value, (int, float)) and db_value >= 0:
+            return int(db_value)
+        value = self._get_context_backed_value(_TASK_BANKED_LLM_CALL_COUNT_KEY)
+        return int(value) if isinstance(value, (int, float)) and value >= 0 else None
+
+    @llm_call_count_banked.setter
+    def llm_call_count_banked(self, value: int | None) -> None:
+        self.llm_call_count_banked_db = None if value is None else int(value)
+        self._set_context_backed_value(_TASK_BANKED_LLM_CALL_COUNT_KEY, None)
+
+    @property
+    def attempt_history(self) -> List[Dict[str, Any]] | None:
+        db_value = self.__dict__.get("attempt_history_db", _UNLOADED)
+        if isinstance(db_value, list):
+            return list(db_value)
+        value = self._get_context_backed_value(_TASK_ATTEMPT_HISTORY_KEY)
+        return list(value) if isinstance(value, list) else None
+
+    @attempt_history.setter
+    def attempt_history(self, value: List[Dict[str, Any]] | None) -> None:
+        self.attempt_history_db = None if value is None else list(value)
+        self._set_context_backed_value(_TASK_ATTEMPT_HISTORY_KEY, None)
+
+
+def _coerce_nonnegative_int(value: Any) -> int:
+    if isinstance(value, (int, float)) and value >= 0:
+        return int(value)
+    return 0
+
+
+def get_task_current_attempt_llm_totals(task: Task) -> tuple[int, int, int]:
+    summary = task.api_call_summary or {}
+    return (
+        _coerce_nonnegative_int(summary.get("total_input_tokens")),
+        _coerce_nonnegative_int(summary.get("total_output_tokens")),
+        _coerce_nonnegative_int(summary.get("llm_call_count")),
+    )
+
+
+def get_task_total_llm_totals(task: Task) -> tuple[int, int, int]:
+    input_tokens, output_tokens, call_count = get_task_current_attempt_llm_totals(task)
+    return (
+        input_tokens + int(task.llm_input_tokens_banked or 0),
+        output_tokens + int(task.llm_output_tokens_banked or 0),
+        call_count + int(task.llm_call_count_banked or 0),
+    )
+
+
+def get_task_current_attempt_vm_cost_usd(
+    task: Task, *, stopped_at: datetime | None = None
+) -> float:
+    if task.vm_provisioned_at is None:
+        return 0.0
+    effective_stop = stopped_at or task.vm_stopped_at
+    if effective_stop is None:
+        return 0.0
+    runtime_seconds = max(
+        0.0, (effective_stop - task.vm_provisioned_at).total_seconds()
+    )
+    if runtime_seconds <= 0:
+        return 0.0
+    return runtime_seconds * get_vm_rate_per_second(spot=task.vm_spot)
+
+
+def get_task_total_vm_cost_usd(
+    task: Task, *, stopped_at: datetime | None = None
+) -> float:
+    return float(
+        task.vm_runtime_cost_banked or 0.0
+    ) + get_task_current_attempt_vm_cost_usd(task, stopped_at=stopped_at)
+
+
+def with_task_attempt_banking(
+    task: Task, context: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Return context plus the task's banked retry-attribution fields.
+
+    Requeue paths sometimes keep mutating a stale pre-banking context copy
+    after ``bank_task_current_attempt()`` runs. Copying only the banked
+    attribution fields back into that context preserves retry costs without
+    resurrecting runtime keys that the caller intentionally removed.
+    """
+
+    merged = dict(context or {})
+
+    banked_vm_cost = task.vm_runtime_cost_banked
+    if banked_vm_cost is None:
+        merged.pop(_TASK_BANKED_VM_RUNTIME_COST_KEY, None)
+    else:
+        merged[_TASK_BANKED_VM_RUNTIME_COST_KEY] = float(banked_vm_cost)
+
+    banked_input_tokens = task.llm_input_tokens_banked
+    if banked_input_tokens is None:
+        merged.pop(_TASK_BANKED_LLM_INPUT_TOKENS_KEY, None)
+    else:
+        merged[_TASK_BANKED_LLM_INPUT_TOKENS_KEY] = int(banked_input_tokens)
+
+    banked_output_tokens = task.llm_output_tokens_banked
+    if banked_output_tokens is None:
+        merged.pop(_TASK_BANKED_LLM_OUTPUT_TOKENS_KEY, None)
+    else:
+        merged[_TASK_BANKED_LLM_OUTPUT_TOKENS_KEY] = int(banked_output_tokens)
+
+    banked_call_count = task.llm_call_count_banked
+    if banked_call_count is None:
+        merged.pop(_TASK_BANKED_LLM_CALL_COUNT_KEY, None)
+    else:
+        merged[_TASK_BANKED_LLM_CALL_COUNT_KEY] = int(banked_call_count)
+
+    attempt_history = task.attempt_history
+    if attempt_history is None:
+        merged.pop(_TASK_ATTEMPT_HISTORY_KEY, None)
+    else:
+        merged[_TASK_ATTEMPT_HISTORY_KEY] = list(attempt_history)
+
+    return merged
+
+
+def bank_task_current_attempt(
+    task: Task,
+    *,
+    stopped_at: datetime | None = None,
+    clear_current_attempt: bool = True,
+) -> Dict[str, Any] | None:
+    effective_stop = stopped_at or task.vm_stopped_at
+    vm_cost = get_task_current_attempt_vm_cost_usd(task, stopped_at=effective_stop)
+    input_tokens, output_tokens, call_count = get_task_current_attempt_llm_totals(task)
+    has_attempt_data = (
+        task.vm_provisioned_at is not None
+        or task.api_call_summary is not None
+        or vm_cost > 0
+        or input_tokens > 0
+        or output_tokens > 0
+        or call_count > 0
+    )
+    if not has_attempt_data:
+        return None
+
+    if vm_cost > 0:
+        task.vm_runtime_cost_banked = (
+            float(task.vm_runtime_cost_banked or 0.0) + vm_cost
+        )
+    if input_tokens > 0:
+        task.llm_input_tokens_banked = (
+            int(task.llm_input_tokens_banked or 0) + input_tokens
+        )
+    if output_tokens > 0:
+        task.llm_output_tokens_banked = (
+            int(task.llm_output_tokens_banked or 0) + output_tokens
+        )
+    if call_count > 0:
+        task.llm_call_count_banked = int(task.llm_call_count_banked or 0) + call_count
+
+    snapshot: Dict[str, Any] = {
+        "vm_provisioned_at": task.vm_provisioned_at.isoformat()
+        if task.vm_provisioned_at
+        else None,
+        "vm_stopped_at": effective_stop.isoformat() if effective_stop else None,
+        "vm_spot": bool(task.vm_spot),
+        "vm_runtime_cost_usd": round(vm_cost, 6),
+        "llm_input_tokens": input_tokens,
+        "llm_output_tokens": output_tokens,
+        "llm_call_count": call_count,
+    }
+    history = list(task.attempt_history or [])
+    history.append(snapshot)
+    task.attempt_history = history
+
+    total_vm_cost = float(task.vm_runtime_cost_banked or 0.0)
+    task.estimated_cost_usd = round(total_vm_cost, 4) if total_vm_cost > 0 else None
+
+    if clear_current_attempt:
+        task.vm_provisioned_at = None
+        task.vm_started_at = None
+        task.vm_stopped_at = None
+        task.api_call_summary = None
+
+    return snapshot
 
 
 class TaskHistory(SQLModel, table=True):

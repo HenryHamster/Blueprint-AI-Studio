@@ -26,7 +26,7 @@ from app.efficiency_snapshot import (
     read_baseline_with_drift,
     write_snapshot,
 )
-from app.models import TaskStatus
+from app.models import TaskStatus, bank_task_current_attempt
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 from testing.factories import _utcnow, make_membership, make_project, make_task
 
@@ -987,6 +987,78 @@ async def test_llm_token_pricing_no_token_data(db_session):
 
     axes = await compute_current_axes(db_session, project.id)
     assert axes[AXIS_LLM_COST_PER_MERGED_PR] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_retry_banked_vm_and_llm_costs_count_across_attempts(db_session):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    first_started = now - timedelta(minutes=9)
+    first_stopped = now - timedelta(minutes=5)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        context={"pr_merged": True, "review_loop": {"iteration": 1}},
+        vm_provisioned_at=first_started,
+        vm_spot=True,
+        api_call_summary={
+            "llm_call_count": 3,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 400,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    bank_task_current_attempt(task, stopped_at=first_stopped)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    first_vm_cost = (first_stopped - first_started).total_seconds() * SPOT_RATE
+    assert task.vm_runtime_cost_banked == pytest.approx(first_vm_cost)
+    assert task.llm_input_tokens_banked == 1000
+    assert task.llm_output_tokens_banked == 400
+    assert task.llm_call_count_banked == 3
+    assert task.vm_provisioned_at is None
+    assert task.api_call_summary is None
+
+    second_started = now - timedelta(minutes=3)
+    task.status = TaskStatus.COMPLETED
+    task.vm_provisioned_at = second_started
+    task.vm_stopped_at = now
+    task.vm_spot = False
+    task.api_call_summary = {
+        "llm_call_count": 2,
+        "total_input_tokens": 250,
+        "total_output_tokens": 150,
+    }
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+    expected_vm_cost = round(
+        first_vm_cost + (now - second_started).total_seconds() * ON_DEMAND_RATE, 4
+    )
+    assert axes[AXIS_COST_PER_MERGED_PR] == pytest.approx(expected_vm_cost)
+
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+    expected_llm_cost = round(
+        (1250 * input_rate) + (550 * output_rate),
+        6,
+    )
+    assert axes[AXIS_LLM_COST_PER_MERGED_PR] == pytest.approx(expected_llm_cost)
+
+    refreshed = await db_session.get(type(task), task.id)
+    breakdown = compute_llm_cost_breakdown([refreshed])
+    assert breakdown["totals"]["total_input_tokens"] == 1250
+    assert breakdown["totals"]["total_output_tokens"] == 550
+    assert breakdown["by_model"][0]["llm_call_count"] == 5
 
 
 @pytest.mark.asyncio

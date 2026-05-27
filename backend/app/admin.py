@@ -1469,7 +1469,16 @@ async def get_task_pr_files(
     except ValueError:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    task = await _get_user_task(tid, current_user["user_id"], session)
+    # Require at least member role; non-members get 404, viewers get 403.
+    # include_patch exposes raw diff via the installation token — restrict to owners.
+    if include_patch:
+        task = await _get_user_task_with_role(
+            tid, current_user["user_id"], session, min_role="owner"
+        )
+    else:
+        task = await _get_user_task_with_role(
+            tid, current_user["user_id"], session, min_role="member"
+        )
 
     # Find the PR artifact
     artifact_result = await session.execute(

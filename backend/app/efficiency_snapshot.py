@@ -32,13 +32,15 @@ from sqlmodel import select
 from app.admin import _get_user_project_with_role
 from app.auth import get_current_user
 from app.database import get_session
-from app.models import Project, Task, TaskStatus, _utcnow
-from app.vm_cost_rates import VM_COST_RATES
+from app.models import (
+    Project,
+    Task,
+    TaskStatus,
+    _utcnow,
+    get_task_total_llm_totals,
+    get_task_total_vm_cost_usd,
+)
 from app.task_locking import project_lock
-
-# VM cost rates are sourced from vm_cost_rates.py for e2-standard-2
-ON_DEMAND_RATE = VM_COST_RATES["e2-standard-2"][0] / 3600  # per second
-SPOT_RATE = VM_COST_RATES["e2-standard-2"][1] / 3600
 
 router = APIRouter()
 
@@ -184,9 +186,7 @@ def _compute_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
     total_cost = 0.0
     merged = 0
     for t in tasks:
-        if t.vm_provisioned_at and t.vm_stopped_at:
-            rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-            total_cost += (t.vm_stopped_at - t.vm_provisioned_at).total_seconds() * rate
+        total_cost += get_task_total_vm_cost_usd(t)
         if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
             merged += 1
     if not merged:
@@ -199,15 +199,8 @@ def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> Optional[float]:
     total_cost = 0.0
     merged = 0
     for t in tasks:
-        summary = t.api_call_summary or {}
-        input_tokens = summary.get("total_input_tokens")
-        output_tokens = summary.get("total_output_tokens")
-        if (
-            isinstance(input_tokens, (int, float))
-            and isinstance(output_tokens, (int, float))
-            and t.provider
-            and t.model
-        ):
+        input_tokens, output_tokens, _ = get_task_total_llm_totals(t)
+        if (input_tokens > 0 or output_tokens > 0) and t.provider and t.model:
             pricing = LLM_TOKEN_PRICING.get((t.provider.lower(), t.model.lower()))
             if pricing:
                 input_rate, output_rate = pricing
@@ -233,11 +226,12 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
         have non-zero tokens but no entry in :data:`LLM_TOKEN_PRICING`.
 
     A task contributes to a bucket when it has a non-null provider, non-null
-    model, and numeric ``total_input_tokens`` / ``total_output_tokens`` in
-    ``api_call_summary``. Unpriced (provider, model) combos are still counted
-    in ``task_count`` and feed ``unpriced_coverage_fraction`` but contribute
-    ``0.0`` cost. Cost values are rounded to 6 decimals and shares to 4
-    decimals, matching the rest of this module.
+    model, and non-zero aggregate tokens across the banked retry totals plus
+    the live ``api_call_summary`` snapshot. Unpriced (provider, model) combos
+    are still counted in ``task_count`` and feed
+    ``unpriced_coverage_fraction`` but contribute ``0.0`` cost. Cost values
+    are rounded to 6 decimals and shares to 4 decimals, matching the rest of
+    this module.
     """
     from collections import defaultdict
 
@@ -269,15 +263,8 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
     total_task_count = 0
 
     for t in tasks:
-        summary = t.api_call_summary or {}
-        input_tokens = summary.get("total_input_tokens")
-        output_tokens = summary.get("total_output_tokens")
-        if (
-            not isinstance(input_tokens, (int, float))
-            or not isinstance(output_tokens, (int, float))
-            or not t.provider
-            or not t.model
-        ):
+        input_tokens, output_tokens, call_count = get_task_total_llm_totals(t)
+        if (input_tokens <= 0 and output_tokens <= 0) or not t.provider or not t.model:
             continue
         provider = t.provider.lower()
         model = t.model.lower()
@@ -297,13 +284,6 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
                 and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
             ):
                 unpriced_combos.append(combo)
-
-        llm_call_count = summary.get("llm_call_count")
-        call_count = (
-            int(llm_call_count)
-            if isinstance(llm_call_count, (int, float)) and llm_call_count >= 0
-            else 0
-        )
 
         mb = model_buckets[key]
         mb["input_tokens"] += int(input_tokens)
@@ -399,14 +379,8 @@ def _compute_llm_cost_pricing_coverage(
     unpriced = 0
     unpriced_combos: list[str] = []
     for t in tasks:
-        summary = t.api_call_summary or {}
-        input_tokens = summary.get("total_input_tokens")
-        output_tokens = summary.get("total_output_tokens")
-        has_tokens = (
-            isinstance(input_tokens, (int, float))
-            and isinstance(output_tokens, (int, float))
-            and (input_tokens + output_tokens) > 0
-        )
+        input_tokens, output_tokens, _ = get_task_total_llm_totals(t)
+        has_tokens = (input_tokens + output_tokens) > 0
         if not has_tokens or not t.provider or not t.model:
             continue
         key = (t.provider.lower(), t.model.lower())
@@ -465,10 +439,10 @@ def _compute_vm_reuse_rate(tasks: list[Task]) -> Optional[float]:
 def _compute_median_api_calls_per_task(tasks: list[Task]) -> Optional[float]:
     counts: list[int] = []
     for t in tasks:
-        summary = t.api_call_summary or {}
-        c = summary.get("llm_call_count")
-        if isinstance(c, (int, float)) and c >= 0:
-            counts.append(int(c))
+        if t.api_call_summary is None and t.llm_call_count_banked is None:
+            continue
+        _, _, call_count = get_task_total_llm_totals(t)
+        counts.append(int(call_count))
     if not counts:
         return None
     return round(float(statistics.median(counts)), 2)

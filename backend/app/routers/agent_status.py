@@ -24,14 +24,17 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import get_session
 from app.models import (
-    Task,
-    Artifact,
-    TaskHistory,
     Alert,
     AlertSeverity,
-    TaskStatus,
+    Artifact,
     ArtifactType,
     Project,
+    Task,
+    TaskHistory,
+    TaskStatus,
+    bank_task_current_attempt,
+    get_task_total_vm_cost_usd,
+    with_task_attempt_banking,
 )
 from app.schemas import AgentStatusPayload
 from app.shared_state import limiter
@@ -2051,6 +2054,9 @@ async def update_agent_status(
 
                     if should_requeue:
                         old_vm_id_rl = task.vm_instance_id  # Save BEFORE reassignment
+                        bank_task_current_attempt(task, stopped_at=_utcnow())
+                        ctx = with_task_attempt_banking(task, ctx)
+                        task.context = ctx
                         task.status = TaskStatus.QUEUED
                         # The earlier FAILED assignment fired the SQLAlchemy set event
                         # which added task.id to _terminated_task_ids, revoking the JWT.
@@ -2122,9 +2128,11 @@ async def update_agent_status(
                                     earliest_recovery - _utcnow()
                                 ).total_seconds() / 60
                                 set_retry_after(task, minutes_until)
+                                ctx = dict(task.context or {})
                                 task.latest_status_message = "Rate Limited — all accounts exhausted, waiting for recovery"
                             else:
                                 set_retry_after(task, 5)
+                                ctx = dict(task.context or {})
                                 task.latest_status_message = "Rate Limited — all accounts exhausted, retrying in 5min"
                         elif failure_class != "EXTERNAL_API":
                             task.retry_after_until = (
@@ -2224,17 +2232,17 @@ async def update_agent_status(
         task.model = str(_model) if _model else None
 
         task.vm_stopped_at = _utcnow()
-        if task.vm_provisioned_at:
-            _runtime_secs = (
-                task.vm_stopped_at - task.vm_provisioned_at
-            ).total_seconds()
-            _rate = SPOT_RATE if task.vm_spot else ON_DEMAND_RATE
+        _estimated_cost = get_task_total_vm_cost_usd(
+            task, stopped_at=task.vm_stopped_at
+        )
+        if _estimated_cost > 0:
             ctx = dict(task.context or {})
-            _estimated_cost = round(_runtime_secs * _rate, 4)
-            ctx["estimated_cost_usd"] = _estimated_cost
+            ctx["estimated_cost_usd"] = round(_estimated_cost, 4)
             task.context = ctx
-            task.estimated_cost_usd = _estimated_cost
+            task.estimated_cost_usd = round(_estimated_cost, 4)
             await _check_daily_cost_ceiling(task, session)
+        else:
+            task.estimated_cost_usd = None
         old_vm_id = task.vm_instance_id
         # Fire-and-forget: awaiting _ensure_vm_deleted holds the FOR UPDATE
         # row lock through 60-90s of GCP I/O. Concurrent /api/agent/status
@@ -2587,6 +2595,7 @@ async def update_agent_status(
             and failure_class != SCOPE_EMPTY
         ):
             task.attempt_count += 1
+            bank_task_current_attempt(task, stopped_at=task.vm_stopped_at)
             task.status = TaskStatus.QUEUED
             # The earlier FAILED assignment fired the SQLAlchemy set event
             # which added task.id to _terminated_task_ids, revoking the JWT.

@@ -4888,6 +4888,186 @@ class TestGetTaskPrFiles:
         resp = await client.get("/api/admin/tasks/not-a-uuid/pr-files")
         assert resp.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_viewer_is_denied_basic_file_list(
+        self, override_get_session, db_session
+    ):
+        """Viewer role gets 403 for the basic file list."""
+        from app.auth import get_current_user as _gcu
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="test task",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create", "prompt": "do something"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        viewer_id = "viewer-user-999"
+        db_session.add(
+            ProjectMember(project_id=project.id, user_id=viewer_id, role="viewer")
+        )
+        await db_session.commit()
+
+        async def _viewer():
+            return {"user_id": viewer_id, "email": "viewer@example.com", "role": "user"}
+
+        app.dependency_overrides[_gcu] = _viewer
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get(f"/api/admin/tasks/{task.id}/pr-files")
+        finally:
+            app.dependency_overrides.pop(_gcu, None)
+
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_member_can_access_basic_file_list(
+        self, override_get_session, db_session
+    ):
+        """Member role succeeds for the basic file list."""
+        from app.models import Artifact, ArtifactType
+        from app.auth import get_current_user as _gcu
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="test task",
+            status=TaskStatus.EVALUATING,
+            payloads=[{"type": "create", "prompt": "do something"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        artifact = Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/99",
+        )
+        db_session.add(artifact)
+
+        member_id = "member-user-999"
+        db_session.add(
+            ProjectMember(project_id=project.id, user_id=member_id, role="member")
+        )
+        await db_session.commit()
+
+        async def _member():
+            return {"user_id": member_id, "email": "member@example.com", "role": "user"}
+
+        app.dependency_overrides[_gcu] = _member
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                with (
+                    patch(
+                        "app.routers.agent.get_github_token_for_task",
+                        new_callable=AsyncMock,
+                        return_value=("tok", "owner", "repo"),
+                    ),
+                    patch(
+                        "app.github.get_pr_files",
+                        new_callable=AsyncMock,
+                        return_value=[],
+                    ),
+                ):
+                    resp = await ac.get(f"/api/admin/tasks/{task.id}/pr-files")
+        finally:
+            app.dependency_overrides.pop(_gcu, None)
+
+        assert resp.status_code == 200
+        assert resp.json()["pr_number"] == 99
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_access_patch(self, override_get_session, db_session):
+        """Member role gets 403 for include_patch=true."""
+        from app.auth import get_current_user as _gcu
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="test task",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create", "prompt": "do something"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        member_id = "member-user-888"
+        db_session.add(
+            ProjectMember(project_id=project.id, user_id=member_id, role="member")
+        )
+        await db_session.commit()
+
+        async def _member():
+            return {"user_id": member_id, "email": "member@example.com", "role": "user"}
+
+        app.dependency_overrides[_gcu] = _member
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get(
+                    f"/api/admin/tasks/{task.id}/pr-files?include_patch=true"
+                )
+        finally:
+            app.dependency_overrides.pop(_gcu, None)
+
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_owner_can_access_patch(self, client: AsyncClient, db_session):
+        """Owner role can access include_patch=true."""
+        from app.models import Artifact, ArtifactType
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="test task",
+            status=TaskStatus.EVALUATING,
+            payloads=[{"type": "create", "prompt": "do something"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        artifact = Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/77",
+        )
+        db_session.add(artifact)
+        await db_session.commit()
+
+        mock_files = [{"filename": "x.py", "patch": "diff..."}]
+        with (
+            patch(
+                "app.routers.agent.get_github_token_for_task",
+                new_callable=AsyncMock,
+                return_value=("tok", "owner", "repo"),
+            ),
+            patch(
+                "app.github.get_pr_files",
+                new_callable=AsyncMock,
+                return_value=mock_files,
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/tasks/{task.id}/pr-files?include_patch=true"
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["pr_number"] == 77
+        assert resp.json()["files"][0]["filename"] == "x.py"
+
 
 class TestGetAuditFindings:
     """GET /api/admin/projects/{id}/audit-findings — read-only audit findings endpoint."""

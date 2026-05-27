@@ -13,7 +13,14 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
-from app.models import Task, TaskStatus, Project, Artifact, ArtifactType
+from app.models import (
+    Artifact,
+    ArtifactType,
+    Project,
+    Task,
+    TaskStatus,
+    bank_task_current_attempt,
+)
 from app.compute import (
     get_provision_error,
     record_zone_failure,
@@ -1668,6 +1675,7 @@ async def reaper_service():
                             # disable_account_model was already invoked (with retry+sleep)
                             # in the unlocked I/O block above; rl_acct_id and rl_model
                             # captured there. Apply the resulting state mutations here.
+                            bank_task_current_attempt(task, stopped_at=_utcnow())
                             task.status = TaskStatus.QUEUED
                             task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                             task.last_heartbeat = None
@@ -2073,6 +2081,7 @@ async def reaper_service():
                                 reap_acct = (get_task_llm_account_id(reap_ctx) or "?")[
                                     :8
                                 ]
+                                bank_task_current_attempt(task, stopped_at=_utcnow())
                                 task.latest_status_message = f"Reaped ({retry_label}): {reap_reason} [zone={reap_zone}, acct={reap_acct}]"
                                 task.status = TaskStatus.QUEUED
                                 task.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
@@ -2958,6 +2967,7 @@ async def reaper_service():
                         _new_ctx.pop("_api_failure_retries", None)
                         _t.context = _new_ctx
                         _t.attempt_count = 0
+                        bank_task_current_attempt(_t, stopped_at=_utcnow())
                         _t.status = TaskStatus.QUEUED
                         _t.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
                         _t.last_heartbeat = None

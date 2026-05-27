@@ -35,7 +35,14 @@ from app.compute import (
     soonest_zone_recovery,
 )
 from app.database import AsyncSessionLocal
-from app.models import DeploymentState, Project, Task, TaskStatus
+from app.models import (
+    DeploymentState,
+    Project,
+    Task,
+    TaskStatus,
+    bank_task_current_attempt,
+    with_task_attempt_banking,
+)
 from app.orchestrator_filters import (
     filter_file_conflicts,
     filter_rollup_conflicts,
@@ -908,6 +915,7 @@ async def orchestrator_worker():
                         if zombie and not zombie.done():
                             zombie.cancel()
                             cancelled_provision_ids.append(str(t.id))
+                        bank_task_current_attempt(fresh_t, stopped_at=_utcnow())
                         fresh_t.status = TaskStatus.QUEUED
                         fresh_t.started_at = None
                         fresh_t.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
@@ -2946,6 +2954,13 @@ async def orchestrator_worker():
                                                     infra_count
                                                 )
                                                 ctx["_infra_wait"] = True
+                                                bank_task_current_attempt(
+                                                    failed_task, stopped_at=_utcnow()
+                                                )
+                                                ctx = with_task_attempt_banking(
+                                                    failed_task, ctx
+                                                )
+                                                failed_task.context = ctx
                                                 failed_task.status = TaskStatus.QUEUED
                                                 failed_task.vm_instance_id = (
                                                     f"agent-vm-{uuid.uuid4().hex}"
@@ -2967,6 +2982,7 @@ async def orchestrator_worker():
                                                 else:
                                                     delay_min = 10
                                                 set_retry_after(failed_task, delay_min)
+                                                ctx = dict(failed_task.context or {})
                                                 failed_task.latest_status_message = f"Infra-wide provision failure (#{infra_count}), requeued — waiting for zone recovery: {provision_err or 'unknown'}"[
                                                     :500
                                                 ]
@@ -3043,6 +3059,14 @@ async def orchestrator_worker():
                                                     )
                                                 else:
                                                     # Requeue for retry
+                                                    bank_task_current_attempt(
+                                                        failed_task,
+                                                        stopped_at=_utcnow(),
+                                                    )
+                                                    ctx = with_task_attempt_banking(
+                                                        failed_task, ctx
+                                                    )
+                                                    failed_task.context = ctx
                                                     failed_task.status = (
                                                         TaskStatus.QUEUED
                                                     )
@@ -3052,7 +3076,6 @@ async def orchestrator_worker():
                                                     failed_task.last_heartbeat = None
                                                     failed_task.started_at = None
                                                     # Back off 2 min per failure to let zones recover
-                                                    failed_task.context = ctx
                                                     set_retry_after(
                                                         failed_task, 2 * prov_failures
                                                     )
