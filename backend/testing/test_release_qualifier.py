@@ -1079,6 +1079,22 @@ class TestScoreAuditVerification:
         audit, _ = rq._score_audit(report)
         assert audit == pytest.approx(1.0)
 
+    def test_all_findings_unverified_audit_missing_reason_fires(self):
+        """When _score_audit returns 1.0 due to all-unverified findings,
+        _audit_missing_reason must return 'all_findings_unverified'."""
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Potential issue.",
+                    "file": "app/foo.py",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0), "unverified high must not be deducted"
+        assert rq._audit_missing_reason(report) == "all_findings_unverified"
+
 
 class TestScoreAuditComputedErosion:
     """_score_audit prefers computed_test_erosion (authoritative, deterministic
@@ -1201,9 +1217,15 @@ class TestAuditMissingReason:
         assert rq._audit_missing_reason(report) == "parseable_but_unscoreable"
 
     def test_scoreable_report_returns_none(self):
-        """A report with real findings (dict entries with severity) → None."""
+        """A report with a verified high finding → None (genuinely scoreable)."""
         report = {
-            "findings": [{"severity": "high", "summary": "Token baked into image."}],
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Token baked into image.",
+                    "verification_note": "Read infra/packer/agent.pkr.hcl lines 20-35: API token hardcoded in provisioner.",
+                }
+            ],
             "audit_score": 0.85,
         }
         assert rq._audit_missing_reason(report) is None
@@ -1214,8 +1236,63 @@ class TestAuditMissingReason:
         assert rq._audit_missing_reason(report) == "audit_score_null_no_findings"
 
     def test_issues_key_with_severity_returns_none(self):
-        """Scoreable findings under 'issues' key → None."""
-        report = {"issues": [{"severity": "medium", "summary": "dep pinning risk"}]}
+        """Scoreable findings under 'issues' key with verified finding → None."""
+        report = {
+            "issues": [
+                {
+                    "severity": "medium",
+                    "summary": "dep pinning risk",
+                    "verification_note": "Read requirements.txt and pyproject.toml: unpinned transitive deps confirmed.",
+                }
+            ]
+        }
+        assert rq._audit_missing_reason(report) is None
+
+    def test_all_findings_unverified_single_high(self):
+        """Single unverified high finding → 'all_findings_unverified'."""
+        report = {
+            "findings": [{"severity": "high", "summary": "Potential issue."}],
+        }
+        assert rq._audit_missing_reason(report) == "all_findings_unverified"
+
+    def test_all_findings_unverified_multiple_mixed_severity(self):
+        """Multiple unverified high/medium/critical findings → 'all_findings_unverified'."""
+        report = {
+            "findings": [
+                {"severity": "critical", "summary": "SQL injection."},
+                {"severity": "high", "summary": "Leaked secret."},
+                {"severity": "medium", "summary": "Weak cipher."},
+            ]
+        }
+        assert rq._audit_missing_reason(report) == "all_findings_unverified"
+
+    def test_one_verified_one_unverified_returns_none(self):
+        """One verified high + one unverified medium → None (scoreable)."""
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Hardcoded credential.",
+                    "verification_note": "Read app/config.py lines 10-25: API key hardcoded in module-level constant.",
+                },
+                {
+                    "severity": "medium",
+                    "summary": "Missing rate limit.",
+                    "file": "app/api.py",
+                },
+            ]
+        }
+        assert rq._audit_missing_reason(report) is None
+
+    def test_all_findings_unverified_only_low_findings_returns_none(self):
+        """Only low/info findings (not in _SEVERITIES_REQUIRING_VERIFICATION) → None."""
+        report = {
+            "findings": [
+                {"severity": "low", "summary": "Minor style nit."},
+                {"severity": "info", "summary": "Informational note."},
+            ]
+        }
+        # No higher-severity findings to check → does not fire the new reason
         assert rq._audit_missing_reason(report) is None
 
 
@@ -1409,6 +1486,24 @@ class TestComputeAuditReconciliation:
         out = rq._compute_audit_reconciliation(report)
         assert out["excluded_findings_count"] == 0
         assert out["findings_derived_score"] == pytest.approx(0.98)  # 1.0 - 0.02
+
+    def test_excluded_findings_count_coincides_with_all_findings_unverified(self):
+        """When all higher-severity findings are unverified, excluded_findings_count > 0
+        and _audit_missing_reason returns 'all_findings_unverified'."""
+        report = {
+            "audit_score": 0.9,
+            "findings": [
+                {"severity": "high", "summary": "Leaked token.", "file": "app/auth.py"},
+                {
+                    "severity": "medium",
+                    "summary": "Weak cipher.",
+                    "file": "app/crypto.py",
+                },
+            ],
+        }
+        out = rq._compute_audit_reconciliation(report)
+        assert out["excluded_findings_count"] == 2
+        assert rq._audit_missing_reason(report) == "all_findings_unverified"
 
 
 class TestScoreSmoketest:

@@ -258,6 +258,79 @@ describe('TaskCard SrDisallowedBadge', () => {
   });
 });
 
+describe('TaskCard Direction Label', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('displays direction_title (truncated to ~24 chars) when present', () => {
+    const onDirectionClick = vi.fn();
+    const task = makeTask({
+      context: {
+        direction_id: 'd-abc123def456',
+        direction_title: 'Add user authentication with OAuth 2.0 flow for better security',
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} onDirectionClick={onDirectionClick} />);
+    // The title should be truncated to ~24 chars with ellipsis
+    const button = screen.getByRole('button', { name: /Add user authentication/ });
+    expect(button.textContent).toMatch(/Add user authentication.*…/);
+  });
+
+  it('displays direction_id (truncated to 10 chars) when title is absent', () => {
+    const onDirectionClick = vi.fn();
+    const task = makeTask({
+      context: {
+        direction_id: 'd-abc123def456',
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} onDirectionClick={onDirectionClick} />);
+    const label = screen.getByText('d-abc123de…');
+    expect(label).toBeInTheDocument();
+  });
+
+  it('shows full direction_title and direction_id in tooltip when title present', () => {
+    const onDirectionClick = vi.fn();
+    const task = makeTask({
+      context: {
+        direction_id: 'd-abc123def456',
+        direction_title: 'Add user authentication with OAuth 2.0 flow',
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} onDirectionClick={onDirectionClick} />);
+    const button = screen.getByRole('button', { name: /Add user authentication/ });
+    expect(button).toHaveAttribute('title', expect.stringContaining('Add user authentication with OAuth 2.0 flow'));
+    expect(button).toHaveAttribute('title', expect.stringContaining('d-abc123def456'));
+  });
+
+  it('shows only direction_id in tooltip when title absent', () => {
+    const onDirectionClick = vi.fn();
+    const task = makeTask({
+      context: {
+        direction_id: 'd-abc123def456',
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} onDirectionClick={onDirectionClick} />);
+    const button = screen.getByRole('button', { name: /d-abc123de/ });
+    expect(button).toHaveAttribute('title', 'Direction: d-abc123def456');
+  });
+
+  it('filters by direction_id (not label text) when clicked', async () => {
+    const user = userEvent.setup();
+    const onDirectionClick = vi.fn();
+    const task = makeTask({
+      context: {
+        direction_id: 'd-abc123def456',
+        direction_title: 'Add user authentication',
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} onDirectionClick={onDirectionClick} />);
+    const button = screen.getByRole('button', { name: /Add user/ });
+    await user.click(button);
+    expect(onDirectionClick).toHaveBeenCalledWith('d-abc123def456');
+  });
+});
+
 describe('TaskCard SrDivergenceBadge', () => {
   beforeEach(() => {
     vi.clearAllMocks();

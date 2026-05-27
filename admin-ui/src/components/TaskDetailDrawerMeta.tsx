@@ -803,6 +803,8 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
 
   const provenanceCtx = task.context as Record<string, unknown> | undefined;
   const provenanceDirectionId = provenanceCtx?.direction_id as string | undefined;
+  const llmProvider = typeof provenanceCtx?.llm_provider === 'string' ? provenanceCtx.llm_provider : null;
+  const llmModel = typeof provenanceCtx?.llm_model === 'string' ? provenanceCtx.llm_model : null;
 
   useEffect(() => {
     if (!provenanceDirectionId || !task.project_id) return;
@@ -949,6 +951,8 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
           </DetailRow>
         );
       })()}
+      {llmProvider && <DetailRow label="LLM Provider"><span className="font-mono text-sm break-all">{llmProvider}</span></DetailRow>}
+      {llmModel && <DetailRow label="LLM Model"><span className="font-mono text-sm break-all">{llmModel}</span></DetailRow>}
 
       {(() => {
         // R3-W2 (H1): read the dedicated column first; fall back to the

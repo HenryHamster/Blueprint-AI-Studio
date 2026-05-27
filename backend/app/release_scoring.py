@@ -454,6 +454,25 @@ def _audit_missing_reason(report: dict[str, Any] | None) -> str | None:
     if not scoreable:
         return "parseable_but_unscoreable"
 
+    # Detect the case where every higher-severity finding was rejected by the
+    # verification gate.  When this fires, _score_audit returns 1.0 (no
+    # deductions applied) which is indistinguishable from a clean audit — this
+    # reason code makes the gap visible to operators via the verdict row.
+    higher_sev_findings = [
+        f
+        for f in findings
+        if isinstance(f, dict)
+        and str(f.get("severity") or f.get("level") or "").lower()
+        in _SEVERITIES_REQUIRING_VERIFICATION
+    ]
+    if higher_sev_findings and all(
+        not _finding_is_verified(
+            f, str(f.get("severity") or f.get("level") or "").lower()
+        )
+        for f in higher_sev_findings
+    ):
+        return "all_findings_unverified"
+
     return None
 
 

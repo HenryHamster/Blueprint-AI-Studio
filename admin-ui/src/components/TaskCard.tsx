@@ -749,6 +749,17 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
   const borderColor = task.task_type ? (taskTypeBorderColor[task.task_type] ?? 'border-l-neutral-700') : 'border-l-neutral-700';
 
   const directionId = (task.context as Record<string, unknown> | undefined)?.direction_id as string | undefined;
+  const directionTitle = (task.context as Record<string, unknown> | undefined)?.direction_title as string | undefined;
+
+  // Truncate direction_title to ~24 chars with ellipsis, fallback to direction_id
+  const directionLabel = directionTitle
+    ? (directionTitle.length > 24 ? `${directionTitle.slice(0, 24)}…` : directionTitle)
+    : ((directionId?.length ?? 0) > 10 ? `${directionId?.slice(0, 10)}…` : directionId);
+
+  // Tooltip: show full title and id when title exists, otherwise just id
+  const directionTooltip = directionTitle && directionId
+    ? `Direction: ${directionTitle}\n\nID: ${directionId}`
+    : `Direction: ${directionId}`;
 
   return (
     <div
@@ -855,19 +866,19 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             <button
               type="button"
               onClick={(e) => { e.stopPropagation(); onDirectionClick(directionId); }}
-              className="inline-flex items-center gap-0.5 text-[10px] text-neutral-500 font-mono hover:text-neutral-200 hover:bg-neutral-800 rounded px-1 -mx-1 transition-colors cursor-pointer min-h-[44px] sm:min-h-auto"
-              title={`Filter by direction: ${directionId}`}
+              className="inline-flex items-center gap-0.5 text-[10px] text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 rounded px-1 -mx-1 transition-colors cursor-pointer min-h-[44px] sm:min-h-auto"
+              title={directionTooltip}
             >
               <Compass className="w-3 h-3" />
-              {directionId.length > 10 ? `${directionId.slice(0, 10)}…` : directionId}
+              {directionLabel}
             </button>
           ) : (
             <span
-              className="inline-flex items-center gap-0.5 text-[10px] text-neutral-500 font-mono"
-              title={`Direction: ${directionId}`}
+              className="inline-flex items-center gap-0.5 text-[10px] text-neutral-500"
+              title={directionTooltip}
             >
               <Compass className="w-3 h-3" />
-              {directionId.length > 10 ? `${directionId.slice(0, 10)}…` : directionId}
+              {directionLabel}
             </span>
           )
         )}
