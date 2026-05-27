@@ -375,6 +375,29 @@ export function strVal(v: unknown, fallback = ''): string {
   return typeof v === 'string' ? v : fallback;
 }
 
+/**
+ * Resolve a task's base branch through the per-project cascade:
+ * ``payload.base_branch`` → ``task.project_metadata.integration_branch`` → ``fallback``.
+ *
+ * The backend stamps every claim response's ``project_metadata.integration_branch``
+ * (see backend/app/routers/agent.py), so any handler that defaults to ``'main'``
+ * without consulting that field silently breaks projects whose integration branch
+ * is something else (e.g. ``master``, ``production``, ``develop``). Use this helper
+ * everywhere a handler needs the project's integration branch.
+ */
+export function resolveBaseBranch(
+  payload: Record<string, unknown>,
+  task: Record<string, unknown>,
+  fallback = 'main',
+): string {
+  const fromPayload = strVal(payload.base_branch);
+  if (fromPayload) return fromPayload;
+  const meta = task.project_metadata as Record<string, unknown> | undefined;
+  const fromMeta = strVal(meta?.integration_branch);
+  if (fromMeta) return fromMeta;
+  return fallback;
+}
+
 
 function appendBoundedTail(current: string, chunk: string, maxBytes: number): string {
   const combined = current + chunk;
@@ -4275,13 +4298,9 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
 
   // Capture the task's base_branch so the role-loop can pass it to
   // resetForNextRole(...) and the optional fetch+rebase step actually runs
-  // between warm roles. Default to 'main' when unspecified — matches the
-  // handlers' own strVal(payload.base_branch, 'main') fallback.
-  const rawBaseBranch = payload.base_branch;
-  const baseBranchForReset =
-    typeof rawBaseBranch === 'string' && rawBaseBranch.trim()
-      ? rawBaseBranch.trim()
-      : 'main';
+  // between warm roles. Routes through resolveBaseBranch so projects whose
+  // integration branch is not 'main' do not silently fall through to 'main'.
+  const baseBranchForReset = resolveBaseBranch(payload, task).trim();
 
   // Start heartbeat & log stream
   const statusRef = { value: 'Initializing...' };

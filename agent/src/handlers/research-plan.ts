@@ -6,6 +6,7 @@ import {
   WORKSPACE, strVal, sanitize, sendLog, readHandlerOutput,
   persistAndPostStatus, runClaudeCode,
   getProviderRunner, apiPost,
+  resolveBaseBranch,
 } from '../index.js';
 import * as indexMod from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
@@ -1042,7 +1043,7 @@ export async function handlePlan(
   model?: string, effort?: string
 ) {
   const prompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
-  const baseBranch = strVal(payload.base_branch, 'main');
+  const baseBranch = resolveBaseBranch(payload, task);
   const planPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
 
   if (!prompt) throw new Error('Plan task missing prompt');
@@ -1487,7 +1488,7 @@ export async function handleResearch(
 ) {
   const directions = Array.isArray(payload.directions) ? payload.directions as Array<Record<string, unknown>> : [];
   const currentDirectionId = payload.current_direction_id as string | undefined;
-  const baseBranch = strVal(payload.base_branch, 'main');
+  const baseBranch = resolveBaseBranch(payload, task);
   const userPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
 
   // Full clone — research needs history context

@@ -4,6 +4,7 @@ import {
   WORKSPACE, strVal, sendLog, validateBranchName,
   persistAndPostStatus, apiGet, runClaudeCode,
   setCurrentPromptFingerprint, sendHeartbeatSync,
+  resolveBaseBranch,
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
@@ -22,7 +23,7 @@ export async function handleDesignDocUpdate(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawBaseBranch = resolveBaseBranch(payload, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   statusRef.value = `Cloning ${owner}/${repo} for architecture review...`;

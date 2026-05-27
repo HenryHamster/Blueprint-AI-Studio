@@ -20,6 +20,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 vi.mock('../index.js', () => ({
   WORKSPACE: '/tmp/workspace',
   strVal: (v: unknown, fallback = '') => (typeof v === 'string' ? v : fallback),
+  resolveBaseBranch: (payload: Record<string, unknown>, task: Record<string, unknown>, fallback = 'main') => {
+    if (typeof payload.base_branch === 'string' && payload.base_branch) return payload.base_branch;
+    const meta = task.project_metadata as Record<string, unknown> | undefined;
+    if (typeof meta?.integration_branch === 'string' && meta.integration_branch) return meta.integration_branch;
+    return fallback;
+  },
   sanitize: (s: string) => s,
   sendLog: vi.fn(),
   log: vi.fn(),

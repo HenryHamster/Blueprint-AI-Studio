@@ -4,6 +4,7 @@ import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName, readHandlerOutput,
   persistAndPostStatus, git, runClaudeCode, sendHeartbeatSync,
   setCurrentPromptFingerprint, listOpenPullRequestsForBranch, deriveTaskBranch, matchesRateLimit,
+  resolveBaseBranch,
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
@@ -71,7 +72,7 @@ export async function handleSecurityAudit(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawBaseBranch = resolveBaseBranch(payload, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   statusRef.value = `Cloning ${owner}/${repo} for security audit...`;
@@ -177,7 +178,7 @@ export async function handleMigrate(
   model?: string, effort?: string
 ) {
   const rawPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
-  const rawBaseBranch = strVal(payload.base_branch) || strVal((task.project_metadata as Record<string, unknown> | undefined)?.integration_branch) || 'main';
+  const rawBaseBranch = resolveBaseBranch(payload, task);
   const migratePromotionTarget = strVal(payload.promotion_target) || strVal((task.project_metadata as Record<string, unknown> | undefined)?.promotion_target) || undefined;
   const migrateTaskTitle = strVal(task.title);
   const prompt = migrateTaskTitle ? `Task: ${migrateTaskTitle}\n\n${rawPrompt}` : rawPrompt;
@@ -319,7 +320,7 @@ export async function handleSmoketest(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawBaseBranch = resolveBaseBranch(payload, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   // CRITICAL (C4): the qualifier-smoketest must run against ONE pinned
@@ -512,7 +513,7 @@ export async function handleDebug(
   const errorLogs = strVal(payload.error_logs) || strVal(payload.failure_context);
   const failedTaskId = strVal(payload.failed_task_id);
   const failedTaskTitle = strVal(payload.failed_task_title) || strVal(task.title);
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawBaseBranch = resolveBaseBranch(payload, task);
   validateBranchName(rawBaseBranch, 'base_branch');
 
   // Clone for read-only analysis (no work branch or push needed)
@@ -625,7 +626,7 @@ export async function handlePerf(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawBaseBranch = resolveBaseBranch(payload, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   statusRef.value = `Cloning ${owner}/${repo} for performance analysis...`;
@@ -732,7 +733,7 @@ export async function handleInvestigate(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawBaseBranch = resolveBaseBranch(payload, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
   const userPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
   // Match handleMigrate (line 133): a missing prompt produces a malformed
@@ -890,7 +891,7 @@ export async function handleSelfAudit(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawBaseBranch = resolveBaseBranch(payload, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   statusRef.value = `Cloning ${owner}/${repo} for self audit...`;
@@ -1041,7 +1042,7 @@ export async function handleReleaseAudit(
 ) {
   // CRITICAL: always clone base_branch (main), never automain. The audit must
   // judge the incoming changes by main's standards, not the new code's standards.
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawBaseBranch = resolveBaseBranch(payload, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   // CRITICAL (C2/C4): the qualifier must score one PINNED candidate commit, not

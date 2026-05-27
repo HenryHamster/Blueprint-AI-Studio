@@ -1658,3 +1658,81 @@ describe('Parallel audit guidance injection', () => {
     expect(prompt).toContain(PARALLEL_AUDIT_GUIDANCE);
   });
 });
+
+// ── Per-project integration_branch cascade (resolveBaseBranch) ───────────────
+// Each analysis-style handler must clone the per-project integration branch
+// when payload.base_branch is absent. Without the cascade, projects whose
+// integration branch is not 'main' (e.g. 'master', 'production') would
+// silently clone the wrong branch.
+describe('resolveBaseBranch cascade — analysis handlers honor project_metadata.integration_branch', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+
+  const TASK_WITH_INTEGRATION = {
+    ...BASE_TASK,
+    project_metadata: { integration_branch: 'master' },
+  };
+  const PAYLOAD_NO_BASE_BRANCH = {}; // no base_branch
+
+  it('handleSecurityAudit clones project_metadata.integration_branch when payload.base_branch is absent', async () => {
+    await handleSecurityAudit(
+      TASK_ID, PAYLOAD_NO_BASE_BRANCH, TASK_WITH_INTEGRATION,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
+    expect(opts.branch).toBe('master');
+    expect(opts.baseBranch).toBe('master');
+  });
+
+  it('handlePerf clones project_metadata.integration_branch when payload.base_branch is absent', async () => {
+    await handlePerf(
+      TASK_ID, PAYLOAD_NO_BASE_BRANCH, TASK_WITH_INTEGRATION,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
+    expect(opts.branch).toBe('master');
+    expect(opts.baseBranch).toBe('master');
+  });
+
+  it('handleInvestigate clones project_metadata.integration_branch when payload.base_branch is absent', async () => {
+    await handleInvestigate(
+      TASK_ID, { prompt: 'investigate' }, TASK_WITH_INTEGRATION,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
+    expect(opts.branch).toBe('master');
+    expect(opts.baseBranch).toBe('master');
+  });
+
+  it('handleSelfAudit clones project_metadata.integration_branch when payload.base_branch is absent', async () => {
+    await handleSelfAudit(
+      TASK_ID, PAYLOAD_NO_BASE_BRANCH, TASK_WITH_INTEGRATION,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
+    expect(opts.branch).toBe('master');
+    expect(opts.baseBranch).toBe('master');
+  });
+
+  it('falls back to main when both payload.base_branch and project_metadata.integration_branch are absent', async () => {
+    await handleSecurityAudit(
+      TASK_ID, PAYLOAD_NO_BASE_BRANCH, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
+    expect(opts.branch).toBe('main');
+    expect(opts.baseBranch).toBe('main');
+  });
+
+  it('payload.base_branch overrides project_metadata.integration_branch when both are present', async () => {
+    await handleSecurityAudit(
+      TASK_ID, { base_branch: 'feature/x' }, TASK_WITH_INTEGRATION,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
+    expect(opts.branch).toBe('feature/x');
+    expect(opts.baseBranch).toBe('feature/x');
+  });
+});

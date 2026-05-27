@@ -6,6 +6,7 @@ import {
   persistAndPostStatus, git, setupWorkspace, runClaudeCode,
   captureTestBaseline, getProviderRunner, setCurrentPromptFingerprint, sendHeartbeatSync,
   apiPost,
+  resolveBaseBranch,
 } from '../index.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
@@ -763,7 +764,15 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
   const buildConfig = resolveBuildConfig(task);
   const ctx = (task.context as Record<string, unknown> | undefined) || {};
-  const rawBaseBranch = strVal(payload.base_branch) || strVal(ctx.research_branch) || strVal(ctx.original_base) || 'main';
+  // Cascade: explicit payload override → research-mode context branches →
+  // per-project integration_branch → 'main'. resolveBaseBranch supplies the
+  // final two steps so non-Blueprint projects whose integration branch is
+  // not 'main' (e.g. 'master', 'production') do not silently fall through.
+  const rawBaseBranch =
+    strVal(payload.base_branch)
+    || strVal(ctx.research_branch)
+    || strVal(ctx.original_base)
+    || resolveBaseBranch({} as Record<string, unknown>, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
   const projectMetaForPromotion = task.project_metadata as Record<string, unknown> | undefined;
   const promotionTarget =
@@ -1205,7 +1214,7 @@ export async function handleCreate(
   const operatorReviewFor = taskCtx?.operator_requested_review_for as string | undefined;
   if (operatorReviewFor) {
     const prBranch = validateBranchName(strVal(payload.branch), 'branch');
-    const prBaseBranch = validateBranchName(strVal(payload.base_branch) || strVal((task.project_metadata as Record<string, unknown> | undefined)?.integration_branch) || 'main', 'base_branch');
+    const prBaseBranch = validateBranchName(resolveBaseBranch(payload, task), 'base_branch');
     const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
 
     // Check the branch still exists before cloning — auto-delete-on-merge removes

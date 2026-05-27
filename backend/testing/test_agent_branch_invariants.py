@@ -75,14 +75,46 @@ _TARGET_RELATIVE = [
     Path("prompt.ts"),
 ]
 
+# Files scanned by the payload.base_branch cascade guard. Every handler that
+# reads ``payload.base_branch`` must route through ``resolveBaseBranch`` (or
+# the equivalent ``strVal(payload.base_branch) || ... || 'main'`` cascade)
+# so non-Blueprint projects honour their configured integration branch
+# instead of silently defaulting to 'main'. ``index.ts`` is included because
+# the role-loop also reads ``payload.base_branch`` directly.
+_PAYLOAD_BASE_BRANCH_TARGET_RELATIVE = [
+    Path("handlers") / "review-fix.ts",
+    Path("handlers") / "specialized.ts",
+    Path("handlers") / "standard.ts",
+    Path("handlers") / "research-plan.ts",
+    Path("handlers") / "design-doc.ts",
+    Path("index.ts"),
+]
+
 _TARGET_FILES: list[Path] = (
     [_AGENT_SRC / rel for rel in _TARGET_RELATIVE] if _AGENT_SRC else []
+)
+
+_PAYLOAD_BASE_BRANCH_TARGET_FILES: list[Path] = (
+    [_AGENT_SRC / rel for rel in _PAYLOAD_BASE_BRANCH_TARGET_RELATIVE]
+    if _AGENT_SRC
+    else []
 )
 
 
 # Matches a direct equality/inequality comparison against a bare branch
 # literal: ``=== 'main'``, ``!== "automain"``, ``== 'master'``, etc.
 _FORBIDDEN_RE = re.compile(r"""(===|!==|==|!=)\s*['"](main|automain|master)['"]""")
+
+# Matches the ``strVal(payload.base_branch, '<fallback>')`` regression:
+# a direct payload read with a default-value second argument bypasses the
+# ``project_metadata.integration_branch`` cascade and silently defaults to
+# the bare literal for projects whose integration branch is not 'main'.
+# Correct patterns: ``resolveBaseBranch(payload, task)`` or
+# ``strVal(payload.base_branch) || strVal(meta?.integration_branch) || 'main'``
+# (note the absence of a second argument to strVal in either case).
+_FORBIDDEN_PAYLOAD_BASE_BRANCH_DEFAULT_RE = re.compile(
+    r"""strVal\s*\(\s*payload\.base_branch\s*,"""
+)
 
 # Matches parenthesized fallback expressions like ``(promotionTarget ?? 'main')``
 # or ``(baseBranch || "automain")`` so they can be stripped before the forbidden
@@ -184,6 +216,24 @@ def _scan_for_offenders(path: Path) -> list[str]:
     return offenders
 
 
+def _scan_for_payload_base_branch_default(path: Path) -> list[str]:
+    """Return offender strings for ``strVal(payload.base_branch, '<fallback>')``.
+
+    This pattern bypasses the per-project integration_branch cascade and
+    silently defaults to the bare literal for projects whose integration
+    branch is not ``'main'``. Correct alternatives are ``resolveBaseBranch(
+    payload, task)`` or ``strVal(payload.base_branch) || strVal(meta?.\
+    integration_branch) || 'main'`` (note the absence of a second argument
+    to ``strVal``).
+    """
+    src = path.read_text(encoding="utf-8")
+    offenders: list[str] = []
+    for lineno, line in _strip_comments(src):
+        if _FORBIDDEN_PAYLOAD_BASE_BRANCH_DEFAULT_RE.search(line):
+            offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+    return offenders
+
+
 # ---------------------------------------------------------------------------
 # Guard tests
 # ---------------------------------------------------------------------------
@@ -269,6 +319,46 @@ class TestAgentBranchInvariants:
             "bare literal:\n" + "\n".join(all_offenders)
         )
 
+    def test_no_payload_base_branch_default_in_agent_sources(self):
+        """No agent TS handler may read ``payload.base_branch`` via
+        ``strVal(payload.base_branch, '<fallback>')``.
+
+        The backend stamps every claim response's
+        ``project_metadata.integration_branch`` (see
+        ``backend/app/routers/agent.py``).  Calling ``strVal(payload.base_\
+        branch, 'main')`` bypasses that field and silently defaults to the
+        bare literal for projects whose integration branch is not 'main'
+        (e.g. 'master', 'production', 'develop').
+
+        Correct patterns:
+
+          * ``resolveBaseBranch(payload, task)`` — the preferred helper.
+          * ``strVal(payload.base_branch) || strVal(meta?.integration_branch)
+            || 'main'`` — the inlined cascade (note the absence of a second
+            argument to ``strVal``).
+
+        Skipped when ``agent/src`` is not available in this test environment.
+        """
+        if _AGENT_SRC is None:
+            pytest.skip(
+                "agent/src not available in this test environment "
+                "(CI docker context is ./backend; run locally or via "
+                "scripts/test-backend.sh from a checkout for enforcement)"
+            )
+        all_offenders: list[str] = []
+        for path in _PAYLOAD_BASE_BRANCH_TARGET_FILES:
+            if not path.is_file():
+                continue
+            all_offenders.extend(_scan_for_payload_base_branch_default(path))
+
+        assert not all_offenders, (
+            "``strVal(payload.base_branch, '<fallback>')`` bypasses the "
+            "per-project integration_branch cascade.  Use "
+            "``resolveBaseBranch(payload, task)`` (or the inlined cascade "
+            "``strVal(payload.base_branch) || strVal(meta?.integration_"
+            "branch) || 'main'``) instead:\n" + "\n".join(all_offenders)
+        )
+
     def test_scanner_detects_injected_regression(self):
         """Sanity-check the scanner itself against synthetic source text so
         a future refactor that accidentally weakens the regex (e.g. anchors
@@ -290,7 +380,6 @@ class TestAgentBranchInvariants:
             "if (baseBranch === (promotionTarget || 'main')) {",
             "const target = promotionTarget ?? 'main';",
             "const target = promotionTarget || 'main';",
-            "const branch = strVal(payload.base_branch, 'main');",
             "// baseBranch === 'main' is the legacy check",
             " * comparison was baseBranch === 'main' before the refactor",
             "log.info('switched to main branch');",
@@ -314,5 +403,40 @@ class TestAgentBranchInvariants:
             _, line = lines[0]
             cleaned = _strip_paren_fallbacks(line)
             assert not _FORBIDDEN_RE.search(cleaned), (
+                f"Scanner false-positive on known-good snippet: {snippet!r}"
+            )
+
+    def test_payload_base_branch_default_scanner(self):
+        """Sanity-check the ``strVal(payload.base_branch, ...)`` scanner against
+        synthetic snippets so a future tweak to the regex does not silently
+        weaken the guard.
+        """
+        bad_snippets = [
+            "const x = strVal(payload.base_branch, 'main');",
+            'const y = strVal(payload.base_branch, "automain");',
+            "  const z = strVal( payload.base_branch , 'master');",
+        ]
+        good_snippets = [
+            "const x = strVal(payload.base_branch);",
+            "const y = resolveBaseBranch(payload, task);",
+            "const z = strVal(payload.base_branch) || strVal(meta?.integration_branch) || 'main';",
+            "// strVal(payload.base_branch, 'main') was the legacy pattern",
+            "const ok = strVal(payload.branch, 'main');",  # different field
+        ]
+
+        for snippet in bad_snippets:
+            lines = _strip_comments(snippet)
+            assert lines, f"Bad snippet was stripped as a comment: {snippet!r}"
+            _, line = lines[0]
+            assert _FORBIDDEN_PAYLOAD_BASE_BRANCH_DEFAULT_RE.search(line), (
+                f"Scanner failed to flag known-bad snippet: {snippet!r}"
+            )
+
+        for snippet in good_snippets:
+            lines = _strip_comments(snippet)
+            if not lines:
+                continue
+            _, line = lines[0]
+            assert not _FORBIDDEN_PAYLOAD_BASE_BRANCH_DEFAULT_RE.search(line), (
                 f"Scanner false-positive on known-good snippet: {snippet!r}"
             )

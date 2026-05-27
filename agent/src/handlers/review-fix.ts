@@ -8,6 +8,7 @@ import {
   runClaudeCode, sendHeartbeatSync, setCurrentPromptFingerprint,
   captureTestBaseline, testFixLoop, extractPytestSelectorsFromOutput,
   snapshotToolTrace, extractInvestigatedFiles,
+  resolveBaseBranch,
 } from '../index.js';
 import { runCodeChangeTask } from './code-change.js';
 import { runFreshReviewerPass } from './standard.js';
@@ -812,7 +813,7 @@ export async function handleReview(
   const prNumber = Number(payload.pr_number);
   if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Invalid pr_number: ${String(payload.pr_number)}`);
   const branch = validateBranchName(strVal(payload.branch), 'branch');
-  const baseBranch = validateBranchName(strVal(payload.base_branch) || strVal((task.project_metadata as Record<string, unknown> | undefined)?.integration_branch) || 'main', 'base_branch');
+  const baseBranch = validateBranchName(resolveBaseBranch(payload, task), 'base_branch');
   const originalPrompt = strVal(payload.original_prompt);
 
   // Read review iteration from task context
@@ -1143,7 +1144,7 @@ export async function handleFix(
   model?: string, effort?: string
 ) {
   const branch = validateBranchName(strVal(payload.branch), 'branch');
-  const baseBranch = validateBranchName(strVal(payload.base_branch) || strVal((task.project_metadata as Record<string, unknown> | undefined)?.integration_branch) || 'main', 'base_branch');
+  const baseBranch = validateBranchName(resolveBaseBranch(payload, task), 'base_branch');
   const prompt = strVal(payload.prompt);
   const prNumber = Number(payload.pr_number);
   if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Invalid pr_number: ${String(payload.pr_number)}`);
