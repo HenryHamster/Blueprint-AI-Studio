@@ -2566,9 +2566,9 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
         db_session,
         project,
         version,
-        # 2 high + 1 low findings → derived audit 0.68, erosion 1.0, smoketest
-        # 0.5 (half-passing) → composite 0.722 < 0.75: not_promoted with no
-        # hard blocker, exercising the soft-miss path.
+        # Three findings derive audit 0.68; with erosion 1.0 and smoketest 0.5
+        # (half-passing), the composite lands at 0.722, just under the 0.75
+        # bar and on the soft-miss path.
         audit_logs={
             "audit_score": 0.35,
             "test_erosion": {
