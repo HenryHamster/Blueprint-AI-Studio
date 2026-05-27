@@ -16,6 +16,7 @@ from sqlalchemy.orm import load_only
 from app.database import get_session
 from app.shared_state import (
     derive_task_branch as _derive_task_branch,
+    backfill_branch_columns,
     get_project_integration_branch,
     get_project_pr_title_prefix as _get_project_pr_title_prefix,
     get_project_promotion_target as _get_project_promotion_target_for_task,
@@ -1609,6 +1610,8 @@ async def create_task_manually(
             )
         )
         await session.commit()
+
+    await backfill_branch_columns(session, project_id=project.id)
 
     # Auto-generate VM instance ID so orchestrator worker picks up the task
     vm_name = f"agent-vm-{uuid.uuid4().hex}"

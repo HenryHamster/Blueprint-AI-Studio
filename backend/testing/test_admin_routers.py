@@ -650,6 +650,46 @@ class TestUpdateProject:
         assert resp.json()["autonomous_enabled"] is True
 
     @pytest.mark.asyncio
+    async def test_create_task_auto_backfills_branch_columns_before_base_branch(
+        self, client: AsyncClient, db_session
+    ):
+        with (
+            patch(
+                "app.release_promotion._resolve_github_with_session",
+                new_callable=AsyncMock,
+                return_value=("tok", "acme", "develop-repo"),
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="develop",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/tasks",
+                json={
+                    "github_repo": "acme/develop-repo",
+                    "title": "First task",
+                    "prompt": "Do the thing",
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        project = (
+            await db_session.execute(
+                select(Project).where(
+                    Project.github_owner == "acme",
+                    Project.github_repo == "develop-repo",
+                )
+            )
+        ).scalar_one()
+        assert project.integration_branch == "develop"
+        assert project.promotion_target == "develop"
+        task = (
+            await db_session.execute(select(Task).where(Task.project_id == project.id))
+        ).scalar_one()
+        assert task.payloads[0]["base_branch"] == "develop"
+
+    @pytest.mark.asyncio
     async def test_viewer_cannot_update_project(self, client: AsyncClient, db_session):
         """Viewer-role is below the 'member' threshold — returns 403."""
         other = Project(name="Viewer Project", user_id="other-99")

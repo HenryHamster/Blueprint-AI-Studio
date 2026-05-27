@@ -38,7 +38,7 @@ from app.models import (
 )
 from app.payload_schemas import validate_task_payload
 from app.schemas import DeployPayload
-from app.shared_state import limiter
+from app.shared_state import backfill_branch_columns, limiter
 from app.broadcast import manager, broadcast_to_project, _sanitize_log
 from app.event_fanout import enqueue_agent_log
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
@@ -167,6 +167,12 @@ async def deploy_blueprint(
         session.add(task)
         created_tasks.append(task)
 
+    await session.commit()
+
+    # Populate branch columns from GitHub immediately so that the first task
+    # spawned via this path resolves the correct base branch rather than
+    # silently falling back to 'main' for repos with a different default.
+    await backfill_branch_columns(session, project_id=project.id)
     await session.commit()
 
     # 3. The Orchestrator Worker will automatically pick up QUEUED tasks
