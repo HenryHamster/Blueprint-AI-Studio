@@ -526,3 +526,54 @@ async def test_recover_memo_from_parse_failure_empty_logs(db_session, _quiet_bro
     assert await _try_recover_memo_from_parse_failure(task, None, db_session) is False  # type: ignore[arg-type]
     await db_session.refresh(task)
     assert task.status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_recover_memo_from_incomplete_failure(db_session, _quiet_broadcast):
+    """Recovery is also attempted when raw_fc == 'incomplete' — a stale handler that
+    exits cleanly (exit_code=0) without emitting turn.completed still produces a valid
+    item.completed envelope that _try_recover_memo_from_parse_failure can extract."""
+    project = make_project(name="RecoveryIncompleteProj")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Memo: incomplete recovery test",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "memo", "topic": "Z", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        context={"agent_failure_category_raw": "incomplete"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    memo = {
+        "summary": "Incomplete recovery summary",
+        "reasoning": "Reasoning from an incomplete but otherwise valid memo agent run.",
+        "citations": ["task:xyz789"],
+        "tags": ["incomplete", "recovery"],
+    }
+    logs = _make_codex_jsonl(memo)
+
+    recovered = await _try_recover_memo_from_parse_failure(task, logs, db_session)
+
+    assert recovered is True
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+    artifacts = (
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1
+    assert artifacts[0].artifact_type == ArtifactType.MEMO
+    persisted = json.loads(artifacts[0].logs)
+    assert persisted["summary"] == memo["summary"]
+    assert persisted["citations"] == memo["citations"]
+
+    assert task.plan_output["memo"]["summary"] == memo["summary"]
