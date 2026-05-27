@@ -773,6 +773,52 @@ class TestBaseBranchFallback:
             "Offenders:\n" + "\n".join(offenders)
         )
 
+    def test_no_hardcoded_branch_in_task_display_strings(self):
+        """No production module under backend/app/ may embed a literal 'main...'
+        or 'main -> automain' inside a task title= or description= field.
+
+        These display strings are shown to operators for every project, including
+        non-Blueprint repos whose branches are not main/automain, so they would
+        mislabel what is actually being audited. Branch values must be interpolated
+        from the per-task resolved base_branch/diff_range variables instead.
+
+        Scope: only task/alert display fields (title=, description=, message=).
+        Log format strings are intentionally excluded — they are internal and
+        not shown to operators in the UI.
+        """
+        import os
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        # Match literal 'main...' or 'main -> automain' in task display field assignments.
+        patterns = [
+            re.compile(
+                r"""(?:title|description|message)\s*=\s*f?['""][^'"]*\bmain\.\.\."""
+            ),
+            re.compile(
+                r"""(?:title|description|message)\s*=\s*f?['""][^'"]*\bmain\s*->\s*automain"""
+            ),
+        ]
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in files:
+                if not fname.endswith(".py"):
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    for lineno, line in enumerate(f, start=1):
+                        if line.lstrip().startswith("#") or "# noqa" in line:
+                            continue
+                        if any(pattern.search(line) for pattern in patterns):
+                            rel = os.path.relpath(fpath, app_dir)
+                            offenders.append(f"  {rel}:{lineno}: {line.rstrip()}")
+        assert not offenders, (
+            "Found hardcoded branch names in task display fields (title=/description=/message=) "
+            "in backend/app/.\n"
+            "Interpolate branch values from the resolved per-task variable (e.g. base_branch)\n"
+            "instead of embedding literal 'main...' or 'main -> automain'.\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
 
 # ── Staging-branch prefix classification guard ────────────────────────────
 

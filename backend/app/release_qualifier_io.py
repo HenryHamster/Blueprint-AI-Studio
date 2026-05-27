@@ -95,7 +95,7 @@ async def _spawn_release_audit_task(
 
     task = Task(
         project_id=project_id,
-        title=f"Release audit: main...{candidate_sha[:8]} diff",
+        title=f"Release audit: {base_branch}...{candidate_sha[:8]} diff",
         description=(
             f"Differential audit of {diff_range} against base_branch "
             f"standards for the release qualifier"
