@@ -1879,6 +1879,39 @@ describe('provider runner reliability', () => {
       .rejects.toBeInstanceOf(RateLimitError);
   });
 
+  it('classifies clean-exit (code 0) with rate-limit text in tail as RateLimitError', async () => {
+    // The Anthropic CLI sometimes emits the weekly-limit message as a normal
+    // assistant turn then exits CLEAN (code 0); without this catch, every
+    // handler treats the run as success and posts a degenerate artifact —
+    // most recently the release_audit handler posted a `{audit_score: 0}`
+    // stub that the qualifier scored as a legitimate 0.43 verdict instead
+    // of routing through account rotation.
+    mockProviderRun(["You've hit your weekly limit · resets May 29, 4am (UTC)\n"], 0);
+
+    await expect(runProviderAgent('prompt', null, { value: '' }))
+      .rejects.toBeInstanceOf(RateLimitError);
+  });
+
+  it('clean-exit with rate-limit text >5KB from the tail does NOT match', async () => {
+    // LOG_TAIL_BYTES = 5_000. Anything beyond that window from the end must
+    // not match — a mid-conversation mention of the phrase (e.g. an earlier
+    // tool result quoting documentation) is not a real rate-limit signal.
+    // Chunks are concatenated to stderr in this mock; stderrBuffer is bounded
+    // to its own tail by appendBoundedTail, so a leading rate-limit phrase
+    // followed by 60KB of benign output drops the phrase out of the tail.
+    mockProviderRun(["you've hit your usage limit\n", 'x'.repeat(60_000)], 0);
+
+    await expect(runProviderAgent('prompt', null, { value: '' }))
+      .resolves.toMatchObject({ exitCode: 0 });
+  });
+
+  it('clean-exit with no rate-limit text resolves normally (regression)', async () => {
+    mockProviderRun(['ordinary tool output\n'], 0);
+
+    await expect(runProviderAgent('prompt', null, { value: '' }))
+      .resolves.toMatchObject({ exitCode: 0 });
+  });
+
   it('writes the stdin prompt file as owner-only', async () => {
     vi.stubEnv('TASK_ID', '');
     mockProviderRun([], 0);
