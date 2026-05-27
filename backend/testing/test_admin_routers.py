@@ -4131,6 +4131,179 @@ class TestSetVersionPhase:
         assert "dry-run calibration" in reasoning
 
 
+class TestVersionLifecycleInfraFailureFields:
+    """GET /api/admin/projects/{id}/version-lifecycle exposes infra-failure fields."""
+
+    @pytest.mark.asyncio
+    async def test_infra_failure_fields_exposed_in_last_qualification(
+        self, client: AsyncClient, db_session
+    ):
+        """error, consecutive_infra_errors, and audit_missing_reason from an
+        infra_failure last_qualification record are surfaced in the response."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={
+                "status": "infra_failure",
+                "error": "audit_report_missing",
+                "consecutive_infra_errors": 2,
+                "audit_missing_reason": None,
+                "candidate_sha": "abc1234",
+                "finalized_at": "2026-05-27T00:00:00",
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.get_latest_release_audit_report",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        lq = resp.json()["current_version"]["last_qualification"]
+        assert lq["status"] == "infra_failure"
+        assert lq["error"] == "audit_report_missing"
+        assert lq["consecutive_infra_errors"] == 2
+        assert lq["audit_missing_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_infra_failure_fields_absent_for_successful_qualification(
+        self, client: AsyncClient, db_session
+    ):
+        """For a non-infra-failure qualification, error/consecutive_infra_errors
+        are null and audit_missing_reason is null."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="stabilize",
+            status="open",
+            last_qualification={
+                "status": "dry_run",
+                "confidence": 0.95,
+                "threshold": 0.90,
+                "sub_scores": {"audit": 1.0, "test_erosion": 0.9, "smoketest": 0.95},
+                "blocker": None,
+                "finalized_at": "2026-05-27T00:00:00",
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": True, "reason": "ok"}),
+            ),
+            patch(
+                "app.release_qualifier.get_latest_release_audit_report",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        lq = resp.json()["current_version"]["last_qualification"]
+        assert lq["status"] == "dry_run"
+        assert lq["error"] is None
+        assert lq["consecutive_infra_errors"] is None
+        assert lq["audit_missing_reason"] is None
+
+
+class TestQualificationVerdictsAuditMissingReason:
+    """GET /api/admin/projects/{id}/qualification-verdicts exposes audit_missing_reason."""
+
+    @pytest.mark.asyncio
+    async def test_audit_missing_reason_exposed_on_verdict_row(
+        self, client: AsyncClient, db_session
+    ):
+        """audit_missing_reason populated on a verdict row is returned by the endpoint."""
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="deadbeef",
+            confidence=0.0,
+            blocker="audit_missing",
+            audit_missing_reason="parseable_but_unscoreable",
+            would_promote=False,
+            promotion_enabled=False,
+            terminal_status="not_promoted",
+            threshold=0.90,
+        )
+        db_session.add(verdict)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/qualification-verdicts"
+        )
+        assert resp.status_code == 200, resp.text
+        verdicts = resp.json()["verdicts"]
+        assert len(verdicts) == 1
+        assert verdicts[0]["audit_missing_reason"] == "parseable_but_unscoreable"
+        assert verdicts[0]["blocker"] == "audit_missing"
+
+    @pytest.mark.asyncio
+    async def test_audit_missing_reason_null_for_clean_verdict(
+        self, client: AsyncClient, db_session
+    ):
+        """audit_missing_reason is null on a clean (promoted) verdict."""
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="goodsha123",
+            confidence=0.95,
+            blocker=None,
+            audit_missing_reason=None,
+            would_promote=True,
+            promotion_enabled=True,
+            terminal_status="promoted",
+            threshold=0.90,
+        )
+        db_session.add(verdict)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/qualification-verdicts"
+        )
+        assert resp.status_code == 200, resp.text
+        verdicts = resp.json()["verdicts"]
+        assert len(verdicts) == 1
+        assert verdicts[0]["audit_missing_reason"] is None
+
+
 class TestResetIterationCap:
     """POST /api/admin/tasks/{task_id}/reset-iteration-cap — archives FAILED
     review/fix tasks for the PR. The archive filter pushes pr_number into SQL;

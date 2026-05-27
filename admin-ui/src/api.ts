@@ -743,6 +743,11 @@ export interface VersionQualification {
   ci_resolution: CiResolution | null;
   blocker: string | null;
   finalized_at: string | null;
+  // Infra-failure context (populated only when status=infra_failure).
+  error?: string | null;
+  consecutive_infra_errors?: number | null;
+  // Audit observability: why the audit sub-score is missing/unscoreable.
+  audit_missing_reason?: string | null;
 }
 
 export interface CurrentVersion {
@@ -856,6 +861,7 @@ export interface QualificationVerdictRecord {
   confidence: number | null;
   sub_scores: VersionQualificationSubScores | null;
   blocker: string | null;
+  audit_missing_reason: string | null;
   would_promote: boolean | null;
   promotion_enabled: boolean | null;
   terminal_status: string | null;

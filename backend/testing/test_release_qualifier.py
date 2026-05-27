@@ -3441,6 +3441,71 @@ class TestFinalizeInfraFailure:
         assert count == 0
 
     @pytest.mark.asyncio
+    async def test_legitimate_empty_findings_audit_reaches_verdict_not_infra_failure(
+        self, db_session
+    ):
+        """An audit report with findings=[] and a valid audit_score reaches a real verdict.
+
+        Regression guard: if _audit_missing_reason() were changed to return
+        'parseable_but_unscoreable' for empty-findings-with-score reports, the
+        finalize path would silently mis-route a clean audit as infra_failure.
+        This test ensures that path stays open — a QualificationVerdict row is
+        written and the audit sub-score reflects the clean signal (1.0).
+        """
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={
+                "audit_score": 1.0,
+                "findings": [],
+                "test_erosion": {
+                    "deleted_test_files": [],
+                    "assertion_delta": 0,
+                    "test_count_delta": 0,
+                },
+            },
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "smoke-ok", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # Primary guard: legitimate empty findings must NOT route to infra_failure.
+        assert result["status"] != "infra_failure", (
+            f"empty-findings clean audit mis-routed as infra_failure: {result}"
+        )
+        # A real QualificationVerdict row should be written.
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 1, f"expected 1 QualificationVerdict, got {count}"
+
+        # Audit sub-score must reflect the clean 1.0 signal, not collapse.
+        await db_session.refresh(version)
+        qual = version.last_qualification
+        assert qual["sub_scores"]["audit"] == 1.0, (
+            f"audit sub-score collapsed: {qual['sub_scores']['audit']}, expected 1.0"
+        )
+        # A clean audit is not a hard-blocking dimension.
+        assert result["would_promote"] is True, (
+            f"would_promote should be True for a clean audit, got {result}"
+        )
+
+    @pytest.mark.asyncio
     async def test_smoketest_completed_no_report_reclassified_as_infra_failure(
         self, db_session
     ):

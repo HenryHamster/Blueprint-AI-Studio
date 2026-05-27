@@ -275,6 +275,7 @@ async def _record_qualification_verdict(
             ),
             sub_scores=sub_scores if sub_scores else None,
             blocker=base_record.get("blocker"),
+            audit_missing_reason=base_record.get("audit_missing_reason") or None,
             would_promote=bool(would_promote),
             promotion_enabled=bool(promotion_enabled),
             terminal_status=terminal_status,

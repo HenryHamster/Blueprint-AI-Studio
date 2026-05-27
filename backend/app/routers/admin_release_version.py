@@ -99,6 +99,11 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
         "ci_resolution": qual.get("ci_resolution"),
         "blocker": qual.get("blocker"),
         "finalized_at": qual.get("finalized_at"),
+        # Infra-failure context (populated only when status=infra_failure).
+        "error": qual.get("error"),
+        "consecutive_infra_errors": qual.get("consecutive_infra_errors"),
+        # Audit observability: why the audit sub-score is missing/unscoreable.
+        "audit_missing_reason": qual.get("audit_missing_reason"),
     }
 
 
@@ -292,6 +297,7 @@ async def list_qualification_verdicts(
                 "confidence": v.confidence,
                 "sub_scores": v.sub_scores,
                 "blocker": v.blocker,
+                "audit_missing_reason": v.audit_missing_reason,
                 "would_promote": v.would_promote,
                 "promotion_enabled": v.promotion_enabled,
                 "terminal_status": v.terminal_status,

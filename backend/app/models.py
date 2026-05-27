@@ -2829,6 +2829,12 @@ class QualificationVerdict(SQLModel, table=True):
         sa_column=Column(String(64), nullable=True),
     )
 
+    # Reason the audit sub-score was missing/unscoreable (from release_scoring).
+    audit_missing_reason: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
     # Whether the candidate cleared the promotion threshold.
     would_promote: bool = Field(
         default=False,
