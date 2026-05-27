@@ -697,3 +697,50 @@ async def test_patch_issue_implementation_rejects_base_branch(
         json={"base_branch": "release"},
     )
     assert resp.status_code == 422, resp.text
+
+
+# ---------------------------------------------------------------------------
+# Branch-column backfill endpoint tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_post_backfill_branches_requires_owner_role(
+    client: AsyncClient, db_session, project_member
+):
+    """A member (non-owner) cannot POST backfill-branches."""
+    project = project_member
+    resp = await client.post(f"/api/admin/projects/{project.id}/backfill-branches")
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_post_backfill_branches_owner_succeeds(
+    client: AsyncClient, db_session, project_owner
+):
+    """An owner can POST backfill-branches; the project row is actually mutated and persisted.
+
+    Uses a self-repo project so the backfill takes the no-GitHub-round-trip path
+    (promotion_target := 'main'), letting us assert real DB writes without mocking.
+    """
+    project = project_owner
+    project.is_self_repo = True
+    project.integration_branch = "automain"  # already set; backfill should skip
+    project.promotion_target = None  # the column the backfill must fill
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.post(f"/api/admin/projects/{project.id}/backfill-branches")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["project_id"] == str(project.id)
+    assert data["filled"] == 1
+    assert data["errored"] == 0
+
+    # Verify the write was actually committed — re-read from the DB.
+    db_session.expire(project)
+    await db_session.refresh(project)
+    assert project.promotion_target == "main"
+    assert project.integration_branch == "automain"

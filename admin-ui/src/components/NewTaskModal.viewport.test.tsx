@@ -1,4 +1,4 @@
-import { afterEach, describe, test, vi } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { NewTaskModal } from './NewTaskModal';
@@ -71,6 +71,9 @@ describe('NewTaskModal — viewport regression', () => {
             useManualBranch={false}
             setUseManualBranch={() => {}}
             setBranchOptions={() => {}}
+            taskBranchDefaultsReady={true}
+            taskBranchDefaultsLoading={false}
+            taskBranchDefaultsError={null}
             onRepoChange={() => {}}
             onSubmit={async () => {}}
             onClose={() => {}}
@@ -81,6 +84,64 @@ describe('NewTaskModal — viewport regression', () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 50));
       });
     });
+  });
+
+  test('does not prefill main while project branch config is still loading', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <NewTaskModal
+          newTaskRepo="example/repo"
+          newTaskBranch=""
+          newTaskTitle="Test task"
+          newTaskPrompt="Test prompt"
+          newTaskType="create"
+          newTaskPrNumber=""
+          newTaskPrBranch=""
+          setNewTaskRepo={() => {}}
+          setNewTaskBranch={() => {}}
+          setNewTaskTitle={() => {}}
+          setNewTaskPrompt={() => {}}
+          setNewTaskType={() => {}}
+          setNewTaskPrNumber={() => {}}
+          setNewTaskPrBranch={() => {}}
+          newTaskModel=""
+          newTaskEffort=""
+          setNewTaskModel={() => {}}
+          setNewTaskEffort={() => {}}
+          getDefaultModelForType={() => 'claude-opus-4-7'}
+          getDefaultEffortForType={() => 'medium'}
+          repoOptions={[{ full_name: 'example/repo', default_branch: 'develop' }]}
+          repoLoading={false}
+          repoError={null}
+          useManualRepo={false}
+          setUseManualRepo={() => {}}
+          branchOptions={[]}
+          branchLoading={false}
+          branchError={null}
+          useManualBranch={false}
+          setUseManualBranch={() => {}}
+          setBranchOptions={() => {}}
+          taskBranchDefaultsReady={false}
+          taskBranchDefaultsLoading={true}
+          taskBranchDefaultsError={null}
+          onRepoChange={() => {}}
+          onSubmit={async () => {}}
+          onClose={() => {}}
+        />,
+      );
+    });
+    const branchInput = document.querySelector('input[placeholder="main"]') as HTMLInputElement | null;
+    if (branchInput) {
+      expect(branchInput.value).toBe('');
+    }
+    const launchButton = Array.from(document.querySelectorAll('button')).find(button => button.textContent?.includes('Launch')) as HTMLButtonElement | undefined;
+    expect(launchButton?.disabled).toBe(true);
+    expect(document.body.textContent).toContain('Loading project branch config...');
   });
 
   test('input focus does not trigger zoom at 375px', async () => {
@@ -124,6 +185,9 @@ describe('NewTaskModal — viewport regression', () => {
             useManualBranch={false}
             setUseManualBranch={() => {}}
             setBranchOptions={() => {}}
+            taskBranchDefaultsReady={true}
+            taskBranchDefaultsLoading={false}
+            taskBranchDefaultsError={null}
             onRepoChange={() => {}}
             onSubmit={async () => {}}
             onClose={() => {}}
@@ -182,6 +246,9 @@ describe('NewTaskModal — viewport regression', () => {
             useManualBranch={false}
             setUseManualBranch={() => {}}
             setBranchOptions={() => {}}
+            taskBranchDefaultsReady={true}
+            taskBranchDefaultsLoading={false}
+            taskBranchDefaultsError={null}
             onRepoChange={() => {}}
             onSubmit={async () => {}}
             onClose={() => {}}
@@ -238,6 +305,9 @@ describe('NewTaskModal — viewport regression', () => {
             useManualBranch={false}
             setUseManualBranch={() => {}}
             setBranchOptions={() => {}}
+            taskBranchDefaultsReady={true}
+            taskBranchDefaultsLoading={false}
+            taskBranchDefaultsError={null}
             onRepoChange={() => {}}
             onSubmit={async () => {}}
             onClose={() => {}}
@@ -291,6 +361,9 @@ describe('NewTaskModal — viewport regression', () => {
             useManualBranch={false}
             setUseManualBranch={() => {}}
             setBranchOptions={() => {}}
+            taskBranchDefaultsReady={true}
+            taskBranchDefaultsLoading={false}
+            taskBranchDefaultsError={null}
             onRepoChange={() => {}}
             onSubmit={async () => {}}
             onClose={() => {}}
@@ -346,6 +419,9 @@ describe('NewTaskModal — viewport regression', () => {
             useManualBranch={false}
             setUseManualBranch={() => {}}
             setBranchOptions={() => {}}
+            taskBranchDefaultsReady={true}
+            taskBranchDefaultsLoading={false}
+            taskBranchDefaultsError={null}
             onRepoChange={() => {}}
             onSubmit={async () => {}}
             onClose={() => {}}

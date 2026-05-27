@@ -56,7 +56,7 @@ describe('useTaskModal', () => {
       useTaskModal('create', vi.fn(), { current: vi.fn() }),
     );
     expect(result.current.newTaskRepo).toBe('');
-    expect(result.current.newTaskBranch).toBe('main');
+    expect(result.current.newTaskBranch).toBe('');
     expect(result.current.newTaskTitle).toBe('');
     expect(result.current.newTaskPrompt).toBe('');
     expect(result.current.newTaskType).toBe('create');
@@ -111,6 +111,18 @@ describe('useTaskModal', () => {
       result.current.openNewTaskModal();
     });
     expect(result.current.newTaskBranch).toBe('automain');
+  });
+
+  it('openNewTaskModal leaves base branch empty while project branch config is unresolved', async () => {
+    const defaultTaskBranchRef = { current: null };
+    const selectedProjectRepoRef = { current: 'owner/repo' };
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }, defaultTaskBranchRef, selectedProjectRepoRef),
+    );
+    await act(async () => {
+      result.current.openNewTaskModal();
+    });
+    expect(result.current.newTaskBranch).toBe('');
   });
 
   it('setShowNewTaskModal(false) closes the modal', async () => {

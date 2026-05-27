@@ -12,10 +12,10 @@ export function useTaskModal(
   defaultTaskType: UserLaunchableTaskType,
   addToast: (msg: string, type: 'success' | 'error') => void,
   fetchTasksRef: React.MutableRefObject<() => void>,
-  defaultTaskBranchRef?: React.MutableRefObject<string>,
+  defaultTaskBranchRef?: React.MutableRefObject<string | null>,
   selectedProjectRepoRef?: React.MutableRefObject<string | null>,
 ) {
-  const getDefaultTaskBranch = () => defaultTaskBranchRef?.current || 'main';
+  const getDefaultTaskBranch = () => defaultTaskBranchRef?.current ?? null;
   const getSelectedProjectRepo = () => selectedProjectRepoRef?.current || null;
   const defaultTaskBranch = getDefaultTaskBranch();
 
@@ -24,7 +24,7 @@ export function useTaskModal(
 
   // Form fields
   const [newTaskRepo, setNewTaskRepo] = useState('');
-  const [newTaskBranch, setNewTaskBranch] = useState(defaultTaskBranch);
+  const [newTaskBranch, setNewTaskBranch] = useState(defaultTaskBranch ?? '');
   const [newTaskTitle, setNewTaskTitle] = useState('');
   const [newTaskPrompt, setNewTaskPrompt] = useState('');
   const [newTaskType, setNewTaskType] = useState<UserLaunchableTaskType>('create');
@@ -45,18 +45,24 @@ export function useTaskModal(
 
   useEffect(() => {
     if (!showNewTaskModal) {
-      setNewTaskBranch(defaultTaskBranch);
+      setNewTaskBranch(defaultTaskBranch ?? '');
     }
   }, [defaultTaskBranch, showNewTaskModal]);
+
+  useEffect(() => {
+    if (showNewTaskModal && defaultTaskBranch && !newTaskBranch) {
+      setNewTaskBranch(defaultTaskBranch);
+    }
+  }, [defaultTaskBranch, newTaskBranch, showNewTaskModal]);
 
   const getDefaultBranchForRepo = (repo: string) => {
     const repoMeta = repoOptions.find(r => r.full_name === repo);
     const selectedProjectRepo = getSelectedProjectRepo();
     const defaultTaskBranch = getDefaultTaskBranch();
     if (repo && repo === selectedProjectRepo) {
-      return defaultTaskBranch || repoMeta?.default_branch || 'main';
+      return defaultTaskBranch ?? '';
     }
-    return repoMeta?.default_branch || defaultTaskBranch || 'main';
+    return repoMeta?.default_branch || defaultTaskBranch || '';
   };
 
   const getDefaultModelForType = (taskType: string) => {
@@ -127,7 +133,7 @@ export function useTaskModal(
     setNewTaskType(defaultTaskType);
     setNewTaskModel(getDefaultModelForType(defaultTaskType));
     setNewTaskEffort(getDefaultEffortForType(defaultTaskType));
-    setNewTaskBranch(getDefaultTaskBranch());
+    setNewTaskBranch(getDefaultTaskBranch() ?? '');
     setUseManualRepo(false);
     setUseManualBranch(false);
     setBranchOptions([]);

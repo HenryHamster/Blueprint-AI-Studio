@@ -27,6 +27,7 @@ from app.admin import _get_user_project_with_role
 from app.task_locking import lock_project_or_429, with_design_doc_locked
 from app.playbook_storage import archive_playbook_entry
 from app.shared_state import (
+    backfill_branch_columns,
     get_project_integration_branch,
     get_project_promotion_target,
     get_project_task_branch_namespace,
@@ -880,3 +881,28 @@ async def update_playbook_entry(
             "effectiveness_score": min(round(confirmed / max(referenced, 1), 3), 1.0),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Branch-column backfill endpoint
+# ---------------------------------------------------------------------------
+
+
+@router.post("/projects/{project_id}/backfill-branches")
+async def backfill_project_branches(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Re-run the integration_branch / promotion_target backfill for a single project.
+
+    Only writes NULL columns — populated columns are left untouched.  Useful when
+    a project was onboarded before migrations 0124/0125 or when the initial GitHub
+    API call failed and the operator has since fixed credentials.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    summary = await backfill_branch_columns(session, project_id=project_id)
+    await session.commit()
+    return {"project_id": str(project_id), **summary}

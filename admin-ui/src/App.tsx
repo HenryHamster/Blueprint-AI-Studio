@@ -957,6 +957,9 @@ export default function App() {
           useManualBranch={s.useManualBranch}
           setUseManualBranch={s.setUseManualBranch}
           setBranchOptions={s.setBranchOptions}
+          taskBranchDefaultsReady={s.taskBranchDefaultsReady}
+          taskBranchDefaultsLoading={s.taskBranchDefaultsLoading}
+          taskBranchDefaultsError={s.taskBranchDefaultsError}
           onRepoChange={s.handleRepoChange}
           onSubmit={s.handleCreateTask}
           onClose={() => s.setShowNewTaskModal(false)}

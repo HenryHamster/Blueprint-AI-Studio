@@ -54,7 +54,7 @@ export function useAppState() {
   } = useArchive(addToast);
 
   const fetchTasksRef = useRef<() => Promise<void>>(async () => {});
-  const defaultTaskBranchRef = useRef('main');
+  const defaultTaskBranchRef = useRef<string | null>(null);
   const selectedProjectRepoRef = useRef<string | null>(null);
 
   // Moved before useDeploymentState so it can be passed as a parameter
@@ -1071,19 +1071,32 @@ export function useAppState() {
 
   // ── Integration branch config (project-scoped) ───────────────────────────
   const [integrationBranchData, setIntegrationBranchData] = useState<{ integration_branch: string; is_default: boolean } | null>(null);
+  const [integrationBranchLoaded, setIntegrationBranchLoaded] = useState(false);
+  const [integrationBranchError, setIntegrationBranchError] = useState<string | null>(null);
 
   // ── Promotion target config (project-scoped) ─────────────────────────────
   const [promotionTargetData, setPromotionTargetData] = useState<{ promotion_target: string; is_default: boolean } | null>(null);
+  const [promotionTargetLoaded, setPromotionTargetLoaded] = useState(false);
+  const [promotionTargetError, setPromotionTargetError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!selectedProjectId) {
       setIntegrationBranchData(null);
+      setIntegrationBranchLoaded(false);
+      setIntegrationBranchError(null);
       return;
     }
     authGet(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/integration-branch`)
       .then(res => res.ok ? res.json() : null)
-      .then(data => { if (data?.integration_branch !== undefined) setIntegrationBranchData({ integration_branch: data.integration_branch, is_default: data.is_default }); })
-      .catch(() => {});
+      .then(data => {
+        if (data?.integration_branch !== undefined) setIntegrationBranchData({ integration_branch: data.integration_branch, is_default: data.is_default });
+        setIntegrationBranchLoaded(true);
+        setIntegrationBranchError(null);
+      })
+      .catch(() => {
+        setIntegrationBranchLoaded(true);
+        setIntegrationBranchError('Failed to load integration branch');
+      });
   }, [selectedProjectId]);
 
   const handleUpdateIntegrationBranch = async (branch: string | null) => {
@@ -1109,19 +1122,54 @@ export function useAppState() {
   useEffect(() => {
     if (!selectedProjectId) {
       setPromotionTargetData(null);
+      setPromotionTargetLoaded(false);
+      setPromotionTargetError(null);
       return;
     }
     authGet(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/promotion-target`)
       .then(res => res.ok ? res.json() : null)
-      .then(data => { if (data?.promotion_target !== undefined) setPromotionTargetData({ promotion_target: data.promotion_target, is_default: data.is_default }); })
-      .catch(() => {});
+      .then(data => {
+        if (data?.promotion_target !== undefined) setPromotionTargetData({ promotion_target: data.promotion_target, is_default: data.is_default });
+        setPromotionTargetLoaded(true);
+        setPromotionTargetError(null);
+      })
+      .catch(() => {
+        setPromotionTargetLoaded(true);
+        setPromotionTargetError('Failed to load promotion target');
+      });
   }, [selectedProjectId]);
 
   useEffect(() => {
     const project = projects.find(p => p.id === selectedProjectId) ?? null;
     selectedProjectRepoRef.current = project ? `${project.github_owner}/${project.github_repo}` : null;
-    defaultTaskBranchRef.current = promotionTargetData?.promotion_target || integrationBranchData?.integration_branch || 'main';
-  }, [projects, selectedProjectId, promotionTargetData, integrationBranchData]);
+    const branchConfigReady = !selectedProjectId || (
+      integrationBranchLoaded &&
+      promotionTargetLoaded &&
+      !integrationBranchError &&
+      !promotionTargetError
+    );
+    defaultTaskBranchRef.current = branchConfigReady
+      ? promotionTargetData?.promotion_target || integrationBranchData?.integration_branch || null
+      : null;
+  }, [
+    projects,
+    selectedProjectId,
+    promotionTargetData,
+    integrationBranchData,
+    integrationBranchLoaded,
+    promotionTargetLoaded,
+    integrationBranchError,
+    promotionTargetError,
+  ]);
+
+  const taskBranchDefaultsReady = !selectedProjectId || (
+    integrationBranchLoaded &&
+    promotionTargetLoaded &&
+    !integrationBranchError &&
+    !promotionTargetError
+  );
+  const taskBranchDefaultsLoading = Boolean(selectedProjectId) && !taskBranchDefaultsReady && !integrationBranchError && !promotionTargetError;
+  const taskBranchDefaultsError = integrationBranchError || promotionTargetError;
 
   const handleUpdatePromotionTarget = async (branch: string | null) => {
     if (!selectedProjectId) return;
@@ -1184,6 +1232,7 @@ export function useAppState() {
     setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
+    taskBranchDefaultsReady, taskBranchDefaultsLoading, taskBranchDefaultsError,
     openNewTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
     // Defaults
     defaultTaskType, setDefaultTaskType,

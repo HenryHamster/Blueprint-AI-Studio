@@ -649,7 +649,7 @@ def get_project_promotion_target(project) -> str:
     return getattr(project, "promotion_target", None) or "main"
 
 
-async def backfill_branch_columns(session) -> dict:
+async def backfill_branch_columns(session, project_id=None) -> dict:
     """Populate NULL integration_branch / promotion_target from GitHub defaults.
 
     Runs once at startup (called from main.py lifespan) after migrations finish.
@@ -663,6 +663,10 @@ async def backfill_branch_columns(session) -> dict:
     get_repo_default_branch().  When the GitHub API call fails, emits a per-project
     Alert so an operator can fix credentials and re-run rather than silently falling
     back to 'main'.
+
+    When project_id is provided, only that project is processed.  Used by
+    POST /api/admin/projects/{id}/backfill-branches to re-run the backfill for a
+    single project without restarting the service.
 
     Returns a summary dict:
       {
@@ -680,12 +684,13 @@ async def backfill_branch_columns(session) -> dict:
     summary = {"filled": 0, "skipped": 0, "errored": 0, "self_repo_skipped": 0}
 
     try:
-        result = await session.execute(
-            select(Project).where(
-                (Project.integration_branch.is_(None))
-                | (Project.promotion_target.is_(None))
-            )
+        query = select(Project).where(
+            (Project.integration_branch.is_(None))
+            | (Project.promotion_target.is_(None))
         )
+        if project_id is not None:
+            query = query.where(Project.id == project_id)
+        result = await session.execute(query)
         projects = result.scalars().all()
     except Exception as exc:  # noqa: BLE001
         logger.warning("[BRANCH_BACKFILL] Could not query projects: %s", exc)

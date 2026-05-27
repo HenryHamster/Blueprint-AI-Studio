@@ -468,6 +468,19 @@ async def lifespan(app):
 
     # This instance owns the background-leader lock — start all background services.
 
+    # Backfill NULL integration_branch / promotion_target from GitHub defaults.
+    # Runs once per startup on the leader only; wrapped so an exception here does
+    # not prevent service startup (logged + alerted, not raised).
+    try:
+        async with AsyncSessionLocal() as _bf_session:
+            _bf_summary = await _shared_state.backfill_branch_columns(_bf_session)
+            await _bf_session.commit()
+            logger.info("[STARTUP] Branch backfill complete: %s", _bf_summary)
+    except Exception as _bf_exc:
+        logger.error(
+            "[STARTUP] Branch backfill failed (non-fatal): %s", _bf_exc, exc_info=True
+        )
+
     # Start the Reaper Service background task
     reaper_task = asyncio.create_task(reaper_service())
 
