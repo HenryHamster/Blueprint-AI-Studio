@@ -72,5 +72,21 @@ export function resolveBuildConfig(task: Record<string, unknown>): BuildConfig |
     if (typeof raw.git_user_email === 'string') config.git_user_email = raw.git_user_email;
   }
 
+  // Staging-branch prefixes (research/plan rollup heads). Apply the same
+  // path-traversal + shell-safety hygiene as directory paths since these are
+  // interpolated into reviewer instructions; drop malformed entries. If every
+  // entry is rejected (or the field is the wrong shape) leave it unset so
+  // callers fall back to the Blueprint default (["research/", "plan/"]).
+  if (Array.isArray(raw.staging_branch_prefixes)) {
+    const prefixes: string[] = [];
+    for (const p of raw.staging_branch_prefixes) {
+      if (typeof p !== 'string' || p === '') continue;
+      if (p.includes('..') || p.startsWith('/') || p.includes('\0')) continue;
+      if (!SHELL_CMD_RE.test(p)) continue;
+      prefixes.push(p);
+    }
+    if (prefixes.length > 0) config.staging_branch_prefixes = prefixes;
+  }
+
   return config;
 }

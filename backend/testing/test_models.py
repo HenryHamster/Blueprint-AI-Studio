@@ -331,3 +331,42 @@ def test_task_branch_prefix_explicit_override_wins_over_namespace_derivation():
         }
     )
     assert project.task_branch_prefix == "legacy/"
+
+
+# is_staging_branch (per-project intermediate staging branch predicate)
+
+
+def test_is_staging_branch_default_prefixes_research():
+    assert _make_project().is_staging_branch("research/cycle-1") is True
+
+
+def test_is_staging_branch_default_prefixes_plan():
+    assert _make_project().is_staging_branch("plan/cycle-1") is True
+
+
+def test_is_staging_branch_default_prefixes_non_staging():
+    assert _make_project().is_staging_branch("blueprint/task-abc123") is False
+    assert _make_project().is_staging_branch("main") is False
+
+
+def test_is_staging_branch_custom_prefixes_recognized():
+    project = _make_project(
+        build_config={"staging_branch_prefixes": ["feature/", "wip/"]}
+    )
+    assert project.is_staging_branch("feature/foo") is True
+    assert project.is_staging_branch("wip/bar") is True
+
+
+def test_is_staging_branch_custom_prefixes_reject_default_research():
+    project = _make_project(
+        build_config={"staging_branch_prefixes": ["feature/", "wip/"]}
+    )
+    # With custom prefixes configured, the Blueprint default 'research/' is no
+    # longer a staging branch for this project.
+    assert project.is_staging_branch("research/cycle-1") is False
+
+
+def test_is_staging_branch_empty_or_none_branch():
+    project = _make_project()
+    assert project.is_staging_branch("") is False
+    assert project.is_staging_branch(None) is False

@@ -774,6 +774,59 @@ class TestBaseBranchFallback:
         )
 
 
+# ── Staging-branch prefix classification guard ────────────────────────────
+
+
+class TestStagingBranchClassification:
+    """Guard against hardcoded staging-prefix startswith calls in backend/app/.
+
+    Per-project branch classification must route through Project.is_staging_branch()
+    or Project.staging_branch_prefixes, not via bare .startswith("research/") /
+    .startswith("plan/") calls that silently break non-Blueprint installs.
+
+    Allowlisted files (they legitimately define or default these literals):
+      - models.py  — defines the staging_branch_prefixes property and fallback
+      - services.py — defines _DEFAULT_STAGING_PREFIXES constant
+    """
+
+    _ALLOWLIST = {"models.py", "services.py"}
+    _PATTERN = re.compile(r'\.startswith\(["\'](?:research|plan)/')
+
+    def test_no_hardcoded_staging_prefix_startswith(self):
+        """No production module under backend/app/ may call
+        .startswith("research/") or .startswith("plan/") directly.
+
+        If this fails, replace the hardcoded classification with:
+          - project.is_staging_branch(branch)   for boolean checks
+          - project.staging_branch_prefixes       for prefix iteration
+          - get_project_integration_branch(...)   for integration-branch decisions
+        The allowlisted files (models.py, services.py) define these values and
+        may legitimately contain the literals.
+        """
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in files:
+                if not fname.endswith(".py"):
+                    continue
+                if fname in self._ALLOWLIST:
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    for lineno, line in enumerate(f, start=1):
+                        if line.lstrip().startswith("#") or "# noqa" in line:
+                            continue
+                        if self._PATTERN.search(line):
+                            rel = os.path.relpath(fpath, app_dir)
+                            offenders.append(f"  {rel}:{lineno}: {line.rstrip()}")
+        assert not offenders, (
+            "Found hardcoded staging-prefix startswith calls in backend/app/.\n"
+            "Replace with project.is_staging_branch(branch) or\n"
+            "project.staging_branch_prefixes for per-project prefix resolution.\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
+
 # ── Deployment State Model ──────────────────────────────────────────────────
 
 

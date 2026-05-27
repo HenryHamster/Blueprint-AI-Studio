@@ -355,6 +355,19 @@ class Project(SQLModel, table=True):
                 return prefixes
         return ("research/", "plan/")
 
+    def is_staging_branch(self, branch: str | None) -> bool:
+        """True when ``branch`` is one of this project's intermediate staging
+        branches (research/plan rollup targets).
+
+        Routes all "is this an intermediate staging branch?" decisions through
+        the per-project ``staging_branch_prefixes`` so non-Blueprint installs
+        with custom prefixes are classified correctly. Guards against
+        ``None``/empty branch names.
+        """
+        if not branch:
+            return False
+        return branch.startswith(tuple(self.staging_branch_prefixes))
+
     @property
     def research_branch_prefix(self) -> str:
         """Prefix for research staging branches."""

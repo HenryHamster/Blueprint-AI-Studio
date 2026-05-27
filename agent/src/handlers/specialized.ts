@@ -305,7 +305,7 @@ ${DEFAULT_TOOL_GUIDANCE}`;
     baseBranch,
     owner,
     repo,
-    testsOnMainBranch: baseBranch === (migratePromotionTarget ?? 'main'),
+    testsOnMainBranch: baseBranch === (migratePromotionTarget ?? resolveBaseBranch({} as Record<string, unknown>, task)),
     baseCommit: migrateBaseCommit,
     model,
     effort,

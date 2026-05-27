@@ -93,8 +93,8 @@ async def tl_db(mocker):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-async def _make_project(session) -> Project:
-    project = Project(name="Test Project", user_id="user-1")
+async def _make_project(session, *, build_config: dict | None = None) -> Project:
+    project = Project(name="Test Project", user_id="user-1", build_config=build_config)
     session.add(project)
     await session.commit()
     await session.refresh(project)
@@ -3779,6 +3779,102 @@ async def test_auto_merge_dirty_spawns_fix_with_prompt(tl_db, mocker):
     assert "rebase" in fix_prompt.lower(), "fix_prompt must contain rebase guidance"
     assert "77" in fix_prompt, "fix_prompt must reference the PR number"
     assert "research/cycle-1" in fix_prompt, "fix_prompt must reference the base branch"
+
+
+@pytest.mark.asyncio
+async def test_is_intermediate_honors_custom_staging_prefix(tl_db, mocker):
+    """A small-scope create task whose base branch matches a NON-default
+    configured staging prefix must be classified as intermediate (is_intermediate
+    =True), routing through the auto-merge path. Regression guard for the bug
+    where the small-diff path hardcoded 'research/'/'plan/' instead of the
+    per-project staging_branch_prefixes.
+    """
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+
+    captured_kwargs: list[dict] = []
+
+    async def _capture_spawn(*args, **kwargs):
+        captured_kwargs.append(kwargs)
+        mock_task = mocker.MagicMock()
+        mock_task.id = uuid.uuid4()
+        mock_task.first_payload = {"type": "fix"}
+        mock_task.status = TaskStatus.QUEUED
+        return (mock_task, True)
+
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+    # Merge fails with a dirty state so the intermediate path spawns a
+    # merge_conflict fix — observable proof the intermediate branch was taken.
+    mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "message": "merge conflict"},
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "mergeable_state": "dirty",
+            "head": {"sha": "abc123", "ref": "blueprint/task-deadbeef"},
+        },
+    )
+
+    session, factory = tl_db
+    project = await _make_project(
+        session, build_config={"staging_branch_prefixes": ["feature/", "wip/"]}
+    )
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small"},
+    )
+    # Custom-prefix base branch — only recognized as intermediate when the site
+    # routes through the per-project staging prefixes.
+    task.payloads = [
+        {
+            "type": "create",
+            "prompt": "implement feature X",
+            "base_branch": "feature/cycle-1",
+        }
+    ]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/88",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    fix_spawns = [
+        kw for kw in captured_kwargs if kw.get("fix_reason") == "merge_conflict"
+    ]
+    assert fix_spawns, (
+        "Expected the intermediate auto-merge path to fire for a custom-prefix "
+        "base branch (is_intermediate must honor staging_branch_prefixes)"
+    )
+    assert "feature/cycle-1" in fix_spawns[0].get("fix_prompt", "")
 
 
 @pytest.mark.asyncio

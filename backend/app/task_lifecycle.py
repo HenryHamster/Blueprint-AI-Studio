@@ -1609,9 +1609,9 @@ async def _process_post_commit(
                     "base_branch"
                 ) or _shared_state.get_project_integration_branch(_project)
                 original_prompt = task_payload.get("prompt", task.description or "")
-                is_intermediate = base_branch.startswith(
-                    "research/"
-                ) or base_branch.startswith("plan/")
+                is_intermediate = _project is not None and _project.is_staging_branch(
+                    base_branch
+                )
                 scope = (task.context or {}).get("scope", "unknown")
 
                 # Auto-approve trivially small main-branch diffs: skip review and route

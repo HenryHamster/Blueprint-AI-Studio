@@ -1564,9 +1564,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         f"{failed_count} child(ren) failed — cannot create rollup PR"
                     )
 
-                is_target_intermediate = target_branch.startswith(
-                    "research/"
-                ) or target_branch.startswith("plan/")
+                is_target_intermediate = (
+                    project is not None and project.is_staging_branch(target_branch)
+                )
 
                 # Resume from prior crash — skip PR creation if already done
                 existing_pr = parent_ctx.get("rollup_pr_number")

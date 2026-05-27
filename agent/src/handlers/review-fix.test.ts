@@ -2438,6 +2438,76 @@ describe('handleReview prompt determinism', () => {
   });
 });
 
+// ── handleReview: rollup-PR guidance honors per-project staging prefixes ─────
+describe('handleReview — rollup-PR guidance staging prefixes', () => {
+  const ROLLUP_MARKER = 'Rollup-PR verification';
+  const REVIEW_TASK = { title: 'Review', description: '', context: {}, project_context: {} };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(resolveBuildConfig).mockReturnValue({});
+    vi.mocked(indexMod.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+
+  function lastReviewPrompt(): string {
+    const calls = vi.mocked(indexMod.runClaudeCode).mock.calls;
+    if (calls.length === 0) throw new Error('runClaudeCode was not invoked');
+    return calls[calls.length - 1][0];
+  }
+
+  it('injects rollup guidance when a custom staging prefix matches the head branch', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValue({ staging_branch_prefixes: ['stage/', 'integration/'] });
+    await handleReview(
+      'task-rollup-custom',
+      { pr_number: 10, branch: 'stage/abcd1234', base_branch: 'main' },
+      REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).toContain(ROLLUP_MARKER);
+  });
+
+  it('does NOT inject rollup guidance when the head branch matches no configured prefix', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValue({ staging_branch_prefixes: ['stage/', 'integration/'] });
+    await handleReview(
+      'task-rollup-nomatch',
+      { pr_number: 11, branch: 'feature/foo', base_branch: 'main' },
+      REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).not.toContain(ROLLUP_MARKER);
+  });
+
+  it('default Blueprint config still injects rollup guidance for research/* heads (regression guard)', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValue({});
+    await handleReview(
+      'task-rollup-default',
+      { pr_number: 12, branch: 'research/4da143e3', base_branch: 'main' },
+      REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).toContain(ROLLUP_MARKER);
+  });
+
+  it('default Blueprint config does NOT inject rollup guidance for a non-staging branch', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValue({});
+    await handleReview(
+      'task-rollup-default-nonstaging',
+      { pr_number: 13, branch: 'feat', base_branch: 'main' },
+      REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).not.toContain(ROLLUP_MARKER);
+  });
+
+  it('fingerprint stays invariant to per-project staging prefixes (stable default)', () => {
+    // The fingerprint must track template edits, not per-task config: a project
+    // configuring custom prefixes must not fragment reviewer telemetry, so the
+    // fingerprint always evaluates rollup detection against ['research/','plan/'].
+    const baseFp = computeReviewPromptFingerprint(BLUEPRINT_CONFIG, { branch: 'research/abc', baseBranch: 'main' });
+    const customFp = computeReviewPromptFingerprint(
+      { ...BLUEPRINT_CONFIG, staging_branch_prefixes: ['stage/', 'integration/'] },
+      { branch: 'research/abc', baseBranch: 'main' },
+    );
+    expect(customFp).toBe(baseFp);
+  });
+});
+
 // ── handleFix: fix-task self-review SR focus ─────────────────────────────────
 describe('handleFix — fix-task SR focus block', () => {
   it('includes FIX_TASK_FOCUS content (regression_risk, scope-drift) in the fix prompt', async () => {

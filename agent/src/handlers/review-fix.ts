@@ -263,8 +263,12 @@ For each issue in the \`issues\` array:
 IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
 }
 
-function buildRollupReviewGuidance(branch: string, baseBranch: string): string {
-  const isRollupHead = branch.startsWith('research/') || branch.startsWith('plan/');
+function buildRollupReviewGuidance(
+  branch: string,
+  baseBranch: string,
+  stagingPrefixes: string[] = ['research/', 'plan/'],
+): string {
+  const isRollupHead = stagingPrefixes.some(p => branch.startsWith(p));
   return isRollupHead
     ? `
 **Rollup-PR verification (IMPORTANT — head branch "${branch}" looks like a rollup):**
@@ -973,7 +977,7 @@ export async function handleReview(
   // the rollup branch. We've seen reviewers misread these as "already-on-main"
   // and flag perfectly valid rollup PRs as empty, looping the fix agent on
   // nothing. Make the verification steps explicit.
-  const rollupGuidance = buildRollupReviewGuidance(branch, baseBranch);
+  const rollupGuidance = buildRollupReviewGuidance(branch, baseBranch, reviewBuildConfig?.staging_branch_prefixes);
 
   // Surface which files the create task's self-review verified vs. left unread
   // (truncation blind spots). Only present when _self_review_outcome was

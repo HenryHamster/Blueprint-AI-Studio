@@ -290,6 +290,11 @@ export interface BuildConfig {
    *  Mirrors ``project.task_branch_namespace`` on the backend (resolved via
    *  ``shared_state.get_project_task_branch_namespace``). */
   task_branch_namespace?: string;
+  /** Ordered staging-branch prefixes that identify research/plan rollup heads.
+   *  Defaults to ``["research/", "plan/"]`` when unset. Mirrors
+   *  ``project.staging_branch_prefixes`` on the backend (see
+   *  ``backend/app/models.py``). */
+  staging_branch_prefixes?: string[];
 }
 
 // ── Environment ─────────────────────────────────────────────────────────────

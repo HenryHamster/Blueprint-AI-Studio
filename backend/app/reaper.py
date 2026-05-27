@@ -2545,14 +2545,16 @@ async def reaper_service():
                         ) or payload.get("pr_number")
                         if not pr_number:
                             continue
-                        # Skip closing rollup PRs (branch=research/*). A rollup PR
-                        # represents many tasks' worth of merged work; closing it
-                        # discards the whole body. Better to leave the rollup
-                        # open for human follow-up than to throw away N children's
-                        # successfully-merged contributions for a single fix task
-                        # that exhausted retries.
+                        # Skip closing rollup PRs (branch=staging prefix). A
+                        # rollup PR represents many tasks' worth of merged work;
+                        # closing it discards the whole body. Better to leave the
+                        # rollup open for human follow-up than to throw away N
+                        # children's successfully-merged contributions for a
+                        # single fix task that exhausted retries. Match the FULL
+                        # set of per-project staging prefixes, not just research/.
                         branch = payload.get("branch", "")
-                        if branch.startswith("research/"):
+                        _proj = await session.get(Project, task.project_id)
+                        if _proj is not None and _proj.is_staging_branch(branch):
                             logger.warning(
                                 f"[REAPER] Skip closing rollup PR #{pr_number} "
                                 f"(branch={branch}, fix task {task.id}) — "

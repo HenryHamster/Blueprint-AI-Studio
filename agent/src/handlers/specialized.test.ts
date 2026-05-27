@@ -690,6 +690,36 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
 
     const opts = capturedMigrateOpts();
     expect(opts.baseBranch).toBe('trunk');
+    // No promotion_target → testsOnMainBranch falls back to the resolved
+    // integration branch ('trunk'), which equals baseBranch → true. The
+    // migration must capture the backend baseline on a non-'main' trunk.
+    expect(opts.testsOnMainBranch).toBe(true);
+  });
+
+  it('treats a non-main integration branch as the trunk for testsOnMainBranch', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { prompt: 'Add column' },
+      { ...BASE_TASK, project_metadata: { integration_branch: 'master' } },
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const opts = capturedMigrateOpts();
+    expect(opts.baseBranch).toBe('master');
+    expect(opts.testsOnMainBranch).toBe(true);
+  });
+
+  it('disables tests-on-main when base_branch diverges from a non-main resolved trunk', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { base_branch: 'feature/x', prompt: 'Add column' },
+      { ...BASE_TASK, project_metadata: { integration_branch: 'master' } },
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const opts = capturedMigrateOpts();
+    expect(opts.baseBranch).toBe('feature/x');
+    // base_branch ('feature/x') ≠ resolved trunk ('master') → false.
     expect(opts.testsOnMainBranch).toBe(false);
   });
 

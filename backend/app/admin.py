@@ -2882,9 +2882,9 @@ async def trigger_rollup(
     rollup_pr_url = pr_result.get("html_url", "")
     rollup_pr_number = pr_result.get("number")
 
-    is_target_intermediate = target_branch.startswith(
-        "research/"
-    ) or target_branch.startswith("plan/")
+    is_target_intermediate = _project is not None and _project.is_staging_branch(
+        target_branch
+    )
 
     if is_target_intermediate:
         merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)

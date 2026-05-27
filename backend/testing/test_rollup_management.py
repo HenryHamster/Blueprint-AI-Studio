@@ -162,6 +162,46 @@ async def test_rollup_not_touching_migrations_unaffected(cleanup_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_rollup_auto_merges_for_custom_staging_prefix(cleanup_db, mocker):
+    """A rollup whose target branch matches a NON-default configured staging
+    prefix must be classified as intermediate (is_target_intermediate=True) and
+    auto-merge. Regression guard for the bug where the rollup-completion path
+    hardcoded 'research/'/'plan/' instead of the per-project
+    staging_branch_prefixes — under a custom-prefix project the rollup would
+    have been routed to review instead of auto-merging."""
+    mock_merge, mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("backend/app/models.py"),
+        diff="",  # non-migration → guard returns ok without fetching diff
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    project.build_config = {"staging_branch_prefixes": ["feature/", "wip/"]}
+    cleanup_db.add(project)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(project)
+
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db,
+        project.id,
+        extra_context={
+            "research_branch": "feature/conflict-stg",
+            "parent_base": "feature/conflict-base",
+        },
+    )
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_merge.assert_awaited_once()
+    mock_spawn.assert_not_called()
+    await cleanup_db.refresh(parent)
+    assert parent.requires_approval is False
+
+
+@pytest.mark.asyncio
 async def test_duplicate_revision_rollup_blocked_and_routed_to_fix(cleanup_db, mocker):
     """Two sibling migrations declaring the same revision identifier → the
     combined chain is invalid; the rollup is NOT merged, the parent is held for
