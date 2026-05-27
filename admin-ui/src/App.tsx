@@ -892,7 +892,7 @@ export default function App() {
                   {showSrMissed && (
                     srMissedLoading
                       ? <p className="text-[10px] text-neutral-500 mt-2">Loading…</p>
-                      : <div className="mt-2"><SrMissedRetrospective tasks={srMissedTasks} onTaskClick={handleViewTask} initialCategory={srMissedCategory} /></div>
+                      : <div className="mt-2"><SrMissedRetrospective tasks={srMissedTasks} onTaskClick={handleViewTask} selectedCategory={srMissedCategory} /></div>
                   )}
                 </div>
               )}

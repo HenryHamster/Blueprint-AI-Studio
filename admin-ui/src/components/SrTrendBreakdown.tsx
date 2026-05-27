@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { TrendingUp, TrendingDown, Minus, ChevronRight, ChevronDown, AlertTriangle, ArrowDownRight, ArrowUpRight, Search, Loader2 } from 'lucide-react';
 
 export interface SrMissExample {
@@ -1861,11 +1861,16 @@ const WINDOW_OPTIONS: { label: string; days: number }[] = [
 interface SrMissedRetrospectiveProps {
   tasks: SrMissedTask[];
   onTaskClick?: (taskId: string) => void;
-  initialCategory?: string;
+  selectedCategory?: string;
 }
 
-export function SrMissedRetrospective({ tasks, onTaskClick, initialCategory }: SrMissedRetrospectiveProps) {
-  const [categoryFilter, setCategoryFilter] = useState(initialCategory ?? '');
+export function SrMissedRetrospective({ tasks, onTaskClick, selectedCategory }: SrMissedRetrospectiveProps) {
+  const [categoryFilter, setCategoryFilter] = useState(selectedCategory ?? '');
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- prop-driven reset, not async fetch
+    setCategoryFilter(selectedCategory ?? '');
+  }, [selectedCategory]);
   const [typeFilter, setTypeFilter] = useState('');
   const [windowDays, setWindowDays] = useState(14);
   const [openTaskIds, setOpenTaskIds] = useState<Set<string>>(() => new Set());

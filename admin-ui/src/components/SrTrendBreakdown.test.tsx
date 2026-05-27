@@ -315,6 +315,33 @@ describe('SrMissedRetrospective drilldown', () => {
     expect(screen.getByText('origin: reviewer')).toBeInTheDocument();
     expect(screen.getByText('origin: author')).toBeInTheDocument();
   });
+
+  it('re-syncs the visible list when selectedCategory prop changes', () => {
+    const tasks = [
+      {
+        task_id: 'c1',
+        title: 'Correctness task',
+        created_at: new Date().toISOString(),
+        missed_categories: ['correctness'],
+        caught_categories: [],
+      },
+      {
+        task_id: 's1',
+        title: 'Security task',
+        created_at: new Date().toISOString(),
+        missed_categories: ['security'],
+        caught_categories: [],
+      },
+    ];
+
+    const { rerender } = render(<SrMissedRetrospective tasks={tasks} selectedCategory="correctness" />);
+    expect(screen.getByText('Correctness task')).toBeInTheDocument();
+    expect(screen.queryByText('Security task')).not.toBeInTheDocument();
+
+    rerender(<SrMissedRetrospective tasks={tasks} selectedCategory="security" />);
+    expect(screen.queryByText('Correctness task')).not.toBeInTheDocument();
+    expect(screen.getByText('Security task')).toBeInTheDocument();
+  });
 });
 
 describe('SrTrendBreakdown skip rate line', () => {

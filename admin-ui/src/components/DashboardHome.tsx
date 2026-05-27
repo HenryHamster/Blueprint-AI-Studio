@@ -1237,7 +1237,11 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
         })(),
         (async () => {
           try {
-            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-recent-misses`);
+            const params = new URLSearchParams();
+            if (selectedSrCategory) params.set('category', selectedSrCategory);
+            const query = params.toString();
+            const url = `/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-recent-misses${query ? `?${query}` : ''}`;
+            const res = await apiFetch(url);
             if (res.ok) {
               const data = await res.json();
               setSrRecentMisses(data.misses ?? []);
@@ -1311,7 +1315,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       ? !digestOk && !diagnosticsOk && !openPRsOk
       : !digestOk;
     setLastFetchError(allFailed);
-  }, [selectedProjectId, windowHours]);
+  }, [selectedProjectId, windowHours, selectedSrCategory]);
 
   const refreshVersionLifecycle = useCallback(async () => {
     if (!selectedProjectId) return;
@@ -1980,7 +1984,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
               </p>
               <SrMissedRetrospective
                 tasks={srRecentMisses}
-                initialCategory={selectedSrCategory}
+                selectedCategory={selectedSrCategory}
                 onTaskClick={(taskId) => {
                   const task = tasks.find(t => t.id === taskId);
                   if (task) onViewTask(task);
