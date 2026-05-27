@@ -6,9 +6,10 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { TaskCard, TASK_TYPE_STYLES } from './TaskCard';
+import { TaskCard, TASK_TYPE_STYLES, FAILURE_CLASS_CONFIG } from './TaskCard';
 import type { Task, TaskStatus } from './TaskCard';
 import type { KanbanColumn as KanbanColumnConfig, SortBy } from './KanbanBoard';
+import { getFailureClassBreakdown } from '../utils/failureClass';
 
 const ARCHIVABLE_COLUMNS: TaskStatus[] = ['COMPLETED', 'CANCELLED', 'FAILED'];
 
@@ -20,6 +21,30 @@ const SORT_LABELS: Record<SortBy, string> = {
   duration: 'Longest running',
   attempts: 'Most retried',
 };
+
+function FailureClassBreakdown({ tasks }: { tasks: Task[] }) {
+  const breakdown = useMemo(() => getFailureClassBreakdown(tasks), [tasks]);
+  const entries = useMemo(() => Object.entries(breakdown).sort((a, b) => b[1] - a[1]), [breakdown]);
+
+  if (entries.length === 0) return null;
+
+  return (
+    <div className="flex flex-wrap gap-1">
+      {entries.map(([failureClass, count]) => {
+        const config = FAILURE_CLASS_CONFIG[failureClass];
+        return (
+          <div
+            key={failureClass}
+            className={`text-[9px] px-1.5 py-0.5 rounded-sm font-medium whitespace-nowrap ${config?.color ?? 'bg-neutral-700/50 text-neutral-400'}`}
+            title={config?.hint ?? failureClass}
+          >
+            {count} {config?.label ?? failureClass}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 export function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection, onShiftClick, onCtrlClick, maxRetries, actionLoadingMap, compact, blockingCount, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, onDuplicate, colIdx, cardIdx, cardRef, onNavigate, searchQuery, onDirectionClick }: {
   task: Task;
@@ -383,11 +408,18 @@ export function KanbanColumn({
           const label = style?.label ?? type.toUpperCase();
           return (
             <div key={type} className="mb-3">
-              <div className={`sticky top-0 z-[5] flex items-center gap-1.5 px-2 py-1 mb-2 rounded text-[10px] font-bold uppercase tracking-wider border ${style ? `${style.bg} ${style.text}` : 'bg-neutral-800/50 border-neutral-700/50 text-neutral-400'}`}>
-                <span>{label}</span>
-                <span className="opacity-60">({typeTasks.length})</span>
+              <div className="space-y-0.5">
+                <div className={`sticky top-0 z-[5] flex items-center gap-1.5 px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider border ${style ? `${style.bg} ${style.text}` : 'bg-neutral-800/50 border-neutral-700/50 text-neutral-400'}`}>
+                  <span>{label}</span>
+                  <span className="opacity-60">({typeTasks.length})</span>
+                </div>
+                {col.id === 'FAILED' && typeTasks.length > 0 && (
+                  <div className="px-2">
+                    <FailureClassBreakdown tasks={typeTasks} />
+                  </div>
+                )}
               </div>
-              <div className={compact ? 'space-y-1.5' : 'space-y-2'}>
+              <div className={compact ? 'space-y-1.5 mt-2' : 'space-y-2 mt-2'}>
                 {typeTasks.map(task => {
                   const flatIdx = taskFlatIndex.get(task.id) ?? 0;
                   return (
@@ -435,11 +467,18 @@ export function KanbanColumn({
           const name = projectId === '__none__' ? 'No Project' : (projectMap[projectId] ?? projectId);
           return (
             <div key={projectId} className="mb-3">
-              <div className="sticky top-0 z-[5] flex items-center gap-1.5 px-2 py-1 mb-2 rounded text-[10px] font-bold uppercase tracking-wider bg-neutral-800/50 border border-neutral-700/50 text-neutral-400">
-                <span className="truncate max-w-[200px]" title={name}>{name}</span>
-                <span className="opacity-60 shrink-0">({projectTasks.length})</span>
+              <div className="space-y-0.5">
+                <div className="sticky top-0 z-[5] flex items-center gap-1.5 px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider bg-neutral-800/50 border border-neutral-700/50 text-neutral-400">
+                  <span className="truncate max-w-[200px]" title={name}>{name}</span>
+                  <span className="opacity-60 shrink-0">({projectTasks.length})</span>
+                </div>
+                {col.id === 'FAILED' && projectTasks.length > 0 && (
+                  <div className="px-2">
+                    <FailureClassBreakdown tasks={projectTasks} />
+                  </div>
+                )}
               </div>
-              <div className={compact ? 'space-y-1.5' : 'space-y-2'}>
+              <div className={compact ? 'space-y-1.5 mt-2' : 'space-y-2 mt-2'}>
                 {projectTasks.map(task => {
                   const flatIdx = taskFlatIndex.get(task.id) ?? 0;
                   return (
@@ -563,43 +602,50 @@ export function KanbanColumn({
 
         {/* Expanded content */}
         <div className={`flex flex-col flex-1 overflow-hidden ${isCollapsed ? 'hidden' : ''}`}>
-          <div className="sticky top-0 z-10 bg-neutral-900/95 backdrop-blur-sm pb-2 -mx-1 px-1 flex items-center justify-between mb-3">
-            <div className="flex items-center gap-1">
-              <button
-                data-viewport-allow-small-target
-                onClick={() => toggleCollapse(col.id)}
-                title={`Collapse ${col.label}`}
-                className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50 transition-colors"
-              >
-                <ChevronLeft className="w-3.5 h-3.5" />
-              </button>
-              <h2 className={`text-[11px] font-bold uppercase tracking-widest ${col.id === 'EVALUATING' ? 'text-amber-400' : 'text-neutral-400'}`}>{col.label}</h2>
-            </div>
-            <div className="flex items-center gap-1.5">
-              {selectionMode && columnTasks.length > 0 && (
-                <ColumnSelectCheckbox
-                  columnTasks={columnTasks}
-                  selectedTaskIds={selectedTaskIds}
-                  onBulkToggle={onBulkToggle}
-                />
-              )}
-              <span title={`Sorted: ${SORT_LABELS[sortBy]}`} className="text-neutral-600 flex items-center">
-                <ArrowDownUp className="w-3 h-3" />
-              </span>
-              <span className="text-[10px] bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
-                {columnTasks.length}
-              </span>
-              {isArchivable && columnTasks.length > 0 && (
+          <div className="sticky top-0 z-10 bg-neutral-900/95 backdrop-blur-sm pb-2 -mx-1 px-1 space-y-1.5 mb-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-1">
                 <button
                   data-viewport-allow-small-target
-                  onClick={() => onArchiveColumn(taskIds, col.label)}
-                  title={`Archive all ${col.label} tasks`}
+                  onClick={() => toggleCollapse(col.id)}
+                  title={`Collapse ${col.label}`}
                   className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50 transition-colors"
                 >
-                  <Archive className="w-3.5 h-3.5" />
+                  <ChevronLeft className="w-3.5 h-3.5" />
                 </button>
-              )}
+                <h2 className={`text-[11px] font-bold uppercase tracking-widest ${col.id === 'EVALUATING' ? 'text-amber-400' : 'text-neutral-400'}`}>{col.label}</h2>
+              </div>
+              <div className="flex items-center gap-1.5">
+                {selectionMode && columnTasks.length > 0 && (
+                  <ColumnSelectCheckbox
+                    columnTasks={columnTasks}
+                    selectedTaskIds={selectedTaskIds}
+                    onBulkToggle={onBulkToggle}
+                  />
+                )}
+                <span title={`Sorted: ${SORT_LABELS[sortBy]}`} className="text-neutral-600 flex items-center">
+                  <ArrowDownUp className="w-3 h-3" />
+                </span>
+                <span className="text-[10px] bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
+                  {columnTasks.length}
+                </span>
+                {isArchivable && columnTasks.length > 0 && (
+                  <button
+                    data-viewport-allow-small-target
+                    onClick={() => onArchiveColumn(taskIds, col.label)}
+                    title={`Archive all ${col.label} tasks`}
+                    className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50 transition-colors"
+                  >
+                    <Archive className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
             </div>
+            {col.id === 'FAILED' && columnTasks.length > 0 && (
+              <div className="px-1">
+                <FailureClassBreakdown tasks={columnTasks} />
+              </div>
+            )}
           </div>
 
           <div className={`overflow-y-auto flex-1 pr-1 custom-scrollbar ${compact ? 'space-y-1.5' : 'space-y-2'}`}>

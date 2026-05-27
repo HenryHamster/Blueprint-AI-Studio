@@ -1,5 +1,7 @@
 import type { DateRange } from '../hooks/useSearchFilters';
+import { FAILURE_CLASSES } from '../hooks/useSearchFilters';
 import { FILTER_TASK_TYPE_IDS } from '../taskCapabilities';
+import { FAILURE_CLASS_CONFIG } from './TaskCard';
 
 interface QuickFilterPresetsProps {
   statusFilter: string[];
@@ -11,6 +13,7 @@ interface QuickFilterPresetsProps {
   stuckCount1h: number;
   stuckMinSeconds: number;
   searchQuery: string;
+  failureClassFilter?: string[];
   setStatusFilter: (v: string[]) => void;
   setTaskTypeFilter: (v: string[]) => void;
   setDateRange: (v: DateRange) => void;
@@ -19,6 +22,7 @@ interface QuickFilterPresetsProps {
   setStuckFilter: (v: boolean) => void;
   setStuckMinSeconds: (v: number) => void;
   setSearchQuery: (v: string) => void;
+  setFailureClassFilter?: (v: string[]) => void;
 }
 
 const ALL_STATUSES = ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING', 'FAILED', 'CANCELLED', 'COMPLETED'];
@@ -27,6 +31,8 @@ const ALL_TYPES = [...FILTER_TASK_TYPE_IDS];
 export function QuickFilterPresets({
   statusFilter, dateRange, requiresApproval, blockedFilter, stuckFilter, stuckCount, stuckCount1h, stuckMinSeconds, searchQuery,
   setStatusFilter, setTaskTypeFilter, setDateRange, setRequiresApproval, setBlockedFilter, setStuckFilter, setStuckMinSeconds, setSearchQuery,
+  failureClassFilter = [],
+  setFailureClassFilter,
 }: QuickFilterPresetsProps) {
   const isFailedToday = statusFilter.length === 1 && statusFilter[0] === 'FAILED' && dateRange === '24h' && !requiresApproval && searchQuery === '';
   const isStuckHour = stuckFilter && stuckMinSeconds === 3600 && statusFilter.length === ALL_STATUSES.length && dateRange === 'all' && searchQuery === '';
@@ -43,6 +49,16 @@ export function QuickFilterPresets({
     setStuckFilter(false);
     setStuckMinSeconds(0);
     setSearchQuery('');
+    setFailureClassFilter?.([]);
+  };
+
+  const applyFailureClass = (failureClass: string) => {
+    if (setFailureClassFilter) {
+      const isActive = failureClassFilter.length === 1 && failureClassFilter[0] === failureClass;
+      setFailureClassFilter(isActive ? [] : [failureClass]);
+      return;
+    }
+    window.dispatchEvent(new CustomEvent('blueprint:failure-class-filter', { detail: failureClass }));
   };
 
   const presets = [
@@ -117,20 +133,31 @@ export function QuickFilterPresets({
       },
     },
   ];
+  const failureClassPresets = FAILURE_CLASSES.map(failureClass => ({
+    failureClass,
+    label: FAILURE_CLASS_CONFIG[failureClass].label,
+    active: failureClassFilter.length === 1 && failureClassFilter[0] === failureClass,
+  }));
 
   return (
-    <div className="flex items-center gap-1.5 mb-3">
+    <div className="flex flex-wrap items-center gap-1.5 mb-3">
       {presets.map(p => (
+        <button key={p.label.split(' (')[0]} onClick={p.apply} className={`px-2.5 py-0.5 rounded-full text-xs border transition-colors ${
+          p.active
+            ? p.danger ? 'bg-red-500/20 border-red-500/40 text-red-400' : 'bg-amber-500/20 border-amber-500/40 text-amber-400'
+            : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+        }`}>{p.label}</button>
+      ))}
+      {failureClassPresets.map(p => (
         <button
-          key={p.label.split(' (')[0]}
-          onClick={p.apply}
+          key={p.failureClass}
+          onClick={() => applyFailureClass(p.failureClass)}
           className={`px-2.5 py-0.5 rounded-full text-xs border transition-colors ${
             p.active
-              ? p.danger
-                ? 'bg-red-500/20 border-red-500/40 text-red-400'
-                : 'bg-amber-500/20 border-amber-500/40 text-amber-400'
+              ? `border-transparent ${FAILURE_CLASS_CONFIG[p.failureClass].color}`
               : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
           }`}
+          title={`Filter FAILED tasks to ${p.label}`}
         >
           {p.label}
         </button>

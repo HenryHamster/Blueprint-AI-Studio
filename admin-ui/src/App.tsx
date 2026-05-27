@@ -36,6 +36,7 @@ import { ProjectMembers } from './components/ProjectMembers';
 import { CatchUpPanel } from './components/CatchUpPanel';
 import { MessagesPanel } from './components/MessagesPanel';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
+import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
 // StatusBar removed — redundant connection info
 import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
@@ -77,6 +78,14 @@ export default function App() {
       return (stored as SortBy) ?? 'newest';
     } catch { return 'newest'; }
   });
+  useEffect(() => {
+    const onFailureClassFilter = (e: Event) => {
+      const failureClass = (e as CustomEvent<string>).detail;
+      if (failureClass && failureClass in FAILURE_CLASS_CONFIG) s.setFailureClassFilter([failureClass]);
+    };
+    window.addEventListener('blueprint:failure-class-filter', onFailureClassFilter);
+    return () => window.removeEventListener('blueprint:failure-class-filter', onFailureClassFilter);
+  }, [s.setFailureClassFilter]);
 
   useEffect(() => {
     localStorage.setItem(SORT_KEY, sortBy);
@@ -363,11 +372,12 @@ export default function App() {
       const dateMatch = cutoff === null || parseTimestamp(t.created_at).getTime() >= cutoff;
       const blockedMatch = !s.blockedFilter || (t.status === 'QUEUED' && t.depends_on != null && t.depends_on.length > 0);
       const approvalMatch = !s.requiresApproval || t.requires_approval;
+      const failureClassMatch = s.failureClassFilter.length === 0 || (t.status === 'FAILED' && t.failure_class != null && s.failureClassFilter.includes(t.failure_class));
       const stuckMatch = !s.stuckFilter || stuckTaskIds.has(t.id);
-      return typeMatch && statusMatch && searchMatch && projectMatch && dateMatch && blockedMatch && approvalMatch && stuckMatch;
+      return typeMatch && statusMatch && searchMatch && projectMatch && dateMatch && blockedMatch && approvalMatch && failureClassMatch && stuckMatch;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.blockedFilter, s.requiresApproval, s.stuckFilter, s.stuckMinSeconds, stuckTaskIds]);
+  }, [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.blockedFilter, s.requiresApproval, s.stuckFilter, s.stuckMinSeconds, stuckTaskIds, s.failureClassFilter]);
 
   const orderedExportTasks = useMemo(() => {
     if (s.viewMode !== 'kanban') return filteredTasks;
@@ -380,7 +390,7 @@ export default function App() {
     downloadTaskCsv(orderedExportTasks, projectName);
   }, [orderedExportTasks, selectedProject?.github_repo, selectedProject?.name, s.selectedProjectId]);
 
-  const hasActiveFilters = s.tasks.length > 0 && filteredTasks.length < s.tasks.length;
+  const hasActiveFilters = s.tasks.length > 0 && (filteredTasks.length < s.tasks.length || s.failureClassFilter.length > 0);
 
   if (s.authLoading) {
     return (
@@ -773,6 +783,8 @@ export default function App() {
               onTypeFilterChange={s.setTaskTypeFilter}
               statusFilter={s.statusFilter}
               onStatusFilterChange={s.setStatusFilter}
+              failureClassFilter={s.failureClassFilter}
+              onFailureClassFilterChange={s.setFailureClassFilter}
               dateRange={s.dateRange}
               onDateRangeChange={s.setDateRange}
               blockedFilter={s.blockedFilter}
@@ -838,6 +850,8 @@ export default function App() {
             stuckCount1h={stuckCount1h}
             stuckMinSeconds={s.stuckMinSeconds}
             searchQuery={s.searchQuery}
+            failureClassFilter={s.failureClassFilter}
+            setFailureClassFilter={s.setFailureClassFilter}
             setStatusFilter={s.setStatusFilter}
             setTaskTypeFilter={s.setTaskTypeFilter}
             setDateRange={s.setDateRange}

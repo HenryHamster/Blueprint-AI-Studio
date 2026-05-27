@@ -958,12 +958,15 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
 
       {task.status === 'FAILED' && task.failure_class && FAILURE_CLASS_CONFIG[task.failure_class] ? (
         <div className="mb-2">
-          <span
-            className={`inline-block text-[10px] px-1.5 py-0.5 rounded font-semibold ${FAILURE_CLASS_CONFIG[task.failure_class].color}`}
+          <button
+            type="button"
+            data-viewport-allow-small-target
+            onClick={(e) => { e.stopPropagation(); window.dispatchEvent(new CustomEvent('blueprint:failure-class-filter', { detail: task.failure_class })); }}
+            className={`inline-flex items-center text-[10px] px-1.5 py-0.5 rounded font-semibold hover:opacity-80 transition-opacity ${FAILURE_CLASS_CONFIG[task.failure_class].color}`}
             title={FAILURE_CLASS_CONFIG[task.failure_class].hint}
           >
             {FAILURE_CLASS_CONFIG[task.failure_class].label}
-          </span>
+          </button>
           <p className="text-[10px] text-neutral-500 mt-0.5">{FAILURE_CLASS_CONFIG[task.failure_class].suggestion}</p>
           {(() => {
             const retryAfter = task.context?.retry_after as string | undefined;

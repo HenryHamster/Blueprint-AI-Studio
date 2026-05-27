@@ -3,6 +3,7 @@ import { useRef, useState, useEffect } from 'react';
 import type { RefObject } from 'react';
 import type { DateRange } from '../hooks/useSearchFilters';
 import { FILTER_TASK_TYPE_OPTIONS } from '../taskCapabilities';
+import { FAILURE_CLASS_CONFIG } from './TaskCard';
 
 interface SearchFilterBarProps {
   searchQuery: string;
@@ -11,6 +12,8 @@ interface SearchFilterBarProps {
   onTypeFilterChange: (filter: string[]) => void;
   statusFilter?: string[];
   onStatusFilterChange?: (filter: string[]) => void;
+  failureClassFilter?: string[];
+  onFailureClassFilterChange?: (filter: string[]) => void;
   dateRange: DateRange;
   onDateRangeChange: (range: DateRange) => void;
   blockedFilter: boolean;
@@ -173,8 +176,9 @@ const DATE_RANGE_OPTIONS: { label: string; value: DateRange }[] = [
 ];
 
 const DATE_RANGE_SELECT_OPTIONS: { label: string; value: string }[] = DATE_RANGE_OPTIONS.map(o => ({ label: o.label, value: o.value }));
+const FAILURE_CLASS_OPTIONS = Object.entries(FAILURE_CLASS_CONFIG).map(([value, config]) => ({ value, label: config.label }));
 
-export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, dateRange, onDateRangeChange, blockedFilter, onBlockedFilterChange, onDownloadCsv, inputRef }: SearchFilterBarProps) {
+export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, failureClassFilter = [], onFailureClassFilterChange, dateRange, onDateRangeChange, blockedFilter, onBlockedFilterChange, onDownloadCsv, inputRef }: SearchFilterBarProps) {
   const [inputValue, setInputValue] = useState(searchQuery);
   const typeOptions = FILTER_TASK_TYPE_OPTIONS;
   useEffect(() => {
@@ -191,6 +195,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
   const activeFilterCount = [
     searchQuery !== '',
     taskTypeFilter.length < typeOptions.length,
+    onFailureClassFilterChange != null && failureClassFilter.length > 0,
     dateRange !== 'all',
     blockedFilter,
   ].filter(Boolean).length;
@@ -200,6 +205,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
   function handleClear() {
     onSearchChange('');
     onTypeFilterChange(typeOptions.map(o => o.value));
+    onFailureClassFilterChange?.([]);
     onDateRangeChange('all');
     onBlockedFilterChange(false);
   }
@@ -224,6 +230,15 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
         selected={taskTypeFilter}
         onChange={onTypeFilterChange}
       />
+
+      {onFailureClassFilterChange && (
+        <MultiSelectDropdown
+          label="Failure class"
+          options={FAILURE_CLASS_OPTIONS}
+          selected={failureClassFilter}
+          onChange={onFailureClassFilterChange}
+        />
+      )}
 
       <SingleSelectDropdown
         options={DATE_RANGE_SELECT_OPTIONS}
