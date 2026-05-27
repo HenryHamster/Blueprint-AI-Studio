@@ -295,6 +295,13 @@ describe('handleCreate configuration', () => {
     expect(opts.baseBranch).toBe('feature/parent');
     expect(opts.testsOnMainBranch).toBe(false);
   });
+
+  it('uses task.project_metadata.promotion_target when payload omits promotion_target', async () => {
+    const task = { title: 'Task', description: '', project_metadata: { promotion_target: 'release' } };
+    await handleCreate(TASK_ID, { prompt: 'Do something', base_branch: 'release' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const opts = capturedOpts();
+    expect(opts.testsOnMainBranch).toBe(true);
+  });
 });
 
 describe('handleRefactor configuration', () => {
@@ -3550,5 +3557,28 @@ describe('operator_requested_review_for branch-existence check', () => {
       ([, body]) => body['failure_category'] === 'PR_BRANCH_DELETED',
     );
     expect(deletedCalls).toHaveLength(0);
+  });
+
+  it('uses project_metadata.integration_branch as prBaseBranch fallback when payload.base_branch is absent', async () => {
+    const { execFileSync } = await import('child_process');
+    const { prepareWorkspaceForRole } = await import('../workspacePrep.js');
+    // ls-remote returns non-empty → branch exists
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from('abc123\trefs/heads/blueprint/task-trunk\n'));
+
+    const task = {
+      title: 'Review PR #7777',
+      description: '',
+      context: { operator_requested_review_for: 'pr-7777' },
+      project_metadata: { integration_branch: 'trunk' },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Automated review', branch: 'blueprint/task-trunk' },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    expect(vi.mocked(prepareWorkspaceForRole)).toHaveBeenCalledWith(
+      expect.objectContaining({ baseBranch: 'trunk' }),
+    );
   });
 });

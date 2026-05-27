@@ -1,8 +1,8 @@
-# Blueprint — Claude Code PVM Launcher
+# Blueprint
 
-A platform for launching, monitoring, and scaling autonomous Claude Code instances on sandboxed GCP Virtual Machines. Assign a repo and a prompt, and Blueprint spins up an isolated VM, runs Claude Code, pushes a branch, and opens a PR.
+Blueprint is a platform for launching, monitoring, and scaling autonomous Claude Code instances on sandboxed GCP Virtual Machines. Assign a repo and a prompt, and Blueprint provisions an isolated VM, runs Claude Code, pushes a branch, and opens a PR.
 
-Blueprint also supports **autonomous research mode**: a continuous loop where the orchestrator automatically generates and dispatches tasks based on configurable strategic directions, without manual intervention.
+Blueprint also supports autonomous research mode: the orchestrator can generate and dispatch tasks from configurable strategic directions without manual intervention.
 
 ## Architecture
 
@@ -23,37 +23,41 @@ Agent VMs          Background workers
 
 ### Components
 
-- **Orchestrator** (`backend/`) — FastAPI backend deployed to Cloud Run. Manages projects, tasks, VM lifecycle, and autonomous research. Runs background workers:
+- **Orchestrator** (`backend/`) — FastAPI backend deployed to Cloud Run. Manages projects, tasks, VM lifecycle, and autonomous research. It registers the API routers under `backend/app/routers/` and runs background workers:
   - `orchestrator_worker` — polls for QUEUED tasks every 10 s and provisions VMs
   - `reaper_service` — kills VMs that miss heartbeats (5-minute timeout, 30 s cadence)
   - `gcp_cleanup_service` — sweeps orphaned VMs every 15 min
   - `autonomous_research_worker` — spawns research tasks based on strategic directions
 
-- **Admin UI** (`admin-ui/`) — React dashboard for monitoring agents, reviewing directions, configuring settings, and viewing analytics. Real-time log streaming via WebSocket.
+- **Admin UI** (`admin-ui/`) — React dashboard for monitoring agents, reviewing directions, configuring settings, and viewing analytics. It also consumes the WebSocket log stream.
 
-- **Launcher UI** (root `src/`) — Lighter React frontend for creating new tasks and viewing progress. Runs on port 3000.
+- **Launcher UI** (root `src/`) — Lightweight React frontend for creating new tasks and viewing progress. Runs on port 3000 in local dev.
 
-- **Agent** (`agent/`) — TypeScript process that runs inside each VM. Claims its task, clones the repo, runs `claude -p` with streaming output, handles the review-fix cycle, and creates a PR.
+- **Agent** (`agent/`) — TypeScript process that runs inside each VM. Claims its task, clones the repo, runs Claude Code with streaming output, handles the review-fix cycle, and creates a PR.
 
-- **Infrastructure** (`infra/`) — Terraform for VPC, Cloud NAT, Cloud Run, AlloyDB, IAM. Packer for pre-baked agent VM images with Claude Code CLI.
+- **Infrastructure** (`infra/`) — Terraform for VPC, Cloud NAT, Cloud Run, AlloyDB, and IAM. Packer builds the pre-baked agent VM image.
 
 ## Quick Start (Local Mode)
 
-Local mode runs agents as subprocesses instead of GCP VMs — no cloud setup needed for testing.
+Local mode runs agents as subprocesses instead of GCP VMs. You still need the backend, database, and frontends running locally.
 
 ```bash
 # 1. Copy and fill in environment variables
 cp .env.example .env
-# Set at minimum: ANTHROPIC_API_KEY, ADMIN_API_KEY, LOCAL_MODE=true
+# Set at minimum: ANTHROPIC_API_KEY, ADMIN_API_KEY, LOCAL_MODE=true, DATABASE_URL
 
 # 2. Start backend + database
 docker-compose up -d
 
-# 3. Start UIs (launcher on :3000, admin on :3001)
+# 3. Run the backend API
+cd backend
+uvicorn app.main:app --reload --port 8080
+
+# 4. Start UIs (launcher on :3000, admin on :3001)
 npm install
 npm run dev
 
-# 4. Open http://localhost:3001 and launch a task
+# 5. Open http://localhost:3001 and launch a task
 ```
 
 ## Production Setup (GCP)
@@ -72,7 +76,7 @@ See [Deploy.md](Deploy.md) for full Cloud Run + GCP deployment instructions.
 | `ANTHROPIC_API_KEY` | API key passed to agent VMs for Claude Code |
 | `ADMIN_API_KEY` | Shared key for admin UI authentication |
 | `LOCAL_MODE` | `true` to run agents as local subprocesses |
-| `DATABASE_URL` | PostgreSQL connection string (asyncpg) |
+| `DATABASE_URL` | PostgreSQL connection string used by the backend |
 | `GCP_PROJECT_ID` | GCP project for VM provisioning |
 | `ORCHESTRATOR_URL` | URL agents use to reach the orchestrator |
 | `MAX_CONCURRENT_VMS` | Maximum simultaneously running agent VMs (default 8) |
@@ -82,20 +86,20 @@ See `.env.example` for the full list.
 
 ## How It Works
 
-1. Open the admin UI and click **Launch Task**
+1. Open the admin UI and click Launch Task
 2. Enter a GitHub repo (`owner/repo`), base branch, and a prompt
-3. The orchestrator creates a project + task, assigns a VM name
-4. The orchestrator worker picks up the task and provisions a GCP VM (or local subprocess)
-5. The agent boots, claims its task via JWT-authenticated API
+3. The orchestrator creates a project and task, then assigns a VM name
+4. The orchestrator worker picks up the queued task and provisions a GCP VM, or a local subprocess in `LOCAL_MODE=true`
+5. The agent boots and claims its task via the JWT-authenticated API
 6. It clones the repo, creates a working branch, and runs Claude Code
-7. Logs stream back to the admin UI in real-time via WebSocket
-8. On success: commits, pushes, creates a PR, reports COMPLETED
-9. On failure: reports FAILED with error logs, retries up to 3 times
-10. The VM self-destructs (1-hour hard TTL as safety net)
+7. Logs stream back to the admin UI in real time via WebSocket
+8. On success, it commits, pushes, creates a PR, and reports `COMPLETED`
+9. On failure, it reports `FAILED` with logs and retries up to 3 times
+10. The VM is reaped if it stops heartbeating or exceeds its hard TTL
 
 ## Task Types
 
-Blueprint supports 17 task types, each handled by a dedicated agent handler:
+Blueprint supports 20 task types, each handled by a dedicated agent handler:
 
 | Type | Description |
 |---|---|
@@ -116,6 +120,9 @@ Blueprint supports 17 task types, each handled by a dedicated agent handler:
 | `debug` | Investigate and diagnose a bug |
 | `perf` | Profile and improve performance |
 | `investigate` | Open-ended investigation of an issue |
+| `self_audit` | Audit system maturity and recommend operating mode |
+| `release_audit` | Audit the release qualifier diff |
+| `memo` | Produce a structured reasoning artifact without opening a PR |
 
 ## Autonomous Research Mode
 
@@ -150,19 +157,20 @@ Run tests locally before committing:
 
 ```bash
 # Backend (requires Docker for Postgres)
-bash scripts/test-backend.sh                    # Full suite
+bash scripts/test-backend.sh                     # Full suite
 bash scripts/test-backend.sh testing/test_foo.py  # Specific file
 
-# Frontend (linting + unit tests)
-cd admin-ui && npm run build && npx eslint .
+# Frontend
+npm run build
+cd admin-ui && npm run test:viewport
 
 # Agent (TypeScript)
-cd agent && npx tsc --noEmit
+cd agent && npm run build && npm run lint
 ```
 
 Key test invariants:
 - Module size guardrails (`backend/testing/module_size_limits.json`) — request permission to bump limits via test assertion message
-- Schema revision (`EXPECTED_SCHEMA_REVISION` in `backend/app/main.py`) — must match latest Alembic migration
+- Schema revision (`EXPECTED_SCHEMA_REVISION` in `backend/app/main.py`) — must match the latest Alembic migration
 - Database migrations are immutable — new migrations must chain from the latest `down_revision`
 
 ### Adding Features

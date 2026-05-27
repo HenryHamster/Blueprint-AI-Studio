@@ -177,8 +177,8 @@ export async function handleMigrate(
   model?: string, effort?: string
 ) {
   const rawPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
-  const migratePromotionTarget = strVal(payload.promotion_target) || undefined;
+  const rawBaseBranch = strVal(payload.base_branch) || strVal((task.project_metadata as Record<string, unknown> | undefined)?.integration_branch) || 'main';
+  const migratePromotionTarget = strVal(payload.promotion_target) || strVal((task.project_metadata as Record<string, unknown> | undefined)?.promotion_target) || undefined;
   const migrateTaskTitle = strVal(task.title);
   const prompt = migrateTaskTitle ? `Task: ${migrateTaskTitle}\n\n${rawPrompt}` : rawPrompt;
 

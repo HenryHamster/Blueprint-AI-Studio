@@ -26,7 +26,7 @@ FastAPI application entry point. Defines:
 TASK_PRIORITY_MAP = {"high": 100, "medium": 50, "low": 0}
 ```
 
-**Schema revision:** Always matches the latest Alembic migration (currently `0114`).
+**Schema revision:** Always matches the latest Alembic migration (currently `0125`).
 
 ---
 
@@ -205,12 +205,13 @@ Handles terminal status transitions (COMPLETED, FAILED).
 Task type → handler mapping and validation.
 
 **Task types:**
-- Code changes: `create`, `refactor`, `fix`
+- Code changes: `create`, `refactor`, `fix`, `qa`
 - Review: `review`
-- Planning & research: `plan`, `research`, `strategic_review`
-- Specialized: `security_audit`, `qa`, `perf`, `debug`, `investigate`
+- Planning & research: `plan`, `research`, `strategic_review`, `design_doc_update`
+- Specialized: `security_audit`, `perf`, `debug`, `investigate`
 - Docs: `docs`
-- Other: `deps`, `migrate`, `smoketest`, `design_doc_update`, `self_audit`, `release_audit`, `memo`
+- Ops: `deps`, `migrate`, `smoketest`
+- System/diagnostic: `self_audit`, `release_audit`, `memo`
 
 Each type has a handler in `agent/src/handlers/`.
 

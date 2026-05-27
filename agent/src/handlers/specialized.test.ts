@@ -656,6 +656,45 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
     expect(opts.testsOnMainBranch).toBe(false);
   });
 
+  it('falls back to project_metadata.integration_branch when payload.base_branch is absent', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { prompt: 'Add column' },
+      { ...BASE_TASK, project_metadata: { integration_branch: 'trunk' } },
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const opts = capturedMigrateOpts();
+    expect(opts.baseBranch).toBe('trunk');
+    expect(opts.testsOnMainBranch).toBe(false);
+  });
+
+  it('falls back to main when both payload.base_branch and project_metadata.integration_branch are absent', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { prompt: 'Add column' },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const opts = capturedMigrateOpts();
+    expect(opts.baseBranch).toBe('main');
+    expect(opts.testsOnMainBranch).toBe(true);
+  });
+
+  it('falls back to project_metadata.promotion_target when payload.promotion_target is absent', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { prompt: 'Add column' },
+      { ...BASE_TASK, project_metadata: { integration_branch: 'trunk', promotion_target: 'trunk' } },
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const opts = capturedMigrateOpts();
+    expect(opts.baseBranch).toBe('trunk');
+    // base_branch matches promotion_target → testsOnMainBranch=true
+    expect(opts.testsOnMainBranch).toBe(true);
+  });
+
   it('throws when stale remote branch has open PRs (refuses to delete)', async () => {
     // ls-remote succeeds (branch exists); simulate open PR on that branch
     vi.mocked(git).mockImplementation((args: string[]) => {

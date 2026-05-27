@@ -3439,6 +3439,141 @@ class TestFinalizeInfraFailure:
 
 
 # ===========================================================================
+# _finalize_qualification — happy-path audit_score regression
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_finalize_happy_path_audit_score_high(db_session, mocker):
+    """Happy path: a COMPLETED audit with clean findings yields audit sub-score ≥ 0.7.
+
+    Regression guard for the 0.00-collapse finding: ensures that a real
+    COMPLETED audit task whose RELEASE_AUDIT_REPORT artifact carries a small
+    number of low-severity findings produces a high composite with no blocker.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.9,
+            "findings": [
+                {
+                    "severity": "low",
+                    "summary": "Minor style issue.",
+                    "file": "app/foo.py",
+                },
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 3,
+                "test_count_delta": 1,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "smoke-a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run", f"expected dry_run, got {result['status']}"
+    assert result["would_promote"] is True
+
+    # sub_scores are stored in the persisted last_qualification record.
+    await db_session.refresh(version)
+    qual = version.last_qualification
+    assert qual["sub_scores"]["audit"] >= 0.7, (
+        f"audit sub-score collapsed to {qual['sub_scores']['audit']}, expected ≥ 0.7"
+    )
+    assert qual.get("blocker") is None, f"unexpected blocker: {qual.get('blocker')}"
+
+
+@pytest.mark.asyncio
+async def test_finalize_quality_blocker_four_critical_findings(db_session, mocker):
+    """Quality blocker: 4 critical findings yield a quality verdict (not infra_failure).
+
+    Ensures that a COMPLETED audit task with a 0.00 audit_score from real
+    findings is recorded as a quality verdict and the strategic agent can target
+    the findings list — not mis-routed as infra_failure.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.0,
+            "findings": [
+                {
+                    "severity": "critical",
+                    "summary": f"SQL injection {i}.",
+                    "file": "app/db.py",
+                }
+                for i in range(4)
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "smoke-b", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Must be a quality verdict (not_promoted), NOT an infra_failure.
+    assert result["status"] == "not_promoted", (
+        f"expected not_promoted quality verdict, got {result['status']}"
+    )
+    assert result["status"] != "infra_failure"
+
+    # A QualificationVerdict row must be written (quality path, not infra path).
+    count = (
+        await db_session.execute(
+            select(sa_func.count()).where(
+                QualificationVerdict.release_version_id == version.id
+            )
+        )
+    ).scalar()
+    assert count == 1, f"expected 1 QualificationVerdict row, got {count}"
+
+    # sub_scores and findings are persisted in last_qualification.
+    await db_session.refresh(version)
+    qual = version.last_qualification
+    assert qual["sub_scores"]["audit"] == pytest.approx(0.0), (
+        f"expected audit sub-score 0.0 (4 critical findings), got {qual['sub_scores']['audit']}"
+    )
+    # Findings must be captured so the strategic agent can target them.
+    findings = qual.get("audit_findings", [])
+    assert len(findings) > 0, (
+        "expected audit_findings in last_qualification for strategic agent"
+    )
+
+
+# ===========================================================================
 # maybe_finalize_qualification — task-completion coordination glue
 # ===========================================================================
 

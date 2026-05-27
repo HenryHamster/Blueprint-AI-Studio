@@ -812,7 +812,7 @@ export async function handleReview(
   const prNumber = Number(payload.pr_number);
   if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Invalid pr_number: ${String(payload.pr_number)}`);
   const branch = validateBranchName(strVal(payload.branch), 'branch');
-  const baseBranch = validateBranchName(strVal(payload.base_branch, 'main'), 'base_branch');
+  const baseBranch = validateBranchName(strVal(payload.base_branch) || strVal((task.project_metadata as Record<string, unknown> | undefined)?.integration_branch) || 'main', 'base_branch');
   const originalPrompt = strVal(payload.original_prompt);
 
   // Read review iteration from task context
@@ -1143,13 +1143,13 @@ export async function handleFix(
   model?: string, effort?: string
 ) {
   const branch = validateBranchName(strVal(payload.branch), 'branch');
-  const baseBranch = validateBranchName(strVal(payload.base_branch, 'main'), 'base_branch');
+  const baseBranch = validateBranchName(strVal(payload.base_branch) || strVal((task.project_metadata as Record<string, unknown> | undefined)?.integration_branch) || 'main', 'base_branch');
   const prompt = strVal(payload.prompt);
   const prNumber = Number(payload.pr_number);
   if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Invalid pr_number: ${String(payload.pr_number)}`);
   const originalPrompt = strVal(payload.original_prompt);
   const fixOrigTaskType = strVal(payload.original_task_type || '');
-  const promotionTarget = strVal(payload.promotion_target) || undefined;
+  const promotionTarget = strVal(payload.promotion_target) || strVal((task.project_metadata as Record<string, unknown> | undefined)?.promotion_target) || undefined;
 
   if (!prompt) throw new Error('Fix task missing prompt');
 

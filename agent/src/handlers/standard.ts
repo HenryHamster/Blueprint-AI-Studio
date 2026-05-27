@@ -765,7 +765,11 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const ctx = (task.context as Record<string, unknown> | undefined) || {};
   const rawBaseBranch = strVal(payload.base_branch) || strVal(ctx.research_branch) || strVal(ctx.original_base) || 'main';
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
-  const promotionTarget = strVal(payload.promotion_target) || undefined;
+  const projectMetaForPromotion = task.project_metadata as Record<string, unknown> | undefined;
+  const promotionTarget =
+    strVal(payload.promotion_target) ||
+    strVal(projectMetaForPromotion?.promotion_target) ||
+    undefined;
   const rawTitle = strVal(task.title) || strVal(payload.title) || 'automated changes';
   const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
 
@@ -1201,7 +1205,7 @@ export async function handleCreate(
   const operatorReviewFor = taskCtx?.operator_requested_review_for as string | undefined;
   if (operatorReviewFor) {
     const prBranch = validateBranchName(strVal(payload.branch), 'branch');
-    const prBaseBranch = validateBranchName(strVal(payload.base_branch, 'main'), 'base_branch');
+    const prBaseBranch = validateBranchName(strVal(payload.base_branch) || strVal((task.project_metadata as Record<string, unknown> | undefined)?.integration_branch) || 'main', 'base_branch');
     const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
 
     // Check the branch still exists before cloning — auto-delete-on-merge removes

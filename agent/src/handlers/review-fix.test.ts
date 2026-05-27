@@ -1274,6 +1274,56 @@ describe('handleFix — runCodeChangeTask delegation', () => {
     // Implementation must follow.
     expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalledTimes(1);
   });
+
+  it('falls back to project_metadata.integration_branch when payload.base_branch is absent', async () => {
+    await handleFix(
+      'task-fix-meta-branch',
+      { branch: 'feature/x', pr_number: 42, prompt: 'fix it' },
+      { context: { scope: 'small' }, project_metadata: { integration_branch: 'develop' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const opts = capturedFixOpts();
+    expect(opts.baseBranch).toBe('develop');
+  });
+
+  it('falls back to main when both payload.base_branch and project_metadata.integration_branch are absent', async () => {
+    await handleFix(
+      'task-fix-fallback-main',
+      { branch: 'feature/x', pr_number: 42, prompt: 'fix it' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const opts = capturedFixOpts();
+    expect(opts.baseBranch).toBe('main');
+  });
+
+  it('picks up promotionTarget from project_metadata when payload omits it', async () => {
+    await handleFix(
+      'task-fix-meta-promotion',
+      { branch: 'feature/x', base_branch: 'trunk', pr_number: 42, prompt: 'fix it', promotion_target: 'trunk' },
+      { context: { scope: 'small' }, project_metadata: { promotion_target: 'trunk' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const opts = capturedFixOpts();
+    // base_branch matches promotion_target → testsOnMainBranch=true
+    expect(opts.testsOnMainBranch).toBe(true);
+  });
+
+  it('falls back to project_metadata.promotion_target when payload.promotion_target is absent', async () => {
+    await handleFix(
+      'task-fix-meta-promo-fallback',
+      { branch: 'feature/x', base_branch: 'trunk', pr_number: 42, prompt: 'fix it' },
+      { context: { scope: 'small' }, project_metadata: { promotion_target: 'trunk' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const opts = capturedFixOpts();
+    // base_branch 'trunk' matches project_metadata.promotion_target 'trunk' → testsOnMainBranch=true
+    expect(opts.testsOnMainBranch).toBe(true);
+  });
 });
 
 // ── handleFix: self-review blind-spots surfacing ────────────────────────────
