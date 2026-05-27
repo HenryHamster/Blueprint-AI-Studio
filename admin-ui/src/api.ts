@@ -733,7 +733,15 @@ export type QualificationStatus =
   | 'promoted'
   | 'promotion_failed'
   | 'error'
-  | 'sha_error';
+  | 'sha_error'
+  | 'infra_failure';
+
+export interface AuditReconciliation {
+  model_reported_score: number | null;
+  findings_derived_score: number | null;
+  score_delta: number | null;
+  excluded_findings_count: number;
+}
 
 export interface VersionQualification {
   status: QualificationStatus | null;
@@ -748,6 +756,8 @@ export interface VersionQualification {
   consecutive_infra_errors?: number | null;
   // Audit observability: why the audit sub-score is missing/unscoreable.
   audit_missing_reason?: string | null;
+  // Audit reconciliation: model vs findings-derived scores and excluded count.
+  audit_reconciliation?: AuditReconciliation | null;
 }
 
 export interface CurrentVersion {
@@ -871,9 +881,15 @@ export interface QualificationVerdictRecord {
   created_at: string;
 }
 
+export interface QualificationVerdictsInfraContext {
+  infra_failure_count: number;
+  consecutive_infra_errors: number;
+}
+
 export interface QualificationVerdictsResponse {
   verdicts: QualificationVerdictRecord[];
   total: number;
+  infra_context?: QualificationVerdictsInfraContext;
 }
 
 export async function fetchQualificationVerdicts(

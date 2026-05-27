@@ -343,6 +343,77 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
     return audit_score, _clamp01(score)
 
 
+def _compute_audit_reconciliation(report: dict[str, Any] | None) -> dict[str, Any]:
+    """Compute audit-score reconciliation metadata for observability.
+
+    Records the model's self-reported score alongside the deterministic
+    findings-derived score so an operator can tell, for a given qualification
+    run, whether the two agree and how many findings were dropped for lacking
+    substantiation.
+
+    Returns a dict with:
+    - ``model_reported_score`` — the LLM's self-reported ``audit_score``,
+      clamped to [0,1], or None when absent/non-numeric.
+    - ``findings_derived_score`` — deterministic score from findings list
+      (same deduction table as ``_score_audit``), or None when no findings
+      are present.
+    - ``score_delta`` — ``abs(findings_derived - model_reported)``, rounded
+      to 4 dp, or None when either component is absent.
+    - ``excluded_findings_count`` — number of high/medium/critical/blocker/
+      warning findings excluded because their ``verification_note`` was absent
+      or too short (< 20 non-whitespace chars).
+
+    This function is pure and does NOT change the gating math; call it
+    alongside ``_score_audit`` to attach reconciliation fields to
+    ``last_qualification`` / ``QualificationVerdict`` records.
+    """
+    empty: dict[str, Any] = {
+        "model_reported_score": None,
+        "findings_derived_score": None,
+        "score_delta": None,
+        "excluded_findings_count": 0,
+    }
+    if not isinstance(report, dict):
+        return empty
+
+    # Model-reported score (self-assessment from the LLM audit output).
+    raw_audit = report.get("audit_score")
+    model_reported: float | None = None
+    if isinstance(raw_audit, (int, float)) and not isinstance(raw_audit, bool):
+        model_reported = _clamp01(raw_audit)
+
+    # Deterministic findings-derived score — mirrors the deduction loop in
+    # ``_score_audit`` but additionally tracks excluded findings.
+    findings = report.get("findings")
+    if not isinstance(findings, list):
+        findings = report.get("issues")
+
+    findings_derived: float | None = None
+    excluded_count: int = 0
+    if isinstance(findings, list):
+        derived: float = 1.0
+        for f in findings:
+            if isinstance(f, dict):
+                sev = str(f.get("severity") or f.get("level") or "").lower()
+                if sev:
+                    if _finding_is_verified(f, sev):
+                        derived -= _AUDIT_DEDUCTIONS.get(sev, _AUDIT_DEDUCTION_UNKNOWN)
+                    elif sev in _SEVERITIES_REQUIRING_VERIFICATION:
+                        excluded_count += 1
+        findings_derived = _clamp01(derived)
+
+    score_delta: float | None = None
+    if model_reported is not None and findings_derived is not None:
+        score_delta = round(abs(findings_derived - model_reported), 4)
+
+    return {
+        "model_reported_score": model_reported,
+        "findings_derived_score": findings_derived,
+        "score_delta": score_delta,
+        "excluded_findings_count": excluded_count,
+    }
+
+
 def _audit_missing_reason(report: dict[str, Any] | None) -> str | None:
     """Return a structured sub-status string when a parseable audit report yields
     no scoring signal, or ``None`` when the report is scoreable or absent.

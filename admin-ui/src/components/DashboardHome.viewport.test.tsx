@@ -1,6 +1,7 @@
-import { afterEach, describe, test, vi } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
+import { screen } from '@testing-library/react';
 import { DashboardHome } from './DashboardHome';
 import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt } from '../test/viewport';
 import { apiFetch } from '../api';
@@ -61,6 +62,35 @@ const POPULATED_TASKS: Task[] = [
     created_at: new Date(now - 300_000).toISOString(),
   },
 ];
+
+let versionLifecycleResponse: unknown = {
+  current_version: {
+    version_number: 42,
+    phase: 'stabilize',
+    phase_changed_at: '2026-05-20T12:00:00Z',
+    opened_at: '2026-05-15T00:00:00Z',
+    qualification_attempts: 2,
+    merged_task_count: 15,
+    last_qualification: {
+      status: 'dry_run',
+      confidence: 0.78,
+      threshold: 0.80,
+      sub_scores: { audit: 0.85, test_erosion: 0.70, smoketest: 0.90 },
+      blocker: null,
+      finalized_at: '2026-05-20T11:00:00Z',
+      error: null,
+      consecutive_infra_errors: 0,
+      audit_missing_reason: null,
+    },
+  },
+  recent_versions: [
+    { version_number: 41, status: 'promoted', opened_at: '2026-05-10T00:00:00Z', promoted_at: '2026-05-15T00:00:00Z', qualification_attempts: 1, last_qualification: { status: 'promoted', confidence: 0.85, threshold: 0.80, sub_scores: null, blocker: null, finalized_at: null, error: null, consecutive_infra_errors: 0, audit_missing_reason: null } },
+  ],
+};
+
+function setVersionLifecycleResponse(next: unknown) {
+  versionLifecycleResponse = next;
+}
 
 // DashboardHome (and its sub-components) transitively import apiFetch from
 // '../api', which pulls in Firebase. Mock the module so the test does not
@@ -124,30 +154,7 @@ vi.mock('../api', () => ({
       );
     }
     if (url.includes('/version-lifecycle')) {
-      return new Response(
-        JSON.stringify({
-          current_version: {
-            version_number: 42,
-            phase: 'stabilize',
-            phase_changed_at: '2026-05-20T12:00:00Z',
-            opened_at: '2026-05-15T00:00:00Z',
-            qualification_attempts: 2,
-            merged_task_count: 15,
-            last_qualification: {
-              status: 'dry_run',
-              confidence: 0.78,
-              threshold: 0.80,
-              sub_scores: { audit: 0.85, test_erosion: 0.70, smoketest: 0.90 },
-              blocker: null,
-              finalized_at: '2026-05-20T11:00:00Z',
-            },
-          },
-          recent_versions: [
-            { version_number: 41, status: 'promoted', opened_at: '2026-05-10T00:00:00Z', promoted_at: '2026-05-15T00:00:00Z', qualification_attempts: 1, last_qualification: { status: 'promoted', confidence: 0.85, threshold: 0.80, sub_scores: null, blocker: null, finalized_at: null } },
-          ],
-        }),
-        { status: 200 },
-      );
+      return new Response(JSON.stringify(versionLifecycleResponse), { status: 200 });
     }
     // All other endpoints return 404 so sub-components see their `if (!res.ok)`
     // / `if (!data)` early-exits and render their idle/empty states. Returning
@@ -261,6 +268,125 @@ describe('DashboardHome — viewport regression', () => {
       await act(async () => {
         await new Promise<void>((resolve) => setTimeout(resolve, 50));
       });
+    });
+  });
+
+  test('version lifecycle panel stays clean when there is no audit or infra issue', async () => {
+    setVersionLifecycleResponse({
+      current_version: {
+        version_number: 42,
+        phase: 'stabilize',
+        phase_changed_at: '2026-05-20T12:00:00Z',
+        opened_at: '2026-05-15T00:00:00Z',
+        qualification_attempts: 2,
+        merged_task_count: 15,
+        last_qualification: {
+          status: 'dry_run',
+          confidence: 0.78,
+          threshold: 0.80,
+          sub_scores: { audit: 0.85, test_erosion: 0.70, smoketest: 0.90 },
+          blocker: null,
+          finalized_at: '2026-05-20T11:00:00Z',
+          error: null,
+          consecutive_infra_errors: 0,
+          audit_missing_reason: null,
+        },
+      },
+      recent_versions: [],
+    });
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<DashboardHome tasks={POPULATED_TASKS} selectedProjectId="proj-abc" onViewTask={() => {}} />);
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+      expect(screen.queryByText('audit findings present but missing severity tags')).not.toBeInTheDocument();
+      expect(screen.queryByText(/consecutive infra failures/i)).not.toBeInTheDocument();
+    });
+  });
+
+  test('version lifecycle panel renders parseable-but-unscoreable audit reason chip', async () => {
+    setVersionLifecycleResponse({
+      current_version: {
+        version_number: 42,
+        phase: 'stabilize',
+        phase_changed_at: '2026-05-20T12:00:00Z',
+        opened_at: '2026-05-15T00:00:00Z',
+        qualification_attempts: 2,
+        merged_task_count: 15,
+        last_qualification: {
+          status: 'dry_run',
+          confidence: 0.78,
+          threshold: 0.80,
+          sub_scores: { audit: 0.85, test_erosion: 0.70, smoketest: 0.90 },
+          blocker: 'audit below threshold',
+          finalized_at: '2026-05-20T11:00:00Z',
+          error: null,
+          consecutive_infra_errors: 0,
+          audit_missing_reason: 'parseable_but_unscoreable',
+        },
+      },
+      recent_versions: [],
+    });
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<DashboardHome tasks={POPULATED_TASKS} selectedProjectId="proj-abc" onViewTask={() => {}} />);
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+      expect(screen.getByText('audit findings present but missing severity tags')).toBeInTheDocument();
+    });
+  });
+
+  test('version lifecycle panel renders infra streak and error distinctly', async () => {
+    setVersionLifecycleResponse({
+      current_version: {
+        version_number: 42,
+        phase: 'stabilize',
+        phase_changed_at: '2026-05-20T12:00:00Z',
+        opened_at: '2026-05-15T00:00:00Z',
+        qualification_attempts: 2,
+        merged_task_count: 15,
+        last_qualification: {
+          status: 'infra_failure',
+          confidence: 0.78,
+          threshold: 0.80,
+          sub_scores: { audit: 0.85, test_erosion: 0.70, smoketest: 0.90 },
+          blocker: null,
+          finalized_at: '2026-05-20T11:00:00Z',
+          error: 'release_audit heartbeat stale',
+          consecutive_infra_errors: 3,
+          audit_missing_reason: null,
+        },
+      },
+      recent_versions: [],
+    });
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<DashboardHome tasks={POPULATED_TASKS} selectedProjectId="proj-abc" onViewTask={() => {}} />);
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+      expect(screen.getByText('3 consecutive infra failures')).toBeInTheDocument();
+      expect(screen.getByText('release_audit heartbeat stale')).toBeInTheDocument();
     });
   });
 

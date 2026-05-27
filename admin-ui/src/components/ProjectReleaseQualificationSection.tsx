@@ -1,4 +1,4 @@
-import type { QualificationVerdictRecord, CurrentVersion } from '../api';
+import type { QualificationVerdictRecord, CurrentVersion, AuditReconciliation } from '../api';
 
 interface ProjectReleaseQualificationSectionProps {
   currentVersion: CurrentVersion | null;
@@ -23,6 +23,37 @@ function SubScoreBadge({ label, value }: { label: string; value: number | null |
     <span className={`inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded border ${color}`}>
       {label} <span className="font-mono">{pct}%</span>
     </span>
+  );
+}
+
+function AuditReconciliationRow({ rec }: { rec: AuditReconciliation }) {
+  const hasDivergence = rec.score_delta != null && rec.score_delta >= 0.1;
+  return (
+    <div className="flex flex-wrap gap-1.5 items-center pt-0.5">
+      <span className="text-[10px] text-neutral-600 shrink-0">audit reconciliation:</span>
+      {rec.model_reported_score != null && (
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
+          model {Math.round(rec.model_reported_score * 100)}%
+        </span>
+      )}
+      {rec.findings_derived_score != null && (
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
+          findings {Math.round(rec.findings_derived_score * 100)}%
+        </span>
+      )}
+      {rec.score_delta != null && (
+        <span className={`text-[10px] px-1.5 py-0.5 rounded border font-mono ${
+          hasDivergence ? 'bg-amber-950/40 text-amber-400 border-amber-900/50' : 'bg-neutral-800 text-neutral-500 border-neutral-700'
+        }`}>
+          δ {Math.round(rec.score_delta * 100)}%
+        </span>
+      )}
+      {rec.excluded_findings_count > 0 && (
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-500 border border-amber-900/50">
+          {rec.excluded_findings_count} finding{rec.excluded_findings_count !== 1 ? 's' : ''} excluded
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -102,6 +133,9 @@ export function ProjectReleaseQualificationSection({
               <div className="flex items-center gap-2 mt-1 px-2 py-1.5 rounded bg-amber-950/30 border border-amber-900/40">
                 <span className="text-[11px] text-amber-400">&#9888; {infraErrors} consecutive infra error{infraErrors !== 1 ? 's' : ''}</span>
               </div>
+            )}
+            {lq?.audit_reconciliation && (
+              <AuditReconciliationRow rec={lq.audit_reconciliation} />
             )}
           </div>
         )}

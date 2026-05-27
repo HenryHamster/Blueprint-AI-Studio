@@ -175,6 +175,7 @@ from app.release_scoring import (
     _audit_missing_reason,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*
     _extract_audit_findings,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*
     _fmt_sub_scores,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*
+    _compute_audit_reconciliation,  # noqa: F401 — re-exported for tests/observability
     _score_audit,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*
     _score_smoketest,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*
     compute_composite,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*

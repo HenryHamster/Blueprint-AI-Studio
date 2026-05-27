@@ -33,15 +33,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app import release_version
+from app.failure_classification import RATE_LIMIT, classify_failure
 from app.models import (
     ArtifactType,
+    Project,
     Task,
     TaskStatus,
 )
-from app.shared_state import runtime_config as _runtime_config
+from app.release_scoring import _compute_audit_reconciliation
+from app.shared_state import (
+    get_project_integration_branch,
+    runtime_config as _runtime_config,
+)
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+# Maximum number of times a RATE_LIMIT-classified release_audit task will be
+# re-spawned per qualification run before falling through to _handle_infra_failure.
+_MAX_AUDIT_RL_RESPAWNS = 2
 
 
 def _enrich_infra_error(base_label: str, task: Task | None) -> str:
@@ -167,14 +177,72 @@ async def _finalize_qualification(
                 TaskStatus.FAILED,
                 TaskStatus.CANCELLED,
             ):
+                # A RATE_LIMIT-classified FAILED audit is a transient account-credit
+                # failure, not a pipeline infrastructure failure.  Re-spawn the audit
+                # child with the same candidate_sha so the same snapshot is scored,
+                # and record the respawn count in last_qualification so the cap is
+                # visible to the operator.  Non-transient FAILED/CANCELLED tasks and
+                # exhausted respawns fall through to _handle_infra_failure as before.
+                rl_respawn_count = qual.get("audit_rl_respawn_count", 0)
+                if (
+                    _audit_task_obj.status == TaskStatus.FAILED
+                    and classify_failure(_audit_task_obj) == RATE_LIMIT
+                    and rl_respawn_count < _MAX_AUDIT_RL_RESPAWNS
+                ):
+                    fp = _audit_task_obj.first_payload or {}
+                    _project = await session.get(Project, version.project_id)
+                    _integration_branch = get_project_integration_branch(_project)
+                    new_base_branch = fp.get("base_branch", "") or _integration_branch
+                    new_diff_range = (
+                        fp.get("diff_range", "")
+                        or f"{_integration_branch}...{candidate_sha}"
+                    )
+                    new_audit_task = await rq._spawn_release_audit_task(
+                        session,
+                        version.project_id,
+                        version_id=version.id,
+                        base_branch=new_base_branch,
+                        diff_range=new_diff_range,
+                        candidate_sha=candidate_sha,
+                    )
+                    new_count = rl_respawn_count + 1
+                    updated_qual = {
+                        **qual,
+                        "audit_task_id": str(new_audit_task.id),
+                        "audit_rl_respawn_count": new_count,
+                    }
+                    version.last_qualification = updated_qual
+                    flag_modified(version, "last_qualification")
+                    session.add(version)
+                    await session.flush()
+                    logger.info(
+                        "[RELEASE_QUALIFIER] v%d audit task %s was rate-limited; "
+                        "re-spawned as %s (respawn %d/%d)",
+                        version.version_number,
+                        audit_task_id,
+                        new_audit_task.id,
+                        new_count,
+                        _MAX_AUDIT_RL_RESPAWNS,
+                    )
+                    return {
+                        "status": "audit_rate_limit_respawned",
+                        "respawn_count": new_count,
+                    }
+                infra_label = _enrich_infra_error(
+                    f"audit_task_{_audit_task_obj.status.lower()}",
+                    _audit_task_obj,
+                )
+                if (
+                    _audit_task_obj.status == TaskStatus.FAILED
+                    and classify_failure(_audit_task_obj) == RATE_LIMIT
+                    and rl_respawn_count >= _MAX_AUDIT_RL_RESPAWNS
+                ):
+                    infra_label = "audit_rate_limit_respawn_cap_exceeded"
                 return await rq._handle_infra_failure(
                     session,
                     version,
                     qual,
-                    _enrich_infra_error(
-                        f"audit_task_{_audit_task_obj.status.lower()}",
-                        _audit_task_obj,
-                    ),
+                    infra_label,
                 )
         except (ValueError, TypeError):
             logger.warning(
@@ -240,6 +308,9 @@ async def _finalize_qualification(
         )
 
     audit_score, test_erosion_score = rq._score_audit(audit_report)
+    # Observability: record model-reported vs findings-derived score delta and
+    # count of findings excluded for missing/short verification_note.
+    audit_reconciliation = _compute_audit_reconciliation(audit_report)
     # Carry the findings (not just the score) into last_qualification so the
     # strategic agent can target them — otherwise the audit sub-score, usually
     # the binding constraint, is opaque to the loop.
@@ -324,6 +395,7 @@ async def _finalize_qualification(
         "smoketest_task_id": smoketest_task_id,
         "audit_findings": audit_findings,
         "audit_missing_reason": audit_missing_reason,
+        "audit_reconciliation": audit_reconciliation,
     }
 
     promotion_enabled = bool(_runtime_config.get("promotion_enabled"))

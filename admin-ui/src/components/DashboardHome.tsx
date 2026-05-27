@@ -453,6 +453,13 @@ function CiBadge({ ci }: { ci: CiResolution }) {
   );
 }
 
+const AUDIT_MISSING_REASON_LABELS: Record<string, string> = {
+  no_findings_key: 'audit findings key missing',
+  empty_findings_list: 'audit findings list empty',
+  audit_score_null_no_findings: 'audit score missing with no findings',
+  parseable_but_unscoreable: 'audit findings present but missing severity tags',
+};
+
 function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadiness | null | undefined }) {
   if (!readiness) return null;
   const { ready, reason, verdicts_evaluated, would_promote_rate, consecutive_clean_passes, recurring_blockers } = readiness;
@@ -577,6 +584,25 @@ function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: 
                 )}
                 {cv.last_qualification.blocker && (
                   <p className="text-[10px] text-red-400 truncate">{cv.last_qualification.blocker}</p>
+                )}
+                {(cv.last_qualification.audit_missing_reason || (cv.last_qualification.consecutive_infra_errors ?? 0) > 0 || (cv.last_qualification.status === 'infra_failure' && cv.last_qualification.error)) && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {cv.last_qualification.audit_missing_reason && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/20">
+                        {AUDIT_MISSING_REASON_LABELS[cv.last_qualification.audit_missing_reason] ?? cv.last_qualification.audit_missing_reason}
+                      </span>
+                    )}
+                    {(cv.last_qualification.consecutive_infra_errors ?? 0) > 0 && (
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded border ${(cv.last_qualification.consecutive_infra_errors ?? 0) >= 3 ? 'bg-red-500/10 text-red-400 border-red-500/20' : 'bg-orange-500/10 text-orange-400 border-orange-500/20'}`}>
+                        {cv.last_qualification.consecutive_infra_errors} consecutive infra failures
+                      </span>
+                    )}
+                    {cv.last_qualification.status === 'infra_failure' && cv.last_qualification.error && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20">
+                        {cv.last_qualification.error}
+                      </span>
+                    )}
+                  </div>
                 )}
               </div>
             )}

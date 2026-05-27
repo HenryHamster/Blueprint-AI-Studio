@@ -104,6 +104,9 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
         "consecutive_infra_errors": qual.get("consecutive_infra_errors"),
         # Audit observability: why the audit sub-score is missing/unscoreable.
         "audit_missing_reason": qual.get("audit_missing_reason"),
+        # Audit reconciliation: model-reported vs findings-derived score delta
+        # and excluded findings count (populated by _compute_audit_reconciliation).
+        "audit_reconciliation": qual.get("audit_reconciliation"),
     }
 
 

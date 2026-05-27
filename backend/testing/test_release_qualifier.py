@@ -1341,6 +1341,76 @@ class TestExtractAuditFindings:
         assert out == [{"severity": "unknown", "summary": "a plain string"}]
 
 
+class TestComputeAuditReconciliation:
+    """_compute_audit_reconciliation surfaces divergence between the model's
+    self-reported audit_score and the deterministic findings-derived score,
+    and counts findings excluded for lacking a substantive verification_note."""
+
+    def test_none_report_returns_empty_structure(self):
+        out = rq._compute_audit_reconciliation(None)
+        assert out == {
+            "model_reported_score": None,
+            "findings_derived_score": None,
+            "score_delta": None,
+            "excluded_findings_count": 0,
+        }
+
+    def test_model_score_only_no_findings(self):
+        """When findings key is absent, findings_derived_score and delta are None."""
+        out = rq._compute_audit_reconciliation({"audit_score": 0.8})
+        assert out["model_reported_score"] == pytest.approx(0.8)
+        assert out["findings_derived_score"] is None
+        assert out["score_delta"] is None
+        assert out["excluded_findings_count"] == 0
+
+    def test_agreement_yields_small_delta(self):
+        """No findings → derived=1.0; model-reported=1.0 → delta=0."""
+        out = rq._compute_audit_reconciliation({"audit_score": 1.0, "findings": []})
+        assert out["model_reported_score"] == pytest.approx(1.0)
+        assert out["findings_derived_score"] == pytest.approx(1.0)
+        assert out["score_delta"] == pytest.approx(0.0)
+
+    def test_divergence_delta_populated(self):
+        """A high finding (verified) reduces derived score; delta reflects gap."""
+        report = {
+            "audit_score": 1.0,
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "leaked secret",
+                    "verification_note": "confirmed in full repo scan with evidence",
+                }
+            ],
+        }
+        out = rq._compute_audit_reconciliation(report)
+        # findings-derived = 1.0 - 0.15 = 0.85; model_reported = 1.0
+        assert out["findings_derived_score"] == pytest.approx(0.85)
+        assert out["score_delta"] == pytest.approx(0.15)
+        assert out["excluded_findings_count"] == 0
+
+    def test_excluded_findings_counted_for_missing_note(self):
+        """High finding without a substantive note is excluded and counted."""
+        report = {
+            "audit_score": 0.9,
+            "findings": [
+                {"severity": "high", "summary": "risk", "verification_note": ""}
+            ],
+        }
+        out = rq._compute_audit_reconciliation(report)
+        assert out["excluded_findings_count"] == 1
+        # Not deducted, so derived stays 1.0
+        assert out["findings_derived_score"] == pytest.approx(1.0)
+
+    def test_low_finding_never_excluded(self):
+        """Low-severity findings are always counted without needing a note."""
+        report = {
+            "findings": [{"severity": "low", "summary": "minor"}],
+        }
+        out = rq._compute_audit_reconciliation(report)
+        assert out["excluded_findings_count"] == 0
+        assert out["findings_derived_score"] == pytest.approx(0.98)  # 1.0 - 0.02
+
+
 class TestScoreSmoketest:
     def test_all_tests_pass(self):
         """A fully-passing smoketest yields a 1.0 score."""
@@ -1894,6 +1964,18 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
     # candidate_sha, the full 40-char SHA.
     assert audit_task.first_payload["candidate_sha"] == candidate
     assert audit_task.context["release_version_id"] == str(version.id)
+    assert audit_task.context["scope"] == "medium"
+
+    from datetime import datetime, timezone
+
+    from app import reaper
+
+    hb_cutoff = reaper._heartbeat_stale_cutoff(
+        audit_task, datetime(2026, 1, 1, tzinfo=timezone.utc)
+    )
+    assert (
+        datetime(2026, 1, 1, tzinfo=timezone.utc) - hb_cutoff
+    ).total_seconds() == 420
 
     # The qualifier smoketest carries candidate_sha in its payload too and is
     # flagged so its failure does not spawn a fix task.
@@ -4186,6 +4268,159 @@ class TestFinalizeInfraFailure:
         payload = dispatch_mock.call_args[0][2]
         assert payload["consecutive_infra_errors"] == 2
 
+    @pytest.mark.asyncio
+    async def test_audit_rate_limited_respawns_new_task(self, db_session):
+        """FAILED audit classified RATE_LIMIT → respawn, not infra_failure.
+
+        A transient rate-limit failure must not pollute the consecutive_infra_errors
+        streak or waste the candidate_sha snapshot.  The qualifier re-spawns a new
+        audit task carrying the same candidate_sha and returns
+        status='audit_rate_limit_respawned' instead of routing to _handle_infra_failure.
+        """
+        from app.failure_classification import RATE_LIMIT, persist_failure_category
+
+        project, version = await _make_project_and_version(db_session)
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[
+                {
+                    "type": "release_audit",
+                    "base_branch": "main",
+                    "diff_range": "main...abcd1234",
+                    "candidate_sha": "abcd1234" * 5,
+                }
+            ],
+            vm_instance_id="vm-audit-rate-limited",
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        persist_failure_category(audit_task, RATE_LIMIT)
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        original_audit_id = str(audit_task.id)
+        candidate = "abcd1234" * 5
+
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": original_audit_id,
+            "smoketest_task_id": None,
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # Returns the respawn status, not infra_failure.
+        assert result["status"] == "audit_rate_limit_respawned"
+        assert result["respawn_count"] == 1
+
+        # last_qualification carries the new audit_task_id and the counter.
+        await db_session.refresh(version)
+        new_qual = version.last_qualification
+        assert new_qual["audit_rl_respawn_count"] == 1
+        assert new_qual["audit_task_id"] != original_audit_id
+
+        # No QualificationVerdict row — verdict was not rendered.
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+        # No infra_failure ProjectMessage — this is a transient respawn, not a
+        # hard pipeline failure.
+        infra_msg_count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.context["event_type"].as_string()
+                    == "release_infra_failure",
+                )
+            )
+        ).scalar()
+        assert infra_msg_count == 0
+
+    @pytest.mark.asyncio
+    async def test_audit_rate_limited_cap_exceeded_routes_to_infra_failure(
+        self, db_session
+    ):
+        """When audit_rl_respawn_count hits _MAX_AUDIT_RL_RESPAWNS, fall through to
+        infra_failure with label 'audit_rate_limit_respawn_cap_exceeded'."""
+        from app.failure_classification import RATE_LIMIT, persist_failure_category
+        from app.release_qualifier_finalize import _MAX_AUDIT_RL_RESPAWNS
+
+        project, version = await _make_project_and_version(db_session)
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[
+                {
+                    "type": "release_audit",
+                    "base_branch": "main",
+                    "diff_range": "main...cafe5678",
+                    "candidate_sha": "cafe5678" * 5,
+                }
+            ],
+            vm_instance_id="vm-audit-rl-cap",
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        persist_failure_category(audit_task, RATE_LIMIT)
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "cafe5678" * 5,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_task_id": None,
+            "prior_infra_streak": 0,
+            # At the cap — next failure must route to infra_failure.
+            "audit_rl_respawn_count": _MAX_AUDIT_RL_RESPAWNS,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_rate_limit_respawn_cap_exceeded"
+
+        await db_session.refresh(version)
+        assert version.phase == "stabilize"
+        assert version.last_qualification["status"] == "infra_failure"
+        assert (
+            version.last_qualification["error"]
+            == "audit_rate_limit_respawn_cap_exceeded"
+        )
+
     # -----------------------------------------------------------------------
     # Malformed audit artifact shapes — each must produce either a real verdict
     # OR an infra_failure; never both, never neither, never a silent clean score.
@@ -4421,6 +4656,137 @@ class TestFinalizeInfraFailure:
             )
         ).scalar()
         assert count == 0
+
+
+# ===========================================================================
+# _finalize_qualification — reaper-induced heartbeat timeout
+# ===========================================================================
+
+
+class TestReaperInducedAuditHeartbeatTimeout:
+    """Regression guard: reaper-reaped release_audit routes to infra_failure.
+
+    Exercises the full reaper → finalize pipeline to catch regressions where
+    a reaped audit task silently creates a QualificationVerdict with
+    sub_scores.audit=0 (the 0.00 collapse) or crashes during finalization.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reaper_heartbeat_timeout_routes_to_infra_failure(self, db_session):
+        """Heartbeat-stale audit reaped as FAILED → infra_failure, no verdict.
+
+        Five assertions (matching the task contract):
+          (a) status is infra_failure, not not_promoted / dry_run.
+          (b) No QualificationVerdict row is created.
+          (c) Version remains open with phase=stabilize.
+          (d) Error label carries the heartbeat_timeout enrichment so the
+              operator can distinguish a VM heartbeat death from a code-defect
+              failure.
+          (e) consecutive_infra_errors is incremented (0 prior → 1).
+        """
+        from datetime import timedelta
+
+        from app.failure_classification import persist_failure_category
+        from app.reaper import _heartbeat_stale_cutoff
+        from app.time_utils import _utcnow
+
+        project, version = await _make_project_and_version(
+            db_session, phase="stabilize"
+        )
+
+        now = _utcnow()
+        # 400 s exceeds the default small-scope heartbeat-stale cutoff (300 s).
+        stale_heartbeat = now - timedelta(seconds=400)
+
+        # Seed an IN_PROGRESS release_audit task with a stale last_heartbeat,
+        # simulating an agent VM that stopped heartbeating before the reaper swept.
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[
+                {"type": "release_audit", "base_branch": "main", "scope": "small"}
+            ],
+            vm_instance_id="vm-audit-heartbeat-timeout",
+            status=TaskStatus.IN_PROGRESS,
+            last_heartbeat=stale_heartbeat,
+            context={
+                "release_version_id": str(version.id),
+                # Simulates an agent that reported its failure category before dying
+                # (e.g. via the agent_status endpoint before the VM was killed).
+                "agent_failure_category_raw": "heartbeat_timeout",
+            },
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        # Confirm the seeded heartbeat is stale per the reaper's own cutoff logic.
+        cutoff = _heartbeat_stale_cutoff(audit_task, now)
+        assert stale_heartbeat < cutoff, (
+            f"test precondition: heartbeat {stale_heartbeat} must be before "
+            f"stale cutoff {cutoff} — adjust timedelta if thresholds changed"
+        )
+
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "dead" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_task_id": None,
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Simulate the reaper sweep: mark the task FAILED and record the
+        # failure category (AGENT_TIMEOUT is what the reaper classifies
+        # heartbeat_timeout_post_claim failures as).
+        audit_task.status = TaskStatus.FAILED
+        persist_failure_category(audit_task, "AGENT_TIMEOUT")
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # (a) status is infra_failure, not not_promoted / dry_run.
+        assert result["status"] == "infra_failure", (
+            f"expected infra_failure, got {result['status']}: {result}"
+        )
+
+        # (b) No QualificationVerdict row — the qualifier never rendered a verdict.
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0, f"expected 0 QualificationVerdict rows, got {count}"
+
+        # (c) Version remains open with phase=stabilize.
+        await db_session.refresh(version)
+        assert version.status == "open"
+        assert version.phase == "stabilize"
+
+        # (d) Error label carries the heartbeat_timeout enrichment from
+        #     agent_failure_category_raw — distinguishes VM heartbeat death
+        #     from code-defect failures in operator notifications.
+        assert "audit_task_failed" in result["error"], (
+            f"expected 'audit_task_failed' prefix, got {result['error']!r}"
+        )
+        assert "heartbeat_timeout" in result["error"], (
+            f"expected 'heartbeat_timeout' enrichment in error label, "
+            f"got {result['error']!r}"
+        )
+
+        # (e) consecutive_infra_errors is incremented (0 prior → 1).
+        assert result["consecutive_infra_errors"] == 1
 
 
 # ===========================================================================

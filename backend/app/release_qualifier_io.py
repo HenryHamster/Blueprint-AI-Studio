@@ -107,6 +107,7 @@ async def _spawn_release_audit_task(
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,
+            "scope": "medium",
         },
     )
     session.add(task)

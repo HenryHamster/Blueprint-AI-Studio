@@ -1495,6 +1495,53 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
     expect(prompt).toMatch(/substantiation required/i);
     expect(prompt).toMatch(/read the relevant unchanged files/i);
   });
+
+  describe('release_audit prompt false-positive disclaimers', () => {
+    it('guards the hardcoded-constant-is-not-injection disclaimer', async () => {
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+      // This disclaimer protects against the false positive: a hardcoded value in the
+      // source flowing to a sink (e.g. hardcoded SQL fragment reaching a query) is NOT
+      // injection if the hardcoded value is the only possible input.
+      expect(prompt).toContain('A hardcoded constant reaching a sink is NOT injection.');
+    });
+
+    it('guards the per-request-check-is-not-replay-gap disclaimer', async () => {
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+      // This disclaimer protects against the false positive: a per-request check
+      // (e.g. token validation) is NOT a token-replay vulnerability when the token
+      // is genuinely validated on each request.
+      expect(prompt).toContain('A per-request DB check is NOT a replay gap.');
+    });
+
+    it('guards the exception-guarded-comparison-is-not-type-error disclaimer', async () => {
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+      // This disclaimer protects against the false positive: a comparison operation
+      // guarded by an exception handler (e.g. try/except or if type check) is NOT
+      // a TypeError vulnerability.
+      expect(prompt).toContain('A comparison that is exception-guarded is NOT a TypeError.');
+    });
+
+    it('guards the verification-note exclusion contract for unsubstantiated findings', async () => {
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+      // This contract is critical: high/medium/critical findings without a substantive
+      // verification_note are silently excluded from the score. If this contract is
+      // dropped, unsubstantiated findings could cause false-positive audit_score collapses.
+      expect(prompt).toContain('Findings at severity high/medium/critical WITHOUT a substantive `verification_note` are silently excluded from the score');
+    });
+
+    it('guards the substantiation requirement and whole-repo context guidance', async () => {
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+      // The substantiation rule must remain: before recording high/medium/critical findings,
+      // the agent must read unchanged files to check for mitigations.
+      expect(prompt).toContain('Before recording any finding at severity high, medium, or critical, read the relevant unchanged files in the full repository');
+      expect(prompt).toContain('check for existing mitigations');
+    });
+  });
 });
 
 // ── resolveCandidateSha — payload/context SHA resolution + validation ─────────
@@ -1772,5 +1819,54 @@ describe('resolveBaseBranch cascade — analysis handlers honor project_metadata
     const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
     expect(opts.branch).toBe('feature/x');
     expect(opts.baseBranch).toBe('feature/x');
+  });
+});
+
+// ── Release audit JSON schema contract ───────────────────────────────────────
+// Guards the shape contract between the agent prompt and backend score parser.
+// If the prompt is rewritten to document 'issues'/'level', these tests break.
+describe('handleReleaseAudit — JSON schema field name contract', () => {
+  const CANDIDATE_SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+  const RELEASE_PAYLOAD = { base_branch: 'main', candidate_sha: CANDIDATE_SHA };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(git).mockReturnValue('');
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+  });
+
+  /** Capture the prompt string passed to runClaudeCode by handleReleaseAudit. */
+  async function captureReleaseAuditPrompt(): Promise<string> {
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const calls = vi.mocked(runClaudeCode).mock.calls;
+    if (calls.length === 0) throw new Error('runClaudeCode was not invoked');
+    return calls[calls.length - 1][0];
+  }
+
+  it('prompt documents "findings" as the top-level array key', async () => {
+    const prompt = await captureReleaseAuditPrompt();
+    expect(prompt).toContain('"findings"');
+  });
+
+  it('prompt documents "severity" as the finding severity field', async () => {
+    const prompt = await captureReleaseAuditPrompt();
+    expect(prompt).toContain('"severity"');
+  });
+
+  it('prompt JSON schema block does not use "issues" as the findings key', async () => {
+    const prompt = await captureReleaseAuditPrompt();
+    // Extract the fenced JSON block containing audit_score to scope the check.
+    const match = prompt.match(/```json\s*([\s\S]*?)```/);
+    const block = match ? match[1] : prompt;
+    expect(block).not.toContain('"issues"');
+  });
+
+  it('prompt JSON schema block does not use "level" as the severity field', async () => {
+    const prompt = await captureReleaseAuditPrompt();
+    const match = prompt.match(/```json\s*([\s\S]*?)```/);
+    const block = match ? match[1] : prompt;
+    expect(block).not.toContain('"level"');
   });
 });
