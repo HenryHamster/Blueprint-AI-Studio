@@ -44,6 +44,26 @@ from app.time_utils import _utcnow
 logger = logging.getLogger(__name__)
 
 
+def _enrich_infra_error(base_label: str, task: Task | None) -> str:
+    """Append agent_failure_category_raw to base_label for FAILED tasks.
+
+    Only enriches FAILED tasks — CANCELLED tasks carry no failure_category.
+    Returns base_label unchanged when task is None, CANCELLED, or has no
+    agent_failure_category_raw recorded in its context.
+    """
+    if task is None or task.status != TaskStatus.FAILED:
+        return base_label
+    raw = (task.context or {}).get("agent_failure_category_raw", "")
+    if not raw:
+        return base_label
+    sanitized = "".join(
+        c if c.isalnum() or c == "_" else "_" for c in str(raw).strip().lower()
+    )
+    if not sanitized:
+        return base_label
+    return f"{base_label}_{sanitized}"
+
+
 # Human-readable rendering of the compute_composite() hard-blocker codes.
 _BLOCKER_LABELS: dict[str, str] = {
     "ci_not_green": "CI is not green on the candidate",
@@ -151,7 +171,10 @@ async def _finalize_qualification(
                     session,
                     version,
                     qual,
-                    f"audit_task_{_audit_task_obj.status.lower()}",
+                    _enrich_infra_error(
+                        f"audit_task_{_audit_task_obj.status.lower()}",
+                        _audit_task_obj,
+                    ),
                 )
         except (ValueError, TypeError):
             logger.warning(
@@ -172,7 +195,10 @@ async def _finalize_qualification(
                     session,
                     version,
                     qual,
-                    f"smoketest_task_{_smoke_task_obj.status.lower()}",
+                    _enrich_infra_error(
+                        f"smoketest_task_{_smoke_task_obj.status.lower()}",
+                        _smoke_task_obj,
+                    ),
                 )
         except (ValueError, TypeError):
             logger.warning(
@@ -218,6 +244,7 @@ async def _finalize_qualification(
     # strategic agent can target them — otherwise the audit sub-score, usually
     # the binding constraint, is opaque to the loop.
     audit_findings = rq._extract_audit_findings(audit_report)
+    audit_missing_reason = rq._audit_missing_reason(audit_report)
 
     # --- Read the smoketest result -----------------------------------------
     # Audit H3: only when the smoketest subsystem was enabled — a disabled run
@@ -238,6 +265,16 @@ async def _finalize_qualification(
                 smoketest_task_id,
                 version.version_number,
             )
+    if (
+        smoketest_enabled
+        and smoketest_task_id
+        and _smoke_task_obj is not None
+        and _smoke_task_obj.status == TaskStatus.COMPLETED
+        and smoketest_result is None
+    ):
+        return await rq._handle_infra_failure(
+            session, version, qual, "smoketest_report_missing"
+        )
     smoketest_score = rq._score_smoketest(smoketest_result)
 
     # --- Compute the composite ---------------------------------------------
@@ -266,6 +303,7 @@ async def _finalize_qualification(
         "audit_task_id": audit_task_id,
         "smoketest_task_id": smoketest_task_id,
         "audit_findings": audit_findings,
+        "audit_missing_reason": audit_missing_reason,
     }
 
     promotion_enabled = bool(_runtime_config.get("promotion_enabled"))

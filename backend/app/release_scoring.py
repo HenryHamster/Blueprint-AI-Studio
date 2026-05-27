@@ -312,6 +312,49 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
     return derived, _clamp01(score)
 
 
+def _audit_missing_reason(report: dict[str, Any] | None) -> str | None:
+    """Return a structured sub-status string when a parseable audit report yields
+    no scoring signal, or ``None`` when the report is scoreable or absent.
+
+    Callers should invoke this alongside ``_score_audit`` to attach observability
+    metadata when ``audit_score`` is ``None`` or ``0.0`` despite a parseable JSON
+    artifact.  Possible return values:
+
+    - ``'no_findings_key'``         — neither "findings" nor "issues" key present
+    - ``'empty_findings_list'``     — findings list exists but is empty
+    - ``'audit_score_null_no_findings'`` — findings empty AND no self-reported score
+    - ``'parseable_but_unscoreable'`` — findings list has entries but none are dicts
+      with a severity/level field, so no deductions were applied
+    """
+    if not isinstance(report, dict):
+        return None
+
+    findings = report.get("findings")
+    if not isinstance(findings, list):
+        findings = report.get("issues")
+
+    if findings is None:
+        return "no_findings_key"
+
+    if not isinstance(findings, list) or len(findings) == 0:
+        raw_audit = report.get("audit_score")
+        has_score = isinstance(raw_audit, (int, float)) and not isinstance(
+            raw_audit, bool
+        )
+        if not has_score:
+            return "audit_score_null_no_findings"
+        return "empty_findings_list"
+
+    # findings is a non-empty list — check whether any entry had a usable severity
+    scoreable = any(
+        isinstance(f, dict) and (f.get("severity") or f.get("level")) for f in findings
+    )
+    if not scoreable:
+        return "parseable_but_unscoreable"
+
+    return None
+
+
 # Cap on findings carried into last_qualification (and thus the strategic
 # agent's payload). Kept small so the version_phase block stays well under the
 # pack budget while still giving the agent enough to target the audit sub-score.

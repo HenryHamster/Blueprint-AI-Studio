@@ -172,6 +172,7 @@ from app.release_scoring import (
     _SEVERITY_RANK,  # noqa: F401
     _clamp01,  # noqa: F401
     _classify_check_runs,  # noqa: F401 — re-exported for tests/back-compat
+    _audit_missing_reason,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*
     _extract_audit_findings,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*
     _fmt_sub_scores,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*
     _score_audit,  # noqa: F401 — re-exported; release_qualifier_finalize calls via rq.*

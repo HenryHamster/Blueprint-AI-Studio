@@ -974,6 +974,55 @@ class TestScoreAuditComputedErosion:
         assert any("test_erosion divergence" in r.message for r in caplog.records)
 
 
+class TestAuditMissingReason:
+    """_audit_missing_reason returns a structured sub-status string for parseable
+    reports that yield no scoring signal, and None when the report is scoreable."""
+
+    def test_none_report_returns_none(self):
+        assert rq._audit_missing_reason(None) is None
+
+    def test_non_dict_returns_none(self):
+        assert rq._audit_missing_reason("not-a-dict") is None  # type: ignore[arg-type]
+
+    def test_no_findings_key(self):
+        """A report with neither 'findings' nor 'issues' key → 'no_findings_key'."""
+        report: dict = {"audit_score": 0.8}
+        assert rq._audit_missing_reason(report) == "no_findings_key"
+
+    def test_empty_findings_list_with_score(self):
+        """findings=[], audit_score present → 'empty_findings_list'."""
+        report = {"findings": [], "audit_score": 0.9}
+        assert rq._audit_missing_reason(report) == "empty_findings_list"
+
+    def test_audit_score_null_no_findings(self):
+        """findings=[], no self-reported audit_score → 'audit_score_null_no_findings'."""
+        report: dict = {"findings": []}
+        assert rq._audit_missing_reason(report) == "audit_score_null_no_findings"
+
+    def test_parseable_but_unscoreable(self):
+        """findings list with entries that have no severity/level → 'parseable_but_unscoreable'."""
+        report = {"findings": [{"description": "some issue"}, {"title": "another"}]}
+        assert rq._audit_missing_reason(report) == "parseable_but_unscoreable"
+
+    def test_scoreable_report_returns_none(self):
+        """A report with real findings (dict entries with severity) → None."""
+        report = {
+            "findings": [{"severity": "high", "summary": "Token baked into image."}],
+            "audit_score": 0.85,
+        }
+        assert rq._audit_missing_reason(report) is None
+
+    def test_issues_key_fallback_empty(self):
+        """'issues' key with empty list and no audit_score → 'audit_score_null_no_findings'."""
+        report: dict = {"issues": []}
+        assert rq._audit_missing_reason(report) == "audit_score_null_no_findings"
+
+    def test_issues_key_with_severity_returns_none(self):
+        """Scoreable findings under 'issues' key → None."""
+        report = {"issues": [{"severity": "medium", "summary": "dep pinning risk"}]}
+        assert rq._audit_missing_reason(report) is None
+
+
 class TestExtractAuditFindings:
     """_extract_audit_findings carries the findings (not just the score) into
     last_qualification so the strategic agent can target them — see the
@@ -3298,6 +3347,103 @@ class TestFinalizeInfraFailure:
         assert count == 0
 
     @pytest.mark.asyncio
+    async def test_smoketest_completed_no_report_reclassified_as_infra_failure(
+        self, db_session
+    ):
+        """A COMPLETED smoketest with no SMOKETEST_RESULT is infra_failure,
+        not a smoketest_startup_failed verdict."""
+        project, version = await _make_project_and_version(db_session)
+        await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.COMPLETED,
+            smoke_status=TaskStatus.COMPLETED,
+            smoketest_enabled=True,
+        )
+
+        db_session.add(
+            Artifact(
+                task_id=version.last_qualification["audit_task_id"],
+                artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+                logs=json.dumps(
+                    {
+                        "audit_score": 1.0,
+                        "test_erosion": {"deleted_test_files": []},
+                    }
+                ),
+            )
+        )
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "smoketest_report_missing"
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_smoketest_completed_unparseable_artifact_reclassified_as_infra_failure(
+        self, db_session
+    ):
+        """A COMPLETED smoketest with an unparseable SMOKETEST_RESULT is infra_failure."""
+        project, version = await _make_project_and_version(db_session)
+        audit_task, smoke_task = await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.COMPLETED,
+            smoke_status=TaskStatus.COMPLETED,
+            smoketest_enabled=True,
+        )
+        db_session.add(
+            Artifact(
+                task_id=audit_task.id,
+                artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+                logs=json.dumps(
+                    {
+                        "audit_score": 1.0,
+                        "test_erosion": {"deleted_test_files": []},
+                    }
+                ),
+            )
+        )
+        db_session.add(
+            Artifact(
+                task_id=smoke_task.id,
+                artifact_type=ArtifactType.SMOKETEST_RESULT,
+                logs="not json {{{",
+            )
+        )
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "smoketest_report_missing"
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
     async def test_consecutive_infra_errors_backstop_fires_alert(self, db_session):
         """After _MIN_INFRA_ERROR_STREAK consecutive infra failures, an Alert is
         raised — the calcification guard is silent for infra failures, so this
@@ -3436,6 +3582,122 @@ class TestFinalizeInfraFailure:
         # Took the normal quality-verdict path (dry_run since promotion disabled).
         assert result["status"] == "dry_run"
         assert result["status"] != "infra_failure"
+
+    @pytest.mark.asyncio
+    async def test_audit_task_failed_enriches_error_with_failure_category(
+        self, db_session
+    ):
+        """FAILED audit with agent_failure_category_raw → enriched error label.
+
+        Ensures operators can distinguish audit infra failures by the specific
+        agent failure category (e.g. rate_limited vs. claude_code_failed) when
+        inspecting consecutive infra-failure alerts.
+        """
+        project, version = await _make_project_and_version(db_session)
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[{"type": "release_audit", "base_branch": "main"}],
+            vm_instance_id="vm-audit-enriched",
+            status=TaskStatus.FAILED,
+            context={
+                "release_version_id": str(version.id),
+                "agent_failure_category_raw": "release_audit_report_unparseable",
+            },
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "cafe" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_task_id": None,
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_task_failed_release_audit_report_unparseable"
+
+        await db_session.refresh(version)
+        assert version.last_qualification["status"] == "infra_failure"
+        assert (
+            version.last_qualification["error"]
+            == "audit_task_failed_release_audit_report_unparseable"
+        )
+
+    @pytest.mark.asyncio
+    async def test_audit_task_failed_no_failure_category_falls_back_to_generic(
+        self, db_session
+    ):
+        """FAILED audit with no agent_failure_category_raw → generic label.
+
+        Ensures backward compatibility when older agents didn't record the
+        failure category — the label stays 'audit_task_failed'.
+        """
+        project, version = await _make_project_and_version(db_session)
+        await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.FAILED,
+            smoke_status=TaskStatus.COMPLETED,
+            smoketest_enabled=False,
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_task_failed"
+
+        await db_session.refresh(version)
+        assert version.last_qualification["error"] == "audit_task_failed"
+
+    @pytest.mark.asyncio
+    async def test_smoketest_task_failed_enriches_error_with_failure_category(
+        self, db_session
+    ):
+        """FAILED smoketest with agent_failure_category_raw → enriched error label."""
+        project, version = await _make_project_and_version(db_session)
+        audit_task, smoke_task = await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.COMPLETED,
+            smoke_status=TaskStatus.FAILED,
+            smoketest_enabled=True,
+        )
+        # Patch the smoketest task's context to include a failure category.
+        smoke_task.context = {
+            **dict(smoke_task.context or {}),
+            "agent_failure_category_raw": "rate_limited",
+        }
+        db_session.add(smoke_task)
+        await db_session.commit()
+        await db_session.refresh(smoke_task)
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "smoketest_task_failed_rate_limited"
+
+        await db_session.refresh(version)
+        assert (
+            version.last_qualification["error"] == "smoketest_task_failed_rate_limited"
+        )
 
 
 # ===========================================================================
