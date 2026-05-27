@@ -3899,12 +3899,21 @@ echo ""
     throw err;
   }
 
-  if (exitCode !== 0) {
-    const combined = stderrBuffer + allOutput.slice(-LOG_TAIL_BYTES);
-    if (matchesRateLimit(combined, runner.provider, runner.authMode)) {
-      const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
-      throw new RateLimitError(`${runner.displayName} API usage exhausted — ${snippet}`);
-    }
+  // Rate-limit detection runs regardless of exit code: the Anthropic CLI
+  // sometimes emits a weekly-limit message ("You've hit your weekly limit ·
+  // resets ...") as a normal assistant turn and exits CLEANLY with code 0 —
+  // every handler then treats it as success and posts a degenerate artifact
+  // (e.g. release_audit posted a `{audit_score: 0, findings: []}` stub that
+  // the qualifier scored as a legitimate 0.43 verdict instead of routing to
+  // RATE_LIMIT / account rotation). Tail-bounded to the last LOG_TAIL_BYTES
+  // (5KB) of stdout + the bounded stderrBuffer — a mid-conversation mention
+  // of one of these CLI phrasings 6KB+ from the end will not match, and the
+  // real CLI limit message lands in the last few hundred bytes when the CLI
+  // gives up the next round.
+  const combined = stderrBuffer + allOutput.slice(-LOG_TAIL_BYTES);
+  if (matchesRateLimit(combined, runner.provider, runner.authMode)) {
+    const snippet = (stderrBuffer || allOutput.slice(-500)).slice(0, 500);
+    throw new RateLimitError(`${runner.displayName} API usage exhausted — ${snippet}`);
   }
 
   // Surface the last 500 bytes of stderr so failure handlers (memo, audit)
