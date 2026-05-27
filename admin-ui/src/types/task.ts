@@ -65,6 +65,12 @@ export interface Task {
   history?: { timestamp: string; action: string; details: Record<string, unknown> }[];
   child_task_ids?: string[];
   estimated_cost_usd?: number | null;
+  api_call_summary?: {
+    llm_call_count?: number;
+    total_input_tokens?: number;
+    total_output_tokens?: number;
+    last_updated_at?: string;
+  } | null;
   fix_loop_history?: Record<string, FixLoopAttempt[]> | null;
   fix_loop_summary?: FixLoopSummary[] | null;
   edges_considered?: EdgeConsidered[] | null;

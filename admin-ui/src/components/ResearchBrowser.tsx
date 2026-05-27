@@ -1,8 +1,8 @@
 import { useState, useMemo, useEffect } from 'react';
-import { X, ChevronDown, ChevronRight, Compass, Search, CheckCircle, Clock, XCircle, Minus, ExternalLink } from 'lucide-react';
+import { X, ChevronDown, ChevronRight, Compass, Search, CheckCircle, Clock, XCircle, Minus, ExternalLink, BarChart2 } from 'lucide-react';
 import type { Task, ResearchFinding } from './TaskCard';
 import { TaskTypeBadge, isSafeUrl } from './TaskCard';
-import { API_BASE_URL, authHeaders } from '../api';
+import { API_BASE_URL, authHeaders, fetchRecentFindings, type RecentFindingsResponse } from '../api';
 import { parseTimestamp } from '../utils/time';
 
 interface Direction {
@@ -218,6 +218,18 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
   const [expandedFinding, setExpandedFinding] = useState<string | null>(null);
   const [directions, setDirections] = useState<Direction[]>([]);
   const [directionFilter, setDirectionFilter] = useState<string | null>(initialDirectionId ?? null);
+  const [recentFindings, setRecentFindings] = useState<RecentFindingsResponse | null>(null);
+  const [qualityCardCollapsed, setQualityCardCollapsed] = useState(false);
+
+  // Fetch recent findings with actionability grades for the quality card
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    let cancelled = false;
+    fetchRecentFindings(selectedProjectId)
+      .then(data => { if (!cancelled) setRecentFindings(data); })
+      .catch(() => {/* non-critical */});
+    return () => { cancelled = true; };
+  }, [selectedProjectId]);
 
   // Fetch directions for the selected project
   useEffect(() => {
@@ -451,6 +463,67 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
 
         {/* Findings grouped by direction */}
         <div className="flex-1 overflow-y-auto p-4 space-y-3">
+          {/* Research quality card */}
+          {recentFindings && recentFindings.total > 0 && (
+            <div className="bg-neutral-900/50 border border-neutral-800 rounded-lg overflow-hidden">
+              {/* reason: quality card collapse toggle; py-3 matches direction group header density */}
+              <button
+                data-viewport-allow-small-target
+                onClick={() => setQualityCardCollapsed(c => !c)}
+                className="w-full flex items-center gap-3 px-4 py-3 hover:bg-neutral-800/30 transition-colors text-left"
+              >
+                <BarChart2 className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                <span className="flex-1 text-xs font-medium text-neutral-200">Research quality</span>
+                <span className="text-[10px] text-neutral-500 shrink-0">{recentFindings.total} findings · last 7d</span>
+                {qualityCardCollapsed
+                  ? <ChevronRight className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
+                  : <ChevronDown className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
+                }
+              </button>
+              {!qualityCardCollapsed && (
+                <div className="border-t border-neutral-800 px-4 py-3 space-y-3">
+                  {/* Distribution bar */}
+                  <div className="space-y-1.5">
+                    <div className="flex h-2 rounded-full overflow-hidden bg-neutral-800">
+                      {recentFindings.grade_distribution_pct.HIGH > 0 && (
+                        <div style={{ width: `${recentFindings.grade_distribution_pct.HIGH}%` }} className="bg-emerald-500" />
+                      )}
+                      {recentFindings.grade_distribution_pct.MEDIUM > 0 && (
+                        <div style={{ width: `${recentFindings.grade_distribution_pct.MEDIUM}%` }} className="bg-amber-500" />
+                      )}
+                      {recentFindings.grade_distribution_pct.LOW > 0 && (
+                        <div style={{ width: `${recentFindings.grade_distribution_pct.LOW}%` }} className="bg-neutral-600" />
+                      )}
+                    </div>
+                    <div className="flex gap-4 text-[10px]">
+                      <span className="text-emerald-400">{recentFindings.grade_distribution.HIGH} HIGH ({recentFindings.grade_distribution_pct.HIGH}%)</span>
+                      <span className="text-amber-400">{recentFindings.grade_distribution.MEDIUM} MED ({recentFindings.grade_distribution_pct.MEDIUM}%)</span>
+                      <span className="text-neutral-500">{recentFindings.grade_distribution.LOW} LOW ({recentFindings.grade_distribution_pct.LOW}%)</span>
+                    </div>
+                  </div>
+                  {/* Recent findings list */}
+                  <div className="space-y-1">
+                    {recentFindings.findings.slice(0, 10).map((f, i) => (
+                      <div key={i} className="flex items-center gap-2 text-[11px]">
+                        <span className={`shrink-0 px-1.5 py-0.5 rounded text-[9px] font-medium ${
+                          f.actionability_grade === 'HIGH' ? 'bg-emerald-500/20 text-emerald-400' :
+                          f.actionability_grade === 'LOW' ? 'bg-neutral-700 text-neutral-500' :
+                          'bg-amber-500/20 text-amber-400'
+                        }`}>
+                          {f.actionability_grade}
+                        </span>
+                        <span className="text-neutral-300 truncate">{f.title}</span>
+                        {f.researched_at && (
+                          <span className="text-neutral-600 shrink-0 ml-auto">{relativeDate(f.researched_at)}</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           {filteredGroups.length === 0 && (
             <div className="text-neutral-600 text-center py-12 text-sm">
               {groups.length === 0 ? 'No research findings yet.' : 'No findings match your search.'}

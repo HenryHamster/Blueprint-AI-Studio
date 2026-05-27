@@ -2385,6 +2385,7 @@ async def get_pr_files(
     repo: str,
     pr_number: int,
     project_id: str | None = None,
+    include_patch: bool = False,
 ) -> list[dict]:
     """Fetches the list of files changed in a PR with their status.
 
@@ -2392,6 +2393,9 @@ async def get_pr_files(
     genuinely empty PR (returns []) from a transient GitHub failure. The
     empty-rollup short-circuit in task_lifecycle relies on this distinction to
     avoid closing real PRs when the API is briefly unavailable.
+
+    When include_patch=True, the returned dicts also contain a 'patch' key with
+    the unified diff text for each file (may be absent for binary files).
     """
     headers = {
         "Authorization": f"Bearer {token}",
@@ -2416,7 +2420,19 @@ async def get_pr_files(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"GitHub API error fetching PR #{pr_number} files (HTTP {response.status_code})",
         )
-    return [{"filename": f["filename"], "status": f["status"]} for f in response.json()]
+    result = []
+    for f in response.json():
+        entry: dict = {
+            "filename": f["filename"],
+            "status": f["status"],
+            "additions": f.get("additions", 0),
+            "deletions": f.get("deletions", 0),
+            "changes": f.get("changes", 0),
+        }
+        if include_patch and "patch" in f:
+            entry["patch"] = f["patch"]
+        result.append(entry)
+    return result
 
 
 def _unique(*values: int | None) -> list[int]:

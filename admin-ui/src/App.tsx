@@ -903,6 +903,7 @@ export default function App() {
               onViewLogs={s.handleViewLogs}
               onTrack={s.trackTask}
               trackedTaskIds={s.trackedTaskIds}
+              onDuplicate={s.openDuplicateTaskModal}
               searchQuery={s.searchQuery}
               onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
             />
@@ -1032,6 +1033,7 @@ export default function App() {
           onRetry={s.handleRetry}
           onEditPrompt={s.handleEditPrompt}
           onDismiss={s.handleDismiss}
+          onDuplicate={s.openDuplicateTaskModal}
           onWidthChange={setDrawerWidth}
           onNavigateToTask={(taskId) => {
             const target = s.tasks.find(t => t.id === taskId);

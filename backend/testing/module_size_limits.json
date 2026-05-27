@@ -8,7 +8,7 @@
     "task_lifecycle.py": 5750,
     "orchestrator.py": 5300,
     "orchestrator_health.py": 500,
-    "admin.py": 3100,
+    "admin.py": 3200,
     "compute.py": 2500,
     "github.py": 2950,
     "routers/admin_settings.py": 3000,

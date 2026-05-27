@@ -1375,6 +1375,7 @@ async def get_task(
         "history": history,
         "child_task_ids": child_task_ids,
         "estimated_cost_usd": _estimated_cost_usd(task),
+        "api_call_summary": task.api_call_summary,
     }
 
 
@@ -1446,6 +1447,63 @@ async def get_task_serial_console(
         "captured_at": _utcnow().isoformat(),
         "source": source,
     }
+
+
+@router.get("/tasks/{task_id}/pr-files")
+async def get_task_pr_files(
+    task_id: str,
+    include_patch: bool = Query(False),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return changed-file summary for a task's PR.
+
+    Fetches the PR's file list from GitHub on demand (not cached). Returns
+    {files, pr_number} on success, or {files: null, reason: "no_pr"} when the
+    task has no PR artifact. Set include_patch=true to include the unified diff
+    text for each file (subject to GitHub's 5 MB / 3000-line patch cap).
+    """
+    try:
+        tid = uuid.UUID(task_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = await _get_user_task(tid, current_user["user_id"], session)
+
+    # Find the PR artifact
+    artifact_result = await session.execute(
+        select(Artifact).where(
+            Artifact.task_id == task.id,
+            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+        )
+    )
+    artifact = artifact_result.scalars().first()
+
+    if not artifact or not artifact.pr_url:
+        return {"files": None, "pr_number": None, "reason": "no_pr"}
+
+    pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
+
+    from app.routers.agent import get_github_token_for_task
+    from app.github import get_pr_files
+
+    try:
+        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"[ADMIN] Failed to get GitHub token for task {task_id}: {exc}")
+        raise HTTPException(status_code=502, detail="Failed to obtain GitHub token")
+
+    files = await get_pr_files(
+        gh_token,
+        owner,
+        repo,
+        pr_number,
+        project_id=str(task.project_id),
+        include_patch=include_patch,
+    )
+    return {"files": files, "pr_number": pr_number}
 
 
 class CreateTaskPayload(BaseModel):

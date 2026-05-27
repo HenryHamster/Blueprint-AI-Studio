@@ -17,6 +17,8 @@ import {
   Legend,
 } from 'recharts';
 
+type MetricsWindow = '15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all';
+
 interface MetricsPoint {
   timestamp: number;
   activeVMs: number;
@@ -31,12 +33,12 @@ interface MetricsDashboardProps {
   cumulativeVmHours: number;
   maxConcurrentVMs: number;
   tasks: Task[];
-  metricsWindow: '15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all';
-  onWindowChange: (w: '15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all') => void;
+  metricsWindow: MetricsWindow;
+  onWindowChange: (w: MetricsWindow) => void;
   projectId?: string;
 }
 
-const WINDOW_MS: Record<'15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all', number> = { '15m': 900000, '30m': 1800000, '1h': 3600000, '2h': 7200000, '3h': 10800000, '6h': 21600000, '12h': 43200000, '24h': 86400000, 'all': Number.MAX_SAFE_INTEGER };
+const WINDOW_MS: Record<MetricsWindow, number> = { '15m': 900000, '30m': 1800000, '1h': 3600000, '2h': 7200000, '3h': 10800000, '6h': 21600000, '12h': 43200000, '24h': 86400000, 'all': Number.MAX_SAFE_INTEGER };
 
 const TICK_STYLE = { fill: '#737373', fontSize: 10 };
 const GRID_COLOR = '#262626';
@@ -236,6 +238,39 @@ interface EfficiencyAxesLocal {
   vm_cold_start_breakdown?: Record<string, number | null> | null;
 }
 
+interface TaskCostBreakdownEntry {
+  task_type: string;
+  task_count: number;
+  estimated_cost_usd: number;
+}
+
+interface DirectionCostBreakdownEntry {
+  direction_id: string | null;
+  task_count: number;
+  estimated_cost_usd: number;
+}
+
+interface TopCostTask {
+  task_id: string;
+  task_title: string;
+  task_type: string;
+  direction_id: string | null;
+  completed_at: string;
+  estimated_cost_usd: number;
+}
+
+interface TaskCostBreakdownResponse {
+  project_id: string | null;
+  window: MetricsWindow;
+  window_ms: number | null;
+  window_start: string | null;
+  task_count: number;
+  total_estimated_cost_usd: number;
+  task_type_breakdown: TaskCostBreakdownEntry[];
+  direction_breakdown: DirectionCostBreakdownEntry[];
+  top_tasks: TopCostTask[];
+}
+
 const COLD_START_STAGE_LABELS: [string, string, boolean][] = [
   ['dispatch_to_slot_ms', 'Queue wait (slot)', true],
   ['dispatch_to_creds_ms', 'Dispatch → creds', false],
@@ -377,6 +412,112 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function TaskCostBreakdownWidget({ projectId, window }: { projectId: string; window: MetricsWindow }) {
+  const [data, setData] = useState<TaskCostBreakdownResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    setLoading(true);
+    setError(null);
+    setData(null);
+
+    (async () => {
+      try {
+        const params = new URLSearchParams({
+          project_id: projectId,
+          window,
+          top_n: '5',
+        });
+        const result = await apiFetch(`/api/admin/task-cost-breakdown?${params}`);
+        if (!result.ok) throw new Error(`Failed to fetch task cost breakdown: ${result.status}`);
+        if (mounted) {
+          setData(await result.json());
+        }
+      } catch (err) {
+        if (mounted) {
+          setError(err instanceof Error ? err.message : 'Unknown error');
+        }
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    })();
+
+    return () => { mounted = false; };
+  }, [projectId, window]);
+
+  if (loading) {
+    return <div className="flex items-center justify-center h-24 text-neutral-500 text-xs">Loading spend breakdown…</div>;
+  }
+
+  if (error) {
+    return <div className="flex items-center justify-center h-24 text-red-400 text-xs">{error}</div>;
+  }
+
+  if (!data || data.task_count === 0) {
+    return <div className="flex items-center justify-center h-24 text-neutral-500 text-xs">No completed cost data in this window</div>;
+  }
+
+  const sectionCard = 'rounded-lg bg-neutral-800/50 border border-neutral-700/50 p-3';
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-[11px] text-neutral-400 uppercase tracking-wide">Selected project spend</div>
+        <div className="text-xs font-mono text-neutral-300">${data.total_estimated_cost_usd.toFixed(2)} across {data.task_count} tasks</div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+        <div className={sectionCard}>
+          <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">By task type</div>
+          <div className="space-y-1">
+            {data.task_type_breakdown.map((row) => (
+              <div key={row.task_type} className="flex items-center justify-between gap-3 text-xs min-w-0">
+                <span className="text-neutral-300 break-all min-w-0">{row.task_type}</span>
+                <span className="text-neutral-400 font-mono shrink-0">${row.estimated_cost_usd.toFixed(2)} · {row.task_count}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className={sectionCard}>
+          <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">By research direction</div>
+          <div className="space-y-1">
+            {data.direction_breakdown.map((row) => (
+              <div key={row.direction_id ?? 'unassigned'} className="flex items-center justify-between gap-3 text-xs min-w-0">
+                <span className="text-neutral-300 break-all min-w-0">{row.direction_id ?? 'No direction'}</span>
+                <span className="text-neutral-400 font-mono shrink-0">${row.estimated_cost_usd.toFixed(2)} · {row.task_count}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className={sectionCard}>
+        <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">Top expensive tasks</div>
+        <div className="space-y-2">
+          {data.top_tasks.map((row) => (
+            <div key={row.task_id} className="grid grid-cols-[minmax(0,1fr)_auto] gap-3 items-start text-xs">
+              <div className="min-w-0">
+                <div className="text-neutral-200 break-all">{row.task_title}</div>
+                <div className="mt-0.5 text-[10px] text-neutral-500 break-all">
+                  <span className="font-mono">{row.task_type}</span>
+                  {' · '}
+                  <span className="font-mono">{row.direction_id ?? 'No direction'}</span>
+                  {' · '}
+                  {formatTime(parseTimestamp(row.completed_at).getTime(), window === 'all' ? WINDOW_MS['24h'] : WINDOW_MS[window])}
+                </div>
+              </div>
+              <div className="font-mono text-neutral-300 whitespace-nowrap">${row.estimated_cost_usd.toFixed(2)}</div>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
@@ -560,6 +701,14 @@ export default function MetricsDashboard({
           <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">Failure Rate</div>
           <FailureRateChart points={metricsHistory} windowMs={windowMs} />
         </div>
+
+        {/* Cost breakdown widget — full width */}
+        {projectId && (
+          <div className={`${cardClass} sm:col-span-2`}>
+            <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-3">Cost Breakdown</div>
+            <TaskCostBreakdownWidget projectId={projectId} window={metricsWindow} />
+          </div>
+        )}
 
         {/* Efficiency axes widget — full width */}
         {projectId && (

@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import React, { useState, useEffect, useRef, memo, forwardRef } from 'react';
-import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers, Gauge, Compass, FileText } from 'lucide-react';
+import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers, Gauge, Compass, FileText, Copy } from 'lucide-react';
 import { formatDurationMs, parseTimestamp } from '../utils/time';
 import { authGet, API_BASE_URL } from '../api';
 import { EXIT_REASON_COLORS } from '../utils/fixLoopColors';
@@ -429,6 +429,7 @@ interface TaskCardProps {
   onOpenSelfReview?: () => void;
   onTrack?: (task: Task) => void;
   isTracked?: boolean;
+  onDuplicate?: (task: Task) => void;
   blockingCount?: number;
   searchQuery?: string;
   onDirectionClick?: (directionId: string) => void;
@@ -588,7 +589,7 @@ function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   );
 }
 
-export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, actionLoading, compact, blockingCount, selectionMode, onToggleTaskSelection, onCtrlClick, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onOpenSelfReview, onTrack, isTracked, searchQuery, onDirectionClick }, ref) {
+export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, actionLoading, compact, blockingCount, selectionMode, onToggleTaskSelection, onCtrlClick, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onOpenSelfReview, onTrack, isTracked, onDuplicate, searchQuery, onDirectionClick }, ref) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
   const [descExpanded, setDescExpanded] = useState(false);
@@ -809,6 +810,15 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 className={`sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100'}`}
               >
                 <Archive className="w-3.5 h-3.5" />
+              </button>
+            )}
+            {onDuplicate && (
+              <button
+                title="Duplicate task"
+                onClick={(e) => { e.stopPropagation(); onDuplicate(task); }}
+                className="sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100 transition-colors min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto"
+              >
+                <Copy className="w-3.5 h-3.5" />
               </button>
             )}
           </div>

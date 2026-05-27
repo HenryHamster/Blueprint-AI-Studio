@@ -938,6 +938,17 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         </span>
       </DetailRow>
       {task.attempt_count != null && <DetailRow label="Attempts"><span>{task.attempt_count}</span></DetailRow>}
+      {task.api_call_summary != null && (() => {
+        const s = task.api_call_summary;
+        const calls = s.llm_call_count ?? 0;
+        const input = s.total_input_tokens ?? 0;
+        const output = s.total_output_tokens ?? 0;
+        return (
+          <DetailRow label="LLM Usage">
+            <span className="font-mono text-sm">{calls.toLocaleString()} calls · {input.toLocaleString()} in / {output.toLocaleString()} out tokens</span>
+          </DetailRow>
+        );
+      })()}
 
       {(() => {
         // R3-W2 (H1): read the dedicated column first; fall back to the

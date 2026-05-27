@@ -4,7 +4,6 @@ import {
   TrendingDown,
   AlertTriangle,
   CheckCircle,
-  Clock,
   ExternalLink,
   GitMerge,
   Minus,
@@ -13,7 +12,7 @@ import {
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
 import { apiFetch, fetchQualificationVerdicts, fetchSrUnhandledEdgesRetrospectives, setVersionPhase, triggerQualify, type CiResolution, type PromptFingerprintAnalyticsResponse, type QualificationVerdictRecord, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
-import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
+import { timeAgo, formatDurationSec } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
 import { RecentErrorsWidget } from './RecentErrorsWidget';
 import { DirectionAutoPauseWidget } from './DirectionAutoPauseWidget';
@@ -37,17 +36,23 @@ import { ManualInterventionPanel, AutoRecoveredPanel, AnomalyTrackerPanel } from
 import { RecentlyResolvedRegressionsPanel } from './RecentlyResolvedRegressionsPanel';
 import { ViewportDebtPanel } from './ViewportDebtPanel';
 import type { Task } from '../types/task';
-import type { ProjectDiagnostics } from '../types/diagnostics';
 import type { Project } from '../types/project';
 
 // ---------- local types ----------
 
-interface IssueItem {
+interface HealthOverviewIssue {
   severity: 'critical' | 'warning' | 'info';
-  icon: typeof AlertTriangle;
   title: string;
-  detail?: string;
-  onClick?: () => void;
+  hint: string;
+  task_ids: string[];
+  category: string;
+}
+
+interface HealthOverviewResponse {
+  overall_status: 'healthy' | 'degraded' | 'unhealthy';
+  success_rate: { current: number | null; trend: string | null; window_hours: number };
+  queue_depth: { queued: number; active: number; evaluating: number };
+  actionable_issues: HealthOverviewIssue[];
 }
 
 export interface PipelineRegression {
@@ -838,120 +843,112 @@ function FailureClassPill({ group, sparkData, cost }: { group: FailureGroup; spa
 
 // ---------- cost breakdown pill ----------
 
-// ---------- issue row ----------
+// ---------- system health card ----------
 
-const _SEVERITY_BORDER: Record<string, string> = { critical: 'border-l-red-500', warning: 'border-l-amber-500', info: 'border-l-blue-500' };
-const _SEVERITY_ICON_COLOR: Record<string, string> = { critical: 'text-red-400', warning: 'text-amber-400', info: 'text-blue-400' };
+const _HEALTH_SEV_BORDER: Record<string, string> = { critical: 'border-l-red-500', warning: 'border-l-amber-500', info: 'border-l-blue-500' };
+const _HEALTH_SEV_ICON: Record<string, string> = { critical: 'text-red-400', warning: 'text-amber-400', info: 'text-blue-400' };
+const _HEALTH_STATUS_STYLE: Record<string, { badge: string; label: string }> = {
+  healthy: { badge: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400', label: 'Healthy' },
+  degraded: { badge: 'bg-amber-500/10 border-amber-500/30 text-amber-400', label: 'Degraded' },
+  unhealthy: { badge: 'bg-red-500/10 border-red-500/30 text-red-400', label: 'Unhealthy' },
+};
 
-function IssueRow({ severity, icon: Icon, title, detail, onClick }: IssueItem) {
-  const Tag = onClick ? 'button' : 'div';
+function SystemHealthCard({
+  data,
+  loading,
+  tasks,
+  onViewTask,
+}: {
+  data: HealthOverviewResponse | null;
+  loading: boolean;
+  tasks: Task[];
+  onViewTask: (task: Task) => void;
+}) {
+  const status = data?.overall_status ?? 'healthy';
+  const statusStyle = _HEALTH_STATUS_STYLE[status] ?? _HEALTH_STATUS_STYLE.healthy;
+  const sr = data?.success_rate;
+  const qd = data?.queue_depth;
+  const issues = data?.actionable_issues ?? [];
+  const trendColor = sr?.trend === 'improving' ? 'text-emerald-400' : sr?.trend === 'declining' ? 'text-red-400' : 'text-neutral-400';
+  const trendIcon = sr?.trend === 'improving' ? '↑' : sr?.trend === 'declining' ? '↓' : '→';
+
   return (
-    <Tag
-      onClick={onClick}
-      className={`w-full text-left bg-neutral-900/50 border border-neutral-800/50 border-l-2 ${_SEVERITY_BORDER[severity]} rounded-lg p-3 flex items-start gap-2 ${onClick ? 'cursor-pointer hover:bg-neutral-800/50 transition-colors' : ''}`}
-    >
-      <Icon className={`w-4 h-4 mt-0.5 shrink-0 ${_SEVERITY_ICON_COLOR[severity]}`} />
-      <div className="min-w-0">
-        <p className="text-xs text-neutral-200">{title}</p>
-        {detail && <p className="text-[10px] text-neutral-500 mt-0.5 truncate">{detail}</p>}
+    <section>
+      <div className="flex items-center gap-2 mb-2">
+        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">System Health</h2>
+        {!loading && data && (
+          <span className={`text-[10px] font-semibold px-2 py-0.5 rounded border ${statusStyle.badge}`}>
+            {statusStyle.label}
+          </span>
+        )}
       </div>
-    </Tag>
+      {loading ? (
+        <div className="space-y-2"><Skeleton className="h-10 w-full" /><Skeleton className="h-14 w-full" /></div>
+      ) : (
+        <>
+          {data && (sr?.current != null || qd) && (
+            <div className="flex flex-wrap gap-2 mb-2">
+              {sr?.current != null && (
+                <div className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2.5 py-1.5 text-xs flex items-center gap-1.5">
+                  <span className="text-neutral-500">Success</span>
+                  <span className="font-mono font-bold text-neutral-200">{Math.round(sr.current * 100)}%</span>
+                  {sr.trend && <span className={`text-[10px] ${trendColor}`}>{trendIcon}</span>}
+                </div>
+              )}
+              {qd && (
+                <div className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2.5 py-1.5 text-xs flex items-center gap-2">
+                  <span className="text-neutral-500">Queue</span>
+                  <span className="font-mono text-neutral-300" title="queued">{qd.queued}q</span>
+                  <span className="font-mono text-neutral-300" title="active">{qd.active}a</span>
+                  <span className="font-mono text-neutral-300" title="evaluating">{qd.evaluating}e</span>
+                </div>
+              )}
+            </div>
+          )}
+          {issues.length === 0 ? (
+            <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 flex items-center gap-2 text-emerald-400 text-xs">
+              <CheckCircle className="w-4 h-4" />
+              All systems healthy
+            </div>
+          ) : (
+            <div className="space-y-1.5">
+              {issues.map((issue, i) => {
+                const borderCls = _HEALTH_SEV_BORDER[issue.severity] ?? 'border-l-neutral-500';
+                const iconCls = _HEALTH_SEV_ICON[issue.severity] ?? 'text-neutral-400';
+                const linkedTasks = issue.task_ids.slice(0, 3)
+                  .map(id => tasks.find(t => t.id === id))
+                  .filter((t): t is Task => t != null);
+                return (
+                  <div key={i} className={`bg-neutral-900/50 border border-neutral-800/50 border-l-2 ${borderCls} rounded-lg p-3`}>
+                    <div className="flex items-start gap-2">
+                      <AlertTriangle className={`w-4 h-4 mt-0.5 shrink-0 ${iconCls}`} />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs text-neutral-200">{issue.title}</p>
+                        {issue.hint && <p className="text-[10px] text-neutral-500 mt-0.5">{issue.hint}</p>}
+                        {linkedTasks.length > 0 && (
+                          <div className="flex flex-wrap gap-1 mt-1.5">
+                            {linkedTasks.map(t => (
+                              <button
+                                key={t.id}
+                                onClick={() => onViewTask(t)}
+                                className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800/60 text-neutral-300 hover:text-neutral-100 hover:bg-neutral-700/60 transition-colors truncate max-w-[200px] min-h-[44px] flex items-center"
+                              >
+                                {(t.title ?? t.id).slice(0, 40)}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </>
+      )}
+    </section>
   );
-}
-
-function buildIssues(
-  diagnostics: ProjectDiagnostics | null,
-  digest: DigestData | null,
-  tasks: Task[],
-  onViewTask: (task: Task) => void,
-): IssueItem[] {
-  const items: IssueItem[] = [];
-
-  if (diagnostics?.circuit_breaker && diagnostics.circuit_breaker.state !== 'CLOSED') {
-    items.push({
-      severity: 'critical',
-      icon: AlertTriangle,
-      title: `Circuit breaker ${diagnostics.circuit_breaker.state} (${diagnostics.circuit_breaker.failure_count} failures)`,
-    });
-  }
-
-  const stuckSorted = [...(diagnostics?.stuck_tasks ?? [])].sort((a, b) => b.stuck_for_seconds - a.stuck_for_seconds);
-  for (const st of stuckSorted.slice(0, 3)) {
-    const matchedTask = tasks.find(t => t.id === st.task_id);
-    items.push({
-      severity: 'warning',
-      icon: AlertTriangle,
-      title: `Stuck: ${st.title}`,
-      detail: st.remediation_hint ?? st.stuck_reason,
-      onClick: matchedTask ? () => onViewTask(matchedTask) : undefined,
-    });
-  }
-
-  if (digest && digest.pending_approval_count > 0) {
-    items.push({
-      severity: 'info',
-      icon: Clock,
-      title: `${digest.pending_approval_count} task${digest.pending_approval_count !== 1 ? 's' : ''} awaiting approval`,
-    });
-  }
-
-  if (digest && (digest.daily_cost_ceiling_usd ?? 0) > 0) {
-    const ceiling = digest.daily_cost_ceiling_usd ?? 0;
-    const daily = digest.daily_cost_usd ?? 0;
-    if (daily >= ceiling) {
-      items.push({
-        severity: 'warning',
-        icon: AlertTriangle,
-        title: `Daily cost ceiling exceeded ($${daily.toFixed(2)} / $${ceiling.toFixed(2)})`,
-      });
-    } else if (daily >= ceiling * 0.8) {
-      items.push({
-        severity: 'info',
-        icon: AlertTriangle,
-        title: `Daily cost approaching ceiling ($${daily.toFixed(2)} / $${ceiling.toFixed(2)})`,
-      });
-    }
-  }
-
-  if (diagnostics?.zone_health?.exhausted && diagnostics.zone_health.exhausted.length > 0) {
-    const cooldownRecovery = diagnostics.zone_health.cooldown_recovery ?? {};
-    const now = Date.now();
-    const zoneDetails = diagnostics.zone_health.exhausted.map(zone => {
-      const expiresAt = cooldownRecovery[zone];
-      if (expiresAt) {
-        const minsLeft = Math.ceil((parseTimestamp(expiresAt).getTime() - now) / 60000);
-        return minsLeft > 0 ? `${zone} — recovering in ${minsLeft}min` : zone;
-      }
-      return zone;
-    });
-    items.push({
-      severity: 'warning',
-      icon: AlertTriangle,
-      title: `Zone${diagnostics.zone_health.exhausted.length !== 1 ? 's' : ''} exhausted: ${zoneDetails.join(', ')}`,
-    });
-  }
-
-  const tax = digest?.failure_taxonomy_distribution;
-  if (tax && tax.total_failures >= 3 && tax.dominant_category) {
-    const cat = tax.categories[tax.dominant_category];
-    if (cat && cat.percentage > 50) {
-      const remediation: Record<string, string> = {
-        scope_related: 'Review task decomposition and scope budgets to keep work within size limits.',
-        review_quality: 'Strengthen self-review and lint configuration to catch defects earlier.',
-        infra_related: 'Check infrastructure health (zones, provisioning, external APIs).',
-        code_defect: 'Review agent code-quality patterns and prompt guidance.',
-      };
-      const label = TAXONOMY_LABELS[tax.dominant_category] ?? tax.dominant_category;
-      items.push({
-        severity: 'info',
-        icon: AlertTriangle,
-        title: `${label} failures dominate (${Math.round(cat.percentage)}% of ${tax.total_failures})`,
-        detail: remediation[tax.dominant_category],
-      });
-    }
-  }
-
-  return items;
 }
 
 // ---------- skeleton ----------
@@ -972,7 +969,6 @@ const WINDOW_OPTIONS = [
 
 export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick, onConfigureTargets }: DashboardHomeProps) {
   const [digest, setDigest] = useState<DigestData | null>(null);
-  const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
   const [measurementData, setMeasurementData] = useState<MediumScopeMeasurement | null>(null);
   const [scopeBaselines, setScopeBaselines] = useState<ScopeBaselinesResponse | null>(null);
@@ -993,10 +989,10 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const [srTrendDrilldownRows, setSrTrendDrilldownRows] = useState<{ task_id: string; title: string; missed_categories: string[]; sr_verdict: string | null }[]>([]);
   const [srTrendDrilldownLoading, setSrTrendDrilldownLoading] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [healthOverview, setHealthOverview] = useState<HealthOverviewResponse | null>(null);
   const [fixLoopTrendDays, setFixLoopTrendDays] = useState<7 | 14 | 30>(7);
   const [openPRsRefreshing, setOpenPRsRefreshing] = useState(false);
   const [lastFetchError, setLastFetchError] = useState(false);
-  const [showAllIssues, setShowAllIssues] = useState(false);
   const [windowHours, setWindowHours] = useState(24);
   const [selectedSrCategory, setSelectedSrCategory] = useState<string>('');
   const sparkRef = useRef<SparkPoint[]>([]);
@@ -1091,7 +1087,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
         (async () => {
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/diagnostics`);
-            if (res.ok) { setDiagnostics(await res.json()); diagnosticsOk = true; }
+            if (res.ok) { diagnosticsOk = true; }
           } catch { /* silent */ }
         })(),
         (async () => {
@@ -1202,6 +1198,16 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           if (res.ok) setTaskDurationStats(await res.json());
         } catch { /* silent */ }
       })(),
+      (async () => {
+        try {
+          const url = selectedProjectId
+            ? `/api/admin/health-overview?project_id=${encodeURIComponent(selectedProjectId)}&lookback_hours=${windowHours}`
+            : `/api/admin/health-overview?lookback_hours=${windowHours}`;
+          const res = await apiFetch(url);
+          if (res.ok) setHealthOverview(await res.json());
+          else setHealthOverview(null);
+        } catch { setHealthOverview(null); }
+      })(),
     );
 
     await Promise.allSettled(fetches);
@@ -1256,10 +1262,6 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   }, [activeCount, queuedCount, digest?.failed_count]);
   const failedCount = digest?.failed_count ?? 0;
   const successRate = digest?.success_rate;
-
-  // Build issues list
-  const issues = buildIssues(diagnostics, digest, tasks, onViewTask);
-  const visibleIssues = showAllIssues ? issues : issues.slice(0, 3);
 
   // Recent completions with pr_url (from digest)
   const mergeEvents = (digest?.recent_completions ?? []).filter(e => e.pr_url);
@@ -1326,6 +1328,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
 
       {/* Anomaly Throttle Banner */}
       <AnomalyThrottleBanner digest={digest} />
+
+      {/* System Health — actionable issues with remediation hints */}
+      <SystemHealthCard data={healthOverview} loading={loading} tasks={tasks} onViewTask={onViewTask} />
 
       {/* Pipeline Regressions */}
       {selectedProjectId && <PipelineRegressionsPanel projectId={selectedProjectId} />}
@@ -2275,32 +2280,6 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           {/* Drift Signals */}
           {!!selectedProjectId && <DriftSignalsCard projectId={selectedProjectId} />}
 
-          {/* Section 3: Top Actionable Issues */}
-          <section>
-            <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Actionable Issues</h2>
-            {loading ? (
-              <div className="space-y-2"><Skeleton className="h-14 w-full" /><Skeleton className="h-14 w-full" /></div>
-            ) : issues.length === 0 ? (
-              <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 flex items-center gap-2 text-emerald-400 text-xs">
-                <CheckCircle className="w-4 h-4" />
-                All systems healthy
-              </div>
-            ) : (
-              <div className="space-y-1.5">
-                {visibleIssues.map((issue, i) => (
-                  <IssueRow key={i} {...issue} />
-                ))}
-                {issues.length > 3 && (
-                  <button
-                    onClick={() => setShowAllIssues(v => !v)}
-                    className="text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors"
-                  >
-                    {showAllIssues ? 'Show less' : `Show ${issues.length - 3} more`}
-                  </button>
-                )}
-              </div>
-            )}
-          </section>
         </div>
 
         {/* Section 4: Recent Merge Timeline */}

@@ -902,3 +902,57 @@ export async function fetchQualificationVerdicts(
   if (!res.ok) throw new Error(`Failed to fetch qualification verdicts: ${res.status}`);
   return res.json();
 }
+
+export interface PrFileEntry {
+  filename: string;
+  status: string;
+  additions: number;
+  deletions: number;
+  changes: number;
+  patch?: string;
+}
+
+export interface PrFilesResponse {
+  files: PrFileEntry[] | null;
+  pr_number: number | null;
+  reason?: string;
+}
+
+export async function fetchTaskPrFiles(
+  taskId: string,
+  includePatch = false,
+): Promise<PrFilesResponse> {
+  const url = `/api/admin/tasks/${encodeURIComponent(taskId)}/pr-files${includePatch ? '?include_patch=true' : ''}`;
+  const res = await apiFetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch PR files: ${res.status}`);
+  return res.json();
+}
+
+export interface RecentFinding {
+  task_id: string;
+  title: string;
+  type: string;
+  scope: string;
+  priority: string;
+  actionability_grade: 'HIGH' | 'MEDIUM' | 'LOW';
+  direction_id: string | null;
+  researched_at: string | null;
+}
+
+export interface RecentFindingsResponse {
+  findings: RecentFinding[];
+  grade_distribution: { HIGH: number; MEDIUM: number; LOW: number };
+  grade_distribution_pct: { HIGH: number; MEDIUM: number; LOW: number };
+  total: number;
+}
+
+export async function fetchRecentFindings(
+  projectId: string,
+  limit = 50,
+): Promise<RecentFindingsResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/recent-findings?limit=${limit}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch recent findings: ${res.status}`);
+  return res.json();
+}

@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import type React from 'react';
 import { API_BASE_URL, authHeaders, authGet } from '../api';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
+import { USER_LAUNCHABLE_TASK_TYPE_IDS } from '../taskCapabilities';
+import type { Task } from '../types/task';
 
 interface RepoOption {
   full_name: string;
@@ -21,6 +23,9 @@ export function useTaskModal(
 
   // Modal visibility
   const [showNewTaskModal, setShowNewTaskModal] = useState(false);
+  // Tracks which opener populated the modal — 'new' persists drafts, 'duplicate' suppresses
+  // them so prefilled source-task content doesn't overwrite the user's saved draft.
+  const [modalOpener, setModalOpener] = useState<'new' | 'duplicate'>('new');
 
   // Form fields
   const [newTaskRepo, setNewTaskRepo] = useState('');
@@ -128,7 +133,47 @@ export function useTaskModal(
     }
   };
 
+  const getDraftStorageKey = (suffix: string) => {
+    const projectRepo = getSelectedProjectRepo();
+    return projectRepo ? `blueprint-admin:draft:${projectRepo}:${suffix}` : null;
+  };
+
+  const restoreDraft = () => {
+    const titleKey = getDraftStorageKey('title');
+    const promptKey = getDraftStorageKey('prompt');
+    if (!titleKey || !promptKey) return;
+    const savedTitle = localStorage.getItem(titleKey);
+    const savedPrompt = localStorage.getItem(promptKey);
+    if (savedTitle) setNewTaskTitle(savedTitle);
+    if (savedPrompt) setNewTaskPrompt(savedPrompt);
+  };
+
+  const clearDraft = () => {
+    const titleKey = getDraftStorageKey('title');
+    const promptKey = getDraftStorageKey('prompt');
+    if (!titleKey || !promptKey) return;
+    localStorage.removeItem(titleKey);
+    localStorage.removeItem(promptKey);
+  };
+
+  useEffect(() => {
+    // Only persist drafts while the new-task modal is the active opener.
+    // When opened as a duplicate, the title/prompt are prefilled from the source task,
+    // and persisting them would clobber the user's saved draft (issue #6321 review).
+    if (!showNewTaskModal || modalOpener !== 'new') return;
+    const projectRepo = selectedProjectRepoRef?.current || null;
+    if (!projectRepo) return;
+    const timer = setTimeout(() => {
+      const titleKey = `blueprint-admin:draft:${projectRepo}:title`;
+      const promptKey = `blueprint-admin:draft:${projectRepo}:prompt`;
+      localStorage.setItem(titleKey, newTaskTitle);
+      localStorage.setItem(promptKey, newTaskPrompt);
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [newTaskTitle, newTaskPrompt, showNewTaskModal, modalOpener, selectedProjectRepoRef]);
+
   const openNewTaskModal = () => {
+    setModalOpener('new');
     setShowNewTaskModal(true);
     setNewTaskType(defaultTaskType);
     setNewTaskModel(getDefaultModelForType(defaultTaskType));
@@ -138,6 +183,7 @@ export function useTaskModal(
     setUseManualBranch(false);
     setBranchOptions([]);
     setBranchError(null);
+    restoreDraft();
     fetchRepoOptions();
   };
 
@@ -192,12 +238,43 @@ export function useTaskModal(
       setNewTaskPrompt('');
       setNewTaskPrNumber('');
       setNewTaskPrBranch('');
+      clearDraft();
       addToast('Task created successfully', 'success');
       fetchTasksRef.current();
     } catch (error) {
       console.error('Failed to create task:', error);
       addToast('Failed to create task', 'error');
     }
+  };
+
+  const openDuplicateTaskModal = (task: Task) => {
+    const payload = task.payloads?.[0] ?? {};
+    const repo = (payload.github_repo as string) || '';
+    const branch = (payload.base_branch as string) || '';
+    const model = (payload.model as string) || '';
+    const effort = (payload.effort as string) || '';
+    const taskType: UserLaunchableTaskType =
+      USER_LAUNCHABLE_TASK_TYPE_IDS.includes(task.task_type as UserLaunchableTaskType)
+        ? (task.task_type as UserLaunchableTaskType)
+        : 'create';
+
+    setModalOpener('duplicate');
+    setShowNewTaskModal(true);
+    setNewTaskRepo(repo);
+    setNewTaskBranch(branch || getDefaultTaskBranch() || '');
+    setNewTaskTitle(task.title);
+    setNewTaskPrompt(task.description || '');
+    setNewTaskType(taskType);
+    setNewTaskModel(model || getDefaultModelForType(taskType));
+    setNewTaskEffort(effort || getDefaultEffortForType(taskType));
+    setNewTaskPrNumber('');
+    setNewTaskPrBranch('');
+    setUseManualRepo(false);
+    setUseManualBranch(false);
+    setBranchOptions([]);
+    setBranchError(null);
+    fetchRepoOptions();
+    if (repo) fetchBranchOptions(repo);
   };
 
   return {
@@ -208,6 +285,6 @@ export function useTaskModal(
     setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
-    openNewTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
+    openNewTaskModal, openDuplicateTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
   };
 }

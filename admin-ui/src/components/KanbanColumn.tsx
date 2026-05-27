@@ -21,7 +21,7 @@ const SORT_LABELS: Record<SortBy, string> = {
   attempts: 'Most retried',
 };
 
-export function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection, onShiftClick, onCtrlClick, maxRetries, actionLoadingMap, compact, blockingCount, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, colIdx, cardIdx, cardRef, onNavigate, searchQuery, onDirectionClick }: {
+export function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSelection, onShiftClick, onCtrlClick, maxRetries, actionLoadingMap, compact, blockingCount, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, isTracked, onDuplicate, colIdx, cardIdx, cardRef, onNavigate, searchQuery, onDirectionClick }: {
   task: Task;
   selectionMode: boolean;
   selectedTaskIds: Set<string>;
@@ -42,6 +42,7 @@ export function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSel
   onViewLogs: (task: Task) => void;
   onTrack?: (task: Task) => void;
   isTracked?: boolean;
+  onDuplicate?: (task: Task) => void;
   colIdx?: number;
   cardIdx?: number;
   cardRef?: (el: HTMLDivElement | null) => void;
@@ -92,6 +93,7 @@ export function TaskItem({ task, selectionMode, selectedTaskIds, onToggleTaskSel
           onViewLogs={onViewLogs}
           onTrack={onTrack}
           isTracked={isTracked}
+          onDuplicate={onDuplicate}
           searchQuery={searchQuery}
           onDirectionClick={onDirectionClick}
         />
@@ -121,6 +123,7 @@ export interface SortableCardProps {
   onViewLogs: (task: Task) => void;
   onTrack?: (task: Task) => void;
   isTracked?: boolean;
+  onDuplicate?: (task: Task) => void;
   isOverlay?: boolean;
   colIdx: number;
   cardIdx: number;
@@ -151,6 +154,7 @@ export function SortableCard({
   onViewLogs,
   onTrack,
   isTracked,
+  onDuplicate,
   isOverlay = false,
   colIdx,
   cardIdx,
@@ -228,6 +232,7 @@ export function SortableCard({
           onViewLogs={onViewLogs}
           onTrack={onTrack}
           isTracked={isTracked}
+          onDuplicate={onDuplicate}
           searchQuery={searchQuery}
           onDirectionClick={onDirectionClick}
         />
@@ -295,6 +300,7 @@ export interface KanbanColumnProps {
   onArchiveColumn: (taskIds: string[], columnLabel: string) => void;
   onViewLogs: (task: Task) => void;
   onTrack?: (task: Task) => void;
+  onDuplicate?: (task: Task) => void;
   onToggleTaskSelection: (id: string) => void;
   onCtrlClick?: (taskId: string) => void;
   toggleCollapse: (colId: string) => void;
@@ -336,6 +342,7 @@ export function KanbanColumn({
   onArchiveColumn,
   onViewLogs,
   onTrack,
+  onDuplicate,
   onToggleTaskSelection,
   onCtrlClick,
   toggleCollapse,
@@ -487,6 +494,7 @@ export function KanbanColumn({
               onViewLogs={onViewLogs}
               onTrack={onTrack}
               isTracked={trackedTaskIds?.has(task.id)}
+              onDuplicate={onDuplicate}
               searchQuery={searchQuery}
               onDirectionClick={onDirectionClick}
             />

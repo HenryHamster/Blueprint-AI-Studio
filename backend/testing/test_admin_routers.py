@@ -4751,3 +4751,99 @@ class TestDeployRollback:
             assert "rev-good=100" in call_args
             assert "us-west1" in call_args
             assert "test-project" in call_args
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GET /api/admin/tasks/{task_id}/pr-files
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestGetTaskPrFiles:
+    @pytest.mark.asyncio
+    async def test_task_with_pr_returns_files(self, client: AsyncClient, db_session):
+        """Returns file list when task has a PR artifact."""
+        from app.models import Artifact, ArtifactType
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="test task",
+            status=TaskStatus.EVALUATING,
+            payloads=[{"type": "create", "prompt": "do something"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        artifact = Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/42",
+        )
+        db_session.add(artifact)
+        await db_session.commit()
+
+        mock_files = [
+            {
+                "filename": "foo.py",
+                "status": "modified",
+                "additions": 5,
+                "deletions": 2,
+                "changes": 7,
+            }
+        ]
+        with (
+            patch(
+                "app.routers.agent.get_github_token_for_task",
+                new_callable=AsyncMock,
+                return_value=("tok", "owner", "repo"),
+            ),
+            patch(
+                "app.github.get_pr_files",
+                new_callable=AsyncMock,
+                return_value=mock_files,
+            ),
+        ):
+            resp = await client.get(f"/api/admin/tasks/{task.id}/pr-files")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["pr_number"] == 42
+        assert len(data["files"]) == 1
+        assert data["files"][0]["filename"] == "foo.py"
+        assert data["files"][0]["additions"] == 5
+
+    @pytest.mark.asyncio
+    async def test_task_without_pr_returns_no_pr_reason(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns reason='no_pr' when task has no PR artifact."""
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="test task",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create", "prompt": "do something"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}/pr-files")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["files"] is None
+        assert data["reason"] == "no_pr"
+
+    @pytest.mark.asyncio
+    async def test_unknown_task_returns_404(self, client: AsyncClient, db_session):
+        """Returns 404 for a task that does not exist."""
+        resp = await client.get(f"/api/admin/tasks/{uuid.uuid4()}/pr-files")
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_invalid_task_id_returns_404(self, client: AsyncClient, db_session):
+        """Returns 404 for a malformed task ID."""
+        resp = await client.get("/api/admin/tasks/not-a-uuid/pr-files")
+        assert resp.status_code == 404

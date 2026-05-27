@@ -352,6 +352,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
 
   // Refs for scrolling to sections from summary card
   const blockersRefEl = useRef<HTMLDivElement>(null);
+  const questionsRefEl = useRef<HTMLDivElement>(null);
   const routineRefEl = useRef<HTMLDivElement>(null);
 
   // Stable ref for addToast
@@ -532,8 +533,17 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
           parseTimestamp(m.created_at).getTime() > dividerTime &&
           effectiveSignal(m, eventPrefs, tempMutes) === 'high'
         ).length,
+        questions: openMessages.filter(m =>
+          m.message_type === 'QUESTION' &&
+          m.created_at &&
+          parseTimestamp(m.created_at).getTime() > dividerTime &&
+          // Match pinnedQuestions predicate (effectiveSignal === 'high'): the summary card
+          // scrolls to the pinned-questions section, so it must not announce QUESTIONs that
+          // were demoted to 'routine' and live elsewhere in the list.
+          effectiveSignal(m, eventPrefs, tempMutes) === 'high'
+        ).length,
       }
-    : { blockers: 0, feedback: 0, bugReports: 0, routine: 0, highSignalNotes: 0 },
+    : { blockers: 0, feedback: 0, bugReports: 0, routine: 0, highSignalNotes: 0, questions: 0 },
   [openMessages, dividerTime, eventPrefs, tempMutes]);
 
   // Total new count: each message counted exactly once (high-signal and routine are disjoint)
@@ -573,9 +583,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openMessages, eventPrefs, tempMutes, searchQuery, sortMode, showOnlyNew, dividerTime]);
 
-  // In importance mode, pin BLOCKERs at the top with a visual divider
+  // In importance mode, pin BLOCKERs and unanswered QUESTIONs at the top with visual dividers
   const pinnedBlockers = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type === 'BLOCKER') : [];
-  const otherHighSignal = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type !== 'BLOCKER') : highSignalOpen;
+  const pinnedQuestions = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type === 'QUESTION') : [];
+  const otherHighSignal = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type !== 'BLOCKER' && m.message_type !== 'QUESTION') : highSignalOpen;
 
   // Failing routine groups auto-promoted above the routine ops section
   const { promotedGroups, remainingRoutineRows, autoExpandedKeys, visibleRoutineCount, mutedRoutineCount } = useMemo(() => {
@@ -1811,9 +1822,34 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
                     renderBubble(item.msg, false, false, messages)
                   )
                 )}
-                {otherHighSignal.length > 0 && <div className="border-t border-neutral-800/60" />}
+                {(pinnedQuestions.length > 0 || otherHighSignal.length > 0) && <div className="border-t border-neutral-800/60" />}
               </>
             )}
+
+            {/* Pinned QUESTIONs (importance mode only) — awaiting operator reply */}
+            <div ref={questionsRefEl}>
+              {pinnedQuestions.length > 0 && (
+                <>
+                  <div className="flex items-center gap-1.5 text-[11px] text-blue-400/70 font-semibold uppercase tracking-wide px-1">
+                    <HelpCircle className="w-3 h-3" />
+                    <span>Awaiting reply · Questions</span>
+                    <span className="ml-auto bg-blue-500/20 text-blue-300 border border-blue-500/40 rounded-full px-1.5 py-0.5 text-[10px]">{pinnedQuestions.length} waiting</span>
+                  </div>
+                  {insertTimeDividers(pinnedQuestions).map((item, idx) =>
+                    item.kind === 'divider' ? (
+                      <div key={`divider-questions-${idx}`} className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2">
+                        <div className="flex-1 border-t border-neutral-800/60" />
+                        <span className="shrink-0">{item.label}</span>
+                        <div className="flex-1 border-t border-neutral-800/60" />
+                      </div>
+                    ) : (
+                      renderBubble(item.msg, false, false, messages)
+                    )
+                  )}
+                  {otherHighSignal.length > 0 && <div className="border-t border-neutral-800/60" />}
+                </>
+              )}
+            </div>
 
             {/* Divider: show before first new message if divider time is set and not dismissed */}
             {dividerTime && totalNewCount > 0 && !dividerDismissedRef.current && (
@@ -1837,7 +1873,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
             )}
 
             {/* Summary card: show counts of new messages if divider is active */}
-            {dividerTime && !dividerDismissedRef.current && (newMessageCounts.blockers > 0 || newMessageCounts.feedback > 0 || newMessageCounts.bugReports > 0 || newMessageCounts.routine > 0 || newMessageCounts.highSignalNotes > 0) && (
+            {dividerTime && !dividerDismissedRef.current && (newMessageCounts.blockers > 0 || newMessageCounts.questions > 0 || newMessageCounts.feedback > 0 || newMessageCounts.bugReports > 0 || newMessageCounts.routine > 0 || newMessageCounts.highSignalNotes > 0) && (
               <div className="mx-2 my-3 p-3 rounded-lg bg-gradient-to-r from-blue-950/40 to-blue-900/30 border border-blue-800/40 text-[11px] text-blue-200/90">
                 <div className="font-semibold mb-2 text-blue-300">Since you last looked</div>
                 <div className="space-y-1.5">
@@ -1850,6 +1886,17 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
                       data-testid="summary-card-blockers"
                     >
                       <span className="font-medium text-amber-300">{newMessageCounts.blockers}</span> new blocker{newMessageCounts.blockers !== 1 ? 's' : ''}
+                    </button>
+                  )}
+                  {newMessageCounts.questions > 0 && (
+                    <button
+                      onClick={() => {
+                        questionsRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                      }}
+                      className="block w-full text-left hover:text-blue-100 transition-colors"
+                      data-testid="summary-card-questions"
+                    >
+                      <span className="font-medium text-blue-300">{newMessageCounts.questions}</span> question{newMessageCounts.questions !== 1 ? 's' : ''} waiting
                     </button>
                   )}
                   {newMessageCounts.bugReports > 0 && (

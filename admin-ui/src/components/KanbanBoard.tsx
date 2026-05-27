@@ -77,6 +77,7 @@ interface KanbanBoardProps {
   onViewLogs: (task: Task) => void;
   onTrack?: (task: Task) => void;
   trackedTaskIds?: Set<string>;
+  onDuplicate?: (task: Task) => void;
   hasActiveFilters?: boolean;
   searchQuery?: string;
   onDirectionClick?: (directionId: string) => void;
@@ -124,6 +125,7 @@ export function KanbanBoard({
   onViewLogs,
   onTrack,
   trackedTaskIds,
+  onDuplicate,
   searchQuery,
   onDirectionClick,
 }: KanbanBoardProps) {
@@ -568,6 +570,7 @@ export function KanbanBoard({
                       onViewLogs={onViewLogs}
                       onTrack={onTrack}
                       isTracked={trackedTaskIds?.has(task.id)}
+                      onDuplicate={onDuplicate}
                       searchQuery={searchQuery}
                       onDirectionClick={onDirectionClick}
                     />
@@ -660,6 +663,7 @@ export function KanbanBoard({
               onArchiveColumn={onArchiveColumn}
               onViewLogs={onViewLogs}
               onTrack={onTrack}
+              onDuplicate={onDuplicate}
               onToggleTaskSelection={onToggleTaskSelection}
               onCtrlClick={onCtrlClick}
               toggleCollapse={toggleCollapse}
@@ -697,6 +701,7 @@ export function KanbanBoard({
             onViewLogs={onViewLogs}
             onTrack={onTrack}
             isTracked={trackedTaskIds?.has(activeTask.id)}
+            onDuplicate={onDuplicate}
             searchQuery={searchQuery}
             onDirectionClick={onDirectionClick}
             isOverlay

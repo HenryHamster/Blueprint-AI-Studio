@@ -244,6 +244,144 @@ class TestTaskDurationStats:
         assert phase["execution"] == {"p50_seconds": 200.0, "sample_size": 3}
 
 
+class TestTaskCostBreakdown:
+    @pytest.mark.asyncio
+    async def test_breakdown_filters_by_project_window_and_groups_costs(
+        self, client: AsyncClient, db_session
+    ):
+        """Only terminal tasks in the requested project/window contribute to cost buckets."""
+        project_a = make_project()
+        project_b = make_project(name="Other Project")
+        db_session.add_all([project_a, project_b])
+        await db_session.commit()
+
+        now = _utcnow()
+
+        def add_cost_task(
+            project_id: uuid.UUID,
+            *,
+            title: str,
+            task_type: str,
+            direction_id: str | None,
+            completed_minutes_ago: int,
+            vm_seconds: int,
+        ) -> None:
+            completed_at = now - timedelta(minutes=completed_minutes_ago)
+            started_at = completed_at - timedelta(seconds=vm_seconds)
+            db_session.add(
+                make_task(
+                    project_id=project_id,
+                    title=title,
+                    status=TaskStatus.COMPLETED,
+                    created_by="ORCHESTRATOR",
+                    payloads=[{"type": task_type, "prompt": "x"}],
+                    context={"direction_id": direction_id} if direction_id else {},
+                    started_at=started_at,
+                    created_at=started_at,
+                    status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                    vm_provisioned_at=started_at,
+                    vm_stopped_at=completed_at,
+                    vm_spot=False,
+                )
+            )
+
+        add_cost_task(
+            project_a.id,
+            title="Research expensive",
+            task_type="research",
+            direction_id="dir-a",
+            completed_minutes_ago=10,
+            vm_seconds=3600,
+        )
+        add_cost_task(
+            project_a.id,
+            title="Create supporting task",
+            task_type="create",
+            direction_id="dir-a",
+            completed_minutes_ago=20,
+            vm_seconds=1800,
+        )
+        add_cost_task(
+            project_a.id,
+            title="Unassigned task",
+            task_type="create",
+            direction_id=None,
+            completed_minutes_ago=30,
+            vm_seconds=600,
+        )
+        add_cost_task(
+            project_a.id,
+            title="Too old to count",
+            task_type="research",
+            direction_id="dir-old",
+            completed_minutes_ago=180,
+            vm_seconds=7200,
+        )
+        add_cost_task(
+            project_b.id,
+            title="Other project task",
+            task_type="research",
+            direction_id="dir-b",
+            completed_minutes_ago=15,
+            vm_seconds=3600,
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/task-cost-breakdown?project_id={project_a.id}&window=1h&top_n=2"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        assert body["project_id"] == str(project_a.id)
+        assert body["window"] == "1h"
+        assert body["task_count"] == 3
+        assert body["total_estimated_cost_usd"] == pytest.approx(0.11)
+
+        assert body["task_type_breakdown"] == [
+            {
+                "task_type": "research",
+                "task_count": 1,
+                "estimated_cost_usd": pytest.approx(
+                    round(3600 * admin_analytics.ON_DEMAND_RATE, 2)
+                ),
+            },
+            {
+                "task_type": "create",
+                "task_count": 2,
+                "estimated_cost_usd": pytest.approx(
+                    round(2400 * admin_analytics.ON_DEMAND_RATE, 2)
+                ),
+            },
+        ]
+        assert body["direction_breakdown"] == [
+            {
+                "direction_id": "dir-a",
+                "task_count": 2,
+                "estimated_cost_usd": pytest.approx(
+                    round(5400 * admin_analytics.ON_DEMAND_RATE, 2)
+                ),
+            },
+            {
+                "direction_id": None,
+                "task_count": 1,
+                "estimated_cost_usd": pytest.approx(
+                    round(600 * admin_analytics.ON_DEMAND_RATE, 2)
+                ),
+            },
+        ]
+        assert [task["task_title"] for task in body["top_tasks"]] == [
+            "Research expensive",
+            "Create supporting task",
+        ]
+        assert body["top_tasks"][0]["estimated_cost_usd"] == pytest.approx(
+            round(3600 * admin_analytics.ON_DEMAND_RATE, 2)
+        )
+        assert body["top_tasks"][1]["estimated_cost_usd"] == pytest.approx(
+            round(1800 * admin_analytics.ON_DEMAND_RATE, 2)
+        )
+
+
 class TestOpenPrs:
     @pytest.fixture(autouse=True)
     def _reset_open_prs_cache(self):

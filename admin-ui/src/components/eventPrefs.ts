@@ -135,7 +135,7 @@ export function classifySignalLevel(msg: {
   context: Record<string, unknown>;
 }): 'high' | 'routine' {
   if ((msg.from_type || '').toLowerCase() === 'user') return 'high';
-  if (['FEEDBACK', 'BLOCKER', 'BUG_REPORT'].includes(msg.message_type)) return 'high';
+  if (['FEEDBACK', 'BLOCKER', 'BUG_REPORT', 'QUESTION'].includes(msg.message_type)) return 'high';
   if (msg.message_type === 'NOTE') {
     const et = msg.context.event_type as string | undefined;
     if (et && HIGH_SIGNAL_NOTE_EVENTS.has(et)) return 'high';
@@ -159,7 +159,7 @@ export function effectiveSignal(
 
 export function getToastSeverity(msg: { message_type: string; from_type: string; context: Record<string, unknown> }): 'error' | 'info' {
   const et = msg.context.event_type as string | undefined;
-  if (msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT') return 'error';
+  if (msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT' || msg.message_type === 'QUESTION') return 'error';
   if (et && CRITICAL_NOTE_EVENTS.has(et)) return 'error';
   return 'info';
 }
@@ -168,7 +168,7 @@ export function isCriticalSeverity(msg: {
   message_type: string;
   context: Record<string, unknown>;
 }): boolean {
-  if (msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT') return true;
+  if (msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT' || msg.message_type === 'QUESTION') return true;
   if (msg.message_type === 'NOTE') {
     const et = msg.context.event_type as string | undefined;
     if (et && CRITICAL_NOTE_EVENTS.has(et)) return true;

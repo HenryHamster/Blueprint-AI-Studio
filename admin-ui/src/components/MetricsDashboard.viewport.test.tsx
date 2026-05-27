@@ -65,9 +65,44 @@ vi.mock('recharts', () => ({
 }));
 
 vi.mock('../api', () => ({
-  apiFetch: vi.fn(async () => ({
-    ok: true,
-    json: async () => ({
+  apiFetch: vi.fn(async (url: string) => {
+    if (url.includes('/task-cost-breakdown')) {
+      return new Response(JSON.stringify({
+        project_id: 'test-project-id',
+        window: '1h',
+        window_ms: 3600000,
+        window_start: '2026-04-24T11:00:00Z',
+        task_count: 3,
+        total_estimated_cost_usd: 48.75,
+        task_type_breakdown: [
+          { task_type: 'research', task_count: 2, estimated_cost_usd: 39.0 },
+          { task_type: 'create', task_count: 1, estimated_cost_usd: 9.75 },
+        ],
+        direction_breakdown: [
+          { direction_id: 'dir-super-long-direction-name-that-needs-wrap-001', task_count: 2, estimated_cost_usd: 39.0 },
+          { direction_id: null, task_count: 1, estimated_cost_usd: 9.75 },
+        ],
+        top_tasks: [
+          {
+            task_id: 'task-1',
+            task_title: 'Investigate the deeply nested metrics dashboard cost-overview panel for wrap safety at mobile widths',
+            task_type: 'research',
+            direction_id: 'dir-super-long-direction-name-that-needs-wrap-001',
+            completed_at: '2026-04-24T11:55:00Z',
+            estimated_cost_usd: 25.25,
+          },
+          {
+            task_id: 'task-2',
+            task_title: 'Refine dashboard cost breakdown aggregation and keep the long labels from clipping',
+            task_type: 'create',
+            direction_id: null,
+            completed_at: '2026-04-24T11:40:00Z',
+            estimated_cost_usd: 9.75,
+          },
+        ],
+      }), { status: 200 });
+    }
+    return new Response(JSON.stringify({
       axes: {
         cost_per_merged_pr: {
           current: 45.2, baseline: 50.0, drift_pct: -9.6,
@@ -92,8 +127,8 @@ vi.mock('../api', () => ({
       },
       baseline_captured_at: '2026-05-01T00:00:00Z',
       last_snapshot_at: '2026-05-08T00:00:00Z',
-    }),
-  })),
+    }), { status: 200 });
+  }),
 }));
 
 describe('MetricsDashboard — viewport regression', () => {

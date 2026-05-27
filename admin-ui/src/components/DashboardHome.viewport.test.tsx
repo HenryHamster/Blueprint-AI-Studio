@@ -153,6 +153,17 @@ vi.mock('../api', () => ({
         { status: 200 },
       );
     }
+    if (url.includes('/health-overview')) {
+      return new Response(
+        JSON.stringify({
+          overall_status: 'healthy',
+          success_rate: { current: 0.87, trend: 'stable', window_hours: 24 },
+          queue_depth: { queued: 2, active: 3, evaluating: 1 },
+          actionable_issues: [],
+        }),
+        { status: 200 },
+      );
+    }
     if (url.includes('/version-lifecycle')) {
       return new Response(JSON.stringify(versionLifecycleResponse), { status: 200 });
     }
