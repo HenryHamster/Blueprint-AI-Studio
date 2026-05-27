@@ -3923,6 +3923,11 @@ async def test_stabilize_hint_points_at_carried_audit_findings(
     assert "audit_findings" in suffix, f"Expected findings pointer; got: {suffix}"
     assert "Token baked into VM image" in suffix
     assert "recommended_mode='audit'" in suffix
+    # The project has no active audit/fundamentals-mode direction, so the hint
+    # must demand the agent CREATE one rather than merely "update" (a status
+    # note had been satisfying the old phrasing).
+    assert "MUST create a new direction" in suffix
+    assert "does NOT count" in suffix
 
     vp = payload.get("version_phase")
     assert vp is not None
@@ -3931,6 +3936,75 @@ async def test_stabilize_hint_points_at_carried_audit_findings(
         {"severity": "high", "summary": "Token baked into VM image."},
         {"severity": "low", "summary": "Private cross-module import."},
     ]
+
+
+@pytest.mark.asyncio
+async def test_stabilize_findings_hint_softens_when_remediation_direction_exists(
+    db_session, mocker, _lts_split_active
+):
+    """When an active audit-mode direction already exists, the hint must NOT
+    demand a new one — it should instead tell the agent to confirm the existing
+    direction targets the findings."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+        directions=[
+            {
+                "id": "d-existing",
+                "text": "Fix the release audit findings",
+                "status": "active",
+                "priority": "high",
+                "recommended_mode": "audit",
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=4,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        qualification_attempts=2,
+        last_qualification={
+            "status": "not_promoted",
+            "confidence": 0.6971,
+            "blocker": None,
+            "sub_scores": {"audit": 0.47, "test_erosion": 1.0},
+            "audit_findings": [
+                {"severity": "high", "summary": "Token TTL rollout gap."},
+            ],
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks
+    suffix = tasks[0].payloads[0].get("prompt_suffix", "")
+    assert "Token TTL rollout gap" in suffix
+    assert "already have an active audit/fundamentals-mode direction" in suffix
+    assert "MUST create a new direction" not in suffix, (
+        f"Should not demand a new direction when one exists; got: {suffix}"
+    )
 
 
 @pytest.mark.asyncio

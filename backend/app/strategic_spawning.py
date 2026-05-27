@@ -1961,11 +1961,43 @@ async def _spawn_strategic_review(
                 f" The last qualification's audit flagged {len(_carried_findings)} "
                 f"finding(s) — full list in "
                 f"version_phase.last_qualification.audit_findings — and the audit "
-                f"sub-score is the binding constraint on promotion. Target these "
-                f"specifically: create or update a direction "
-                f"(recommended_mode='audit') to fix them rather than generic "
-                f"cleanup. Top findings: {_top}."
+                f"sub-score is the binding constraint on promotion. Top "
+                f"findings: {_top}."
             )
+            # Only audit/fundamentals-mode directions do remediation work; a
+            # ship/pause direction that merely mentions the audit topic does
+            # not dispatch fixes.  When no remediation-mode direction is active,
+            # the agent must CREATE one — and we say so unambiguously.  The
+            # prior "create OR update a direction" phrasing let the agent
+            # satisfy the instruction by appending a status note to an
+            # unrelated ship-mode direction (observed 2026-05-27: v2 audit
+            # dropped to 0.47 with 10 real findings, the agent added a status
+            # note to a ship-mode direction and opened nothing, so the findings
+            # were never dispatched and the score stayed below the bar).
+            _remediation_modes = {"audit", "fundamentals"}
+            _has_remediation_direction = any(
+                d.get("status") == "active"
+                and d.get("recommended_mode") in _remediation_modes
+                for d in (project.directions or [])
+            )
+            if _has_remediation_direction:
+                _stabilize_hint += (
+                    " You already have an active audit/fundamentals-mode "
+                    "direction; confirm it explicitly targets THESE findings "
+                    "(update its text/scope if not) so the remediation work is "
+                    "actually dispatched this cycle."
+                )
+            else:
+                _stabilize_hint += (
+                    " There is currently NO active direction in audit or "
+                    "fundamentals mode, so nothing is set up to FIX these "
+                    "findings. You MUST create a new direction "
+                    "(recommended_mode='audit') whose stated work is resolving "
+                    "them — adding a status note to an existing ship/pause "
+                    "direction does NOT count and will not move the audit "
+                    "score. Creating this direction is the highest-leverage "
+                    "action available this cycle."
+                )
         prompt_suffix = (
             f"{prompt_suffix}\n{_stabilize_hint}" if prompt_suffix else _stabilize_hint
         )
