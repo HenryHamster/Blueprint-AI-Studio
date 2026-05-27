@@ -230,7 +230,6 @@ logger = logging.getLogger(__name__)
 # app.release_scoring; _load_policy stays here because it reads _POLICY_PATH
 # (patched in tests via app.release_qualifier._POLICY_PATH) off the filesystem.
 # ---------------------------------------------------------------------------
-
 # promotion_policy.yaml lives at backend/promotion_policy.yaml — two parents up
 # from this file (backend/app/release_qualifier.py).
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "promotion_policy.yaml"
