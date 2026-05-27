@@ -275,7 +275,13 @@ async def list_qualification_verdicts(
     Viewer+ role required.  Returns a bounded list (max 50) of per-verdict
     history rows covering both dry-run and promotion-enabled regimes, giving
     operators a live view of qualifier behavior across the full history.
+
+    ``infra_context`` accompanies the verdict list so callers can distinguish
+    'no recent verdicts because qualifier never ran' from 'qualifier has been
+    thrashing on infrastructure failures'.
     """
+    from app.release_qualifier import compute_promotion_readiness  # noqa: PLC0415
+
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
     )
@@ -287,6 +293,8 @@ async def list_qualification_verdicts(
         .limit(limit)
     )
     rows = list((await session.execute(stmt)).scalars().all())
+
+    readiness = await compute_promotion_readiness(session, project_id)
 
     return {
         "verdicts": [
@@ -309,4 +317,8 @@ async def list_qualification_verdicts(
             for v in rows
         ],
         "total": len(rows),
+        "infra_context": {
+            "infra_failure_count": readiness.get("infra_failure_count", 0),
+            "consecutive_infra_errors": readiness.get("consecutive_infra_errors", 0),
+        },
     }

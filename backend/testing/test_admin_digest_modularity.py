@@ -73,6 +73,7 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "compute_migration_health",
         "compute_narrative_summary",
         "compute_rejection_pattern_summary",
+        "compute_release_qualifier_infra_metrics",
         "compute_remediation_and_patterns",
         "compute_resurrection_outcome_summary",
         "compute_retry_analytics",

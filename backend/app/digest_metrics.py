@@ -24,6 +24,7 @@ from app.models import (
     Task,
     TaskStatus,
     RegressionRemediationCase,
+    ReleaseVersion,
     _utcnow,
 )
 from app.sr_blind_spots import (
@@ -3608,4 +3609,72 @@ def compute_retry_analytics(
         "avg_retries_before_failure": avg_retries_before_failure,
         "retry_success_rate_by_class": retry_success_rate_by_class,
         "retry_wasted_rate": retry_wasted_rate,
+    }
+
+
+async def compute_release_qualifier_infra_metrics(
+    session: AsyncSession,
+    *,
+    project_id: Optional[uuid.UUID],
+    window_start: datetime,
+) -> Dict[str, Any]:
+    """Aggregate release-qualifier audit-pipeline infra failure counters.
+
+    Scans ReleaseVersion.last_qualification JSONB (one record per version,
+    latest qualification only) and returns six counters over the digest window.
+    Returns zeroed counters when no qualifying rows exist.
+
+    Counters:
+      qualifier_runs_total                       — all finalized qualifications in window
+      release_infra_failure_total                — subset with status==infra_failure
+      audit_report_missing_count                 — error==audit_report_missing
+      audit_report_parseable_but_unscoreable_count — error==audit_report_parseable_but_unscoreable
+      smoketest_report_missing_count             — error==smoketest_report_missing
+      release_infra_failure_streak_max           — highest consecutive_infra_errors seen
+    """
+    stmt = select(ReleaseVersion)
+    if project_id:
+        stmt = stmt.where(ReleaseVersion.project_id == project_id)
+
+    result = await session.execute(stmt.limit(10000))
+    versions = result.scalars().all()
+
+    window_iso = window_start.isoformat()
+
+    qualifier_runs_total = 0
+    release_infra_failure_total = 0
+    audit_report_missing_count = 0
+    audit_report_parseable_but_unscoreable_count = 0
+    smoketest_report_missing_count = 0
+    release_infra_failure_streak_max = 0
+
+    for version in versions:
+        qual = version.last_qualification
+        if not isinstance(qual, dict):
+            continue
+        finalized_at = qual.get("finalized_at")
+        if not finalized_at or finalized_at < window_iso:
+            continue
+        qualifier_runs_total += 1
+        if qual.get("status") != "infra_failure":
+            continue
+        release_infra_failure_total += 1
+        error = qual.get("error") or ""
+        if error == "audit_report_missing":
+            audit_report_missing_count += 1
+        elif error == "audit_report_parseable_but_unscoreable":
+            audit_report_parseable_but_unscoreable_count += 1
+        elif error == "smoketest_report_missing":
+            smoketest_report_missing_count += 1
+        streak = int(qual.get("consecutive_infra_errors") or 0)
+        if streak > release_infra_failure_streak_max:
+            release_infra_failure_streak_max = streak
+
+    return {
+        "qualifier_runs_total": qualifier_runs_total,
+        "release_infra_failure_total": release_infra_failure_total,
+        "audit_report_missing_count": audit_report_missing_count,
+        "audit_report_parseable_but_unscoreable_count": audit_report_parseable_but_unscoreable_count,
+        "smoketest_report_missing_count": smoketest_report_missing_count,
+        "release_infra_failure_streak_max": release_infra_failure_streak_max,
     }

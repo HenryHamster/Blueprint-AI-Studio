@@ -24,14 +24,18 @@ resolving via the historical import surface.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import uuid
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app import release_version
-from app.models import Alert, AlertSeverity
+from app.models import Alert, AlertSeverity, ReleaseVersion
+from app.notification_dispatch import dispatch_external_notification
 from app.release_promotion import _notify_operator
 from app.time_utils import _utcnow
 
@@ -159,6 +163,19 @@ async def _handle_infra_failure(
         },
     )
 
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            version.project_id,
+            "RELEASE_INFRA_FAILURE",
+            {
+                "version_number": version.version_number,
+                "version_id": str(version.id),
+                "infra_error": infra_error,
+                "consecutive_infra_errors": current_streak,
+            },
+        )
+    )
+
     logger.warning(
         "[RELEASE_QUALIFIER] v%d infra failure: %s (streak=%d) — "
         "no verdict recorded, version returned to stabilize",
@@ -170,4 +187,53 @@ async def _handle_infra_failure(
         "status": "infra_failure",
         "error": infra_error,
         "consecutive_infra_errors": current_streak,
+    }
+
+
+async def get_infra_failure_stats(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    window: int = 50,
+) -> dict[str, Any]:
+    """Return infra-failure summary for a project over the most-recent ``window`` versions.
+
+    Infra failures are intentionally NOT written as ``QualificationVerdict`` rows
+    (no quality judgement was rendered).  This function queries
+    ``ReleaseVersion.last_qualification`` directly so callers can surface the
+    infra-failure signal alongside verdict history without running the full
+    promotion-readiness computation.
+
+    Returns a dict with:
+      ``infra_failure_count``      – count of infra_failure records in the window
+      ``consecutive_infra_errors`` – current consecutive-failure streak
+    """
+    stmt = (
+        select(ReleaseVersion.last_qualification)
+        .where(
+            ReleaseVersion.project_id == project_id,
+            ReleaseVersion.last_qualification.is_not(None),
+        )
+        .order_by(ReleaseVersion.updated_at.desc())
+        .limit(window)
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
+
+    infra_failure_count = sum(
+        1 for q in rows if isinstance(q, dict) and q.get("status") == "infra_failure"
+    )
+    consecutive_infra_errors = 0
+    for q in rows:
+        if not isinstance(q, dict):
+            continue
+        if q.get("status") == "pending":
+            consecutive_infra_errors = int(q.get("prior_infra_streak") or 0)
+            break
+        if q.get("status") == "infra_failure":
+            consecutive_infra_errors = int(q.get("consecutive_infra_errors") or 1)
+            break
+
+    return {
+        "infra_failure_count": infra_failure_count,
+        "consecutive_infra_errors": consecutive_infra_errors,
     }

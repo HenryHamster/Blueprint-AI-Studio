@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import QualificationVerdict
+from app.models import QualificationVerdict, ReleaseVersion
 
 # Maps the internal last_qualification status code to a human-readable label
 # for the version-lifecycle panel.
@@ -76,7 +76,12 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
     }
 
 
-def _empty_readiness(thresholds: dict[str, Any]) -> dict[str, Any]:
+def _empty_readiness(
+    thresholds: dict[str, Any],
+    *,
+    infra_failure_count: int = 0,
+    consecutive_infra_errors: int = 0,
+) -> dict[str, Any]:
     """The not-ready summary returned when there is no verdict history yet."""
     return {
         "ready": False,
@@ -85,6 +90,8 @@ def _empty_readiness(thresholds: dict[str, Any]) -> dict[str, Any]:
         "would_promote_count": 0,
         "would_promote_rate": 0.0,
         "consecutive_clean_passes": 0,
+        "consecutive_infra_errors": consecutive_infra_errors,
+        "infra_failure_count": infra_failure_count,
         "confidence": {
             "mean": None,
             "stdev": None,
@@ -111,6 +118,32 @@ async def compute_promotion_readiness(
         "history_window": _READINESS_HISTORY_WINDOW,
     }
 
+    infra_stmt = (
+        select(ReleaseVersion.last_qualification)
+        .where(
+            ReleaseVersion.project_id == project_id,
+            ReleaseVersion.last_qualification.is_not(None),
+        )
+        .order_by(ReleaseVersion.updated_at.desc())
+        .limit(_READINESS_HISTORY_WINDOW)
+    )
+    infra_rows = list((await session.execute(infra_stmt)).scalars().all())
+    infra_failure_count = sum(
+        1
+        for qual in infra_rows
+        if isinstance(qual, dict) and qual.get("status") == "infra_failure"
+    )
+    consecutive_infra_errors = 0
+    for qual in infra_rows:
+        if not isinstance(qual, dict):
+            continue
+        if qual.get("status") == "pending":
+            consecutive_infra_errors = int(qual.get("prior_infra_streak") or 0)
+            break
+        if qual.get("status") == "infra_failure":
+            consecutive_infra_errors = int(qual.get("consecutive_infra_errors") or 1)
+            break
+
     stmt = (
         select(QualificationVerdict)
         .where(
@@ -124,7 +157,16 @@ async def compute_promotion_readiness(
 
     evaluated = len(verdicts)
     if evaluated == 0:
-        return _empty_readiness(thresholds)
+        out = _empty_readiness(
+            thresholds,
+            infra_failure_count=infra_failure_count,
+            consecutive_infra_errors=consecutive_infra_errors,
+        )
+        if infra_failure_count:
+            out["reason"] = (
+                "recent qualifications have been infrastructure failures, not quality findings"
+            )
+        return out
 
     would_promote_count = sum(1 for v in verdicts if v.would_promote)
     would_promote_rate = round(would_promote_count / evaluated, 4)
@@ -196,6 +238,8 @@ async def compute_promotion_readiness(
         "would_promote_count": would_promote_count,
         "would_promote_rate": would_promote_rate,
         "consecutive_clean_passes": consecutive_clean,
+        "consecutive_infra_errors": consecutive_infra_errors,
+        "infra_failure_count": infra_failure_count,
         "confidence": {
             "mean": conf_mean,
             "stdev": conf_stdev,

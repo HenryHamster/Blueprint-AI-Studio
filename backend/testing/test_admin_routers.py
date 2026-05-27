@@ -4304,6 +4304,75 @@ class TestQualificationVerdictsAuditMissingReason:
         assert verdicts[0]["audit_missing_reason"] is None
 
 
+class TestQualificationVerdictsInfraContext:
+    """GET /api/admin/projects/{id}/qualification-verdicts includes infra_context."""
+
+    @pytest.mark.asyncio
+    async def test_infra_context_zero_when_no_infra_failures(
+        self, client: AsyncClient, db_session
+    ):
+        """infra_context counts are 0 when no ReleaseVersion has an infra_failure."""
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="abc123",
+            confidence=0.95,
+            blocker=None,
+            audit_missing_reason=None,
+            would_promote=True,
+            promotion_enabled=False,
+            terminal_status="dry_run",
+            threshold=0.90,
+        )
+        db_session.add(verdict)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/qualification-verdicts"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "infra_context" in data
+        assert data["infra_context"]["infra_failure_count"] == 0
+        assert data["infra_context"]["consecutive_infra_errors"] == 0
+
+    @pytest.mark.asyncio
+    async def test_infra_context_counts_infra_failures(
+        self, client: AsyncClient, db_session
+    ):
+        """infra_context surfaces infra_failure_count when ReleaseVersion has
+        infra_failure last_qualification entries, distinguishing 'never ran'
+        from 'infrastructure failing'."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={
+                "status": "infra_failure",
+                "error": "audit_report_missing",
+                "consecutive_infra_errors": 3,
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/qualification-verdicts"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["verdicts"] == []
+        assert data["infra_context"]["infra_failure_count"] >= 1
+        assert data["infra_context"]["consecutive_infra_errors"] >= 1
+
+
 class TestResetIterationCap:
     """POST /api/admin/tasks/{task_id}/reset-iteration-cap — archives FAILED
     review/fix tasks for the PR. The archive filter pushes pr_number into SQL;

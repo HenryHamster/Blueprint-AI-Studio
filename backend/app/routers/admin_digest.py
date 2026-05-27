@@ -59,6 +59,7 @@ from app.digest_metrics import (
     compute_retry_analytics,  # noqa: F401  re-exported for external importers
     compute_retry_pattern_summary,  # noqa: F401  re-exported for external importers
     compute_review_cap_exhaustion_summary,  # noqa: F401  re-exported for external importers
+    compute_release_qualifier_infra_metrics,  # noqa: F401  re-exported for external importers
     compute_review_quality_metrics,
     compute_scope_mismatch_summary,
 )
@@ -1105,6 +1106,12 @@ async def _compute_digest(
         completed_tasks, failed_tasks
     )
 
+    release_qualifier_infra_metrics = await compute_release_qualifier_infra_metrics(
+        session=session,
+        project_id=project_id,
+        window_start=window_start,
+    )
+
     _remediation_result = await compute_remediation_and_patterns(
         session=session,
         project_id=project_id,
@@ -1250,4 +1257,5 @@ async def _compute_digest(
         "prediction_calibration_sample_count": prediction_calibration["sample_count"]
         if prediction_calibration
         else None,
+        "release_qualifier_infra_metrics": release_qualifier_infra_metrics,
     }

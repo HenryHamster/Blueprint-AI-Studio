@@ -4019,6 +4019,68 @@ class TestFinalizeInfraFailure:
             version.last_qualification["error"] == "smoketest_task_failed_rate_limited"
         )
 
+    @pytest.mark.asyncio
+    async def test_infra_failure_dispatches_external_webhook(self, db_session, mocker):
+        """_handle_infra_failure fires an external webhook with RELEASE_INFRA_FAILURE."""
+        import asyncio
+
+        dispatch_mock = AsyncMock()
+        mocker.patch(
+            "app.release_qualifier_infra.dispatch_external_notification",
+            dispatch_mock,
+        )
+
+        project, version = await _make_project_and_version(db_session)
+        await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.FAILED,
+            smoke_status=TaskStatus.COMPLETED,
+        )
+
+        await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+        # Drain ensure_future'd coroutine.
+        await asyncio.sleep(0)
+
+        dispatch_mock.assert_called_once()
+        call_args = dispatch_mock.call_args
+        assert call_args[0][1] == "RELEASE_INFRA_FAILURE"
+        payload = call_args[0][2]
+        assert payload["consecutive_infra_errors"] >= 1
+        assert "version_number" in payload
+        assert "infra_error" in payload
+
+    @pytest.mark.asyncio
+    async def test_infra_failure_streak_in_webhook_payload(self, db_session, mocker):
+        """Webhook payload carries the correct consecutive_infra_errors streak count."""
+        import asyncio
+
+        dispatch_mock = AsyncMock()
+        mocker.patch(
+            "app.release_qualifier_infra.dispatch_external_notification",
+            dispatch_mock,
+        )
+
+        project, version = await _make_project_and_version(db_session)
+        await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.FAILED,
+            smoke_status=TaskStatus.COMPLETED,
+            prior_infra_streak=1,
+        )
+
+        await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+        await asyncio.sleep(0)
+
+        dispatch_mock.assert_called_once()
+        payload = dispatch_mock.call_args[0][2]
+        assert payload["consecutive_infra_errors"] == 2
+
 
 # ===========================================================================
 # _finalize_qualification — happy-path audit_score regression
@@ -9001,6 +9063,66 @@ async def test_readiness_excludes_promotion_enabled_verdicts(db_session):
 
     assert out["verdicts_evaluated"] == 5
     assert out["ready"] is True, out["reason"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_surfaces_infra_failure_count_and_reason(db_session):
+    """When the only recent qualification is an infra_failure, the readiness
+    summary surfaces infra_failure_count >= 1, consecutive_infra_errors >= 1,
+    and a reason that distinguishes 'broken pipeline' from 'never ran'.
+
+    This is the anti-silent-collapse guard: operators must be able to tell the
+    difference between 'qualifier has not run' and 'qualifier is thrashing on
+    infrastructure'."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+
+    # Stamp the version's last_qualification as an infra_failure with a streak.
+    from sqlalchemy.orm.attributes import flag_modified
+
+    version.last_qualification = {
+        "status": "infra_failure",
+        "consecutive_infra_errors": 3,
+        "reason": "audit_report_missing",
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    # No QualificationVerdict rows were written — infra failures don't write them.
+    assert out["verdicts_evaluated"] == 0
+    assert out["infra_failure_count"] == 1
+    assert out["consecutive_infra_errors"] == 3
+    assert "infrastructure failures" in out["reason"]
+    assert out["ready"] is False
+
+
+@pytest.mark.asyncio
+async def test_readiness_consecutive_infra_errors_from_pending_prior_streak(db_session):
+    """When the latest last_qualification is 'pending' (a new run just started
+    after a streak of infra failures), consecutive_infra_errors is sourced from
+    prior_infra_streak on the pending record rather than from the previous infra
+    failure record."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    version.last_qualification = {
+        "status": "pending",
+        "prior_infra_streak": 2,
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["consecutive_infra_errors"] == 2
+    # infra_failure_count counts only infra_failure status rows, not pending.
+    assert out["infra_failure_count"] == 0
 
 
 # ===========================================================================
