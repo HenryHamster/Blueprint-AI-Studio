@@ -126,6 +126,19 @@ class TestBackfillTaskBranchNamespace:
         assert "task_branch_namespace" in project.build_config
 
     @pytest.mark.asyncio
+    async def test_empty_slug_non_self_repo_does_not_use_blueprint(self):
+        """A repo name that slugifies to empty gets 'project', not 'blueprint'."""
+        project = _project(github_repo="---", is_self_repo=False)
+        session = _make_session([project])
+
+        summary = await backfill_task_branch_namespace(session)
+
+        assert summary["namespace_filled"] == 1
+        ns = project.build_config["task_branch_namespace"]
+        assert ns != "blueprint"
+        assert ns == "project"
+
+    @pytest.mark.asyncio
     async def test_single_project_filter(self):
         """When project_id is given, only that project is queried."""
         target_id = uuid.uuid4()

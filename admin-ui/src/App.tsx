@@ -227,15 +227,16 @@ export default function App() {
   const [srMissedTasks, setSrMissedTasks] = useState<SrMissedTask[]>([]);
   const [srMissedLoading, setSrMissedLoading] = useState(false);
   const [srMissedCategory, setSrMissedCategory] = useState('');
+  const [srMissedWindowDays, setSrMissedWindowDays] = useState<7 | 14 | 30>(14);
   const srMissedRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!showSrMissed || !selectedProjectId) return;
     setSrMissedLoading(true);
-    fetchSrMissedRetrospectives(selectedProjectId, { days: 14, page_size: 200 })
+    fetchSrMissedRetrospectives(selectedProjectId, { days: srMissedWindowDays, page_size: 500 })
       .then(r => setSrMissedTasks(r.items))
       .catch(() => {})
       .finally(() => setSrMissedLoading(false));
-  }, [showSrMissed, selectedProjectId]);
+  }, [showSrMissed, selectedProjectId, srMissedWindowDays]);
 
   // Open operator-spawned SR investigations, keyed by category — used to dedup spawning.
   const [srInvestigationTaskIds, setSrInvestigationTaskIds] = useState<Record<string, string>>({});
@@ -898,7 +899,7 @@ export default function App() {
                   {showSrMissed && (
                     srMissedLoading
                       ? <p className="text-[10px] text-neutral-500 mt-2">Loading…</p>
-                      : <div className="mt-2"><SrMissedRetrospective tasks={srMissedTasks} onTaskClick={handleViewTask} selectedCategory={srMissedCategory} /></div>
+                      : <div className="mt-2"><SrMissedRetrospective tasks={srMissedTasks} onTaskClick={handleViewTask} selectedCategory={srMissedCategory} windowDays={srMissedWindowDays} onWindowDaysChange={setSrMissedWindowDays} /></div>
                   )}
                 </div>
               )}

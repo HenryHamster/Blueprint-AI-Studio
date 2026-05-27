@@ -879,7 +879,7 @@ async def backfill_task_branch_namespace(session, project_id=None) -> dict:
             namespace = "blueprint"
         else:
             slug = _re.sub(r"[^a-z0-9]+", "-", github_repo.lower()).strip("-")
-            namespace = slug[:40] if slug else "blueprint"
+            namespace = slug[:40] if slug else "project"
 
         project.build_config = {**build_config, "task_branch_namespace": namespace}
         flag_modified(project, "build_config")

@@ -650,6 +650,38 @@ class TestOnboardTaskBranchNamespace:
         ) == "blueprintaistudio"
 
     @pytest.mark.asyncio
+    async def test_empty_slug_repo_does_not_use_blueprint(
+        self, client: AsyncClient, db_session
+    ):
+        """A repo whose name slugifies to empty falls back to 'project', not 'blueprint'."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="main",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "---"},
+            )
+        assert resp.status_code == 200
+        project = await db_session.get(Project, resp.json()["project_id"])
+        ns = (project.build_config or {}).get("task_branch_namespace")
+        assert ns != "blueprint"
+        assert ns == "project"
+
+    @pytest.mark.asyncio
     async def test_build_config_override_wins(self, client: AsyncClient, db_session):
         """Explicit task_branch_namespace in build_config_override overrides derived value."""
         with (

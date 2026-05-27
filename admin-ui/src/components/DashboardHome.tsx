@@ -1059,6 +1059,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const [blindSpots, setBlindSpots] = useState<BlindSpotsData | null>(null);
   const [srRecentMisses, setSrRecentMisses] = useState<SrMissedTask[] | null>(null);
   const [srRecentMissesTotal, setSrRecentMissesTotal] = useState<number>(0);
+  const [srUnhandledEdgesWindowDays, setSrUnhandledEdgesWindowDays] = useState<7 | 14 | 30>(14);
   const [srUnhandledEdgesTasks, setSrUnhandledEdgesTasks] = useState<SrUnhandledEdgesTask[] | null>(null);
   const [srReviewerDisagreements, setSrReviewerDisagreements] = useState<SrReviewerDisagreementsData | null>(null);
   const [directionSrBreakdown, setDirectionSrBreakdown] = useState<DirectionSrBreakdownData | null>(null);
@@ -1252,7 +1253,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
         })(),
         (async () => {
           try {
-            const data = await fetchSrUnhandledEdgesRetrospectives(selectedProjectId);
+            const data = await fetchSrUnhandledEdgesRetrospectives(selectedProjectId, { days: srUnhandledEdgesWindowDays, page_size: 500 });
             setSrUnhandledEdgesTasks(data.items ?? []);
           } catch { /* silent */ }
         })(),
@@ -1316,7 +1317,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       ? !digestOk && !diagnosticsOk && !openPRsOk
       : !digestOk;
     setLastFetchError(allFailed);
-  }, [selectedProjectId, windowHours, selectedSrCategory]);
+  }, [selectedProjectId, windowHours, selectedSrCategory, srUnhandledEdgesWindowDays]);
 
   const refreshVersionLifecycle = useCallback(async () => {
     if (!selectedProjectId) return;
@@ -2007,6 +2008,8 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
                   const task = tasks.find(t => t.id === taskId);
                   if (task) onViewTask(task);
                 }}
+                windowDays={srUnhandledEdgesWindowDays}
+                onWindowDaysChange={setSrUnhandledEdgesWindowDays}
               />
             </section>
           )}

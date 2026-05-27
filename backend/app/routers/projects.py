@@ -817,20 +817,11 @@ async def cancel_project(
     Halts the project, marks pending tasks as cancelled, and immediately terminates all associated running VMs.
     """
     from app.main import _ensure_vm_deleted  # noqa: PLC0415
+    from app.admin import _get_user_project_with_role  # noqa: PLC0415
 
-    member = (
-        await session.execute(
-            select(ProjectMember).where(
-                ProjectMember.project_id == project_id,
-                ProjectMember.user_id == current_user["user_id"],
-            )
-        )
-    ).scalar_one_or_none()
-    if not member:
-        raise HTTPException(status_code=404, detail="Project not found or unauthorized")
-    project = await session.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found or unauthorized")
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="owner"
+    )
 
     if project.status in [
         ProjectStatus.COMPLETED,

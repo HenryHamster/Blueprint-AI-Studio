@@ -33,7 +33,7 @@ def _derive_task_branch_namespace(github_repo: str) -> str:
     this function slugifies all repo names uniformly.
     """
     slug = re.sub(r"[^a-z0-9]+", "-", github_repo.lower()).strip("-")
-    return slug[:40] if slug else "blueprint"
+    return slug[:40] if slug else "project"
 
 
 async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, Any]:

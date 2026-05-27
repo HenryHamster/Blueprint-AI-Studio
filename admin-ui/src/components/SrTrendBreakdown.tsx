@@ -1862,9 +1862,11 @@ interface SrMissedRetrospectiveProps {
   tasks: SrMissedTask[];
   onTaskClick?: (taskId: string) => void;
   selectedCategory?: string;
+  windowDays?: 7 | 14 | 30;
+  onWindowDaysChange?: (days: 7 | 14 | 30) => void;
 }
 
-export function SrMissedRetrospective({ tasks, onTaskClick, selectedCategory }: SrMissedRetrospectiveProps) {
+export function SrMissedRetrospective({ tasks, onTaskClick, selectedCategory, windowDays = 14, onWindowDaysChange }: SrMissedRetrospectiveProps) {
   const [categoryFilter, setCategoryFilter] = useState(selectedCategory ?? '');
 
   useEffect(() => {
@@ -1872,7 +1874,6 @@ export function SrMissedRetrospective({ tasks, onTaskClick, selectedCategory }: 
     setCategoryFilter(selectedCategory ?? '');
   }, [selectedCategory]);
   const [typeFilter, setTypeFilter] = useState('');
-  const [windowDays, setWindowDays] = useState(14);
   const [openTaskIds, setOpenTaskIds] = useState<Set<string>>(() => new Set());
   const [mountedAt] = useState(() => Date.now());
 
@@ -1900,7 +1901,7 @@ export function SrMissedRetrospective({ tasks, onTaskClick, selectedCategory }: 
           // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
             key={w.days}
-            onClick={() => setWindowDays(w.days)}
+            onClick={() => onWindowDaysChange?.(w.days as 7 | 14 | 30)}
             className={`px-1.5 py-0.5 rounded border ${windowDays === w.days ? 'border-blue-500 text-blue-300' : 'border-neutral-700 text-neutral-400 hover:border-neutral-500'}`}
           >{w.label}</button>
         ))}
@@ -2013,11 +2014,12 @@ export interface SrUnhandledEdgesTask {
 interface SrUnhandledEdgesRetrospectiveProps {
   tasks: SrUnhandledEdgesTask[];
   onTaskClick?: (taskId: string) => void;
+  windowDays?: 7 | 14 | 30;
+  onWindowDaysChange?: (days: 7 | 14 | 30) => void;
 }
 
-export function SrUnhandledEdgesRetrospective({ tasks, onTaskClick }: SrUnhandledEdgesRetrospectiveProps) {
+export function SrUnhandledEdgesRetrospective({ tasks, onTaskClick, windowDays = 14, onWindowDaysChange }: SrUnhandledEdgesRetrospectiveProps) {
   const [typeFilter, setTypeFilter] = useState('');
-  const [windowDays, setWindowDays] = useState(14);
   const [openTaskIds, setOpenTaskIds] = useState<Set<string>>(() => new Set());
   const [mountedAt] = useState(() => Date.now());
 
@@ -2043,7 +2045,7 @@ export function SrUnhandledEdgesRetrospective({ tasks, onTaskClick }: SrUnhandle
           // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
             key={w.days}
-            onClick={() => setWindowDays(w.days)}
+            onClick={() => onWindowDaysChange?.(w.days as 7 | 14 | 30)}
             className={`px-1.5 py-0.5 rounded border ${windowDays === w.days ? 'border-blue-500 text-blue-300' : 'border-neutral-700 text-neutral-400 hover:border-neutral-500'}`}
           >{w.label}</button>
         ))}

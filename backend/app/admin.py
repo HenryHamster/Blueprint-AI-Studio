@@ -1272,7 +1272,9 @@ async def get_task(
     except ValueError:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    task = await _get_user_task(tid, current_user["user_id"], session)
+    task = await _get_user_task_with_role(
+        tid, current_user["user_id"], session, "member"
+    )
 
     # Fetch all artifacts for this task (all types, not just last per type)
     artifact_stmt = (
@@ -1407,7 +1409,9 @@ async def get_task_serial_console(
     except ValueError:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    task = await _get_user_task(tid, current_user["user_id"], session)
+    task = await _get_user_task_with_role(
+        tid, current_user["user_id"], session, "member"
+    )
 
     # 404 if task has no VM
     if not task.vm_instance_id:
