@@ -20,6 +20,7 @@ from sqlalchemy import (
     Enum as SAEnum,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Session as _OrmSession
 from sqlalchemy.types import TypeDecorator
 import logging
 import uuid
@@ -1067,6 +1068,55 @@ _on_task_terminal_callbacks: list = []
 # Firing revive callbacks on every non-terminal status set restores the
 # cache invariant so the agent can claim cleanly.
 _on_task_revive_callbacks: list = []
+
+
+def notify_tasks_terminated(task_ids: list) -> None:
+    """Fire terminal callbacks for a list of task IDs.
+
+    Used by bulk UPDATE sites (e.g. force-delete) that bypass the ORM event
+    listener, ensuring the in-memory deny-list is populated for all cancelled
+    tasks exactly as if each transition had gone through the ORM setter.
+    """
+    for task_id in task_ids:
+        tid = str(task_id)
+        for cb in _on_task_terminal_callbacks:
+            try:
+                cb(tid)
+            except Exception as e:  # noqa: PERF203
+                logger.error(
+                    f"[MODELS] Terminal callback failed for task {tid}: {e}",
+                    exc_info=True,
+                )
+
+
+@event.listens_for(_OrmSession, "before_flush")
+def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
+    """Emit pg_notify for Task rows transitioning to a terminal status.
+
+    Runs inside the before_flush hook (sync context, greenlet-driven by
+    AsyncSession.flush) so the NOTIFY lands in the same transaction as the
+    status mutation.  Postgres only delivers the notification to listeners
+    after commit — so receivers see the change as durable.
+
+    Uses a late import to break the circular dependency:
+      agent.py → models.py → jwt_revocation.py → agent.py
+    Exceptions are fully swallowed so a NOTIFY failure never aborts the flush.
+    """
+    try:
+        from sqlalchemy import inspect as _sa_inspect
+        from app.jwt_revocation import emit_task_terminated_notify  # noqa: PLC0415
+
+        terminal = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+        for instance in session.dirty:
+            if not isinstance(instance, Task):
+                continue
+            history = _sa_inspect(instance).attrs.status.history
+            if not history.added:
+                continue
+            if history.added[0] in terminal:
+                emit_task_terminated_notify(session, str(instance.id))
+    except Exception as exc:  # noqa: BLE001 — never block the flush
+        logger.warning("[MODELS] before_flush NOTIFY failed: %s", exc)
 
 
 @event.listens_for(Task.status, "set")

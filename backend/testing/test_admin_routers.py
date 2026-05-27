@@ -24,6 +24,7 @@ from app.models import (
     ProjectMessage,
     MessageType,
     SystemMaturity,
+    _on_task_terminal_callbacks,
 )
 from app.auth import get_current_user, require_admin
 
@@ -1140,6 +1141,33 @@ class TestDeleteProject:
         resp = await client.delete(f"/api/admin/projects/{project.id}?force=true")
         assert resp.status_code == 200
         assert resp.json()["active_tasks_cancelled"] == 1
+
+    @pytest.mark.asyncio
+    async def test_delete_project_force_populates_deny_list(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """Force-delete fires terminal callbacks so cancelled task IDs enter the deny-list."""
+        mocker.patch("app.main._ensure_vm_deleted", return_value=None)
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "smoketest"}],
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        task_id = str(task.id)
+
+        fired_ids: list = []
+        sentinel = lambda tid: fired_ids.append(tid)  # noqa: E731
+        _on_task_terminal_callbacks.append(sentinel)
+        try:
+            resp = await client.delete(f"/api/admin/projects/{project.id}?force=true")
+            assert resp.status_code == 200
+            assert task_id in fired_ids
+        finally:
+            _on_task_terminal_callbacks.remove(sentinel)
 
     @pytest.mark.asyncio
     async def test_delete_project_non_owner_returns_403(

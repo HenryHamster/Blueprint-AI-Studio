@@ -1088,8 +1088,8 @@ export function extractInvestigatedFiles(trace: ToolTraceEntry[]): string[] {
 // ── Heartbeat ───────────────────────────────────────────────────────────────
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
-// Proactive JWT refresh — fires at TOKEN_PROACTIVE_REFRESH_MS (90 min) so the
-// 2h agent token is always renewed well before expiry.
+// Proactive JWT refresh — fires at TOKEN_PROACTIVE_REFRESH_MS (45 min) so the
+// 1h agent token is always renewed well before expiry.
 let tokenRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
 function startProactiveTokenRefresh(): void {

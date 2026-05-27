@@ -12,7 +12,14 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
 from app.shared_state import limiter
-from app.models import Task, TaskStatus, Project, ProjectMember, _utcnow
+from app.models import (
+    Task,
+    TaskStatus,
+    Project,
+    ProjectMember,
+    _utcnow,
+    notify_tasks_terminated,
+)
 from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
 from app.task_locking import lock_project_or_429
@@ -530,6 +537,22 @@ async def delete_project_admin(
         # load window), then delete VMs for the loaded subset.
         from app.main import _ensure_vm_deleted
 
+        # Fetch all affected task IDs before the bulk UPDATE so we can fire
+        # terminal callbacks after commit — the bulk UPDATE bypasses the ORM
+        # event listener that normally populates the JWT deny-list.
+        all_cancelled_ids = (
+            (
+                await session.execute(
+                    select(Task.id).where(
+                        Task.project_id == project_id,
+                        Task.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
         result = await session.execute(
             update(Task)
             .where(Task.project_id == project_id, Task.status.in_(ACTIVE_STATUSES))
@@ -542,7 +565,14 @@ async def delete_project_admin(
         cancelled_count = result.rowcount
         for task in active_tasks:
             await _ensure_vm_deleted(task, reason="project_force_delete")
+        # Emit cross-instance NOTIFY before commit so sibling instances see the
+        # revocation only after the bulk UPDATE is durable.  The post-commit
+        # notify_tasks_terminated call still fires for in-process callback fanout.
+        from app.jwt_revocation import emit_bulk_task_terminated_notify  # noqa: PLC0415
+
+        await emit_bulk_task_terminated_notify(session, all_cancelled_ids)
         await session.commit()
+        notify_tasks_terminated(all_cancelled_ids)
 
     # Delete dependent records that lack ON DELETE CASCADE
     from app.models import Alert

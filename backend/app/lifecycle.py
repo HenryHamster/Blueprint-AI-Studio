@@ -344,10 +344,14 @@ async def lifespan(app):
             "[STARTUP] Not background-leader; skipping leader-only services (serving HTTP only)"
         )
         # Per-instance services still run on non-leader instances.
+        from app.jwt_revocation import jwt_revocation_service
+
         config_sync_task = asyncio.create_task(runtime_config_sync_service())
+        jwt_revocation_task_nl = asyncio.create_task(jwt_revocation_service())
         from app.shared_state import background_tasks as _bg_tasks_nl
 
         _bg_tasks_nl["config_sync"] = config_sync_task
+        _bg_tasks_nl["jwt_revocation"] = jwt_revocation_task_nl
 
         # Minimal watchdog: restart per-instance services if they crash, AND
         # periodically probe the leader advisory lock so we can take over
@@ -373,6 +377,18 @@ async def lifespan(app):
                         )
                         _bg_tasks_nl["config_sync"] = asyncio.create_task(
                             runtime_config_sync_service()
+                        )
+                    if jwt_revocation_task_nl.done():
+                        exc = (
+                            jwt_revocation_task_nl.exception()
+                            if not jwt_revocation_task_nl.cancelled()
+                            else None
+                        )
+                        logger.error(
+                            f"[MONITOR] jwt_revocation DIED on non-leader (exc={exc}); restarting"
+                        )
+                        _bg_tasks_nl["jwt_revocation"] = asyncio.create_task(
+                            jwt_revocation_service()
                         )
 
                     # Leader-lock probe. Try to acquire on a fresh session;
@@ -431,10 +447,14 @@ async def lifespan(app):
 
         nl_monitor_task.cancel()
         config_sync_task.cancel()
+        jwt_revocation_task_nl.cancel()
         try:
             await asyncio.wait_for(
                 asyncio.gather(
-                    nl_monitor_task, config_sync_task, return_exceptions=True
+                    nl_monitor_task,
+                    config_sync_task,
+                    jwt_revocation_task_nl,
+                    return_exceptions=True,
                 ),
                 timeout=10.0,
             )
@@ -655,6 +675,13 @@ async def lifespan(app):
     # Cloud Run instances (each has its own in-memory dict; DB is shared).
     config_sync_task = asyncio.create_task(runtime_config_sync_service())
 
+    # Per-instance JWT revocation listener — each instance keeps its own
+    # _terminated_task_ids cache; LISTEN/NOTIFY broadcasts terminations from
+    # sibling instances so all caches converge within seconds.
+    from app.jwt_revocation import jwt_revocation_service
+
+    jwt_revocation_task = asyncio.create_task(jwt_revocation_service())
+
     # Refresh per-account model-availability caches every 30 min so a
     # provider-side preview-access change doesn't sit in dispatch rotation
     # for hours (audit E13).
@@ -677,6 +704,7 @@ async def lifespan(app):
     _bg_tasks["efficiency_snapshot"] = efficiency_snapshot_task
     _bg_tasks["branch_reconciliation"] = branch_reconciliation_task
     _bg_tasks["config_sync"] = config_sync_task
+    _bg_tasks["jwt_revocation"] = jwt_revocation_task
     _bg_tasks["availability_refresh"] = availability_refresh_task
 
     # Monitor background tasks for silent crashes (with exponential backoff)
@@ -706,6 +734,7 @@ async def lifespan(app):
             "efficiency_snapshot": _efficiency_snapshot_service,
             "branch_reconciliation": _branch_reconciliation_service,
             "config_sync": runtime_config_sync_service,
+            "jwt_revocation": jwt_revocation_service,
             "availability_refresh": account_availability_refresh_service,
         }
         while True:
@@ -956,6 +985,7 @@ async def lifespan(app):
         branch_reconciliation_task,
         orchestrator_task,
         config_sync_task,
+        jwt_revocation_task,
         monitor_task,
     ]
     for t in tasks_to_cancel:

@@ -934,6 +934,54 @@ async def test_agent_token_rejected_for_terminated_task(
     _terminated_task_ids.pop(task_id_str, None)
 
 
+@pytest.mark.asyncio
+async def test_refresh_token_replaces_expiring_token(client: AsyncClient, db_session):
+    """Refreshed token must be accepted on the next request even if the
+    original token was issued with a TTL so short it would already be expired.
+
+    This validates the proactive-refresh window: the agent calls
+    /api/agent/refresh-token before the old JWT expires and the returned
+    token is valid for subsequent API calls (heartbeat here as a proxy).
+    AGENT_TOKEN_TTL_HOURS = 1 so the refresh fires at ~45 min (75% of TTL).
+    """
+    project = Project(name="Token Refresh Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-refresh",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id_str = str(task.id)
+
+    # Use a normal-TTL token for the refresh call itself.
+    valid_token = create_agent_token(task_id_str, "agent-vm-refresh")
+    resp = await client.post(
+        "/api/agent/refresh-token",
+        headers={"x-agent-token": valid_token},
+    )
+    assert resp.status_code == 200, resp.text
+    new_token = resp.json()["token"]
+    assert new_token != valid_token, "refresh must return a distinct token"
+
+    # The refreshed token must be accepted on the next heartbeat call.
+    heartbeat_resp = await client.post(
+        "/api/agent/heartbeat",
+        json={"task_id": task_id_str, "status_message": "still running"},
+        headers={"x-agent-token": new_token},
+    )
+    assert heartbeat_resp.status_code == 200, (
+        f"Refreshed token was rejected on the next request: {heartbeat_resp.text}"
+    )
+
+
 def _agent_auth_body(endpoint: str, task_id: str, vm_instance_id: str) -> dict:
     if endpoint == "status":
         return {"task_id": task_id, "status": "COMPLETED"}

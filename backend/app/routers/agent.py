@@ -130,9 +130,9 @@ async def _create_review_check_run_bg(
 # ---------------------------------------------------------------------------
 
 # Maps task_id -> timestamp of termination. Entries older than _TERMINATED_TTL
-# are evicted to prevent unbounded growth (JWTs expire after 8h).
+# are evicted to prevent unbounded growth (JWTs expire after 1h).
 _terminated_task_ids: dict[str, float] = {}
-_TERMINATED_TTL = 9 * 3600  # 9h — slightly longer than 8h JWT max lifetime
+_TERMINATED_TTL = 75 * 60  # 75 min — 60 min JWT lifetime + 15 min grace
 _TERMINATED_TASK_IDS_MAX = 5000  # evict expired entries when cache exceeds this size
 _on_task_terminal_callbacks.append(
     lambda tid: _terminated_task_ids.__setitem__(tid, time.time())
@@ -146,7 +146,7 @@ _on_task_terminal_callbacks.append(
 _on_task_revive_callbacks.append(lambda tid: _terminated_task_ids.pop(tid, None))
 
 # Issue M3 (warm-VM continuity audit, deferred): JWTs for terminated tasks
-# remain valid for the JWT's full TTL (8h). The is_idempotent_path branch
+# remain valid for the JWT's full TTL (1h). The is_idempotent_path branch
 # accepts these terminal-task tokens on /next-role and /vm-heartbeat so a
 # legitimate warm chain can poll for the next role. A leaked terminal-task
 # JWT can therefore spam-keepalive a phantom VM identity (blocking
@@ -728,7 +728,7 @@ async def agent_refresh_token(
     token: dict = Depends(verify_agent_token),
 ):
     """
-    Accepts a valid (non-expired) agent JWT and returns a new one with a fresh 2-hour TTL.
+    Accepts a valid (non-expired) agent JWT and returns a new one with a fresh 1-hour TTL.
 
     Audit 2026-04-25 (W3/E1/E2): refresh now also validates that the task
     is still assigned to this VM — a stale agent whose task has been
