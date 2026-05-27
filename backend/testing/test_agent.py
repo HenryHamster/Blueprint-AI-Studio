@@ -1,4 +1,6 @@
+import logging
 import os
+import time
 import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -1085,13 +1087,44 @@ def _agent_auth_body(endpoint: str, task_id: str, vm_instance_id: str) -> dict:
     raise AssertionError(f"unknown endpoint: {endpoint}")
 
 
+def _truncate_vm_instance_id_for_assertion(vm_instance_id: str) -> str:
+    return vm_instance_id if len(vm_instance_id) <= 12 else f"{vm_instance_id[:12]}..."
+
+
+def _assert_agent_auth_reject_log(
+    caplog,
+    *,
+    reason: str,
+    path: str,
+    task_id: str,
+    token_vm_instance_id: str | None = None,
+    token_project_id: str | None = None,
+) -> None:
+    expected_parts = [
+        "[AGENT_AUTH_REJECT]",
+        f"reason={reason}",
+        f"path={path}",
+        f"task_id={task_id}",
+    ]
+    if token_vm_instance_id is not None:
+        expected_parts.append(
+            f"token_vm_instance_id={_truncate_vm_instance_id_for_assertion(token_vm_instance_id)}"
+        )
+    if token_project_id is not None:
+        expected_parts.append(f"token_project_id={token_project_id}")
+    expected = " ".join(expected_parts)
+    assert any(expected in record.message for record in caplog.records), (
+        f"missing auth reject log: {expected}\ncaptured={caplog.messages}"
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "endpoint",
     ["status", "heartbeat", "vm-heartbeat", "next-role"],
 )
 async def test_agent_token_rejected_when_task_row_missing(
-    client: AsyncClient, db_session, endpoint: str
+    client: AsyncClient, db_session, endpoint: str, caplog
 ):
     """Missing task rows must fail closed on auth check."""
     from app.routers.agent import _terminated_task_ids
@@ -1134,6 +1167,7 @@ async def test_agent_token_rejected_when_task_row_missing(
 
     previous_override = app.dependency_overrides.get(get_session)
     app.dependency_overrides[get_session] = _override_missing_row_session
+    caplog.set_level(logging.INFO)
     try:
         resp = await client.post(
             f"/api/agent/{endpoint}",
@@ -1148,6 +1182,13 @@ async def test_agent_token_rejected_when_task_row_missing(
         _terminated_task_ids.pop(task_id, None)
 
     assert resp.status_code == 401
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="task_missing",
+        path=f"/api/agent/{endpoint}",
+        task_id=task_id,
+        token_vm_instance_id=vm_instance_id,
+    )
 
 
 @pytest.mark.asyncio
@@ -1156,7 +1197,7 @@ async def test_agent_token_rejected_when_task_row_missing(
     ["status", "heartbeat", "vm-heartbeat", "next-role"],
 )
 async def test_agent_token_rejected_on_db_error(
-    client: AsyncClient, db_session, endpoint: str
+    client: AsyncClient, db_session, endpoint: str, caplog
 ):
     """DB auth errors must reject writes on auth check."""
     from app.routers.agent import _terminated_task_ids
@@ -1196,6 +1237,7 @@ async def test_agent_token_rejected_on_db_error(
 
     previous_override = app.dependency_overrides.get(get_session)
     app.dependency_overrides[get_session] = _override_failing_session
+    caplog.set_level(logging.INFO)
     try:
         resp = await client.post(
             f"/api/agent/{endpoint}",
@@ -1212,6 +1254,61 @@ async def test_agent_token_rejected_on_db_error(
     assert resp.status_code == 503
     detail = resp.json().get("detail") or resp.json().get("error", {}).get("message")
     assert detail == "agent_auth_db_unavailable"
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="db_unavailable",
+        path=f"/api/agent/{endpoint}",
+        task_id=task_id,
+        token_vm_instance_id=vm_instance_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_token_rejected_on_deny_list_hit_non_idempotent_path(
+    client: AsyncClient, db_session, caplog
+):
+    from app.routers.agent import _terminated_task_ids
+
+    project = Project(name="Deny-List Auth Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-deny-list",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+    vm_instance_id = "agent-vm-deny-list"
+    token = create_agent_token(task_id, vm_instance_id)
+
+    _terminated_task_ids[task_id] = time.time()
+    caplog.set_level(logging.INFO)
+    try:
+        resp = await client.post(
+            "/api/agent/heartbeat",
+            json=_agent_auth_body("heartbeat", task_id, vm_instance_id),
+            headers={"x-agent-token": token},
+        )
+    finally:
+        _terminated_task_ids.pop(task_id, None)
+
+    assert resp.status_code == 401
+    detail = resp.json().get("detail") or resp.json().get("error", {}).get("message")
+    assert detail == "Task is no longer active"
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="deny_list_hit_non_idempotent_path",
+        path="/api/agent/heartbeat",
+        task_id=task_id,
+        token_vm_instance_id=vm_instance_id,
+    )
 
 
 @pytest.mark.asyncio
@@ -1225,7 +1322,7 @@ async def test_agent_token_rejected_on_db_error(
     ids=["completed", "failed", "cancelled"],
 )
 async def test_agent_token_rejected_when_task_terminal_status(
-    client: AsyncClient, db_session, endpoint: str, terminal_status: TaskStatus
+    client: AsyncClient, db_session, endpoint: str, terminal_status: TaskStatus, caplog
 ):
     """Terminal-status check must reject non-idempotent paths.
 
@@ -1255,6 +1352,7 @@ async def test_agent_token_rejected_when_task_terminal_status(
     token = create_agent_token(task_id, vm_instance_id)
 
     _terminated_task_ids.pop(task_id, None)
+    caplog.set_level(logging.INFO)
 
     try:
         resp = await client.post(
@@ -1272,11 +1370,18 @@ async def test_agent_token_rejected_when_task_terminal_status(
     resp_json = resp.json()
     detail = resp_json.get("detail") or resp_json.get("error", {}).get("message")
     assert detail == "Task is no longer active"
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="deny_list_hit_non_idempotent_path",
+        path=f"/api/agent/{endpoint}",
+        task_id=task_id,
+        token_vm_instance_id=vm_instance_id,
+    )
 
 
 @pytest.mark.asyncio
 async def test_agent_idempotent_path_enforces_freshness(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, caplog
 ):
     """Freshness-window check enforces age on warm-idempotent paths.
 
@@ -1328,6 +1433,7 @@ async def test_agent_idempotent_path_enforces_freshness(
     stale_token = jwt.encode(to_encode, AGENT_JWT_SECRET, algorithm=AGENT_JWT_ALGORITHM)
 
     _terminated_task_ids.pop(task_id, None)
+    caplog.set_level(logging.INFO)
 
     try:
         resp = await client.post(
@@ -1345,11 +1451,18 @@ async def test_agent_idempotent_path_enforces_freshness(
     resp_json = resp.json()
     detail = resp_json.get("detail") or resp_json.get("error", {}).get("message")
     assert detail == "terminal_token_expired_for_idempotent"
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="terminal_token_expired_for_idempotent",
+        path="/api/agent/vm-heartbeat",
+        task_id=task_id,
+        token_vm_instance_id=vm_instance_id,
+    )
 
 
 @pytest.mark.asyncio
 async def test_agent_token_rejected_on_vm_instance_mismatch(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, caplog
 ):
     """VM instance mismatch check must reject token when task reassigned.
 
@@ -1379,6 +1492,7 @@ async def test_agent_token_rejected_on_vm_instance_mismatch(
     token = create_agent_token(task_id, original_vm)
 
     _terminated_task_ids.pop(task_id, None)
+    caplog.set_level(logging.INFO)
 
     try:
         resp = await client.post(
@@ -1393,11 +1507,68 @@ async def test_agent_token_rejected_on_vm_instance_mismatch(
     resp_json = resp.json()
     detail = resp_json.get("detail") or resp_json.get("error", {}).get("message")
     assert detail == "vm_instance_mismatch"
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="vm_instance_mismatch",
+        path="/api/agent/heartbeat",
+        task_id=task_id,
+        token_vm_instance_id=original_vm,
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_token_rejected_on_terminal_idempotent_vm_mismatch(
+    client: AsyncClient, db_session, caplog
+):
+    from app.routers.agent import _terminated_task_ids
+
+    project = Project(name="Terminal VM Mismatch Auth Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-terminal-mismatch",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+    original_vm = "agent-vm-original-terminal"
+    token = create_agent_token(task_id, original_vm)
+
+    _terminated_task_ids.pop(task_id, None)
+    caplog.set_level(logging.INFO)
+
+    try:
+        resp = await client.post(
+            "/api/agent/vm-heartbeat",
+            json={"vm_instance_id": original_vm},
+            headers={"x-agent-token": token},
+        )
+    finally:
+        _terminated_task_ids.pop(task_id, None)
+
+    assert resp.status_code == 403
+    resp_json = resp.json()
+    detail = resp_json.get("detail") or resp_json.get("error", {}).get("message")
+    assert detail == "vm_instance_mismatch"
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="vm_instance_mismatch",
+        path="/api/agent/vm-heartbeat",
+        task_id=task_id,
+        token_vm_instance_id=original_vm,
+    )
 
 
 @pytest.mark.asyncio
 async def test_agent_token_rejected_on_project_mismatch(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, caplog
 ):
     """Project mismatch check must reject token for cross-project requests.
 
@@ -1430,6 +1601,7 @@ async def test_agent_token_rejected_on_project_mismatch(
     token = create_agent_token(task_id, vm_instance_id, project_id=str(project1.id))
 
     _terminated_task_ids.pop(task_id, None)
+    caplog.set_level(logging.INFO)
 
     try:
         resp = await client.post(
@@ -1444,6 +1616,14 @@ async def test_agent_token_rejected_on_project_mismatch(
     resp_json = resp.json()
     detail = resp_json.get("detail") or resp_json.get("error", {}).get("message")
     assert detail == "project_mismatch"
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="project_mismatch",
+        path="/api/agent/heartbeat",
+        task_id=task_id,
+        token_vm_instance_id=vm_instance_id,
+        token_project_id=str(project1.id),
+    )
 
 
 @pytest.mark.asyncio
@@ -4939,7 +5119,7 @@ async def test_safe_ws_close_reraises_other_runtime_errors():
         await _safe_ws_close(ws, code=1008, reason="boom")
 
 
-def test_agent_ws_invalid_token_closes_with_1008(mocker):
+def test_agent_ws_invalid_token_closes_with_1008(mocker, caplog):
     """
     Tests that connecting to the agent WebSocket without a valid token causes
     the server to close the connection with code 1008 (Policy Violation).
@@ -4970,6 +5150,7 @@ def test_agent_ws_invalid_token_closes_with_1008(mocker):
     )
 
     task_id = uuid.uuid4()
+    caplog.set_level(logging.INFO)
     with (
         TestClient(app=main_module.app) as tc,
         pytest.raises(WebSocketDisconnect) as exc_info,
@@ -4978,10 +5159,173 @@ def test_agent_ws_invalid_token_closes_with_1008(mocker):
         ws.send_json({"token": "not-a-valid-jwt-token"})
         ws.receive_text()
     assert exc_info.value.code == 1008
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="ws_initial_auth_failure",
+        path=f"/api/agent/ws/{task_id}",
+        task_id=str(task_id),
+    )
 
 
 @pytest.mark.asyncio
-async def test_agent_ws_receive_loop_rejects_terminated_task(mocker):
+async def test_agent_ws_auth_closes_on_terminal_task(mocker, caplog):
+    import app.routers.projects as projects_module
+    from unittest.mock import AsyncMock, MagicMock
+
+    task_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    token = create_agent_token(
+        str(task_id), "agent-vm-terminal-ws", project_id=str(project_id)
+    )
+
+    mock_task = MagicMock()
+    mock_task.id = task_id
+    mock_task.project_id = project_id
+    mock_task.vm_instance_id = "agent-vm-terminal-ws"
+    mock_task.status = TaskStatus.COMPLETED
+
+    mock_execute_result = MagicMock()
+    mock_execute_result.scalars.return_value.first.return_value = mock_task
+
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(return_value=mock_execute_result)
+
+    mock_session_cm = AsyncMock()
+    mock_session_cm.__aenter__.return_value = mock_session
+    mock_session_cm.__aexit__.return_value = None
+
+    mocker.patch("app.routers.projects.AsyncSessionLocal", return_value=mock_session_cm)
+    mocker.patch(
+        "app.routers.projects.manager.check_and_add_ip",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch("app.routers.projects.manager.remove_ip")
+    ws = AsyncMock()
+    ws.receive_json = AsyncMock(return_value={"token": token})
+    ws.close = AsyncMock()
+    caplog.set_level(logging.INFO)
+
+    await projects_module.agent_websocket_endpoint(ws, task_id)
+
+    ws.close.assert_called_once_with(code=1008, reason="Task is no longer active")
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="ws_task_terminal",
+        path=f"/api/agent/ws/{task_id}",
+        task_id=str(task_id),
+        token_vm_instance_id="agent-vm-terminal-ws",
+        token_project_id=str(project_id),
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_ws_auth_closes_on_project_mismatch(mocker, caplog):
+    import app.routers.projects as projects_module
+    from unittest.mock import AsyncMock, MagicMock
+
+    task_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    token_project_id = uuid.uuid4()
+    token = create_agent_token(
+        str(task_id), "agent-vm-ws-project", project_id=str(token_project_id)
+    )
+
+    mock_task = MagicMock()
+    mock_task.id = task_id
+    mock_task.project_id = project_id
+    mock_task.vm_instance_id = "agent-vm-ws-project"
+    mock_task.status = TaskStatus.IN_PROGRESS
+
+    mock_execute_result = MagicMock()
+    mock_execute_result.scalars.return_value.first.return_value = mock_task
+
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(return_value=mock_execute_result)
+
+    mock_session_cm = AsyncMock()
+    mock_session_cm.__aenter__.return_value = mock_session
+    mock_session_cm.__aexit__.return_value = None
+
+    mocker.patch("app.routers.projects.AsyncSessionLocal", return_value=mock_session_cm)
+    mocker.patch(
+        "app.routers.projects.manager.check_and_add_ip",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch("app.routers.projects.manager.remove_ip")
+    ws = AsyncMock()
+    ws.receive_json = AsyncMock(return_value={"token": token})
+    ws.close = AsyncMock()
+    caplog.set_level(logging.INFO)
+
+    await projects_module.agent_websocket_endpoint(ws, task_id)
+
+    ws.close.assert_called_once_with(code=1008, reason="Project mismatch")
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="ws_project_mismatch",
+        path=f"/api/agent/ws/{task_id}",
+        task_id=str(task_id),
+        token_vm_instance_id="agent-vm-ws-project",
+        token_project_id=str(token_project_id),
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_ws_auth_closes_on_vm_mismatch(mocker, caplog):
+    import app.routers.projects as projects_module
+    from unittest.mock import AsyncMock, MagicMock
+
+    task_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    token = create_agent_token(
+        str(task_id), "agent-vm-ws-original", project_id=str(project_id)
+    )
+
+    mock_task = MagicMock()
+    mock_task.id = task_id
+    mock_task.project_id = project_id
+    mock_task.vm_instance_id = "agent-vm-ws-assigned"
+    mock_task.status = TaskStatus.IN_PROGRESS
+
+    mock_execute_result = MagicMock()
+    mock_execute_result.scalars.return_value.first.return_value = mock_task
+
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(return_value=mock_execute_result)
+
+    mock_session_cm = AsyncMock()
+    mock_session_cm.__aenter__.return_value = mock_session
+    mock_session_cm.__aexit__.return_value = None
+
+    mocker.patch("app.routers.projects.AsyncSessionLocal", return_value=mock_session_cm)
+    mocker.patch(
+        "app.routers.projects.manager.check_and_add_ip",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch("app.routers.projects.manager.remove_ip")
+    ws = AsyncMock()
+    ws.receive_json = AsyncMock(return_value={"token": token})
+    ws.close = AsyncMock()
+    caplog.set_level(logging.INFO)
+
+    await projects_module.agent_websocket_endpoint(ws, task_id)
+
+    ws.close.assert_called_once_with(code=1008, reason="VM instance mismatch")
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="ws_vm_instance_mismatch",
+        path=f"/api/agent/ws/{task_id}",
+        task_id=str(task_id),
+        token_vm_instance_id="agent-vm-ws-original",
+        token_project_id=str(project_id),
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_ws_receive_loop_rejects_terminated_task(mocker, caplog):
     """
     Regression: WS receive loop must close with 1008 when task appears in the
     terminated-task deny-list between auth and the next received message.
@@ -5027,6 +5371,7 @@ async def test_agent_ws_receive_loop_rejects_terminated_task(mocker):
 
     ws = AsyncMock()
     ws.receive_json = AsyncMock(return_value={"token": token})
+    caplog.set_level(logging.INFO)
 
     # Inject task into deny-list inside receive_text so the in-loop check fires
     async def _inject_and_return():
@@ -5040,9 +5385,83 @@ async def test_agent_ws_receive_loop_rejects_terminated_task(mocker):
 
     # Connection must be closed with 1008 (Task is no longer active)
     ws.close.assert_called_once_with(code=1008, reason="Task is no longer active")
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="ws_deny_list_hit",
+        path=f"/api/agent/ws/{task_id}",
+        task_id=str(task_id),
+        token_vm_instance_id=str(project_id),
+    )
 
     # Clean up deny-list entry
     agent_module._terminated_task_ids.pop(str(task_id), None)
+
+
+@pytest.mark.asyncio
+async def test_agent_ws_receive_loop_closes_on_periodic_recheck_terminal(
+    mocker, caplog
+):
+    import app.routers.projects as projects_module
+    from unittest.mock import AsyncMock, MagicMock
+
+    task_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    token = create_agent_token(
+        str(task_id), "agent-vm-periodic", project_id=str(project_id)
+    )
+
+    mock_task = MagicMock()
+    mock_task.id = task_id
+    mock_task.project_id = project_id
+    mock_task.vm_instance_id = "agent-vm-periodic"
+    mock_task.status = TaskStatus.IN_PROGRESS
+
+    fresh_task = MagicMock()
+    fresh_task.id = task_id
+    fresh_task.project_id = project_id
+    fresh_task.vm_instance_id = "agent-vm-periodic"
+    fresh_task.status = TaskStatus.COMPLETED
+
+    mock_execute_result = MagicMock()
+    mock_execute_result.scalars.return_value.first.return_value = mock_task
+
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(return_value=mock_execute_result)
+    mock_session.get = AsyncMock(return_value=fresh_task)
+
+    mock_session_cm = AsyncMock()
+    mock_session_cm.__aenter__.return_value = mock_session
+    mock_session_cm.__aexit__.return_value = None
+
+    mocker.patch("app.routers.projects.AsyncSessionLocal", return_value=mock_session_cm)
+    mocker.patch(
+        "app.routers.projects.manager.check_and_add_ip",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch("app.routers.projects.manager.remove_ip")
+    mocker.patch("app.routers.projects.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.projects.time.time",
+        side_effect=[0.0, 0.0, 31.0, 31.0, 31.0, 31.0],
+    )
+    ws = AsyncMock()
+    ws.receive_json = AsyncMock(return_value={"token": token})
+    ws.receive_text = AsyncMock(return_value='{"type": "log", "content": "hello"}')
+    ws.close = AsyncMock()
+    caplog.set_level(logging.INFO)
+
+    await projects_module.agent_websocket_endpoint(ws, task_id)
+
+    ws.close.assert_called_once_with(code=1008, reason="Task is no longer active")
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="ws_periodic_recheck_terminal",
+        path=f"/api/agent/ws/{task_id}",
+        task_id=str(task_id),
+        token_vm_instance_id="agent-vm-periodic",
+        token_project_id=str(project_id),
+    )
 
 
 @pytest.mark.asyncio
@@ -9841,7 +10260,7 @@ async def test_vm_heartbeat_fresh_terminal_jwt_accepted(
 
 @pytest.mark.asyncio
 async def test_vm_heartbeat_stale_terminal_jwt_rejected(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, caplog
 ):
     """A stale terminal-task JWT (iat = now-60 min) is rejected 401 on /vm-heartbeat."""
     from app.routers.agent import _terminated_task_ids
@@ -9862,6 +10281,7 @@ async def test_vm_heartbeat_stale_terminal_jwt_rejected(
     await db_session.refresh(task)
 
     _terminated_task_ids.pop(str(task.id), None)
+    caplog.set_level(logging.INFO)
 
     token = _make_jwt_with_iat(
         str(task.id), "agent-vm-m3-stale-hb", iat_offset_secs=-3600
@@ -9875,10 +10295,19 @@ async def test_vm_heartbeat_stale_terminal_jwt_rejected(
     body = resp.json()
     detail = body.get("detail") or body.get("error", {}).get("message", "")
     assert detail == "terminal_token_expired_for_idempotent"
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="terminal_token_expired_for_idempotent",
+        path="/api/agent/vm-heartbeat",
+        task_id=str(task.id),
+        token_vm_instance_id="agent-vm-m3-stale-hb",
+    )
 
 
 @pytest.mark.asyncio
-async def test_next_role_stale_terminal_jwt_rejected(client: AsyncClient, db_session):
+async def test_next_role_stale_terminal_jwt_rejected(
+    client: AsyncClient, db_session, caplog
+):
     """A stale terminal-task JWT (iat = now-60 min) is rejected 401 on /next-role.
 
     Same defense as the heartbeat test — a leaked terminal-task token can't
@@ -9902,6 +10331,7 @@ async def test_next_role_stale_terminal_jwt_rejected(client: AsyncClient, db_ses
     await db_session.refresh(task)
 
     _terminated_task_ids.pop(str(task.id), None)
+    caplog.set_level(logging.INFO)
 
     token = _make_jwt_with_iat(
         str(task.id), "agent-vm-m3-stale-nr", iat_offset_secs=-3600
@@ -9919,6 +10349,13 @@ async def test_next_role_stale_terminal_jwt_rejected(client: AsyncClient, db_ses
     body = resp.json()
     detail = body.get("detail") or body.get("error", {}).get("message", "")
     assert detail == "terminal_token_expired_for_idempotent"
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="terminal_token_expired_for_idempotent",
+        path="/api/agent/next-role",
+        task_id=str(task.id),
+        token_vm_instance_id="agent-vm-m3-stale-nr",
+    )
 
 
 @pytest.mark.asyncio

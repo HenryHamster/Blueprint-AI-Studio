@@ -42,6 +42,47 @@ def _get_raw_dsn() -> str | None:
     return url
 
 
+async def _seed_deny_list(conn, terminated_task_ids: dict) -> None:
+    """Backfill the local deny-list from the DB for recently-terminated tasks.
+
+    Called at startup (cold-start gap) and after each LISTEN reconnect
+    (reconnect gap) so events that arrived while we were disconnected are
+    not silently missed.  Failures are logged and swallowed — losing the
+    seed degrades to the slow DB-recheck path, not a fatal error.
+    """
+    # Late import avoids circular dep; matches the import in jwt_revocation_service.
+    from app.routers.agent import _TERMINATED_TTL  # noqa: PLC0415
+
+    ttl_minutes = _TERMINATED_TTL // 60
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT id::text FROM task
+            WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED')
+              AND updated_at > NOW() - ($1 * INTERVAL '1 minute')
+            LIMIT 10000
+            """,
+            ttl_minutes,
+        )
+        now = time.time()
+        added = 0
+        for row in rows:
+            task_id = row["id"]
+            if task_id not in terminated_task_ids:
+                terminated_task_ids[task_id] = now
+                added += 1
+        logger.info(
+            "[JWT_REVOCATION] Seeded deny-list: %d tasks added (%d total terminal in window)",
+            added,
+            len(rows),
+        )
+    except Exception as exc:
+        logger.warning(
+            "[JWT_REVOCATION] _seed_deny_list failed, continuing without pre-seed: %s",
+            exc,
+        )
+
+
 async def jwt_revocation_service() -> None:
     """Background service: LISTEN for task_terminated notifications.
 
@@ -107,6 +148,7 @@ async def jwt_revocation_service() -> None:
         try:
             conn.add_termination_listener(_on_terminate)
             await conn.add_listener(_NOTIFY_CHANNEL, _on_notify)
+            await _seed_deny_list(conn, _terminated_task_ids)
             logger.info(
                 "[JWT_REVOCATION] LISTEN %s — cross-instance revocation active",
                 _NOTIFY_CHANNEL,

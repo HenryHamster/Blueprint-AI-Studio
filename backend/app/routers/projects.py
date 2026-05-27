@@ -45,6 +45,35 @@ from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 logger = logging.getLogger(__name__)
 
 
+def _truncate_vm_instance_id(vm_instance_id: object) -> str:
+    if vm_instance_id is None:
+        return "none"
+    value = str(vm_instance_id)
+    if len(value) <= 12:
+        return value
+    return f"{value[:12]}..."
+
+
+def _log_agent_auth_reject(
+    reason: str,
+    *,
+    path: str,
+    task_id: object,
+    token_vm_instance_id: object = None,
+    token_project_id: object = None,
+    error: object | None = None,
+) -> None:
+    logger.info(
+        "[AGENT_AUTH_REJECT] reason=%s path=%s task_id=%s token_vm_instance_id=%s token_project_id=%s error=%s",
+        reason,
+        path,
+        task_id,
+        _truncate_vm_instance_id(token_vm_instance_id),
+        token_project_id or "none",
+        error if error is not None else "none",
+    )
+
+
 async def _safe_ws_close(ws: WebSocket, code: int, reason: str = "") -> None:
     """Close a WebSocket, tolerating the double-close race.
 
@@ -476,6 +505,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
     """
     WebSocket endpoint for agents to stream high-throughput logs and real-time events.
     """
+    path = f"/api/agent/ws/{task_id}"
     await websocket.accept()
 
     # Require the client to send the token as the first message
@@ -483,17 +513,39 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
         auth_message = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
         token = auth_message.get("token")
         if not token:
+            _log_agent_auth_reject(
+                "ws_initial_auth_failure_missing_token",
+                path=path,
+                task_id=task_id,
+            )
             await _safe_ws_close(websocket, code=1008, reason="Missing token")
             return
 
         payload = verify_agent_jwt(token)
         if payload.get("sub") != str(task_id):
+            _log_agent_auth_reject(
+                "ws_initial_auth_failure_task_id_mismatch",
+                path=path,
+                task_id=task_id,
+                token_vm_instance_id=payload.get("vm_instance_id"),
+                token_project_id=payload.get("project_id"),
+            )
             await _safe_ws_close(websocket, code=1008, reason="Task ID mismatch")
             return
     except asyncio.TimeoutError:
+        _log_agent_auth_reject(
+            "ws_initial_auth_failure_timeout",
+            path=path,
+            task_id=task_id,
+        )
         await _safe_ws_close(websocket, code=1008, reason="Authentication timeout")
         return
     except Exception:
+        _log_agent_auth_reject(
+            "ws_initial_auth_failure",
+            path=path,
+            task_id=task_id,
+        )
         await _safe_ws_close(websocket, code=1008, reason="Authentication failed")
         return
 
@@ -502,6 +554,13 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
         stmt = select(Task).where(Task.id == task_id)
         task = (await session.execute(stmt)).scalars().first()
         if not task:
+            _log_agent_auth_reject(
+                "ws_task_missing",
+                path=path,
+                task_id=task_id,
+                token_vm_instance_id=payload.get("vm_instance_id"),
+                token_project_id=payload.get("project_id"),
+            )
             await _safe_ws_close(websocket, code=1008)
             return
 
@@ -512,6 +571,13 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
         ):
+            _log_agent_auth_reject(
+                "ws_task_terminal",
+                path=path,
+                task_id=task_id,
+                token_vm_instance_id=payload.get("vm_instance_id"),
+                token_project_id=payload.get("project_id"),
+            )
             await _safe_ws_close(
                 websocket, code=1008, reason="Task is no longer active"
             )
@@ -519,11 +585,25 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
 
         token_project = payload.get("project_id")
         if token_project and token_project != str(task.project_id):
+            _log_agent_auth_reject(
+                "ws_project_mismatch",
+                path=path,
+                task_id=task_id,
+                token_vm_instance_id=payload.get("vm_instance_id"),
+                token_project_id=token_project,
+            )
             await _safe_ws_close(websocket, code=1008, reason="Project mismatch")
             return
 
         token_vm = payload.get("vm_instance_id")
         if token_vm and task.vm_instance_id and token_vm != task.vm_instance_id:
+            _log_agent_auth_reject(
+                "ws_vm_instance_mismatch",
+                path=path,
+                task_id=task_id,
+                token_vm_instance_id=token_vm,
+                token_project_id=token_project,
+            )
             await _safe_ws_close(websocket, code=1008, reason="VM instance mismatch")
             return
 
@@ -571,6 +651,13 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
 
                 # Termination recheck: deny-list fast path + DB fallback
                 if str(task_id) in _terminated_task_ids_ref:
+                    _log_agent_auth_reject(
+                        "ws_deny_list_hit",
+                        path=path,
+                        task_id=task_id,
+                        token_vm_instance_id=payload.get("vm_instance_id"),
+                        token_project_id=payload.get("project_id"),
+                    )
                     await _safe_ws_close(
                         websocket, code=1008, reason="Task is no longer active"
                     )
@@ -594,6 +681,13 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
                             and fresh.vm_instance_id != payload.get("vm_instance_id")
                         )
                     ):
+                        _log_agent_auth_reject(
+                            "ws_periodic_recheck_terminal",
+                            path=path,
+                            task_id=task_id,
+                            token_vm_instance_id=payload.get("vm_instance_id"),
+                            token_project_id=payload.get("project_id"),
+                        )
                         await _safe_ws_close(
                             websocket, code=1008, reason="Task is no longer active"
                         )
@@ -644,6 +738,13 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
 
                 # Fast path: deny-list
                 if str(task_id) in _terminated_task_ids_ref:
+                    _log_agent_auth_reject(
+                        "ws_deny_list_hit",
+                        path=path,
+                        task_id=task_id,
+                        token_vm_instance_id=payload.get("vm_instance_id"),
+                        token_project_id=payload.get("project_id"),
+                    )
                     receive_task.cancel()
                     await _safe_ws_close(
                         websocket, code=1008, reason="Task is no longer active"
@@ -670,6 +771,13 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
                             and fresh.vm_instance_id != payload.get("vm_instance_id")
                         )
                     ):
+                        _log_agent_auth_reject(
+                            "ws_periodic_recheck_terminal",
+                            path=path,
+                            task_id=task_id,
+                            token_vm_instance_id=payload.get("vm_instance_id"),
+                            token_project_id=payload.get("project_id"),
+                        )
                         receive_task.cancel()
                         await _safe_ws_close(
                             websocket, code=1008, reason="Task is no longer active"

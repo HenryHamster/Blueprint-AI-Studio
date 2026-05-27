@@ -83,6 +83,35 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 _COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-f]{7,40}$")
 
 
+def _truncate_vm_instance_id(vm_instance_id: object) -> str:
+    if vm_instance_id is None:
+        return "none"
+    value = str(vm_instance_id)
+    if len(value) <= 12:
+        return value
+    return f"{value[:12]}..."
+
+
+def _log_agent_auth_reject(
+    reason: str,
+    *,
+    path: str,
+    task_id: object,
+    token_vm_instance_id: object = None,
+    token_project_id: object = None,
+    error: object | None = None,
+) -> None:
+    logger.info(
+        "[AGENT_AUTH_REJECT] reason=%s path=%s task_id=%s token_vm_instance_id=%s token_project_id=%s error=%s",
+        reason,
+        path,
+        task_id,
+        _truncate_vm_instance_id(token_vm_instance_id),
+        token_project_id or "none",
+        error if error is not None else "none",
+    )
+
+
 async def _create_review_check_run_bg(
     task_id: uuid.UUID,
     pr_number: int,
@@ -230,6 +259,13 @@ async def verify_agent_token(
             return
         iat = payload.get("iat")
         if iat is None:
+            _log_agent_auth_reject(
+                "terminal_token_expired_for_idempotent",
+                path=request.url.path,
+                task_id=task_id,
+                token_vm_instance_id=token_vm,
+                token_project_id=payload.get("project_id"),
+            )
             raise HTTPException(
                 status_code=401,
                 detail="terminal_token_expired_for_idempotent",
@@ -237,11 +273,26 @@ async def verify_agent_token(
         try:
             iat_secs = float(iat)
         except (TypeError, ValueError) as conv_exc:
+            _log_agent_auth_reject(
+                "terminal_token_expired_for_idempotent",
+                path=request.url.path,
+                task_id=task_id,
+                token_vm_instance_id=token_vm,
+                token_project_id=payload.get("project_id"),
+                error=conv_exc,
+            )
             raise HTTPException(
                 status_code=401,
                 detail="terminal_token_expired_for_idempotent",
             ) from conv_exc
         if (time.time() - iat_secs) > _TERMINAL_IDEMPOTENT_FRESHNESS_SECS:
+            _log_agent_auth_reject(
+                "terminal_token_expired_for_idempotent",
+                path=request.url.path,
+                task_id=task_id,
+                token_vm_instance_id=token_vm,
+                token_project_id=payload.get("project_id"),
+            )
             raise HTTPException(
                 status_code=401,
                 detail="terminal_token_expired_for_idempotent",
@@ -250,6 +301,13 @@ async def verify_agent_token(
     # Fast path: known terminated (in-memory, O(1))
     # Same-VM retry on idempotent paths is allowed; a different-VM call is rejected.
     if task_id in _terminated_task_ids and not is_idempotent_path:
+        _log_agent_auth_reject(
+            "deny_list_hit_non_idempotent_path",
+            path=request.url.path,
+            task_id=task_id,
+            token_vm_instance_id=token_vm,
+            token_project_id=payload.get("project_id"),
+        )
         raise HTTPException(status_code=401, detail="Task is no longer active")
     if task_id in _terminated_task_ids and is_warm_idempotent_path:
         # Cache says terminated AND we're on a warm-VM idempotent path —
@@ -268,16 +326,37 @@ async def verify_agent_token(
         async for session in session_factory():
             task = await session.get(Task, uuid.UUID(task_id))
             if task is None:
+                _log_agent_auth_reject(
+                    "task_missing",
+                    path=request.url.path,
+                    task_id=task_id,
+                    token_vm_instance_id=token_vm,
+                    token_project_id=payload.get("project_id"),
+                )
                 raise HTTPException(status_code=401, detail="Task is no longer active")
             # Audit W3/E10: project_id authz when the token carries it.
             token_project = payload.get("project_id")
             if token_project and str(task.project_id) != token_project:
+                _log_agent_auth_reject(
+                    "project_mismatch",
+                    path=request.url.path,
+                    task_id=task_id,
+                    token_vm_instance_id=token_vm,
+                    token_project_id=token_project,
+                )
                 raise HTTPException(status_code=403, detail="project_mismatch")
             # Audit W3/E2: stale-VM guard. If the task has been reassigned
             # to a different VM (reaper requeue), the original agent's
             # token must NOT be allowed to mutate state for the new VM's
             # task. Same-VM retries are still allowed (idempotent path).
             if token_vm and task.vm_instance_id and task.vm_instance_id != token_vm:
+                _log_agent_auth_reject(
+                    "vm_instance_mismatch",
+                    path=request.url.path,
+                    task_id=task_id,
+                    token_vm_instance_id=token_vm,
+                    token_project_id=token_project,
+                )
                 raise HTTPException(status_code=403, detail="vm_instance_mismatch")
             if task.status in (
                 TaskStatus.COMPLETED,
@@ -288,6 +367,13 @@ async def verify_agent_token(
                 # Same-VM idempotent retry on terminal task is OK; different
                 # VM (or any non-idempotent path) fails fast.
                 if not is_idempotent_path:
+                    _log_agent_auth_reject(
+                        "deny_list_hit_non_idempotent_path",
+                        path=request.url.path,
+                        task_id=task_id,
+                        token_vm_instance_id=token_vm,
+                        token_project_id=token_project,
+                    )
                     raise HTTPException(
                         status_code=401, detail="Task is no longer active"
                     )
@@ -299,8 +385,13 @@ async def verify_agent_token(
     except HTTPException:
         raise
     except Exception as e:
-        logger.warning(
-            f"[AUTH] DB check failed for task {task_id}, rejecting request: {e}"
+        _log_agent_auth_reject(
+            "db_unavailable",
+            path=request.url.path,
+            task_id=task_id,
+            token_vm_instance_id=token_vm,
+            token_project_id=payload.get("project_id"),
+            error=e,
         )
         raise HTTPException(status_code=503, detail="agent_auth_db_unavailable") from e
 

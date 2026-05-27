@@ -217,6 +217,150 @@ class TestJwtRevocationServiceCallback:
             pass  # expected
 
     @pytest.mark.anyio
+    async def test_seed_deny_list_populates_from_db(self, monkeypatch):
+        """_seed_deny_list queries DB and pre-populates _terminated_task_ids."""
+        task_id = str(uuid.uuid4())
+        terminated_task_ids: dict = {}
+
+        monkeypatch.setattr(
+            "app.routers.agent._terminated_task_ids", terminated_task_ids
+        )
+        monkeypatch.setattr("app.routers.agent._TERMINATED_TTL", 75 * 60)
+
+        fake_conn = MagicMock()
+        fake_conn.fetch = AsyncMock(return_value=[{"id": task_id}])
+
+        from app.jwt_revocation import _seed_deny_list
+
+        before = time.time()
+        await _seed_deny_list(fake_conn, terminated_task_ids)
+
+        assert task_id in terminated_task_ids
+        assert terminated_task_ids[task_id] >= before
+        fake_conn.fetch.assert_called_once()
+        # Verify LIMIT is present in the query
+        call_sql = fake_conn.fetch.call_args[0][0]
+        assert "LIMIT" in call_sql
+
+    @pytest.mark.anyio
+    async def test_seed_deny_list_swallows_db_failure(self, monkeypatch):
+        """_seed_deny_list logs a warning and continues when the DB query fails."""
+        monkeypatch.setattr("app.routers.agent._TERMINATED_TTL", 75 * 60)
+
+        fake_conn = MagicMock()
+        fake_conn.fetch = AsyncMock(side_effect=RuntimeError("connection error"))
+
+        from app.jwt_revocation import _seed_deny_list
+
+        # Must not raise
+        await _seed_deny_list(fake_conn, {})
+
+    @pytest.mark.anyio
+    async def test_service_seeds_on_startup(self, monkeypatch):
+        """jwt_revocation_service calls _seed_deny_list after connecting."""
+        task_id = str(uuid.uuid4())
+        terminated_task_ids: dict = {}
+
+        monkeypatch.setattr(
+            "app.routers.agent._terminated_task_ids", terminated_task_ids
+        )
+
+        seed_calls = []
+
+        async def fake_seed(conn, cache):
+            seed_calls.append(True)
+            cache[task_id] = time.time()
+
+        monkeypatch.setattr("app.jwt_revocation._seed_deny_list", fake_seed)
+        monkeypatch.setattr(
+            "app.jwt_revocation._get_raw_dsn", lambda: "postgresql://host/db"
+        )
+
+        fake_conn = MagicMock()
+        # Use side_effect=lambda cb: cb(fake_conn) so the service's own
+        # _on_terminate callback is invoked, setting the service's internal
+        # terminated_event (not an outer variable in this test scope).
+        fake_conn.add_termination_listener = MagicMock(
+            side_effect=lambda cb: cb(fake_conn)
+        )
+        fake_conn.add_listener = AsyncMock()
+        fake_conn.close = AsyncMock()
+
+        async def _cancel_on_first_sleep(secs):
+            raise asyncio.CancelledError()
+
+        with (
+            patch(
+                "app.jwt_revocation._asyncpg.connect",
+                new=AsyncMock(return_value=fake_conn),
+            ),
+            patch("asyncio.sleep", side_effect=_cancel_on_first_sleep),
+        ):
+            from app.jwt_revocation import jwt_revocation_service
+
+            try:
+                await jwt_revocation_service()
+            except asyncio.CancelledError:
+                pass
+
+        assert len(seed_calls) >= 1, "Seed should be called at least once on startup"
+        assert task_id in terminated_task_ids
+
+    @pytest.mark.anyio
+    async def test_service_reseeds_on_reconnect(self, monkeypatch):
+        """jwt_revocation_service re-seeds the deny-list after each reconnect."""
+        terminated_task_ids: dict = {}
+        monkeypatch.setattr(
+            "app.routers.agent._terminated_task_ids", terminated_task_ids
+        )
+
+        seed_calls = []
+        connect_calls = []
+
+        task_ids_per_seed = [str(uuid.uuid4()), str(uuid.uuid4())]
+
+        async def fake_seed(conn, cache):
+            idx = len(seed_calls)
+            seed_calls.append(True)
+            if idx < len(task_ids_per_seed):
+                cache[task_ids_per_seed[idx]] = time.time()
+
+        monkeypatch.setattr("app.jwt_revocation._seed_deny_list", fake_seed)
+        monkeypatch.setattr(
+            "app.jwt_revocation._get_raw_dsn", lambda: "postgresql://host/db"
+        )
+
+        async def _make_conn(dsn):  # must accept dsn arg passed by the service
+            connect_calls.append(True)
+            fake_conn = MagicMock()
+            # Immediately invoke _on_terminate so terminated_event.wait() returns fast.
+            fake_conn.add_termination_listener = MagicMock(
+                side_effect=lambda cb: cb(fake_conn)
+            )
+            fake_conn.add_listener = AsyncMock()
+            fake_conn.close = AsyncMock()
+            return fake_conn
+
+        async def _fast_sleep(secs):
+            if len(connect_calls) >= 2:
+                raise asyncio.CancelledError()
+
+        with (
+            patch("app.jwt_revocation._asyncpg.connect", side_effect=_make_conn),
+            patch("asyncio.sleep", side_effect=_fast_sleep),
+        ):
+            from app.jwt_revocation import jwt_revocation_service
+
+            try:
+                await jwt_revocation_service()
+            except asyncio.CancelledError:
+                pass
+
+        assert len(seed_calls) >= 2, "Seed should be called after each reconnect"
+        assert task_ids_per_seed[0] in terminated_task_ids
+        assert task_ids_per_seed[1] in terminated_task_ids
+
+    @pytest.mark.anyio
     async def test_service_reconnects_on_connection_failure(self, monkeypatch):
         """Service retries with backoff when asyncpg.connect raises."""
         monkeypatch.setattr(
