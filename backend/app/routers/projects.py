@@ -533,83 +533,155 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
         return
 
     _terminated_task_ids_ref = _terminated_task_ids
-    _RECHECK_INTERVAL = 30  # seconds between periodic DB rechecks
-    last_recheck = time.time()
+    _RECHECK_INTERVAL = 5  # timer tick: seconds between termination checks
+    # DB fallback runs on every tick so a deny-list miss (after restart,
+    # listener gap, or cache desync) still revokes within the 5s window the
+    # direction requires. Per-connection DB load: ~1 SELECT every 5s.
+    _DB_RECHECK_INTERVAL = _RECHECK_INTERVAL
+    last_recheck = 0.0  # force first DB recheck on first tick
 
+    receive_task: Optional[asyncio.Task] = None
     try:
         last_message_time = time.time()
         message_count = 0
+        receive_task = asyncio.create_task(websocket.receive_text())
         while True:
-            text_data = await websocket.receive_text()
+            # Race message receipt against a timer so termination is detected
+            # even when the agent sends no messages.
+            timer_task = asyncio.create_task(asyncio.sleep(_RECHECK_INTERVAL))
+            done, _pending = await asyncio.wait(
+                {receive_task, timer_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
 
-            # Periodic task-termination recheck: deny-list fast path + DB fallback
-            if str(task_id) in _terminated_task_ids_ref:
-                await _safe_ws_close(
-                    websocket, code=1008, reason="Task is no longer active"
-                )
-                return
-            now = time.time()
-            if now - last_recheck >= _RECHECK_INTERVAL:
-                async with AsyncSessionLocal() as rs:
-                    fresh = await rs.get(Task, task_id)
-                if (
-                    fresh is None
-                    or fresh.status
-                    in (
-                        TaskStatus.COMPLETED,
-                        TaskStatus.FAILED,
-                        TaskStatus.CANCELLED,
-                    )
-                    or (
-                        payload.get("vm_instance_id")
-                        and fresh is not None
-                        and fresh.vm_instance_id
-                        and fresh.vm_instance_id != payload.get("vm_instance_id")
-                    )
-                ):
+            if receive_task in done:
+                # A message arrived — cancel the unused timer.
+                timer_task.cancel()
+                try:
+                    await timer_task
+                except asyncio.CancelledError:
+                    pass
+
+                try:
+                    text_data = receive_task.result()
+                except WebSocketDisconnect:
+                    return
+                except Exception:
+                    return
+
+                # Termination recheck: deny-list fast path + DB fallback
+                if str(task_id) in _terminated_task_ids_ref:
                     await _safe_ws_close(
                         websocket, code=1008, reason="Task is no longer active"
                     )
                     return
-                last_recheck = now
+                now = time.time()
+                if now - last_recheck >= _DB_RECHECK_INTERVAL:
+                    async with AsyncSessionLocal() as rs:
+                        fresh = await rs.get(Task, task_id)
+                    if (
+                        fresh is None
+                        or fresh.status
+                        in (
+                            TaskStatus.COMPLETED,
+                            TaskStatus.FAILED,
+                            TaskStatus.CANCELLED,
+                        )
+                        or (
+                            payload.get("vm_instance_id")
+                            and fresh is not None
+                            and fresh.vm_instance_id
+                            and fresh.vm_instance_id != payload.get("vm_instance_id")
+                        )
+                    ):
+                        await _safe_ws_close(
+                            websocket, code=1008, reason="Task is no longer active"
+                        )
+                        return
+                    last_recheck = now
 
-            if len(text_data) > 100000:  # 100KB limit for agent logs
-                await _safe_ws_close(websocket, code=1009, reason="Message too big")
-                return
+                if len(text_data) > 100000:  # 100KB limit for agent logs
+                    await _safe_ws_close(websocket, code=1009, reason="Message too big")
+                    return
 
-            # Simple rate limiting: 20 messages per second
-            current_time = time.time()
-            if current_time - last_message_time < 1.0:
-                message_count += 1
-                if message_count > 20:
+                # Simple rate limiting: 20 messages per second
+                current_time = time.time()
+                if current_time - last_message_time < 1.0:
+                    message_count += 1
+                    if message_count > 20:
+                        await _safe_ws_close(
+                            websocket, code=1008, reason="Rate limit exceeded"
+                        )
+                        return
+                else:
+                    last_message_time = current_time
+                    message_count = 1
+
+                try:
+                    data = json.loads(text_data)
+                except json.JSONDecodeError:
+                    receive_task = asyncio.create_task(websocket.receive_text())
+                    continue
+
+                if data.get("type") == "log":
+                    await broadcast_to_project(
+                        project_id,
+                        "agent_log",
+                        {
+                            "task_id": str(task_id),
+                            "log": _sanitize_log(data.get("content", "")),
+                        },
+                    )
+                elif data.get("type") == "status":
+                    # Optionally handle status updates via WS too
+                    pass
+
+                receive_task = asyncio.create_task(websocket.receive_text())
+
+            else:
+                # Timer fired before a message arrived — run termination check.
+                # receive_task is still pending; keep it for the next iteration.
+
+                # Fast path: deny-list
+                if str(task_id) in _terminated_task_ids_ref:
+                    receive_task.cancel()
                     await _safe_ws_close(
-                        websocket, code=1008, reason="Rate limit exceeded"
+                        websocket, code=1008, reason="Task is no longer active"
                     )
                     return
-            else:
-                last_message_time = current_time
-                message_count = 1
 
-            try:
-                data = json.loads(text_data)
-            except json.JSONDecodeError:
-                continue
+                # Slow path: DB recheck (rate-limited)
+                now = time.time()
+                if now - last_recheck >= _DB_RECHECK_INTERVAL:
+                    async with AsyncSessionLocal() as rs:
+                        fresh = await rs.get(Task, task_id)
+                    if (
+                        fresh is None
+                        or fresh.status
+                        in (
+                            TaskStatus.COMPLETED,
+                            TaskStatus.FAILED,
+                            TaskStatus.CANCELLED,
+                        )
+                        or (
+                            payload.get("vm_instance_id")
+                            and fresh is not None
+                            and fresh.vm_instance_id
+                            and fresh.vm_instance_id != payload.get("vm_instance_id")
+                        )
+                    ):
+                        receive_task.cancel()
+                        await _safe_ws_close(
+                            websocket, code=1008, reason="Task is no longer active"
+                        )
+                        return
+                    last_recheck = now
 
-            if data.get("type") == "log":
-                await broadcast_to_project(
-                    project_id,
-                    "agent_log",
-                    {
-                        "task_id": str(task_id),
-                        "log": _sanitize_log(data.get("content", "")),
-                    },
-                )
-            elif data.get("type") == "status":
-                # Optionally handle status updates via WS too
-                pass
     except WebSocketDisconnect:
         pass
     finally:
+        if receive_task is not None and not receive_task.done():
+            receive_task.cancel()
         manager.remove_ip(websocket)
 
 

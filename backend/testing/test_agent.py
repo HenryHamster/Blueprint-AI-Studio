@@ -5046,6 +5046,169 @@ async def test_agent_ws_receive_loop_rejects_terminated_task(mocker):
 
 
 @pytest.mark.asyncio
+async def test_agent_ws_closes_on_termination_without_messages(mocker):
+    """
+    Regression: WS must close ≤5s after task termination even when no messages
+    are received (timer-driven path, not receive-driven).
+
+    Simulates: agent opens WS, task is injected into the deny-list by the timer
+    callback — no further messages are sent — the concurrent timer must fire and
+    close the connection.
+    """
+    import asyncio
+    import time as time_module
+    import app.routers.agent as agent_module
+    from app.routers.projects import agent_websocket_endpoint
+    from unittest.mock import AsyncMock, MagicMock
+
+    task_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+
+    token = create_agent_token(str(task_id), str(project_id))
+
+    mock_task = MagicMock()
+    mock_task.id = task_id
+    mock_task.project_id = project_id
+    mock_task.vm_instance_id = None
+    mock_task.status = TaskStatus.IN_PROGRESS
+
+    mock_execute_result = MagicMock()
+    mock_execute_result.scalars.return_value.first.return_value = mock_task
+
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(return_value=mock_execute_result)
+
+    mock_session_cm = AsyncMock()
+    mock_session_cm.__aenter__.return_value = mock_session
+    mock_session_cm.__aexit__.return_value = None
+
+    mocker.patch("app.routers.projects.AsyncSessionLocal", return_value=mock_session_cm)
+    mocker.patch(
+        "app.routers.projects.manager.check_and_add_ip",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch("app.routers.projects.manager.remove_ip")
+    mocker.patch("app.routers.projects.broadcast_to_project", new_callable=AsyncMock)
+
+    ws = AsyncMock()
+    ws.receive_json = AsyncMock(return_value={"token": token})
+
+    # receive_text blocks forever — no messages are sent after auth
+    block_event = asyncio.Event()
+
+    async def _never_return():
+        await block_event.wait()
+        return ""
+
+    ws.receive_text = AsyncMock(side_effect=_never_return)
+    ws.close = AsyncMock()
+
+    # Patch asyncio.sleep so the 5s timer fires immediately and injects termination.
+    async def _instant_sleep_with_inject(seconds):
+        agent_module._terminated_task_ids[str(task_id)] = time_module.time()
+
+    mocker.patch("asyncio.sleep", new=_instant_sleep_with_inject)
+
+    await agent_websocket_endpoint(ws, task_id)
+
+    # Connection must be closed with 1008 (Task is no longer active)
+    ws.close.assert_called_once_with(code=1008, reason="Task is no longer active")
+
+    # Unblock any lingering receive coroutines and clean up
+    block_event.set()
+    agent_module._terminated_task_ids.pop(str(task_id), None)
+
+
+@pytest.mark.asyncio
+async def test_agent_ws_closes_on_db_fallback_when_denylist_misses(mocker):
+    """
+    Regression: WS must close ≤5s after task termination even when the
+    in-memory deny-list is empty (cache miss after restart, listener gap, or
+    desync). The timer-driven DB fallback must observe the terminal status in
+    the DB and close the connection on the next tick.
+    """
+    import asyncio
+    import app.routers.agent as agent_module
+    from app.routers.projects import agent_websocket_endpoint
+    from unittest.mock import AsyncMock, MagicMock
+
+    task_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+
+    # Ensure deny-list does NOT contain the task — this is the cache-miss case
+    agent_module._terminated_task_ids.pop(str(task_id), None)
+
+    token = create_agent_token(str(task_id), str(project_id))
+
+    # Initial auth-time task: IN_PROGRESS so the handshake succeeds
+    initial_task = MagicMock()
+    initial_task.id = task_id
+    initial_task.project_id = project_id
+    initial_task.vm_instance_id = None
+    initial_task.status = TaskStatus.IN_PROGRESS
+
+    # DB-fallback task: now terminal (COMPLETED) — must trigger a close
+    terminal_task = MagicMock()
+    terminal_task.id = task_id
+    terminal_task.project_id = project_id
+    terminal_task.vm_instance_id = None
+    terminal_task.status = TaskStatus.COMPLETED
+
+    auth_execute_result = MagicMock()
+    auth_execute_result.scalars.return_value.first.return_value = initial_task
+
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(return_value=auth_execute_result)
+    # Subsequent session.get(Task, ...) inside the timer-driven DB fallback
+    # returns the terminal task.
+    mock_session.get = AsyncMock(return_value=terminal_task)
+
+    mock_session_cm = AsyncMock()
+    mock_session_cm.__aenter__.return_value = mock_session
+    mock_session_cm.__aexit__.return_value = None
+
+    mocker.patch("app.routers.projects.AsyncSessionLocal", return_value=mock_session_cm)
+    mocker.patch(
+        "app.routers.projects.manager.check_and_add_ip",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch("app.routers.projects.manager.remove_ip")
+    mocker.patch("app.routers.projects.broadcast_to_project", new_callable=AsyncMock)
+
+    ws = AsyncMock()
+    ws.receive_json = AsyncMock(return_value={"token": token})
+
+    block_event = asyncio.Event()
+
+    async def _never_return():
+        await block_event.wait()
+        return ""
+
+    ws.receive_text = AsyncMock(side_effect=_never_return)
+    ws.close = AsyncMock()
+
+    # Patch asyncio.sleep so the 5s timer fires immediately. Deny-list stays
+    # empty — only the DB fallback can detect the termination.
+    async def _instant_sleep(seconds):
+        return None
+
+    mocker.patch("asyncio.sleep", new=_instant_sleep)
+
+    await agent_websocket_endpoint(ws, task_id)
+
+    # Confirm deny-list was NOT the trigger
+    assert str(task_id) not in agent_module._terminated_task_ids
+    # DB fallback must have been consulted at least once on the timer path
+    assert mock_session.get.await_count >= 1
+    # Connection must be closed with 1008 (Task is no longer active)
+    ws.close.assert_called_once_with(code=1008, reason="Task is no longer active")
+
+    block_event.set()
+
+
+@pytest.mark.asyncio
 async def test_external_api_requeue_sets_exponential_backoff(
     client: AsyncClient, db_session, mocker
 ):
@@ -9584,8 +9747,35 @@ async def test_next_role_broadcasts_on_claim(client: AsyncClient, db_session, mo
 # the JWT's full TTL (8h via the is_idempotent_path exemption). Attacker spam-
 # keepalives a phantom vm_id, blocking warm-pin clearout AND can claim future
 # tasks pinned to that VM. The fix rejects terminal-task tokens whose iat is
-# outside the freshness window (default 30 min, env-tunable). Active-task
+# outside the freshness window (default 5 min, env-tunable). Active-task
 # tokens are unaffected.
+
+
+def test_terminal_idempotent_freshness_default_is_300():
+    """_TERMINAL_IDEMPOTENT_FRESHNESS_SECS defaults to 300 when env var is unset."""
+    import os
+    import importlib
+    import sys
+
+    env_key = "AGENT_TERMINAL_IDEMPOTENT_FRESHNESS_SECS"
+    original = os.environ.pop(env_key, None)
+    try:
+        # Force re-evaluation of the module-level constant by reimporting.
+        mod_name = "app.routers.agent"
+        if mod_name in sys.modules:
+            del sys.modules[mod_name]
+        from app.routers import agent as agent_mod
+
+        assert agent_mod._TERMINAL_IDEMPOTENT_FRESHNESS_SECS == 300, (
+            f"Expected default 300, got {agent_mod._TERMINAL_IDEMPOTENT_FRESHNESS_SECS}"
+        )
+    finally:
+        if original is not None:
+            os.environ[env_key] = original
+        # Restore the cached module so other tests aren't affected.
+        if mod_name in sys.modules:
+            del sys.modules[mod_name]
+        importlib.import_module(mod_name)
 
 
 def _make_jwt_with_iat(task_id: str, vm_instance_id: str, iat_offset_secs: int):
@@ -9618,7 +9808,7 @@ def _make_jwt_with_iat(task_id: str, vm_instance_id: str, iat_offset_secs: int):
 async def test_vm_heartbeat_fresh_terminal_jwt_accepted(
     client: AsyncClient, db_session
 ):
-    """A fresh terminal-task JWT (iat = now-5 min) is allowed on /vm-heartbeat."""
+    """A fresh terminal-task JWT (iat = now-1 min) is allowed on /vm-heartbeat."""
     from app.routers.agent import _terminated_task_ids
 
     project = Project(name="M3 Fresh Heartbeat", user_id="test-user-123")
@@ -9639,7 +9829,7 @@ async def test_vm_heartbeat_fresh_terminal_jwt_accepted(
     _terminated_task_ids.pop(str(task.id), None)
 
     token = _make_jwt_with_iat(
-        str(task.id), "agent-vm-m3-fresh-hb", iat_offset_secs=-300
+        str(task.id), "agent-vm-m3-fresh-hb", iat_offset_secs=-60
     )
     resp = await client.post(
         "/api/agent/vm-heartbeat",
@@ -9754,7 +9944,7 @@ async def test_next_role_fresh_terminal_jwt_accepted(client: AsyncClient, db_ses
     _terminated_task_ids.pop(str(task.id), None)
 
     token = _make_jwt_with_iat(
-        str(task.id), "agent-vm-m3-fresh-nr", iat_offset_secs=-300
+        str(task.id), "agent-vm-m3-fresh-nr", iat_offset_secs=-60
     )
     resp = await client.post(
         "/api/agent/next-role",

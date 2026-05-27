@@ -145,18 +145,15 @@ _on_task_terminal_callbacks.append(
 # for the full rationale.
 _on_task_revive_callbacks.append(lambda tid: _terminated_task_ids.pop(tid, None))
 
-# Issue M3 (warm-VM continuity audit, deferred): JWTs for terminated tasks
-# remain valid for the JWT's full TTL (1h). The is_idempotent_path branch
-# accepts these terminal-task tokens on /next-role and /vm-heartbeat so a
-# legitimate warm chain can poll for the next role. A leaked terminal-task
-# JWT can therefore spam-keepalive a phantom VM identity (blocking
-# warm-pin clearout for 240s per pinned task) and / or claim any future
-# task pinned to that VM. A normal warm chain transitions roles in
-# minutes; a replay 30+ minutes after the JWT's iat is suspicious. Reject
-# terminal-task tokens that are too old to plausibly be the same agent
-# that was just running the prior role.
+# Issue M3 (warm-VM continuity audit): JWTs for terminated tasks remain valid
+# for the JWT's full TTL (1h). The is_idempotent_path branch accepts these
+# terminal-task tokens on /next-role and /vm-heartbeat so a legitimate warm
+# chain can poll for the next role immediately after task completion. This
+# window is intentionally short (default 5 min) — it covers only the brief
+# next-role poll and warm-claim handoff. A replay well after that window is
+# suspicious; reject terminal-task tokens that are too old.
 _TERMINAL_IDEMPOTENT_FRESHNESS_SECS = int(
-    os.getenv("AGENT_TERMINAL_IDEMPOTENT_FRESHNESS_SECS", "1800")
+    os.getenv("AGENT_TERMINAL_IDEMPOTENT_FRESHNESS_SECS", "300")
 )
 
 # Retain strong references to fire-and-forget background tasks so the event loop
