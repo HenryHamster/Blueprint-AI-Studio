@@ -1066,8 +1066,23 @@ async def post_remediation_result_message(
             task_id=task.id,
         )
     _project = await session.get(Project, task.project_id) if task.project_id else None
-    _fallback_branch = get_project_promotion_target(_project) if _project else "main"
-    branch = (task.context or {}).get("ci_failure_branch") or _fallback_branch
+    _ci_failure_branch = (task.context or {}).get("ci_failure_branch")
+    if _ci_failure_branch:
+        branch = _ci_failure_branch
+    elif _project:
+        branch = get_project_promotion_target(_project)
+    else:
+        logger.warning(
+            "[AUTO-REMEDIATION] post_remediation_result_message: "
+            "project not found for task %s (project_id=%s) and no ci_failure_branch "
+            "in context — aborting",
+            task.id,
+            task.project_id,
+        )
+        raise ValueError(
+            f"post_remediation_result_message: project not found for task {task.id} "
+            f"and no ci_failure_branch in context"
+        )
     return await post_auto_fix_result_message(
         session,
         task.project_id,

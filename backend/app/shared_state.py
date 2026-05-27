@@ -13,6 +13,7 @@ from typing import Any, Dict
 
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from sqlalchemy.orm import object_session
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.failure_classification import INFRA_CLASSES as _DIRECTION_INFRA_CLASSES
@@ -68,6 +69,9 @@ TASK_TYPE_BRANCH_PREFIX: Dict[str, str] = {
 TASK_BRANCH_NAMESPACE_DEFAULT = "blueprint"
 
 
+_missing_project_branch_alerts: set[tuple[str, str]] = set()
+
+
 def derive_task_branch(
     task_id: Any,
     task_type: str | None,
@@ -83,6 +87,48 @@ def derive_task_branch(
     """
     prefix = TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
     return f"{namespace}/{prefix}-{str(task_id).replace('-', '')[:8]}"
+
+
+def _signal_missing_project_branch(project, column_name: str, alert_title: str) -> None:
+    project_id = getattr(project, "id", None)
+    project_id_str = str(project_id) if project_id is not None else "<unknown>"
+    dedupe_key = (project_id_str, column_name)
+    if dedupe_key in _missing_project_branch_alerts:
+        return
+    _missing_project_branch_alerts.add(dedupe_key)
+    logger.warning(
+        "[BRANCH_RESOLVER] project %s missing %s; falling back to main",
+        project_id_str,
+        column_name,
+    )
+
+    try:
+        session = object_session(project)
+    except Exception:  # noqa: BLE001
+        session = None
+    if session is None or project_id is None:
+        return
+
+    from app.models import Alert, AlertSeverity
+
+    try:
+        session.add(
+            Alert(
+                project_id=project_id,
+                severity=AlertSeverity.ERROR,
+                title=alert_title,
+                message=(
+                    f"Project {project_id_str} has NULL {column_name}; "
+                    "falling back to main until the column is populated."
+                ),
+            )
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[BRANCH_RESOLVER] project %s missing %s; alert could not be staged",
+            project_id_str,
+            column_name,
+        )
 
 
 def resolve_task_branch(task: Any) -> str:
@@ -573,7 +619,13 @@ def get_project_integration_branch(project) -> str:
     The deprecated runtime_config bridge was removed after the per-project
     column stabilized across the migration/backfill rollout.
     """
-    return getattr(project, "integration_branch", None) or "main"
+    integration_branch = getattr(project, "integration_branch", None)
+    if integration_branch:
+        return integration_branch
+    _signal_missing_project_branch(
+        project, "integration_branch", "Missing integration_branch"
+    )
+    return "main"
 
 
 def get_project_task_branch_namespace(project) -> str:
@@ -646,7 +698,13 @@ def get_project_promotion_target(project) -> str:
     The deprecated runtime_config bridge was removed after the per-project
     column stabilized across the migration/backfill rollout.
     """
-    return getattr(project, "promotion_target", None) or "main"
+    promotion_target = getattr(project, "promotion_target", None)
+    if promotion_target:
+        return promotion_target
+    _signal_missing_project_branch(
+        project, "promotion_target", "Missing promotion_target"
+    )
+    return "main"
 
 
 async def backfill_branch_columns(session, project_id=None) -> dict:
@@ -771,6 +829,68 @@ async def backfill_branch_columns(session, project_id=None) -> dict:
             summary["skipped"],
             summary["errored"],
             summary["self_repo_skipped"],
+        )
+
+    return summary
+
+
+async def backfill_task_branch_namespace(session, project_id=None) -> dict:
+    """Populate missing task_branch_namespace in build_config for legacy projects.
+
+    Runs at startup and via the admin backfill endpoint.  Idempotent: only
+    writes projects where build_config['task_branch_namespace'] is absent or
+    empty.  Self-repo (Blueprint) projects always get 'blueprint'; all others
+    get the slugified GitHub repo name (matching _derive_task_branch_namespace
+    in admin_onboard.py).
+
+    When project_id is provided, only that project is processed.
+
+    Returns a summary dict:
+      {
+        "namespace_filled": int,   # projects updated
+        "namespace_skipped": int,  # projects already had a value
+      }
+    """
+    import re as _re
+
+    from app.models import Project
+    from sqlmodel import select
+
+    summary = {"namespace_filled": 0, "namespace_skipped": 0}
+
+    try:
+        query = select(Project)
+        if project_id is not None:
+            query = query.where(Project.id == project_id)
+        result = await session.execute(query)
+        projects = result.scalars().all()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[NS_BACKFILL] Could not query projects: %s", exc)
+        return summary
+
+    for project in projects:
+        build_config = project.build_config or {}
+        if build_config.get("task_branch_namespace"):
+            summary["namespace_skipped"] += 1
+            continue
+
+        github_repo = getattr(project, "github_repo", "") or ""
+        if project.is_self_repo or github_repo.lower() == "blueprintaistudio":
+            namespace = "blueprint"
+        else:
+            slug = _re.sub(r"[^a-z0-9]+", "-", github_repo.lower()).strip("-")
+            namespace = slug[:40] if slug else "blueprint"
+
+        project.build_config = {**build_config, "task_branch_namespace": namespace}
+        flag_modified(project, "build_config")
+        session.add(project)
+        summary["namespace_filled"] += 1
+
+    if summary["namespace_filled"]:
+        logger.info(
+            "[NS_BACKFILL] complete: namespace_filled=%d namespace_skipped=%d",
+            summary["namespace_filled"],
+            summary["namespace_skipped"],
         )
 
     return summary

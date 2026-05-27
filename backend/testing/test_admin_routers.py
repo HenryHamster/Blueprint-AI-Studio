@@ -429,6 +429,44 @@ class TestProjectMembers:
         assert resp.status_code == 400
 
 
+class TestNullBranchConfigDiagnostics:
+    @pytest.mark.asyncio
+    async def test_lists_null_branch_projects_and_separates_self_repo(
+        self, client: AsyncClient, db_session
+    ):
+        self_repo = Project(
+            name="Self Repo",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="self-repo",
+            is_self_repo=True,
+        )
+        configured = Project(
+            name="Configured",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="configured-repo",
+            integration_branch="develop",
+            promotion_target="release",
+        )
+        db_session.add_all([self_repo, configured])
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/diagnostics/null-branch-config")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 1
+        assert data["projects"] == []
+        assert len(data["self_repo_skipped"]) == 1
+        skipped = data["self_repo_skipped"][0]
+        assert skipped["id"] == str(self_repo.id)
+        assert skipped["name"] == "Self Repo"
+        assert skipped["github_owner"] == "acme"
+        assert skipped["github_repo"] == "self-repo"
+        assert skipped["is_self_repo"] is True
+        assert "created_at" in skipped
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_projects.py — Project CRUD + Autonomous Mode
 # ═══════════════════════════════════════════════════════════════════════════════

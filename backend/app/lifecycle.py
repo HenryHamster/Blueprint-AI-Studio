@@ -507,8 +507,15 @@ async def lifespan(app):
     try:
         async with AsyncSessionLocal() as _bf_session:
             _bf_summary = await _shared_state.backfill_branch_columns(_bf_session)
+            _ns_summary = await _shared_state.backfill_task_branch_namespace(
+                _bf_session
+            )
             await _bf_session.commit()
-            logger.info("[STARTUP] Branch backfill complete: %s", _bf_summary)
+            logger.info(
+                "[STARTUP] Branch backfill complete: %s namespace_backfill: %s",
+                _bf_summary,
+                _ns_summary,
+            )
     except Exception as _bf_exc:
         logger.error(
             "[STARTUP] Branch backfill failed (non-fatal): %s", _bf_exc, exc_info=True

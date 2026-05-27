@@ -898,11 +898,15 @@ async def _spawn_ci_auto_remediation_followup(
     _ci_project = (
         await session.get(Project, task.project_id) if task.project_id else None
     )
-    _promotion_target = (
-        _shared_state.get_project_promotion_target(_ci_project)
-        if _ci_project
-        else "main"
-    )
+    if not _ci_project:
+        logger.warning(
+            "[AUTO-REMEDIATION] _spawn_ci_auto_remediation_followup: "
+            "project not found for task %s (project_id=%s) — aborting follow-up spawn",
+            task.id,
+            task.project_id,
+        )
+        return False
+    _promotion_target = _shared_state.get_project_promotion_target(_ci_project)
     branch = ctx.get("ci_failure_branch") or _promotion_target
     fingerprint = ctx.get("_previous_error_fingerprint") or ""
     failed_checks = ctx.get("ci_failure_checks") or []

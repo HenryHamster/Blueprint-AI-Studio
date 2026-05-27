@@ -28,6 +28,7 @@ from app.task_locking import lock_project_or_429, with_design_doc_locked
 from app.playbook_storage import archive_playbook_entry
 from app.shared_state import (
     backfill_branch_columns,
+    backfill_task_branch_namespace,
     get_project_integration_branch,
     get_project_promotion_target,
     get_project_task_branch_namespace,
@@ -473,6 +474,43 @@ async def update_auto_review_config(
 _VALID_BRANCH_RE = re.compile(r"^[a-zA-Z0-9._/\-]+$")
 
 
+async def _validate_branch_exists_on_remote(project, branch: str) -> None:
+    """Confirm that branch exists on the project's GitHub remote.
+
+    Raises HTTP 422 if the branch is not found, HTTP 502 if the GitHub
+    credential cannot be resolved.  Does nothing when the project has no
+    GitHub integration configured (github_owner/github_repo are None).
+    """
+    if not project.github_owner or not project.github_repo:
+        return
+
+    from app.github import get_branch_sha, get_repo_installation_token
+
+    token = await get_repo_installation_token(project.github_owner, project.github_repo)
+    if token is None:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"GitHub credential unavailable for "
+                f"{project.github_owner}/{project.github_repo} — "
+                "cannot validate branch existence"
+            ),
+        )
+
+    try:
+        await get_branch_sha(token, project.github_owner, project.github_repo, branch)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f'Branch "{branch}" does not exist on '
+                    f"{project.github_owner}/{project.github_repo}"
+                ),
+            )
+        raise
+
+
 @router.get("/projects/{project_id}/integration-branch")
 async def get_integration_branch_config(
     project_id: uuid.UUID,
@@ -498,7 +536,7 @@ async def update_integration_branch_config(
     current_user: dict = Depends(get_current_user),
 ):
     """Set the per-project integration branch. Pass null to revert to global default."""
-    await _get_user_project_with_role(
+    precheck_project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
     )
 
@@ -519,6 +557,7 @@ async def update_integration_branch_config(
                 status_code=422,
                 detail="'integration_branch' contains invalid characters",
             )
+        await _validate_branch_exists_on_remote(precheck_project, branch)
 
     project = await lock_project_or_429(session, project_id)
     project.integration_branch = branch
@@ -562,7 +601,7 @@ async def update_promotion_target_config(
     current_user: dict = Depends(get_current_user),
 ):
     """Set the per-project promotion/LTS target branch. Pass null to revert to global default."""
-    await _get_user_project_with_role(
+    precheck_project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
     )
 
@@ -583,6 +622,7 @@ async def update_promotion_target_config(
                 status_code=422,
                 detail="'promotion_target' contains invalid characters",
             )
+        await _validate_branch_exists_on_remote(precheck_project, branch)
 
     project = await lock_project_or_429(session, project_id)
     project.promotion_target = branch
@@ -904,5 +944,6 @@ async def backfill_project_branches(
         project_id, current_user["user_id"], session, "owner"
     )
     summary = await backfill_branch_columns(session, project_id=project_id)
+    ns_summary = await backfill_task_branch_namespace(session, project_id=project_id)
     await session.commit()
-    return {"project_id": str(project_id), **summary}
+    return {"project_id": str(project_id), **summary, **ns_summary}

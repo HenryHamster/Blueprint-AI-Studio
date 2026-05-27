@@ -602,7 +602,15 @@ async def test_open_backmerge_pr_no_credentials_raises_alert(db_session, mocker)
     """With no resolvable GitHub token the back-merge is blocked and an ERROR
     Alert is raised — a missed back-merge must never pass silently."""
     # Project with no github_owner/repo -> _resolve_github_with_session fails.
-    project = Project(name="Backmerge-NoCreds", user_id="bm-user")
+    # integration_branch/promotion_target set so the branch resolver in
+    # shared_state doesn't stage its own "Missing integration_branch" Alert
+    # alongside the no_credentials alert we're asserting on.
+    project = Project(
+        name="Backmerge-NoCreds",
+        user_id="bm-user",
+        integration_branch="automain",
+        promotion_target="main",
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)

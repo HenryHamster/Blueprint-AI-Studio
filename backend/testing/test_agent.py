@@ -8543,12 +8543,21 @@ async def test_smoketest_post_promotion_detection_uses_promotion_target_config(
     assert spawned[0].first_payload.get("type") == "plan"
 
 
-def test_smoketest_project_none_fallback_uses_main_integration_branch():
+def test_smoketest_project_none_skips_fix_spawn():
+    """When _smoketest_project is None the fix-spawn block must log and skip,
+    not fall back to a hardcoded 'main' integration branch via dead runtime_config keys."""
     source = (
         Path(__file__).resolve().parent.parent / "app" / "routers" / "agent_status.py"
     ).read_text()
-    assert '_runtime_config.get("integration_branch", "main")' in source
-    assert '"automain"' not in source
+    assert '_runtime_config.get("integration_branch", "main")' not in source, (
+        "Dead-code fallback removed: _runtime_config has no 'integration_branch' key"
+    )
+    assert '_runtime_config.get("promotion_target", "main")' not in source, (
+        "Dead-code fallback removed: _runtime_config has no 'promotion_target' key"
+    )
+    assert "skipping fix spawn" in source, (
+        "When project is None, code must log-and-skip rather than defaulting to 'main'"
+    )
 
 
 @pytest.mark.asyncio

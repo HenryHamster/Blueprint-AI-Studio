@@ -4584,6 +4584,45 @@ async def test_dedup_uses_project_promotion_target_not_main(tl_db):
     )
 
 
+@pytest.mark.asyncio
+async def test_spawn_ci_auto_remediation_followup_aborts_when_project_missing(tl_db):
+    """When the project row is absent, _spawn_ci_auto_remediation_followup must
+    return False without spawning any child task — fail-loud, not a silent 'main' fallback.
+
+    SQLite (used by tl_db) does not enforce FK constraints, so we can persist a
+    task with a project_id that has no matching project row."""
+    from app.task_lifecycle import _spawn_ci_auto_remediation_followup
+
+    session, _ = tl_db
+    nonexistent_project_id = uuid.uuid4()
+    task = Task(
+        project_id=nonexistent_project_id,
+        payloads=[{"type": "fix", "prompt": "auto-fix"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        context={
+            "spawned_by": "ci_auto_remediation",
+            "ci_failure_type": "test_failure",
+        },
+        auto_remediation=True,
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    result = await _spawn_ci_auto_remediation_followup(task, session)
+    assert result is False
+
+    spawned_count = (
+        (await session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(spawned_count) == 0, (
+        "no child task must be spawned when project is missing"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Orphan-PR cleanup on cancellation
 # ---------------------------------------------------------------------------

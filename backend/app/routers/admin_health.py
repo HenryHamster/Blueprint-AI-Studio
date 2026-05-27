@@ -70,6 +70,49 @@ async def get_health_overview(
     )
 
 
+@router.get("/diagnostics/null-branch-config")
+async def get_null_branch_config_diagnostics(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    rows = (
+        (
+            await session.execute(
+                select(Project)
+                .where(
+                    (Project.integration_branch.is_(None))
+                    | (Project.promotion_target.is_(None))
+                )
+                .order_by(Project.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    projects = []
+    self_repo_skipped = []
+    for project in rows:
+        item = {
+            "id": str(project.id),
+            "name": project.name,
+            "github_owner": project.github_owner,
+            "github_repo": project.github_repo,
+            "is_self_repo": project.is_self_repo,
+            "created_at": project.created_at.isoformat()
+            if project.created_at
+            else None,
+        }
+        if project.is_self_repo and project.integration_branch is None:
+            self_repo_skipped.append(item)
+        else:
+            projects.append(item)
+    return {
+        "projects": projects,
+        "self_repo_skipped": self_repo_skipped,
+        "total": len(projects) + len(self_repo_skipped),
+    }
+
+
 async def _compute_health_overview(
     *,
     project_id: uuid.UUID | None,
