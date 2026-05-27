@@ -37,6 +37,12 @@ variable "cache_repo" {
 # continuation retry). Extractor hardening: extractJsonObjectDetailed now validates
 # that required keys are own properties of the parsed object, preventing Codex JSONL
 # envelope objects from being silently mis-extracted as the memo result.
+# - PR #6138 (aa0b8a3): own-property validation in json-extract — prevents envelope
+#   objects from being mis-extracted as the memo result payload.
+# - PR #6162 (45a2d0a): autonomy cluster fixes — corrects cluster-dispatch edge cases
+#   that caused memo tasks to stall without emitting turn.completed.
+# - Current HEAD memo handler state: full extraction path and reopen retry are correct
+#   on main; this rebuild bakes these fixes into the deployed agent image.
 source "googlecompute" "agent_image" {
   project_id          = var.project_id
   source_image_family = "ubuntu-2204-lts"
