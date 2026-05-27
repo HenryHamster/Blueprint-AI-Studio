@@ -496,11 +496,14 @@ class TestOpenPrs:
                     "pr_url": "https://github.com/acme/widgets/pull/17",
                     "pr_title": "Lonely PR",
                     "pr_branch": "lonely-branch",
+                    "pr_base_branch": "",
                     "pr_created_at": "2026-04-29T12:00:00Z",
                     "tasks": [],
                     "is_orphaned": True,
                 }
-            ]
+            ],
+            "project_integration_branch": "main",
+            "project_promotion_target": "main",
         }
         token_mock.assert_awaited_once()
         prs_mock.assert_awaited_once_with("token", "acme", "widgets")

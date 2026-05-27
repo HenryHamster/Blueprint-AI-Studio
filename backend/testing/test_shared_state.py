@@ -342,6 +342,42 @@ class TestBackfillBranchColumns:
         assert project.promotion_target == "main"
         assert summary["filled"] == 1
 
+    @pytest.mark.asyncio
+    async def test_auto_create_path_both_null_non_main_default(self):
+        """Regression: project auto-created with both columns NULL, GitHub default != 'main'.
+
+        Simulates the admin create-task and deploy-endpoint paths that create projects
+        without initialising branch columns. After backfill, both integration_branch and
+        promotion_target must reflect the repo's actual default (not silently resolve to
+        'main'), and the branch resolvers must return the same non-'main' value.
+        """
+        project = _project(integration_branch=None, promotion_target=None)
+        session = _make_session([project])
+
+        with (
+            patch(
+                "app.release_promotion._resolve_github_with_session",
+                new_callable=AsyncMock,
+                return_value=("tok", "acme", "myrepo"),
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="develop",
+            ),
+        ):
+            summary = await backfill_branch_columns(session, project_id=project.id)
+
+        assert project.integration_branch == "develop"
+        assert project.promotion_target == "develop"
+        assert summary["filled"] == 2
+        assert summary["errored"] == 0
+
+        # Regression guard: branch resolvers must not fall back to 'main' once
+        # the columns are populated by the backfill called from the auto-create path.
+        assert _shared_state.get_project_integration_branch(project) == "develop"
+        assert _shared_state.get_project_promotion_target(project) == "develop"
+
 
 class TestProjectBranchResolvers:
     @pytest.fixture(autouse=True)

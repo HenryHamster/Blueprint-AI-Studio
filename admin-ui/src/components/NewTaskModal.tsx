@@ -48,6 +48,7 @@ interface NewTaskModalProps {
   taskBranchDefaultsReady: boolean;
   taskBranchDefaultsLoading: boolean;
   taskBranchDefaultsError: string | null;
+  integrationBranch?: string;
   onRepoChange: (value: string) => void;
   onSubmit: (e: React.FormEvent) => Promise<void>;
   onClose: () => void;
@@ -88,6 +89,7 @@ export function NewTaskModal({
   taskBranchDefaultsReady,
   taskBranchDefaultsLoading,
   taskBranchDefaultsError,
+  integrationBranch,
   onRepoChange,
   onSubmit,
   onClose,
@@ -205,7 +207,7 @@ export function NewTaskModal({
                     value={newTaskBranch}
                     onChange={e => setNewTaskBranch(e.target.value)}
                     className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${submitAttempted && branchError ? 'border-red-500' : 'border-neutral-800'}`}
-                    placeholder="main"
+                    placeholder={integrationBranch || "main"}
                   />
                   {branchError && <p className="text-[10px] text-amber-500 mt-1">{branchError}</p>}
                 </>

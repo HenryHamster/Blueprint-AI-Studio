@@ -1046,6 +1046,8 @@ const WINDOW_OPTIONS = [
 export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick, onConfigureTargets }: DashboardHomeProps) {
   const [digest, setDigest] = useState<DigestData | null>(null);
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
+  const [openPRsIntegrationBranch, setOpenPRsIntegrationBranch] = useState<string | null>(null);
+  const [openPRsPromotionTarget, setOpenPRsPromotionTarget] = useState<string | null>(null);
   const [measurementData, setMeasurementData] = useState<MediumScopeMeasurement | null>(null);
   const [scopeBaselines, setScopeBaselines] = useState<ScopeBaselinesResponse | null>(null);
   const [scopeTrendsOpen, setScopeTrendsOpen] = useState(false);
@@ -1087,6 +1089,8 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       if (res.ok) {
         const data = await res.json();
         setOpenPRs(data.open_prs ?? []);
+        setOpenPRsIntegrationBranch(data.project_integration_branch ?? null);
+        setOpenPRsPromotionTarget(data.project_promotion_target ?? null);
       }
     } catch { /* silent */ }
     finally {
@@ -1183,6 +1187,8 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             if (res.ok) {
               const data = await res.json();
               setOpenPRs(data.open_prs ?? []);
+              setOpenPRsIntegrationBranch(data.project_integration_branch ?? null);
+              setOpenPRsPromotionTarget(data.project_promotion_target ?? null);
               openPRsOk = true;
             }
           } catch { /* silent */ }
@@ -2427,6 +2433,8 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             hasProject={!!selectedProjectId}
             tasks={tasks}
             onViewTask={onViewTask}
+            integrationBranch={openPRsIntegrationBranch}
+            promotionTarget={openPRsPromotionTarget}
           />
         </div>
       </div>

@@ -16,6 +16,7 @@ export interface OpenPR {
   pr_url: string;
   pr_title: string;
   pr_branch: string;
+  pr_base_branch?: string;
   pr_created_at: string;
   tasks: OpenPRTask[];
   is_orphaned: boolean;
@@ -44,7 +45,7 @@ function SkeletonRow() {
   return <div className="animate-pulse bg-neutral-800/60 rounded h-10 w-full" />;
 }
 
-export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasProject, tasks, onViewTask }: { openPRs: OpenPR[]; loading: boolean; refreshing: boolean; onRefresh: () => void; hasProject: boolean; tasks: Task[]; onViewTask: (task: Task) => void }) {
+export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasProject, tasks, onViewTask, integrationBranch, promotionTarget }: { openPRs: OpenPR[]; loading: boolean; refreshing: boolean; onRefresh: () => void; hasProject: boolean; tasks: Task[]; onViewTask: (task: Task) => void; integrationBranch?: string | null; promotionTarget?: string | null }) {
   const [expanded, setExpanded] = useState(true);
   const tasksById = React.useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
   const busy = loading || refreshing;
@@ -90,7 +91,18 @@ export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasP
                       <p className="text-xs text-neutral-200 truncate">{pr.pr_title}</p>
                       <span className="text-[10px] text-neutral-500 ml-auto">{timeAgo(pr.pr_created_at)}</span>
                     </div>
-                    <p className="text-[9px] text-neutral-600 font-mono truncate mt-0.5">{pr.pr_branch}</p>
+                    <div className="flex items-center gap-1 mt-0.5 flex-wrap">
+                      <span className="text-[9px] text-neutral-600 font-mono truncate">{pr.pr_branch}</span>
+                      {pr.pr_base_branch && (
+                        <>
+                          <span className="text-[9px] text-neutral-700">→</span>
+                          <span className="text-[9px] text-neutral-600 font-mono truncate">{pr.pr_base_branch}</span>
+                        </>
+                      )}
+                      {pr.pr_base_branch && integrationBranch && pr.pr_base_branch !== integrationBranch && pr.pr_base_branch !== (promotionTarget ?? '') && (
+                        <span className="text-[9px] text-amber-400 border border-amber-500/30 rounded px-1 py-0 ml-0.5">drift</span>
+                      )}
+                    </div>
                     {pr.is_orphaned ? (
                       <div className="mt-1.5 text-[9px] text-red-400 font-medium">No active task</div>
                     ) : (

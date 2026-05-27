@@ -283,6 +283,12 @@ export default function App() {
     }, 100);
   }, [s]);
 
+  const handleConfigureBranchProject = useCallback((projectId: string) => {
+    s.setSelectedProjectId(projectId);
+    setSettingsInitialSection('integration-branch');
+    if (!s.showSettings) s.handleToggleSettings();
+  }, [s]);
+
   // Clear the deep-link section once Settings closes, so a subsequent plain
   // Settings open is not forced back to the build-config tab.
   useEffect(() => {
@@ -721,7 +727,7 @@ export default function App() {
         onViewTask={handleViewTask}
       />
 
-      {s.userRole === 'admin' && <NullBranchDiagnosticsPanel />}
+      {s.userRole === 'admin' && <NullBranchDiagnosticsPanel onConfigure={handleConfigureBranchProject} />}
 
       <WarmVmPanel onViewTask={handleViewTask} />
 
@@ -1010,6 +1016,7 @@ export default function App() {
           taskBranchDefaultsReady={s.taskBranchDefaultsReady}
           taskBranchDefaultsLoading={s.taskBranchDefaultsLoading}
           taskBranchDefaultsError={s.taskBranchDefaultsError}
+          integrationBranch={s.integrationBranchData?.integration_branch}
           onRepoChange={s.handleRepoChange}
           onSubmit={s.handleCreateTask}
           onClose={() => s.setShowNewTaskModal(false)}

@@ -116,6 +116,26 @@ describe('NullBranchDiagnosticsPanel', () => {
     expect(screen.getByText('Acme API')).toBeTruthy();
   });
 
+  test('Configure button is absent when onConfigure prop is not provided', async () => {
+    (fetchNullBranchConfig as ReturnType<typeof vi.fn>).mockResolvedValue(populatedData);
+    render(<NullBranchDiagnosticsPanel />);
+
+    await screen.findByText('Acme API');
+    expect(screen.queryByText('Configure')).toBeNull();
+  });
+
+  test('Configure button calls onConfigure with the correct project id', async () => {
+    (fetchNullBranchConfig as ReturnType<typeof vi.fn>).mockResolvedValue(populatedData);
+    const onConfigure = vi.fn();
+    render(<NullBranchDiagnosticsPanel onConfigure={onConfigure} />);
+
+    await screen.findByText('Acme API');
+    const configureButtons = screen.getAllByText('Configure');
+    expect(configureButtons).toHaveLength(2);
+    fireEvent.click(configureButtons[0]);
+    expect(onConfigure).toHaveBeenCalledWith('p1');
+  });
+
   test('only self_repo_skipped — panel still renders the disclosure', async () => {
     const onlySelf = { projects: [], self_repo_skipped: populatedData.self_repo_skipped, total: 1 };
     (fetchNullBranchConfig as ReturnType<typeof vi.fn>).mockResolvedValue(onlySelf);

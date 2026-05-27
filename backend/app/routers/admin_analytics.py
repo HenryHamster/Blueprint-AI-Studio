@@ -25,6 +25,10 @@ from app.models import (
 )
 from app.auth import get_current_user, require_admin
 from app.vm_cost_rates import get_vm_rate_per_second, VM_COST_RATES
+from app.shared_state import (
+    get_project_integration_branch,
+    get_project_promotion_target,
+)
 
 # Re-export for test and internal use (single source of truth is vm_cost_rates)
 ON_DEMAND_RATE = VM_COST_RATES["e2-standard-2"][0] / 3600  # $/sec
@@ -786,12 +790,17 @@ async def get_open_prs(
                 "pr_url": pr_url,
                 "pr_title": gh_pr.get("title", ""),
                 "pr_branch": (gh_pr.get("head") or {}).get("ref", ""),
+                "pr_base_branch": (gh_pr.get("base") or {}).get("ref", ""),
                 "pr_created_at": gh_pr.get("created_at"),
                 "tasks": tasks_payload,
                 "is_orphaned": len(tasks_payload) == 0,
             }
         )
 
-    payload = {"open_prs": result}
+    payload = {
+        "open_prs": result,
+        "project_integration_branch": get_project_integration_branch(project),
+        "project_promotion_target": get_project_promotion_target(project),
+    }
     _open_prs_cache[project_id] = (time.time(), payload)
     return payload

@@ -109,6 +109,65 @@ describe('PRMonitorSection', () => {
     expect(screen.getByText('fix/flaky-migration')).toBeInTheDocument();
   });
 
+  it('renders head→base branch format when pr_base_branch is set', () => {
+    const pr = makeOpenPR({
+      pr_branch: 'feature/my-change',
+      pr_base_branch: 'develop',
+    });
+    render(<PRMonitorSection {...baseProps} openPRs={[pr]} />);
+    expect(screen.getByText('feature/my-change')).toBeInTheDocument();
+    expect(screen.getByText('develop')).toBeInTheDocument();
+    expect(screen.getByText('→')).toBeInTheDocument();
+  });
+
+  it('renders drift chip when pr_base_branch differs from integrationBranch', () => {
+    const pr = makeOpenPR({
+      pr_branch: 'feature/my-change',
+      pr_base_branch: 'some-other-branch',
+    });
+    render(
+      <PRMonitorSection
+        {...baseProps}
+        openPRs={[pr]}
+        integrationBranch="develop"
+        promotionTarget="main"
+      />,
+    );
+    expect(screen.getByText('drift')).toBeInTheDocument();
+  });
+
+  it('does not render drift chip when pr_base_branch matches integrationBranch', () => {
+    const pr = makeOpenPR({
+      pr_branch: 'feature/my-change',
+      pr_base_branch: 'develop',
+    });
+    render(
+      <PRMonitorSection
+        {...baseProps}
+        openPRs={[pr]}
+        integrationBranch="develop"
+        promotionTarget="main"
+      />,
+    );
+    expect(screen.queryByText('drift')).toBeNull();
+  });
+
+  it('does not render drift chip when pr_base_branch matches promotionTarget', () => {
+    const pr = makeOpenPR({
+      pr_branch: 'feature/my-change',
+      pr_base_branch: 'main',
+    });
+    render(
+      <PRMonitorSection
+        {...baseProps}
+        openPRs={[pr]}
+        integrationBranch="develop"
+        promotionTarget="main"
+      />,
+    );
+    expect(screen.queryByText('drift')).toBeNull();
+  });
+
   it('renders a clickable button for a linked PR whose task is in the tasks prop', async () => {
     const user = userEvent.setup();
     const fullTask = makeTask({ id: 'task-42', title: 'Real task object' });

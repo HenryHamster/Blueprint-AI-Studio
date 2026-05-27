@@ -2,7 +2,11 @@ import { useEffect, useState } from 'react';
 import { ChevronDown, ChevronUp, GitBranch, AlertTriangle } from 'lucide-react';
 import { fetchNullBranchConfig, backfillProjectBranches, type NullBranchConfigEntry } from '../api';
 
-export function NullBranchDiagnosticsPanel() {
+interface NullBranchDiagnosticsPanelProps {
+  onConfigure?: (projectId: string) => void;
+}
+
+export function NullBranchDiagnosticsPanel({ onConfigure }: NullBranchDiagnosticsPanelProps = {}) {
   const [projects, setProjects] = useState<NullBranchConfigEntry[]>([]);
   const [selfRepoSkipped, setSelfRepoSkipped] = useState<NullBranchConfigEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -72,13 +76,23 @@ export function NullBranchDiagnosticsPanel() {
               {errors[project.id] && (
                 <span className="text-red-400 text-[10px]">{errors[project.id]}</span>
               )}
-              <button
-                onClick={() => handleBackfill(project)}
-                disabled={backfilling.has(project.id)}
-                className="ml-auto px-2 min-h-[44px] rounded text-[10px] font-medium bg-blue-500/10 border border-blue-500/30 text-blue-400 hover:bg-blue-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-              >
-                {backfilling.has(project.id) ? 'Backfilling…' : 'Backfill'}
-              </button>
+              <div className="ml-auto flex items-center gap-1.5">
+                {onConfigure && (
+                  <button
+                    onClick={() => onConfigure(project.id)}
+                    className="px-2 min-h-[44px] rounded text-[10px] font-medium bg-neutral-800 border border-neutral-700 text-neutral-300 hover:bg-neutral-700 transition-colors"
+                  >
+                    Configure
+                  </button>
+                )}
+                <button
+                  onClick={() => handleBackfill(project)}
+                  disabled={backfilling.has(project.id)}
+                  className="px-2 min-h-[44px] rounded text-[10px] font-medium bg-blue-500/10 border border-blue-500/30 text-blue-400 hover:bg-blue-500/20 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  {backfilling.has(project.id) ? 'Backfilling…' : 'Backfill'}
+                </button>
+              </div>
             </div>
           ))}
         </div>
