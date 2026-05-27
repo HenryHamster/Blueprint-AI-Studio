@@ -635,6 +635,10 @@ export interface MttaActiveCase {
   live_elapsed_sec: number | null;
   live_elapsed_investigate_sec: number | null;
   recovery_check_in_sec: number | null;
+  elapsed_since_merge_sec: number | null;
+  eta_to_investigate_sec: number | null;
+  eta_to_merge_sec: number | null;
+  eta_to_recovery_sec: number | null;
 }
 
 export interface MttaClassRow {
@@ -775,6 +779,8 @@ export interface VersionQualification {
   audit_missing_reason?: string | null;
   // Audit reconciliation: model vs findings-derived scores and excluded count.
   audit_reconciliation?: AuditReconciliation | null;
+  // Audit findings carried from the qualification run (severity + summary per finding).
+  audit_findings?: AuditFinding[] | null;
 }
 
 export interface CurrentVersion {

@@ -4847,3 +4847,59 @@ class TestGetTaskPrFiles:
         """Returns 404 for a malformed task ID."""
         resp = await client.get("/api/admin/tasks/not-a-uuid/pr-files")
         assert resp.status_code == 404
+
+
+class TestGetAuditFindings:
+    """GET /api/admin/projects/{id}/audit-findings — read-only audit findings endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_returns_findings_from_last_qualification(
+        self, client: AsyncClient, db_session
+    ):
+        """audit_findings stored in last_qualification are returned by the endpoint."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+        version.last_qualification = {
+            "audit_findings": [
+                {"severity": "high", "summary": "Token baked into image."},
+                {"severity": "low", "summary": "Unused import."},
+            ],
+            "audit_missing_reason": None,
+            "finalized_at": "2026-01-01T00:00:00",
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/audit-findings")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["source"] == "last_qualification"
+        assert len(data["findings"]) == 2
+        assert data["findings"][0]["severity"] == "high"
+        assert data["findings"][1]["severity"] == "low"
+        assert data["finalized_at"] == "2026-01-01T00:00:00"
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_no_open_version(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns empty findings list and 'no_open_version' source when no open version."""
+        project = await _make_project(db_session)
+        resp = await client.get(f"/api/admin/projects/{project.id}/audit-findings")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["findings"] == []
+        assert data["source"] == "no_open_version"
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_no_qualification_yet(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns empty findings when an open version exists but no qualification ran."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+        resp = await client.get(f"/api/admin/projects/{project.id}/audit-findings")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["findings"] == []
+        assert data["source"] == "last_qualification"

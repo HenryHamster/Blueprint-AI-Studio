@@ -181,6 +181,7 @@ export function ClassKpisPanel({ projectId, filterClass, onClassSelect }: Props)
               <th className="text-right px-2 py-1.5 font-medium hidden sm:table-cell">Closed</th>
               <th className="text-right px-2 py-1.5 font-medium">MTTD</th>
               <th className="text-right px-2 py-1.5 font-medium">MTTR</th>
+              <th className="text-right px-2 py-1.5 font-medium hidden sm:table-cell">Attempts</th>
               <th className="text-right px-3 py-1.5 font-medium">Success</th>
             </tr>
           </thead>
@@ -198,6 +199,7 @@ export function ClassKpisPanel({ projectId, filterClass, onClassSelect }: Props)
                   <td className="px-2 py-1.5 text-right text-emerald-400 hidden sm:table-cell">{row.cases_closed}</td>
                   <td className="px-2 py-1.5 text-right text-neutral-400">{formatMttd(row.mean_time_to_detect_seconds)}</td>
                   <td className="px-2 py-1.5 text-right text-neutral-400">{formatMttd(row.mean_time_to_remediate_seconds)}</td>
+                  <td className="px-2 py-1.5 text-right text-neutral-500 hidden sm:table-cell">{row.dispatch_attempt_count}</td>
                   <td className="px-3 py-1.5 text-right">
                     {row.remediation_success_rate !== null
                       ? <span className={row.remediation_success_rate >= 0.5 ? 'text-emerald-400' : 'text-amber-400'}>{Math.round(row.remediation_success_rate * 100)}%</span>
@@ -1046,31 +1048,44 @@ function MttaClassCard({ row }: { row: MttaClassRow }) {
         })}
       </div>
       {row.active_cases.length > 0 && (
-        <div className="border-t border-neutral-800/50 pt-1 space-y-0.5">
+        <div className="border-t border-neutral-800/50 pt-1 space-y-1">
           {row.active_cases.map((ac) => {
             const p50Total = totalP50 > 0 ? totalP50 : null;
             const elapsed = ac.live_elapsed_sec;
             const isStalled = p50Total !== null && elapsed !== null && elapsed > p50Total * 1.5;
             return (
-              <div key={ac.case_id} className="flex items-center gap-2 flex-wrap text-[10px]">
-                <span className={`px-1.5 py-0.5 rounded border font-mono ${isStalled ? 'bg-amber-950/30 border-amber-700/50 text-amber-300' : 'bg-neutral-800/40 border-neutral-700/40 text-neutral-400'}`}>
-                  {ac.status}
-                </span>
-                {elapsed !== null && (
-                  <span className={isStalled ? 'text-amber-400' : 'text-neutral-400'}>
-                    elapsed: {formatMttd(elapsed)}
-                    {isStalled && ' ⚠ stalled'}
-                    {!isStalled && p50Total !== null && ` (eta ~${formatMttd(Math.max(0, p50Total - elapsed))})`}
+              <div key={ac.case_id} className="space-y-0.5">
+                <div className="flex items-center gap-2 flex-wrap text-[10px]">
+                  <span className={`px-1.5 py-0.5 rounded border font-mono ${isStalled ? 'bg-amber-950/30 border-amber-700/50 text-amber-300' : 'bg-neutral-800/40 border-neutral-700/40 text-neutral-400'}`}>
+                    {ac.status}
                   </span>
-                )}
-                {ac.recovery_check_in_sec !== null && (
-                  <span className="text-blue-400">
-                    recovery check in {formatMttd(ac.recovery_check_in_sec)}
-                  </span>
-                )}
-                {ac.recovery_check_in_sec === null && ac.status === 'MERGED' && (
-                  <span className="text-emerald-400/80">recovery window active</span>
-                )}
+                  {elapsed !== null && (
+                    <span className={isStalled ? 'text-amber-400' : 'text-neutral-400'}>
+                      elapsed: {formatMttd(elapsed)}
+                      {isStalled && ' ⚠ stalled'}
+                      {!isStalled && p50Total !== null && ` (eta ~${formatMttd(Math.max(0, p50Total - elapsed))})`}
+                    </span>
+                  )}
+                  {ac.recovery_check_in_sec !== null && (
+                    <span className="text-blue-400">
+                      recovery check in {formatMttd(ac.recovery_check_in_sec)}
+                    </span>
+                  )}
+                  {ac.recovery_check_in_sec === null && ac.status === 'MERGED' && (
+                    <span className="text-emerald-400/80">recovery window active</span>
+                  )}
+                </div>
+                <div className="text-[9px] text-neutral-500 flex flex-wrap gap-2 pl-1">
+                  {ac.live_elapsed_sec !== null && ac.eta_to_investigate_sec !== null && (
+                    <span>detect: {formatMttd(ac.live_elapsed_sec)} / eta {formatMttd(ac.eta_to_investigate_sec)}</span>
+                  )}
+                  {ac.live_elapsed_investigate_sec !== null && ac.eta_to_merge_sec !== null && (
+                    <span>investigate: {formatMttd(ac.live_elapsed_investigate_sec)} / eta {formatMttd(ac.eta_to_merge_sec)}</span>
+                  )}
+                  {ac.elapsed_since_merge_sec !== null && ac.eta_to_recovery_sec !== null && (
+                    <span>merge: {formatMttd(ac.elapsed_since_merge_sec)} / eta {formatMttd(ac.eta_to_recovery_sec)}</span>
+                  )}
+                </div>
               </div>
             );
           })}

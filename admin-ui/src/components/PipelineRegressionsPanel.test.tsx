@@ -4,7 +4,7 @@ import { render, screen, fireEvent, waitFor, within } from '@testing-library/rea
 vi.mock('../api', () => ({ apiFetch: vi.fn(), authHeaders: vi.fn(), API_BASE_URL: '' }));
 
 import { apiFetch } from '../api';
-import { ManualInterventionPanel, AutoRecoveredPanel, EscalationOutcomePanel } from './PipelineRegressionsPanel';
+import { ManualInterventionPanel, AutoRecoveredPanel, EscalationOutcomePanel, MttaTimelinePanel } from './PipelineRegressionsPanel';
 
 const apiFetchMock = apiFetch as unknown as ReturnType<typeof vi.fn>;
 const response = (cases: unknown[]): Response =>
@@ -332,5 +332,117 @@ describe('ManualInterventionPanel — viewport regression class parsing', () => 
     const button = screen.getAllByRole('button', { name: /failure screenshot/ })[0];
     fireEvent.click(button);
     expect(screen.getByAltText('TaskCard failure at 768px')).toBeInTheDocument();
+  });
+});
+
+describe('MttaTimelinePanel — per-stage elapsed/ETA display', () => {
+  it('displays per-stage elapsed and ETA information for active cases with all fields', async () => {
+    const mttaResponse = (): Response => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        project_id: 'proj-1',
+        window_days: 30,
+        class_count: 1,
+        recovery_cooldown_sec: 900,
+        classes: [
+          {
+            regression_class: 'test_class',
+            sample_count: 2,
+            stages: {
+              signal_trip_to_detect: { p50_sec: 600, p90_sec: 1200, sample_count: 5 },
+              detect_to_investigate: { p50_sec: 300, p90_sec: 600, sample_count: 4 },
+              investigate_to_merge: { p50_sec: 3600, p90_sec: 7200, sample_count: 3 },
+              merge_to_recovery: { p50_sec: 1800, p90_sec: 3600, sample_count: 2 },
+            },
+            active_cases: [
+              {
+                case_id: 'case-1',
+                status: 'INVESTIGATING',
+                live_elapsed_sec: 100,
+                live_elapsed_investigate_sec: 50,
+                recovery_check_in_sec: null,
+                elapsed_since_merge_sec: null,
+                eta_to_investigate_sec: 500,
+                eta_to_merge_sec: 250,
+                eta_to_recovery_sec: null,
+              },
+              {
+                case_id: 'case-2',
+                status: 'MERGED',
+                live_elapsed_sec: 1500,
+                live_elapsed_investigate_sec: 800,
+                recovery_check_in_sec: 300,
+                elapsed_since_merge_sec: 700,
+                eta_to_investigate_sec: null,
+                eta_to_merge_sec: null,
+                eta_to_recovery_sec: 1100,
+              },
+            ],
+          },
+        ],
+      }),
+    }) as Response;
+
+    apiFetchMock.mockResolvedValueOnce(mttaResponse());
+    render(<MttaTimelinePanel projectId="proj-1" />);
+
+    // Click to expand the panel
+    const expandButton = await screen.findByRole('button', { name: /MTTA Timeline/ });
+    fireEvent.click(expandButton);
+
+    // Check for INVESTIGATING case per-stage breakdown
+    await waitFor(() => {
+      expect(screen.getByText(/detect:.*\/.*eta/)).toBeInTheDocument();
+      expect(screen.getByText(/investigate:.*\/.*eta/)).toBeInTheDocument();
+    });
+  });
+
+  it('displays per-stage information for MERGED case with recovery ETA', async () => {
+    const mttaResponse = (): Response => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        project_id: 'proj-1',
+        window_days: 30,
+        class_count: 1,
+        recovery_cooldown_sec: 900,
+        classes: [
+          {
+            regression_class: 'test_class',
+            sample_count: 1,
+            stages: {
+              signal_trip_to_detect: { p50_sec: 600, p90_sec: 1200, sample_count: 3 },
+              detect_to_investigate: { p50_sec: 300, p90_sec: 600, sample_count: 3 },
+              investigate_to_merge: { p50_sec: 3600, p90_sec: 7200, sample_count: 2 },
+              merge_to_recovery: { p50_sec: 1800, p90_sec: 3600, sample_count: 2 },
+            },
+            active_cases: [
+              {
+                case_id: 'case-merged',
+                status: 'MERGED',
+                live_elapsed_sec: 2100,
+                live_elapsed_investigate_sec: 1200,
+                recovery_check_in_sec: 600,
+                elapsed_since_merge_sec: 600,
+                eta_to_investigate_sec: null,
+                eta_to_merge_sec: null,
+                eta_to_recovery_sec: 1200,
+              },
+            ],
+          },
+        ],
+      }),
+    }) as Response;
+
+    apiFetchMock.mockResolvedValueOnce(mttaResponse());
+    render(<MttaTimelinePanel projectId="proj-1" />);
+
+    const expandButton = await screen.findByRole('button', { name: /MTTA Timeline/ });
+    fireEvent.click(expandButton);
+
+    await waitFor(() => {
+      expect(screen.getByText(/merge:.*\/.*eta/)).toBeInTheDocument();
+    });
   });
 });

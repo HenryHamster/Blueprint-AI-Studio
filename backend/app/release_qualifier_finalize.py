@@ -74,6 +74,17 @@ def _enrich_infra_error(base_label: str, task: Task | None) -> str:
     return f"{base_label}_{sanitized}"
 
 
+def get_latest_qualification_audit_findings(
+    version: release_version.ReleaseVersion | None,
+) -> list[dict[str, Any]]:
+    """Return the stored audit findings from a version's latest qualification."""
+    qual = (version.last_qualification or {}) if version is not None else {}
+    findings = qual.get("audit_findings")
+    if not isinstance(findings, list):
+        return []
+    return [finding for finding in findings if isinstance(finding, dict)]
+
+
 # Human-readable rendering of the compute_composite() hard-blocker codes.
 _BLOCKER_LABELS: dict[str, str] = {
     "ci_not_green": "CI is not green on the candidate",

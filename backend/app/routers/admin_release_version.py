@@ -263,6 +263,54 @@ async def set_version_phase(
     }
 
 
+@router.get("/projects/{project_id}/audit-findings")
+async def get_audit_findings(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return the latest qualification's audit findings for a project.
+
+    Read-only; viewer+ role required. Surfaces the ``audit_findings`` list
+    carried into ``last_qualification`` by ``_finalize_qualification`` so
+    operators can see which specific issues drove a low audit sub-score.
+    Returns an empty list when no open version exists or no qualification
+    has run yet.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="viewer"
+    )
+
+    open_row = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "open",
+                )
+                .order_by(ReleaseVersion.opened_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if open_row is None:
+        return {"findings": [], "source": "no_open_version"}
+
+    qual = open_row.last_qualification or {}
+    findings = qual.get("audit_findings") or []
+    if not isinstance(findings, list):
+        findings = []
+    return {
+        "findings": findings,
+        "audit_missing_reason": qual.get("audit_missing_reason"),
+        "finalized_at": qual.get("finalized_at"),
+        "source": "last_qualification",
+    }
+
+
 _VERDICT_HISTORY_LIMIT = 50
 
 
