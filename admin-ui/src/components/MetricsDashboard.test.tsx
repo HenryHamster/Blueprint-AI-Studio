@@ -93,4 +93,36 @@ describe('MetricsDashboard', () => {
     fireEvent.click(screen.getByRole('button', { name: '6h' }));
     expect(onWindowChange).toHaveBeenCalledWith('6h');
   });
+
+  it('exports the currently filtered metric series as CSV and JSON', () => {
+    const originalCreateElement = document.createElement.bind(document);
+    const createObjectURL = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:metrics');
+    const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+    const click = vi.fn();
+    vi.spyOn(document, 'createElement').mockImplementation(((tagName: string) =>
+      tagName === 'a' ? ({ click, set href(_value: string) {}, set download(_value: string) {} } as unknown as HTMLAnchorElement) : originalCreateElement(tagName)) as typeof document.createElement);
+
+    render(
+      <MetricsDashboard
+        metricsHistory={[
+          { timestamp: Date.now() - 4000000, activeVMs: 1, costPerHr: 1, completedCount: 1, failedCount: 0 },
+          { timestamp: Date.now() - 300000, activeVMs: 2, costPerHr: 2, completedCount: 3, failedCount: 1 },
+        ]}
+        cumulativeCost={0}
+        cumulativeVmHours={0}
+        maxConcurrentVMs={4}
+        tasks={[]}
+        metricsWindow="1h"
+        onWindowChange={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'CSV' }));
+    expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
+    expect(click).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole('button', { name: 'JSON' }));
+    expect(click).toHaveBeenCalledTimes(2);
+    expect(revokeObjectURL).toHaveBeenCalledTimes(2);
+  });
 });

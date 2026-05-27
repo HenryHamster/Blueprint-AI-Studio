@@ -4,6 +4,7 @@
 // Populated from task.build_config (a JSONB field on Project passed via claim).
 
 import type { BuildConfig, DirectoryConfig } from './index.js';
+import { SHELL_CMD_RE } from './shell-safety.js';
 
 const VALID_TYPES = new Set(['python', 'node', 'go', 'rust']);
 
@@ -32,6 +33,7 @@ export function resolveBuildConfig(task: Record<string, unknown>): BuildConfig |
     if (!path) continue;
     // Reject path traversal: no .., no absolute paths, no null bytes
     if (path.includes('..') || path.startsWith('/') || path.includes('\0')) continue;
+    if (!SHELL_CMD_RE.test(path)) continue;
     // Accept 'type' directly, or fall back to 'language' for backwards compat
     const rawType = dir.type ?? dir.language;
     const type = VALID_TYPES.has(rawType as string) ? (rawType as string) : 'python';
@@ -41,6 +43,10 @@ export function resolveBuildConfig(task: Record<string, unknown>): BuildConfig |
     const buildCmd = dir.build_cmd ?? dir.build_command;
     const testCmd = dir.test_cmd ?? dir.test_command;
     const installCmd = dir.install_cmd;
+    if (typeof lintCmd === 'string' && lintCmd !== '' && !SHELL_CMD_RE.test(lintCmd)) continue;
+    if (typeof buildCmd === 'string' && buildCmd !== '' && !SHELL_CMD_RE.test(buildCmd)) continue;
+    if (typeof testCmd === 'string' && testCmd !== '' && !SHELL_CMD_RE.test(testCmd)) continue;
+    if (typeof installCmd === 'string' && installCmd !== '' && !SHELL_CMD_RE.test(installCmd)) continue;
     if (typeof lintCmd === 'string') entry.lint_cmd = lintCmd;
     if (typeof buildCmd === 'string') entry.build_cmd = buildCmd;
     if (typeof testCmd === 'string') entry.test_cmd = testCmd;

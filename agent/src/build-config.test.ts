@@ -273,4 +273,21 @@ describe('resolveBuildConfig', () => {
     };
     expect(resolveBuildConfig(task)).toBeUndefined();
   });
+
+  it('rejects shell-unsafe directory paths and command values', () => {
+    const task = {
+      build_config: {
+        directories: [
+          { path: 'svc$(whoami)`rm`;echo|cat&', type: 'node', lint_cmd: 'npm run lint' },
+          { path: 'backend', type: 'python', build_cmd: 'python -m build' },
+          { path: 'worker', type: 'python', install_cmd: 'pip install -e . && echo bad' },
+        ],
+      },
+    };
+    expect(resolveBuildConfig(task)).toEqual({
+      directories: [
+        { path: 'backend', type: 'python', build_cmd: 'python -m build' },
+      ],
+    });
+  });
 });

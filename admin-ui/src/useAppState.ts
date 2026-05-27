@@ -178,6 +178,7 @@ export function useAppState() {
   const [notifyOnFail, setNotifyOnFail] = usePersistedState<boolean>('notifyOnFail', false);
   const [notifyOnApprovalNeeded, setNotifyOnApprovalNeeded] = usePersistedState<boolean>('notifyOnApprovalNeeded', false);
   const [soundOnComplete, setSoundOnComplete] = usePersistedState<boolean>('soundOnComplete', false);
+  const [notifyOnHighSignalMessage, setNotifyOnHighSignalMessage] = usePersistedState<boolean>('notifyOnHighSignalMessage', false);
   const prevTasksRef = useRef<Task[]>([]);
   const notifyRef = useRef(notifyOnComplete);
   useEffect(() => { notifyRef.current = notifyOnComplete; }, [notifyOnComplete]);
@@ -187,6 +188,8 @@ export function useAppState() {
   useEffect(() => { notifyOnApprovalNeededRef.current = notifyOnApprovalNeeded; }, [notifyOnApprovalNeeded]);
   const soundOnCompleteRef = useRef(soundOnComplete);
   useEffect(() => { soundOnCompleteRef.current = soundOnComplete; }, [soundOnComplete]);
+  const notifyOnHighSignalMessageRef = useRef(notifyOnHighSignalMessage);
+  useEffect(() => { notifyOnHighSignalMessageRef.current = notifyOnHighSignalMessage; }, [notifyOnHighSignalMessage]);
 
   // Project dashboard state
   const [projects, setProjects] = useState<Project[]>([]);
@@ -1240,6 +1243,7 @@ export function useAppState() {
     notifyOnFail, setNotifyOnFail,
     notifyOnApprovalNeeded, setNotifyOnApprovalNeeded,
     soundOnComplete, setSoundOnComplete,
+    notifyOnHighSignalMessage, setNotifyOnHighSignalMessage,
     // Settings
     showSettings, settingsRef, handleToggleSettings,
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour, usingMaxPlan,

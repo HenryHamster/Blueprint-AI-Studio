@@ -40,6 +40,7 @@ from app.payload_schemas import validate_task_payload
 from app.schemas import DeployPayload
 from app.shared_state import limiter
 from app.broadcast import manager, broadcast_to_project, _sanitize_log
+from app.event_fanout import enqueue_agent_log
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 
 logger = logging.getLogger(__name__)
@@ -718,14 +719,18 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
                     continue
 
                 if data.get("type") == "log":
+                    sanitized = _sanitize_log(data.get("content", ""))
                     await broadcast_to_project(
                         project_id,
                         "agent_log",
-                        {
-                            "task_id": str(task_id),
-                            "log": _sanitize_log(data.get("content", "")),
-                        },
+                        {"task_id": str(task_id), "log": sanitized},
                     )
+                    # Additionally buffer the line for batched cross-instance
+                    # relay so an operator whose viewer WebSocket landed on a
+                    # DIFFERENT Cloud Run instance also sees the live log. No-op
+                    # on single-instance / non-Postgres backends (the line is
+                    # already delivered locally above), so no double delivery.
+                    enqueue_agent_log(project_id, str(task_id), sanitized)
                 elif data.get("type") == "status":
                     # Optionally handle status updates via WS too
                     pass

@@ -453,6 +453,8 @@ export default function App() {
         onUpdateNotifyOnApprovalNeeded={s.setNotifyOnApprovalNeeded}
         soundOnComplete={s.soundOnComplete}
         onUpdateSoundOnComplete={s.setSoundOnComplete}
+        notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
+        onUpdateNotifyOnHighSignalMessage={s.setNotifyOnHighSignalMessage}
         onSetViewMode={s.setViewMode}
         showResearchBrowser={s.showResearchBrowser}
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
@@ -725,6 +727,7 @@ export default function App() {
           addToast={s.addToast}
           onMessageCountChange={handleMessageCountChange}
           onOpenTask={handleViewTask}
+          notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
         />
       ) : s.showArchive ? (
         <ArchiveView

@@ -8,6 +8,7 @@ import type { BuildConfig } from './index.js';
 import { formatProjectContext } from './prompts/project-context.js';
 import { isReadOnlyTaskType } from './taskCapabilities.js';
 import { parseBackendTimestamp } from './utils/time.js';
+import { SHELL_CMD_RE } from './shell-safety.js';
 
 // ── Re-exports from sub-modules (facade) ────────────────────────────────────
 // The bulky helpers have been split out into prompts/* modules so that small
@@ -1112,10 +1113,6 @@ function loadSrSectionScriptB64(): string {
 const BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
 const OWNER_REPO_RE = /^[A-Za-z0-9._-]+$/;
 const TASK_ID_RE = /^[A-Za-z0-9-]+$/;
-// build_config paths/commands/env values are emitted as single-quoted bash
-// literals; this allowlist rejects single quotes and every shell metacharacter
-// ($ ` ; & | < > ( ) newline ...), so no value can break out of its quoting.
-const SHELL_CMD_RE = /^[A-Za-z0-9 _./@:=,+-]+$/;
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 function validateCfgShellSafety(cfg: CodeChangeHelperConfig): void {

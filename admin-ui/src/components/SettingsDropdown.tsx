@@ -41,6 +41,8 @@ interface SettingsDropdownProps {
   onUpdateNotifyOnApprovalNeeded: (value: boolean) => void;
   soundOnComplete: boolean;
   onUpdateSoundOnComplete: (value: boolean) => void;
+  notifyOnHighSignalMessage: boolean;
+  onUpdateNotifyOnHighSignalMessage: (value: boolean) => void;
   // Existing
   maxConcurrentVMs: number;
   onUpdateMaxVMs: (value: number) => void;
@@ -298,6 +300,8 @@ export function SettingsDropdown({
   onUpdateNotifyOnApprovalNeeded,
   soundOnComplete,
   onUpdateSoundOnComplete,
+  notifyOnHighSignalMessage,
+  onUpdateNotifyOnHighSignalMessage,
   maxConcurrentVMs,
   onUpdateMaxVMs,
   maxRetries,
@@ -705,6 +709,13 @@ export function SettingsDropdown({
             <div className="flex items-center justify-between">
               <span className="text-xs text-neutral-400">Play sound on task completion</span>
               <Toggle enabled={soundOnComplete} onChange={onUpdateSoundOnComplete} />
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-neutral-400">Browser notification on high-signal message</span>
+              <Toggle enabled={notifyOnHighSignalMessage} onChange={v => {
+                if (v && 'Notification' in window && Notification.permission === 'default') Notification.requestPermission();
+                onUpdateNotifyOnHighSignalMessage(v);
+              }} />
             </div>
             <p className="text-[11px] text-neutral-600 pt-1">
               These are browser-only notifications. For external webhooks (Slack, PagerDuty, etc.), see the{' '}

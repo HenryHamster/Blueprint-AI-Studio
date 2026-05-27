@@ -53,6 +53,8 @@ export interface HeaderBarProps {
   onUpdateNotifyOnApprovalNeeded: (value: boolean) => void;
   soundOnComplete: boolean;
   onUpdateSoundOnComplete: (value: boolean) => void;
+  notifyOnHighSignalMessage: boolean;
+  onUpdateNotifyOnHighSignalMessage: (value: boolean) => void;
   maxRetries: number;
   maxAutonomousTasksPerHour: number;
   requireApprovalGates: boolean;
@@ -211,6 +213,8 @@ export function HeaderBar(props: HeaderBarProps) {
     onUpdateNotifyOnApprovalNeeded,
     soundOnComplete,
     onUpdateSoundOnComplete,
+    notifyOnHighSignalMessage,
+    onUpdateNotifyOnHighSignalMessage,
     maxRetries,
     maxAutonomousTasksPerHour,
     requireApprovalGates,
@@ -425,6 +429,8 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateNotifyOnApprovalNeeded={onUpdateNotifyOnApprovalNeeded}
           soundOnComplete={soundOnComplete}
           onUpdateSoundOnComplete={onUpdateSoundOnComplete}
+          notifyOnHighSignalMessage={notifyOnHighSignalMessage}
+          onUpdateNotifyOnHighSignalMessage={onUpdateNotifyOnHighSignalMessage}
           maxConcurrentVMs={maxConcurrentVMs}
           onUpdateMaxVMs={onUpdateMaxVMs}
           maxRetries={maxRetries}

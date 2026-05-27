@@ -2833,6 +2833,32 @@ describe('buildTypeCheckInstructions — lint scoping', () => {
     return re.test(s);
   };
 
+  it.each([
+    "svc$(whoami)`rm`;echo|cat&",
+    'svc;rm -rf /',
+    'svc|tee',
+    'svc&wait',
+    'svc`id`',
+  ])('rejects unsafe build_config path %s before emitting review instructions', async (maliciousPath) => {
+    const actualBuildConfig = await vi.importActual<typeof import('../build-config.js')>('../build-config.js');
+    const cfg = actualBuildConfig.resolveBuildConfig({
+      build_config: {
+        directories: [
+          {
+            path: maliciousPath,
+            type: 'python',
+            build_cmd: 'python -m build',
+          },
+        ],
+      },
+    });
+    expect(cfg).toBeUndefined();
+
+    const out = buildTypeCheckInstructions(cfg);
+    expect(out).not.toContain(maliciousPath);
+    expect(out).toContain('Build & Type Safety (MUST run these');
+  });
+
   it('ruff: keeps hardcoded --select E,F,W --ignore E501 override and strips trailing dot', () => {
     const out = buildTypeCheckInstructions(makeConfig('ruff check .'));
     expect(out).toContain('xargs -r python3 -m ruff check --select E,F,W --ignore E501');

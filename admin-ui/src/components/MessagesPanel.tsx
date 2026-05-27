@@ -75,6 +75,7 @@ interface MessagesPanelProps {
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onMessageCountChange?: (count: number) => void;
   onOpenTask?: (taskId: string) => void;
+  notifyOnHighSignalMessage?: boolean;
 }
 
 type MessagesPanelPrefs = { version: 1; routineExpanded: boolean; showResolved: boolean; criticalOnly: boolean };
@@ -252,7 +253,7 @@ async function postBackendLastSeen(projectId: string, timestamp: number): Promis
   } catch { /* ignore — localStorage already saved */ }
 }
 
-export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask }: MessagesPanelProps) {
+export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage }: MessagesPanelProps) {
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [loading, setLoading] = useState(true);
   // Compose
@@ -356,6 +357,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // Stable ref for addToast
   const addToastRef = useRef(addToast);
   addToastRef.current = addToast;
+  const notifyOnHighSignalMessageRef = useRef(notifyOnHighSignalMessage);
+  notifyOnHighSignalMessageRef.current = notifyOnHighSignalMessage;
 
   // Track seen messages to detect new arrivals and avoid initial-load toast spam
   const seenMessageIdsRef = useRef<Set<string>>(new Set());
@@ -859,6 +862,13 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
           // Use the highest severity among the new messages
           const toastSeverity = newHighSignal.some(m => getToastSeverity(m) === 'error') ? 'error' : 'info';
           addToastRef.current(summary, toastSeverity);
+
+          // Fire desktop notifications for each high-signal message when opted in
+          if (notifyOnHighSignalMessageRef.current && 'Notification' in window && Notification.permission === 'granted') {
+            for (const msg of newHighSignal) {
+              new Notification(msg.message_type, { body: msg.content.slice(0, 100) });
+            }
+          }
         }
       }
 

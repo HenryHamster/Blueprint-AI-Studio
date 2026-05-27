@@ -49,6 +49,7 @@ const formatCostPerHr = (value: unknown): [string, string] => [(value as number)
 const formatActiveVMs = (value: unknown): [string, string] => [String(value) + ' VMs', 'Active VMs'];
 const formatFailureRate = (value: unknown): [string, string] => [(value as number).toFixed(1) + '%', 'Failure Rate'];
 const makeLabelFormatter = (windowMs: number) => (ts: unknown) => formatTime(Number(ts), windowMs);
+const METRICS_EXPORT_FIELDS = ['timestamp', 'activeVMs', 'costPerHr', 'completedCount', 'failedCount'] as const;
 
 function formatTime(ts: number, windowMs?: number): string {
   const d = new Date(ts);
@@ -59,6 +60,21 @@ function formatTime(ts: number, windowMs?: number): string {
     return `${month}/${day} ${time}`;
   }
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function escapeCsv(value: string | number): string {
+  const text = String(value);
+  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function downloadText(filename: string, mimeType: string, text: string) {
+  const blob = new Blob([text], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 function NoDataMessage() {
@@ -442,11 +458,29 @@ export default function MetricsDashboard({
   }
 
   const cardClass = 'bg-neutral-900/50 border border-neutral-800/50 rounded-xl p-4';
+  const filteredMetrics = metricsHistory.filter((p) => p.timestamp >= now - windowMs);
+  const exportMetrics = (format: 'csv' | 'json') => {
+    const rows = filteredMetrics.map((p) => ({
+      timestamp: new Date(p.timestamp).toISOString(),
+      activeVMs: p.activeVMs,
+      costPerHr: p.costPerHr,
+      completedCount: p.completedCount,
+      failedCount: p.failedCount,
+    }));
+    const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
+    if (format === 'json') {
+      downloadText(`metrics-${metricsWindow}-${stamp}.json`, 'application/json', JSON.stringify(rows, null, 2));
+      return;
+    }
+    const csv = [METRICS_EXPORT_FIELDS.join(','), ...rows.map((row) => METRICS_EXPORT_FIELDS.map((field) => escapeCsv(row[field])).join(','))].join('\n');
+    downloadText(`metrics-${metricsWindow}-${stamp}.csv`, 'text/csv', csv);
+  };
 
   return (
     <div className="mb-6">
       {/* Window selector */}
-      <div className="flex flex-wrap items-center gap-1 mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+        <div className="flex flex-wrap items-center gap-1">
         {WINDOW_OPTIONS.map((w) => (
           // reason: time-window filter pill in compact metrics toolbar; py-1 is operator-density convention
           <button
@@ -462,6 +496,11 @@ export default function MetricsDashboard({
             {w}
           </button>
         ))}
+        </div>
+        <div className="flex items-center gap-1">
+          <button data-viewport-allow-small-target onClick={() => exportMetrics('csv')} className="px-3 py-1 rounded-full text-xs font-medium border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300">CSV</button>
+          <button data-viewport-allow-small-target onClick={() => exportMetrics('json')} className="px-3 py-1 rounded-full text-xs font-medium border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300">JSON</button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
