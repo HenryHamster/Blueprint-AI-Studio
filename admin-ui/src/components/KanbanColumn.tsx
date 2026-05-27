@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { Archive, ArrowDownUp, ChevronLeft, ChevronRight, GripVertical } from 'lucide-react';
 import {
   SortableContext,
@@ -292,6 +292,71 @@ export function ColumnSelectCheckbox({ columnTasks, selectedTaskIds, onBulkToggl
       className="w-4 h-4 accent-amber-400 cursor-pointer"
       title={allSelected ? 'Deselect all in column' : 'Select all in column'}
     />
+  );
+}
+
+export function ColumnArchiveButton({
+  taskIds,
+  columnLabel,
+  onArchiveColumn,
+  extraClassName,
+}: {
+  taskIds: string[];
+  columnLabel: string;
+  onArchiveColumn: (taskIds: string[], columnLabel: string) => void;
+  extraClassName?: string;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const [countdown, setCountdown] = useState(4);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, []);
+
+  const handleClick = () => {
+    if (confirming) {
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      setConfirming(false);
+      setCountdown(4);
+      if (taskIds.length > 10 && !window.confirm(`Archive all ${taskIds.length} ${columnLabel} tasks? This cannot be undone.`)) return;
+      onArchiveColumn(taskIds, columnLabel);
+    } else {
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      setConfirming(true);
+      setCountdown(4);
+      let remaining = 4;
+      intervalRef.current = setInterval(() => {
+        remaining -= 1;
+        setCountdown(remaining);
+        if (remaining <= 0 && intervalRef.current) clearInterval(intervalRef.current);
+      }, 1000);
+      timeoutRef.current = setTimeout(() => {
+        setConfirming(false);
+        setCountdown(4);
+      }, 4000);
+    }
+  };
+
+  const stateClass = confirming
+    ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30'
+    : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50';
+
+  return (
+    <button
+      data-viewport-allow-small-target
+      onClick={handleClick}
+      title={confirming ? `Archive ${taskIds.length} tasks? (${countdown}s)` : `Archive all ${columnLabel} tasks`}
+      className={`p-1 rounded transition-colors ${stateClass}${extraClassName ? ` ${extraClassName}` : ''}`}
+    >
+      <Archive className="w-3.5 h-3.5" />
+    </button>
   );
 }
 
@@ -589,14 +654,11 @@ export function KanbanColumn({
             <ArrowDownUp className="w-3 h-3" />
           </span>
           {isArchivable && columnTasks.length > 0 && (
-            // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
-            <button
-              onClick={() => onArchiveColumn(taskIds, col.label)}
-              title={`Archive all ${col.label} tasks`}
-              className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50 transition-colors"
-            >
-              <Archive className="w-3.5 h-3.5" />
-            </button>
+            <ColumnArchiveButton
+              taskIds={taskIds}
+              columnLabel={col.label}
+              onArchiveColumn={onArchiveColumn}
+            />
           )}
         </div>
 
@@ -630,14 +692,11 @@ export function KanbanColumn({
                   {columnTasks.length}
                 </span>
                 {isArchivable && columnTasks.length > 0 && (
-                  <button
-                    data-viewport-allow-small-target
-                    onClick={() => onArchiveColumn(taskIds, col.label)}
-                    title={`Archive all ${col.label} tasks`}
-                    className="p-1 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50 transition-colors"
-                  >
-                    <Archive className="w-3.5 h-3.5" />
-                  </button>
+                  <ColumnArchiveButton
+                    taskIds={taskIds}
+                    columnLabel={col.label}
+                    onArchiveColumn={onArchiveColumn}
+                  />
                 )}
               </div>
             </div>

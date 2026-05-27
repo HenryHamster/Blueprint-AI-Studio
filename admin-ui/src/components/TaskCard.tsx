@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import React, { useState, useEffect, useRef, memo, forwardRef } from 'react';
-import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers, Gauge, Compass, FileText, Copy } from 'lucide-react';
+import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers, Gauge, Compass, FileText, Copy, Check } from 'lucide-react';
 import { formatDurationMs, parseTimestamp } from '../utils/time';
 import { authGet, API_BASE_URL } from '../api';
 import { EXIT_REASON_COLORS } from '../utils/fixLoopColors';
@@ -574,6 +574,31 @@ export function StatusBadge({ status }: { status: TaskStatus }) {
   );
 }
 
+function ErrorLogsBlock({ errorLogs }: { errorLogs: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(errorLogs);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  return (
+    <div className="bg-red-950/30 text-red-400 text-[11px] p-2 rounded mb-2 border border-red-900/30 font-mono max-h-20 overflow-y-auto relative group">
+      {/* eslint-disable-next-line viewport/min-touch-target -- dense toolbar */}
+      <button
+        onClick={(e) => { e.stopPropagation(); handleCopy(); }}
+        className="absolute top-2 right-2 p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity bg-neutral-900/80 hover:bg-neutral-800 text-neutral-400 hover:text-emerald-400"
+        title="Copy full error logs"
+      >
+        {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+      </button>
+      <span className="font-semibold block mb-1 text-red-500 font-sans">Error:</span>
+      {errorLogs.slice(0, 500)}
+    </div>
+  );
+}
+
 function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   const subtasks = planOutput.subtasks as Record<string, unknown>[] | undefined;
   if (!subtasks) return null;
@@ -994,10 +1019,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       ) : null}
 
       {task.status === 'FAILED' && task.error_logs ? (
-        <div className="bg-red-950/30 text-red-400 text-[11px] p-2 rounded mb-2 border border-red-900/30 font-mono max-h-20 overflow-y-auto">
-          <span className="font-semibold block mb-1 text-red-500 font-sans">Error:</span>
-          {task.error_logs.slice(0, 500)}
-        </div>
+        <ErrorLogsBlock errorLogs={task.error_logs} />
       ) : null}
 
       {task.research_findings ? (

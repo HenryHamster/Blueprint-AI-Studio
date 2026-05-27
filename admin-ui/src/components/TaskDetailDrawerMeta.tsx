@@ -249,6 +249,32 @@ function SerialLogBlock({ log, taskId, vmInstanceId }: { log: string | null; tas
   );
 }
 
+function ErrorLogsPanel({ errorLogs }: { errorLogs: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(errorLogs);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  return (
+    <div className="relative group">
+      {/* eslint-disable-next-line viewport/min-touch-target -- dense drawer content */}
+      <button
+        onClick={handleCopy}
+        className="absolute top-3 right-3 z-10 p-1.5 rounded opacity-0 group-hover:opacity-100 transition-opacity bg-neutral-900/80 hover:bg-neutral-800 text-neutral-400 hover:text-emerald-400"
+        title="Copy full error logs"
+      >
+        {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+      </button>
+      <pre className="text-sm text-red-300 whitespace-pre-wrap break-words bg-red-950/20 rounded-lg p-3 max-h-96 overflow-y-auto custom-scrollbar border border-red-900/30 font-mono">
+        {errorLogs}
+      </pre>
+    </div>
+  );
+}
+
 function ToolTraceTail({ entries }: { entries: ToolTraceEntry[] }) {
   const tail = entries.slice(-30);
   const [expandedSet, setExpandedSet] = useState<Set<number>>(new Set());
@@ -1288,9 +1314,7 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
       {task.error_logs && (
         <>
           <SectionHeader>Error Logs</SectionHeader>
-          <pre className="text-sm text-red-300 whitespace-pre-wrap break-words bg-red-950/20 rounded-lg p-3 max-h-96 overflow-y-auto custom-scrollbar border border-red-900/30 font-mono">
-            {task.error_logs}
-          </pre>
+          <ErrorLogsPanel errorLogs={task.error_logs} />
         </>
       )}
 

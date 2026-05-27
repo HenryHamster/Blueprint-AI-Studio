@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ChevronRight, ExternalLink, RefreshCw } from 'lucide-react';
+import { ChevronRight, ExternalLink, EyeOff, RefreshCw, Wand2 } from 'lucide-react';
 import { timeAgo } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
 import type { Task } from '../types/task';
@@ -45,10 +45,12 @@ function SkeletonRow() {
   return <div className="animate-pulse bg-neutral-800/60 rounded h-10 w-full" />;
 }
 
-export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasProject, tasks, onViewTask, integrationBranch, promotionTarget }: { openPRs: OpenPR[]; loading: boolean; refreshing: boolean; onRefresh: () => void; hasProject: boolean; tasks: Task[]; onViewTask: (task: Task) => void; integrationBranch?: string | null; promotionTarget?: string | null }) {
+export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasProject, tasks, onViewTask, integrationBranch, promotionTarget, onSpawnFixTask }: { openPRs: OpenPR[]; loading: boolean; refreshing: boolean; onRefresh: () => void; hasProject: boolean; tasks: Task[]; onViewTask: (task: Task) => void; integrationBranch?: string | null; promotionTarget?: string | null; onSpawnFixTask?: (pr: OpenPR) => void }) {
   const [expanded, setExpanded] = useState(true);
+  const [dismissedPrs, setDismissedPrs] = useState<Set<number>>(() => new Set());
   const tasksById = React.useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks]);
   const busy = loading || refreshing;
+  const visiblePRs = React.useMemo(() => openPRs.filter(pr => !dismissedPrs.has(pr.pr_number)), [openPRs, dismissedPrs]);
 
   return (
     <section className="mt-4">
@@ -58,7 +60,7 @@ export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasP
           className="flex items-center justify-center gap-1.5 group min-h-11 px-2"
         >
           <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">Open PRs</h2>
-          <span className="text-[10px] text-neutral-500 font-mono">{openPRs.length}</span>
+          <span className="text-[10px] text-neutral-500 font-mono">{visiblePRs.length}</span>
           <ChevronRight className={`w-3 h-3 text-neutral-500 transition-transform ${expanded ? 'rotate-90' : ''}`} />
         </button>
         {hasProject && (
@@ -77,11 +79,11 @@ export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasP
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">Select a project</div>
         ) : loading ? (
           <div className="space-y-2"><SkeletonRow /><SkeletonRow /></div>
-        ) : openPRs.length === 0 ? (
+        ) : visiblePRs.length === 0 ? (
           <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 text-neutral-500 text-xs">No open PRs</div>
         ) : (
           <div className="space-y-1.5 max-h-[400px] overflow-y-auto custom-scrollbar">
-            {openPRs.map(pr => (
+            {visiblePRs.map(pr => (
               <div key={pr.pr_number} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2.5">
                 <div className="flex items-start gap-2">
                   <div className={`w-1.5 h-1.5 rounded-full mt-1.5 shrink-0 ${pr.is_orphaned ? 'bg-red-400' : 'bg-emerald-400'}`} />
@@ -136,11 +138,33 @@ export function PRMonitorSection({ openPRs, loading, refreshing, onRefresh, hasP
                       </div>
                     )}
                   </div>
-                  {pr.pr_url && isSafeUrl(pr.pr_url) && (
-                    <a href={pr.pr_url} target="_blank" rel="noopener noreferrer" className="text-neutral-500 hover:text-neutral-300 shrink-0">
-                      <ExternalLink className="w-3.5 h-3.5" />
-                    </a>
-                  )}
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    {pr.is_orphaned && onSpawnFixTask && (
+                      <button
+                        type="button"
+                        onClick={() => onSpawnFixTask(pr)}
+                        title="Spawn fix task"
+                        className="text-neutral-500 hover:text-neutral-300"
+                      >
+                        <Wand2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                    {pr.is_orphaned && (
+                      <button
+                        type="button"
+                        onClick={() => setDismissedPrs(prev => { const next = new Set(prev); next.add(pr.pr_number); return next; })}
+                        title="Dismiss until refresh"
+                        className="text-neutral-500 hover:text-neutral-300"
+                      >
+                        <EyeOff className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                    {pr.pr_url && isSafeUrl(pr.pr_url) && (
+                      <a href={pr.pr_url} target="_blank" rel="noopener noreferrer" className="text-neutral-500 hover:text-neutral-300">
+                        <ExternalLink className="w-3.5 h-3.5" />
+                      </a>
+                    )}
+                  </div>
                 </div>
               </div>
             ))}

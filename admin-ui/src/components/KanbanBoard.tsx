@@ -1,5 +1,5 @@
 import React, { useMemo, useState, useRef, useCallback, useEffect } from 'react';
-import { Archive, ArrowDownUp } from 'lucide-react';
+import { ArrowDownUp } from 'lucide-react';
 import {
   DndContext,
   closestCenter,
@@ -19,6 +19,7 @@ import {
   SortableCard,
   TaskItem,
   ColumnSelectCheckbox,
+  ColumnArchiveButton,
 } from './KanbanColumn';
 
 export type SortBy = TaskSortBy;
@@ -604,13 +605,12 @@ export function KanbanBoard({
                     {columnTasks.length}
                   </span>
                   {isArchivable && columnTasks.length > 0 && (
-                    <button
-                      onClick={() => onArchiveColumn(taskIds, col.label)}
-                      title={`Archive all ${col.label} tasks`}
-                      className="p-1 min-h-11 min-w-11 flex items-center justify-center rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50 transition-colors"
-                    >
-                      <Archive className="w-3.5 h-3.5" />
-                    </button>
+                    <ColumnArchiveButton
+                      taskIds={taskIds}
+                      columnLabel={col.label}
+                      onArchiveColumn={onArchiveColumn}
+                      extraClassName="min-h-11 min-w-11 flex items-center justify-center"
+                    />
                   )}
                 </div>
               </div>

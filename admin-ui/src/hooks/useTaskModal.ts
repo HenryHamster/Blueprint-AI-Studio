@@ -247,6 +247,39 @@ export function useTaskModal(
     }
   };
 
+  const openPrefilledTaskModal = ({
+    taskType,
+    title,
+    prompt,
+    prNumber,
+    prBranch,
+  }: {
+    taskType: UserLaunchableTaskType;
+    title: string;
+    prompt: string;
+    prNumber?: number | string;
+    prBranch?: string;
+  }) => {
+    const repo = getSelectedProjectRepo() || '';
+    setModalOpener('duplicate');
+    setShowNewTaskModal(true);
+    setNewTaskRepo(repo);
+    setNewTaskBranch(getDefaultTaskBranch() ?? '');
+    setNewTaskTitle(title);
+    setNewTaskPrompt(prompt);
+    setNewTaskType(taskType);
+    setNewTaskModel(getDefaultModelForType(taskType));
+    setNewTaskEffort(getDefaultEffortForType(taskType));
+    setNewTaskPrNumber(prNumber === undefined || prNumber === null ? '' : String(prNumber));
+    setNewTaskPrBranch(prBranch ?? '');
+    setUseManualRepo(false);
+    setUseManualBranch(false);
+    setBranchOptions([]);
+    setBranchError(null);
+    fetchRepoOptions();
+    if (repo) fetchBranchOptions(repo);
+  };
+
   const openDuplicateTaskModal = (task: Task) => {
     const payload = task.payloads?.[0] ?? {};
     const repo = (payload.github_repo as string) || '';
@@ -285,6 +318,6 @@ export function useTaskModal(
     setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
-    openNewTaskModal, openDuplicateTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
+    openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
   };
 }

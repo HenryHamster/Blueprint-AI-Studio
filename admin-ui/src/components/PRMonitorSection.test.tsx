@@ -284,6 +284,106 @@ describe('PRMonitorSection', () => {
     expect(rel).toContain('noreferrer');
   });
 
+  it('renders Spawn and Dismiss icon buttons only on orphaned rows', () => {
+    const orphan = makeOpenPR({ pr_number: 10, is_orphaned: true, tasks: [] });
+    const linked = makeOpenPR({
+      pr_number: 11,
+      is_orphaned: false,
+      tasks: [makeOpenPRTask({ task_id: 'task-x' })],
+    });
+    render(
+      <PRMonitorSection
+        {...baseProps}
+        openPRs={[orphan, linked]}
+        onSpawnFixTask={vi.fn()}
+      />,
+    );
+    // Each orphan row contributes one Spawn + one Dismiss button.
+    expect(screen.getAllByTitle('Spawn fix task')).toHaveLength(1);
+    expect(screen.getAllByTitle('Dismiss until refresh')).toHaveLength(1);
+  });
+
+  it('hides the Spawn button when onSpawnFixTask is omitted but still shows Dismiss', () => {
+    const orphan = makeOpenPR({ pr_number: 13, is_orphaned: true, tasks: [] });
+    render(<PRMonitorSection {...baseProps} openPRs={[orphan]} />);
+    expect(screen.queryByTitle('Spawn fix task')).toBeNull();
+    expect(screen.getByTitle('Dismiss until refresh')).toBeInTheDocument();
+  });
+
+  it('clicking Spawn invokes onSpawnFixTask with the full PR object', async () => {
+    const user = userEvent.setup();
+    const orphan = makeOpenPR({
+      pr_number: 42,
+      pr_title: 'Stuck orphan PR',
+      pr_url: 'https://github.com/acme/repo/pull/42',
+      pr_branch: 'fix/stuck',
+      is_orphaned: true,
+      tasks: [],
+    });
+    const onSpawnFixTask = vi.fn();
+    render(
+      <PRMonitorSection
+        {...baseProps}
+        openPRs={[orphan]}
+        onSpawnFixTask={onSpawnFixTask}
+      />,
+    );
+    await user.click(screen.getByTitle('Spawn fix task'));
+    expect(onSpawnFixTask).toHaveBeenCalledTimes(1);
+    expect(onSpawnFixTask).toHaveBeenCalledWith(orphan);
+  });
+
+  it('clicking Dismiss hides only that PR row and leaves the other rendered', async () => {
+    const user = userEvent.setup();
+    const a = makeOpenPR({ pr_number: 100, pr_title: 'Orphan A', is_orphaned: true, tasks: [] });
+    const b = makeOpenPR({ pr_number: 101, pr_title: 'Orphan B', is_orphaned: true, tasks: [] });
+    render(<PRMonitorSection {...baseProps} openPRs={[a, b]} />);
+    expect(screen.getByText('Orphan A')).toBeInTheDocument();
+    expect(screen.getByText('Orphan B')).toBeInTheDocument();
+
+    const dismissButtons = screen.getAllByTitle('Dismiss until refresh');
+    await user.click(dismissButtons[0]);
+
+    expect(screen.queryByText('Orphan A')).toBeNull();
+    expect(screen.getByText('Orphan B')).toBeInTheDocument();
+  });
+
+  it('dismiss state persists across parent re-renders with the same openPRs (only remount resets it)', async () => {
+    const user = userEvent.setup();
+    const a = makeOpenPR({ pr_number: 200, pr_title: 'Orphan persist A', is_orphaned: true, tasks: [] });
+    const b = makeOpenPR({ pr_number: 201, pr_title: 'Orphan persist B', is_orphaned: true, tasks: [] });
+    const { rerender, unmount } = render(<PRMonitorSection {...baseProps} openPRs={[a, b]} />);
+
+    await user.click(screen.getAllByTitle('Dismiss until refresh')[0]);
+    expect(screen.queryByText('Orphan persist A')).toBeNull();
+
+    // Re-render with the same openPRs list — dismiss state must NOT reset.
+    rerender(<PRMonitorSection {...baseProps} openPRs={[a, b]} />);
+    expect(screen.queryByText('Orphan persist A')).toBeNull();
+    expect(screen.getByText('Orphan persist B')).toBeInTheDocument();
+
+    // Real remount (simulating a page reload) restores the dismissed row.
+    unmount();
+    render(<PRMonitorSection {...baseProps} openPRs={[a, b]} />);
+    expect(screen.getByText('Orphan persist A')).toBeInTheDocument();
+    expect(screen.getByText('Orphan persist B')).toBeInTheDocument();
+  });
+
+  it('header count reflects visible (non-dismissed) PR count', async () => {
+    const user = userEvent.setup();
+    const a = makeOpenPR({ pr_number: 300, pr_title: 'Count A', is_orphaned: true, tasks: [] });
+    const b = makeOpenPR({ pr_number: 301, pr_title: 'Count B', is_orphaned: true, tasks: [] });
+    const { container } = render(<PRMonitorSection {...baseProps} openPRs={[a, b]} />);
+    const header = screen.getByRole('heading', { name: 'Open PRs' });
+    // Count badge sits adjacent to the heading.
+    const countSpan = header.parentElement?.querySelector('span.font-mono');
+    expect(countSpan?.textContent).toBe('2');
+
+    await user.click(screen.getAllByTitle('Dismiss until refresh')[0]);
+    expect(countSpan?.textContent).toBe('1');
+    expect(container.querySelector('span.font-mono')?.textContent).toBe('1');
+  });
+
   it('does not render an anchor for an unsafe javascript: pr_url', () => {
     const pr = makeOpenPR({ pr_url: 'javascript:alert(1)' });
     const { container } = render(

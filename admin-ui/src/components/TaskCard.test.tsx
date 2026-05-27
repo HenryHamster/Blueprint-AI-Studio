@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { TaskCard } from './TaskCard';
@@ -466,5 +466,70 @@ describe('TaskCard SrDivergenceBadge', () => {
     render(<TaskCard task={task} {...baseProps} />);
     const badge = screen.getByText('SR missed performance');
     expect(badge).toHaveAttribute('title', expect.stringContaining('all divergences'));
+  });
+});
+
+describe('TaskCard error logs copy', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('renders error logs when status is FAILED and error_logs exist', () => {
+    const errorText = 'This is a test error log';
+    const task = makeTask({
+      status: 'FAILED',
+      error_logs: errorText,
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText(errorText.slice(0, 500))).toBeInTheDocument();
+  });
+
+  it('does not render error logs when status is not FAILED', () => {
+    const task = makeTask({
+      status: 'COMPLETED',
+      error_logs: 'This should not be shown',
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.queryByText(/This should not be shown/)).toBeNull();
+  });
+
+  it('displays copy button on error logs block', () => {
+    const task = makeTask({
+      status: 'FAILED',
+      error_logs: 'test error',
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByTitle('Copy full error logs')).toBeInTheDocument();
+  });
+
+  it('copies full error logs to clipboard on button click', async () => {
+    const user = userEvent.setup();
+    const fullErrorLog = 'a'.repeat(600); // Longer than 500 char truncation
+    const task = makeTask({
+      status: 'FAILED',
+      error_logs: fullErrorLog,
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    const copyButton = screen.getByTitle('Copy full error logs');
+    await user.click(copyButton);
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(fullErrorLog);
+  });
+
+  it('prevents event propagation when copy button is clicked', async () => {
+    const user = userEvent.setup();
+    const task = makeTask({
+      status: 'FAILED',
+      error_logs: 'test error',
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    const copyButton = screen.getByTitle('Copy full error logs');
+    // Verify the button was clickable and clipboard was called
+    await user.click(copyButton);
+    expect(navigator.clipboard.writeText).toHaveBeenCalled();
   });
 });

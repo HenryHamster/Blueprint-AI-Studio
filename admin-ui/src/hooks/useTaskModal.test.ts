@@ -446,6 +446,72 @@ describe('useTaskModal', () => {
     expect(result.current.getDefaultModelForType('create')).toBe('claude-haiku-4-5');
   });
 
+  // --- openPrefilledTaskModal ---
+
+  it('openPrefilledTaskModal sets task type, title, prompt, prNumber, and prBranch', async () => {
+    const selectedProjectRepoRef = { current: 'owner/repo' };
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }, undefined, selectedProjectRepoRef),
+    );
+    await act(async () => {
+      result.current.openPrefilledTaskModal({
+        taskType: 'fix',
+        title: 'Stuck orphan PR',
+        prompt: 'PR #42 is open but has no active task — investigate. PR: https://github.com/acme/repo/pull/42',
+        prNumber: 42,
+        prBranch: 'fix/stuck',
+      });
+    });
+    expect(result.current.showNewTaskModal).toBe(true);
+    expect(result.current.newTaskType).toBe('fix');
+    expect(result.current.newTaskTitle).toBe('Stuck orphan PR');
+    expect(result.current.newTaskPrompt).toContain('#42');
+    expect(result.current.newTaskPrompt).toContain('https://github.com/acme/repo/pull/42');
+    expect(result.current.newTaskPrNumber).toBe('42');
+    expect(result.current.newTaskPrBranch).toBe('fix/stuck');
+    expect(result.current.newTaskRepo).toBe('owner/repo');
+  });
+
+  it('openPrefilledTaskModal does NOT autosave the prefilled title/prompt as a draft', async () => {
+    const selectedProjectRepoRef = { current: 'owner/repo' };
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }, undefined, selectedProjectRepoRef),
+    );
+    await act(async () => {
+      result.current.openPrefilledTaskModal({
+        taskType: 'fix',
+        title: 'Prefilled title — should not clobber draft',
+        prompt: 'Prefilled prompt — should not clobber draft',
+      });
+    });
+    // Wait past the 500ms debounce window for draft autosave.
+    await new Promise(r => setTimeout(r, 700));
+    expect(localStorage.getItem('blueprint-admin:draft:owner/repo:title')).toBeNull();
+    expect(localStorage.getItem('blueprint-admin:draft:owner/repo:prompt')).toBeNull();
+  });
+
+  it('openPrefilledTaskModal triggers fetchRepoOptions (and branches when repo is available)', async () => {
+    const selectedProjectRepoRef = { current: 'owner/repo' };
+    mockAuthGet.mockClear();
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }, undefined, selectedProjectRepoRef),
+    );
+    await act(async () => {
+      result.current.openPrefilledTaskModal({
+        taskType: 'fix',
+        title: 't',
+        prompt: 'p',
+        prNumber: 1,
+        prBranch: 'fix/x',
+      });
+    });
+    await waitFor(() => {
+      const urls = mockAuthGet.mock.calls.map(c => String(c[0]));
+      expect(urls.some(u => u.includes('/api/admin/github/repos'))).toBe(true);
+      expect(urls.some(u => u.includes('/api/admin/github/branches'))).toBe(true);
+    });
+  });
+
   it('getDefaultEffortForType reads effort from localStorage', () => {
     localStorage.setItem(
       'blueprint-admin:taskTypeEffort:research',
