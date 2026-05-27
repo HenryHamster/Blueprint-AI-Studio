@@ -177,6 +177,31 @@ class TestComputeCompositeHardBlockers:
         # audit_missing — NOT test_file_deleted.
         assert result["blocker"] == "audit_missing"
 
+    def test_parseable_but_unscoreable_audit_forces_zero(self):
+        """Malformed findings are blocked the same way as an unusable audit."""
+        audit_score, test_erosion = rq._score_audit(
+            {
+                "audit_score": 0.95,
+                "findings": [{"description": "missing severity"}],
+                "test_erosion": {
+                    "deleted_test_files": [],
+                    "assertion_delta": 0,
+                    "test_count_delta": 0,
+                },
+            }
+        )
+        assert audit_score is None
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=audit_score,
+            test_erosion=test_erosion,
+            smoketest_score=1.0,
+            policy=_POLICY,
+        )
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+        assert result["blocker"] == "audit_missing"
+
     def test_blocker_precedence_ci_first(self):
         """When multiple blockers fire, ci_not_green is reported first."""
         result = rq.compute_composite(
@@ -695,6 +720,24 @@ class TestScoreAudit:
         audit, erosion = rq._score_audit(report)
         # derived from findings (empty) → 1.0; reported 0.85 is observability only
         assert audit == pytest.approx(1.0)
+        assert erosion == pytest.approx(1.0)
+
+    def test_parseable_but_unscoreable_returns_none_audit_score(self):
+        """Findings with no severity/level are treated as an unusable audit signal."""
+        report = {
+            "audit_score": 0.95,
+            "findings": [
+                {"description": "Some issue without severity."},
+                "plain-text finding with no structured severity",
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        }
+        audit, erosion = rq._score_audit(report)
+        assert audit is None
         assert erosion == pytest.approx(1.0)
 
     def test_findings_deducted_correctly(self):
@@ -3336,6 +3379,57 @@ class TestFinalizeInfraFailure:
 
         assert result["status"] == "infra_failure"
         assert result["error"] == "audit_report_missing"
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_audit_completed_parseable_but_unscoreable_reclassified_as_infra_failure(
+        self, db_session
+    ):
+        """Structured but unscorable audit findings are infra_failure, not a verdict."""
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={
+                "audit_score": 0.95,
+                "findings": [
+                    {"description": "missing severity"},
+                    "plain-text finding with no structured severity",
+                ],
+                "test_erosion": {
+                    "deleted_test_files": [],
+                    "assertion_delta": 0,
+                    "test_count_delta": 0,
+                },
+            },
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "smoke-c", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_report_parseable_but_unscoreable"
+
+        await db_session.refresh(version)
+        assert version.last_qualification["status"] == "infra_failure"
+        assert (
+            version.last_qualification["error"]
+            == "audit_report_parseable_but_unscoreable"
+        )
 
         count = (
             await db_session.execute(

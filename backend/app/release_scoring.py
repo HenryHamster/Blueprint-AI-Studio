@@ -248,19 +248,25 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
                 if sev:
                     derived -= _AUDIT_DEDUCTIONS.get(sev, _AUDIT_DEDUCTION_UNKNOWN)
     derived = _clamp01(derived)
-
-    # Observability: log when the model's self-reported score diverges materially.
-    raw_audit = report.get("audit_score")
-    if isinstance(raw_audit, (int, float)) and not isinstance(raw_audit, bool):
-        reported = _clamp01(raw_audit)
-        if abs(derived - reported) > 0.10:
-            logger.warning(
-                "[RELEASE_QUALIFIER] audit_score drift: derived=%.3f reported=%.3f"
-                " (delta=%.3f) — findings-derived score is authoritative",
-                derived,
-                reported,
-                abs(derived - reported),
-            )
+    missing_reason = _audit_missing_reason(report)
+    audit_score: float | None = derived
+    if missing_reason == "parseable_but_unscoreable":
+        # The report parsed, but no findings entry carried a usable severity.
+        # Treat that as an unusable audit signal instead of a clean 1.0.
+        audit_score = None
+    else:
+        # Observability: log when the model's self-reported score diverges materially.
+        raw_audit = report.get("audit_score")
+        if isinstance(raw_audit, (int, float)) and not isinstance(raw_audit, bool):
+            reported = _clamp01(raw_audit)
+            if abs(derived - reported) > 0.10:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] audit_score drift: derived=%.3f reported=%.3f"
+                    " (delta=%.3f) — findings-derived score is authoritative",
+                    derived,
+                    reported,
+                    abs(derived - reported),
+                )
 
     # Prefer computed_test_erosion (deterministic git-diff computation, authoritative)
     # over the LLM's self-reported test_erosion.  Fall back to test_erosion when
@@ -291,12 +297,12 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
 
     if not isinstance(erosion, dict):
         # No test-erosion block — assume neutral (no erosion detected).
-        return derived, 1.0
+        return audit_score, 1.0
 
     deleted = erosion.get("deleted_test_files")
     if isinstance(deleted, list) and len(deleted) > 0:
         # Hard blocker — any deleted test file forces a non-promote.
-        return derived, None
+        return audit_score, None
 
     # Graded penalty for net assertion / test-count reduction.  Each negative
     # delta knocks the score down; positive deltas leave it at the ceiling.
@@ -309,7 +315,7 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
     if isinstance(assertion_delta, (int, float)) and assertion_delta < 0:
         # 0.02 penalty per net-removed assertion, capped.
         score -= min(0.3, abs(float(assertion_delta)) * 0.02)
-    return derived, _clamp01(score)
+    return audit_score, _clamp01(score)
 
 
 def _audit_missing_reason(report: dict[str, Any] | None) -> str | None:

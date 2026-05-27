@@ -245,6 +245,10 @@ async def _finalize_qualification(
     # the binding constraint, is opaque to the loop.
     audit_findings = rq._extract_audit_findings(audit_report)
     audit_missing_reason = rq._audit_missing_reason(audit_report)
+    if audit_missing_reason == "parseable_but_unscoreable":
+        return await rq._handle_infra_failure(
+            session, version, qual, "audit_report_parseable_but_unscoreable"
+        )
 
     # --- Read the smoketest result -----------------------------------------
     # Audit H3: only when the smoketest subsystem was enabled — a disabled run

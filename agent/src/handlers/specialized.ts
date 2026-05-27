@@ -496,10 +496,11 @@ ${DEFAULT_TOOL_GUIDANCE}`;
       ...(!passed ? { failure_category: 'claude_code_failed' } : {}),
     });
   } else {
+    const smoketestUnparseable = exitCode === 0;
     await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
       logs: sanitize(allOutput.slice(-10_000)),
-      failure_category: matchesRateLimit(allOutput) ? 'rate_limited' : 'claude_code_failed',
+      failure_category: matchesRateLimit(allOutput) ? 'rate_limited' : (smoketestUnparseable ? 'smoketest_result_unparseable' : 'claude_code_failed'),
     });
   }
 }
