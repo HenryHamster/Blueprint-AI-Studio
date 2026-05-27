@@ -1,6 +1,6 @@
 {
   "_doc": "Per-component and project-wide caps on viewport escape-hatch debt. Read by viewport-coverage.test.ts (checkEscapeHatchBudget). Re-baselined 2026-05-22: each cap is set to the component's then-current actual opt-out count plus 1 (single-opt-out headroom). This removes dead slack that accumulated as debt was paid down -- it is NOT lowering caps below current usage to force refactoring. Policy: one justified opt-out in a component passes without a bump; a cluster of new opt-outs requires a visible, reviewable budget increase in the same PR. Bump 'total' alongside any per-component increase.",
-  "total": 228,
+  "total": 230,
   "perComponent": {
     "DirectionCard": 22,
     "CatchUpPanel": 1,
@@ -18,7 +18,7 @@
     "DesignDocViewer": 5,
     "KanbanColumn": 5,
     "ProblemModelEditor": 4,
-    "ProjectBuildConfigSection": 4,
+    "ProjectBuildConfigSection": 6,
     "ProviderCategoriesPanel": 5,
     "ProviderModelBreakdownPanel": 5,
     "SrTrendBreakdown": 5,

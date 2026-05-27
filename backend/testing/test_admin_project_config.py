@@ -1049,3 +1049,90 @@ async def test_patch_build_config_empty_stale_prefixes_preserved(
     bc = project.build_config or {}
     assert "stale_branch_prefixes" in bc
     assert bc["stale_branch_prefixes"] == []
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_get_staging_branch_prefixes_defaults(client: AsyncClient, project_owner):
+    """GET /staging-branch-prefixes returns the Blueprint defaults when unset."""
+    project = project_owner
+    resp = await client.get(f"/api/admin/projects/{project.id}/staging-branch-prefixes")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["project_id"] == str(project.id)
+    assert data["staging_branch_prefixes"] == ["research/", "plan/"]
+    assert data["is_default"] is True
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_staging_branch_prefixes_round_trip(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH then GET returns custom prefixes and is_default=False."""
+    project = project_owner
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/staging-branch-prefixes",
+        json={"staging_branch_prefixes": ["feature/", "exp/"]},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["staging_branch_prefixes"] == ["feature/", "exp/"]
+    assert data["is_default"] is False
+
+    await db_session.refresh(project)
+    assert (project.build_config or {}).get("staging_branch_prefixes") == [
+        "feature/",
+        "exp/",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_patch_staging_branch_prefixes_revert_to_default(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH with null reverts to global default and removes the build_config key."""
+    project = project_owner
+    project.build_config = {"staging_branch_prefixes": ["feature/"]}
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/staging-branch-prefixes",
+        json={"staging_branch_prefixes": None},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["staging_branch_prefixes"] == ["research/", "plan/"]
+    assert data["is_default"] is True
+
+    await db_session.refresh(project)
+    assert "staging_branch_prefixes" not in (project.build_config or {})
+
+
+@pytest.mark.asyncio
+async def test_patch_staging_branch_prefixes_rejects_empty_entry(
+    client: AsyncClient, project_owner
+):
+    """PATCH rejects a list containing an empty or whitespace-only string."""
+    project = project_owner
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/staging-branch-prefixes",
+        json={"staging_branch_prefixes": ["feature/", ""]},
+    )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_patch_staging_branch_prefixes_trims_whitespace(
+    client: AsyncClient, db_session, project_owner
+):
+    """PATCH trims leading/trailing whitespace from each prefix entry."""
+    project = project_owner
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/staging-branch-prefixes",
+        json={"staging_branch_prefixes": ["  feature/  ", "exp/"]},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["staging_branch_prefixes"] == ["feature/", "exp/"]

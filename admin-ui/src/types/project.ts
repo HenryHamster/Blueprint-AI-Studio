@@ -41,6 +41,12 @@ export interface BuildConfig {
   task_branch_namespace?: string;
   task_branch_prefix?: string;
   pr_title_prefix?: string;
+  staging_branch_prefixes?: string[] | null;
+}
+
+export interface StagingBranchPrefixesConfig {
+  staging_branch_prefixes: string[];
+  is_default: boolean;
 }
 
 export interface Project {

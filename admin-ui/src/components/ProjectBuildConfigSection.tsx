@@ -76,6 +76,9 @@ export function ProjectBuildConfigSection({
   const [prTitlePrefix, setPrTitlePrefix] = useState(
     buildConfig?.pr_title_prefix ?? ''
   );
+  const [stagingPrefixes, setStagingPrefixes] = useState<string[]>([]);
+  const [stagingPrefixesIsDefault, setStagingPrefixesIsDefault] = useState(true);
+  const [stagingPrefixesSaving, setStagingPrefixesSaving] = useState(false);
   const [saving, setSaving] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [srTargets, setSrTargets] = useState<Record<string, number>>({});
@@ -95,6 +98,18 @@ export function ProjectBuildConfigSection({
     setPrTitlePrefix(buildConfig?.pr_title_prefix ?? preserved?.prTitlePrefix ?? '');
     preservedBranchOnDetect.current = null;
   }, [buildConfig]);
+
+  // Load staging-branch-prefixes from the dedicated endpoint
+  useEffect(() => {
+    if (!projectId) { setStagingPrefixes([]); setStagingPrefixesIsDefault(true); return; }
+    apiFetch(`/api/admin/projects/${projectId}/staging-branch-prefixes`)
+      .then(r => r.json())
+      .then((resp: { staging_branch_prefixes: string[]; is_default: boolean }) => {
+        setStagingPrefixes(resp.staging_branch_prefixes);
+        setStagingPrefixesIsDefault(resp.is_default);
+      })
+      .catch(() => {});
+  }, [projectId]);
 
   // Load SR catch-rate targets from the project when projectId changes
   useEffect(() => {
@@ -131,6 +146,39 @@ export function ProjectBuildConfigSection({
       }
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleSaveStagingPrefixes = async () => {
+    if (!projectId) return;
+    const trimmed = stagingPrefixes.map(p => p.trim()).filter(Boolean);
+    setStagingPrefixesSaving(true);
+    try {
+      const resp = await apiFetch(`/api/admin/projects/${projectId}/staging-branch-prefixes`, {
+        method: 'PATCH',
+        body: JSON.stringify({ staging_branch_prefixes: trimmed }),
+      });
+      const data = await resp.json();
+      setStagingPrefixes(data.staging_branch_prefixes);
+      setStagingPrefixesIsDefault(data.is_default);
+    } finally {
+      setStagingPrefixesSaving(false);
+    }
+  };
+
+  const handleRevertStagingPrefixes = async () => {
+    if (!projectId) return;
+    setStagingPrefixesSaving(true);
+    try {
+      const resp = await apiFetch(`/api/admin/projects/${projectId}/staging-branch-prefixes`, {
+        method: 'PATCH',
+        body: JSON.stringify({ staging_branch_prefixes: null }),
+      });
+      const data = await resp.json();
+      setStagingPrefixes(data.staging_branch_prefixes);
+      setStagingPrefixesIsDefault(data.is_default);
+    } finally {
+      setStagingPrefixesSaving(false);
     }
   };
 
@@ -469,6 +517,72 @@ export function ProjectBuildConfigSection({
                 Legacy override. Leave blank to derive from namespace.
               </p>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Staging Branch Prefixes */}
+      {hasConfig && projectId && (
+        <div>
+          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Staging Branch Prefixes</h3>
+          <p className="text-[11px] text-neutral-600 mb-3">
+            Branch prefixes Blueprint treats as staging branches. Gates rollup and auto-merge routing. Defaults to <code className="font-mono text-neutral-400">research/</code> and <code className="font-mono text-neutral-400">plan/</code>.
+          </p>
+          <div className="flex items-center gap-2 mb-3">
+            {stagingPrefixesIsDefault ? (
+              <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-500 border border-neutral-700">global default</span>
+            ) : (
+              <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-cyan-950/40 text-cyan-400 border border-cyan-900/50">override</span>
+            )}
+          </div>
+          <div className="space-y-2 mb-3">
+            {stagingPrefixes.map((prefix, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={prefix}
+                  onChange={e => setStagingPrefixes(prev => prev.map((p, j) => j === i ? e.target.value : p))}
+                  placeholder="research/"
+                  className="flex-1 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                />
+                {/* reason: inline icon-only remove button in dense prefix list */}
+                <button
+                  data-viewport-allow-small-target
+                  onClick={() => setStagingPrefixes(prev => prev.filter((_, j) => j !== i))}
+                  className="text-neutral-600 hover:text-red-400 transition-colors shrink-0"
+                  title="Remove prefix"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+          {/* reason: inline text link to add prefix; text-xs single-line button in config section */}
+          <button
+            data-viewport-allow-small-target
+            onClick={() => setStagingPrefixes(prev => [...prev, ''])}
+            className="flex items-center gap-1.5 text-xs text-neutral-500 hover:text-neutral-300 transition-colors mb-4"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            Add prefix
+          </button>
+          <div className="flex items-center gap-3 flex-wrap">
+            {!stagingPrefixesIsDefault && (
+              <button
+                onClick={handleRevertStagingPrefixes}
+                disabled={stagingPrefixesSaving}
+                className="inline-flex items-center justify-center min-h-[44px] bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded-lg px-4 py-2 text-xs transition-colors disabled:opacity-50"
+              >
+                {stagingPrefixesSaving ? 'Reverting...' : 'Revert to default'}
+              </button>
+            )}
+            <button
+              onClick={handleSaveStagingPrefixes}
+              disabled={stagingPrefixesSaving || stagingPrefixes.length === 0 || stagingPrefixes.some(p => !p.trim())}
+              className="inline-flex items-center justify-center min-h-[44px] bg-neutral-700 hover:bg-neutral-600 text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50 ml-auto"
+            >
+              {stagingPrefixesSaving ? 'Saving...' : 'Save Staging Prefixes'}
+            </button>
           </div>
         </div>
       )}

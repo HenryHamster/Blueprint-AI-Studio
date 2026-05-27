@@ -784,6 +784,95 @@ async def update_task_branch_prefix_config(
 
 
 # ---------------------------------------------------------------------------
+# Staging-branch-prefixes config endpoints
+# ---------------------------------------------------------------------------
+
+_DEFAULT_STAGING_BRANCH_PREFIXES = ["research/", "plan/"]
+
+
+def _get_staging_branch_prefixes(project) -> list[str]:
+    configured = (project.build_config or {}).get("staging_branch_prefixes")
+    if configured is not None:
+        prefixes = [str(p).strip() for p in configured if str(p).strip()]
+        if prefixes:
+            return prefixes
+    return list(_DEFAULT_STAGING_BRANCH_PREFIXES)
+
+
+@router.get("/projects/{project_id}/staging-branch-prefixes")
+async def get_staging_branch_prefixes_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the per-project staging-branch prefixes (gates rollup/auto-merge routing)."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    return {
+        "project_id": str(project_id),
+        "staging_branch_prefixes": _get_staging_branch_prefixes(project),
+        "is_default": not _build_config_has_key(project, "staging_branch_prefixes"),
+    }
+
+
+@router.patch("/projects/{project_id}/staging-branch-prefixes")
+async def update_staging_branch_prefixes_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Set the per-project staging-branch prefixes. Pass null to revert to the global default."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if "staging_branch_prefixes" not in body:
+        raise HTTPException(
+            status_code=422,
+            detail="Request body must include 'staging_branch_prefixes'",
+        )
+
+    prefixes = body["staging_branch_prefixes"]
+    if prefixes is not None:
+        if not isinstance(prefixes, list):
+            raise HTTPException(
+                status_code=422,
+                detail="'staging_branch_prefixes' must be a list of strings or null",
+            )
+        trimmed = [p.strip() if isinstance(p, str) else None for p in prefixes]
+        if any(p is None or not p for p in trimmed):
+            raise HTTPException(
+                status_code=422,
+                detail="'staging_branch_prefixes' must not contain empty or whitespace-only entries",
+            )
+        if not trimmed:
+            raise HTTPException(
+                status_code=422,
+                detail="'staging_branch_prefixes' must contain at least one prefix",
+            )
+        prefixes = trimmed
+
+    project = await lock_project_or_429(session, project_id)
+    build_config = dict(project.build_config or {})
+    if prefixes is None:
+        build_config.pop("staging_branch_prefixes", None)
+    else:
+        build_config["staging_branch_prefixes"] = prefixes
+    project.build_config = build_config
+    flag_modified(project, "build_config")
+    session.add(project)
+    await session.commit()
+
+    return {
+        "project_id": str(project_id),
+        "staging_branch_prefixes": _get_staging_branch_prefixes(project),
+        "is_default": not _build_config_has_key(project, "staging_branch_prefixes"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Broadcast-limit config endpoints
 # ---------------------------------------------------------------------------
 

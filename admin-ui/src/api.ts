@@ -974,3 +974,29 @@ export async function fetchRecentFindings(
   if (!res.ok) throw new Error(`Failed to fetch recent findings: ${res.status}`);
   return res.json();
 }
+
+export interface StagingBranchPrefixesResponse {
+  project_id: string;
+  staging_branch_prefixes: string[];
+  is_default: boolean;
+}
+
+export async function fetchStagingBranchPrefixes(
+  projectId: string,
+): Promise<StagingBranchPrefixesResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/staging-branch-prefixes`);
+  if (!res.ok) throw new Error(`Failed to fetch staging branch prefixes: ${res.status}`);
+  return res.json();
+}
+
+export async function updateStagingBranchPrefixes(
+  projectId: string,
+  prefixes: string[] | null,
+): Promise<StagingBranchPrefixesResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/staging-branch-prefixes`,
+    { method: 'PATCH', body: JSON.stringify({ staging_branch_prefixes: prefixes }) },
+  );
+  if (!res.ok) throw new Error(`Failed to update staging branch prefixes: ${res.status}`);
+  return res.json();
+}
