@@ -743,6 +743,23 @@ export interface AuditReconciliation {
   excluded_findings_count: number;
 }
 
+export interface AuditFinding {
+  severity: string;
+  summary: string;
+}
+
+export interface LatestAudit {
+  audit_task_id: string;
+  task_status: string;
+  candidate_sha: string | null;
+  created_at: string | null;
+  report: {
+    findings?: AuditFinding[];
+    audit_score?: number | null;
+    test_erosion?: number | null;
+  } | null;
+}
+
 export interface VersionQualification {
   status: QualificationStatus | null;
   confidence: number | null;
@@ -770,6 +787,7 @@ export interface CurrentVersion {
   qualification_attempts: number;
   merged_task_count: number;
   last_qualification: VersionQualification | null;
+  latest_audit?: LatestAudit | null;
 }
 
 export interface RecentVersion {

@@ -81,6 +81,25 @@ let versionLifecycleResponse: unknown = {
       error: null,
       consecutive_infra_errors: 0,
       audit_missing_reason: null,
+      audit_reconciliation: {
+        model_reported_score: 0.85,
+        findings_derived_score: 0.70,
+        score_delta: 0.15,
+        excluded_findings_count: 1,
+      },
+    },
+    latest_audit: {
+      audit_task_id: 'audit-task-1',
+      task_status: 'COMPLETED',
+      candidate_sha: 'abcdef1234567890',
+      created_at: '2026-05-20T10:30:00Z',
+      report: {
+        audit_score: 0.70,
+        findings: [
+          { severity: 'high', summary: 'Token stored in source code without encryption.' },
+          { severity: 'medium', summary: 'Missing input validation on user-supplied field.' },
+        ],
+      },
     },
   },
   recent_versions: [

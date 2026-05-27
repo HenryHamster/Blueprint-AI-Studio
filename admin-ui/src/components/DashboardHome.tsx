@@ -10,7 +10,7 @@ import {
   Search,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { apiFetch, fetchQualificationVerdicts, fetchSrUnhandledEdgesRetrospectives, setVersionPhase, triggerQualify, type CiResolution, type PromptFingerprintAnalyticsResponse, type QualificationVerdictRecord, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
+import { apiFetch, fetchQualificationVerdicts, fetchSrUnhandledEdgesRetrospectives, setVersionPhase, triggerQualify, type AuditFinding, type AuditReconciliation, type CiResolution, type LatestAudit, type PromptFingerprintAnalyticsResponse, type QualificationVerdictRecord, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import { timeAgo, formatDurationSec } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
@@ -465,6 +465,74 @@ const AUDIT_MISSING_REASON_LABELS: Record<string, string> = {
   parseable_but_unscoreable: 'audit findings present but missing severity tags',
 };
 
+const FINDING_SEVERITY_STYLE: Record<string, string> = {
+  critical: 'bg-red-500/10 text-red-400 border-red-500/20',
+  high: 'bg-orange-500/10 text-orange-400 border-orange-500/20',
+  medium: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+  low: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
+};
+const FINDING_SEVERITY_ORDER = ['critical', 'high', 'medium', 'low'];
+
+function AuditFindingsList({ audit }: { audit: LatestAudit }) {
+  if (!audit.report) {
+    return (
+      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20">
+        audit crashed — no report
+      </span>
+    );
+  }
+  const findings: AuditFinding[] = audit.report.findings ?? [];
+  if (findings.length === 0) {
+    return <span className="text-[10px] text-neutral-500 italic">audit: no findings</span>;
+  }
+  const sorted = [...findings].sort((a, b) => {
+    const ai = FINDING_SEVERITY_ORDER.indexOf(a.severity?.toLowerCase() ?? '');
+    const bi = FINDING_SEVERITY_ORDER.indexOf(b.severity?.toLowerCase() ?? '');
+    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+  });
+  return (
+    <div className="space-y-0.5">
+      <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Audit Findings</p>
+      {sorted.map((f, i) => (
+        <div key={i} className={`flex items-start gap-1.5 text-[10px] px-1.5 py-0.5 rounded border ${FINDING_SEVERITY_STYLE[f.severity?.toLowerCase() ?? ''] ?? 'bg-neutral-800/50 text-neutral-400 border-neutral-700/50'}`}>
+          <span className="font-semibold shrink-0">{f.severity ?? '?'}</span>
+          <span>{f.summary}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AuditReconciliationRow({ rec }: { rec: AuditReconciliation }) {
+  const hasDivergence = rec.score_delta != null && rec.score_delta >= 0.1;
+  return (
+    <div className="flex flex-wrap gap-1.5 items-center pt-0.5">
+      <span className="text-[10px] text-neutral-600 shrink-0">reconciliation:</span>
+      {rec.model_reported_score != null && (
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
+          model {Math.round(rec.model_reported_score * 100)}%
+        </span>
+      )}
+      {rec.findings_derived_score != null && (
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
+          findings {Math.round(rec.findings_derived_score * 100)}%
+        </span>
+      )}
+      {rec.score_delta != null && (
+        <span className={`text-[10px] px-1.5 py-0.5 rounded border font-mono ${hasDivergence ? 'bg-amber-950/40 text-amber-400 border-amber-900/50' : 'bg-neutral-800 text-neutral-500 border-neutral-700'}`}>
+          δ {Math.round(rec.score_delta * 100)}%
+        </span>
+      )}
+      {rec.excluded_findings_count > 0 && (
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-500 border border-amber-900/50">
+          {rec.excluded_findings_count} finding{rec.excluded_findings_count !== 1 ? 's' : ''} excluded
+        </span>
+      )}
+    </div>
+  );
+}
+
+
 function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadiness | null | undefined }) {
   if (!readiness) return null;
   const { ready, reason, verdicts_evaluated, would_promote_rate, consecutive_clean_passes, recurring_blockers } = readiness;
@@ -609,6 +677,14 @@ function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: 
                     )}
                   </div>
                 )}
+                {cv.last_qualification.audit_reconciliation && (
+                  <AuditReconciliationRow rec={cv.last_qualification.audit_reconciliation} />
+                )}
+              </div>
+            )}
+            {cv.latest_audit && (
+              <div className="pl-2 border-l border-neutral-700/50">
+                <AuditFindingsList audit={cv.latest_audit} />
               </div>
             )}
             {projectId && (

@@ -751,6 +751,7 @@ if admin_ui_runtime_touched; then
       MISSING_VIEWPORT_TESTS=()
       while IFS= read -r comp; do
         [ -z "$comp" ] && continue
+        [ ! -f "$comp" ] && continue
         [ -f "\${comp%.tsx}.viewport.test.tsx" ] && continue
         basename "$comp" .tsx | grep -qE '^[a-z]' && continue
         grep -q '@viewport-test-exempt' "$comp" 2>/dev/null && continue
