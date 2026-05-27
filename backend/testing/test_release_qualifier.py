@@ -3219,20 +3219,17 @@ class TestFinalizeInfraFailure:
         assert readiness["verdicts_evaluated"] == 0
 
     @pytest.mark.asyncio
-    async def test_audit_completed_no_report_still_records_verdict(self, db_session):
-        """A COMPLETED audit task whose report is absent or unparseable routes
-        through the normal compute_composite path (audit_missing quality blocker)
-        — the existing 'quality verdict' code, NOT the new infra-failure path.
-        Preserves existing behaviour: a COMPLETED child with a missing artifact
-        is still a real quality blocker (the agent ran but produced no output)."""
-        from app import shared_state
-
-        shared_state.runtime_config["promotion_enabled"] = True
-
+    async def test_audit_completed_no_report_reclassified_as_infra_failure(
+        self, db_session
+    ):
+        """A COMPLETED audit task whose RELEASE_AUDIT_REPORT artifact is absent
+        is now reclassified as infra_failure — the agent ran but emitted no
+        usable output.  No QualificationVerdict row is written; the operator
+        notification is 'release_infra_failure', not 'release_blocked'."""
         project, version = await _make_project_and_version(db_session)
-        # Both children COMPLETED but NO artifacts seeded — the audit produced
-        # no report, which is a quality blocker, not an infra failure.
-        await _seed_infra_failure_children(
+        # Both children COMPLETED but NO artifacts seeded — audit produced
+        # no report, which is an infra failure (defense-in-depth path).
+        audit_task, _ = await _seed_infra_failure_children(
             db_session,
             project,
             version,
@@ -3244,11 +3241,11 @@ class TestFinalizeInfraFailure:
         result = await rq._finalize_qualification(db_session, version)
         await db_session.commit()
 
-        # Routes to the quality path: audit_missing (or smoketest_startup_failed
-        # since smoketest also has no artifact).  Either way, a verdict IS recorded.
-        assert result["status"] in ("not_promoted", "dry_run")
+        # Reclassified as infra_failure, not a quality verdict.
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_report_missing"
 
-        # A QualificationVerdict row was written — quality verdict, not infra error.
+        # NO QualificationVerdict row written — infra failure, not quality blocker.
         count = (
             await db_session.execute(
                 select(sa_func.count()).where(
@@ -3256,7 +3253,49 @@ class TestFinalizeInfraFailure:
                 )
             )
         ).scalar()
-        assert count == 1
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_audit_completed_unparseable_artifact_reclassified_as_infra_failure(
+        self, db_session
+    ):
+        """A COMPLETED audit task whose RELEASE_AUDIT_REPORT artifact contains
+        non-JSON logs (unparseable) is reclassified as infra_failure — distinct
+        regression test from the 'no artifact row' sub-case above."""
+        project, version = await _make_project_and_version(db_session)
+        audit_task, _ = await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.COMPLETED,
+            smoke_status=TaskStatus.COMPLETED,
+            smoketest_enabled=True,
+        )
+        # Seed a RELEASE_AUDIT_REPORT artifact with non-JSON content.
+        db_session.add(
+            Artifact(
+                task_id=audit_task.id,
+                artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+                logs="this is not valid json {{{{",
+            )
+        )
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_report_missing"
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
 
     @pytest.mark.asyncio
     async def test_consecutive_infra_errors_backstop_fires_alert(self, db_session):

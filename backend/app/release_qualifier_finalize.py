@@ -136,9 +136,10 @@ async def _finalize_qualification(
     # broke (agent VM crash, timeout, clone failure) — NOT a quality finding.
     # Route these to _handle_infra_failure BEFORE reading artifacts so the
     # quality-verdict path only sees COMPLETED children.  A COMPLETED child
-    # whose artifact is absent or unparseable still routes through the normal
-    # compute_composite path (audit_missing quality blocker — the real report
-    # was expected but absent, which is a candidate-scoring concern, not infra).
+    # whose artifact is absent or unparseable is also an infrastructure failure
+    # (the agent ran but emitted no usable output) — checked after artifact
+    # reading below.
+    _audit_task_obj: Task | None = None
     if audit_task_id:
         try:
             _audit_task_obj = await session.get(Task, uuid.UUID(str(audit_task_id)))
@@ -196,6 +197,22 @@ async def _finalize_qualification(
                 audit_task_id,
                 version.version_number,
             )
+    # Defense-in-depth: a COMPLETED audit task whose RELEASE_AUDIT_REPORT
+    # artifact is absent or unparseable is an infrastructure failure — the
+    # agent ran but produced no usable output.  Route to _handle_infra_failure
+    # so the operator notification is "release_infra_failure" (not
+    # "release_blocked / audit_missing"), and no QualificationVerdict row is
+    # written.
+    if (
+        audit_report is None
+        and audit_task_id
+        and _audit_task_obj is not None
+        and _audit_task_obj.status == TaskStatus.COMPLETED
+    ):
+        return await rq._handle_infra_failure(
+            session, version, qual, "audit_report_missing"
+        )
+
     audit_score, test_erosion_score = rq._score_audit(audit_report)
     # Carry the findings (not just the score) into last_qualification so the
     # strategic agent can target them — otherwise the audit sub-score, usually

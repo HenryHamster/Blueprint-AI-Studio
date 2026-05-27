@@ -1401,6 +1401,23 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
     expect(stored.test_erosion.assertion_delta).toBe(9);
     expect(stored.test_erosion.test_count_delta).toBe(2);
   });
+
+  it('fails loudly with release_audit_report_unparseable when the report cannot be parsed', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: 'no json object here',
+      lastResultText: 'raw tail fallback text',
+    });
+
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.artifact_type).toBe('ERROR_LOG');
+    expect(call.failure_category).toBe('release_audit_report_unparseable');
+    expect(call.logs).toContain('raw tail fallback text');
+  });
 });
 
 // ── resolveCandidateSha — payload/context SHA resolution + validation ─────────

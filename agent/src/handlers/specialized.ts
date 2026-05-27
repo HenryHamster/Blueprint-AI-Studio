@@ -1309,6 +1309,7 @@ Rules:
     : handlerOutput;
 
   let logs = '';
+  let releaseAuditUnparseable = false;
   if (enrichedOutput !== null) {
     logs = sanitize(JSON.stringify(enrichedOutput));
   } else {
@@ -1320,6 +1321,7 @@ Rules:
         : objExtract.value;
       logs = sanitize(JSON.stringify(enrichedExtracted));
     } else {
+      releaseAuditUnparseable = exitCode === 0;
       sendLog(ws, `[WARNING] Could not extract release audit JSON: ${describeJsonExtractionResult(objExtract)}\n`);
       logs = sanitize(lastResultText || allOutput.slice(-50_000));
     }
@@ -1327,8 +1329,12 @@ Rules:
 
   await persistAndPostStatus(taskId, {
     task_id: taskId,
-    status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
-    ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG', failure_category: 'claude_code_failed' } : { artifact_type: 'RELEASE_AUDIT_REPORT' }),
+    status: releaseAuditUnparseable || exitCode !== 0 ? 'FAILED' : 'COMPLETED',
+    ...(releaseAuditUnparseable
+      ? { artifact_type: 'ERROR_LOG', failure_category: 'release_audit_report_unparseable' }
+      : exitCode !== 0
+        ? { artifact_type: 'ERROR_LOG', failure_category: 'claude_code_failed' }
+        : { artifact_type: 'RELEASE_AUDIT_REPORT' }),
     logs,
   });
 }
