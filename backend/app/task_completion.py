@@ -67,12 +67,9 @@ from app.broadcast import broadcast_to_project
 from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX, STRATEGIC_RATIONALE_MAX
 from app.time_utils import _utcnow
 from app.task_locking import with_design_doc_locked, with_directions_locked
+from app.vm_cost_rates import get_vm_rate_per_second
 
 logger = logging.getLogger(__name__)
-
-# VM cost rates ($/sec) — mirror admin.py to avoid cross-module import
-_SPOT_RATE_PER_SEC = 0.020 / 3600
-_ON_DEMAND_RATE_PER_SEC = 0.067 / 3600
 
 # Shared marker used by both the TypeScript agent handler (review-fix.ts
 # buildBlueprintPrFooter) and this Python helper so either side can update
@@ -128,7 +125,7 @@ def _estimated_task_cost_usd(task: Task) -> Optional[float]:
     """Return the VM cost for a task, or None when timing data is incomplete."""
     if not task.vm_provisioned_at or not task.vm_stopped_at:
         return None
-    rate = _SPOT_RATE_PER_SEC if task.vm_spot else _ON_DEMAND_RATE_PER_SEC
+    rate = get_vm_rate_per_second(spot=task.vm_spot)
     return (task.vm_stopped_at - task.vm_provisioned_at).total_seconds() * rate
 
 

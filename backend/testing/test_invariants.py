@@ -1386,6 +1386,52 @@ class TestFrontendSizeGuardrails:
         self._check_frontend("components/TaskDurationWidget.tsx")
 
 
+# ── LLM Token Pricing Coverage ──────────────────────────────────────────────
+
+
+class TestLLMTokenPricingCoverage:
+    """Verify that every selectable LLM model has a pricing entry.
+
+    Selectable models are those advertised in each provider's settings_schema
+    model enum plus the values returned by tier_to_model() for each tier
+    (opus, sonnet, haiku with empty runtime_config).
+
+    This test guards against silent drift: when a provider adds/rotates a model,
+    operators can select it immediately, but if it's missing from LLM_TOKEN_PRICING,
+    tasks run on it contribute $0 to LLM cost and are flagged `priced: false` in
+    the cost breakdown — drifting the efficiency axes silently until the pricing
+    table is updated.
+    """
+
+    def test_all_selectable_models_have_pricing(self):
+        """Every model in get_all_selectable_models() must have an entry in
+        LLM_TOKEN_PRICING, keyed by (provider_name_lower, model_lower).
+        """
+        from app.efficiency_snapshot import LLM_TOKEN_PRICING
+        from app.providers.registry import get_all_selectable_models
+
+        selectable = get_all_selectable_models()
+        # selectable is {provider_name_str: frozenset[model_str]}
+
+        priced_keys = set(LLM_TOKEN_PRICING.keys())
+        missing = []
+
+        for provider_name, models in selectable.items():
+            for model in models:
+                key = (provider_name.lower(), model.lower())
+                if key not in priced_keys:
+                    missing.append(f"{provider_name}:{model}")
+
+        assert not missing, (
+            "Selectable models missing from LLM_TOKEN_PRICING:\n  "
+            + "\n  ".join(sorted(missing))
+            + "\n\nAdd entries to LLM_TOKEN_PRICING in backend/app/efficiency_snapshot.py "
+            "for each missing (provider, model) combo. Source rates from official "
+            "provider pricing pages; preview/beta models without published rates "
+            "should be priced at the closest GA-tier equivalent with a clarifying comment."
+        )
+
+
 # ── Failure Classification Taxonomy ────────────────────────────────────────
 
 
@@ -3011,4 +3057,68 @@ class TestBuildConfigSchemaCoverage:
             "BuildConfig schema (they will be silently stripped on save):\n"
             + "\n".join(f"  - {k}" for k in sorted(undeclared))
             + "\n\nAdd each missing key to BuildConfig in backend/app/schemas.py."
+        )
+
+
+class TestVmCostRateConsolidation:
+    """Verify that VM cost rates are centralized and used consistently across consumers."""
+
+    def test_all_consumers_resolve_same_rate(self) -> None:
+        """All modules derive ON_DEMAND_RATE and SPOT_RATE from the same source."""
+        from app.vm_cost_rates import VM_COST_RATES, get_vm_rate_per_second
+        from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+
+        expected_on_demand = VM_COST_RATES["e2-standard-2"][0] / 3600
+        expected_spot = VM_COST_RATES["e2-standard-2"][1] / 3600
+
+        assert ON_DEMAND_RATE == expected_on_demand, (
+            f"admin_analytics ON_DEMAND_RATE ({ON_DEMAND_RATE}) does not match "
+            f"vm_cost_rates source ({expected_on_demand})"
+        )
+        assert SPOT_RATE == expected_spot, (
+            f"admin_analytics SPOT_RATE ({SPOT_RATE}) does not match "
+            f"vm_cost_rates source ({expected_spot})"
+        )
+
+        on_demand_from_func = get_vm_rate_per_second(spot=False)
+        spot_from_func = get_vm_rate_per_second(spot=True)
+
+        assert on_demand_from_func == expected_on_demand, (
+            f"get_vm_rate_per_second(spot=False) ({on_demand_from_func}) does not match "
+            f"expected rate ({expected_on_demand})"
+        )
+        assert spot_from_func == expected_spot, (
+            f"get_vm_rate_per_second(spot=True) ({spot_from_func}) does not match "
+            f"expected rate ({expected_spot})"
+        )
+
+    def test_default_machine_type_has_rate_entry(self) -> None:
+        """The configured default machine type must have a rate entry."""
+        from app.compute import MACHINE_TYPE
+        from app.vm_cost_rates import VM_COST_RATES
+
+        assert MACHINE_TYPE in VM_COST_RATES, (
+            f"Default MACHINE_TYPE '{MACHINE_TYPE}' is not in VM_COST_RATES. "
+            "Configured machine type must have an associated cost rate. "
+            "Add the rate to VM_COST_RATES in backend/app/vm_cost_rates.py."
+        )
+
+    def test_unknown_machine_type_falls_back_to_default(self) -> None:
+        """Unknown machine types should fall back to e2-standard-2, not silently yield zero cost."""
+        from app.vm_cost_rates import get_vm_rate_per_second, VM_COST_RATES
+
+        unknown_type = "unknown-machine-type"
+        expected_rate = VM_COST_RATES["e2-standard-2"][0] / 3600
+
+        rate = get_vm_rate_per_second(machine_type=unknown_type, spot=False)
+        assert rate == expected_rate, (
+            f"Unknown machine type '{unknown_type}' should fall back to "
+            f"e2-standard-2 rate ({expected_rate}), got {rate}"
+        )
+
+        unknown_spot = get_vm_rate_per_second(machine_type=unknown_type, spot=True)
+        expected_spot = VM_COST_RATES["e2-standard-2"][1] / 3600
+        assert unknown_spot == expected_spot, (
+            f"Unknown machine type '{unknown_type}' spot rate should fall back to "
+            f"e2-standard-2 spot rate ({expected_spot}), got {unknown_spot}"
         )

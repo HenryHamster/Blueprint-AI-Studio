@@ -24,6 +24,11 @@ from app.models import (
     _utcnow,
 )
 from app.auth import get_current_user, require_admin
+from app.vm_cost_rates import get_vm_rate_per_second, VM_COST_RATES
+
+# Re-export for test and internal use (single source of truth is vm_cost_rates)
+ON_DEMAND_RATE = VM_COST_RATES["e2-standard-2"][0] / 3600  # $/sec
+SPOT_RATE = VM_COST_RATES["e2-standard-2"][1] / 3600  # $/sec
 
 logger = logging.getLogger(__name__)
 
@@ -58,9 +63,6 @@ def _derive_completed_at(t: "Task") -> datetime:
             pass
     return _strip_tz(t.created_at)
 
-
-ON_DEMAND_RATE = 0.067 / 3600  # $/sec
-SPOT_RATE = 0.020 / 3600  # $/sec
 
 _TASK_COST_WINDOW_MS: Dict[str, int] = {
     "15m": 15 * 60 * 1000,
@@ -231,7 +233,7 @@ def _task_estimated_cost_usd(task: Task) -> float | None:
     """Return the VM cost for a task, or None when timing data is incomplete."""
     if not task.vm_provisioned_at or not task.vm_stopped_at:
         return None
-    rate = SPOT_RATE if task.vm_spot else ON_DEMAND_RATE
+    rate = get_vm_rate_per_second(spot=task.vm_spot)
     return (task.vm_stopped_at - task.vm_provisioned_at).total_seconds() * rate
 
 

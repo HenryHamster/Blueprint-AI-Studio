@@ -33,8 +33,12 @@ from app.admin import _get_user_project_with_role
 from app.auth import get_current_user
 from app.database import get_session
 from app.models import Project, Task, TaskStatus, _utcnow
-from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+from app.vm_cost_rates import VM_COST_RATES
 from app.task_locking import project_lock
+
+# VM cost rates are sourced from vm_cost_rates.py for e2-standard-2
+ON_DEMAND_RATE = VM_COST_RATES["e2-standard-2"][0] / 3600  # per second
+SPOT_RATE = VM_COST_RATES["e2-standard-2"][1] / 3600
 
 router = APIRouter()
 
@@ -104,10 +108,21 @@ LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
     ("openai", "gpt-5.4"): (5e-6, 25e-6),
     ("openai", "gpt-5.4-mini"): (0.5e-6, 2e-6),
     ("openai", "gpt-5.3-codex"): (3e-6, 12e-6),
-    # Gemini (ai.google.dev/gemini-api/docs/pricing, 2026-05)
+    # gpt-5.3-codex-spark is ChatGPT-Pro-only with no separately published API
+    # rate; priced at the gpt-5.3-codex rate as the closest GA equivalent
+    # (openai.com/api/pricing, 2026-05).
+    ("openai", "gpt-5.3-codex-spark"): (3e-6, 12e-6),
+    # gpt-5.2 pre-dates the 5.3 generation (openai.com/api/pricing, 2026-05).
+    ("openai", "gpt-5.2"): (2e-6, 8e-6),
+    # Gemini GA models (ai.google.dev/gemini-api/docs/pricing, 2026-05)
     ("gemini", "gemini-2.5-pro"): (1.25e-6, 10e-6),
     ("gemini", "gemini-2.5-flash"): (0.30e-6, 2.5e-6),
     ("gemini", "gemini-2.5-flash-lite"): (0.10e-6, 0.40e-6),
+    # Gemini 3.x previews have no separately published rate; priced at the
+    # closest GA-tier equivalent (ai.google.dev/gemini-api/docs/pricing, 2026-05).
+    ("gemini", "gemini-3.1-pro-preview"): (1.25e-6, 10e-6),
+    ("gemini", "gemini-3-flash-preview"): (0.30e-6, 2.5e-6),
+    ("gemini", "gemini-3.1-flash-lite-preview"): (0.10e-6, 0.40e-6),
 }
 
 DESIGN_DOC_KEY = "efficiency_baseline"
@@ -601,6 +616,14 @@ async def write_snapshot(
             if baseline.get("_schema_version") == 3:
                 baseline[AXIS_LLM_COST_PER_MERGED_PR] = None
                 baseline["_schema_version"] = 4
+            # One-time migration: baselines captured before pricing was added for
+            # gpt-5.3-codex-spark, gpt-5.2, and the Gemini 3.x preview models
+            # (schema_version 4) may be silently zero for tasks on those models.
+            # Clear llm_cost_per_merged_pr so it re-seeds with the now-complete
+            # pricing table.
+            if baseline.get("_schema_version") == 4:
+                baseline[AXIS_LLM_COST_PER_MERGED_PR] = None
+                baseline["_schema_version"] = 5
             # Re-seed any individual axes that were cleared (e.g. by the migration
             # above) once a valid current value is available.
             for axis in ALL_AXES:

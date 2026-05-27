@@ -289,8 +289,10 @@ async def test_write_snapshot_migrates_stale_cold_start_baseline(db_session):
     # Old stale value must be gone; re-seeded from the new snapshot.
     assert baseline[AXIS_VM_COLD_START_P50_MS] != stale_cold_start
     assert baseline[AXIS_VM_COLD_START_P50_MS] == 15000.0
-    # Migration marker applied — a v0 baseline chains to the current head (v4).
-    assert baseline["_schema_version"] == 4
+    # Migration marker applied — a v0 baseline chains through all migrations to current head (v5).
+    # v0 → v1 (cold-start), v1 → v2 (review-iterations), v2 → v3 (cold-start dispatch fix),
+    # v3 → v4 (llm cost init), v4 → v5 (pricing table additions).
+    assert baseline["_schema_version"] == 5
     # Other baseline axes must not be clobbered.
     assert baseline[AXIS_COST_PER_MERGED_PR] == 0.01
 
@@ -370,8 +372,8 @@ async def test_write_snapshot_migrates_cold_start_baseline_v2_to_v3(db_session):
     # Stale provision-confirm-anchored value must be gone; re-seeded from new snapshot.
     assert baseline[AXIS_VM_COLD_START_P50_MS] != stale_cold_start
     assert baseline[AXIS_VM_COLD_START_P50_MS] == 25000.0
-    # Schema migrated to v4.
-    assert baseline["_schema_version"] == 4
+    # Schema migrated: v2 → v3 (tested here) plus v3 → v4, v4 → v5 (auto-chained).
+    assert baseline["_schema_version"] == 5
     # Other baseline axes must not be clobbered.
     assert baseline[AXIS_COST_PER_MERGED_PR] == 0.05
 
@@ -696,8 +698,9 @@ async def test_write_snapshot_migrates_review_iterations_baseline(db_session):
     # Stale value replaced by the corrected snapshot value.
     assert baseline[AXIS_MEDIAN_REVIEW_ITERATIONS] != 4.0
     assert baseline[AXIS_MEDIAN_REVIEW_ITERATIONS] == 2.0
-    # v1 chains through v2 (review-iterations), v3 (cold-start dispatch fix), and v4 (llm cost).
-    assert baseline["_schema_version"] == 4
+    # v1 chains through v2 (review-iterations), v3 (cold-start dispatch fix),
+    # v4 (llm cost init), and v5 (pricing table additions).
+    assert baseline["_schema_version"] == 5
     # Other axes must not be clobbered.
     assert baseline[AXIS_COST_PER_MERGED_PR] == 0.01
 
@@ -989,7 +992,12 @@ async def test_llm_token_pricing_no_token_data(db_session):
 @pytest.mark.asyncio
 async def test_schema_version_v3_migrates_llm_axis(db_session):
     """Existing baseline at schema_version=3 gets llm_cost_per_merged_pr cleared
-    and re-seeded, then bumped to schema_version=4."""
+    and re-seeded, then bumped to schema_version=5 (via v4 intermediate).
+
+    v3→v4: Clear stale llm_cost_per_merged_pr (before it was measured).
+    v4→v5: Clear llm_cost_per_merged_pr again due to pricing table additions
+            (gpt-5.3-codex-spark, gpt-5.2, Gemini 3.x preview models).
+    """
     project = make_project(
         design_doc={
             DESIGN_DOC_KEY: {
@@ -1034,8 +1042,8 @@ async def test_schema_version_v3_migrates_llm_axis(db_session):
     assert baseline[AXIS_LLM_COST_PER_MERGED_PR] != 9999.0
     expected = round(2000 * input_rate + 1000 * output_rate, 6)
     assert baseline[AXIS_LLM_COST_PER_MERGED_PR] == expected
-    # Schema bumped to v4.
-    assert baseline["_schema_version"] == 4
+    # Schema bumped to v5 (v3 → v4 for llm cost, v4 → v5 for pricing table additions).
+    assert baseline["_schema_version"] == 5
     # Other axes untouched.
     assert baseline[AXIS_COST_PER_MERGED_PR] == 0.03
 

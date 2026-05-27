@@ -30,6 +30,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import Task, TaskStatus, _utcnow
+from app.vm_cost_rates import get_vm_rate_per_second
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +153,7 @@ async def _post_merge_summary(
     _prov_at = getattr(task, "vm_provisioned_at", None)
     _stop_at = getattr(task, "vm_stopped_at", None)
     if _prov_at and _stop_at:
-        _rate = (0.020 if getattr(task, "vm_spot", False) else 0.067) / 3600
+        _rate = get_vm_rate_per_second(spot=getattr(task, "vm_spot", False))
         cost_usd = (_stop_at - _prov_at).total_seconds() * _rate
 
     type_scope = f"{task_type} / {scope}" if scope else task_type

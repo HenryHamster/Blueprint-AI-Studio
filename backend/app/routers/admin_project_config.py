@@ -33,6 +33,7 @@ from app.shared_state import (
     get_project_promotion_target,
     get_project_task_branch_namespace,
 )
+from app.vm_cost_rates import VM_COST_RATES
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +50,9 @@ async def cost_summary(
     days: int = Query(7, ge=1, le=365),
     current_user: dict = Depends(require_admin),
 ):
-    # e2-standard-2 pricing: ~$0.067/hr on-demand, ~$0.020/hr spot
-    ON_DEMAND_RATE = 0.067 / 3600  # per second
-    SPOT_RATE = 0.020 / 3600
+    # VM cost rates are sourced from vm_cost_rates.py for e2-standard-2
+    ON_DEMAND_RATE = VM_COST_RATES["e2-standard-2"][0] / 3600  # per second
+    SPOT_RATE = VM_COST_RATES["e2-standard-2"][1] / 3600
 
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
     duration_seconds = func.extract(
