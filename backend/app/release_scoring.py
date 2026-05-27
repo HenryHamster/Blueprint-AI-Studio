@@ -213,6 +213,31 @@ _AUDIT_DEDUCTIONS: dict[str, float] = {
 # Fallback deduction for any non-empty severity label not listed above.
 _AUDIT_DEDUCTION_UNKNOWN: float = 0.02
 
+# Severities that require a substantive verification_note before the deduction
+# is applied.  Low/info findings are cheap enough to trust without explicit
+# substantiation; everything else (medium/moderate/warning/high/critical/blocker)
+# carries real deduction weight and must be confirmed against the full repo.
+_SEVERITIES_REQUIRING_VERIFICATION: frozenset[str] = frozenset(
+    {"critical", "blocker", "high", "medium", "moderate", "warning"}
+)
+
+
+def _finding_is_verified(f: dict, sev: str) -> bool:
+    """Return True when the finding may be counted toward the audit deduction.
+
+    Low/info findings are always counted.  For higher-severity findings the
+    reviewer must have read the relevant unchanged files and recorded the
+    supporting evidence in ``verification_note`` (≥ 20 non-whitespace chars).
+    Findings that fail this check are silently excluded from the score so
+    diff-only speculation cannot suppress the audit sub-score.
+    """
+    if sev not in _SEVERITIES_REQUIRING_VERIFICATION:
+        return True
+    note = f.get("verification_note", "")
+    if not isinstance(note, str):
+        return False
+    return sum(1 for c in note if not c.isspace()) >= 20
+
 
 def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | None]:
     """Derive ``(audit_score, test_erosion_score)`` from a RELEASE_AUDIT_REPORT.
@@ -245,7 +270,7 @@ def _score_audit(report: dict[str, Any] | None) -> tuple[float | None, float | N
         for f in findings:
             if isinstance(f, dict):
                 sev = str(f.get("severity") or f.get("level") or "").lower()
-                if sev:
+                if sev and _finding_is_verified(f, sev):
                     derived -= _AUDIT_DEDUCTIONS.get(sev, _AUDIT_DEDUCTION_UNKNOWN)
     derived = _clamp01(derived)
     missing_reason = _audit_missing_reason(report)

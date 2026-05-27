@@ -105,7 +105,7 @@ def _serialize_sr_catch_rate_trends(sr_trends: Dict[str, Any]) -> Dict[str, Any]
     computed_at_str = sr_trends.get("computed_at")
     if computed_at_str:
         try:
-            computed_at_dt = datetime.fromisoformat(computed_at_str)
+            computed_at_dt = _to_naive_utc(datetime.fromisoformat(computed_at_str))
             is_stale = computed_at_dt < datetime.utcnow() - timedelta(
                 days=_SR_TREND_STALENESS_DAYS
             )

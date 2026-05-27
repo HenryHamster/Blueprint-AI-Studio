@@ -1380,6 +1380,63 @@ async def test_agent_token_rejected_when_task_terminal_status(
 
 
 @pytest.mark.asyncio
+async def test_agent_jwt_rejected_cold_deny_list(
+    client: AsyncClient, db_session, monkeypatch, caplog
+):
+    """DB proof path rejects terminal-task JWTs even when the in-memory deny-list is empty.
+
+    Simulates a cold instance (rolling deploy) where _terminated_task_ids has never been
+    populated. The DB status check at routers/agent.py:361-379 must still reject the request.
+    """
+    import app.routers.agent as agent_router
+    from app.routers.agent import _terminated_task_ids
+
+    project = Project(name="Cold Deny List Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-cold",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id = str(task.id)
+    vm_instance_id = "agent-vm-cold"
+    token = create_agent_token(task_id, vm_instance_id)
+
+    # Simulate cold instance: deny-list is completely empty (not just missing this entry)
+    monkeypatch.setattr(agent_router, "_terminated_task_ids", {})
+    caplog.set_level(logging.INFO)
+
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json=_agent_auth_body("heartbeat", task_id, vm_instance_id),
+        headers={"x-agent-token": token},
+    )
+
+    # DB proof path must reject even with a cold deny-list
+    assert resp.status_code == 401
+    detail = resp.json().get("detail") or resp.json().get("error", {}).get("message")
+    assert detail == "Task is no longer active"
+    _assert_agent_auth_reject_log(
+        caplog,
+        reason="deny_list_hit_non_idempotent_path",
+        path="/api/agent/heartbeat",
+        task_id=task_id,
+        token_vm_instance_id=vm_instance_id,
+    )
+
+    # Restore the real dict so other tests are not affected
+    monkeypatch.setattr(agent_router, "_terminated_task_ids", _terminated_task_ids)
+
+
+@pytest.mark.asyncio
 async def test_agent_idempotent_path_enforces_freshness(
     client: AsyncClient, db_session, caplog
 ):

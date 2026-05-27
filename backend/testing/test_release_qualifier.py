@@ -749,11 +749,13 @@ class TestScoreAudit:
                     "severity": "high",
                     "summary": "Token in source.",
                     "file": "app/auth.py",
+                    "verification_note": "Read app/auth.py lines 10-30: secret hardcoded in plaintext, reaches external HTTP call.",
                 },
                 {
                     "severity": "medium",
                     "summary": "Missing null check.",
                     "file": "app/api.py",
+                    "verification_note": "Read app/api.py lines 55-70: payload.user may be None, dereferenced without guard.",
                 },
             ],
         }
@@ -769,6 +771,7 @@ class TestScoreAudit:
                     "severity": "critical",
                     "summary": "SQL injection.",
                     "file": "app/db.py",
+                    "verification_note": "Read app/db.py lines 88-95: user_id from request headers reaches cursor.execute f-string with no parameterisation.",
                 },
             ],
         }
@@ -779,7 +782,12 @@ class TestScoreAudit:
         """Many critical findings clamp to 0.0."""
         report = {
             "findings": [
-                {"severity": "critical", "summary": f"Issue {i}", "file": ""}
+                {
+                    "severity": "critical",
+                    "summary": f"Issue {i}",
+                    "file": "",
+                    "verification_note": f"Read src/module.py line {i * 10 + 1}: confirmed real defect in the diff with no mitigation.",
+                }
                 for i in range(10)
             ],
         }
@@ -844,12 +852,25 @@ class TestScoreAudit:
         """When derived and reported scores diverge by >0.10 a warning is logged."""
         import logging
 
+        _NOTE = (
+            "Read src/module.py lines 5-20: confirmed real defect with no mitigation."
+        )
         report = {
             "audit_score": 0.90,  # reported
             # derived = 1.0 - 0.30 - 0.30 = 0.40 → delta 0.50
             "findings": [
-                {"severity": "critical", "summary": "Issue A", "file": ""},
-                {"severity": "critical", "summary": "Issue B", "file": ""},
+                {
+                    "severity": "critical",
+                    "summary": "Issue A",
+                    "file": "",
+                    "verification_note": _NOTE,
+                },
+                {
+                    "severity": "critical",
+                    "summary": "Issue B",
+                    "file": "",
+                    "verification_note": _NOTE,
+                },
             ],
         }
         with caplog.at_level(logging.WARNING, logger="backend.app.release_qualifier"):
@@ -860,7 +881,14 @@ class TestScoreAudit:
     def test_moderate_severity_treated_as_medium(self):
         """'moderate' is an alias for 'medium' (same 0.07 deduction)."""
         report = {
-            "findings": [{"severity": "moderate", "summary": "Style issue", "file": ""}]
+            "findings": [
+                {
+                    "severity": "moderate",
+                    "summary": "Style issue",
+                    "file": "",
+                    "verification_note": "Read app/utils.py lines 12-20: pattern inconsistent with rest of module, confirmed present in diff.",
+                }
+            ]
         }
         audit, _ = rq._score_audit(report)
         assert audit == pytest.approx(1.0 - 0.07)
@@ -873,6 +901,7 @@ class TestScoreAudit:
                     "severity": "high",
                     "summary": "Token in source.",
                     "file": "app/auth.py",
+                    "verification_note": "Read app/auth.py lines 10-30: API key hardcoded in source, reaches outbound request.",
                 },
             ]
         }
@@ -884,7 +913,12 @@ class TestScoreAudit:
         """Finding with 'level' instead of 'severity' must apply the correct deduction."""
         report = {
             "findings": [
-                {"level": "critical", "summary": "SQL injection", "file": "app/db.py"},
+                {
+                    "level": "critical",
+                    "summary": "SQL injection",
+                    "file": "app/db.py",
+                    "verification_note": "Read app/db.py lines 88-95: user input reaches cursor.execute without parameterisation.",
+                },
             ]
         }
         audit, _ = rq._score_audit(report)
@@ -892,13 +926,21 @@ class TestScoreAudit:
 
     def test_unrecognized_severity_applies_nonzero_deduction(self):
         """Off-list severity labels ('blocker', 'warning', 'info', 'unknown') must not score 0."""
-        for sev, expected_deduction in [
-            ("blocker", 0.30),
-            ("warning", 0.07),
-            ("info", 0.02),
-            ("custom_label", rq._AUDIT_DEDUCTION_UNKNOWN),
+        _NOTE = "Read src/module.py lines 5-20: confirmed real defect with no mitigation in the diff."
+        for sev, expected_deduction, needs_note in [
+            ("blocker", 0.30, True),  # in _SEVERITIES_REQUIRING_VERIFICATION
+            ("warning", 0.07, True),  # in _SEVERITIES_REQUIRING_VERIFICATION
+            ("info", 0.02, False),  # not in set; no verification required
+            (
+                "custom_label",
+                rq._AUDIT_DEDUCTION_UNKNOWN,
+                False,
+            ),  # unknown; no verification required
         ]:
-            report = {"findings": [{"severity": sev, "summary": "Issue", "file": ""}]}
+            finding: dict = {"severity": sev, "summary": "Issue", "file": ""}
+            if needs_note:
+                finding["verification_note"] = _NOTE
+            report = {"findings": [finding]}
             audit, _ = rq._score_audit(report)
             assert audit == pytest.approx(1.0 - expected_deduction), (
                 f"severity={sev!r} should deduct {expected_deduction} but got {1.0 - audit:.4f}"
@@ -916,6 +958,7 @@ class TestScoreAudit:
                     "level": "high",
                     "summary": "Token baked into source.",
                     "file": "app/secret.py",
+                    "verification_note": "Read app/secret.py lines 5-15: API key hardcoded in module-level constant, reaches outbound HTTP call.",
                 },
             ]
         }
@@ -925,6 +968,116 @@ class TestScoreAudit:
         assert audit < 1.0, "score should reflect the finding, not fail open to 1.0"
         assert len(findings) > 0, "findings should be surfaced for the same report"
         assert findings[0]["severity"] == "high"
+
+
+class TestScoreAuditVerification:
+    """_score_audit must skip deductions for high/medium/critical findings
+    that lack a substantive verification_note (≥ 20 non-whitespace chars)."""
+
+    def test_unverified_high_finding_not_deducted(self):
+        """A high finding without verification_note is excluded → score stays 1.0."""
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Potential issue.",
+                    "file": "app/foo.py",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0)
+
+    def test_unverified_medium_finding_not_deducted(self):
+        """A medium finding without verification_note is excluded → score stays 1.0."""
+        report = {
+            "findings": [
+                {
+                    "severity": "medium",
+                    "summary": "Missing guard.",
+                    "file": "app/bar.py",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0)
+
+    def test_low_finding_always_deducted_without_verification_note(self):
+        """Low findings do not require verification_note — deduction applies."""
+        report = {
+            "findings": [
+                {"severity": "low", "summary": "Nit: inconsistent style.", "file": ""},
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0 - 0.02)
+
+    def test_short_verification_note_not_counted(self):
+        """A verification_note with fewer than 20 non-whitespace chars is treated as absent."""
+        report = {
+            "findings": [
+                {
+                    "severity": "critical",
+                    "summary": "SQL injection.",
+                    "file": "app/db.py",
+                    "verification_note": "too short",  # only 9 non-whitespace chars
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0)
+
+    def test_verified_critical_finding_deducted(self):
+        """A critical finding WITH a substantive verification_note is deducted normally."""
+        report = {
+            "findings": [
+                {
+                    "severity": "critical",
+                    "summary": "SQL injection.",
+                    "file": "app/db.py",
+                    "verification_note": "Read app/db.py lines 88-95: user input from request body reaches cursor.execute without parameterisation.",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0 - 0.30)
+
+    def test_mixed_verified_and_unverified_findings(self):
+        """Only verified findings count — one verified high + one unverified critical."""
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Real issue.",
+                    "file": "app/auth.py",
+                    "verification_note": "Read app/auth.py lines 10-30: API key hardcoded in source, reaches outbound request.",
+                },
+                {
+                    "severity": "critical",
+                    "summary": "Speculative injection.",
+                    "file": "app/db.py",
+                    # no verification_note — should be excluded
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        # Only the verified high finding deducts: 1.0 - 0.15 = 0.85
+        assert audit == pytest.approx(1.0 - 0.15)
+
+    def test_empty_string_verification_note_not_counted(self):
+        """An empty verification_note is treated the same as absent."""
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Missing guard.",
+                    "file": "app/api.py",
+                    "verification_note": "",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0)
 
 
 class TestScoreAuditComputedErosion:
@@ -2362,8 +2515,16 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
             },
             "findings": [
                 {"severity": "low", "summary": "Private cross-module import."},
-                {"severity": "high", "summary": "Token baked into VM image."},
-                {"severity": "high", "summary": "Unsafe dependency pinning."},
+                {
+                    "severity": "high",
+                    "summary": "Token baked into VM image.",
+                    "verification_note": "Read infra/packer/agent.pkr.hcl lines 20-35: API token hardcoded in provisioner shell command, present in diff with no mitigation.",
+                },
+                {
+                    "severity": "high",
+                    "summary": "Unsafe dependency pinning.",
+                    "verification_note": "Read agent/package.json: dependency version unpinned (uses ^), confirmed change in diff allows semver drift.",
+                },
             ],
         },
         smoke_logs={
@@ -3944,6 +4105,7 @@ async def test_finalize_quality_blocker_four_critical_findings(db_session, mocke
                     "severity": "critical",
                     "summary": f"SQL injection {i}.",
                     "file": "app/db.py",
+                    "verification_note": f"Read app/db.py lines {i * 10 + 5}-{i * 10 + 15}: user input from request body reaches cursor.execute f-string at line {i * 10 + 12} without parameterisation.",
                 }
                 for i in range(4)
             ],

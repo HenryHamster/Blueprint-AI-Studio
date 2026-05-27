@@ -1263,7 +1263,8 @@ IMPORTANT: You are running on \`${baseBranch}\` intentionally. You must judge th
     {
       "severity": "high",
       "summary": "One sentence describing the issue",
-      "file": "path/to/affected/file.py"
+      "file": "path/to/affected/file.py",
+      "verification_note": "Read app/auth.py lines 45-62 — req.user_id is user-controlled and reaches the SQL call at line 60 with no sanitisation."
     }
   ]
 }
@@ -1274,10 +1275,11 @@ Field semantics:
 - \`test_erosion.deleted_test_files\`: list of test file paths deleted in the diff. An empty list is good.
 - \`test_erosion.assertion_delta\`: integer — positive means more assertions added than removed (good), negative means erosion.
 - \`test_erosion.test_count_delta\`: integer — positive means more tests added than removed (good), negative means erosion.
-- \`findings\`: each entry has \`severity\` (critical|high|medium|low), \`summary\` (one sentence), and \`file\` (file path or empty string if cross-cutting).
+- \`findings\`: each entry has \`severity\` (critical|high|medium|low), \`summary\` (one sentence), \`file\` (file path or empty string if cross-cutting), and \`verification_note\` (required for high/medium/critical — cite the specific file and line you read and why the issue is real, ≥ 20 non-whitespace characters). Findings at severity high/medium/critical WITHOUT a substantive \`verification_note\` are silently excluded from the score — they do not deduct points. Drop or downgrade to low/info any finding you cannot substantiate.
 
 Rules:
 - Read the actual diff — do NOT speculate about code you haven't read.
+- IMPORTANT — substantiation required: Before recording any finding at severity high, medium, or critical, read the relevant unchanged files in the full repository (not just the diff) to check for existing mitigations (guards, exception handlers, per-request checks, hardcoded constants at the call site). Record what you read and why the issue is real in \`verification_note\`. A hardcoded constant reaching a sink is NOT injection. A per-request DB check is NOT a replay gap. A comparison that is exception-guarded is NOT a TypeError. Only record the finding if you can substantiate it after reading the whole-repo context.
 - If \`git diff ${diffRange}\` produces no output (empty diff), set \`audit_score: 1.0\`, \`findings: []\`, and note it in a single low-severity finding.
 - IMPORTANT: Write ONLY the JSON object to \`/tmp/release_audit_report_${taskId}.json\` — no markdown, no code fences, no extra text.
 - Also output the same JSON object as the final output in your logs.

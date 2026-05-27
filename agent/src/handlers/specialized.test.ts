@@ -1481,6 +1481,20 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
     expect(call.failure_category).toBe('release_audit_report_unparseable');
     expect(call.logs).toContain('raw tail fallback text');
   });
+
+  it('prompt includes verification_note in the findings JSON schema', async () => {
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('verification_note');
+  });
+
+  it('prompt instructs agent to read full-repo context before recording a high/medium/critical finding', async () => {
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // The prompt must require whole-repo verification, not just diff inspection.
+    expect(prompt).toMatch(/substantiation required/i);
+    expect(prompt).toMatch(/read the relevant unchanged files/i);
+  });
 });
 
 // ── resolveCandidateSha — payload/context SHA resolution + validation ─────────

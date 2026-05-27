@@ -1,6 +1,6 @@
 """Integration tests for /api/admin/digest and /api/admin/activity endpoints."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -10958,6 +10958,31 @@ async def test_serialize_sr_catch_rate_trends_is_stale(client: AsyncClient, db_s
     trends3 = response3.json().get("self_review_prediction_accuracy_trends")
     assert trends3 is not None
     assert trends3["is_stale"] is True
+
+
+@pytest.mark.asyncio
+async def test_serialize_sr_catch_rate_trends_handles_tz_aware_computed_at(
+    client: AsyncClient, db_session
+):
+    """A tz-aware computed_at is normalized before the stale check runs."""
+    project = make_project()
+    computed_at = datetime.now(timezone.utc) - timedelta(days=1)
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": computed_at.isoformat(),
+            "categories": {"correctness": {"miss_rate": 0.2, "trend": "stable"}},
+            "by_task_type": {},
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    trends = response.json().get("self_review_prediction_accuracy_trends")
+    assert trends is not None
+    assert trends["is_stale"] is False
 
 
 @pytest.mark.asyncio
