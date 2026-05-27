@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
-from app.time_utils import _to_naive_utc
+from app.time_utils import _to_naive_utc, _coerce_naive_utc
 from app.models import (
     Project,
     Task,
@@ -2980,7 +2980,9 @@ async def compute_direction_progress(
         dir_user_issues_caught = 0
         for entry in d.get("research_history") or []:
             try:
-                entry_ts = datetime.fromisoformat(entry.get("timestamp", ""))
+                entry_ts = _coerce_naive_utc(
+                    datetime.fromisoformat(entry.get("timestamp", ""))
+                )
             except (ValueError, TypeError):
                 continue
             if entry_ts >= window_start:

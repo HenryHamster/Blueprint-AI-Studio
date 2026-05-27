@@ -29,6 +29,7 @@ from app.models import (
     AlertSeverity,
     _utcnow,
 )
+from app.time_utils import _coerce_naive_utc
 from app.routers.admin_analytics import _derive_completed_at
 from app.digest_metrics import (
     _compute_edges_considered_metrics,
@@ -213,7 +214,7 @@ async def compute_pipeline_health_summary(
 
     def _safe_ts_in_window(ts_str: str | None, cutoff: datetime) -> bool:
         try:
-            return datetime.fromisoformat(ts_str or "") >= cutoff
+            return _coerce_naive_utc(datetime.fromisoformat(ts_str or "")) >= cutoff
         except (ValueError, TypeError):
             return False
 
@@ -401,7 +402,9 @@ async def compute_pipeline_health_summary(
             sd_totals: Dict[str, int] = {}
             for entry in d.get("research_history") or []:
                 try:
-                    entry_ts = datetime.fromisoformat(entry.get("timestamp", ""))
+                    entry_ts = _coerce_naive_utc(
+                        datetime.fromisoformat(entry.get("timestamp", ""))
+                    )
                     if entry_ts >= window_start:
                         prs_merged += entry.get("prs_merged") or 0
                         prs_rejected += entry.get("prs_rejected") or 0

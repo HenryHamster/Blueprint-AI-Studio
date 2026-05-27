@@ -37,7 +37,8 @@ import {
   STALE_RESULT_MAX_ATTEMPTS, STALE_RESULT_MAX_AGE_MS, STDERR_TAIL_BYTES,
   PROCESS_KILL_GRACE_MS, CLAUDE_RESULT_GRACE_MS, CLAUDE_STREAM_STALL_MS, LOG_TAIL_BYTES,
   HEARTBEAT_INTERVAL, MAX_LOG_BUFFER,
-  HEARTBEAT_API_TIMEOUT, HEARTBEAT_API_MAX_RETRIES, TOKEN_PROACTIVE_REFRESH_MS,
+  HEARTBEAT_API_TIMEOUT, HEARTBEAT_API_MAX_RETRIES,
+  TOKEN_REFRESH_FRACTION, TOKEN_REFRESH_FLOOR_MS, TOKEN_REFRESH_CEILING_MS,
   WITHIN_CHUNK_YIELD_LINES, WITHIN_CHUNK_YIELD_MS,
   GIT_CLONE_TIMEOUT, CLONE_MAX_RETRIES, CLONE_RETRY_BASE_DELAY,
   CONFLICT_CHECK_TIMEOUT,
@@ -1116,12 +1117,42 @@ export function extractInvestigatedFiles(trace: ToolTraceEntry[]): string[] {
 // ── Heartbeat ───────────────────────────────────────────────────────────────
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
-// Proactive JWT refresh — fires at TOKEN_PROACTIVE_REFRESH_MS (45 min) so the
-// 1h agent token is always renewed well before expiry.
-let tokenRefreshTimer: ReturnType<typeof setInterval> | null = null;
+// Proactive JWT refresh — derives timing from the token's real exp claim so
+// the refresh interval stays correct across any future TTL changes.
+let tokenRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
-function startProactiveTokenRefresh(): void {
-  tokenRefreshTimer = setInterval(() => {
+function decodeJwtExp(token: string): number | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length < 2) return null;
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const json = Buffer.from(b64, 'base64').toString('utf8');
+    const payload = JSON.parse(json) as { exp?: number };
+    return typeof payload.exp === 'number' ? payload.exp : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Compute how many ms from `now` to schedule the next proactive refresh.
+ *  Uses TOKEN_REFRESH_FRACTION * remaining lifetime, clamped to [FLOOR, CEILING]. */
+export function computeRefreshDelayMs(token: string, now = Date.now()): number {
+  const exp = decodeJwtExp(token);
+  if (exp === null) return TOKEN_REFRESH_FLOOR_MS;
+  const remainingMs = exp * 1000 - now;
+  const target = remainingMs * TOKEN_REFRESH_FRACTION;
+  return Math.max(TOKEN_REFRESH_FLOOR_MS, Math.min(TOKEN_REFRESH_CEILING_MS, target));
+}
+
+function scheduleProactiveTokenRefresh(token: string): void {
+  // Defensively clear any existing timer so callers that re-schedule without
+  // an intervening stop (e.g. warm-poll rotation then runRoleOnce) don't orphan
+  // a self-re-scheduling setTimeout, which would otherwise accumulate one extra
+  // refresh schedule per warm-VM rotation.
+  stopProactiveTokenRefresh();
+  const delay = computeRefreshDelayMs(token);
+  log(`Proactive token refresh: next refresh in ${Math.round(delay / 1000)}s`);
+  tokenRefreshTimer = setTimeout(() => {
     void (async () => {
       log('Proactive token refresh: refreshing agent JWT before expiry');
       const ok = await tryRefreshToken();
@@ -1130,12 +1161,13 @@ function startProactiveTokenRefresh(): void {
       } else {
         log('Proactive token refresh: failed — reactive 401 path will retry');
       }
+      scheduleProactiveTokenRefresh(AGENT_TOKEN);
     })();
-  }, TOKEN_PROACTIVE_REFRESH_MS);
+  }, delay);
 }
 
 function stopProactiveTokenRefresh(): void {
-  if (tokenRefreshTimer) { clearInterval(tokenRefreshTimer); tokenRefreshTimer = null; }
+  if (tokenRefreshTimer) { clearTimeout(tokenRefreshTimer); tokenRefreshTimer = null; }
 }
 
 function collectMetrics(): { rss_mb: number; heap_used_mb: number; cgroup_mb?: number; cgroup_limit_mb?: number; disk_free_mb?: number; disk_total_mb?: number } {
@@ -4168,6 +4200,9 @@ async function main() {
       if (pollResult.agentToken) {
         AGENT_TOKEN = pollResult.agentToken;
         apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
+        // Re-schedule proactive refresh based on the new task token's real expiry.
+        stopProactiveTokenRefresh();
+        scheduleProactiveTokenRefresh(AGENT_TOKEN);
       } else {
         // Backend always mints one for warm claims; missing it indicates
         // a deploy mismatch (old backend, new agent). Treat as fatal so
@@ -4310,7 +4345,7 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   // Start heartbeat & log stream
   const statusRef = { value: 'Initializing...' };
   startHeartbeat(taskId, () => statusRef.value);
-  startProactiveTokenRefresh();
+  scheduleProactiveTokenRefresh(AGENT_TOKEN);
   const ws = await connectLogStream(taskId);
   if (!ws) {
     log('WARNING: WebSocket log stream unavailable — logs will be sent via status updates only');

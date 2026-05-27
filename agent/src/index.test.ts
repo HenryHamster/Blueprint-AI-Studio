@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -79,6 +79,8 @@ import {
   MAX_TEST_FIX_ATTEMPTS,
   TOOL_USE_STALL_TIMEOUT_MS,
   CLAUDE_STREAM_STALL_MS,
+  TOKEN_REFRESH_FLOOR_MS,
+  TOKEN_REFRESH_CEILING_MS,
 } from './constants.js';
 import { execFileSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
@@ -89,6 +91,59 @@ function defined<T>(v: T | undefined | null, msg = 'expected value to be defined
   if (v === undefined || v === null) throw new Error(msg);
   return v;
 }
+
+// ── computeRefreshDelayMs ─────────────────────────────────────────────────────
+/** Build a minimal JWT with a given exp claim (no real signature needed). */
+function mockJwtWithExp(expUnixSec: number): string {
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ exp: expUnixSec, sub: 'test-task' })).toString('base64url');
+  return `${header}.${payload}.fakesig`;
+}
+
+describe('computeRefreshDelayMs', () => {
+  it('schedules at 75% of remaining lifetime for a 1h token', () => {
+    const now = 1_000_000_000_000; // arbitrary fixed ms
+    const expSec = Math.floor(now / 1000) + 3600; // 1 hour remaining
+    const delay = computeRefreshDelayMs(mockJwtWithExp(expSec), now);
+    expect(delay).toBe(3600 * 1000 * 0.75); // 2700000ms
+  });
+
+  it('clamps to floor when remaining lifetime is very short', () => {
+    const now = 1_000_000_000_000;
+    const expSec = Math.floor(now / 1000) + 30; // 30 seconds remaining
+    const delay = computeRefreshDelayMs(mockJwtWithExp(expSec), now);
+    expect(delay).toBe(TOKEN_REFRESH_FLOOR_MS);
+  });
+
+  it('clamps to ceiling when remaining lifetime is very long', () => {
+    const now = 1_000_000_000_000;
+    const expSec = Math.floor(now / 1000) + 7200; // 2 hours remaining
+    const delay = computeRefreshDelayMs(mockJwtWithExp(expSec), now);
+    expect(delay).toBe(TOKEN_REFRESH_CEILING_MS);
+  });
+
+  it('falls back to floor for an unparseable token', () => {
+    const delay = computeRefreshDelayMs('not-a-jwt');
+    expect(delay).toBe(TOKEN_REFRESH_FLOOR_MS);
+  });
+
+  it('falls back to floor when token has no exp claim', () => {
+    const now = 1_000_000_000_000;
+    const header = Buffer.from(JSON.stringify({ alg: 'HS256' })).toString('base64url');
+    const payload = Buffer.from(JSON.stringify({ sub: 'test' })).toString('base64url');
+    const token = `${header}.${payload}.sig`;
+    expect(computeRefreshDelayMs(token, now)).toBe(TOKEN_REFRESH_FLOOR_MS);
+  });
+
+  it('is at ceiling for a fresh standard 1h token', () => {
+    // 75% of 3600s = 2700s which is 45 min — within [3 min, 55 min]
+    const now = 1_000_000_000_000;
+    const expSec = Math.floor(now / 1000) + 3600;
+    const delay = computeRefreshDelayMs(mockJwtWithExp(expSec), now);
+    expect(delay).toBeGreaterThanOrEqual(TOKEN_REFRESH_FLOOR_MS);
+    expect(delay).toBeLessThanOrEqual(TOKEN_REFRESH_CEILING_MS);
+  });
+});
 
 // ── strVal ───────────────────────────────────────────────────────────────────
 describe('strVal', () => {

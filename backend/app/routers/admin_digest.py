@@ -13,7 +13,7 @@ from sqlmodel import select
 
 from app.database import get_session
 from app.digest_cache import DigestCache, get_digest_cache
-from app.time_utils import _to_naive_utc
+from app.time_utils import _to_naive_utc, _coerce_naive_utc
 from app.models import (
     Task,
     TaskStatus,
@@ -844,7 +844,9 @@ async def _compute_digest(
                     continue
                 for _entry in _d.get("research_history") or []:
                     try:
-                        _ets = datetime.fromisoformat(_entry.get("timestamp", ""))
+                        _ets = _coerce_naive_utc(
+                            datetime.fromisoformat(_entry.get("timestamp", ""))
+                        )
                     except (ValueError, TypeError):
                         continue
                     if _ets < window_start:
@@ -917,7 +919,9 @@ async def _compute_digest(
             for _d in _proj_prev.directions or []:
                 for _entry in _d.get("research_history") or []:
                     try:
-                        _ets = datetime.fromisoformat(_entry.get("timestamp", ""))
+                        _ets = _coerce_naive_utc(
+                            datetime.fromisoformat(_entry.get("timestamp", ""))
+                        )
                     except (ValueError, TypeError):
                         continue
                     if _ets < window_start:

@@ -778,6 +778,58 @@ async def test_direction_stats_entry_shape_pinned():
     assert not missing, f"direction_stats entry missing keys: {missing}"
 
 
+# ── Timezone-aware research_history timestamps ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_research_history_tz_aware_timestamp_included_in_window():
+    """research_history entries with tz-aware (UTC-Z) timestamps are counted, not silently dropped."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    direction_id = str(uuid.uuid4())
+
+    # Produce a tz-aware ISO timestamp (the 'Z' / '+00:00' form) that is
+    # inside the default 24-hour lookback window.
+    aware_ts = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": direction_id,
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": aware_ts,
+                        "prs_merged": 2,
+                        "tasks_created": 4,
+                        "prs_rejected": 1,
+                    }
+                ],
+            }
+        ]
+    )
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": direction_id},
+            created_at=now - timedelta(hours=4),
+        ),
+    ]
+    session = _make_mock_session(tasks=tasks, project=project)
+
+    # Must not raise TypeError for tz-aware vs naive comparison
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    stats = result["direction_stats"]
+    assert len(stats) == 1, "direction should appear in stats"
+    assert stats[0]["cycles"] == 1
+    # prs_merged/tasks_created should be counted from the tz-aware entry
+    assert stats[0]["conversion_rate"] == 0.5  # 2 merged / 4 created
+    assert stats[0]["acceptance_rate"] == pytest.approx(2 / 3, abs=0.001)
+
+
 # ── First-review approval rate ────────────────────────────────────────────────
 
 

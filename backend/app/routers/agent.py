@@ -17,7 +17,7 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.auth import verify_agent_jwt, create_agent_token
+from app.auth import verify_agent_jwt, create_agent_token, AGENT_TOKEN_TTL_HOURS
 from app.database import get_session, AsyncSessionLocal
 from app.models import (
     Project,
@@ -845,7 +845,8 @@ async def agent_refresh_token(
         task_type=token.get("task_type", ""),
         project_id=token.get("project_id", "") or str(task.project_id),
     )
-    return {"token": new_token}
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=AGENT_TOKEN_TTL_HOURS)
+    return {"token": new_token, "token_expires_at": expires_at.isoformat()}
 
 
 async def _stamp_reviewer_recovery_count(

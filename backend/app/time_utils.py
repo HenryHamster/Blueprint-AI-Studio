@@ -47,6 +47,19 @@ def _strip_tz_assume_utc(dt: Optional[datetime]) -> Optional[datetime]:
 _to_naive_utc = _strip_tz_assume_utc  # deprecated alias
 
 
+def _coerce_naive_utc(dt: datetime) -> datetime:
+    """Convert any datetime to naive UTC, or return it unchanged if already naive.
+
+    Unlike ``_strip_tz_assume_utc``, this accepts non-UTC tz-aware datetimes
+    and converts them to UTC rather than raising. Use this when parsing stored
+    ISO timestamps that may carry an arbitrary offset (including 'Z'-suffix
+    entries emitted by tz-aware writers).
+    """
+    if dt.tzinfo is None:
+        return dt
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def set_retry_after(task_or_ctx, minutes: float) -> str:
     """Clamp `minutes` to [0, 30], write retry_after on the task or context.
 

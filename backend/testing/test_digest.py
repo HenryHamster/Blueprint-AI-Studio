@@ -8197,6 +8197,59 @@ async def test_digest_direction_progress_zero_autonomous_with_operator_actions(
     assert dp["cost_per_merged_pr"] is None
 
 
+# ── Timezone-aware research_history timestamps ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_tz_aware_timestamp_counted(
+    client: AsyncClient, db_session
+):
+    """research_history entries with tz-aware (UTC+Z) timestamps are counted, not dropped or raising TypeError."""
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-tz-aware",
+                "text": "Direction with tz-aware timestamp",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": (
+                            datetime.now(timezone.utc) - timedelta(hours=5)
+                        ).isoformat(),
+                        "prs_merged": 3,
+                        "tasks_created": 6,
+                    }
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-tz-aware"},
+        )
+    )
+    await db_session.commit()
+
+    # Must not raise TypeError for tz-aware vs naive comparison
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert len(data["direction_progress"]) == 1
+    dp = data["direction_progress"][0]
+    # prs_merged/tasks_created should be counted from the tz-aware entry
+    assert dp["prs_merged"] == 3
+    assert dp["conversion_rate"] == 0.5  # 3 merged / 6 created
+
+
 # ---------------------------------------------------------------------------
 # /api/admin/projects/{project_id}/retirement-critiques
 # ---------------------------------------------------------------------------
