@@ -6,7 +6,6 @@ import logging
 import re
 import time
 import uuid
-from collections import deque
 from datetime import datetime, timedelta
 from typing import Dict
 
@@ -238,8 +237,7 @@ async def secret_reconciliation_service():
             break
 
 
-_STALE_BRANCH_PREFIXES = ("blueprint/", "research/", "plan/")
-_PROTECTED_BRANCHES = frozenset(["main", "master", "develop", "dev"])
+_DEFAULT_PROTECTED_BRANCHES = ("main", "master", "develop", "dev")
 # Per-cycle caps. The age check costs one GitHub commit-date call per candidate
 # branch (i.e. branches that already passed the terminal-task filter), plus a
 # DELETE per actually-deleted branch. At 4 cycles/day these caps fit well
@@ -258,15 +256,40 @@ _STALE_BRANCH_AGE_DAYS = 2
 _QUOTA_FLOOR = 500  # install-token (5000/hr bucket)
 _JWT_QUOTA_FLOOR = 10  # App-JWT (~60/hr bucket)
 
+
 # Branch naming conventions these prefixes emit:
-#   blueprint/{task|fix|refactor|docs|deps|migrate}-{short_id}
-#   research/{short_id}
-#   plan/{short_id}
+#   {namespace}/{task|fix|refactor|docs|deps|migrate}-{short_id}
+#   research/{short_id}  (default staging prefix)
+#   plan/{short_id}      (default staging prefix)
 # short_id is the first 8 hex chars of the owning task's UUID (dashes stripped).
-_BRANCH_SHORT_ID_RE = re.compile(
-    r"^(?:blueprint/(?:task|fix|refactor|docs|deps|migrate)-|research/|plan/)"
-    r"([a-f0-9]{8})$"
-)
+# ``{namespace}`` is per-project (``project.task_branch_namespace``); the
+# Blueprint self-repo uses ``"blueprint"``, other installs ship their own.
+_DEFAULT_STAGING_PREFIXES: tuple[str, ...] = ("research/", "plan/")
+
+
+def _build_branch_short_id_re(
+    namespace: str,
+    staging_prefixes: tuple[str, ...] = _DEFAULT_STAGING_PREFIXES,
+) -> re.Pattern:
+    """Compile the short-id extraction regex for a project's namespace.
+
+    ``staging_prefixes`` controls which rollup-staging branch prefixes
+    (e.g. ``research/``, ``plan/``) are recognized alongside the task-branch
+    namespace.  Defaults to Blueprint's conventional pair; projects can
+    override via ``build_config.staging_branch_prefixes``.
+    """
+    staging_alt = "|".join(re.escape(p) for p in staging_prefixes)
+    return re.compile(
+        rf"^(?:{re.escape(namespace)}/(?:task|fix|refactor|docs|deps|migrate)-|{staging_alt})"
+        r"([a-f0-9]{8})$"
+    )
+
+
+# Default regex preserved for callers that pre-date per-project namespaces.
+# New code paths inside the per-project sweep build the regex per-project so
+# branches in a non-Blueprint namespace (e.g. ``autoproj/``) are recognized.
+_BRANCH_SHORT_ID_RE = _build_branch_short_id_re("blueprint")
+
 
 # Statuses a task can sit in after it's done. Only branches owned by tasks in
 # one of these states are eligible for stale-branch cleanup.
@@ -279,14 +302,25 @@ _TERMINAL_TASK_STATUSES = frozenset(
 )
 
 
-def _extract_branch_short_id(branch_name: str) -> str | None:
+def _extract_branch_short_id(
+    branch_name: str, pattern: re.Pattern = _BRANCH_SHORT_ID_RE
+) -> str | None:
     """Return the 8-char task short_id embedded in a branch name, or None.
 
     Used by the stale branch cleanup to attribute each branch to the task that
-    created it without a GitHub API round-trip.
+    created it without a GitHub API round-trip. ``pattern`` defaults to the
+    Blueprint-namespace regex; per-project sweeps pass a project-specific
+    pattern compiled from the project's task-branch namespace.
     """
-    m = _BRANCH_SHORT_ID_RE.match(branch_name)
+    m = pattern.match(branch_name)
     return m.group(1) if m else None
+
+
+# Canonical branch-derivation helpers live in shared_state, the single source
+# of truth for blueprint/{prefix}-{8hex} branch names. Every backend module
+# that needs to derive a task branch imports from there.
+_TASK_TYPE_BRANCH_PREFIX = _shared_state.TASK_TYPE_BRANCH_PREFIX
+_derive_task_branch = _shared_state.derive_task_branch
 
 
 def _pr_possibly_open(ctx: dict | None) -> bool:
@@ -325,7 +359,7 @@ def _pr_possibly_open(ctx: dict | None) -> bool:
     )
 
 
-async def _get_project_github_token(project, session):
+async def _get_project_github_token(project, session, *, integration=None):
     """Retrieve a GitHub token for a project via its UserIntegration.
 
     Reuses the same in-process cache as ``get_github_token_for_task`` so a
@@ -333,6 +367,9 @@ async def _get_project_github_token(project, session):
     60s cache) doesn't mint a fresh install token on every cache-miss.  That
     pattern was silently draining the ~60/hr App-JWT bucket even with zero
     agents running.
+
+    Pass a pre-loaded ``integration`` to skip the per-project DB query (used
+    by ``_run_stale_branch_cleanup`` which batch-loads all integrations upfront).
     """
     from app.models import UserIntegration
     from app.github import (
@@ -358,17 +395,18 @@ async def _get_project_github_token(project, session):
         ):
             return cached["token"]
 
-    integration = (
-        (
-            await session.execute(
-                select(UserIntegration).where(
-                    UserIntegration.user_id == project.user_id
+    if integration is None:
+        integration = (
+            (
+                await session.execute(
+                    select(UserIntegration).where(
+                        UserIntegration.user_id == project.user_id
+                    )
                 )
             )
+            .scalars()
+            .first()
         )
-        .scalars()
-        .first()
-    )
 
     token: str | None = None
     if integration and integration.github_installation_id:
@@ -448,6 +486,24 @@ async def _run_stale_branch_cleanup():
             .all()
         )
 
+        # Batch-load UserIntegrations for all projects upfront to avoid an
+        # N+1 query pattern (one SELECT per project inside the loop).
+        from app.models import UserIntegration
+
+        project_user_ids = list({p.user_id for p in projects})
+        user_integrations = (
+            (
+                await session.execute(
+                    select(UserIntegration).where(
+                        UserIntegration.user_id.in_(project_user_ids)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        user_integration_lookup: dict = {ui.user_id: ui for ui in user_integrations}
+
         ACTIVE_STATUSES = [
             TaskStatus.QUEUED,
             TaskStatus.PROVISIONING,
@@ -474,6 +530,7 @@ async def _run_stale_branch_cleanup():
                 )
             ).all()
 
+            project_namespace = _shared_state.get_project_task_branch_namespace(project)
             active_branches: set = set()
             for row in active_task_rows:
                 ctx = row.context or {}
@@ -494,19 +551,16 @@ async def _run_stale_branch_cleanup():
                 # Computed branch name from task ID (covers cases not in context)
                 first_payload = (row.payloads or [{}])[0]
                 task_type = first_payload.get("type", "task")
-                type_prefix = {
-                    "create": "task",
-                    "fix": "fix",
-                    "refactor": "refactor",
-                    "docs": "docs",
-                    "deps": "deps",
-                    "migrate": "migrate",
-                }.get(task_type, "task")
-                short_id = str(row.id).replace("-", "")[:8]
-                active_branches.add(f"blueprint/{type_prefix}-{short_id}")
+                active_branches.add(
+                    _derive_task_branch(row.id, task_type, project_namespace)
+                )
 
             try:
-                token = await _get_project_github_token(project, session)
+                token = await _get_project_github_token(
+                    project,
+                    session,
+                    integration=user_integration_lookup.get(project.user_id),
+                )
                 if not token:
                     logger.warning(
                         f"[BRANCH CLEANUP] No token for project {project.id}, skipping"
@@ -525,7 +579,7 @@ async def _run_stale_branch_cleanup():
                     token,
                     owner,
                     repo,
-                    prefixes=list(_STALE_BRANCH_PREFIXES),
+                    prefixes=list(project.stale_branch_prefixes),
                     max_branches=1000,
                 )
             except Exception as e:
@@ -536,8 +590,16 @@ async def _run_stale_branch_cleanup():
 
             # Batch-load task metadata for every branch whose name matches our
             # known short_id shape. One SQL query replaces ~N GitHub calls.
+            project_staging_prefixes = getattr(
+                project, "staging_branch_prefixes", _DEFAULT_STAGING_PREFIXES
+            )
+            project_branch_re = _build_branch_short_id_re(
+                project_namespace, project_staging_prefixes
+            )
             branch_short_ids = {
-                sid for b in branches if (sid := _extract_branch_short_id(b["name"]))
+                sid
+                for b in branches
+                if (sid := _extract_branch_short_id(b["name"], project_branch_re))
             }
             # short_id -> (status, context). context is loaded so Gate 5.5 can
             # check for PR closure markers before deleting the branch.
@@ -567,7 +629,7 @@ async def _run_stale_branch_cleanup():
                 name = branch_info["name"]
 
                 # Gate 1: never touch protected branches
-                if name in _PROTECTED_BRANCHES:
+                if name in project.protected_branches:
                     continue
 
                 # Gate 2: skip if the name matches any active task's branch
@@ -577,7 +639,7 @@ async def _run_stale_branch_cleanup():
                 # Gate 3: name must match the known cleanup shape. Unknown
                 # shapes (hand-created branches someone kept around, legacy
                 # naming, etc.) are left alone.
-                short_id = _extract_branch_short_id(name)
+                short_id = _extract_branch_short_id(name, project_branch_re)
                 if not short_id:
                     continue
 
@@ -687,8 +749,7 @@ async def stale_branch_cleanup_service():
             # Demote to a one-line warning so the dashboard doesn't flag it.
             msg = str(e)
             is_close_collateral = (
-                "connection is closed" in msg
-                or "InterfaceError" in type(e).__name__
+                "connection is closed" in msg or "InterfaceError" in type(e).__name__
             )
             if is_close_collateral:
                 logger.warning(
@@ -895,74 +956,6 @@ async def auto_archive_service():
         except asyncio.CancelledError:
             logger.info("[AUTO-ARCHIVE] Service shutting down.")
             break
-
-
-async def _persist_circuit_breakers():
-    """Save circuit breaker state to DB so it survives restarts."""
-    from app.deploy_health import _get_deploy_state_for_update
-
-    try:
-        serializable = {}
-        for k, v in _shared_state.circuit_breakers.items():
-            # Prune: don't persist CLOSED breakers with no failures (default state)
-            if (
-                v.get("state") == "CLOSED"
-                and v.get("failure_count", 0) == 0
-                and v.get("infra_failure_count", 0) == 0
-            ):
-                continue
-            serializable[k] = {
-                **v,
-                "opened_at": v["opened_at"].isoformat() if v.get("opened_at") else None,
-            }
-        async with AsyncSessionLocal() as session:
-            state = await _get_deploy_state_for_update(session)
-            if state:
-                state.circuit_breaker_states = serializable
-                session.add(state)
-                await session.commit()
-    except Exception as e:
-        logger.warning(f"[CIRCUIT BREAKER] Failed to persist state: {e}", exc_info=True)
-
-
-async def _persist_zone_health():
-    """Snapshot zone health to DB so cooldowns survive restarts."""
-    from app.deploy_health import (
-        _get_deploy_state_for_update,
-        _pause_failure_streak,
-        _health_recovery_history,
-        _last_auto_resume_at,
-        _recent_auto_resumes,
-    )
-
-    try:
-        from app.compute import _zone_health, _zone_lock
-
-        def _serialize_value(v):
-            if isinstance(v, datetime):
-                return v.isoformat()
-            if isinstance(v, deque):
-                return list(v)
-            return v
-
-        with _zone_lock:
-            snapshot = {}
-            for zone, data in _zone_health.items():
-                snapshot[zone] = {k: _serialize_value(v) for k, v in data.items()}
-        snapshot["_pause_failure_streak"] = _pause_failure_streak
-        snapshot["_health_recovery_history"] = list(_health_recovery_history)
-        snapshot["_last_auto_resume_at"] = (
-            _last_auto_resume_at.isoformat() if _last_auto_resume_at else None
-        )
-        snapshot["_recent_auto_resumes"] = [t.isoformat() for t in _recent_auto_resumes]
-        async with AsyncSessionLocal() as session:
-            state = await _get_deploy_state_for_update(session)
-            if state:
-                state.zone_health_state = snapshot
-                session.add(state)
-                await session.commit()
-    except Exception as e:
-        logger.warning(f"[ZONE HEALTH] Failed to persist state: {e}", exc_info=True)
 
 
 async def _chain_has_active_pipeline_work(
@@ -1308,10 +1301,14 @@ async def _attempt_ci_backstop_recovery(
     wait window and skip the hard kill for this tick).
     """
     from app.review_pipeline import _spawn_pipeline_task
+    from app.models import Project
 
     pr_number = review_loop.get("pr_number")
     branch = review_loop.get("branch")
-    base_branch = review_loop.get("base_branch", "main")
+    _proj = await session.get(Project, parent.project_id)
+    base_branch = review_loop.get(
+        "base_branch"
+    ) or _shared_state.get_project_integration_branch(_proj)
     original_task_id = review_loop.get("original_task_id") or str(parent.id)
     if not (pr_number and branch):
         return False
@@ -1455,9 +1452,7 @@ async def _check_evaluating_timeouts():
                         await session.execute(
                             select(Task)
                             .options(
-                                load_only(
-                                    Task.id, Task.parent_task_id, Task.status
-                                )
+                                load_only(Task.id, Task.parent_task_id, Task.status)
                             )
                             .where(Task.parent_task_id.in_(_eval_parent_ids))
                         )
@@ -1553,29 +1548,22 @@ async def _check_evaluating_timeouts():
                             task.last_heartbeat = None
                             try:
                                 from app.review_pipeline import _spawn_pipeline_task
+                                from app.models import Project
 
-                                short_id = str(task.id).replace("-", "")[:8]
                                 task_type_str = (task.first_payload or {}).get(
                                     "type", ""
                                 ) or ""
-                                type_prefix_map = {
-                                    "docs": "docs",
-                                    "deps": "deps",
-                                    "migrate": "migrate",
-                                    "refactor": "refactor",
-                                    "perf": "task",
-                                    "qa": "task",
-                                    "security_audit": "task",
-                                    "debug": "task",
-                                    "smoketest": "task",
-                                }
-                                branch_prefix = type_prefix_map.get(
-                                    task_type_str, "task"
+                                _proj = await session.get(Project, task.project_id)
+                                branch = _derive_task_branch(
+                                    task.id,
+                                    task_type_str,
+                                    _shared_state.get_project_task_branch_namespace(
+                                        _proj
+                                    ),
                                 )
-                                branch = f"blueprint/{branch_prefix}-{short_id}"
                                 base_branch = (task.first_payload or {}).get(
-                                    "base_branch", "main"
-                                )
+                                    "base_branch"
+                                ) or _shared_state.get_project_integration_branch(_proj)
                                 original_prompt = (task.first_payload or {}).get(
                                     "prompt", task.description or ""
                                 )
@@ -1859,9 +1847,7 @@ async def _check_evaluating_timeouts():
                     children = (
                         (
                             await session.execute(
-                                select(Task).where(
-                                    Task.parent_task_id == task.id
-                                )
+                                select(Task).where(Task.parent_task_id == task.id)
                             )
                         )
                         .scalars()
@@ -1936,9 +1922,7 @@ async def _check_evaluating_timeouts():
                         f"but is still EVALUATING — triggering missed rollup"
                     )
                     # Re-fetch a terminal child fresh to trigger rollup.
-                    trigger_child = await session.get(
-                        Task, child_status_snap[0][0]
-                    )
+                    trigger_child = await session.get(Task, child_status_snap[0][0])
                     if trigger_child is not None:
                         await _check_and_trigger_rollup(trigger_child, session)
                     await session.commit()
@@ -2464,6 +2448,7 @@ async def _recover_orphaned_tasks():
     """Detect COMPLETED tasks with no PR artifact and no review child. Look up PR on GitHub and spawn review."""
     from app.routers.agent import get_github_token_for_task
     from app.review_pipeline import _spawn_pipeline_task
+    from app.models import Project
 
     try:
         async with AsyncSessionLocal() as session:
@@ -2574,14 +2559,12 @@ async def _recover_orphaned_tasks():
                     )
                     continue
 
-                short_id = str(task.id).replace("-", "")[:8]
-                type_prefix = {
-                    "docs": "docs",
-                    "deps": "deps",
-                    "migrate": "migrate",
-                    "refactor": "refactor",
-                }.get(task_type, "task")
-                branch = f"blueprint/{type_prefix}-{short_id}"
+                _proj = await session.get(Project, task.project_id)
+                branch = _derive_task_branch(
+                    task.id,
+                    task_type,
+                    _shared_state.get_project_task_branch_namespace(_proj),
+                )
 
                 try:
                     from app.github import _github_request
@@ -2617,7 +2600,9 @@ async def _recover_orphaned_tasks():
                 pr = prs[0]
                 pr_url = pr["html_url"]
                 pr_number = pr["number"]
-                base_branch = task.first_payload.get("base_branch", "main")
+                base_branch = task.first_payload.get(
+                    "base_branch"
+                ) or _shared_state.get_project_integration_branch(_proj)
 
                 # Create the missing artifact
                 artifact = Artifact(
@@ -2772,15 +2757,16 @@ async def _recover_orphaned_tasks():
                     continue
 
                 pr_number = int(pr_url.rstrip("/").split("/")[-1])
-                base_branch = locked.first_payload.get("base_branch", "main")
                 short_id = str(locked.id).replace("-", "")[:8]
-                type_prefix = {
-                    "docs": "docs",
-                    "deps": "deps",
-                    "migrate": "migrate",
-                    "refactor": "refactor",
-                }.get(task_type, "task")
-                branch = f"blueprint/{type_prefix}-{short_id}"
+                _proj = await session.get(Project, locked.project_id)
+                base_branch = locked.first_payload.get(
+                    "base_branch"
+                ) or _shared_state.get_project_integration_branch(_proj)
+                branch = _derive_task_branch(
+                    locked.id,
+                    task_type,
+                    _shared_state.get_project_task_branch_namespace(_proj),
+                )
                 original_prompt = locked.first_payload.get(
                     "prompt", locked.description or ""
                 )

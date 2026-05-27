@@ -1,6 +1,7 @@
 import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
+import { fireEvent } from '@testing-library/react';
 import ActivityFeed from './ActivityFeed';
 import { expectNoOverflowAt } from '../test/viewport';
 
@@ -128,5 +129,104 @@ describe('ActivityFeed — viewport regression', () => {
         await new Promise((resolve) => setTimeout(resolve, 50));
       });
     });
+  });
+
+  test('search input filters events by title substring (case-insensitive)', async () => {
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+
+    await act(async () => {
+      r.render(
+        <ActivityFeed
+          selectedProjectId={null}
+          refreshInterval={0}
+          onSelectTask={() => {}}
+          onClose={() => {}}
+        />,
+      );
+    });
+
+    // Wait for events to load
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    });
+
+    const searchInput = host?.querySelector(
+      'input[placeholder="Search events by title or error..."]',
+    ) as HTMLInputElement | null;
+    if (!searchInput) {
+      throw new Error('Search input not found');
+    }
+    if (!searchInput.offsetParent) {
+      throw new Error('Search input is not visible');
+    }
+
+    // Baseline: all four mocked events are rendered before any query is typed.
+    const initialText = host?.textContent ?? '';
+    if (!initialText.includes('OAuth2 PKCE')) {
+      throw new Error('Expected OAuth event in initial render');
+    }
+    if (!initialText.includes('connection pool exhaustion')) {
+      throw new Error('Expected connection-pool event in initial render');
+    }
+    if (!initialText.includes('Deployed v2.4.1')) {
+      throw new Error('Expected deploy event in initial render');
+    }
+
+    // Typing a query must update React-controlled state via fireEvent.change.
+    // Use a case-mismatched query to also exercise case-insensitive matching.
+    await act(async () => {
+      fireEvent.change(searchInput, { target: { value: 'OAUTH' } });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    if (searchInput.value !== 'OAUTH') {
+      throw new Error(`Search input value did not update (got "${searchInput.value}")`);
+    }
+
+    // Filtering must narrow the rendered list: only the OAuth event should remain.
+    const filteredText = host?.textContent ?? '';
+    if (!filteredText.includes('OAuth2 PKCE')) {
+      throw new Error('OAuth event should remain after filtering');
+    }
+    if (filteredText.includes('connection pool exhaustion')) {
+      throw new Error('Non-matching event "connection pool exhaustion" should be filtered out');
+    }
+    if (filteredText.includes('Deployed v2.4.1')) {
+      throw new Error('Non-matching deploy event should be filtered out');
+    }
+    if (filteredText.includes('Authentication patterns in microservices')) {
+      throw new Error('Non-matching research event should be filtered out');
+    }
+
+    // A query with no matches must show the search-specific empty state, not
+    // the generic "No recent activity" copy.
+    await act(async () => {
+      fireEvent.change(searchInput, { target: { value: 'zzz-no-match-zzz' } });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    const emptyText = host?.textContent ?? '';
+    if (!emptyText.includes('No events match your search')) {
+      throw new Error('Expected search-specific empty state copy');
+    }
+
+    // Clearing the input restores all events.
+    await act(async () => {
+      fireEvent.change(searchInput, { target: { value: '' } });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    if (searchInput.value !== '') {
+      throw new Error('Search input did not clear');
+    }
+    const restoredText = host?.textContent ?? '';
+    if (!restoredText.includes('connection pool exhaustion')) {
+      throw new Error('Clearing the search should restore filtered events');
+    }
   });
 });

@@ -10,8 +10,9 @@ import logging
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import cast, or_
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,10 +20,21 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 import app.shared_state as _shared_state
-from app.models import Project, Task, TaskHistory, TaskStatus
+from app.auth import require_admin
+from app.database import get_session
+from app.models import (
+    Project,
+    RegressionCaseStatus,
+    RegressionRemediationCase,
+    Task,
+    TaskHistory,
+    TaskStatus,
+)
 from app.payload_schemas import validate_internal_payload
 from app.strategic_completion import _is_direction_duplicate
 from app.time_utils import _utcnow
+
+router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +110,9 @@ def _task_error_fingerprint(task) -> "str | None":
         from app.failure_classification import classify_failure  # noqa: PLC0415
         from app.failure_stage import _derive_failure_stage  # noqa: PLC0415
 
-        cls = classify_failure(task) or ""
+        cls = (
+            classify_failure(task, at_time=task.last_heartbeat or task.started_at) or ""
+        )
         stage = _derive_failure_stage(cls, msg)
     except Exception:
         stage = None
@@ -189,9 +203,7 @@ def find_directions_sharing_fingerprint(
 def _is_recurring_failure_class(proj_anomalies: dict, failure_class: str) -> bool:
     """Return True if the given failure class has a persistent anomaly with occurrence_count >= 3."""
     entry = proj_anomalies.get(failure_class)
-    return bool(
-        isinstance(entry, dict) and entry.get("occurrence_count", 0) >= 3
-    )
+    return bool(isinstance(entry, dict) and entry.get("occurrence_count", 0) >= 3)
 
 
 def _expire_stale_project_anomalies(
@@ -229,6 +241,7 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     """
     # Deferred import to avoid circular dependency (main.py imports this module)
     from app.failure_classification import classify_failure  # noqa: PLC0415
+    from app.direction_outcomes import _is_cascade_cancelled  # noqa: PLC0415
 
     now = _utcnow()
     window_48h = now - timedelta(hours=48)
@@ -271,24 +284,31 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     anomalies = []
 
     # --- Failure class analysis ---
+    # Exclude benign orchestrator-cascade terminations (requeue replacements,
+    # dependency/parent cancellations, and pipeline supersessions) so that
+    # routine lifecycle bookkeeping never produces false spike or fingerprint signals.
     recent_failures = [
-        t for t in terminal_tasks if t.created_at and t.created_at >= window_48h
+        t
+        for t in terminal_tasks
+        if t.created_at and t.created_at >= window_48h and not _is_cascade_cancelled(t)
     ]
     prior_failures = [
         t
         for t in terminal_tasks
-        if t.created_at and prior_window_start <= t.created_at < window_48h
+        if t.created_at
+        and prior_window_start <= t.created_at < window_48h
+        and not _is_cascade_cancelled(t)
     ]
 
     # Group by failure class
     recent_by_class: dict = {}
     for t in recent_failures:
-        cls = classify_failure(t)
+        cls = classify_failure(t, at_time=t.last_heartbeat or t.started_at)
         recent_by_class.setdefault(cls, []).append(t)
 
     prior_by_class: dict = {}
     for t in prior_failures:
-        cls = classify_failure(t)
+        cls = classify_failure(t, at_time=t.last_heartbeat or t.started_at)
         prior_by_class[cls] = prior_by_class.get(cls, 0) + 1
 
     for cls, tasks in recent_by_class.items():
@@ -381,6 +401,8 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     from app.time_utils import _to_naive_utc
 
     for t in terminal_tasks:
+        if _is_cascade_cancelled(t):
+            continue
         # Task.created_at TIMESTAMPTZ since 0061; momentum_window_start + now are naive.
         t_created = _to_naive_utc(t.created_at)
         if not t_created or t_created < momentum_window_start:
@@ -1154,7 +1176,11 @@ async def seed_task_results_from_db(
     seeded = 0
     for task in rows:
         success = task.status == TaskStatus.COMPLETED
-        failure_class = "" if success else classify_failure(task)
+        failure_class = (
+            ""
+            if success
+            else classify_failure(task, at_time=task.last_heartbeat or task.started_at)
+        )
         task_type = task.first_payload.get("type", "")
         ts_iso = task.vm_stopped_at.isoformat()
         deque_ref.append(
@@ -1355,6 +1381,9 @@ async def _spawn_proactive_fingerprint_investigations(session: AsyncSession) -> 
             pid = uuid.UUID(proj_key)
         except (TypeError, ValueError):
             continue
+        project = await session.get(Project, pid)
+        if project is None:
+            continue
         for anomaly_key, entry in proj_anomalies.items():
             if per_project_spawned >= _PROACTIVE_INVESTIGATION_PER_PROJECT_CAP:
                 break
@@ -1404,8 +1433,8 @@ async def _spawn_proactive_fingerprint_investigations(session: AsyncSession) -> 
                 {
                     "type": "investigate",
                     "prompt": prompt,
-                    "base_branch": _shared_state.runtime_config.get(
-                        "integration_branch", "main"
+                    "base_branch": _shared_state.get_project_integration_branch(
+                        project
                     ),
                     "recent_changes": recent_changes or {},
                 },
@@ -1500,6 +1529,9 @@ async def _spawn_proactive_intra_direction_investigations(session: AsyncSession)
             pid = uuid.UUID(proj_key)
         except (TypeError, ValueError):
             continue
+        project = await session.get(Project, pid)
+        if project is None:
+            continue
         for anomaly_key, entry in proj_anomalies.items():
             if per_project_spawned >= _PROACTIVE_INVESTIGATION_PER_PROJECT_CAP:
                 break
@@ -1546,8 +1578,8 @@ async def _spawn_proactive_intra_direction_investigations(session: AsyncSession)
                 {
                     "type": "investigate",
                     "prompt": prompt,
-                    "base_branch": _shared_state.runtime_config.get(
-                        "integration_branch", "main"
+                    "base_branch": _shared_state.get_project_integration_branch(
+                        project
                     ),
                     "recent_changes": recent_changes or {},
                 },
@@ -1681,81 +1713,112 @@ async def _check_anomaly_proposals(project, session):
 
     Creates at most 1 proposal per call. Proposals require human approval (status='proposed').
     """
+    from app.task_locking import with_directions_locked
+
     proj_key = str(project.id)
-    proj_anomalies = _shared_state.persistent_anomalies.get(proj_key, {})
-    if not proj_anomalies:
-        return
-
-    proj_directions = list(project.directions or [])
-    rejected_proposals = [d for d in proj_directions if d.get("status") == "rejected"]
-    pending_count = sum(1 for d in proj_directions if d.get("status") == "proposed")
-    max_proposals = 10
-
-    if pending_count >= max_proposals:
+    if not _shared_state.persistent_anomalies.get(proj_key, {}):
         return
 
     now_iso = _utcnow().isoformat()
-    for anomaly_key, info in sorted(
-        ((k, v) for k, v in proj_anomalies.items() if isinstance(v, dict)),
-        key=lambda x: x[1].get("occurrence_count", 0),
-        reverse=True,
-    ):
-        if info.get("occurrence_count", 0) < 3:
-            continue
 
-        # Build proposal text based on the anomaly key pattern
-        details = info.get("latest_details", "")
-        if anomaly_key.startswith("Direction_"):
-            # Direction-level anomaly (declining merge rate / high failure)
-            proposal_text = f"Investigate {anomaly_key} anomaly — {details}"[:500]
-        else:
-            # Failure class anomaly (e.g. CODE_ERROR, PROVISION_FAILURE)
-            proposal_text = (
-                f"Investigate and reduce {anomaly_key} task failures — {details}"[:500]
-            )
+    # Mutable cell: records the anomaly_key whose occurrence_count needs reset
+    # after the lock is released (avoids doing _shared_state mutation inside lock).
+    _applied: dict = {}
 
-        if _is_direction_duplicate(proposal_text, proj_directions, rejected_proposals):
-            logger.info(
-                f"[ANOMALY] Skipping proposal for {anomaly_key} — overlaps with existing direction"
-            )
-            continue
-
-        new_direction = {
-            "id": f"d-{uuid.uuid4().hex[:8]}",
-            "text": proposal_text,
-            "priority": "high" if info["severity"] == "high" else "medium",
-            "paths": [],
-            "added_at": now_iso,
-            "status": "proposed",
-            "proposed_by": "ANOMALY_DETECTOR",
-            "proposal_rationale": (
-                f"Anomaly '{anomaly_key}' detected {info['occurrence_count']} times "
-                f"since {info['first_seen']}. Severity: {info['severity']}."
-            )[:500],
-            "proposed_at": now_iso,
-        }
-        proj_directions.append(new_direction)
-        project.directions = proj_directions
-        flag_modified(project, "directions")
-        session.add(project)
-        logger.info(
-            f"[ANOMALY] Created direction proposal for persistent anomaly: {anomaly_key}"
+    def _mutate(dirs: list) -> None:
+        # Compute the candidate snapshot INSIDE the lock closure so the read of
+        # _shared_state.persistent_anomalies is consistent with the serialized
+        # write window. Reading it before the lock let two gather'd coroutines
+        # interleave at the lock's await point and capture a sibling's
+        # transiently-zeroed occurrence_count, dropping one of the proposals.
+        proj_anomalies = _shared_state.persistent_anomalies.get(proj_key, {})
+        candidates = sorted(
+            ((k, v) for k, v in proj_anomalies.items() if isinstance(v, dict)),
+            key=lambda x: x[1].get("occurrence_count", 0),
+            reverse=True,
         )
 
-        # Reset occurrence count so we don't re-propose until it recurs
-        info["occurrence_count"] = 0
+        rejected_proposals = [d for d in dirs if d.get("status") == "rejected"]
+        pending_count = sum(1 for d in dirs if d.get("status") == "proposed")
+        if pending_count >= 10:
+            return
 
-        # Cap at 1 anomaly-driven proposal per cycle
-        break
+        for anomaly_key, info in candidates:
+            if info.get("occurrence_count", 0) < 3:
+                continue
+
+            # Build proposal text based on the anomaly key pattern
+            details = info.get("latest_details", "")
+            if anomaly_key.startswith("Direction_"):
+                proposal_text = f"Investigate {anomaly_key} anomaly — {details}"[:500]
+            else:
+                proposal_text = (
+                    f"Investigate and reduce {anomaly_key} task failures — {details}"[
+                        :500
+                    ]
+                )
+
+            is_dup = _is_direction_duplicate(proposal_text, dirs, rejected_proposals)
+            if is_dup:
+                logger.info(
+                    f"[ANOMALY] Skipping proposal for {anomaly_key} — overlaps with existing direction"
+                )
+                continue
+
+            new_direction = {
+                "id": f"d-{uuid.uuid4().hex[:8]}",
+                "text": proposal_text,
+                "priority": "high" if info["severity"] == "high" else "medium",
+                "paths": [],
+                "added_at": now_iso,
+                "status": "proposed",
+                "proposed_by": "ANOMALY_DETECTOR",
+                "proposal_rationale": (
+                    f"Anomaly '{anomaly_key}' detected {info['occurrence_count']} times "
+                    f"since {info['first_seen']}. Severity: {info['severity']}."
+                )[:500],
+                "proposed_at": now_iso,
+            }
+            dirs.append(new_direction)
+            _applied["anomaly_key"] = anomaly_key
+            logger.info(
+                f"[ANOMALY] Created direction proposal for persistent anomaly: {anomaly_key}"
+            )
+            # Cap at 1 anomaly-driven proposal per cycle
+            break
+
+    # Expire the cached directions attribute so the FOR NO KEY UPDATE re-SELECT
+    # inside with_directions_locked loads the array fresh from the locked row —
+    # otherwise a stale identity-mapped value could whole-array-overwrite a
+    # sibling completion's concurrently-committed append (canonical pattern,
+    # mirrors direction_outcomes / research_direction_state).
+    session.expire(project, ["directions"])
+    await with_directions_locked(session, project.id, _mutate)
+
+    if _applied:
+        # Reset occurrence count outside the lock so we don't re-propose until it recurs
+        anomaly_key = _applied["anomaly_key"]
+        info = _shared_state.persistent_anomalies.get(proj_key, {}).get(anomaly_key)
+        if info is not None:
+            info["occurrence_count"] = 0
 
 
 async def _expire_stale_proposals(session) -> int:
     """Expire direction proposals older than 30 days across all projects."""
     cutoff = (_utcnow() - timedelta(days=30)).isoformat()
+    # Lock the project rows under the canonical FOR NO KEY UPDATE project-row
+    # lock (see task_locking.project_lock) so this cron's read-modify-write of
+    # project.directions can't lose an update racing a concurrent same-project
+    # completion: each row is read fresh under the lock and held until this
+    # transaction ends. skip_locked=False mirrors with_directions_locked — a
+    # background sweep waits for the lock rather than silently dropping the
+    # expiry. The loop does no external I/O, so the hold is brief.
     projects = (
         (
             await session.execute(
-                select(Project).where(Project.autonomous_enabled.is_(True))
+                select(Project)
+                .where(Project.autonomous_enabled.is_(True))
+                .with_for_update(skip_locked=False, key_share=True)
             )
         )
         .scalars()
@@ -1782,5 +1845,115 @@ async def _expire_stale_proposals(session) -> int:
                 f"[DIRECTIONS] Expired {expired_count} stale proposals for project {project.id}"
             )
     if total_expired:
-        await session.commit()
+        await session.commit()  # commit releases the project-row locks
+    else:
+        # Nothing changed, but the FOR-UPDATE select still took row locks;
+        # release them now rather than holding them for the rest of the
+        # idle-research cycle (which performs external I/O) until the session
+        # is closed.
+        await session.rollback()
     return total_expired
+
+
+@router.get("/anomaly-tracker/snapshot")
+async def get_anomaly_tracker_snapshot(
+    project_id: Optional[uuid.UUID] = Query(default=None),
+    freshness_hours: int = Query(default=24, ge=1, le=720),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Read-only snapshot of shared_state.persistent_anomalies.
+
+    Surfaces which fingerprints the detection pipeline is currently tracking,
+    how aged they are, and when the detection sweep last ran (so a silent
+    writer failure is visible). Pure passthrough of stored entries — no
+    normalization, no garbage collection.
+    """
+    pid_filter = str(project_id) if project_id else None
+    now = _utcnow()
+    stale_cutoff_iso = (now - timedelta(hours=freshness_hours)).isoformat()
+
+    # Collect (project_id, RegressionRemediationCase) for last_dispatch_attempt_at.
+    # Best-effort lookup: an active case whose regression_class is the dispatcher's
+    # f"anomaly:{anomaly_key}" form gets its last_seen_at echoed; missing rows
+    # return null. Filter to ACTIVE so this scales with backlog rather than
+    # whole-table size on a hot endpoint.
+    case_where = [RegressionRemediationCase.status == RegressionCaseStatus.ACTIVE]
+    if project_id is not None:
+        case_where.append(RegressionRemediationCase.project_id == project_id)
+    cases = (
+        (await session.execute(select(RegressionRemediationCase).where(*case_where)))
+        .scalars()
+        .all()
+    )
+    # (project_id, anomaly_key) -> latest last_seen_at across rows. The
+    # dispatcher writes regression_class = f"anomaly:{anomaly_key}"
+    # (pipeline_regression_dispatcher.py:1748) — strip that prefix here so the
+    # index keys match the persistent_anomalies anomaly_key directly.
+    case_index: Dict[tuple, datetime] = {}
+    _ANOMALY_PREFIX = "anomaly:"
+    for c in cases:
+        if not c.last_seen_at:
+            continue
+        rclass = c.regression_class or ""
+        if not rclass.startswith(_ANOMALY_PREFIX):
+            continue
+        anomaly_key = rclass[len(_ANOMALY_PREFIX) :]
+        key = (str(c.project_id), anomaly_key)
+        prior = case_index.get(key)
+        if prior is None or c.last_seen_at > prior:
+            case_index[key] = c.last_seen_at
+
+    projects_payload: List[Dict[str, Any]] = []
+    total = 0
+    for proj_key, proj_anomalies in _shared_state.persistent_anomalies.items():
+        if pid_filter and proj_key != pid_filter:
+            continue
+        if not proj_anomalies:
+            continue
+        entries: List[Dict[str, Any]] = []
+        for anomaly_key, entry in proj_anomalies.items():
+            if not isinstance(entry, dict):
+                continue
+            first_seen = entry.get("first_seen")
+            last_seen = entry.get("last_seen")
+            first_seen_iso = (
+                first_seen.isoformat()
+                if isinstance(first_seen, datetime)
+                else (first_seen or None)
+            )
+            last_seen_iso = (
+                last_seen.isoformat()
+                if isinstance(last_seen, datetime)
+                else (last_seen or None)
+            )
+            stuck = bool(last_seen_iso and last_seen_iso < stale_cutoff_iso)
+            dispatch_at = case_index.get((proj_key, anomaly_key))
+            entries.append(
+                {
+                    "key": anomaly_key,
+                    "first_seen": first_seen_iso,
+                    "last_seen": last_seen_iso,
+                    "occurrence_count": entry.get("occurrence_count", 0),
+                    "severity": entry.get("severity"),
+                    "latest_details": entry.get("latest_details"),
+                    "fingerprint": entry.get("fingerprint"),
+                    "affected_directions": entry.get("affected_directions"),
+                    "last_dispatch_attempt_at": dispatch_at.isoformat()
+                    if dispatch_at
+                    else None,
+                    "stuck": stuck,
+                }
+            )
+        # Sort by last_seen desc; entries with missing last_seen sink to the bottom.
+        entries.sort(key=lambda e: e.get("last_seen") or "", reverse=True)
+        total += len(entries)
+        projects_payload.append({"project_id": proj_key, "anomalies": entries})
+
+    last_run = _shared_state.last_anomaly_detection_run_at
+    return {
+        "last_detection_run_at": last_run.isoformat() if last_run else None,
+        "freshness_window_hours": freshness_hours,
+        "total": total,
+        "projects": projects_payload,
+    }

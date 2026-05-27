@@ -73,6 +73,10 @@ vi.mock('../build-config.js', async (importOriginal) => {
   return { ...actual };
 });
 
+vi.mock('../workspacePrep.js', () => ({
+  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
+}));
+
 // fs is consumed by both `import fs from 'fs'` (default import) and
 // `import * as fs from 'fs'` (namespace import) across the codebase under
 // test. Mock both shapes so vitest doesn't reject either access pattern.
@@ -289,6 +293,29 @@ describe('handleCreate configuration', () => {
     await handleCreate(TASK_ID, { prompt: 'Do something', base_branch: 'feature/parent' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const opts = capturedOpts();
     expect(opts.baseBranch).toBe('feature/parent');
+    expect(opts.testsOnMainBranch).toBe(false);
+  });
+
+  it('uses task.project_metadata.promotion_target when payload omits promotion_target', async () => {
+    const task = { title: 'Task', description: '', project_metadata: { promotion_target: 'release' } };
+    await handleCreate(TASK_ID, { prompt: 'Do something', base_branch: 'release' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const opts = capturedOpts();
+    expect(opts.testsOnMainBranch).toBe(true);
+  });
+
+  it('sets testsOnMainBranch=true via integration_branch cascade when promotion_target absent and baseBranch=master', async () => {
+    const task = { title: 'Task', description: '', project_metadata: { integration_branch: 'master' } };
+    await handleCreate(TASK_ID, { prompt: 'Do something', base_branch: 'master' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const opts = capturedOpts();
+    expect(opts.baseBranch).toBe('master');
+    expect(opts.testsOnMainBranch).toBe(true);
+  });
+
+  it('sets testsOnMainBranch=false when baseBranch does not match integration_branch', async () => {
+    const task = { title: 'Task', description: '', project_metadata: { integration_branch: 'master' } };
+    await handleCreate(TASK_ID, { prompt: 'Do something', base_branch: 'feature/x' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const opts = capturedOpts();
+    expect(opts.baseBranch).toBe('feature/x');
     expect(opts.testsOnMainBranch).toBe(false);
   });
 });
@@ -1787,10 +1814,10 @@ describe('handleCreate — enable_fresh_reviewer flag', () => {
     expect(reviewerCall).toBeUndefined();
   });
 
-  it('runs fresh-reviewer pass when project_metadata.is_self_repo is true and enable_fresh_reviewer is unset', async () => {
+  it('skips fresh-reviewer pass when only is_self_repo is true and enable_fresh_reviewer is unset', async () => {
     const idx = await import('../index.js');
     vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
-    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
+    vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
     vi.mocked(idx.setupWorkspace).mockResolvedValue({ workBranch: 'task-abc123', shortId: 'abc123' });
 
     const task = {
@@ -1802,10 +1829,10 @@ describe('handleCreate — enable_fresh_reviewer flag', () => {
     const reviewerCall = vi.mocked(idx.runClaudeCode).mock.calls.find(
       call => typeof call[0] === 'string' && call[0].includes('You are reviewing a PR'),
     );
-    expect(reviewerCall).toBeDefined();
+    expect(reviewerCall).toBeUndefined();
   });
 
-  it('still skips fresh-reviewer pass for auto-remediation tasks even when is_self_repo is true', async () => {
+  it('still skips fresh-reviewer pass for auto-remediation tasks even when enable_fresh_reviewer is true', async () => {
     const idx = await import('../index.js');
     vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
     vi.mocked(idx.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
@@ -1814,7 +1841,7 @@ describe('handleCreate — enable_fresh_reviewer flag', () => {
     const task = {
       title: 'Test task', description: '',
       context: { auto_remediation: true }, project_context: {},
-      project_metadata: { is_self_repo: true, enable_fresh_reviewer: false },
+      project_metadata: { enable_fresh_reviewer: false },
     };
     await handleCreate(TASK_ID, { prompt: 'Do something' }, task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const reviewerCall = vi.mocked(idx.runClaudeCode).mock.calls.find(
@@ -2745,7 +2772,7 @@ describe('runStandardHandler incomplete_review auto-trigger', () => {
     );
   });
 
-  it('does NOT auto-trigger when normal fresh-reviewer already ran (is_self_repo=true)', async () => {
+  it('does NOT auto-trigger when normal fresh-reviewer already ran (enable_fresh_reviewer=true)', async () => {
     const { default: fs } = await import('fs');
     const idx = await import('../index.js');
     vi.mocked(idx.git).mockReturnValue(BIG_DIFF);
@@ -2763,9 +2790,9 @@ describe('runStandardHandler incomplete_review auto-trigger', () => {
       }
       return '';
     });
-    const selfRepoTask = { ...TASK, project_metadata: { is_self_repo: true } };
+    const enabledFreshReviewerTask = { ...TASK, project_metadata: { enable_fresh_reviewer: true } };
 
-    await handleCreate(TASK_ID, PAYLOAD, selfRepoTask, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    await handleCreate(TASK_ID, PAYLOAD, enabledFreshReviewerTask, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     // Only one reviewer pass (the normal path), not two
     const reviewerCalls = vi.mocked(idx.runClaudeCode).mock.calls.filter(
@@ -3464,5 +3491,110 @@ describe('handleCreate — SCOPE_EMPTY pre-flight guard', () => {
       task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
     );
     expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalled();
+  });
+});
+
+// ── operator_requested_review_for branch-existence short-circuit ──────────────
+describe('operator_requested_review_for branch-existence check', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('short-circuits with COMPLETED when ls-remote returns empty (branch deleted)', async () => {
+    const { execFileSync } = await import('child_process');
+    const { persistAndPostStatus } = await import('../index.js');
+    // ls-remote returns empty → branch does not exist
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+
+    const task = {
+      title: 'Review PR #5819',
+      description: '',
+      context: { operator_requested_review_for: 'pr-5819' },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Automated review', branch: 'blueprint/task-deleted', base_branch: 'main' },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      TASK_ID,
+      expect.objectContaining({
+        status: 'COMPLETED',
+        failure_category: 'PR_BRANCH_DELETED',
+      }),
+    );
+    // runCodeChangeTask must NOT be invoked — we returned early
+    expect(vi.mocked(runCodeChangeTask)).not.toHaveBeenCalled();
+  });
+
+  it('proceeds to clone when ls-remote returns a non-empty ref line (branch exists)', async () => {
+    const { execFileSync } = await import('child_process');
+    const { prepareWorkspaceForRole } = await import('../workspacePrep.js');
+    // ls-remote returns a non-empty line → branch exists
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from('abc123\trefs/heads/blueprint/task-active\n'));
+    // git mock (merge-base etc.) already returns ''
+
+    const task = {
+      title: 'Review PR #9999',
+      description: '',
+      context: { operator_requested_review_for: 'pr-9999' },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Automated review', branch: 'blueprint/task-active', base_branch: 'main' },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    expect(vi.mocked(prepareWorkspaceForRole)).toHaveBeenCalled();
+  });
+
+  it('proceeds to clone when ls-remote itself throws (treats as branch-present to surface real errors)', async () => {
+    const { execFileSync } = await import('child_process');
+    const { prepareWorkspaceForRole } = await import('../workspacePrep.js');
+    vi.mocked(execFileSync).mockImplementationOnce(() => { throw new Error('network error'); });
+
+    const task = {
+      title: 'Review PR #8888',
+      description: '',
+      context: { operator_requested_review_for: 'pr-8888' },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Automated review', branch: 'blueprint/task-maybe', base_branch: 'main' },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    // ls-remote threw → we assume the branch exists and let prepareWorkspaceForRole run
+    expect(vi.mocked(prepareWorkspaceForRole)).toHaveBeenCalled();
+    // COMPLETED/PR_BRANCH_DELETED must NOT have been posted
+    const { persistAndPostStatus } = await import('../index.js');
+    const deletedCalls = vi.mocked(persistAndPostStatus).mock.calls.filter(
+      ([, body]) => body['failure_category'] === 'PR_BRANCH_DELETED',
+    );
+    expect(deletedCalls).toHaveLength(0);
+  });
+
+  it('uses project_metadata.integration_branch as prBaseBranch fallback when payload.base_branch is absent', async () => {
+    const { execFileSync } = await import('child_process');
+    const { prepareWorkspaceForRole } = await import('../workspacePrep.js');
+    // ls-remote returns non-empty → branch exists
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from('abc123\trefs/heads/blueprint/task-trunk\n'));
+
+    const task = {
+      title: 'Review PR #7777',
+      description: '',
+      context: { operator_requested_review_for: 'pr-7777' },
+      project_metadata: { integration_branch: 'trunk' },
+    };
+    await handleCreate(
+      TASK_ID,
+      { prompt: 'Automated review', branch: 'blueprint/task-trunk' },
+      task, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    expect(vi.mocked(prepareWorkspaceForRole)).toHaveBeenCalledWith(
+      expect.objectContaining({ baseBranch: 'trunk' }),
+    );
   });
 });

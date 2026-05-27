@@ -4,6 +4,7 @@ import {
   WORKSPACE, strVal, sendLog, validateBranchName,
   persistAndPostStatus, apiGet, runClaudeCode,
   setCurrentPromptFingerprint, sendHeartbeatSync,
+  resolveBaseBranch,
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
@@ -22,7 +23,7 @@ export async function handleDesignDocUpdate(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawBaseBranch = resolveBaseBranch(payload, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   statusRef.value = `Cloning ${owner}/${repo} for architecture review...`;
@@ -227,9 +228,9 @@ Skip full re-analysis of systems with no files in the manifest.
     - Delete systems/capabilities/notes that describe code that no longer exists or no longer matters.
     - Merge duplicate or near-duplicate pages; rename to canonical IDs.
     - Use ./design-doc delete "<key>" liberally. A lean, accurate doc beats a sprawling one.
-11. ACTIVELY CURATE the playbook (./playbook get, ./playbook delete <key>):
-    - Remove entries that describe fixed bugs, stale APIs, or patterns the codebase no longer uses.
-    - Merge duplicates. Don't hoard entries "just in case" — keep only what a future agent would actually benefit from.
+11. ACTIVELY CURATE the playbook (./playbook get, ./playbook set <key> <value>):
+    - Overwrite stale entries with ./playbook set — entries describing fixed bugs, stale APIs, or patterns the codebase no longer uses should be replaced with corrected guidance.
+    - Merge duplicates by overwriting one canonical key with the consolidated value. Don't hoard entries "just in case" — keep only what a future agent would actually benefit from.
     - There is no reward for playbook volume. Fewer, sharper entries is better than hundreds of vague ones.`;
 
   statusRef.value = 'Running architecture review...';

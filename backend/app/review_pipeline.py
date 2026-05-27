@@ -90,10 +90,11 @@ def build_ci_failure_fix_prompt(
     check_runs_hint = ""
     if owner and repo:
         check_runs_hint = (
-            f"  2. Inspect the failing checks via the GitHub API "
-            f'(`curl -H "Authorization: Bearer $GITHUB_TOKEN" '
-            f"https://api.github.com/repos/{owner}/{repo}/commits/$(git rev-parse HEAD)/check-runs`) "
-            f"to confirm which checks are still failing on the latest head.\n"
+            "  2. Inspect the failing checks via the orchestrator's read-only proxy "
+            '(`curl -sS -H "X-Agent-Token: $AGENT_API_TOKEN" '
+            '"$ORCHESTRATOR_URL/api/agent/github/check-runs?commit_sha=$(git rev-parse HEAD)" '
+            "| jq '.data.details[]'`) "
+            "to confirm which checks are still failing on the latest head.\n"
         )
     return (
         f"PR #{pr_number} is blocked by failing CI checks (code review already approved).\n\n"
@@ -110,7 +111,7 @@ def build_ci_failure_fix_prompt(
         f"Diagnose before fixing. A 'new' test failure can be: (a) your diff regressed, "
         f"(b) a sibling PR broke the test — mock-signature drift or fixture change, or (c) flake. "
         f"Read the failing test first; confirm its mocks match the live signatures they patch. A "
-        f"TypeError like \"got multiple values for argument\" or \"unexpected keyword\" is the mock, "
+        f'TypeError like "got multiple values for argument" or "unexpected keyword" is the mock, '
         f"not your code. Run the test on `{base_branch}` HEAD too — if it fails there, fix the test.\n\n"
         f"Focus: fix the build/lint/test errors — the code review is already approved, "
         f"don't re-architect unrelated code. If a failing test was already broken on `{base_branch}` "
@@ -383,6 +384,9 @@ SCOPE_PRESSURE_WARN_THRESHOLD = 0.7
 # SCOPE_PRESSURE_HARD_CAP_PERCENTAGE (90%) level.
 SCOPE_PRESSURE_HARD_CAP_PERCENTAGE = 90
 SCOPE_PRESSURE_HARD_CAP_REMAINING = 2
+# For large-scope tasks, allow slightly more remaining iterations (floor of 3)
+# so we don't slam to 2 remaining on a near-finished large refactor.
+SCOPE_PRESSURE_HARD_CAP_REMAINING_LARGE = 3
 
 _SCOPE_PRESSURE_HARD_CAP_PREFIX = (
     "🚫 SCOPE BUDGET EXHAUSTED: this PR has consumed {count}/{budget} "
@@ -1995,7 +1999,7 @@ async def _spawn_pipeline_task(
                 )
                 fix_prompt = early_prefix + (fix_prompt or "")
 
-    # Graduated scope-budget pressure cap: a medium-scope fix cycle's
+    # Graduated scope-budget pressure cap: a medium- or large-scope fix cycle's
     # remaining iterations are scaled down by how close the PR is to its
     # production file budget. Activation is at SCOPE_PRESSURE_WARN_THRESHOLD
     # (70%); the no-new-files prompt still only fires at
@@ -2016,15 +2020,22 @@ async def _spawn_pipeline_task(
         )
         if (
             _util_for_pressure
-            and _scope_for_pressure == "medium"
+            and _scope_for_pressure in ("medium", "large")
             and _util_for_pressure.get("percentage", 0)
             >= SCOPE_PRESSURE_WARN_THRESHOLD * 100
         ):
             util_pct = _util_for_pressure["percentage"]
             base_remaining = per_chain_cap - iteration
             if base_remaining > 0:
+                # Use a slightly higher hard cap floor for large scope to avoid
+                # slamming to 2 remaining iterations on a near-finished large refactor.
+                hard_cap_floor = (
+                    SCOPE_PRESSURE_HARD_CAP_REMAINING_LARGE
+                    if _scope_for_pressure == "large"
+                    else SCOPE_PRESSURE_HARD_CAP_REMAINING
+                )
                 graduated_remaining = max(
-                    SCOPE_PRESSURE_HARD_CAP_REMAINING,
+                    hard_cap_floor,
                     round(base_remaining * (1.0 - util_pct / 100)),
                 )
                 hard_cap_target = iteration + graduated_remaining

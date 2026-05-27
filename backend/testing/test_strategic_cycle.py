@@ -338,3 +338,83 @@ async def test_mark_phase2_completed_stores_memo_counts(db_session):
     assert updated.cycle_metadata["memos_available"] == 5
     assert updated.cycle_metadata["memos_cited"] == 2
     assert updated.outcome == strategic_cycle.OUTCOME_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_ever_cited_memo_no_cycles(db_session):
+    """Project with no cycles returns ever_cited=False."""
+    project = await _make_project(db_session)
+    result = await strategic_cycle.ever_cited_memo(db_session, project.id)
+    assert result == {
+        "ever_cited": False,
+        "first_cycle_id": None,
+        "first_cited_at": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_ever_cited_memo_no_citations(db_session):
+    """Completed cycles with memos_cited=0 return ever_cited=False."""
+    project = await _make_project(db_session)
+    for _ in range(3):
+        cycle = await strategic_cycle.create(db_session, project_id=project.id)
+        await db_session.commit()
+        await strategic_cycle.mark_phase2_completed(
+            db_session, cycle.id, memos_available=2, memos_cited=0
+        )
+        await db_session.commit()
+
+    result = await strategic_cycle.ever_cited_memo(db_session, project.id)
+    assert result == {
+        "ever_cited": False,
+        "first_cycle_id": None,
+        "first_cited_at": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_ever_cited_memo_with_citation(db_session):
+    """When a cycle has memos_cited > 0, ever_cited=True and returns that cycle."""
+    project = await _make_project(db_session)
+    # First cycle: no citations
+    c1 = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await strategic_cycle.mark_phase2_completed(
+        db_session, c1.id, memos_available=1, memos_cited=0
+    )
+    await db_session.commit()
+    # Second cycle: one citation
+    c2 = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await strategic_cycle.mark_phase2_completed(
+        db_session, c2.id, memos_available=2, memos_cited=1
+    )
+    await db_session.commit()
+    await db_session.refresh(c2)
+
+    result = await strategic_cycle.ever_cited_memo(db_session, project.id)
+    assert result["ever_cited"] is True
+    assert result["first_cycle_id"] == c2.id
+    assert result["first_cited_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_ever_cited_memo_citation_outside_recent_window(db_session):
+    """Citation found even when it falls outside the 20-cycle recent window."""
+    project = await _make_project(db_session)
+    # Create 25 cycles; only cycle 1 has a citation (outside a 20-cycle window)
+    first_cycle_id = None
+    for i in range(25):
+        c = await strategic_cycle.create(db_session, project_id=project.id)
+        await db_session.commit()
+        cited = 1 if i == 0 else 0
+        await strategic_cycle.mark_phase2_completed(
+            db_session, c.id, memos_available=1, memos_cited=cited
+        )
+        await db_session.commit()
+        if i == 0:
+            first_cycle_id = c.id
+
+    result = await strategic_cycle.ever_cited_memo(db_session, project.id)
+    assert result["ever_cited"] is True
+    assert result["first_cycle_id"] == first_cycle_id

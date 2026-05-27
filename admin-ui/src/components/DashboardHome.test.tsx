@@ -163,6 +163,7 @@ function setupApiMocks({
     if (url.includes('/version-lifecycle')) return Promise.resolve(notFoundResponse());
     if (url.includes('/direction-sr-breakdown')) return Promise.resolve(directionSrBreakdown ? jsonResponse(directionSrBreakdown) : notFoundResponse());
     if (url.includes('/prompt-fingerprint-analytics')) return Promise.resolve(promptFingerprintAnalytics ? jsonResponse(promptFingerprintAnalytics) : notFoundResponse());
+    if (url.includes('/health-overview')) return Promise.resolve(jsonResponse({ overall_status: 'healthy', success_rate: { current: null, trend: null, window_hours: 24 }, queue_depth: { queued: 0, active: 0, evaluating: 0 }, actionable_issues: [] }));
     // Unmatched endpoints (sr-blind-spots, sr-reviewer-disagreements,
     // sr-recent-misses, regression-cases, task-duration-stats, etc.) return 404 so the
     // component leaves the corresponding state slot at its initial null/[] sentinel rather
@@ -194,7 +195,7 @@ describe('DashboardHome', () => {
     );
 
     expect(screen.getByText('Task Status')).toBeInTheDocument();
-    expect(screen.getByText('Actionable Issues')).toBeInTheDocument();
+    expect(screen.getByText('System Health')).toBeInTheDocument();
     expect(container.querySelectorAll('.animate-pulse').length).toBeGreaterThan(0);
     expect(screen.queryByText('All systems healthy')).not.toBeInTheDocument();
   });
@@ -475,51 +476,44 @@ describe('DashboardHome', () => {
     expect(screen.queryByText('Provider Account Health')).not.toBeInTheDocument();
   });
 
-  it('calls onViewTask when clicking a stuck-task actionable issue', async () => {
-    const stuckTask = makeTask({
+  it('calls onViewTask when clicking a task link in a health-overview issue', async () => {
+    const linkedTask = makeTask({
       id: 'task-stuck',
       title: 'Repair failing deployment hook',
       status: 'IN_PROGRESS',
     });
     const onViewTask = vi.fn();
 
-    setupApiMocks({
-      digest: {
-        failed_count: 0,
-        pending_approval_count: 0,
-        completed_count: 0,
-        failure_groups: [],
-        direction_progress: [],
-        recent_completions: [],
-      },
-      diagnostics: makeDiagnostics({
-        stuck_tasks: [
+    apiFetchMock.mockImplementation((url: string) => {
+      if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse({ failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] }));
+      if (url.includes('/health-overview')) return Promise.resolve(jsonResponse({
+        overall_status: 'degraded',
+        success_rate: { current: 0.72, trend: 'declining', window_hours: 24 },
+        queue_depth: { queued: 1, active: 2, evaluating: 0 },
+        actionable_issues: [
           {
-            task_id: 'task-stuck',
-            title: 'Repair failing deployment hook',
-            status: 'IN_PROGRESS',
-            stuck_reason: 'no_heartbeat',
-            stuck_for_seconds: 7200,
-            attempt_count: 2,
-            failure_class: null,
-            unresolvable_deps: [],
-            remediation_hint: 'Check VM logs',
+            severity: 'warning',
+            title: '1 task(s) lost heartbeat',
+            hint: 'The reaper will reclaim and retry these tasks automatically.',
+            task_ids: ['task-stuck'],
+            category: 'stuck_tasks',
           },
         ],
-      }),
+      }));
+      return Promise.resolve(notFoundResponse());
     });
 
     const user = userEvent.setup();
     render(
       <DashboardHome
-        tasks={[stuckTask]}
+        tasks={[linkedTask]}
         selectedProjectId="proj1"
         onViewTask={onViewTask}
       />,
     );
 
-    await user.click(await screen.findByText('Stuck: Repair failing deployment hook'));
-    expect(onViewTask).toHaveBeenCalledWith(stuckTask);
+    await user.click(await screen.findByRole('button', { name: /Repair failing deployment hook/i }));
+    expect(onViewTask).toHaveBeenCalledWith(linkedTask);
   });
 
   describe('CPM retirement-risk indicator', () => {
@@ -1295,6 +1289,83 @@ describe('DashboardHome', () => {
     // Shows finding count, not task count
     expect(card).toHaveTextContent('n=4 findings');
     expect(card).not.toHaveTextContent('75%');
+  });
+
+  describe('SR Catch Rate significance-gated verdict', () => {
+    const baseDigest = {
+      failed_count: 0,
+      pending_approval_count: 0,
+      completed_count: 0,
+      failure_groups: [],
+      direction_progress: [],
+      recent_completions: [],
+      self_review_prediction_accuracy: { prediction_hit_rate: 0.75 },
+    };
+    // Enough findings (10 >= MIN_SR_CATCH_FINDINGS=5) so the card renders the full view
+    const baseTrends = {
+      overall_hit_rate: 0.75,
+      computed_at: '2026-05-20T00:00:00Z',
+      categories: {
+        correctness: { current_hit_rate: 0.80, previous_hit_rate: 0.60, current_human_count: 10, previous_human_count: 8 },
+      },
+    };
+
+    it('shows stable indicator (→) and opacity-50 when overall_trend_verdict is stable', async () => {
+      setupApiMocks({
+        digest: { ...baseDigest, self_review_prediction_accuracy_trends: { ...baseTrends, previous_overall_hit_rate: 0.70, overall_trend_verdict: 'stable', overall_trend_significant: false } },
+        diagnostics: makeDiagnostics(),
+      });
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      const card = await screen.findByText('SR Catch Rate').then((el) => el.closest('div[class*="rounded-lg"]'));
+      expect(card).toHaveTextContent('75%');
+      expect(card).toHaveTextContent('→');
+      expect(card?.querySelector('.opacity-50')).not.toBeNull();
+    });
+
+    it('de-emphasizes delta with → when overall_trend_significant is false despite large raw delta', async () => {
+      setupApiMocks({
+        digest: { ...baseDigest, self_review_prediction_accuracy_trends: { ...baseTrends, previous_overall_hit_rate: 0.60, overall_trend_verdict: null, overall_trend_significant: false } },
+        diagnostics: makeDiagnostics(),
+      });
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      const card = await screen.findByText('SR Catch Rate').then((el) => el.closest('div[class*="rounded-lg"]'));
+      expect(card).toHaveTextContent('+15pp');
+      expect(card).toHaveTextContent('→');
+      expect(card?.querySelector('.opacity-50')).not.toBeNull();
+    });
+
+    it('shows declining indicator (↓) when overall_trend_verdict is declining', async () => {
+      setupApiMocks({
+        digest: { ...baseDigest, self_review_prediction_accuracy_trends: { ...baseTrends, previous_overall_hit_rate: 0.80, overall_trend_verdict: 'declining', overall_trend_significant: true } },
+        diagnostics: makeDiagnostics(),
+      });
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      const card = await screen.findByText('SR Catch Rate').then((el) => el.closest('div[class*="rounded-lg"]'));
+      expect(card).toHaveTextContent('↓');
+      expect(card).toHaveTextContent('-5pp');
+    });
+
+    it('shows stale badge when trend data is stale', async () => {
+      setupApiMocks({
+        digest: { ...baseDigest, self_review_prediction_accuracy_trends: { ...baseTrends, previous_overall_hit_rate: 0.70, is_stale: true } },
+        diagnostics: makeDiagnostics(),
+      });
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      const card = await screen.findByText('SR Catch Rate').then((el) => el.closest('div[class*="rounded-lg"]'));
+      expect(card).toHaveTextContent('stale');
+      expect(card).not.toHaveTextContent('frozen');
+    });
+
+    it('shows frozen badge when data_sufficient is false and not stale', async () => {
+      setupApiMocks({
+        digest: { ...baseDigest, self_review_prediction_accuracy_trends: { ...baseTrends, previous_overall_hit_rate: 0.70, is_stale: false, data_sufficient: false } },
+        diagnostics: makeDiagnostics(),
+      });
+      render(<DashboardHome tasks={[]} selectedProjectId="proj1" onViewTask={vi.fn()} />);
+      const card = await screen.findByText('SR Catch Rate').then((el) => el.closest('div[class*="rounded-lg"]'));
+      expect(card).toHaveTextContent('frozen');
+      expect(card).not.toHaveTextContent('stale');
+    });
   });
 
   it('SR Unfixed Flags tile shows the self-flagged shipped-unfixed rate, not the catch hit rate', async () => {

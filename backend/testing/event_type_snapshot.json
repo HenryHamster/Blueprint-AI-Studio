@@ -163,6 +163,12 @@
       "source_fn": "post_direction_outcome_stalled_message"
     },
     {
+      "name": "direction_outcome_scaffolding_escalation",
+      "classification": "escalation",
+      "message_type": "BLOCKER",
+      "source_fn": "post_direction_outcome_scaffolding_escalation_message"
+    },
+    {
       "name": "direction_churn_pause",
       "classification": "escalation",
       "message_type": "BLOCKER",

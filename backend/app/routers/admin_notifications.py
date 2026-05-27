@@ -31,10 +31,11 @@ from app.shared_state import limiter
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
 from app.task_locking import lock_project_or_429
 from app import notification_dispatch as _nd
-from app.playbook_learning import (
+from app.playbook_storage import (
     _archive_least_useful_entry,
     _playbook_size_bytes,
     _PLAYBOOK_CAPACITY_BYTES,
+    record_playbook_tombstone,
 )
 
 logger = logging.getLogger(__name__)
@@ -1182,28 +1183,9 @@ async def admin_playbook_delete(
 
     del doc[playbook_key]
 
-    # Record a tombstone so _is_auto_playbook_suppressed can prevent re-creation
-    tombstone = {
-        "_archived_key": playbook_key,
-        "_archived_at": _utcnow().isoformat(),
-        "_retirement_reason": "operator_deleted",
-    }
-    archive = list(doc.get("playbook_archive") or [])
-    archive.append(tombstone)
-    import app.shared_state as _ss  # noqa: PLC0415
-
-    archive_max = _ss.runtime_config.get("playbook_archive_max", 50)
-    if archive_max > 0 and len(archive) > archive_max:
-        archive = archive[-archive_max:]
-    doc["playbook_archive"] = archive
-
-    # Also track in deleted_keys for durability against archive rotation
-    deleted_keys = list(doc.get("playbook_deleted_keys") or [])
-    if playbook_key not in deleted_keys:
-        deleted_keys.append(playbook_key)
-    if len(deleted_keys) > 200:
-        deleted_keys = deleted_keys[-200:]
-    doc["playbook_deleted_keys"] = deleted_keys
+    # Record a tombstone so auto-playbook regeneration stays suppressed even
+    # after archive trimming.
+    record_playbook_tombstone(doc, playbook_key, archived_at=_utcnow().isoformat())
 
     meta = doc.get("_meta", {"revision": 0})
     meta["revision"] = meta.get("revision", 0) + 1

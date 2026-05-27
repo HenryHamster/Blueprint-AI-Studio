@@ -162,6 +162,8 @@ async def test_warm_vm_full_flow_spawn_heartbeat_next_role_claim(
         assert spawned.vm_instance_id == source_vm_id
         timing = (spawned.context or {}).get("_timing", {})
         assert timing.get("warm_start") is True
+        # Both context flag and column must be synchronized.
+        assert spawned.vm_warm_start is True
         # Issue H3: the diagnostic marker distinguishes server-side seeding
         # from agent-reported values.
         assert timing.get("warm_claim_origin") == "next_role_endpoint"

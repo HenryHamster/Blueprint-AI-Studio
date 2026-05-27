@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select, delete
+from sqlalchemy import update
 from typing import Dict, Any, List
 import uuid
 from datetime import timedelta
@@ -11,16 +12,33 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
 from app.shared_state import limiter
-from app.models import Task, TaskStatus, Project, ProjectMember, _utcnow
+from app.models import (
+    Task,
+    TaskStatus,
+    Project,
+    ProjectMember,
+    _utcnow,
+    notify_tasks_terminated,
+)
 from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
 from app.task_locking import lock_project_or_429
+from app.build_config_lint import build_config_lint_warnings
 
 router = APIRouter(
     prefix="/api/admin",
     tags=["admin-projects"],
     dependencies=[Depends(get_current_user)],
 )
+
+
+def _redact_build_config(build_config: dict, role: str) -> dict:
+    """Return build_config with env_vars omitted for non-owner callers."""
+    if role == "owner":
+        return build_config
+    result = dict(build_config)
+    result.pop("env_vars", None)
+    return result
 
 
 @router.get("/projects")
@@ -75,7 +93,10 @@ async def get_all_projects(
                 "github_repo": row.github_repo,
                 "is_self_repo": row.is_self_repo,
                 "autonomous_enabled": row.autonomous_enabled,
-                "build_config": row.build_config or {},
+                "build_config": _redact_build_config(
+                    row.build_config or {}, row.my_role
+                ),
+                "build_config_warnings": build_config_lint_warnings(row.build_config),
                 "sr_catch_rate_targets": row.sr_catch_rate_targets or {},
                 "running_update_acknowledged_at": (
                     row.running_update_acknowledged_at.isoformat()
@@ -131,7 +152,8 @@ async def get_project(
             else None
         ),
         "self_reflection_log": project.self_reflection_log or [],
-        "build_config": project.build_config or {},
+        "build_config": _redact_build_config(project.build_config or {}, role),
+        "build_config_warnings": build_config_lint_warnings(project.build_config),
         "autonomous_enabled": project.autonomous_enabled,
         "is_self_repo": project.is_self_repo,
         "sr_catch_rate_targets": project.sr_catch_rate_targets or {},
@@ -143,7 +165,13 @@ class ProjectUpdate(BaseModel):
     name: str | None = None
     directions: List[Dict[str, Any]] | None = None
     vision: Dict[str, Any] | None = None
+    # Optimistic concurrency: supply the _meta.revision value the client
+    # loaded.  Server rejects with 409 if another writer has advanced it.
+    vision_base_revision: int | None = None
     design_doc: Dict[str, Any] | None = None
+    # Optimistic concurrency: supply the _meta.revision value the client
+    # loaded.  Server rejects with 409 if another writer has advanced it.
+    design_doc_base_revision: int | None = None
     build_config: Dict[str, Any] | None = None
     autonomous_enabled: bool | None = None
     # Per-category SR catch-rate targets, e.g. {'security': 0.80}.
@@ -152,6 +180,11 @@ class ProjectUpdate(BaseModel):
     # User-editable subset of problem_model — intent, constraints, context.
     # Gaps / capabilities / friction are agent-owned and not writable here.
     problem_model_patch: Dict[str, Any] | None = None
+
+
+_OWNER_ONLY_UPDATE_FIELDS = frozenset(
+    {"build_config", "autonomous_enabled", "design_doc", "vision"}
+)
 
 
 @router.patch("/projects/{project_id}")
@@ -166,6 +199,45 @@ async def update_project(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+
+    # Fetch the caller's actual role so we can gate owner-only fields.
+    caller_member = (
+        await session.execute(
+            select(ProjectMember).where(
+                ProjectMember.project_id == project_id,
+                ProjectMember.user_id == current_user["user_id"],
+            )
+        )
+    ).scalar_one_or_none()
+    caller_role = caller_member.role if caller_member else "member"
+
+    if caller_role != "owner" and any(
+        getattr(payload, f) is not None for f in _OWNER_ONLY_UPDATE_FIELDS
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Only project owners may change build_config, autonomous_enabled, design_doc, or vision.",
+        )
+
+    # Lock the project row whenever directions, design_doc, or vision are
+    # being overwritten so concurrent agent writers cannot silently clobber.
+    needs_lock = (
+        payload.directions is not None
+        or payload.design_doc is not None
+        or payload.vision is not None
+    )
+    if needs_lock:
+        project = await lock_project_or_429(session, project.id)
+        attrs = [
+            a
+            for a, p in (
+                ("directions", payload.directions),
+                ("design_doc", payload.design_doc),
+                ("vision", payload.vision),
+            )
+            if p is not None
+        ]
+        await session.refresh(project, attribute_names=attrs)
 
     if payload.name is not None:
         project.name = payload.name
@@ -190,18 +262,48 @@ async def update_project(
         project.directions = normalized
         flag_modified(project, "directions")
     if payload.vision is not None:
+        stored_vision = project.vision or {}
+        stored_rev = stored_vision.get("revision", 0) or 0
+        if (
+            payload.vision_base_revision is not None
+            and payload.vision_base_revision != stored_rev
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"vision was modified by another writer "
+                    f"(base_revision={payload.vision_base_revision}, current={stored_rev}). "
+                    "Reload and retry."
+                ),
+            )
         vision = dict(payload.vision)
-        current_rev = (project.vision or {}).get("revision", 0)
-        vision["revision"] = (current_rev or 0) + 1
+        vision["revision"] = stored_rev + 1
         vision["last_updated"] = _utcnow().isoformat()
         project.vision = vision
         flag_modified(project, "vision")
     if payload.design_doc is not None:
+        stored_meta = (project.design_doc or {}).get("_meta", {}) or {}
+        stored_rev = stored_meta.get("revision", 0) or 0
+        if (
+            payload.design_doc_base_revision is not None
+            and payload.design_doc_base_revision != stored_rev
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"design_doc was modified by another writer "
+                    f"(base_revision={payload.design_doc_base_revision}, current={stored_rev}). "
+                    "Reload and retry."
+                ),
+            )
         doc = dict(payload.design_doc)
-        current_rev = (project.design_doc or {}).get("revision", 0)
-        doc["revision"] = (current_rev or 0) + 1
-        doc["last_updated"] = _utcnow().isoformat()
-        doc["updated_by"] = "user"
+        # Remove the divergent top-level "revision" key; canonical counter is _meta.revision
+        doc.pop("revision", None)
+        meta = dict(stored_meta)
+        meta["revision"] = stored_rev + 1
+        meta["last_updated"] = _utcnow().isoformat()
+        meta["updated_by"] = "user"
+        doc["_meta"] = meta
         project.design_doc = doc
         flag_modified(project, "design_doc")
     if payload.build_config is not None:
@@ -210,7 +312,29 @@ async def update_project(
         from app.schemas import BuildConfig as BuildConfigSchema
 
         try:
-            merged = {**(project.build_config or {}), **payload.build_config}
+            existing_bc = project.build_config or {}
+            incoming = dict(payload.build_config)
+            # Preserve task-branch naming when incoming clears them — operators
+            # configure these once and expect them to survive normal config saves.
+            for _field in (
+                "task_branch_namespace",
+                "task_branch_prefix",
+                "pr_title_prefix",
+            ):
+                if not incoming.get(_field) and existing_bc.get(_field):
+                    incoming[_field] = existing_bc[_field]
+            # Preserve per-project branch config using key-absence semantics:
+            # an explicit empty list [] means "disable" and must not be lost,
+            # so we check key presence rather than falsiness.
+            for _field in (
+                "staging_branch_prefixes",
+                "stale_branch_prefixes",
+                "protected_branches",
+                "enable_self_improvement",
+            ):
+                if _field not in incoming and _field in existing_bc:
+                    incoming[_field] = existing_bc[_field]
+            merged = {**existing_bc, **incoming}
             validated = BuildConfigSchema(**merged) if merged else BuildConfigSchema()
             project.build_config = validated.model_dump(exclude_none=True)
         except ValidationError as e:
@@ -268,7 +392,13 @@ async def update_project(
     session.add(project)
     await session.commit()
     await session.refresh(project)
-    return project
+    # Preserve the historical response shape (top-level Project fields) and
+    # add a single advisory key — operators read it from the same payload
+    # they already have. Warnings are computed from the validated, committed
+    # build_config so the value reflects what was actually persisted.
+    response = project.model_dump()
+    response["build_config_warnings"] = build_config_lint_warnings(project.build_config)
+    return response
 
 
 @router.post("/projects/{project_id}/detect-build-config")
@@ -280,7 +410,7 @@ async def detect_project_build_config(
     current_user: dict = Depends(get_current_user),
 ):
     project = await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
+        project_id, current_user["user_id"], session, "owner"
     )
     if not project.github_owner or not project.github_repo:
         raise HTTPException(
@@ -309,6 +439,30 @@ async def detect_project_build_config(
         detected["git_user_email"] = existing["git_user_email"]
     if existing.get("git_user_name"):
         detected["git_user_name"] = existing["git_user_name"]
+    if "env_vars" in existing:
+        detected["env_vars"] = existing["env_vars"]
+    if "enable_fresh_reviewer" in existing:
+        detected["enable_fresh_reviewer"] = existing["enable_fresh_reviewer"]
+    if "enable_parallel_review" in existing:
+        detected["enable_parallel_review"] = existing["enable_parallel_review"]
+    if "enable_parallel_fix" in existing:
+        detected["enable_parallel_fix"] = existing["enable_parallel_fix"]
+    # Per-project branch/PR naming overrides are user-set and not detectable from repo contents;
+    # preserve them across re-detect so an operator does not silently lose them.
+    if "task_branch_namespace" in existing:
+        detected["task_branch_namespace"] = existing["task_branch_namespace"]
+    if "task_branch_prefix" in existing:
+        detected["task_branch_prefix"] = existing["task_branch_prefix"]
+    if "pr_title_prefix" in existing:
+        detected["pr_title_prefix"] = existing["pr_title_prefix"]
+    if "staging_branch_prefixes" in existing:
+        detected["staging_branch_prefixes"] = existing["staging_branch_prefixes"]
+    if "stale_branch_prefixes" in existing:
+        detected["stale_branch_prefixes"] = existing["stale_branch_prefixes"]
+    if "protected_branches" in existing:
+        detected["protected_branches"] = existing["protected_branches"]
+    if "enable_self_improvement" in existing:
+        detected["enable_self_improvement"] = existing["enable_self_improvement"]
 
     try:
         validated = BuildConfigSchema(**detected) if detected else BuildConfigSchema()
@@ -320,7 +474,10 @@ async def detect_project_build_config(
     await session.commit()
     await session.refresh(project)
 
-    return {"build_config": project.build_config or {}}
+    return {
+        "build_config": project.build_config or {},
+        "build_config_warnings": build_config_lint_warnings(project.build_config),
+    }
 
 
 @router.post("/projects/{project_id}/running-update/acknowledge")
@@ -373,12 +530,14 @@ async def delete_project_admin(
         TaskStatus.IN_PROGRESS,
         TaskStatus.EVALUATING,
     ]
+    # Bounded load: used for the existence check and per-task VM cleanup.
+    # The bulk UPDATE below covers all matching rows regardless of this cap.
     active_tasks = (
         (
             await session.execute(
-                select(Task).where(
-                    Task.project_id == project_id, Task.status.in_(ACTIVE_STATUSES)
-                )
+                select(Task)
+                .where(Task.project_id == project_id, Task.status.in_(ACTIVE_STATUSES))
+                .limit(1000)
             )
         )
         .scalars()
@@ -391,16 +550,48 @@ async def delete_project_admin(
             detail=f"Project has {len(active_tasks)} active task(s). Cancel them first, or pass ?force=true.",
         )
 
+    cancelled_count = 0
     if active_tasks and force:
-        # Force: cancel active tasks and delete their VMs
+        # Force: bulk-cancel all active tasks (covers rows beyond the 1000-row
+        # load window), then delete VMs for the loaded subset.
         from app.main import _ensure_vm_deleted
 
+        # Fetch all affected task IDs before the bulk UPDATE so we can fire
+        # terminal callbacks after commit — the bulk UPDATE bypasses the ORM
+        # event listener that normally populates the JWT deny-list.
+        all_cancelled_ids = (
+            (
+                await session.execute(
+                    select(Task.id).where(
+                        Task.project_id == project_id,
+                        Task.status.in_(ACTIVE_STATUSES),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        result = await session.execute(
+            update(Task)
+            .where(Task.project_id == project_id, Task.status.in_(ACTIVE_STATUSES))
+            .values(
+                status=TaskStatus.CANCELLED,
+                latest_status_message="Project force-deleted",
+            )
+            .execution_options(synchronize_session=False)
+        )
+        cancelled_count = result.rowcount
         for task in active_tasks:
-            task.status = TaskStatus.CANCELLED
-            task.latest_status_message = "Project force-deleted"
-            session.add(task)
             await _ensure_vm_deleted(task, reason="project_force_delete")
+        # Emit cross-instance NOTIFY before commit so sibling instances see the
+        # revocation only after the bulk UPDATE is durable.  The post-commit
+        # notify_tasks_terminated call still fires for in-process callback fanout.
+        from app.jwt_revocation import emit_bulk_task_terminated_notify  # noqa: PLC0415
+
+        await emit_bulk_task_terminated_notify(session, all_cancelled_ids)
         await session.commit()
+        notify_tasks_terminated(all_cancelled_ids)
 
     # Delete dependent records that lack ON DELETE CASCADE
     from app.models import Alert
@@ -416,7 +607,7 @@ async def delete_project_admin(
 
     return {
         "message": f"Project {project_id} deleted",
-        "active_tasks_cancelled": len(active_tasks) if active_tasks else 0,
+        "active_tasks_cancelled": cancelled_count,
     }
 
 
@@ -573,23 +764,19 @@ async def get_autonomous_status(
 
     # Count autonomous RESEARCH tasks per project in the last hour (matches rate limit guard)
     user_pids = _user_project_ids(current_user["user_id"])
-    auto_tasks = (
-        (
-            await session.execute(
-                select(Task).where(
-                    Task.project_id.in_(user_pids),
-                    Task.created_by == "ORCHESTRATOR",
-                    Task.created_at >= one_hour_ago,
-                )
+    research_count_rows = (
+        await session.execute(
+            select(Task.project_id, func.count().label("cnt"))
+            .where(
+                Task.project_id.in_(user_pids),
+                Task.created_by == "ORCHESTRATOR",
+                Task.created_at >= one_hour_ago,
+                Task.payloads[0]["type"].astext == "research",
             )
+            .group_by(Task.project_id)
         )
-        .scalars()
-        .all()
-    )
-    tasks_per_project: dict = {}
-    for t in auto_tasks:
-        if (t.first_payload).get("type") == "research":
-            tasks_per_project[t.project_id] = tasks_per_project.get(t.project_id, 0) + 1
+    ).all()
+    tasks_per_project: dict = {row.project_id: row.cnt for row in research_count_rows}
 
     # Batch query: most recent autonomous task per project
     last_research_subq = (

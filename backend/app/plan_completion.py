@@ -12,9 +12,13 @@ from typing import Any, Dict, List
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.broadcast import broadcast_to_project
-from app.models import Task, TaskHistory, TaskStatus
+from app.models import Project, Task, TaskHistory, TaskStatus
 from app.payload_schemas import validate_internal_payload
-from app.shared_state import runtime_config as _runtime_config, scope_to_effort
+from app.shared_state import (
+    get_project_integration_branch,
+    runtime_config as _runtime_config,
+    scope_to_effort,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -142,6 +146,7 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     from app.main import _maybe_create_failure_alert
     from app.task_completion import _ensure_branch
 
+    project = await session.get(Project, task.project_id)
     plan_data = _parse_plan_output(logs)
     if not plan_data or not plan_data.get("subtasks"):
         task.latest_status_message = "Plan agent produced no valid subtasks"
@@ -203,10 +208,13 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     task.status = TaskStatus.EVALUATING
     session.add(task)
 
-    parent_base = (task.first_payload).get("base_branch", "main")
+    parent_base = (task.first_payload).get(
+        "base_branch"
+    ) or get_project_integration_branch(project)
     parent_hotfix = bool(task.first_payload.get("hotfix"))
     short_id = str(task.id).replace("-", "")[:8]
-    plan_branch = f"plan/{short_id}"
+    plan_branch_prefix = getattr(project, "plan_branch_prefix", "plan/")
+    plan_branch = f"{plan_branch_prefix}{short_id}"
 
     # Round 4 W1 (audit C2): _ensure_branch now returns Task | None.
     # On success, returns the freshly-locked Task (caller mutates under

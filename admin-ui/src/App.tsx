@@ -25,20 +25,26 @@ import { TaskLaunchFAB } from './components/TaskLaunchFAB';
 import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
 import { DashboardHome } from './components/DashboardHome';
+import { SrMissedRetrospectivesPanel } from './components/SrMissedRetrospectivesPanel';
 import { BulkActionBar } from './components/BulkActionBar';
 import { KanbanBoard } from './components/KanbanBoard';
 import type { KanbanColumn, SortBy } from './components/KanbanBoard';
+import { TimelineView } from './components/TimelineView';
+import { downloadTaskCsv, orderTasksForKanbanExport } from './utils/taskCsv';
 import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
 import { UserManagement } from './components/UserManagement';
 import { ProjectMembers } from './components/ProjectMembers';
 import { CatchUpPanel } from './components/CatchUpPanel';
+import ActivityFeed from './components/ActivityFeed';
 import { MessagesPanel } from './components/MessagesPanel';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
+import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
 // StatusBar removed — redundant connection info
 import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { DiagnosticsPanel } from './components/DiagnosticsPanel';
+import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
 import { PlaybookPanel } from './components/PlaybookPanel';
 import { WarmVmPanel } from './components/WarmVmPanel';
 import { FILTER_TASK_TYPE_IDS } from './taskCapabilities';
@@ -76,6 +82,14 @@ export default function App() {
       return (stored as SortBy) ?? 'newest';
     } catch { return 'newest'; }
   });
+  useEffect(() => {
+    const onFailureClassFilter = (e: Event) => {
+      const failureClass = (e as CustomEvent<string>).detail;
+      if (failureClass && failureClass in FAILURE_CLASS_CONFIG) s.setFailureClassFilter([failureClass]);
+    };
+    window.addEventListener('blueprint:failure-class-filter', onFailureClassFilter);
+    return () => window.removeEventListener('blueprint:failure-class-filter', onFailureClassFilter);
+  }, [s.setFailureClassFilter]);
 
   useEffect(() => {
     localStorage.setItem(SORT_KEY, sortBy);
@@ -183,6 +197,8 @@ export default function App() {
     return { id: p.id, owner: p.github_owner, repo: p.github_repo };
   }, [setupProjectId, s.projects]);
 
+  const [showActivityFeed, setShowActivityFeed] = useState(false);
+
   // Project members panel
   const [showProjectMembers, setShowProjectMembers] = useState(false);
   const selectedProject = useMemo(
@@ -211,15 +227,16 @@ export default function App() {
   const [srMissedTasks, setSrMissedTasks] = useState<SrMissedTask[]>([]);
   const [srMissedLoading, setSrMissedLoading] = useState(false);
   const [srMissedCategory, setSrMissedCategory] = useState('');
+  const [srMissedWindowDays, setSrMissedWindowDays] = useState<7 | 14 | 30>(14);
   const srMissedRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!showSrMissed || !selectedProjectId) return;
     setSrMissedLoading(true);
-    fetchSrMissedRetrospectives(selectedProjectId, { days: 14, page_size: 200 })
+    fetchSrMissedRetrospectives(selectedProjectId, { days: srMissedWindowDays, page_size: 500 })
       .then(r => setSrMissedTasks(r.items))
       .catch(() => {})
       .finally(() => setSrMissedLoading(false));
-  }, [showSrMissed, selectedProjectId]);
+  }, [showSrMissed, selectedProjectId, srMissedWindowDays]);
 
   // Open operator-spawned SR investigations, keyed by category — used to dedup spawning.
   const [srInvestigationTaskIds, setSrInvestigationTaskIds] = useState<Record<string, string>>({});
@@ -266,6 +283,12 @@ export default function App() {
       const element = document.getElementById('sr-catch-rate-targets');
       element?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }, 100);
+  }, [s]);
+
+  const handleConfigureBranchProject = useCallback((projectId: string) => {
+    s.setSelectedProjectId(projectId);
+    setSettingsInitialSection('integration-branch');
+    if (!s.showSettings) s.handleToggleSettings();
   }, [s]);
 
   // Clear the deep-link section once Settings closes, so a subsequent plain
@@ -362,13 +385,25 @@ export default function App() {
       const dateMatch = cutoff === null || parseTimestamp(t.created_at).getTime() >= cutoff;
       const blockedMatch = !s.blockedFilter || (t.status === 'QUEUED' && t.depends_on != null && t.depends_on.length > 0);
       const approvalMatch = !s.requiresApproval || t.requires_approval;
+      const failureClassMatch = s.failureClassFilter.length === 0 || (t.status === 'FAILED' && t.failure_class != null && s.failureClassFilter.includes(t.failure_class));
       const stuckMatch = !s.stuckFilter || stuckTaskIds.has(t.id);
-      return typeMatch && statusMatch && searchMatch && projectMatch && dateMatch && blockedMatch && approvalMatch && stuckMatch;
+      return typeMatch && statusMatch && searchMatch && projectMatch && dateMatch && blockedMatch && approvalMatch && failureClassMatch && stuckMatch;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.blockedFilter, s.requiresApproval, s.stuckFilter, s.stuckMinSeconds, stuckTaskIds]);
+  }, [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.blockedFilter, s.requiresApproval, s.stuckFilter, s.stuckMinSeconds, stuckTaskIds, s.failureClassFilter]);
 
-  const hasActiveFilters = s.tasks.length > 0 && filteredTasks.length < s.tasks.length;
+  const orderedExportTasks = useMemo(() => {
+    if (s.viewMode !== 'kanban') return filteredTasks;
+    if (visibleColumns.length === 0) return filteredTasks;
+    return orderTasksForKanbanExport(filteredTasks, visibleColumns, sortBy);
+  }, [filteredTasks, visibleColumns, s.viewMode, sortBy]);
+
+  const handleDownloadTasksCsv = useCallback(() => {
+    const projectName = selectedProject?.name ?? selectedProject?.github_repo ?? (s.selectedProjectId ?? 'all-projects');
+    downloadTaskCsv(orderedExportTasks, projectName);
+  }, [orderedExportTasks, selectedProject?.github_repo, selectedProject?.name, s.selectedProjectId]);
+
+  const hasActiveFilters = s.tasks.length > 0 && (filteredTasks.length < s.tasks.length || s.failureClassFilter.length > 0);
 
   if (s.authLoading) {
     return (
@@ -453,6 +488,8 @@ export default function App() {
         onUpdateNotifyOnApprovalNeeded={s.setNotifyOnApprovalNeeded}
         soundOnComplete={s.soundOnComplete}
         onUpdateSoundOnComplete={s.setSoundOnComplete}
+        notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
+        onUpdateNotifyOnHighSignalMessage={s.setNotifyOnHighSignalMessage}
         onSetViewMode={s.setViewMode}
         showResearchBrowser={s.showResearchBrowser}
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
@@ -460,6 +497,7 @@ export default function App() {
         onToggleArchive={() => s.setShowArchive(!s.showArchive)}
         showMessages={s.showMessages}
         onToggleMessages={() => s.setShowMessages(prev => !prev)}
+        onOpenActivityFeed={() => setShowActivityFeed(true)}
         openMessageCount={openMessageCount}
         newSinceLastVisitCount={newSinceLastVisit}
         needsAttentionCount={s.needsAttentionCount}
@@ -588,6 +626,10 @@ export default function App() {
         onUpdateIssueImplementationConfig={s.handleUpdateIssueImplementationConfig}
         autoReviewConfig={s.autoReviewConfig}
         onUpdateAutoReviewConfig={s.handleUpdateAutoReviewConfig}
+        integrationBranchData={s.integrationBranchData}
+        onUpdateIntegrationBranch={s.handleUpdateIntegrationBranch}
+        promotionTargetData={s.promotionTargetData}
+        onUpdatePromotionTarget={s.handleUpdatePromotionTarget}
       />
 
       <div
@@ -678,6 +720,7 @@ export default function App() {
           onBulkRetry={(taskIds) => s.handleBulkAction('retry', taskIds)}
           wsRef={s.wsRef}
           userEmail={s.user?.email ?? null}
+          onOpenActivityFeed={() => setShowActivityFeed(true)}
         />
       )}
 
@@ -685,6 +728,8 @@ export default function App() {
         diagnostics={s.diagnostics}
         onViewTask={handleViewTask}
       />
+
+      {s.userRole === 'admin' && <NullBranchDiagnosticsPanel onConfigure={handleConfigureBranchProject} />}
 
       <WarmVmPanel onViewTask={handleViewTask} />
 
@@ -716,10 +761,12 @@ export default function App() {
         <MessagesPanel
           selectedProjectId={s.selectedProjectId}
           githubRepo={selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : undefined}
+          defaultBranch={s.promotionTargetData?.promotion_target || s.integrationBranchData?.integration_branch || undefined}
           onClose={() => s.setShowMessages(false)}
           addToast={s.addToast}
           onMessageCountChange={handleMessageCountChange}
           onOpenTask={handleViewTask}
+          notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
         />
       ) : s.showArchive ? (
         <ArchiveView
@@ -753,10 +800,13 @@ export default function App() {
               onTypeFilterChange={s.setTaskTypeFilter}
               statusFilter={s.statusFilter}
               onStatusFilterChange={s.setStatusFilter}
+              failureClassFilter={s.failureClassFilter}
+              onFailureClassFilterChange={s.setFailureClassFilter}
               dateRange={s.dateRange}
               onDateRangeChange={s.setDateRange}
               blockedFilter={s.blockedFilter}
               onBlockedFilterChange={s.setBlockedFilter}
+              onDownloadCsv={handleDownloadTasksCsv}
               inputRef={searchInputRef}
             />
             {s.viewMode === 'kanban' && (
@@ -817,6 +867,8 @@ export default function App() {
             stuckCount1h={stuckCount1h}
             stuckMinSeconds={s.stuckMinSeconds}
             searchQuery={s.searchQuery}
+            failureClassFilter={s.failureClassFilter}
+            setFailureClassFilter={s.setFailureClassFilter}
             setStatusFilter={s.setStatusFilter}
             setTaskTypeFilter={s.setTaskTypeFilter}
             setDateRange={s.setDateRange}
@@ -829,7 +881,12 @@ export default function App() {
 
           {s.viewMode === 'home' ? (
             <>
-              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onCategoryClick={(cat) => { setSrMissedCategory(cat); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onConfigureTargets={handleConfigureTargets} /></ErrorBoundary>
+              <ErrorBoundary level="panel"><DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onCategoryClick={(cat) => { setSrMissedCategory(cat); setShowSrMissed(true); setTimeout(() => srMissedRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50); }} onConfigureTargets={handleConfigureTargets} onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task — investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })} /></ErrorBoundary>
+              {s.userRole === 'admin' && s.selectedProjectId && (
+                <ErrorBoundary level="panel">
+                  <SrMissedRetrospectivesPanel selectedProjectId={s.selectedProjectId} onSelectTask={handleViewTask} />
+                </ErrorBoundary>
+              )}
               <PlaybookPanel selectedProjectId={s.selectedProjectId} />
               {s.selectedProjectId && (
                 <div ref={srMissedRef} className="shrink-0 mt-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
@@ -842,7 +899,7 @@ export default function App() {
                   {showSrMissed && (
                     srMissedLoading
                       ? <p className="text-[10px] text-neutral-500 mt-2">Loading…</p>
-                      : <div className="mt-2"><SrMissedRetrospective tasks={srMissedTasks} onTaskClick={handleViewTask} initialCategory={srMissedCategory} /></div>
+                      : <div className="mt-2"><SrMissedRetrospective tasks={srMissedTasks} onTaskClick={handleViewTask} selectedCategory={srMissedCategory} windowDays={srMissedWindowDays} onWindowDaysChange={setSrMissedWindowDays} /></div>
                   )}
                 </div>
               )}
@@ -882,11 +939,12 @@ export default function App() {
               onViewLogs={s.handleViewLogs}
               onTrack={s.trackTask}
               trackedTaskIds={s.trackedTaskIds}
+              onDuplicate={s.openDuplicateTaskModal}
               searchQuery={s.searchQuery}
               onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
             />
             </ErrorBoundary>
-          ) : (
+          ) : s.viewMode === 'pipeline' ? (
             <ErrorBoundary level="panel">
             <main className="flex-1 overflow-hidden flex flex-col">
               <PipelineView
@@ -910,6 +968,16 @@ export default function App() {
                   });
                 }}
                 onUnarchiveTask={s.handleUnarchiveTask}
+              />
+            </main>
+            </ErrorBoundary>
+          ) : (
+            <ErrorBoundary level="panel">
+            <main className="flex-1 overflow-hidden flex flex-col">
+              <TimelineView
+                tasks={filteredTasks}
+                hasActiveFilters={hasActiveFilters}
+                onViewLogs={s.handleViewLogs}
               />
             </main>
             </ErrorBoundary>
@@ -952,6 +1020,10 @@ export default function App() {
           useManualBranch={s.useManualBranch}
           setUseManualBranch={s.setUseManualBranch}
           setBranchOptions={s.setBranchOptions}
+          taskBranchDefaultsReady={s.taskBranchDefaultsReady}
+          taskBranchDefaultsLoading={s.taskBranchDefaultsLoading}
+          taskBranchDefaultsError={s.taskBranchDefaultsError}
+          integrationBranch={s.integrationBranchData?.integration_branch}
           onRepoChange={s.handleRepoChange}
           onSubmit={s.handleCreateTask}
           onClose={() => s.setShowNewTaskModal(false)}
@@ -1008,6 +1080,7 @@ export default function App() {
           onRetry={s.handleRetry}
           onEditPrompt={s.handleEditPrompt}
           onDismiss={s.handleDismiss}
+          onDuplicate={s.openDuplicateTaskModal}
           onWidthChange={setDrawerWidth}
           onNavigateToTask={(taskId) => {
             const target = s.tasks.find(t => t.id === taskId);
@@ -1066,6 +1139,19 @@ export default function App() {
           handleBulkCancel={s.handleBulkCancel}
           handleBulkArchiveColumn={s.handleBulkArchiveColumn}
           toggleSelectionMode={s.toggleSelectionMode}
+        />
+      )}
+
+      {showActivityFeed && (
+        <ActivityFeed
+          selectedProjectId={s.selectedProjectId}
+          refreshInterval={s.refreshInterval}
+          onSelectTask={(task) => {
+            setShowActivityFeed(false);
+            handleViewTask(task.id);
+          }}
+          onClose={() => setShowActivityFeed(false)}
+          lastVisitTimestamp={s.lastVisitTimestamp}
         />
       )}
 

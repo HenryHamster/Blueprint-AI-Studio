@@ -140,7 +140,7 @@ async def test_perf_completion_high_severity_spawns_children_and_evaluates(
 
     await db_session.refresh(task)
     assert task.status == TaskStatus.EVALUATING
-    assert "1 high-severity fix task(s) spawned" in (task.latest_status_message or "")
+    assert "1 high-severity fix task spawned" in (task.latest_status_message or "")
 
 
 @pytest.mark.asyncio
@@ -157,3 +157,58 @@ async def test_perf_completion_no_findings_stays_terminal(db_session, _quiet_per
     await db_session.refresh(task)
     assert task.status == TaskStatus.COMPLETED
     assert "no parseable findings" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_perf_completion_multiple_high_severity_bundles_into_one_child(
+    db_session, _quiet_perf_io
+):
+    """Multiple high-severity findings → bundled into a SINGLE child task that
+    enumerates all findings so the agent addresses them together."""
+    task = await _make_perf_task(db_session)
+
+    findings = [
+        {
+            "severity": "high",
+            "area": "provisioning",
+            "title": "VM cold-start blocks claim",
+            "description": "Synchronous provision on the hot path.",
+            "fix_prompt": "Provision asynchronously and reuse warm VMs.",
+        },
+        {
+            "severity": "high",
+            "area": "caching",
+            "title": "Missing result cache",
+            "description": "Repeated computation in hot loop.",
+            "fix_prompt": "Add memoization layer.",
+        },
+        {
+            "severity": "low",
+            "area": "logging",
+            "title": "Chatty debug logs",
+            "description": "Excess log volume.",
+            "fix_prompt": "Drop to debug level.",
+        },
+    ]
+
+    await _handle_perf_completion(task, json.dumps(findings), db_session)
+
+    children = await _children_of(db_session, task)
+    # Key assertion: multiple high-severity findings → ONE bundled child
+    assert len(children) == 1
+    assert children[0].parent_task_id == task.id
+
+    # Verify the bundled task enumerates both findings in its prompt
+    child_payload = children[0].first_payload or {}
+    child_prompt = child_payload.get("prompt", "")
+    assert "2 high-severity findings" in child_prompt or "identified 2" in child_prompt
+    assert "VM cold-start" in child_prompt
+    assert "Missing result cache" in child_prompt
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+    # Verify message indicates bundled task + medium/low findings
+    msg = task.latest_status_message or ""
+    assert "1 high-severity fix task spawned" in msg
+    assert "2 findings" in msg  # The bundled task covers 2 high-sev findings
+    assert "1 medium/low" in msg

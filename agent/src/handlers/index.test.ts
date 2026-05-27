@@ -1,4 +1,4 @@
-import { vi, describe, it, expect } from 'vitest';
+import { vi, describe, it, expect, beforeEach } from 'vitest';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 // Mock ../index.js (the main agent runner) to prevent main() from executing
@@ -20,7 +20,6 @@ vi.mock('../index.js', async (importOriginal) => {
     setupWorkspace: vi.fn(),
     pushAndCreatePR: vi.fn(),
     runClaudeCode: vi.fn(),
-    lintFixLoop: vi.fn(),
     testFixLoop: vi.fn(),
     cloneWithRetry: vi.fn(),
     sendHeartbeatSync: vi.fn(),
@@ -72,6 +71,7 @@ vi.mock('ws', () => ({
 import { ALL_AGENT_TASK_TYPES } from '../taskCapabilities.js';
 import type { AgentTaskType } from '../taskCapabilities.js';
 import { handlers } from './index.js';
+import { persistAndPostStatus } from '../index.js';
 
 // ── Handler registry tests ────────────────────────────────────────────────────
 describe('handlers registry', () => {
@@ -184,5 +184,45 @@ describe('task type class classification — cross-cutting invariants', () => {
       expect(seen, `"${type}" appears more than once in TASK_CLASS_MAP`).not.toContain(type);
       seen.add(type);
     }
+  });
+});
+
+// ── Memo bake smoke contract ──────────────────────────────────────────────────
+// Locks in the contract exercised by the image bake: handlers.memo must resolve
+// with COMPLETED when invoked through the registry with a credential-free
+// dispatcher payload. Prevents future packer edits from silently dropping the
+// memo smoke step and shipping a broken handler in the baked image.
+describe('memo bake smoke contract', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('handlers.memo is a callable function accessible through the registry', () => {
+    expect(typeof handlers.memo).toBe('function');
+  });
+
+  it('handlers.memo completes with COMPLETED for a regression_false_positive dispatcher payload (no Claude call, credential-free)', async () => {
+    const payload = {
+      reasoning_kind: 'regression_false_positive',
+      source_task_id: 'task-bake-verify',
+      source_finding: {
+        verdict_reason: 'CPU spike is a deployment artifact, not a regression.',
+        regression_class: 'cpu_p99_spike',
+      },
+    };
+    const task = { title: 'Bake smoke memo', description: 'Memo smoke', context: {} };
+
+    await handlers.memo('bake-smoke-001', payload, task, '', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(persistAndPostStatus)).toHaveBeenCalledWith(
+      'bake-smoke-001',
+      expect.objectContaining({
+        status: 'COMPLETED',
+        logs: expect.stringContaining('CPU spike is a deployment artifact') as string,
+      }),
+    );
+    // runClaudeCode must NOT be called — dispatcher path synthesizes directly
+    const { runClaudeCode } = await import('../index.js');
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
   });
 });

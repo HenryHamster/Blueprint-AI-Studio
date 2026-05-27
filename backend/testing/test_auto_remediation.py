@@ -474,6 +474,108 @@ async def test_check_run_success_ignored(client: AsyncClient, db_session: AsyncS
 
 
 @pytest.mark.asyncio
+async def test_integration_branch_triggers_auto_remediation(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """CI failure on the configured integration branch triggers auto-remediation
+    even when that branch is NOT in the stored branch_whitelist."""
+    await _create_project(db_session, integration_branch="automain")
+    await db_session.commit()
+
+    payload_dict = _build_check_run_webhook_payload(
+        head_branch="automain", conclusion="failure"
+    )
+    payload_bytes = json.dumps(payload_dict).encode()
+    signature = _sign_webhook_payload(payload_bytes)
+
+    with (
+        patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET),
+        patch("app.auto_remediation._handle_main_branch_ci_failure_inner", AsyncMock()),
+    ):
+        response = await client.post(
+            "/api/github/webhook",
+            content=payload_bytes,
+            headers={
+                "x-hub-signature-256": signature,
+                "x-github-event": "check_run",
+                "x-github-delivery": f"test-{uuid.uuid4()}",
+                "content-type": "application/json",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "auto_remediation_triggered"
+
+
+@pytest.mark.asyncio
+async def test_promotion_target_triggers_auto_remediation(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """CI failure on the configured promotion_target triggers auto-remediation."""
+    await _create_project(
+        db_session, integration_branch="dev", promotion_target="release"
+    )
+    await db_session.commit()
+
+    payload_dict = _build_check_run_webhook_payload(
+        head_branch="release", conclusion="failure"
+    )
+    payload_bytes = json.dumps(payload_dict).encode()
+    signature = _sign_webhook_payload(payload_bytes)
+
+    with (
+        patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET),
+        patch("app.auto_remediation._handle_main_branch_ci_failure_inner", AsyncMock()),
+    ):
+        response = await client.post(
+            "/api/github/webhook",
+            content=payload_bytes,
+            headers={
+                "x-hub-signature-256": signature,
+                "x-github-event": "check_run",
+                "x-github-delivery": f"test-{uuid.uuid4()}",
+                "content-type": "application/json",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "auto_remediation_triggered"
+
+
+@pytest.mark.asyncio
+async def test_feature_branch_not_in_integration_branch_ignored(
+    client: AsyncClient, db_session: AsyncSession
+):
+    """CI failure on an unrelated feature branch (not in whitelist, not the
+    integration branch) still returns ignored_auto_remediation_disabled."""
+    await _create_project(db_session, integration_branch="automain")
+    await db_session.commit()
+
+    payload_dict = _build_check_run_webhook_payload(
+        head_branch="feature/unrelated", conclusion="failure"
+    )
+    payload_bytes = json.dumps(payload_dict).encode()
+    signature = _sign_webhook_payload(payload_bytes)
+
+    with (
+        patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET),
+    ):
+        response = await client.post(
+            "/api/github/webhook",
+            content=payload_bytes,
+            headers={
+                "x-hub-signature-256": signature,
+                "x-github-event": "check_run",
+                "x-github-delivery": f"test-{uuid.uuid4()}",
+                "content-type": "application/json",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ignored_auto_remediation_disabled"
+
+
+@pytest.mark.asyncio
 async def test_completed_tasks_dont_count_concurrent(db_session: AsyncSession):
     """COMPLETED auto-remediation tasks don't count toward concurrent limit."""
     project = await _create_project(db_session)
@@ -1365,6 +1467,12 @@ async def test_merged_preserves_recovery_attempts_for_future_backoff(
         result="merged",
         pr_number=77,
     )
+    # Each auto-fix result is a separate task completion that commits before the
+    # next one runs (see agent_status.py post_remediation_result_message ->
+    # session.commit()). Commit here so the canonical expire-before-lock read in
+    # post_auto_fix_result_message picks up this write rather than reloading the
+    # pre-call row.
+    await db_session.commit()
     ar = (project.design_doc or {}).get("_auto_remediation", {})
     assert "main" not in ar.get("branch_failure_counts", {})
     assert "main" not in ar.get("suspended_branches", [])
@@ -1391,6 +1499,9 @@ async def test_merged_preserves_recovery_attempts_for_future_backoff(
                 branch="main",
                 result="failed",
             )
+            # Commit between completions so each failure increment persists and
+            # the next call's expire-before-lock read accumulates it.
+            await db_session.commit()
 
     ar = (project.design_doc or {}).get("_auto_remediation", {})
     assert "main" in ar.get("suspended_branches", [])
@@ -2160,3 +2271,81 @@ async def test_find_direction_by_fingerprint_prefers_most_recent_active(
         session=db_session,
     )
     assert result == newer_id
+
+
+@pytest.mark.asyncio
+async def test_spawn_direction_stamp_uses_directions_lock(db_session: AsyncSession):
+    """Remediation spawn stamps the direction via with_directions_locked, not bare session.get.
+
+    Verify that after _handle_main_branch_ci_failure_inner spawns a task whose
+    context carries direction_id, the matched direction has last_remediation_task_id
+    set — proving the stamp went through the lock helper and the mutation was
+    committed to the DB row.
+    """
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.ext.asyncio import AsyncSession as _AS
+
+    direction_id = str(uuid.uuid4())
+    project = await _create_project(
+        db_session,
+        directions=[{"id": direction_id, "title": "fix auth", "status": "active"}],
+    )
+    await db_session.commit()
+
+    inv = Task(
+        project_id=project.id,
+        title="Investigate CI",
+        payloads=[{"type": "investigate"}],
+        status=TaskStatus.COMPLETED,
+        context={"direction_id": direction_id, "diagnosis_fingerprint": "fp-lock-test"},
+        plan_output={
+            "summary": "token mismatch",
+            "root_cause": "session cache",
+            "affected_files": [{"path": "backend/app/auth.py"}],
+            "recommended_fix": "reset cache",
+        },
+    )
+    db_session.add(inv)
+    await db_session.commit()
+
+    with (
+        patch(
+            "app.auto_remediation._extract_ci_context", new_callable=AsyncMock
+        ) as mock_ctx,
+        patch(
+            "app.auto_remediation.post_auto_fix_spawned_message", new_callable=AsyncMock
+        ),
+        patch("app.main._send_webhook_notification", new_callable=AsyncMock),
+    ):
+        mock_ctx.return_value = (
+            ["CI"],
+            "FAILED backend/app/auth.py::test_session token mismatch",
+            "test",
+            {"failing_tests": [], "error_locations": [], "error_messages": []},
+        )
+        await _handle_main_branch_ci_failure_inner(
+            owner="acme",
+            repo="webapp",
+            head_sha="deadbeef",
+            head_branch="main",
+            project_id=project.id,
+            config=_default_config(),
+            session=db_session,
+        )
+
+    await db_session.commit()
+
+    # Read fresh to bypass identity-map cache
+    _Session = sessionmaker(
+        bind=db_session.bind,
+        class_=_AS,
+        expire_on_commit=False,
+    )
+    async with _Session() as verify:
+        result = await verify.execute(select(Project).where(Project.id == project.id))
+        refreshed = result.scalar_one()
+
+    target = next(d for d in refreshed.directions if d.get("id") == direction_id)
+    assert "last_remediation_task_id" in target, (
+        "direction was not stamped — with_directions_locked bypass may have silently dropped the mutation"
+    )

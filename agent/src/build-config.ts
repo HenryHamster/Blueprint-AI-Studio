@@ -4,6 +4,7 @@
 // Populated from task.build_config (a JSONB field on Project passed via claim).
 
 import type { BuildConfig, DirectoryConfig } from './index.js';
+import { SHELL_CMD_RE } from './shell-safety.js';
 
 const VALID_TYPES = new Set(['python', 'node', 'go', 'rust']);
 
@@ -11,12 +12,12 @@ const VALID_TYPES = new Set(['python', 'node', 'go', 'rust']);
  * Extract and type-narrow build_config from a task object.
  *
  * Returns undefined (triggers hardcoded fallback) when:
- * - task.project_metadata?.is_self_repo is true (Blueprint's own repo)
+ * - task.project_metadata?.skip_build_config is true (project opted into hardcoded fallback)
  * - directories array is missing or empty
  */
 export function resolveBuildConfig(task: Record<string, unknown>): BuildConfig | undefined {
   const projectMetadata = task.project_metadata as Record<string, unknown> | undefined;
-  if (projectMetadata?.is_self_repo === true) return undefined;
+  if (projectMetadata?.skip_build_config === true) return undefined;
 
   const raw = task.build_config as Record<string, unknown> | undefined;
   if (!raw) return undefined;
@@ -32,6 +33,7 @@ export function resolveBuildConfig(task: Record<string, unknown>): BuildConfig |
     if (!path) continue;
     // Reject path traversal: no .., no absolute paths, no null bytes
     if (path.includes('..') || path.startsWith('/') || path.includes('\0')) continue;
+    if (!SHELL_CMD_RE.test(path)) continue;
     // Accept 'type' directly, or fall back to 'language' for backwards compat
     const rawType = dir.type ?? dir.language;
     const type = VALID_TYPES.has(rawType as string) ? (rawType as string) : 'python';
@@ -41,6 +43,10 @@ export function resolveBuildConfig(task: Record<string, unknown>): BuildConfig |
     const buildCmd = dir.build_cmd ?? dir.build_command;
     const testCmd = dir.test_cmd ?? dir.test_command;
     const installCmd = dir.install_cmd;
+    if (typeof lintCmd === 'string' && lintCmd !== '' && !SHELL_CMD_RE.test(lintCmd)) continue;
+    if (typeof buildCmd === 'string' && buildCmd !== '' && !SHELL_CMD_RE.test(buildCmd)) continue;
+    if (typeof testCmd === 'string' && testCmd !== '' && !SHELL_CMD_RE.test(testCmd)) continue;
+    if (typeof installCmd === 'string' && installCmd !== '' && !SHELL_CMD_RE.test(installCmd)) continue;
     if (typeof lintCmd === 'string') entry.lint_cmd = lintCmd;
     if (typeof buildCmd === 'string') entry.build_cmd = buildCmd;
     if (typeof testCmd === 'string') entry.test_cmd = testCmd;
@@ -64,6 +70,22 @@ export function resolveBuildConfig(task: Record<string, unknown>): BuildConfig |
   } else {
     if (typeof raw.git_user_name === 'string') config.git_user_name = raw.git_user_name;
     if (typeof raw.git_user_email === 'string') config.git_user_email = raw.git_user_email;
+  }
+
+  // Staging-branch prefixes (research/plan rollup heads). Apply the same
+  // path-traversal + shell-safety hygiene as directory paths since these are
+  // interpolated into reviewer instructions; drop malformed entries. If every
+  // entry is rejected (or the field is the wrong shape) leave it unset so
+  // callers fall back to the Blueprint default (["research/", "plan/"]).
+  if (Array.isArray(raw.staging_branch_prefixes)) {
+    const prefixes: string[] = [];
+    for (const p of raw.staging_branch_prefixes) {
+      if (typeof p !== 'string' || p === '') continue;
+      if (p.includes('..') || p.startsWith('/') || p.includes('\0')) continue;
+      if (!SHELL_CMD_RE.test(p)) continue;
+      prefixes.push(p);
+    }
+    if (prefixes.length > 0) config.staging_branch_prefixes = prefixes;
   }
 
   return config;

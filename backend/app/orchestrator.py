@@ -11,7 +11,6 @@ import os
 import random
 import time
 import uuid
-from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -36,7 +35,14 @@ from app.compute import (
     soonest_zone_recovery,
 )
 from app.database import AsyncSessionLocal
-from app.models import DeploymentState, Project, Task, TaskStatus
+from app.models import (
+    DeploymentState,
+    Project,
+    Task,
+    TaskStatus,
+    bank_task_current_attempt,
+    with_task_attempt_banking,
+)
 from app.orchestrator_filters import (
     filter_file_conflicts,
     filter_rollup_conflicts,
@@ -44,6 +50,18 @@ from app.orchestrator_filters import (
     filter_pipeline_duplicates,
     filter_migration_serialization,
     filter_scope_empty,
+)
+from app.stall_alert_diagnostics import (
+    _STALL_TITLE_PREFIX,
+    _compute_all_accounts_blocked_action,
+    _compute_retry_after_escalation_action,
+    _format_stall_alert,
+    _missing_runtime_credentials_stall_reason,
+)
+from app.state_persistence import (
+    _persist_circuit_breakers,  # noqa: F401 — re-exported; callers import via app.orchestrator
+    _persist_zone_health,
+    _persist_self_healing_state_bundle,
 )
 from app.storage import upload_json_payload
 import app.shared_state as _shared_state
@@ -236,135 +254,6 @@ _previously_failing_types: set[str] = set()
 _all_accounts_blocked_alerted: bool = False
 
 
-def _compute_all_accounts_blocked_action(
-    blocked_count: int, dispatched_count: int, already_alerted: bool
-) -> str:
-    """Decide how to handle the all-accounts-blocked stall signal after a cycle.
-
-    Returns 'fire' (emit a new stall alert), 'reset' (re-arm the debounce),
-    or 'noop' (leave state untouched).
-    """
-    if blocked_count > 0 and dispatched_count == 0:
-        return "noop" if already_alerted else "fire"
-    if dispatched_count > 0:
-        return "reset"
-    return "noop"
-
-
-def _compute_retry_after_escalation_action(
-    resets: int, alert_threshold: int, fail_threshold: int
-) -> str | None:
-    """Decide how to escalate a task that keeps cycling through retry_after holds.
-
-    Pool exhaustion is a wait condition, not a terminal one: when every account
-    is rate-limited the right behaviour is to wait for recovery, not to drop the
-    task on the floor. We fire a WARNING once `resets` crosses `alert_threshold`
-    so the situation is visible, and never escalate to 'fail'. `fail_threshold`
-    is accepted for call-site compatibility but ignored.
-    """
-    del fail_threshold
-    if alert_threshold > 0 and resets >= alert_threshold:
-        return "alert"
-    return None
-
-
-_STALL_TITLE_PREFIX = "Pipeline stalled —"
-
-
-def _missing_runtime_credentials_stall_reason(
-    *,
-    user_pool_count: int,
-    provider_account_count: int,
-    ready_provider_account_count: int,
-    runtime_provider: str | None,
-) -> str:
-    """Describe why dispatch cannot find any usable runtime credentials."""
-    if user_pool_count == 0:
-        return "no accounts configured"
-    if runtime_provider and provider_account_count == 0:
-        return f"no accounts configured for provider {runtime_provider}"
-    if ready_provider_account_count == 0:
-        provider_suffix = (
-            f" for provider {runtime_provider}" if runtime_provider else ""
-        )
-        return f"no ready accounts{provider_suffix}"
-    return "no eligible accounts or slot contention"
-
-
-def _format_stall_alert(
-    blockage_reasons: set[str] | None, earliest_recovery: datetime | None
-) -> tuple[str, str]:
-    """Build a truthful (title, body) for the all-accounts-blocked stall alert
-    from the per-cycle blockage reasons emitted by describe_pool_blockage().
-
-    A stall can come from rate-limit cooldown, slot/daily-cap contention,
-    missing accounts, or a mix. Each shape gets a distinct title so the
-    operator alert is not lying about why work isn't dispatching.
-
-    The title says "eligible" rather than "all" because describe_pool_blockage
-    summarizes per-task-model constraints — when only the model-eligible
-    candidates are exhausted, other accounts in the pool can still serve
-    different models. Calling that "all" was the 2026-04-24 misleading-alert
-    bug where the user saw "all rate-limited" while 50 other tasks completed.
-
-    With no reasons supplied (legacy callers / tests), fall back to the
-    rate-limit wording so dedup keys and copy stay stable.
-    """
-    recovery_iso = earliest_recovery.isoformat() if earliest_recovery else None
-    reasons = sorted(blockage_reasons) if blockage_reasons else []
-    if not reasons:
-        title = f"{_STALL_TITLE_PREFIX} eligible Max plan accounts rate-limited"
-        body = (
-            "Every dispatchable task was skipped because the model-eligible "
-            "Max plan accounts are in rate-limit cooldown. "
-            + (
-                f"Earliest recovery: {recovery_iso}."
-                if recovery_iso
-                else "Waiting for cooldown."
-            )
-        )
-        return title, body
-    rate_limited = any(
-        "rate-limit cooldown" in r or "rate-limited" in r for r in reasons
-    )
-    capacity = any("slot contention" in r or "at capacity" in r for r in reasons)
-    no_pool_accounts = any(r == "no accounts configured" for r in reasons)
-    no_provider_accounts = any(
-        "no accounts configured for provider" in r for r in reasons
-    )
-    no_ready_accounts = any("no ready accounts" in r for r in reasons)
-    if (
-        no_pool_accounts
-        and not no_provider_accounts
-        and not no_ready_accounts
-        and not rate_limited
-        and not capacity
-    ):
-        title = f"{_STALL_TITLE_PREFIX} no Max plan accounts configured"
-    elif (
-        (no_pool_accounts or no_provider_accounts or no_ready_accounts)
-        and not rate_limited
-        and not capacity
-    ):
-        title = f"{_STALL_TITLE_PREFIX} no Max plan accounts ready"
-    elif rate_limited and capacity:
-        title = f"{_STALL_TITLE_PREFIX} eligible Max plan accounts unavailable (rate limits + capacity)"
-    elif rate_limited:
-        title = f"{_STALL_TITLE_PREFIX} eligible Max plan accounts rate-limited"
-    elif capacity:
-        title = f"{_STALL_TITLE_PREFIX} eligible Max plan accounts at capacity"
-    else:
-        title = f"{_STALL_TITLE_PREFIX} eligible Max plan accounts unavailable"
-    body = "Every dispatchable task was skipped because: " + "; ".join(reasons) + "."
-    if rate_limited:
-        body += (
-            f" Earliest recovery: {recovery_iso}."
-            if recovery_iso
-            else " Waiting for cooldown."
-        )
-    return title, body
-
-
 async def _emit_all_accounts_blocked_stall(
     session: AsyncSession,
     earliest_recovery: datetime | None,
@@ -501,301 +390,17 @@ ACTIVE_TASKS_LIGHT_COLUMNS = (
 
 
 # ---------------------------------------------------------------------------
-# Cycle detection for deadlock resolution
+# Cycle / health classification — extracted to ``app.orchestrator_health``.
+# Symbols below are re-exported so ``from app.orchestrator import ...`` keeps
+# working for existing callers and tests.
 # ---------------------------------------------------------------------------
+from app.orchestrator_health import (  # noqa: E402,F401
+    _CRITICAL_EXTERNAL_DEPS,
+    _classify_stuck_tasks,
+    _find_cycle_members,
+    _health_score_task,
+)
 
-
-def _find_cycle_members(adj: Dict[str, list]) -> set:
-    """Return node IDs participating in cycles (DFS white/gray/black coloring)."""
-    WHITE, GRAY, BLACK = 0, 1, 2
-    color = dict.fromkeys(adj, WHITE)
-    members: set = set()
-
-    def dfs(n, stack):
-        color[n] = GRAY
-        stack.append(n)
-        for d in adj.get(n, []):
-            if color.get(d) == GRAY:
-                members.update(stack[stack.index(d) :])
-            elif color.get(d) == WHITE:
-                dfs(d, stack)
-        stack.pop()
-        color[n] = BLACK
-
-    for n in list(adj):
-        if color[n] == WHITE:
-            dfs(n, [])
-    return members
-
-
-def _classify_stuck_tasks(stuck, dep_map, dep_status, stuck_ids) -> list:
-    """Return [(task_id, reason)] for tasks whose depends_on should be cleared.
-
-    reason is 'cycle' (true dependency cycle) or 'dead_deps' (all deps are
-    FAILED/CANCELLED/deleted with none stuck or active).
-    """
-    adj = {str(t.id): [str(d) for d in dep_map[t.id] if d in stuck_ids] for t in stuck}
-    cycle_m = _find_cycle_members(adj)
-    out = []
-    for t in stuck:
-        deps = dep_map[t.id]
-        if not deps:
-            continue
-        if str(t.id) in cycle_m:
-            out.append((t.id, "cycle"))
-            continue
-        # Dead-dep: no dep is stuck (resolvable) or active
-        if not any(
-            d in stuck_ids
-            or dep_status.get(d) not in (None, TaskStatus.FAILED, TaskStatus.CANCELLED)
-            for d in deps
-        ):
-            out.append((t.id, "dead_deps"))
-    return out
-
-
-def _health_score_task(task: Task) -> int:
-    """Return a dispatch-priority boost for health-aware reordering during degradation.
-
-    Small scope and low risk are preferred because they are less likely to consume
-    a scarce VM slot and fail.  Higher score = dispatched first.
-
-    Scoring:
-        +2  scope == "small"
-        +1  risk  == "low"
-    """
-    ctx = task.context or {}
-    score = 0
-    if ctx.get("scope") == "small":
-        score += 2
-    if ctx.get("risk") == "low":
-        score += 1
-    return score
-
-
-async def _persist_circuit_breakers():
-    """Save circuit breaker state to DB so it survives restarts."""
-    from app.deploy_health import _get_deploy_state_for_update
-
-    try:
-        serializable = {}
-        for k, v in _shared_state.circuit_breakers.items():
-            # Prune: don't persist CLOSED breakers with no failures (default state)
-            if (
-                v.get("state") == "CLOSED"
-                and v.get("failure_count", 0) == 0
-                and v.get("infra_failure_count", 0) == 0
-            ):
-                continue
-            serializable[k] = {
-                **v,
-                "opened_at": v["opened_at"].isoformat() if v.get("opened_at") else None,
-            }
-        async with AsyncSessionLocal() as session:
-            state = await _get_deploy_state_for_update(session)
-            if state:
-                state.circuit_breaker_states = serializable
-                session.add(state)
-                await session.commit()
-    except Exception as e:
-        logger.warning(f"[CIRCUIT BREAKER] Failed to persist state: {e}", exc_info=True)
-
-
-async def _persist_zone_health():
-    """Snapshot zone health to DB so cooldowns survive restarts."""
-    from app.deploy_health import (
-        _get_deploy_state_for_update,
-        _pause_failure_streak,
-        _health_recovery_history,
-        _last_auto_resume_at,
-        _recent_auto_resumes,
-        _last_resume_was_forced,
-        _consecutive_force_resumes,
-    )
-
-    try:
-        from app.compute import _zone_health, _zone_lock
-
-        with _zone_lock:
-            snapshot = {}
-            for zone, data in _zone_health.items():
-                snapshot[zone] = {
-                    k: (
-                        v.isoformat()
-                        if isinstance(v, datetime)
-                        else list(v)
-                        if isinstance(v, deque)
-                        else v
-                    )
-                    for k, v in data.items()
-                }
-        snapshot["_pause_failure_streak"] = _pause_failure_streak
-        snapshot["_health_recovery_history"] = list(_health_recovery_history)
-        snapshot["_last_auto_resume_at"] = (
-            _last_auto_resume_at.isoformat() if _last_auto_resume_at else None
-        )
-        snapshot["_recent_auto_resumes"] = [t.isoformat() for t in _recent_auto_resumes]
-        snapshot["_last_resume_was_forced"] = bool(_last_resume_was_forced)
-        snapshot["_consecutive_force_resumes"] = int(_consecutive_force_resumes)
-        async with AsyncSessionLocal() as session:
-            state = await _get_deploy_state_for_update(session)
-            if state:
-                state.zone_health_state = snapshot
-                session.add(state)
-                await session.commit()
-    except Exception as e:
-        logger.warning(f"[ZONE HEALTH] Failed to persist state: {e}", exc_info=True)
-
-
-def _serialize_anomaly_snapshot() -> dict:
-    """Build the anomaly-state snapshot from in-memory shared_state."""
-    serializable_anomalies: dict = {}
-    for proj_id, proj_anomalies in _shared_state.persistent_anomalies.items():
-        serializable_anomalies[proj_id] = {}
-        for k, v in proj_anomalies.items():
-            if not isinstance(v, dict):
-                serializable_anomalies[proj_id][k] = (
-                    v.isoformat() if isinstance(v, datetime) else v
-                )
-                continue
-            serializable_anomalies[proj_id][k] = {
-                fk: fv.isoformat() if isinstance(fv, datetime) else fv
-                for fk, fv in v.items()
-            }
-    return {
-        "persistent_anomalies": serializable_anomalies,
-        "anomaly_adjustments": dict(_shared_state.anomaly_adjustments),
-    }
-
-
-def _serialize_direction_streaks_snapshot() -> dict:
-    """Build the direction-streak snapshot from in-memory shared_state."""
-    return {
-        direction_id: {
-            k: v.isoformat() if isinstance(v, datetime) else v
-            for k, v in streak.items()
-        }
-        for direction_id, streak in _shared_state.direction_failure_streaks.items()
-    }
-
-
-def _serialize_pipeline_events_snapshot() -> dict:
-    """Build the pipeline-events snapshot from in-memory shared_state."""
-    events_list = [
-        {k: v.isoformat() if isinstance(v, datetime) else v for k, v in e.items()}
-        for e in _shared_state.deploy_monitoring["pipeline_events"]
-    ]
-    return {"events": events_list}
-
-
-async def _persist_anomaly_state(session: AsyncSession | None = None):
-    """Snapshot anomaly detection state to DB so occurrence counts survive restarts.
-
-    If ``session`` is provided, mutates ``DeploymentState`` on that session and
-    leaves the commit to the caller (lets the orchestrator coalesce multiple
-    persist calls into one round-trip — see M-P6). When called without a
-    session, opens its own session and commits, preserving the legacy
-    fire-and-forget contract used by tests.
-    """
-    from app.deploy_health import _get_deploy_state_for_update
-
-    try:
-        snapshot = _serialize_anomaly_snapshot()
-        if session is not None:
-            state = await _get_deploy_state_for_update(session)
-            if state:
-                state.persistent_anomaly_state = snapshot
-                session.add(state)
-            return
-        async with AsyncSessionLocal() as new_session:
-            state = await _get_deploy_state_for_update(new_session)
-            if state:
-                state.persistent_anomaly_state = snapshot
-                new_session.add(state)
-                await new_session.commit()
-    except Exception as e:
-        logger.warning(f"[ANOMALY STATE] Failed to persist: {e}", exc_info=True)
-
-
-async def _persist_direction_streaks(session: AsyncSession | None = None):
-    """Snapshot direction failure streaks to DB so holds survive restarts.
-
-    See :func:`_persist_anomaly_state` for the optional-session contract.
-    """
-    from app.deploy_health import _get_deploy_state_for_update
-
-    try:
-        serializable = _serialize_direction_streaks_snapshot()
-        if session is not None:
-            state = await _get_deploy_state_for_update(session)
-            if state:
-                state.direction_streak_state = serializable
-                session.add(state)
-            return
-        async with AsyncSessionLocal() as new_session:
-            state = await _get_deploy_state_for_update(new_session)
-            if state:
-                state.direction_streak_state = serializable
-                new_session.add(state)
-                await new_session.commit()
-    except Exception as e:
-        logger.warning(f"[DIRECTION STREAKS] Failed to persist: {e}", exc_info=True)
-
-
-async def _persist_pipeline_events(session: AsyncSession | None = None):
-    """Snapshot pipeline events ring buffer to DB so alert windows survive restarts.
-
-    See :func:`_persist_anomaly_state` for the optional-session contract.
-    """
-    from app.deploy_health import _get_deploy_state_for_update
-
-    try:
-        snapshot = _serialize_pipeline_events_snapshot()
-        if session is not None:
-            state = await _get_deploy_state_for_update(session)
-            if state:
-                state.pipeline_events_state = snapshot
-                session.add(state)
-            return
-        async with AsyncSessionLocal() as new_session:
-            state = await _get_deploy_state_for_update(new_session)
-            if state:
-                state.pipeline_events_state = snapshot
-                new_session.add(state)
-                await new_session.commit()
-    except Exception as e:
-        logger.warning(f"[PIPELINE EVENTS] Failed to persist: {e}", exc_info=True)
-
-
-async def _persist_self_healing_state_bundle():
-    """Coalesced 60s snapshot of anomaly + direction-streak + pipeline-events state.
-
-    All three live on the same ``DeploymentState`` row, so we open one session,
-    take the row lock once via ``_get_deploy_state_for_update``, mutate the
-    three columns, and commit once. Replaces three separate session/commit
-    cycles per orchestrator tick (M-P6).
-    """
-    from app.deploy_health import _get_deploy_state_for_update
-
-    try:
-        anomaly_snapshot = _serialize_anomaly_snapshot()
-        direction_snapshot = _serialize_direction_streaks_snapshot()
-        events_snapshot = _serialize_pipeline_events_snapshot()
-        async with AsyncSessionLocal() as session:
-            state = await _get_deploy_state_for_update(session)
-            if state:
-                state.persistent_anomaly_state = anomaly_snapshot
-                state.direction_streak_state = direction_snapshot
-                state.pipeline_events_state = events_snapshot
-                session.add(state)
-                await session.commit()
-    except Exception as e:
-        logger.warning(
-            f"[SELF-HEALING STATE] Failed to persist bundle: {e}", exc_info=True
-        )
-
-
-_CRITICAL_EXTERNAL_DEPS = ("github_api", "dispatch_api", "gcp")
 
 _ENV_FALLBACK_DEFAULT_MODELS = {
     "anthropic": "claude-opus-4-7",
@@ -975,97 +580,10 @@ def _sync_task_payload_runtime_fields(
     return changed
 
 
-def get_confirmed_down_critical_deps() -> list:
-    """Return critical dependency names confirmed down for 2+ consecutive health checks.
-
-    DB is excluded — if DB is down the orchestrator itself cannot function, so
-    there's no meaningful gate to apply.  A dep needs >=2 consecutive failures to
-    avoid false-positives from transient probe errors.
-    """
-    consec = _shared_state.external_health.get("consecutive_failures", {})
-    return [d for d in _CRITICAL_EXTERNAL_DEPS if consec.get(d, 0) >= 2]
-
-
-async def _check_candidate_task_deps(
-    task: Task,
-    dep_tasks: list,
-    dep_uuids: list,
-    session: AsyncSession,
-    verify_pr_merged,
-) -> tuple[str, dict]:
-    """Check whether a candidate task's dependencies are satisfied.
-
-    Handles requeue-cancelled dependencies: if a dep task is CANCELLED but has
-    ``_replaced_by_task_id`` in its context (set by ``_requeue_parent_task``),
-    the replacement clone's status is used instead of treating the dependency as
-    permanently failed.
-
-    Returns:
-        (result, deps_remapped) where:
-        - result is ``'cascade_cancel'``, ``'eligible'``, or ``'waiting'``
-        - deps_remapped maps old cancelled dep IDs to replacement IDs (for
-          persisting remap so future cycles skip the lookup)
-    """
-    all_met = True
-    any_failed = len(dep_tasks) < len(dep_uuids)  # Missing deps treated as failed
-    deps_remapped: dict[str, str] = {}
-
-    # A SCOPE_EMPTY dependency is a deliberate "scope already covered" exit,
-    # not a defect — the branch is intact and dependent clusters (different
-    # files) must still run. Treat it as a satisfied, non-blocking dep
-    # wherever it surfaces, whether it landed CANCELLED (current) or FAILED
-    # (legacy rows pre-dating the CANCELLED relabel).
-    from app.failure_classification import SCOPE_EMPTY
-
-    for dt in dep_tasks:
-        effective_dt = dt
-        if dt.status == TaskStatus.CANCELLED:
-            if (dt.context or {}).get("failure_category") == SCOPE_EMPTY:
-                continue  # clean no-op exit — satisfied, do not cascade-cancel
-            replacement_id_str = (dt.context or {}).get("_replaced_by_task_id")
-            if replacement_id_str:
-                try:
-                    replacement = await session.get(Task, uuid.UUID(replacement_id_str))
-                except (ValueError, AttributeError):
-                    replacement = None
-                if replacement:
-                    deps_remapped[str(dt.id)] = str(replacement.id)
-                    effective_dt = replacement
-                else:
-                    # Replacement task is gone — treat as permanently cancelled
-                    any_failed = True
-                    break
-            else:
-                # Permanently cancelled (no replacement recorded)
-                any_failed = True
-                break
-
-        if effective_dt.status == TaskStatus.FAILED:
-            if (effective_dt.context or {}).get("failure_category") == SCOPE_EMPTY:
-                continue  # legacy FAILED+SCOPE_EMPTY rows — satisfied
-            any_failed = True
-            break
-        if effective_dt.status == TaskStatus.CANCELLED:
-            if (effective_dt.context or {}).get("failure_category") == SCOPE_EMPTY:
-                continue
-            any_failed = True
-            break
-        if effective_dt.status != TaskStatus.COMPLETED:
-            all_met = False
-            continue
-        # For create tasks, also require PR to be merged
-        dt_type = (effective_dt.first_payload).get("type", "create")
-        if dt_type in ("create", "") and not await verify_pr_merged(
-            effective_dt, session
-        ):
-            all_met = False
-
-    if any_failed:
-        return "cascade_cancel", deps_remapped
-    elif all_met:
-        return "eligible", deps_remapped
-    else:
-        return "waiting", deps_remapped
+from app.orchestrator_health import (  # noqa: E402,F401
+    _check_candidate_task_deps,
+    get_confirmed_down_critical_deps,
+)
 
 
 async def orchestrator_worker():
@@ -1115,6 +633,7 @@ async def orchestrator_worker():
         close_pull_request,
         get_check_runs_cached,
         get_pull_request,
+        pr_is_not_behind_for,
         reopen_pull_request,
         update_branch_with_sha_retry,
     )
@@ -1157,10 +676,12 @@ async def orchestrator_worker():
             # the orchestrator on dispatcher exceptions.
             global _last_regression_dispatch
             if (_utcnow() - _last_regression_dispatch).total_seconds() >= 60:
-                from app.pipeline_regression_dispatcher import (
+                from app.regression_recovery_watchdog import (
                     run_dispatcher_watchdog_alarms as _run_watchdog_alarms,
+                )
+                from app.pipeline_regression_dispatcher import (
                     run_once as _run_regression_dispatcher,
-                )  # noqa: PLC0415
+                )
 
                 # Pull IDs only (no Project ORM rows in any identity map). The
                 # dispatcher's run_once does ``session.get(Project, project_id)``
@@ -1394,6 +915,7 @@ async def orchestrator_worker():
                         if zombie and not zombie.done():
                             zombie.cancel()
                             cancelled_provision_ids.append(str(t.id))
+                        bank_task_current_attempt(fresh_t, stopped_at=_utcnow())
                         fresh_t.status = TaskStatus.QUEUED
                         fresh_t.started_at = None
                         fresh_t.vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
@@ -3432,6 +2954,13 @@ async def orchestrator_worker():
                                                     infra_count
                                                 )
                                                 ctx["_infra_wait"] = True
+                                                bank_task_current_attempt(
+                                                    failed_task, stopped_at=_utcnow()
+                                                )
+                                                ctx = with_task_attempt_banking(
+                                                    failed_task, ctx
+                                                )
+                                                failed_task.context = ctx
                                                 failed_task.status = TaskStatus.QUEUED
                                                 failed_task.vm_instance_id = (
                                                     f"agent-vm-{uuid.uuid4().hex}"
@@ -3453,6 +2982,7 @@ async def orchestrator_worker():
                                                 else:
                                                     delay_min = 10
                                                 set_retry_after(failed_task, delay_min)
+                                                ctx = dict(failed_task.context or {})
                                                 failed_task.latest_status_message = f"Infra-wide provision failure (#{infra_count}), requeued — waiting for zone recovery: {provision_err or 'unknown'}"[
                                                     :500
                                                 ]
@@ -3529,6 +3059,14 @@ async def orchestrator_worker():
                                                     )
                                                 else:
                                                     # Requeue for retry
+                                                    bank_task_current_attempt(
+                                                        failed_task,
+                                                        stopped_at=_utcnow(),
+                                                    )
+                                                    ctx = with_task_attempt_banking(
+                                                        failed_task, ctx
+                                                    )
+                                                    failed_task.context = ctx
                                                     failed_task.status = (
                                                         TaskStatus.QUEUED
                                                     )
@@ -3538,7 +3076,6 @@ async def orchestrator_worker():
                                                     failed_task.last_heartbeat = None
                                                     failed_task.started_at = None
                                                     # Back off 2 min per failure to let zones recover
-                                                    failed_task.context = ctx
                                                     set_retry_after(
                                                         failed_task, 2 * prov_failures
                                                     )
@@ -4288,6 +3825,39 @@ async def orchestrator_worker():
                                 _expected_head_sha = (
                                     pr_data.get("head", {}).get("sha") or None
                                 )
+                                # Short-circuit when GitHub's 'behind' state is stale —
+                                # if the base tip is already an ancestor of the PR head,
+                                # update_branch_with_sha_retry would just churn CI for
+                                # no real change. Mirrors ci_completion.py's pattern.
+                                _orch_ci_project_pre = (
+                                    await session.get(Project, ci_task.project_id)
+                                    if ci_task.project_id
+                                    else None
+                                )
+                                _ci_payload_pre = ci_task.first_payload
+                                _ci_base_pre = (
+                                    ci_loop.get("base_branch", "")
+                                    or _ci_payload_pre.get("base_branch", "")
+                                    or _shared_state.get_project_integration_branch(
+                                        _orch_ci_project_pre
+                                    )
+                                )
+                                _not_behind_pre = await pr_is_not_behind_for(
+                                    ci_gh_token,
+                                    ci_owner,
+                                    ci_repo,
+                                    pr_detail=pr_data,
+                                    base_branch=_ci_base_pre,
+                                    project_id=ci_pid_str,
+                                    call_site="orchestrator_ci",
+                                )
+                                if _not_behind_pre is True:
+                                    logger.info(
+                                        f"[CI] PR #{ci_pr_number} mergeable_state='behind' but "
+                                        f"pr_is_not_behind=True — skipping update_branch_with_sha_retry"
+                                    )
+                                    await session.rollback()
+                                    continue
                                 await session.commit()
                                 # Trivially resolvable via GitHub's update-branch API.
                                 # Update the branch in-place; the merge-commit
@@ -4340,6 +3910,35 @@ async def orchestrator_worker():
                                     )
                                     logger.info(
                                         f"[CI] PR #{ci_pr_number} behind base — update_branch succeeded, skipped fix spawn"
+                                    )
+                                    continue
+                                if _upd.get("not_behind"):
+                                    # GitHub's cached mergeable_state was stale — the
+                                    # PR is not actually behind (no new commits on
+                                    # base). Treat exactly like the pr_is_not_behind
+                                    # short-circuit above: clear any prior retry
+                                    # counter and defer to the next sweep without
+                                    # escalating to fix-spawn.
+                                    ci_task.latest_status_message = (
+                                        f"PR #{ci_pr_number} not behind base "
+                                        f"(no new commits on base) — cached "
+                                        f"mergeable_state was stale, deferring to next CI sweep"
+                                    )
+                                    ci_loop["polls_since_pr_fetch"] = 999
+                                    ci_loop["head_sha"] = ""
+                                    ci_loop.pop("_behind_update_retries", None)
+                                    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+
+                                    ci_task.context = {
+                                        **(ci_task.context or {}),
+                                        "review_loop": ci_loop,
+                                    }
+                                    flag_modified(ci_task, "context")
+                                    session.add(ci_task)
+                                    await session.commit()
+                                    logger.info(
+                                        f"[CI] PR #{ci_pr_number} behind base — "
+                                        f"update_branch reports no new commits on base, deferring to next sweep"
                                     )
                                     continue
                                 # update_branch failed — likely a transient GitHub API error,
@@ -4444,8 +4043,17 @@ async def orchestrator_worker():
                             ci_branch = ci_loop.get("branch", "") or ci_payload.get(
                                 "branch", ""
                             )
-                            ci_base = ci_loop.get("base_branch", "") or ci_payload.get(
-                                "base_branch", "main"
+                            _orch_ci_project = (
+                                await session.get(Project, ci_task.project_id)
+                                if ci_task.project_id
+                                else None
+                            )
+                            ci_base = (
+                                ci_loop.get("base_branch", "")
+                                or ci_payload.get("base_branch", "")
+                                or _shared_state.get_project_integration_branch(
+                                    _orch_ci_project
+                                )
                             )
                             ci_orig_id = ci_loop.get(
                                 "original_task_id", ""
@@ -4481,6 +4089,36 @@ async def orchestrator_worker():
                                 logger.debug(
                                     f"[CI] conflict-fix CI preview fetch failed for PR #{ci_pr_number}: {_ci_preview_exc}"
                                 )
+                            # Pre-spawn ancestor recheck: the PR head may have advanced
+                            # (e.g. a sibling rollup) while update_branch retries were
+                            # running. If it's now not-behind, skip the fix spawn entirely
+                            # and clear the retry counter so the next sweep re-evaluates.
+                            if _behind_fallthrough:
+                                _late_not_behind = await pr_is_not_behind_for(
+                                    ci_gh_token,
+                                    ci_owner,
+                                    ci_repo,
+                                    pr_detail=pr_data,
+                                    base_branch=ci_base,
+                                    project_id=ci_pid_str,
+                                    call_site="orchestrator_ci",
+                                )
+                                if _late_not_behind is True:
+                                    logger.info(
+                                        f"[CI] PR #{ci_pr_number} pr_is_not_behind=True at spawn time "
+                                        f"after update_branch retries exhausted — skipping fix spawn"
+                                    )
+                                    ci_loop.pop("_behind_update_retries", None)
+                                    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+
+                                    ci_task.context = {
+                                        **(ci_task.context or {}),
+                                        "review_loop": ci_loop,
+                                    }
+                                    flag_modified(ci_task, "context")
+                                    session.add(ci_task)
+                                    await session.commit()
+                                    continue
                             if _behind_fallthrough:
                                 # The PR is merely BEHIND base, not conflicting — but the
                                 # GitHub update-branch API failed across the retry budget,
@@ -4496,13 +4134,18 @@ async def orchestrator_worker():
                                     f"IMPORTANT — verify current state before acting. The `mergeable` flag can flip "
                                     f"between spawn and execution. After cloning:\n"
                                     f"  1. Run `git fetch origin && git rebase origin/{ci_base}`.\n"
-                                    f"  2. If the rebase surfaces unexpected conflicts (it shouldn't, given the "
+                                    f"  2. If no conflicts and no commits were replayed (git says 'Current branch "
+                                    f"is up to date'), the PR is already up-to-date — GitHub's mergeability flag "
+                                    f"is just stale. Report no changes needed (don't force-push); retries will "
+                                    f"clear it.\n"
+                                    f"  3. If the rebase surfaces unexpected conflicts (it shouldn't, given the "
                                     f"behind state), check `git status` and `git diff --name-only --diff-filter=U` "
                                     f"and resolve them.\n"
-                                    f"  3. Re-query the PR's current state via the GitHub API "
-                                    f'(`curl -H "Authorization: Bearer $GITHUB_TOKEN" '
-                                    f"https://api.github.com/repos/{ci_owner}/{ci_repo}/pulls/{ci_pr_number}`) "
-                                    f"to confirm what is actually blocking the merge now.\n\n"
+                                    f"  4. If the branch state changed while you were working, inspect the latest "
+                                    f"failing checks via the orchestrator's read-only proxy "
+                                    f'(`curl -sS -H "X-Agent-Token: $AGENT_API_TOKEN" '
+                                    f'"$ORCHESTRATOR_URL/api/agent/github/check-runs?commit_sha=$(git rev-parse HEAD)" '
+                                    f"| jq '.data.details[]'`) so you only act on current CI failures.\n\n"
                                     f"Primary action: rebase onto `{ci_base}` and force-push so the PR is no longer behind."
                                     f"{ci_preview_section}\n\n"
                                     f"Before declaring done: ensure (a) no conflict markers remain (if any surfaced), "
@@ -4519,11 +4162,11 @@ async def orchestrator_worker():
                                     f"or new commits may have reintroduced one). After cloning:\n"
                                     f"  1. Attempt `git rebase origin/{ci_base}` — note whether it succeeds cleanly.\n"
                                     f"  2. Check `git status` and `git diff --name-only --diff-filter=U` for unmerged paths.\n"
-                                    f"  3. If neither shows conflicts, the premise is stale — re-query the PR's "
-                                    f"current mergeable state and failing check runs via the GitHub API "
-                                    f'(`curl -H "Authorization: Bearer $GITHUB_TOKEN" '
-                                    f"https://api.github.com/repos/{ci_owner}/{ci_repo}/pulls/{ci_pr_number}`) "
-                                    f"and fix whatever is actually blocking the merge now.\n\n"
+                                    f"  3. If neither shows conflicts, the premise is stale — inspect the latest "
+                                    f"failing checks via the orchestrator's read-only proxy "
+                                    f'(`curl -sS -H "X-Agent-Token: $AGENT_API_TOKEN" '
+                                    f'"$ORCHESTRATOR_URL/api/agent/github/check-runs?commit_sha=$(git rev-parse HEAD)" '
+                                    f"| jq '.data.details[]'`) and fix whatever is actually blocking the merge now.\n\n"
                                     f"Primary action: rebase onto `{ci_base}` and resolve any conflicts."
                                     f"{ci_preview_section}\n\n"
                                     f"Before declaring done: ensure (a) no conflict markers remain in any file, "

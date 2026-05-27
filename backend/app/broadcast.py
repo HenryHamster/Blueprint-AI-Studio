@@ -179,13 +179,33 @@ manager = ConnectionManager()
 async def broadcast_to_project(project_id: str, event_type: str, data: dict):
     """Broadcasts a message to all WebSocket clients listening to a specific project.
 
-    Swallows exceptions to prevent crashing HTTP handlers after DB commits.
+    Delivers locally (to clients on THIS instance) and additionally publishes
+    the event onto the cross-instance NOTIFY channel so sibling Cloud Run
+    instances re-deliver it to their own locally-connected clients. This is the
+    'originally broadcast here' path (local deliver + publish); the
+    event_fanout listener's 'received from peer' path delivers locally only,
+    which is the structural break that prevents an infinite re-publish loop.
+
+    Swallows exceptions for both steps to prevent crashing HTTP handlers after
+    DB commits (the reaper / agent / orchestrator paths rely on this).
     """
     try:
         await manager.broadcast(project_id, event_type, data)
     except Exception as e:
         logger.warning(
             f"[WS] Broadcast failed (project={project_id}, event={event_type}): {e}"
+        )
+    # Late import avoids a circular dependency: event_fanout's listener imports
+    # `manager` from this module. publish_project_event is itself best-effort
+    # (no-op on non-Postgres, swallows all errors) but we guard again here so a
+    # publish failure never escapes the local-delivery contract above.
+    try:
+        from app.event_fanout import publish_project_event
+
+        await publish_project_event(project_id, event_type, data)
+    except Exception as e:
+        logger.warning(
+            f"[WS] Cross-instance publish failed (project={project_id}, event={event_type}): {e}"
         )
 
 

@@ -31,13 +31,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
 import uuid
 from fastapi import HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.models import DeploymentState, Project, Task
 
@@ -180,7 +181,10 @@ async def lock_project_or_429(
     result = await session.execute(
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=True)
+        # FOR NO KEY UPDATE — see project_lock: serializes project-row writers
+        # without blocking FK child-row inserts (FOR KEY SHARE). PK never changes.
+        .with_for_update(skip_locked=True, key_share=True)
+        .execution_options(populate_existing=True)
     )
     project = result.scalars().first()
     if project is not None:
@@ -271,7 +275,17 @@ async def project_lock(
     stmt = (
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=skip_locked)
+        # FOR NO KEY UPDATE (key_share=True), not FOR UPDATE: still serializes
+        # concurrent project-row writers (it conflicts with itself and FOR
+        # UPDATE), but does NOT conflict with the FOR KEY SHARE lock that every
+        # insert of a project-child row (ProjectMessage / Task / Alert ...) takes
+        # on the parent for its FK. Plain FOR UPDATE deadlocks across connections
+        # when a lock holder (or a chain it awaits) inserts such a child row — the
+        # release-qualifier infra-failure path hit exactly this (operator-message
+        # INSERT blocked on a held project lock). The project PK is never updated,
+        # so FOR NO KEY UPDATE is the correct, strictly-safer lock here.
+        .with_for_update(skip_locked=skip_locked, key_share=True)
+        .execution_options(populate_existing=True)
     )
     try:
         result = await asyncio.wait_for(session.execute(stmt), timeout=timeout)
@@ -334,7 +348,9 @@ async def lock_project_then_task(
     project_stmt = (
         select(Project)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=skip_locked)
+        # FOR NO KEY UPDATE — see project_lock: serializes project-row writers
+        # without blocking FK child-row inserts (FOR KEY SHARE). PK never changes.
+        .with_for_update(skip_locked=skip_locked, key_share=True)
     )
     try:
         project_result = await asyncio.wait_for(
@@ -415,7 +431,10 @@ async def lock_project_for_strategic_transition(
         result = await session.execute(
             select(Project)
             .where(Project.id == project_id)
-            .with_for_update(skip_locked=True)
+            # FOR NO KEY UPDATE — see project_lock: serializes project-row writers
+            # without blocking FK child-row inserts (FOR KEY SHARE). PK never changes.
+            .with_for_update(skip_locked=True, key_share=True)
+            .execution_options(populate_existing=True)
         )
         project = result.scalars().first()
         if project is not None:
@@ -428,3 +447,134 @@ async def lock_project_for_strategic_transition(
             return None  # genuinely missing
         await asyncio.sleep(0.5 * (attempt + 1))
     return None  # row held past retry window — caller defers
+
+
+async def _with_project_locked_list_mutation(
+    session: AsyncSession,
+    project_id,
+    mutate_fn: Callable[[list], list | None],
+    *,
+    skip_locked: bool,
+) -> bool:
+    async with project_lock(session, project_id, skip_locked=skip_locked) as project:
+        if project is None:
+            return False
+        directions = list(project.directions or [])
+        result = mutate_fn(directions)
+        project.directions = result if result is not None else directions
+        flag_modified(project, "directions")
+        session.add(project)
+    return True
+
+
+async def with_design_doc_locked(
+    session: AsyncSession,
+    project_id,
+    mutate_fn: Callable[[dict], None],
+    *,
+    skip_locked: bool = False,
+) -> bool:
+    """Atomic read-modify-write of project.design_doc under a project row lock.
+
+    Acquires SELECT FOR UPDATE, calls mutate_fn(doc) with a copy of the
+    current doc dict, then writes the result back. Caller is responsible for
+    committing the session.
+
+    Args:
+        skip_locked: When False (default), block until the lock is acquired
+            (suitable for background callers that must not silently drop
+            updates). When True, return False immediately if the row is held
+            by another session — preserves best-effort / non-blocking
+            semantics for hot dispatch paths where lock contention should
+            degrade gracefully rather than block.
+
+    Returns:
+        True if mutate_fn was applied, False if the row was held and
+        skip_locked=True caused an immediate skip.
+
+    This is the canonical helper for all design_doc mutations. Using it
+    consistently prevents concurrent writers from clobbering each other's
+    keys via stale read-modify-write races.
+    """
+    async with project_lock(session, project_id, skip_locked=skip_locked) as project:
+        if project is None:
+            return False
+        doc = dict(project.design_doc or {})
+        mutate_fn(doc)
+        project.design_doc = doc
+        flag_modified(project, "design_doc")
+        session.add(project)
+    return True
+
+
+async def with_vision_locked(
+    session: AsyncSession,
+    project_id,
+    mutate_fn: Callable[[dict], None],
+    *,
+    skip_locked: bool = False,
+) -> bool:
+    """Atomic read-modify-write of project.vision under a project row lock.
+
+    Mirror of ``with_design_doc_locked`` for the sibling ``vision`` JSON
+    column. Acquires SELECT FOR UPDATE (skip_locked=False — background callers
+    wait rather than silently skip), hands ``mutate_fn`` the current vision
+    dict loaded *inside* the lock, then writes the result back. Caller is
+    responsible for committing.
+
+    This is the canonical helper for serializing vision mutations from
+    background task completions (strategic_completion, research_completion,
+    etc.). Using it consistently prevents concurrent background writers from
+    clobbering each other's updates via stale read-modify-write races — the
+    same lost-update class already eliminated for ``design_doc`` and
+    ``directions``.
+    """
+    async with project_lock(session, project_id, skip_locked=skip_locked) as project:
+        if project is None:
+            return False
+        vision = dict(project.vision or {})
+        mutate_fn(vision)
+        project.vision = vision
+        flag_modified(project, "vision")
+        session.add(project)
+    return True
+
+
+async def with_directions_locked(
+    session: AsyncSession,
+    project_id,
+    mutate_fn: Callable[[list], list | None],
+    *,
+    skip_locked: bool = False,
+) -> bool:
+    """Atomic read-modify-write of project.directions under a project row lock.
+
+    Mirror of ``with_design_doc_locked`` for the sibling ``directions`` JSON
+    column. Acquires SELECT FOR UPDATE, hands ``mutate_fn`` the current
+    directions list loaded *inside* the lock, then writes the result back.
+    ``mutate_fn`` may mutate the list in place and return None, or return a
+    replacement list (for whole-array overwrites). Caller is responsible for
+    committing.
+
+    Args:
+        skip_locked: When False (default), block until the lock is acquired
+            (suitable for background callers that must not silently drop
+            updates). When True, return False immediately if the row is held
+            by another session — preserves best-effort / non-blocking
+            semantics for hot dispatch paths.
+
+    Returns:
+        True if mutate_fn was applied, False if the row was held and
+        skip_locked=True caused an immediate skip.
+
+    This is the canonical helper for serializing directions mutations. Loading
+    the array inside the lock is what prevents a whole-array overwrite from
+    silently dropping a direction another writer appended concurrently — the
+    same lost-update class already eliminated for ``design_doc``.
+    """
+    return await _with_project_locked_list_mutation(
+        session,
+        project_id,
+        mutate_fn,
+        skip_locked=skip_locked,
+    )

@@ -782,6 +782,35 @@ def test_self_audit_oversized_payload_raises():
 
 
 # ---------------------------------------------------------------------------
+# base_branch must not silently default to "main"
+# ---------------------------------------------------------------------------
+
+
+def test_base_branch_absent_not_defaulted_to_main():
+    """Omitting base_branch must NOT silently inject 'main' into the result.
+
+    Regression guard: BasePayload previously declared base_branch='main',
+    masking spawn-site bugs on repos whose integration branch isn't main.
+    """
+    result = _valid({"type": "research"})
+    assert "base_branch" not in result, (
+        f"base_branch should be absent when not supplied, got {result.get('base_branch')!r}"
+    )
+
+
+def test_base_branch_none_excluded_from_dump():
+    """A payload validated without base_branch must not emit base_branch=None."""
+    result = _valid({"type": "create", "prompt": "Do the thing"})
+    assert "base_branch" not in result
+
+
+def test_base_branch_explicit_value_preserved():
+    """Explicitly supplied base_branch values are still accepted and returned."""
+    result = _valid({"type": "create", "prompt": "x", "base_branch": "trunk"})
+    assert result["base_branch"] == "trunk"
+
+
+# ---------------------------------------------------------------------------
 # SystemMaturity ORM constraint
 # ---------------------------------------------------------------------------
 

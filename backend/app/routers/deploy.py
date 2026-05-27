@@ -243,7 +243,7 @@ async def trigger_rollback(
     # Attempt Cloud Run traffic shift via gcloud
     project_id = os.getenv("GCP_PROJECT_ID", "")
     region = os.getenv("GCP_REGION", "us-central1")
-    service = "blueprint-orchestrator"
+    service = os.getenv("ORCHESTRATOR_SERVICE_NAME", "blueprint-orchestrator")
 
     rollback_revision = state.last_known_good_revision
     rollback_error = None

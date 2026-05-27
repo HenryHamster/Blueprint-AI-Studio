@@ -1,5 +1,6 @@
 import { useMemo, useState, useEffect } from 'react';
 import { parseTimestamp } from '../utils/time';
+import { downloadText, escapeCsv } from '../utils/taskCsv';
 import type { Task } from './TaskCard';
 import { apiFetch } from '../api';
 import {
@@ -16,6 +17,8 @@ import {
   Legend,
 } from 'recharts';
 
+type MetricsWindow = '15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all';
+
 interface MetricsPoint {
   timestamp: number;
   activeVMs: number;
@@ -30,12 +33,12 @@ interface MetricsDashboardProps {
   cumulativeVmHours: number;
   maxConcurrentVMs: number;
   tasks: Task[];
-  metricsWindow: '15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all';
-  onWindowChange: (w: '15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all') => void;
+  metricsWindow: MetricsWindow;
+  onWindowChange: (w: MetricsWindow) => void;
   projectId?: string;
 }
 
-const WINDOW_MS: Record<'15m' | '30m' | '1h' | '2h' | '3h' | '6h' | '12h' | '24h' | 'all', number> = { '15m': 900000, '30m': 1800000, '1h': 3600000, '2h': 7200000, '3h': 10800000, '6h': 21600000, '12h': 43200000, '24h': 86400000, 'all': Number.MAX_SAFE_INTEGER };
+const WINDOW_MS: Record<MetricsWindow, number> = { '15m': 900000, '30m': 1800000, '1h': 3600000, '2h': 7200000, '3h': 10800000, '6h': 21600000, '12h': 43200000, '24h': 86400000, 'all': Number.MAX_SAFE_INTEGER };
 
 const TICK_STYLE = { fill: '#737373', fontSize: 10 };
 const GRID_COLOR = '#262626';
@@ -44,6 +47,12 @@ const TOOLTIP_STYLE = {
   itemStyle: { color: '#f5f5f5' },
   labelStyle: { color: '#a3a3a3' },
 };
+
+const formatCostPerHr = (value: unknown): [string, string] => [(value as number).toFixed(2) + ' $/hr', 'VM Cost/Hr'];
+const formatActiveVMs = (value: unknown): [string, string] => [String(value) + ' VMs', 'Active VMs'];
+const formatFailureRate = (value: unknown): [string, string] => [(value as number).toFixed(1) + '%', 'Failure Rate'];
+const makeLabelFormatter = (windowMs: number) => (ts: unknown) => formatTime(Number(ts), windowMs);
+const METRICS_EXPORT_FIELDS = ['timestamp', 'activeVMs', 'costPerHr', 'completedCount', 'failedCount'] as const;
 
 function formatTime(ts: number, windowMs?: number): string {
   const d = new Date(ts);
@@ -67,6 +76,7 @@ function NoDataMessage() {
 function CostChart({ points, windowMs }: { points: MetricsPoint[]; windowMs: number }) {
   const [now] = useState(Date.now);
   const filtered = points.filter((p) => p.timestamp >= now - windowMs);
+  const labelFmt = useMemo(() => makeLabelFormatter(windowMs), [windowMs]);
   if (filtered.length < 2) return <NoDataMessage />;
 
   return (
@@ -77,8 +87,8 @@ function CostChart({ points, windowMs }: { points: MetricsPoint[]; windowMs: num
         <YAxis tick={TICK_STYLE} />
         <Tooltip
           {...TOOLTIP_STYLE}
-          formatter={(value: unknown) => [(value as number).toFixed(2) + ' $/hr', 'VM Cost/Hr']}
-          labelFormatter={(ts) => formatTime(Number(ts), windowMs)}
+          formatter={formatCostPerHr}
+          labelFormatter={labelFmt}
         />
         <Area dataKey="costPerHr" stroke="#10b981" fill="#10b981" fillOpacity={0.15} dot={false} />
       </AreaChart>
@@ -89,6 +99,7 @@ function CostChart({ points, windowMs }: { points: MetricsPoint[]; windowMs: num
 function VMChart({ points, maxConcurrentVMs, windowMs }: { points: MetricsPoint[]; maxConcurrentVMs: number; windowMs: number }) {
   const [now] = useState(Date.now);
   const filtered = points.filter((p) => p.timestamp >= now - windowMs);
+  const labelFmt = useMemo(() => makeLabelFormatter(windowMs), [windowMs]);
   if (filtered.length < 2) return <NoDataMessage />;
 
   return (
@@ -99,8 +110,8 @@ function VMChart({ points, maxConcurrentVMs, windowMs }: { points: MetricsPoint[
         <YAxis tick={TICK_STYLE} />
         <Tooltip
           {...TOOLTIP_STYLE}
-          formatter={(value: unknown) => [String(value) + ' VMs', 'Active VMs']}
-          labelFormatter={(ts) => formatTime(Number(ts), windowMs)}
+          formatter={formatActiveVMs}
+          labelFormatter={labelFmt}
         />
         <ReferenceLine y={maxConcurrentVMs} stroke="#3b82f6" strokeDasharray="4 3" strokeOpacity={0.5} />
         <Area dataKey="activeVMs" stroke="#3b82f6" fill="#3b82f6" fillOpacity={0.15} dot={false} />
@@ -112,6 +123,7 @@ function VMChart({ points, maxConcurrentVMs, windowMs }: { points: MetricsPoint[
 function TaskOutcomesChart({ points, tasks, windowMs }: { points: MetricsPoint[]; tasks: Task[]; windowMs: number }) {
   const [now] = useState(Date.now);
   const filtered = points.filter((p) => p.timestamp >= now - windowMs);
+  const labelFmt = useMemo(() => makeLabelFormatter(windowMs), [windowMs]);
   if (filtered.length < 2) return <NoDataMessage />;
 
   const baselineCompleted = tasks.filter((t) => t.status === 'COMPLETED').length;
@@ -141,7 +153,7 @@ function TaskOutcomesChart({ points, tasks, windowMs }: { points: MetricsPoint[]
         <YAxis tick={TICK_STYLE} />
         <Tooltip
           {...TOOLTIP_STYLE}
-          labelFormatter={(ts) => formatTime(Number(ts), windowMs)}
+          labelFormatter={labelFmt}
         />
         <Legend wrapperStyle={{ fontSize: 11, color: '#a3a3a3' }} />
         <Line dataKey="cumCompleted" stroke="#10b981" dot={false} name="Completed" />
@@ -154,6 +166,7 @@ function TaskOutcomesChart({ points, tasks, windowMs }: { points: MetricsPoint[]
 function FailureRateChart({ points, windowMs }: { points: MetricsPoint[]; windowMs: number }) {
   const [now] = useState(Date.now);
   const filtered = points.filter((p) => p.timestamp >= now - windowMs);
+  const labelFmt = useMemo(() => makeLabelFormatter(windowMs), [windowMs]);
   if (filtered.length < 2) return <NoDataMessage />;
 
   const ratePoints = filtered.map((p) => {
@@ -170,8 +183,8 @@ function FailureRateChart({ points, windowMs }: { points: MetricsPoint[]; window
         <YAxis tick={TICK_STYLE} domain={[0, 100]} tickFormatter={(v) => `${v}%`} />
         <Tooltip
           {...TOOLTIP_STYLE}
-          formatter={(value: unknown) => [(value as number).toFixed(1) + '%', 'Failure Rate']}
-          labelFormatter={(ts) => formatTime(Number(ts), windowMs)}
+          formatter={formatFailureRate}
+          labelFormatter={labelFmt}
         />
         <Line dataKey="failureRate" stroke="#ef4444" dot={false} name="Failure Rate" />
       </LineChart>
@@ -222,6 +235,73 @@ interface EfficiencyAxesLocal {
   axes: Record<string, EfficiencyAxisLocal>;
   baseline_captured_at: string | null;
   last_snapshot_at: string | null;
+  vm_cold_start_breakdown?: Record<string, number | null> | null;
+}
+
+interface TaskCostBreakdownEntry {
+  task_type: string;
+  task_count: number;
+  estimated_cost_usd: number;
+}
+
+interface DirectionCostBreakdownEntry {
+  direction_id: string | null;
+  task_count: number;
+  estimated_cost_usd: number;
+}
+
+interface TopCostTask {
+  task_id: string;
+  task_title: string;
+  task_type: string;
+  direction_id: string | null;
+  completed_at: string;
+  estimated_cost_usd: number;
+}
+
+interface TaskCostBreakdownResponse {
+  project_id: string | null;
+  window: MetricsWindow;
+  window_ms: number | null;
+  window_start: string | null;
+  task_count: number;
+  total_estimated_cost_usd: number;
+  task_type_breakdown: TaskCostBreakdownEntry[];
+  direction_breakdown: DirectionCostBreakdownEntry[];
+  top_tasks: TopCostTask[];
+}
+
+const COLD_START_STAGE_LABELS: [string, string, boolean][] = [
+  ['dispatch_to_slot_ms', 'Queue wait (slot)', true],
+  ['dispatch_to_creds_ms', 'Dispatch → creds', false],
+  ['creds_to_env_ms', 'Creds → env', false],
+  ['env_to_payload_ms', 'Env → payload', false],
+  ['payload_to_systemctl_ms', 'Payload → systemctl', false],
+  ['systemctl_to_startup_ms', 'Systemctl → startup', false],
+  ['startup_to_claim_ms', 'Startup → claim', false],
+];
+
+function ColdStartBreakdown({ breakdown }: { breakdown: Record<string, number | null> }) {
+  const hasAny = COLD_START_STAGE_LABELS.some(([key]) => breakdown[key] != null);
+  if (!hasAny) return null;
+  return (
+    <div className="mt-2 pt-2 border-t border-neutral-700/50">
+      <div className="text-[10px] text-neutral-500 mb-1 uppercase tracking-wide">Cold-start stage breakdown (p50)</div>
+      <div className="grid grid-cols-2 gap-x-4 gap-y-0.5">
+        {COLD_START_STAGE_LABELS.map(([key, label, isQueueWait]) => {
+          const val = breakdown[key];
+          return (
+            <div key={key} className="flex justify-between items-center text-[10px]">
+              <span className={isQueueWait ? 'text-amber-400/80' : 'text-neutral-500'}>{label}</span>
+              <span className={`font-mono ${isQueueWait ? 'text-amber-400' : 'text-neutral-400'}`}>
+                {val != null ? `${val.toFixed(0)}ms` : '—'}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 function AxisSparkline({ history, favorableDirection }: {
@@ -326,9 +406,118 @@ function EfficiencyWidget({ projectId }: { projectId: string }) {
             {axisData.history && axisData.history.length >= 2 && (
               <AxisSparkline history={axisData.history} favorableDirection={axisDef.favorableDirection} />
             )}
+            {axisDef.key === 'vm_cold_start_p50_ms' && data.vm_cold_start_breakdown && (
+              <ColdStartBreakdown breakdown={data.vm_cold_start_breakdown} />
+            )}
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function TaskCostBreakdownWidget({ projectId, window }: { projectId: string; window: MetricsWindow }) {
+  const [data, setData] = useState<TaskCostBreakdownResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    setLoading(true);
+    setError(null);
+    setData(null);
+
+    (async () => {
+      try {
+        const params = new URLSearchParams({
+          project_id: projectId,
+          window,
+          top_n: '5',
+        });
+        const result = await apiFetch(`/api/admin/task-cost-breakdown?${params}`);
+        if (!result.ok) throw new Error(`Failed to fetch task cost breakdown: ${result.status}`);
+        if (mounted) {
+          setData(await result.json());
+        }
+      } catch (err) {
+        if (mounted) {
+          setError(err instanceof Error ? err.message : 'Unknown error');
+        }
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    })();
+
+    return () => { mounted = false; };
+  }, [projectId, window]);
+
+  if (loading) {
+    return <div className="flex items-center justify-center h-24 text-neutral-500 text-xs">Loading spend breakdown…</div>;
+  }
+
+  if (error) {
+    return <div className="flex items-center justify-center h-24 text-red-400 text-xs">{error}</div>;
+  }
+
+  if (!data || data.task_count === 0) {
+    return <div className="flex items-center justify-center h-24 text-neutral-500 text-xs">No completed cost data in this window</div>;
+  }
+
+  const sectionCard = 'rounded-lg bg-neutral-800/50 border border-neutral-700/50 p-3';
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-[11px] text-neutral-400 uppercase tracking-wide">Selected project spend</div>
+        <div className="text-xs font-mono text-neutral-300">${data.total_estimated_cost_usd.toFixed(2)} across {data.task_count} tasks</div>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+        <div className={sectionCard}>
+          <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">By task type</div>
+          <div className="space-y-1">
+            {data.task_type_breakdown.map((row) => (
+              <div key={row.task_type} className="flex items-center justify-between gap-3 text-xs min-w-0">
+                <span className="text-neutral-300 break-all min-w-0">{row.task_type}</span>
+                <span className="text-neutral-400 font-mono shrink-0">${row.estimated_cost_usd.toFixed(2)} · {row.task_count}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className={sectionCard}>
+          <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">By research direction</div>
+          <div className="space-y-1">
+            {data.direction_breakdown.map((row) => (
+              <div key={row.direction_id ?? 'unassigned'} className="flex items-center justify-between gap-3 text-xs min-w-0">
+                <span className="text-neutral-300 break-all min-w-0">{row.direction_id ?? 'No direction'}</span>
+                <span className="text-neutral-400 font-mono shrink-0">${row.estimated_cost_usd.toFixed(2)} · {row.task_count}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div className={sectionCard}>
+        <div className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">Top expensive tasks</div>
+        <div className="space-y-2">
+          {data.top_tasks.map((row) => (
+            <div key={row.task_id} className="grid grid-cols-[minmax(0,1fr)_auto] gap-3 items-start text-xs">
+              <div className="min-w-0">
+                <div className="text-neutral-200 break-all">{row.task_title}</div>
+                <div className="mt-0.5 text-[10px] text-neutral-500 break-all">
+                  <span className="font-mono">{row.task_type}</span>
+                  {' · '}
+                  <span className="font-mono">{row.direction_id ?? 'No direction'}</span>
+                  {' · '}
+                  {formatTime(parseTimestamp(row.completed_at).getTime(), window === 'all' ? WINDOW_MS['24h'] : WINDOW_MS[window])}
+                </div>
+              </div>
+              <div className="font-mono text-neutral-300 whitespace-nowrap">${row.estimated_cost_usd.toFixed(2)}</div>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
@@ -396,11 +585,29 @@ export default function MetricsDashboard({
   }
 
   const cardClass = 'bg-neutral-900/50 border border-neutral-800/50 rounded-xl p-4';
+  const filteredMetrics = metricsHistory.filter((p) => p.timestamp >= now - windowMs);
+  const exportMetrics = (format: 'csv' | 'json') => {
+    const rows = filteredMetrics.map((p) => ({
+      timestamp: new Date(p.timestamp).toISOString(),
+      activeVMs: p.activeVMs,
+      costPerHr: p.costPerHr,
+      completedCount: p.completedCount,
+      failedCount: p.failedCount,
+    }));
+    const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
+    if (format === 'json') {
+      downloadText(`metrics-${metricsWindow}-${stamp}.json`, 'application/json', JSON.stringify(rows, null, 2));
+      return;
+    }
+    const csv = [METRICS_EXPORT_FIELDS.join(','), ...rows.map((row) => METRICS_EXPORT_FIELDS.map((field) => escapeCsv(row[field])).join(','))].join('\n');
+    downloadText(`metrics-${metricsWindow}-${stamp}.csv`, 'text/csv', csv);
+  };
 
   return (
     <div className="mb-6">
       {/* Window selector */}
-      <div className="flex flex-wrap items-center gap-1 mb-3">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+        <div className="flex flex-wrap items-center gap-1">
         {WINDOW_OPTIONS.map((w) => (
           // reason: time-window filter pill in compact metrics toolbar; py-1 is operator-density convention
           <button
@@ -416,6 +623,11 @@ export default function MetricsDashboard({
             {w}
           </button>
         ))}
+        </div>
+        <div className="flex items-center gap-1">
+          <button data-viewport-allow-small-target onClick={() => exportMetrics('csv')} className="px-3 py-1 rounded-full text-xs font-medium border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300">CSV</button>
+          <button data-viewport-allow-small-target onClick={() => exportMetrics('json')} className="px-3 py-1 rounded-full text-xs font-medium border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300">JSON</button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -489,6 +701,14 @@ export default function MetricsDashboard({
           <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-2">Failure Rate</div>
           <FailureRateChart points={metricsHistory} windowMs={windowMs} />
         </div>
+
+        {/* Cost breakdown widget — full width */}
+        {projectId && (
+          <div className={`${cardClass} sm:col-span-2`}>
+            <div className="text-xs font-semibold text-neutral-400 uppercase tracking-wide mb-3">Cost Breakdown</div>
+            <TaskCostBreakdownWidget projectId={projectId} window={metricsWindow} />
+          </div>
+        )}
 
         {/* Efficiency axes widget — full width */}
         {projectId && (

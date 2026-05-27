@@ -152,7 +152,7 @@ Detailed analytics (cost breakdown, success rates, latency).
 
 ### KanbanBoard
 
-Kanban-style board showing tasks by status column.
+Kanban-style board showing tasks by status column with full drag-and-drop support.
 
 **Columns:**
 - QUEUED
@@ -162,10 +162,20 @@ Kanban-style board showing tasks by status column.
 - FAILED
 
 **Features:**
-- Drag-drop to move tasks (not yet functional; UI only)
+- **Drag-drop** to reorder tasks within columns (uses dnd-kit library)
 - Card count per column
 - Color coding by priority
-- Click card to expand
+- Click card to expand detail drawer
+- Sort tasks by: newest, oldest, type, title, duration, attempt count
+- Archive completed/failed/cancelled tasks
+- Customize visible columns
+- Collapse/expand columns to save space
+
+**Drag & Drop:**
+- Built with `@dnd-kit/core` and `@dnd-kit/sortable`
+- Reorders task position within columns (UI state only; backend ordering may differ)
+- Handlers: `handleDragStart`, `handleDragEnd`
+- Persists column collapse state to localStorage
 
 ---
 

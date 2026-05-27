@@ -31,6 +31,8 @@ from app.task_lifecycle import (
     _process_post_commit,
     _record_parent_failure,
     _is_transient_scan_error,
+)
+from app.retry_prompt import (
     _extract_failing_tests,
     _extract_error_files,
     _build_scope_overflow_details,
@@ -91,8 +93,8 @@ async def tl_db(mocker):
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-async def _make_project(session) -> Project:
-    project = Project(name="Test Project", user_id="user-1")
+async def _make_project(session, *, build_config: dict | None = None) -> Project:
+    project = Project(name="Test Project", user_id="user-1", build_config=build_config)
     session.add(project)
     await session.commit()
     await session.refresh(project)
@@ -3779,6 +3781,213 @@ async def test_auto_merge_dirty_spawns_fix_with_prompt(tl_db, mocker):
     assert "research/cycle-1" in fix_prompt, "fix_prompt must reference the base branch"
 
 
+@pytest.mark.asyncio
+async def test_is_intermediate_honors_custom_staging_prefix(tl_db, mocker):
+    """A small-scope create task whose base branch matches a NON-default
+    configured staging prefix must be classified as intermediate (is_intermediate
+    =True), routing through the auto-merge path. Regression guard for the bug
+    where the small-diff path hardcoded 'research/'/'plan/' instead of the
+    per-project staging_branch_prefixes.
+    """
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+
+    captured_kwargs: list[dict] = []
+
+    async def _capture_spawn(*args, **kwargs):
+        captured_kwargs.append(kwargs)
+        mock_task = mocker.MagicMock()
+        mock_task.id = uuid.uuid4()
+        mock_task.first_payload = {"type": "fix"}
+        mock_task.status = TaskStatus.QUEUED
+        return (mock_task, True)
+
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+    # Merge fails with a dirty state so the intermediate path spawns a
+    # merge_conflict fix — observable proof the intermediate branch was taken.
+    mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "message": "merge conflict"},
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "mergeable_state": "dirty",
+            "head": {"sha": "abc123", "ref": "blueprint/task-deadbeef"},
+        },
+    )
+
+    session, factory = tl_db
+    project = await _make_project(
+        session, build_config={"staging_branch_prefixes": ["feature/", "wip/"]}
+    )
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small"},
+    )
+    # Custom-prefix base branch — only recognized as intermediate when the site
+    # routes through the per-project staging prefixes.
+    task.payloads = [
+        {
+            "type": "create",
+            "prompt": "implement feature X",
+            "base_branch": "feature/cycle-1",
+        }
+    ]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/88",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    fix_spawns = [
+        kw for kw in captured_kwargs if kw.get("fix_reason") == "merge_conflict"
+    ]
+    assert fix_spawns, (
+        "Expected the intermediate auto-merge path to fire for a custom-prefix "
+        "base branch (is_intermediate must honor staging_branch_prefixes)"
+    )
+    assert "feature/cycle-1" in fix_spawns[0].get("fix_prompt", "")
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_clean_state_enables_auto_merge_not_review(tl_db, mocker):
+    """When auto-merge fails but mergeable_state='clean', no recovery task should be
+    spawned. The PR is in good shape — re-enable auto-merge and park in CI-wait.
+    """
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+
+    spawn_calls: list = []
+
+    async def _capture_spawn(*args, **kwargs):
+        spawn_calls.append((args, kwargs))
+        mock_task = mocker.MagicMock()
+        mock_task.id = uuid.uuid4()
+        mock_task.first_payload = {"type": "review"}
+        mock_task.status = TaskStatus.QUEUED
+        return (mock_task, True)
+
+    mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+    mocker.patch(
+        "app.task_lifecycle._merge_with_retry",
+        new_callable=AsyncMock,
+        return_value={"merged": False, "message": "not mergeable"},
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "mergeable_state": "clean",
+            "head": {"sha": "abc123", "ref": "blueprint/task-deadbeef"},
+        },
+    )
+    enable_auto_merge_mock = mocker.patch(
+        "app.github.enable_auto_merge",
+        new_callable=AsyncMock,
+        return_value={"enabled": True},
+    )
+
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.IN_PROGRESS,
+        context={"scope": "small"},
+    )
+    task.payloads = [
+        {
+            "type": "create",
+            "prompt": "implement feature Y",
+            "base_branch": "research/cycle-1",
+        }
+    ]
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        pr_url="https://github.com/owner/repo/pull/88",
+        artifact_type=ArtifactType.PULL_REQUEST,
+    )
+
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    assert not spawn_calls, (
+        "No review or fix task should be spawned when mergeable_state='clean'"
+    )
+    enable_auto_merge_mock.assert_called_once()
+
+    # Parked task must be able to satisfy the merge gate on the next CI signal.
+    # The small/medium-intermediate path explicitly skips review, so no review
+    # task will ever flip review_approved. If the parked review_loop doesn't
+    # carry review_approved=True (and ci_passed=True given mergeable_state=clean
+    # implies green CI), handle_ci_completion's _review_approved gate at
+    # ci_completion.py:1236 strands the task in EVALUATING forever.
+    from app.ci_completion import _review_approved
+
+    await session.refresh(task)
+    parked_loop = (task.context or {}).get("review_loop", {})
+    assert parked_loop.get("ci_waiting") is True
+    assert parked_loop.get("review_approved") is True, (
+        "parked review_loop must carry review_approved=True so the skip-review "
+        "path can satisfy the merge gate"
+    )
+    assert parked_loop.get("ci_passed") is True, (
+        "mergeable_state='clean' implies CI is green; ci_passed=True lets the "
+        "next CI-completion poll merge immediately without re-waiting on checks"
+    )
+    assert _review_approved(parked_loop), (
+        "_review_approved must return True so handle_ci_completion can merge"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # _close_loop_regression_case_on_failure — failure summary capture
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3906,7 +4115,7 @@ async def test_close_loop_failure_no_status_message_leaves_summary_none(tl_db):
 #
 # The follow-up investigation is an autonomous Task (created_by=ORCHESTRATOR,
 # parent_task_id=None). Its spawn-time base_branch default MUST route through
-# runtime_config["integration_branch"] so that after the automain Phase-1
+# the project integration_branch column so that after the automain Phase-1
 # cutover the follow-up branches from automain, not the frozen LTS main.
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -3937,25 +4146,19 @@ async def _make_ci_remediation_task(session, project_id) -> Task:
 
 @pytest.mark.asyncio
 async def test_ci_auto_remediation_followup_uses_integration_branch(tl_db):
-    """When integration_branch is flipped to 'automain', the spawned follow-up
+    """When the project integration_branch is 'automain', the spawned follow-up
     investigation must set base_branch='automain' (not the hardcoded 'main')."""
-    import app.shared_state as _shared_state
     from app.task_lifecycle import _spawn_ci_auto_remediation_followup
 
     session, _ = tl_db
     project = await _make_project(session)
+    project.integration_branch = "automain"
+    await session.commit()
+    await session.refresh(project)
     task = await _make_ci_remediation_task(session, project.id)
 
-    original = _shared_state.runtime_config.get("integration_branch")
-    _shared_state.runtime_config["integration_branch"] = "automain"
-    try:
-        spawned = await _spawn_ci_auto_remediation_followup(task, session)
-        await session.commit()
-    finally:
-        if original is None:
-            _shared_state.runtime_config.pop("integration_branch", None)
-        else:
-            _shared_state.runtime_config["integration_branch"] = original
+    spawned = await _spawn_ci_auto_remediation_followup(task, session)
+    await session.commit()
 
     assert spawned is True
     result = await session.execute(
@@ -3966,31 +4169,21 @@ async def test_ci_auto_remediation_followup_uses_integration_branch(tl_db):
     assert followup.parent_task_id is None
     assert followup.first_payload.get("type") == "investigate"
     assert followup.first_payload.get("base_branch") == "automain", (
-        "CI auto-remediation follow-up bypassed the integration_branch knob"
+        "CI auto-remediation follow-up bypassed the integration_branch column"
     )
 
 
 @pytest.mark.asyncio
 async def test_ci_auto_remediation_followup_defaults_to_main(tl_db):
-    """With integration_branch at its default 'main', the follow-up branches
-    from 'main' — preserving pre-cutover behavior."""
-    import app.shared_state as _shared_state
+    """With no project override, the follow-up branches from 'main'."""
     from app.task_lifecycle import _spawn_ci_auto_remediation_followup
 
     session, _ = tl_db
     project = await _make_project(session)
     task = await _make_ci_remediation_task(session, project.id)
 
-    original = _shared_state.runtime_config.get("integration_branch")
-    _shared_state.runtime_config["integration_branch"] = "main"
-    try:
-        spawned = await _spawn_ci_auto_remediation_followup(task, session)
-        await session.commit()
-    finally:
-        if original is None:
-            _shared_state.runtime_config.pop("integration_branch", None)
-        else:
-            _shared_state.runtime_config["integration_branch"] = original
+    spawned = await _spawn_ci_auto_remediation_followup(task, session)
+    await session.commit()
 
     assert spawned is True
     result = await session.execute(
@@ -4022,6 +4215,32 @@ def test_no_hardcoded_main_base_branch_in_task_lifecycle():
     assert not offenders, (
         "task_lifecycle.py spawn payloads hardcode base_branch='main' "
         "instead of routing through integration_branch:\n" + "\n".join(offenders)
+    )
+
+
+def test_smoketest_and_hotfix_gates_use_promotion_target():
+    """Static guard: the post-rollup smoketest spawn gate and hotfix back-merge
+    gate in task_lifecycle.py must key off promotion_target, not the literal
+    string 'main'.  Using a hardcoded == "main" comparison means those gates
+    never fire for repos whose deploy branch is not literally named 'main'.
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "app" / "task_lifecycle.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'and base_branch == "main"' not in src, (
+        "Smoketest / hotfix back-merge gate hardcodes base_branch == 'main'; "
+        "use _shared_state.get_project_promotion_target(project) instead"
+    )
+    # Accept either the literal config key reference OR the per-project helper
+    # (post-migration 0125 the per-project Project.promotion_target column is
+    # resolved through _shared_state.get_project_promotion_target, which hides
+    # the string literal inside shared_state.py).
+    assert '"promotion_target"' in src or "get_project_promotion_target" in src, (
+        "task_lifecycle.py must reference promotion_target for the "
+        "smoketest / hotfix gate — neither the literal config key nor the "
+        "get_project_promotion_target helper was found"
     )
 
 
@@ -4208,6 +4427,295 @@ async def test_close_loop_merge_compliant_with_one_targeted_plus_one_unmodifiabl
         f"Effective layer count {len(effective)} < 2: "
         f"targeted={sorted(targeted)}, recommended={sorted(recommended)}; "
         "this fix would incorrectly trigger a compliance re-spawn"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _close_loop_regression_case_on_merge — git-ancestry guard
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_close_loop_merge_skips_when_ancestry_indeterminate(tl_db, mocker):
+    """mark_merged is skipped when ancestry check returns None (indeterminate) —
+    fail-safe: an unresolvable ancestry result must not conclude 'landed'."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.task_lifecycle import _close_loop_regression_case_on_merge
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="test-token"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"merge_commit_sha": "deadbeef"}),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=None),
+    )
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    project.github_owner = "owner"
+    project.github_repo = "repo"
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={"regression_class": "sr_catch_rate"},
+    )
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=1,
+        hit_count=1,
+        last_remediation_task_id=task.id,
+    )
+    session.add(case)
+    await session.commit()
+    await session.refresh(case)
+
+    await _close_loop_regression_case_on_merge(task, 101, session)
+    await session.commit()
+    await session.refresh(case)
+
+    assert case.status == RegressionCaseStatus.ACTIVE, (
+        "case must stay ACTIVE when ancestry check returns None (indeterminate treated as not landed)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_close_loop_merge_skips_when_ancestry_false(tl_db, mocker):
+    """mark_merged is skipped when ancestry check returns False (definitive not-ancestor) —
+    fix PR merged to a staging branch, not yet on integration branch."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.task_lifecycle import _close_loop_regression_case_on_merge
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="test-token"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"merge_commit_sha": "staging-sha"}),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=False),
+    )
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    project.github_owner = "owner"
+    project.github_repo = "repo"
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={"regression_class": "sr_catch_rate"},
+    )
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=1,
+        hit_count=1,
+        last_remediation_task_id=task.id,
+    )
+    session.add(case)
+    await session.commit()
+    await session.refresh(case)
+
+    await _close_loop_regression_case_on_merge(task, 102, session)
+    await session.commit()
+    await session.refresh(case)
+
+    assert case.status == RegressionCaseStatus.ACTIVE, (
+        "case must stay ACTIVE when fix PR merge commit is not an ancestor of integration branch"
+    )
+
+
+@pytest.mark.asyncio
+async def test_close_loop_merge_advances_when_ancestry_confirmed(tl_db, mocker):
+    """mark_merged proceeds when ancestry check returns True (confirmed ancestor)."""
+    from app.models import RegressionCaseStatus, RegressionRemediationCase
+    from app.task_lifecycle import _close_loop_regression_case_on_merge
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="test-token"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"merge_commit_sha": "main-sha"}),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+
+    session, _ = tl_db
+    project = await _make_project(session)
+    project.github_owner = "owner"
+    project.github_repo = "repo"
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={"regression_class": "sr_catch_rate"},
+    )
+    case = RegressionRemediationCase(
+        project_id=project.id,
+        regression_class="sr_catch_rate",
+        status=RegressionCaseStatus.ACTIVE,
+        attempts=1,
+        hit_count=1,
+        last_remediation_task_id=task.id,
+    )
+    session.add(case)
+    await session.commit()
+    await session.refresh(case)
+
+    await _close_loop_regression_case_on_merge(task, 103, session)
+    await session.commit()
+    await session.refresh(case)
+
+    assert case.status == RegressionCaseStatus.MERGED, (
+        "case must advance to MERGED when fix PR merge commit is confirmed on integration branch"
+    )
+
+
+# _spawn_ci_auto_remediation_followup — per-project promotion target dedup (R4-C3)
+# ══════════════════════════════════════════════════════════════════════════════
+# When ci_failure_branch is absent from context the dedup key must be the
+# project's promotion_target, NOT the literal 'main'.  A project with
+# promotion_target='production' must dedup against 'production' so that
+# unrelated main-branch investigations don't suppress it and vice-versa.
+
+
+@pytest.mark.asyncio
+async def test_dedup_uses_project_promotion_target_not_main(tl_db):
+    """ci_failure_branch absent → branch falls back to project.promotion_target.
+
+    First call spawns an investigate task with ci_failure_branch='production'.
+    Second call dedups against that same bucket and returns False.
+    If the fallback were still 'main', the first task would record 'main' in
+    context and the dedup assertion would fail.
+    """
+    from app.task_lifecycle import _spawn_ci_auto_remediation_followup
+
+    session, _ = tl_db
+    project = Project(
+        name="Promo Target Test", user_id="u-promo", promotion_target="production"
+    )
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    def _make_no_branch_task():
+        t = Task(
+            project_id=project.id,
+            payloads=[{"type": "fix", "prompt": "auto-fix"}],
+            status=TaskStatus.FAILED,
+            created_by="ORCHESTRATOR",
+            context={
+                "spawned_by": "ci_auto_remediation",
+                "ci_failure_type": "test_failure",
+                "ci_failure_checks": ["backend-tests"],
+                # deliberately NO ci_failure_branch
+            },
+            latest_status_message="auto-fix failed",
+        )
+        return t
+
+    task1 = _make_no_branch_task()
+    session.add(task1)
+    await session.commit()
+    await session.refresh(task1)
+
+    spawned = await _spawn_ci_auto_remediation_followup(task1, session)
+    await session.commit()
+    assert spawned is True
+
+    result = await session.execute(
+        select(Task).where(
+            Task.project_id == project.id,
+            Task.id != task1.id,
+        )
+    )
+    followup = result.scalars().one()
+    assert followup.context["ci_failure_branch"] == "production", (
+        "ci_failure_branch must fall back to project.promotion_target ('production'), "
+        "not the literal 'main'"
+    )
+
+    # Second call must dedup against 'production' bucket, not 'main'
+    task2 = _make_no_branch_task()
+    session.add(task2)
+    await session.commit()
+    await session.refresh(task2)
+
+    spawned2 = await _spawn_ci_auto_remediation_followup(task2, session)
+    await session.commit()
+    assert spawned2 is False, (
+        "second call must be deduped against the 'production' investigation, "
+        "not slip through into a separate 'main' bucket"
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_ci_auto_remediation_followup_aborts_when_project_missing(tl_db):
+    """When the project row is absent, _spawn_ci_auto_remediation_followup must
+    return False without spawning any child task — fail-loud, not a silent 'main' fallback.
+
+    SQLite (used by tl_db) does not enforce FK constraints, so we can persist a
+    task with a project_id that has no matching project row."""
+    from app.task_lifecycle import _spawn_ci_auto_remediation_followup
+
+    session, _ = tl_db
+    nonexistent_project_id = uuid.uuid4()
+    task = Task(
+        project_id=nonexistent_project_id,
+        payloads=[{"type": "fix", "prompt": "auto-fix"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        context={
+            "spawned_by": "ci_auto_remediation",
+            "ci_failure_type": "test_failure",
+        },
+        auto_remediation=True,
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+
+    result = await _spawn_ci_auto_remediation_followup(task, session)
+    assert result is False
+
+    spawned_count = (
+        (await session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(spawned_count) == 0, (
+        "no child task must be spawned when project is missing"
     )
 
 

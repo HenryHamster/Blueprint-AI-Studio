@@ -41,6 +41,12 @@ _BACKGROUND_LOCK_ID: int = ctypes.c_int64(0xB1EB1EB1EB1EB1EB).value
 
 logger = logging.getLogger("blueprint")
 
+# Maximum crash episodes within the 10-minute episode window before spawning a
+# crash-investigation task for the service. Must be >= _ORPHAN_REAP_CRASH_STREAK_LIMIT
+# in reaper.py so a per-task quarantine fires BEFORE service-level investigations
+# are triggered — isolated reap failures should not appear here at all.
+_BACKGROUND_CRASH_EPISODE_THRESHOLD: int = 3
+
 
 async def _spawn_crash_investigations(
     *,
@@ -95,11 +101,10 @@ async def _spawn_crash_investigations(
     )
     spawned_count = 0
     async with AsyncSessionLocal() as session:
-        project_ids = (
-            (await session.execute(select(Project.id))).scalars().all()
-        )
+        projects = (await session.execute(select(Project))).scalars().all()
 
-        for project_id in project_ids:
+        for project in projects:
+            project_id = project.id
             pid_str = str(project_id)
             if pid_str in inflight:
                 continue
@@ -150,8 +155,8 @@ async def _spawn_crash_investigations(
                 {
                     "type": "investigate",
                     "prompt": prompt,
-                    "base_branch": _shared_state.runtime_config.get(
-                        "integration_branch", "main"
+                    "base_branch": _shared_state.get_project_integration_branch(
+                        project
                     ),
                 },
                 "lifecycle:crash_investigation",
@@ -339,10 +344,19 @@ async def lifespan(app):
             "[STARTUP] Not background-leader; skipping leader-only services (serving HTTP only)"
         )
         # Per-instance services still run on non-leader instances.
+        from app.jwt_revocation import jwt_revocation_service
+        from app.event_fanout import agent_log_relay_service, event_fanout_service
+
         config_sync_task = asyncio.create_task(runtime_config_sync_service())
+        jwt_revocation_task_nl = asyncio.create_task(jwt_revocation_service())
+        event_fanout_task_nl = asyncio.create_task(event_fanout_service())
+        agent_log_relay_task_nl = asyncio.create_task(agent_log_relay_service())
         from app.shared_state import background_tasks as _bg_tasks_nl
 
         _bg_tasks_nl["config_sync"] = config_sync_task
+        _bg_tasks_nl["jwt_revocation"] = jwt_revocation_task_nl
+        _bg_tasks_nl["event_fanout"] = event_fanout_task_nl
+        _bg_tasks_nl["agent_log_relay"] = agent_log_relay_task_nl
 
         # Minimal watchdog: restart per-instance services if they crash, AND
         # periodically probe the leader advisory lock so we can take over
@@ -368,6 +382,42 @@ async def lifespan(app):
                         )
                         _bg_tasks_nl["config_sync"] = asyncio.create_task(
                             runtime_config_sync_service()
+                        )
+                    if jwt_revocation_task_nl.done():
+                        exc = (
+                            jwt_revocation_task_nl.exception()
+                            if not jwt_revocation_task_nl.cancelled()
+                            else None
+                        )
+                        logger.error(
+                            f"[MONITOR] jwt_revocation DIED on non-leader (exc={exc}); restarting"
+                        )
+                        _bg_tasks_nl["jwt_revocation"] = asyncio.create_task(
+                            jwt_revocation_service()
+                        )
+                    if event_fanout_task_nl.done():
+                        exc = (
+                            event_fanout_task_nl.exception()
+                            if not event_fanout_task_nl.cancelled()
+                            else None
+                        )
+                        logger.error(
+                            f"[MONITOR] event_fanout DIED on non-leader (exc={exc}); restarting"
+                        )
+                        _bg_tasks_nl["event_fanout"] = asyncio.create_task(
+                            event_fanout_service()
+                        )
+                    if agent_log_relay_task_nl.done():
+                        exc = (
+                            agent_log_relay_task_nl.exception()
+                            if not agent_log_relay_task_nl.cancelled()
+                            else None
+                        )
+                        logger.error(
+                            f"[MONITOR] agent_log_relay DIED on non-leader (exc={exc}); restarting"
+                        )
+                        _bg_tasks_nl["agent_log_relay"] = asyncio.create_task(
+                            agent_log_relay_service()
                         )
 
                     # Leader-lock probe. Try to acquire on a fresh session;
@@ -426,10 +476,18 @@ async def lifespan(app):
 
         nl_monitor_task.cancel()
         config_sync_task.cancel()
+        jwt_revocation_task_nl.cancel()
+        event_fanout_task_nl.cancel()
+        agent_log_relay_task_nl.cancel()
         try:
             await asyncio.wait_for(
                 asyncio.gather(
-                    nl_monitor_task, config_sync_task, return_exceptions=True
+                    nl_monitor_task,
+                    config_sync_task,
+                    jwt_revocation_task_nl,
+                    event_fanout_task_nl,
+                    agent_log_relay_task_nl,
+                    return_exceptions=True,
                 ),
                 timeout=10.0,
             )
@@ -442,6 +500,26 @@ async def lifespan(app):
         return
 
     # This instance owns the background-leader lock — start all background services.
+
+    # Backfill NULL integration_branch / promotion_target from GitHub defaults.
+    # Runs once per startup on the leader only; wrapped so an exception here does
+    # not prevent service startup (logged + alerted, not raised).
+    try:
+        async with AsyncSessionLocal() as _bf_session:
+            _bf_summary = await _shared_state.backfill_branch_columns(_bf_session)
+            _ns_summary = await _shared_state.backfill_task_branch_namespace(
+                _bf_session
+            )
+            await _bf_session.commit()
+            logger.info(
+                "[STARTUP] Branch backfill complete: %s namespace_backfill: %s",
+                _bf_summary,
+                _ns_summary,
+            )
+    except Exception as _bf_exc:
+        logger.error(
+            "[STARTUP] Branch backfill failed (non-fatal): %s", _bf_exc, exc_info=True
+        )
 
     # Start the Reaper Service background task
     reaper_task = asyncio.create_task(reaper_service())
@@ -464,7 +542,7 @@ async def lifespan(app):
     # Start the Regression Recovery Scan (closes or re-arms MERGED cases)
     async def _regression_recovery_scan_service():
         """Periodic leader-only scan: re-evaluates MERGED regression cases."""
-        from app.pipeline_regression_dispatcher import run_recovery_once
+        from app.regression_recovery_watchdog import run_recovery_once
 
         _SCAN_INTERVAL = 300  # 5 minutes
         while True:
@@ -472,15 +550,11 @@ async def lifespan(app):
             try:
                 async with AsyncSessionLocal() as scan_session:
                     project_ids = (
-                        (await scan_session.execute(select(Project.id)))
-                        .scalars()
-                        .all()
+                        (await scan_session.execute(select(Project.id))).scalars().all()
                     )
                     for project_id in project_ids:
                         try:
-                            changed = await run_recovery_once(
-                                scan_session, project_id
-                            )
+                            changed = await run_recovery_once(scan_session, project_id)
                             if changed:
                                 logger.info(
                                     "[RECOVERY_SCAN] project=%s changed=%d",
@@ -508,7 +582,7 @@ async def lifespan(app):
         ACTIVE thresholds run in 24h and MERGED in 6h, so a 30-minute cadence is
         more than enough to catch staleness without burning DB cycles.
         """
-        from app.pipeline_regression_dispatcher import run_watchdog_once
+        from app.regression_recovery_watchdog import run_watchdog_once
 
         _SCAN_INTERVAL = 1800  # 30 minutes
         while True:
@@ -516,9 +590,7 @@ async def lifespan(app):
             try:
                 async with AsyncSessionLocal() as scan_session:
                     project_ids = (
-                        (await scan_session.execute(select(Project.id)))
-                        .scalars()
-                        .all()
+                        (await scan_session.execute(select(Project.id))).scalars().all()
                     )
                     for project_id in project_ids:
                         try:
@@ -566,9 +638,7 @@ async def lifespan(app):
             try:
                 async with AsyncSessionLocal() as scan_session:
                     project_ids = (
-                        (await scan_session.execute(select(Project.id)))
-                        .scalars()
-                        .all()
+                        (await scan_session.execute(select(Project.id))).scalars().all()
                     )
                     for project_id in project_ids:
                         try:
@@ -599,15 +669,12 @@ async def lifespan(app):
 
     # Start the Branch Reconciliation service — keeps automain in sync with main.
     async def _branch_reconciliation_service():
-        """Periodic leader-only scan: back-merge main -> automain for all
-        projects so the integration trunk never silently falls behind the LTS
-        branch.  Per project this is a no-op unless integration_branch is set —
-        the gate lives in reconcile_main_into_automain.
+        """Periodic leader-only scan: back-merge the LTS branch into the
+        integration trunk for all projects so the integration trunk never
+        silently falls behind the LTS branch.
 
-        A hotfix or a direct push to main otherwise diverges the two branches
-        and the next automain -> main promotion conflicts.  Per project this is
-        a no-op unless integration_branch == "automain" — that gate lives in
-        reconcile_main_into_automain.
+        Per project this is a no-op when integration_branch == promotion_target
+        (LTS model is inactive) — the gate lives in reconcile_main_into_automain.
         """
         from app.hotfix_backmerge import reconcile_main_into_automain
 
@@ -617,9 +684,7 @@ async def lifespan(app):
             try:
                 async with AsyncSessionLocal() as scan_session:
                     project_ids = (
-                        (await scan_session.execute(select(Project.id)))
-                        .scalars()
-                        .all()
+                        (await scan_session.execute(select(Project.id))).scalars().all()
                     )
                     for project_id in project_ids:
                         try:
@@ -660,6 +725,29 @@ async def lifespan(app):
     # Cloud Run instances (each has its own in-memory dict; DB is shared).
     config_sync_task = asyncio.create_task(runtime_config_sync_service())
 
+    # Per-instance JWT revocation listener — each instance keeps its own
+    # _terminated_task_ids cache; LISTEN/NOTIFY broadcasts terminations from
+    # sibling instances so all caches converge within seconds.
+    from app.jwt_revocation import jwt_revocation_service
+
+    jwt_revocation_task = asyncio.create_task(jwt_revocation_service())
+
+    # Per-instance cross-instance WebSocket control-event listener — each
+    # instance LISTENs on the project_event channel so a control event
+    # broadcast on a sibling Cloud Run instance is re-delivered to THIS
+    # instance's locally-connected WebSocket clients (board updates, alerts,
+    # deploy-state changes, desktop notifications).
+    from app.event_fanout import agent_log_relay_service, event_fanout_service
+
+    event_fanout_task = asyncio.create_task(event_fanout_service())
+
+    # Per-instance live agent_log relay — buffers per-line log frames received
+    # from agents whose stream landed on THIS instance and flushes them as
+    # batched NOTIFYs so sibling instances re-deliver them to their own viewer
+    # clients (the high-volume agent_log path the discrete control-event fanout
+    # deliberately excludes).
+    agent_log_relay_task = asyncio.create_task(agent_log_relay_service())
+
     # Refresh per-account model-availability caches every 30 min so a
     # provider-side preview-access change doesn't sit in dispatch rotation
     # for hours (audit E13).
@@ -682,6 +770,9 @@ async def lifespan(app):
     _bg_tasks["efficiency_snapshot"] = efficiency_snapshot_task
     _bg_tasks["branch_reconciliation"] = branch_reconciliation_task
     _bg_tasks["config_sync"] = config_sync_task
+    _bg_tasks["jwt_revocation"] = jwt_revocation_task
+    _bg_tasks["event_fanout"] = event_fanout_task
+    _bg_tasks["agent_log_relay"] = agent_log_relay_task
     _bg_tasks["availability_refresh"] = availability_refresh_task
 
     # Monitor background tasks for silent crashes (with exponential backoff)
@@ -711,6 +802,9 @@ async def lifespan(app):
             "efficiency_snapshot": _efficiency_snapshot_service,
             "branch_reconciliation": _branch_reconciliation_service,
             "config_sync": runtime_config_sync_service,
+            "jwt_revocation": jwt_revocation_service,
+            "event_fanout": event_fanout_service,
+            "agent_log_relay": agent_log_relay_service,
             "availability_refresh": account_availability_refresh_service,
         }
         while True:
@@ -752,6 +846,45 @@ async def lifespan(app):
                             orch_task.cancel()
                 except Exception as wd_exc:
                     logger.warning(f"[MONITOR] Watchdog check failed: {wd_exc}")
+                # Liveness watchdog for reaper: analogous to the orchestrator probe.
+                # When halted the reaper is intentionally sleeping — cancelling and
+                # restarting it only produces another halted reaper (module-level
+                # halt state persists across asyncio.Task restarts within the same
+                # process). Skip the cancel so the monitor loop doesn't compound
+                # alert noise while the operator investigates. When NOT halted but
+                # stale, cancel so the restart path re-spawns a fresh cycle.
+                try:
+                    from app.reaper import (
+                        is_reaper_halted as _is_reaper_halted,
+                        _reaper_last_cycle_completed_at as _reaper_last_cycle,
+                    )
+
+                    reaper_task = tasks.get("reaper")
+                    _reaper_stall_threshold = 300.0  # 5 missed 60s cycles
+                    if reaper_task is not None and not reaper_task.done():
+                        if _is_reaper_halted():
+                            pass  # halted intentionally — do not cancel; operator reset required
+                        elif _reaper_last_cycle is not None:
+                            reaper_age = (
+                                _utcnow() - _reaper_last_cycle
+                            ).total_seconds()
+                            if reaper_age > _reaper_stall_threshold:
+                                reaper_reason = (
+                                    f"no cycle completion in {int(reaper_age)}s"
+                                )
+                                logger.error(
+                                    "[MONITOR] Reaper appears hung — %s. "
+                                    "Cancelling task so restart path re-spawns it.",
+                                    reaper_reason,
+                                )
+                                cancel_reasons["reaper"] = (
+                                    f"watchdog cancelled: {reaper_reason}"
+                                )
+                                reaper_task.cancel()
+                except Exception as reaper_wd_exc:
+                    logger.warning(
+                        "[MONITOR] Reaper watchdog check failed: %s", reaper_wd_exc
+                    )
                 for name, t in list(tasks.items()):
                     if t.done():
                         exc = t.exception() if not t.cancelled() else None
@@ -778,11 +911,7 @@ async def lifespan(app):
                         try:
                             async with AsyncSessionLocal() as alert_session:
                                 project_ids = (
-                                    (
-                                        await alert_session.execute(
-                                            select(Project.id)
-                                        )
-                                    )
+                                    (await alert_session.execute(select(Project.id)))
                                     .scalars()
                                     .all()
                                 )
@@ -824,8 +953,10 @@ async def lifespan(app):
                         cutoff = now_ts - timedelta(seconds=600)
                         crash_timestamps[name] = [ts for ts in ts_list if ts >= cutoff]
                         # Spawn an investigate task when 3+ crashes occur in 10 min
-                        _CRASH_EPISODE_THRESHOLD = 3
-                        if len(crash_timestamps[name]) >= _CRASH_EPISODE_THRESHOLD:
+                        if (
+                            len(crash_timestamps[name])
+                            >= _BACKGROUND_CRASH_EPISODE_THRESHOLD
+                        ):
                             inflight = _inflight_crash_investigations.setdefault(
                                 name, {}
                             )
@@ -924,6 +1055,9 @@ async def lifespan(app):
         branch_reconciliation_task,
         orchestrator_task,
         config_sync_task,
+        jwt_revocation_task,
+        event_fanout_task,
+        agent_log_relay_task,
         monitor_task,
     ]
     for t in tasks_to_cancel:

@@ -4,16 +4,15 @@ import {
   TrendingDown,
   AlertTriangle,
   CheckCircle,
-  Clock,
   ExternalLink,
   GitMerge,
   Minus,
   Search,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { apiFetch, fetchQualificationVerdicts, fetchSrUnhandledEdgesRetrospectives, setVersionPhase, triggerQualify, type CiResolution, type PromptFingerprintAnalyticsResponse, type QualificationVerdictRecord, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
+import { apiFetch, fetchQualificationVerdicts, fetchSrUnhandledEdgesRetrospectives, setVersionPhase, triggerQualify, fetchTask, type AuditFinding, type AuditReconciliation, type CiResolution, type LatestAudit, type PromptFingerprintAnalyticsResponse, type QualificationVerdictRecord, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
-import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
+import { timeAgo, formatDurationSec } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
 import { RecentErrorsWidget } from './RecentErrorsWidget';
 import { DirectionAutoPauseWidget } from './DirectionAutoPauseWidget';
@@ -37,17 +36,23 @@ import { ManualInterventionPanel, AutoRecoveredPanel, AnomalyTrackerPanel } from
 import { RecentlyResolvedRegressionsPanel } from './RecentlyResolvedRegressionsPanel';
 import { ViewportDebtPanel } from './ViewportDebtPanel';
 import type { Task } from '../types/task';
-import type { ProjectDiagnostics } from '../types/diagnostics';
 import type { Project } from '../types/project';
 
 // ---------- local types ----------
 
-interface IssueItem {
+interface HealthOverviewIssue {
   severity: 'critical' | 'warning' | 'info';
-  icon: typeof AlertTriangle;
   title: string;
-  detail?: string;
-  onClick?: () => void;
+  hint: string;
+  task_ids: string[];
+  category: string;
+}
+
+interface HealthOverviewResponse {
+  overall_status: 'healthy' | 'degraded' | 'unhealthy';
+  success_rate: { current: number | null; trend: string | null; window_hours: number };
+  queue_depth: { queued: number; active: number; evaluating: number };
+  actionable_issues: HealthOverviewIssue[];
 }
 
 export interface PipelineRegression {
@@ -307,11 +312,12 @@ interface DigestData {
   } | null;
   tasks_truncated?: boolean;
   memo_pathway_exits?: number | null;
+  memo_ever_cited?: { ever_cited: boolean; first_cycle_id: string | null; first_cited_at: string | null } | null;
   recent_cycle_memo_stats?: Array<{ cycle_id: string | null; started_at: string | null; memos_available: number; memos_cited: number }> | null;
 }
 
 interface SrFixIterationBucket { hit_rate?: number | null; miss_rate?: number | null; sample_count?: number | null; }
-type SrTrendWithFixIterations = SrTrendData & { by_fix_iteration?: Record<string, SrFixIterationBucket> | null; fix_iteration_breakdown?: Record<string, SrFixIterationBucket> | null; iteration_breakdown?: Record<string, SrFixIterationBucket> | null; overall_hit_rate?: number | null; previous_overall_hit_rate?: number | null; };
+type SrTrendWithFixIterations = SrTrendData & { by_fix_iteration?: Record<string, SrFixIterationBucket> | null; fix_iteration_breakdown?: Record<string, SrFixIterationBucket> | null; iteration_breakdown?: Record<string, SrFixIterationBucket> | null; overall_hit_rate?: number | null; previous_overall_hit_rate?: number | null; overall_trend_verdict?: 'improving' | 'declining' | 'stable' | null; overall_trend_significant?: boolean | null; overall_sr_alone_hit_rate?: number | null; previous_overall_sr_alone_hit_rate?: number | null; overall_sr_alone_trend_verdict?: 'improving' | 'declining' | 'stable' | null; overall_sr_alone_trend_significant?: boolean | null; };
 
 // Per-direction SR catch-rate breakdown (endpoint: GET /projects/{id}/direction-sr-breakdown)
 // DirectionSrEntry is re-exported from SrTrendBreakdown (canonical model)
@@ -452,6 +458,81 @@ function CiBadge({ ci }: { ci: CiResolution }) {
   );
 }
 
+const AUDIT_MISSING_REASON_LABELS: Record<string, string> = {
+  no_findings_key: 'audit findings key missing',
+  empty_findings_list: 'audit findings list empty',
+  audit_score_null_no_findings: 'audit score missing with no findings',
+  parseable_but_unscoreable: 'audit findings present but missing severity tags',
+};
+
+const FINDING_SEVERITY_STYLE: Record<string, string> = {
+  critical: 'bg-red-500/10 text-red-400 border-red-500/20',
+  high: 'bg-orange-500/10 text-orange-400 border-orange-500/20',
+  medium: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+  low: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
+};
+const FINDING_SEVERITY_ORDER = ['critical', 'high', 'medium', 'low'];
+
+function AuditFindingsList({ audit }: { audit: LatestAudit }) {
+  if (!audit.report) {
+    return (
+      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20">
+        audit crashed — no report
+      </span>
+    );
+  }
+  const findings: AuditFinding[] = audit.report.findings ?? [];
+  if (findings.length === 0) {
+    return <span className="text-[10px] text-neutral-500 italic">audit: no findings</span>;
+  }
+  const sorted = [...findings].sort((a, b) => {
+    const ai = FINDING_SEVERITY_ORDER.indexOf(a.severity?.toLowerCase() ?? '');
+    const bi = FINDING_SEVERITY_ORDER.indexOf(b.severity?.toLowerCase() ?? '');
+    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+  });
+  return (
+    <div className="space-y-0.5">
+      <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Audit Findings</p>
+      {sorted.map((f, i) => (
+        <div key={i} className={`flex items-start gap-1.5 text-[10px] px-1.5 py-0.5 rounded border ${FINDING_SEVERITY_STYLE[f.severity?.toLowerCase() ?? ''] ?? 'bg-neutral-800/50 text-neutral-400 border-neutral-700/50'}`}>
+          <span className="font-semibold shrink-0">{f.severity ?? '?'}</span>
+          <span>{f.summary}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AuditReconciliationRow({ rec }: { rec: AuditReconciliation }) {
+  const hasDivergence = rec.score_delta != null && rec.score_delta >= 0.1;
+  return (
+    <div className="flex flex-wrap gap-1.5 items-center pt-0.5">
+      <span className="text-[10px] text-neutral-600 shrink-0">reconciliation:</span>
+      {rec.model_reported_score != null && (
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
+          model {Math.round(rec.model_reported_score * 100)}%
+        </span>
+      )}
+      {rec.findings_derived_score != null && (
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
+          findings {Math.round(rec.findings_derived_score * 100)}%
+        </span>
+      )}
+      {rec.score_delta != null && (
+        <span className={`text-[10px] px-1.5 py-0.5 rounded border font-mono ${hasDivergence ? 'bg-amber-950/40 text-amber-400 border-amber-900/50' : 'bg-neutral-800 text-neutral-500 border-neutral-700'}`}>
+          δ {Math.round(rec.score_delta * 100)}%
+        </span>
+      )}
+      {rec.excluded_findings_count > 0 && (
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-500 border border-amber-900/50">
+          {rec.excluded_findings_count} finding{rec.excluded_findings_count !== 1 ? 's' : ''} excluded
+        </span>
+      )}
+    </div>
+  );
+}
+
+
 function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadiness | null | undefined }) {
   if (!readiness) return null;
   const { ready, reason, verdicts_evaluated, would_promote_rate, consecutive_clean_passes, recurring_blockers } = readiness;
@@ -577,6 +658,33 @@ function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: 
                 {cv.last_qualification.blocker && (
                   <p className="text-[10px] text-red-400 truncate">{cv.last_qualification.blocker}</p>
                 )}
+                {(cv.last_qualification.audit_missing_reason || (cv.last_qualification.consecutive_infra_errors ?? 0) > 0 || (cv.last_qualification.status === 'infra_failure' && cv.last_qualification.error)) && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {cv.last_qualification.audit_missing_reason && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/20">
+                        {AUDIT_MISSING_REASON_LABELS[cv.last_qualification.audit_missing_reason] ?? cv.last_qualification.audit_missing_reason}
+                      </span>
+                    )}
+                    {(cv.last_qualification.consecutive_infra_errors ?? 0) > 0 && (
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded border ${(cv.last_qualification.consecutive_infra_errors ?? 0) >= 3 ? 'bg-red-500/10 text-red-400 border-red-500/20' : 'bg-orange-500/10 text-orange-400 border-orange-500/20'}`}>
+                        {cv.last_qualification.consecutive_infra_errors} consecutive infra failures
+                      </span>
+                    )}
+                    {cv.last_qualification.status === 'infra_failure' && cv.last_qualification.error && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20">
+                        {cv.last_qualification.error}
+                      </span>
+                    )}
+                  </div>
+                )}
+                {cv.last_qualification.audit_reconciliation && (
+                  <AuditReconciliationRow rec={cv.last_qualification.audit_reconciliation} />
+                )}
+              </div>
+            )}
+            {cv.latest_audit && (
+              <div className="pl-2 border-l border-neutral-700/50">
+                <AuditFindingsList audit={cv.latest_audit} />
               </div>
             )}
             {projectId && (
@@ -702,6 +810,7 @@ export interface DashboardHomeProps {
   onDirectionClick?: (directionId: string) => void;
   onCategoryClick?: (category: string) => void;
   onConfigureTargets?: () => void;
+  onSpawnOrphanFix?: (pr: OpenPR) => void;
 }
 
 // ---------- helpers ----------
@@ -811,120 +920,112 @@ function FailureClassPill({ group, sparkData, cost }: { group: FailureGroup; spa
 
 // ---------- cost breakdown pill ----------
 
-// ---------- issue row ----------
+// ---------- system health card ----------
 
-const _SEVERITY_BORDER: Record<string, string> = { critical: 'border-l-red-500', warning: 'border-l-amber-500', info: 'border-l-blue-500' };
-const _SEVERITY_ICON_COLOR: Record<string, string> = { critical: 'text-red-400', warning: 'text-amber-400', info: 'text-blue-400' };
+const _HEALTH_SEV_BORDER: Record<string, string> = { critical: 'border-l-red-500', warning: 'border-l-amber-500', info: 'border-l-blue-500' };
+const _HEALTH_SEV_ICON: Record<string, string> = { critical: 'text-red-400', warning: 'text-amber-400', info: 'text-blue-400' };
+const _HEALTH_STATUS_STYLE: Record<string, { badge: string; label: string }> = {
+  healthy: { badge: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400', label: 'Healthy' },
+  degraded: { badge: 'bg-amber-500/10 border-amber-500/30 text-amber-400', label: 'Degraded' },
+  unhealthy: { badge: 'bg-red-500/10 border-red-500/30 text-red-400', label: 'Unhealthy' },
+};
 
-function IssueRow({ severity, icon: Icon, title, detail, onClick }: IssueItem) {
-  const Tag = onClick ? 'button' : 'div';
+function SystemHealthCard({
+  data,
+  loading,
+  tasks,
+  onViewTask,
+}: {
+  data: HealthOverviewResponse | null;
+  loading: boolean;
+  tasks: Task[];
+  onViewTask: (task: Task) => void;
+}) {
+  const status = data?.overall_status ?? 'healthy';
+  const statusStyle = _HEALTH_STATUS_STYLE[status] ?? _HEALTH_STATUS_STYLE.healthy;
+  const sr = data?.success_rate;
+  const qd = data?.queue_depth;
+  const issues = data?.actionable_issues ?? [];
+  const trendColor = sr?.trend === 'improving' ? 'text-emerald-400' : sr?.trend === 'declining' ? 'text-red-400' : 'text-neutral-400';
+  const trendIcon = sr?.trend === 'improving' ? '↑' : sr?.trend === 'declining' ? '↓' : '→';
+
   return (
-    <Tag
-      onClick={onClick}
-      className={`w-full text-left bg-neutral-900/50 border border-neutral-800/50 border-l-2 ${_SEVERITY_BORDER[severity]} rounded-lg p-3 flex items-start gap-2 ${onClick ? 'cursor-pointer hover:bg-neutral-800/50 transition-colors' : ''}`}
-    >
-      <Icon className={`w-4 h-4 mt-0.5 shrink-0 ${_SEVERITY_ICON_COLOR[severity]}`} />
-      <div className="min-w-0">
-        <p className="text-xs text-neutral-200">{title}</p>
-        {detail && <p className="text-[10px] text-neutral-500 mt-0.5 truncate">{detail}</p>}
+    <section>
+      <div className="flex items-center gap-2 mb-2">
+        <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest">System Health</h2>
+        {!loading && data && (
+          <span className={`text-[10px] font-semibold px-2 py-0.5 rounded border ${statusStyle.badge}`}>
+            {statusStyle.label}
+          </span>
+        )}
       </div>
-    </Tag>
+      {loading ? (
+        <div className="space-y-2"><Skeleton className="h-10 w-full" /><Skeleton className="h-14 w-full" /></div>
+      ) : (
+        <>
+          {data && (sr?.current != null || qd) && (
+            <div className="flex flex-wrap gap-2 mb-2">
+              {sr?.current != null && (
+                <div className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2.5 py-1.5 text-xs flex items-center gap-1.5">
+                  <span className="text-neutral-500">Success</span>
+                  <span className="font-mono font-bold text-neutral-200">{Math.round(sr.current * 100)}%</span>
+                  {sr.trend && <span className={`text-[10px] ${trendColor}`}>{trendIcon}</span>}
+                </div>
+              )}
+              {qd && (
+                <div className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2.5 py-1.5 text-xs flex items-center gap-2">
+                  <span className="text-neutral-500">Queue</span>
+                  <span className="font-mono text-neutral-300" title="queued">{qd.queued}q</span>
+                  <span className="font-mono text-neutral-300" title="active">{qd.active}a</span>
+                  <span className="font-mono text-neutral-300" title="evaluating">{qd.evaluating}e</span>
+                </div>
+              )}
+            </div>
+          )}
+          {issues.length === 0 ? (
+            <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 flex items-center gap-2 text-emerald-400 text-xs">
+              <CheckCircle className="w-4 h-4" />
+              All systems healthy
+            </div>
+          ) : (
+            <div className="space-y-1.5">
+              {issues.map((issue, i) => {
+                const borderCls = _HEALTH_SEV_BORDER[issue.severity] ?? 'border-l-neutral-500';
+                const iconCls = _HEALTH_SEV_ICON[issue.severity] ?? 'text-neutral-400';
+                const linkedTasks = issue.task_ids.slice(0, 3)
+                  .map(id => tasks.find(t => t.id === id))
+                  .filter((t): t is Task => t != null);
+                return (
+                  <div key={i} className={`bg-neutral-900/50 border border-neutral-800/50 border-l-2 ${borderCls} rounded-lg p-3`}>
+                    <div className="flex items-start gap-2">
+                      <AlertTriangle className={`w-4 h-4 mt-0.5 shrink-0 ${iconCls}`} />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-xs text-neutral-200">{issue.title}</p>
+                        {issue.hint && <p className="text-[10px] text-neutral-500 mt-0.5">{issue.hint}</p>}
+                        {linkedTasks.length > 0 && (
+                          <div className="flex flex-wrap gap-1 mt-1.5">
+                            {linkedTasks.map(t => (
+                              <button
+                                key={t.id}
+                                onClick={() => onViewTask(t)}
+                                className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800/60 text-neutral-300 hover:text-neutral-100 hover:bg-neutral-700/60 transition-colors truncate max-w-[200px] min-h-[44px] flex items-center"
+                              >
+                                {(t.title ?? t.id).slice(0, 40)}
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </>
+      )}
+    </section>
   );
-}
-
-function buildIssues(
-  diagnostics: ProjectDiagnostics | null,
-  digest: DigestData | null,
-  tasks: Task[],
-  onViewTask: (task: Task) => void,
-): IssueItem[] {
-  const items: IssueItem[] = [];
-
-  if (diagnostics?.circuit_breaker && diagnostics.circuit_breaker.state !== 'CLOSED') {
-    items.push({
-      severity: 'critical',
-      icon: AlertTriangle,
-      title: `Circuit breaker ${diagnostics.circuit_breaker.state} (${diagnostics.circuit_breaker.failure_count} failures)`,
-    });
-  }
-
-  const stuckSorted = [...(diagnostics?.stuck_tasks ?? [])].sort((a, b) => b.stuck_for_seconds - a.stuck_for_seconds);
-  for (const st of stuckSorted.slice(0, 3)) {
-    const matchedTask = tasks.find(t => t.id === st.task_id);
-    items.push({
-      severity: 'warning',
-      icon: AlertTriangle,
-      title: `Stuck: ${st.title}`,
-      detail: st.remediation_hint ?? st.stuck_reason,
-      onClick: matchedTask ? () => onViewTask(matchedTask) : undefined,
-    });
-  }
-
-  if (digest && digest.pending_approval_count > 0) {
-    items.push({
-      severity: 'info',
-      icon: Clock,
-      title: `${digest.pending_approval_count} task${digest.pending_approval_count !== 1 ? 's' : ''} awaiting approval`,
-    });
-  }
-
-  if (digest && (digest.daily_cost_ceiling_usd ?? 0) > 0) {
-    const ceiling = digest.daily_cost_ceiling_usd ?? 0;
-    const daily = digest.daily_cost_usd ?? 0;
-    if (daily >= ceiling) {
-      items.push({
-        severity: 'warning',
-        icon: AlertTriangle,
-        title: `Daily cost ceiling exceeded ($${daily.toFixed(2)} / $${ceiling.toFixed(2)})`,
-      });
-    } else if (daily >= ceiling * 0.8) {
-      items.push({
-        severity: 'info',
-        icon: AlertTriangle,
-        title: `Daily cost approaching ceiling ($${daily.toFixed(2)} / $${ceiling.toFixed(2)})`,
-      });
-    }
-  }
-
-  if (diagnostics?.zone_health?.exhausted && diagnostics.zone_health.exhausted.length > 0) {
-    const cooldownRecovery = diagnostics.zone_health.cooldown_recovery ?? {};
-    const now = Date.now();
-    const zoneDetails = diagnostics.zone_health.exhausted.map(zone => {
-      const expiresAt = cooldownRecovery[zone];
-      if (expiresAt) {
-        const minsLeft = Math.ceil((parseTimestamp(expiresAt).getTime() - now) / 60000);
-        return minsLeft > 0 ? `${zone} — recovering in ${minsLeft}min` : zone;
-      }
-      return zone;
-    });
-    items.push({
-      severity: 'warning',
-      icon: AlertTriangle,
-      title: `Zone${diagnostics.zone_health.exhausted.length !== 1 ? 's' : ''} exhausted: ${zoneDetails.join(', ')}`,
-    });
-  }
-
-  const tax = digest?.failure_taxonomy_distribution;
-  if (tax && tax.total_failures >= 3 && tax.dominant_category) {
-    const cat = tax.categories[tax.dominant_category];
-    if (cat && cat.percentage > 50) {
-      const remediation: Record<string, string> = {
-        scope_related: 'Review task decomposition and scope budgets to keep work within size limits.',
-        review_quality: 'Strengthen self-review and lint configuration to catch defects earlier.',
-        infra_related: 'Check infrastructure health (zones, provisioning, external APIs).',
-        code_defect: 'Review agent code-quality patterns and prompt guidance.',
-      };
-      const label = TAXONOMY_LABELS[tax.dominant_category] ?? tax.dominant_category;
-      items.push({
-        severity: 'info',
-        icon: AlertTriangle,
-        title: `${label} failures dominate (${Math.round(cat.percentage)}% of ${tax.total_failures})`,
-        detail: remediation[tax.dominant_category],
-      });
-    }
-  }
-
-  return items;
 }
 
 // ---------- skeleton ----------
@@ -943,10 +1044,11 @@ const WINDOW_OPTIONS = [
   { label: '7d', value: 168 },
 ];
 
-export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick, onConfigureTargets }: DashboardHomeProps) {
+export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, onDirectionClick, onCategoryClick, onConfigureTargets, onSpawnOrphanFix }: DashboardHomeProps) {
   const [digest, setDigest] = useState<DigestData | null>(null);
-  const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
   const [openPRs, setOpenPRs] = useState<OpenPR[]>([]);
+  const [openPRsIntegrationBranch, setOpenPRsIntegrationBranch] = useState<string | null>(null);
+  const [openPRsPromotionTarget, setOpenPRsPromotionTarget] = useState<string | null>(null);
   const [measurementData, setMeasurementData] = useState<MediumScopeMeasurement | null>(null);
   const [scopeBaselines, setScopeBaselines] = useState<ScopeBaselinesResponse | null>(null);
   const [scopeTrendsOpen, setScopeTrendsOpen] = useState(false);
@@ -957,6 +1059,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const [blindSpots, setBlindSpots] = useState<BlindSpotsData | null>(null);
   const [srRecentMisses, setSrRecentMisses] = useState<SrMissedTask[] | null>(null);
   const [srRecentMissesTotal, setSrRecentMissesTotal] = useState<number>(0);
+  const [srUnhandledEdgesWindowDays, setSrUnhandledEdgesWindowDays] = useState<7 | 14 | 30>(14);
   const [srUnhandledEdgesTasks, setSrUnhandledEdgesTasks] = useState<SrUnhandledEdgesTask[] | null>(null);
   const [srReviewerDisagreements, setSrReviewerDisagreements] = useState<SrReviewerDisagreementsData | null>(null);
   const [directionSrBreakdown, setDirectionSrBreakdown] = useState<DirectionSrBreakdownData | null>(null);
@@ -966,10 +1069,10 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const [srTrendDrilldownRows, setSrTrendDrilldownRows] = useState<{ task_id: string; title: string; missed_categories: string[]; sr_verdict: string | null }[]>([]);
   const [srTrendDrilldownLoading, setSrTrendDrilldownLoading] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [healthOverview, setHealthOverview] = useState<HealthOverviewResponse | null>(null);
   const [fixLoopTrendDays, setFixLoopTrendDays] = useState<7 | 14 | 30>(7);
   const [openPRsRefreshing, setOpenPRsRefreshing] = useState(false);
   const [lastFetchError, setLastFetchError] = useState(false);
-  const [showAllIssues, setShowAllIssues] = useState(false);
   const [windowHours, setWindowHours] = useState(24);
   const [selectedSrCategory, setSelectedSrCategory] = useState<string>('');
   const sparkRef = useRef<SparkPoint[]>([]);
@@ -988,6 +1091,8 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       if (res.ok) {
         const data = await res.json();
         setOpenPRs(data.open_prs ?? []);
+        setOpenPRsIntegrationBranch(data.project_integration_branch ?? null);
+        setOpenPRsPromotionTarget(data.project_promotion_target ?? null);
       }
     } catch { /* silent */ }
     finally {
@@ -1007,6 +1112,17 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const handleConfigureTargets = useCallback(() => {
     onConfigureTargets?.();
   }, [onConfigureTargets]);
+
+  const handleViewTaskById = useCallback((taskId: string) => {
+    const task = tasks.find(t => t.id === taskId);
+    if (task) {
+      onViewTask(task);
+    } else {
+      fetchTask(taskId).then(onViewTask).catch(() => {
+        // Silently fail; user can retry or navigate manually
+      });
+    }
+  }, [tasks, onViewTask]);
 
   const handleSpawnSrInvestigation = useCallback(async (signal: SrInvestigationSignal): Promise<string | null> => {
     if (!selectedProjectId) return null;
@@ -1064,7 +1180,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
         (async () => {
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/diagnostics`);
-            if (res.ok) { setDiagnostics(await res.json()); diagnosticsOk = true; }
+            if (res.ok) { diagnosticsOk = true; }
           } catch { /* silent */ }
         })(),
         (async () => {
@@ -1073,6 +1189,8 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             if (res.ok) {
               const data = await res.json();
               setOpenPRs(data.open_prs ?? []);
+              setOpenPRsIntegrationBranch(data.project_integration_branch ?? null);
+              setOpenPRsPromotionTarget(data.project_promotion_target ?? null);
               openPRsOk = true;
             }
           } catch { /* silent */ }
@@ -1121,7 +1239,11 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
         })(),
         (async () => {
           try {
-            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-recent-misses`);
+            const params = new URLSearchParams();
+            if (selectedSrCategory) params.set('category', selectedSrCategory);
+            const query = params.toString();
+            const url = `/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-recent-misses${query ? `?${query}` : ''}`;
+            const res = await apiFetch(url);
             if (res.ok) {
               const data = await res.json();
               setSrRecentMisses(data.misses ?? []);
@@ -1131,7 +1253,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
         })(),
         (async () => {
           try {
-            const data = await fetchSrUnhandledEdgesRetrospectives(selectedProjectId);
+            const data = await fetchSrUnhandledEdgesRetrospectives(selectedProjectId, { days: srUnhandledEdgesWindowDays, page_size: 500 });
             setSrUnhandledEdgesTasks(data.items ?? []);
           } catch { /* silent */ }
         })(),
@@ -1175,6 +1297,16 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           if (res.ok) setTaskDurationStats(await res.json());
         } catch { /* silent */ }
       })(),
+      (async () => {
+        try {
+          const url = selectedProjectId
+            ? `/api/admin/health-overview?project_id=${encodeURIComponent(selectedProjectId)}&lookback_hours=${windowHours}`
+            : `/api/admin/health-overview?lookback_hours=${windowHours}`;
+          const res = await apiFetch(url);
+          if (res.ok) setHealthOverview(await res.json());
+          else setHealthOverview(null);
+        } catch { setHealthOverview(null); }
+      })(),
     );
 
     await Promise.allSettled(fetches);
@@ -1185,7 +1317,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       ? !digestOk && !diagnosticsOk && !openPRsOk
       : !digestOk;
     setLastFetchError(allFailed);
-  }, [selectedProjectId, windowHours]);
+  }, [selectedProjectId, windowHours, selectedSrCategory, srUnhandledEdgesWindowDays]);
 
   const refreshVersionLifecycle = useCallback(async () => {
     if (!selectedProjectId) return;
@@ -1230,10 +1362,6 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const failedCount = digest?.failed_count ?? 0;
   const successRate = digest?.success_rate;
 
-  // Build issues list
-  const issues = buildIssues(diagnostics, digest, tasks, onViewTask);
-  const visibleIssues = showAllIssues ? issues : issues.slice(0, 3);
-
   // Recent completions with pr_url (from digest)
   const mergeEvents = (digest?.recent_completions ?? []).filter(e => e.pr_url);
 
@@ -1257,6 +1385,23 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     return { directions: dirs, totalDirPRs, hasAttribution, totalAutonomousPRs, totalAssistedPRs, selfSufficientCount };
   }, [digest?.direction_progress]);
   const productPct = digest?.overall_product_ratio != null ? Math.round(digest.overall_product_ratio * 100) : null;
+
+  const classSparkMap = useMemo(() => {
+    const trendHistory = digest?.trend_history ?? [];
+    return Object.fromEntries(
+      (digest?.failure_groups ?? []).map(g => [
+        g.failure_class,
+        trendHistory.map(p => ({ v: p.failed_by_class?.[g.failure_class] ?? 0 })),
+      ])
+    );
+  }, [digest?.trend_history, digest?.failure_groups]);
+
+  const taxSparkMap = useMemo(() => {
+    const trendHistory = digest?.trend_history ?? [];
+    return Object.fromEntries(
+      TAXONOMY_ORDER.map(k => [k, trendHistory.map(p => ({ v: p.failed_by_taxonomy?.[k] ?? 0 }))])
+    );
+  }, [digest?.trend_history]);
 
   return (
     <div className="flex-1 overflow-auto custom-scrollbar space-y-4">
@@ -1282,6 +1427,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
 
       {/* Anomaly Throttle Banner */}
       <AnomalyThrottleBanner digest={digest} />
+
+      {/* System Health — actionable issues with remediation hints */}
+      <SystemHealthCard data={healthOverview} loading={loading} tasks={tasks} onViewTask={onViewTask} />
 
       {/* Pipeline Regressions */}
       {selectedProjectId && <PipelineRegressionsPanel projectId={selectedProjectId} />}
@@ -1337,7 +1485,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             <section>
               <div className="flex flex-wrap gap-1.5">
                 {digest.failure_groups.map(g => {
-                  const classSpark = (digest.trend_history ?? []).map(p => ({ v: p.failed_by_class?.[g.failure_class] ?? 0 }));
+                  const classSpark = classSparkMap[g.failure_class] ?? [];
                   const classCost = digest.cost_by_failure_class?.[g.failure_class];
                   return <FailureClassPill key={g.failure_class} group={g} sparkData={classSpark} cost={classCost ?? undefined} />;
                 })}
@@ -1359,7 +1507,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
                   const base = TAXONOMY_COLORS[k] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30';
                   const cls = isDominant ? `${base} ring-1 ring-current` : base;
                   const stroke = TAXONOMY_STROKE[k] ?? '#a3a3a3';
-                  const taxSpark = (digest.trend_history ?? []).map(p => ({ v: p.failed_by_taxonomy?.[k] ?? 0 }));
+                  const taxSpark = taxSparkMap[k] ?? [];
                   const hasSpark = taxSpark.length >= 3;
                   return (
                     <span key={k} className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${cls}`} title={`${TAXONOMY_LABELS[k]}: ${cat.count} (${cat.percentage}%)${isDominant ? ' — dominant' : ''}`}>
@@ -1838,7 +1986,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
               </p>
               <SrMissedRetrospective
                 tasks={srRecentMisses}
-                initialCategory={selectedSrCategory}
+                selectedCategory={selectedSrCategory}
                 onTaskClick={(taskId) => {
                   const task = tasks.find(t => t.id === taskId);
                   if (task) onViewTask(task);
@@ -1860,6 +2008,8 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
                   const task = tasks.find(t => t.id === taskId);
                   if (task) onViewTask(task);
                 }}
+                windowDays={srUnhandledEdgesWindowDays}
+                onWindowDaysChange={setSrUnhandledEdgesWindowDays}
               />
             </section>
           )}
@@ -2046,6 +2196,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
               conversion={digest?.investigation_conversion ?? null}
               loading={loading}
               projectId={selectedProjectId}
+              onViewTask={handleViewTaskById}
             />
           )}
           {!loading && (() => {
@@ -2231,32 +2382,6 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           {/* Drift Signals */}
           {!!selectedProjectId && <DriftSignalsCard projectId={selectedProjectId} />}
 
-          {/* Section 3: Top Actionable Issues */}
-          <section>
-            <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Actionable Issues</h2>
-            {loading ? (
-              <div className="space-y-2"><Skeleton className="h-14 w-full" /><Skeleton className="h-14 w-full" /></div>
-            ) : issues.length === 0 ? (
-              <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-4 flex items-center gap-2 text-emerald-400 text-xs">
-                <CheckCircle className="w-4 h-4" />
-                All systems healthy
-              </div>
-            ) : (
-              <div className="space-y-1.5">
-                {visibleIssues.map((issue, i) => (
-                  <IssueRow key={i} {...issue} />
-                ))}
-                {issues.length > 3 && (
-                  <button
-                    onClick={() => setShowAllIssues(v => !v)}
-                    className="text-[10px] text-neutral-500 hover:text-neutral-300 transition-colors"
-                  >
-                    {showAllIssues ? 'Show less' : `Show ${issues.length - 3} more`}
-                  </button>
-                )}
-              </div>
-            )}
-          </section>
         </div>
 
         {/* Section 4: Recent Merge Timeline */}
@@ -2316,6 +2441,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             hasProject={!!selectedProjectId}
             tasks={tasks}
             onViewTask={onViewTask}
+            integrationBranch={openPRsIntegrationBranch}
+            promotionTarget={openPRsPromotionTarget}
+            onSpawnFixTask={onSpawnOrphanFix}
           />
         </div>
       </div>
@@ -2493,6 +2621,7 @@ function AnomalyThrottleBanner({ digest }: { digest: DigestData | null }) {
 function SystemStatusCard({ digest, loading }: { digest: DigestData | null; loading: boolean }) {
   const cycle = digest?.latest_cycle ?? null;
   const memoExits = digest?.memo_pathway_exits ?? 0;
+  const memoEverCited = digest?.memo_ever_cited ?? null;
   const recentCycleMemoStats = digest?.recent_cycle_memo_stats ?? [];
   const hasContent = digest?.narrative_summary || cycle;
 
@@ -2539,6 +2668,18 @@ function SystemStatusCard({ digest, loading }: { digest: DigestData | null; load
                   <span className="text-[10px] font-semibold text-violet-400 px-1.5 py-0.5 rounded border border-violet-500/30 bg-violet-500/10">
                     {memoExits} exit{memoExits !== 1 ? 's' : ''}
                   </span>
+                  {memoEverCited?.ever_cited ? (
+                    <span
+                      className="text-[10px] font-semibold text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/30 bg-emerald-500/10"
+                      title={memoEverCited.first_cited_at ? `first cited ${timeAgo(memoEverCited.first_cited_at)}` : undefined}
+                    >
+                      ever cited ✓
+                    </span>
+                  ) : memoEverCited != null ? (
+                    <span className="text-[10px] text-neutral-500 px-1.5 py-0.5 rounded border border-neutral-700/50">
+                      not yet cited
+                    </span>
+                  ) : null}
                   {recentCycleMemoStats.length > 0 && (
                     <div className="flex flex-wrap gap-1">
                       {recentCycleMemoStats.slice(0, 5).map((s, i) => (
@@ -2650,10 +2791,10 @@ function SuccessRateCard({ rate, trend, trendHistory, loading }: {
   trendHistory?: { success_rate: number | null; completed: number; failed: number }[];
   loading: boolean;
 }) {
+  const sparkPoints = useMemo(() => (trendHistory ?? []).map(p => ({ v: p.success_rate ?? 0 })), [trendHistory]);
   if (loading) return <Skeleton className="h-20" />;
   const TrendIcon = trend === 'improving' ? TrendingUp : trend === 'declining' ? TrendingDown : Minus;
   const trendColor = trend === 'improving' ? 'text-emerald-400' : trend === 'declining' ? 'text-red-400' : 'text-neutral-500';
-  const sparkPoints = (trendHistory ?? []).map(p => ({ v: p.success_rate ?? 0 }));
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
       <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Success Rate</p>
@@ -2717,9 +2858,9 @@ function CostCard({ totalCost, trendHistory, loading }: {
   trendHistory?: { period_cost_usd?: number | null }[];
   loading: boolean;
 }) {
+  const sparkPoints = useMemo(() => (trendHistory ?? []).map(p => ({ v: p.period_cost_usd ?? 0 })), [trendHistory]);
   if (loading) return <Skeleton className="h-20" />;
   const fill = SPARK_COLORS['blue'];
-  const sparkPoints = (trendHistory ?? []).map(p => ({ v: p.period_cost_usd ?? 0 }));
   const display = totalCost == null ? '--' : totalCost < 10 ? `$${totalCost.toFixed(2)}` : `$${Math.round(totalCost)}`;
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
@@ -2772,25 +2913,74 @@ function SrCatchRateCard({ rate, trends, loading, onScrollToReviewQuality }: {
 
   const overallPrevRate = trends?.previous_overall_hit_rate ?? null;
   const delta = overallPrevRate != null ? rate - overallPrevRate : null;
+  const verdict = trends?.overall_trend_verdict ?? null;
+  const significant = trends?.overall_trend_significant ?? null;
+
+  const srAloneRate = trends?.overall_sr_alone_hit_rate ?? null;
+  const prevSrAloneRate = trends?.previous_overall_sr_alone_hit_rate ?? null;
+  const srAloneDelta = srAloneRate != null && prevSrAloneRate != null ? srAloneRate - prevSrAloneRate : null;
+  const srAloneVerdict = trends?.overall_sr_alone_trend_verdict ?? null;
+  const srAloneSignificant = trends?.overall_sr_alone_trend_significant ?? null;
+  const reviewerLift = srAloneRate != null ? rate - srAloneRate : null;
 
   const pct = Math.round(rate * 100);
   const color = rate >= 0.7 ? 'text-emerald-400' : rate >= 0.4 ? 'text-amber-400' : 'text-red-400';
   const deltaPp = delta != null ? Math.round(delta * 100) : 0;
-  const deltaColor = delta != null && delta > 0.01 ? 'text-emerald-500' : delta != null && delta < -0.01 ? 'text-red-500' : 'text-neutral-500';
-  const deltaIcon = delta != null && delta > 0.01 ? '↑' : delta != null && delta < -0.01 ? '↓' : '→';
+  // Use backend significance-gated verdict when available; fall back to neutral when significance unknown
+  const improving = verdict === 'improving' || (verdict == null && significant !== false && delta != null && delta > 0.01);
+  const declining = verdict === 'declining' || (verdict == null && significant !== false && delta != null && delta < -0.01);
+  const deltaColor = improving ? 'text-emerald-500' : declining ? 'text-red-500' : 'text-neutral-500';
+  const deltaIcon = improving ? '↑' : declining ? '↓' : '→';
+  // De-emphasize delta when backend reports non-significant change
+  const deltaOpacity = (verdict === 'stable' || significant === false) ? 'opacity-50' : '';
+
+  const srAlonePct = srAloneRate != null ? Math.round(srAloneRate * 100) : null;
+  const reviewerLiftPp = reviewerLift != null ? Math.round(reviewerLift * 100) : null;
+  const srAloneDeltaPp = srAloneDelta != null ? Math.round(srAloneDelta * 100) : null;
+  const srAloneImproving = srAloneVerdict === 'improving' || (srAloneVerdict == null && srAloneSignificant !== false && srAloneDelta != null && srAloneDelta > 0.01);
+  const srAloneDeclining = srAloneVerdict === 'declining' || (srAloneVerdict == null && srAloneSignificant !== false && srAloneDelta != null && srAloneDelta < -0.01);
+  const srAloneDeltaColor = srAloneImproving ? 'text-emerald-500' : srAloneDeclining ? 'text-red-500' : 'text-neutral-500';
+  const srAloneDeltaOpacity = (srAloneVerdict === 'stable' || srAloneSignificant === false) ? 'opacity-50' : '';
 
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4 cursor-pointer hover:border-neutral-700/80 transition-colors" onClick={onScrollToReviewQuality}>
-      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">SR Catch Rate</p>
+      <div className="flex items-center justify-between mb-1">
+        <p className="text-[10px] text-neutral-500 uppercase tracking-wide">SR Catch Rate</p>
+        {trends?.is_stale && (
+          <span className="text-[9px] text-amber-400 font-mono" title={`Trend data is stale — last computed ${trends.computed_at ? new Date(trends.computed_at).toLocaleDateString() : 'unknown'}`}>stale</span>
+        )}
+        {trends?.data_sufficient === false && !trends?.is_stale && (
+          <span className="text-[9px] text-amber-500 font-mono" title="Insufficient reviewer-finding data — displayed numbers are frozen">frozen</span>
+        )}
+      </div>
       <div className="flex items-center gap-2">
         <p className={`text-2xl font-bold font-mono ${color}`}>{pct}%</p>
         {delta != null && (
-          <span className={`text-sm font-semibold ${deltaColor}`}>
+          <span className={`text-sm font-semibold ${deltaColor} ${deltaOpacity}`}>
             {deltaIcon} {deltaPp >= 0 ? '+' : ''}{deltaPp}pp
           </span>
         )}
       </div>
-      <p className="text-[10px] text-neutral-600 mt-1">n={reviewerFindingCount} findings</p>
+      {srAlonePct != null ? (
+        <p className="text-[10px] font-mono mt-0.5" title="author = SR-alone catch rate (excludes reviewer saves); +reviewer = additional coverage from fresh-reviewer pass">
+          <span className={srAloneDeclining ? 'text-red-400' : srAloneImproving ? 'text-emerald-400' : 'text-neutral-400'}>
+            author {srAlonePct}%
+          </span>
+          {srAloneDeltaPp != null && (
+            <span className={`${srAloneDeltaColor} ${srAloneDeltaOpacity} ml-0.5`}>
+              {srAloneDeltaPp >= 0 ? '+' : ''}{srAloneDeltaPp}pp
+            </span>
+          )}
+          {reviewerLiftPp != null && reviewerLiftPp > 0 && (
+            <span className="text-neutral-500"> / +reviewer {reviewerLiftPp}pp</span>
+          )}
+        </p>
+      ) : (
+        <p className="text-[10px] text-neutral-600 mt-1">n={reviewerFindingCount} findings</p>
+      )}
+      {srAlonePct != null && (
+        <p className="text-[10px] text-neutral-600">n={reviewerFindingCount} findings</p>
+      )}
     </div>
   );
 }

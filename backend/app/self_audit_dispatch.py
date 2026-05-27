@@ -18,7 +18,10 @@ from sqlmodel import select
 
 from app.models import Project, Task, TaskHistory, TaskStatus
 from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import (
+    get_project_integration_branch,
+    runtime_config as _runtime_config,
+)
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -344,7 +347,7 @@ async def _spawn_self_audit_task(
 
     payload: dict = {
         "type": "self_audit",
-        "base_branch": _runtime_config.get("integration_branch", "main"),
+        "base_branch": get_project_integration_branch(project),
     }
     focus = audit_payload.get("focus_systems")
     if focus:

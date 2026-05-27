@@ -139,6 +139,8 @@ async def test_backlog_reuse_claims_same_project_task(
         timing = (backlog.context or {}).get("_timing", {})
         assert timing.get("warm_start") is True
         assert timing.get("warm_claim_origin") == "backlog_reuse"
+        # Both context flag and column must be synchronized.
+        assert backlog.vm_warm_start is True
         # Warm claim must NOT stamp a cold-start sample.
         assert backlog.vm_cold_start_ms is None
 
@@ -523,3 +525,134 @@ def test_backlog_reuse_finalize_error_records_failure():
     finally:
         ss.warm_backlog_reuse_failure_events.clear()
         ss.warm_backlog_reuse_suppressed_until = None
+
+
+# ---------------------------------------------------------------------------
+# Funnel observability counter tests
+# ---------------------------------------------------------------------------
+
+
+def _clear_funnel_events(wbr):
+    wbr._vms_with_eligible_backlog_events.clear()
+    wbr._teardown_defers_events.clear()
+    wbr._next_role_polls_during_defer_events.clear()
+    wbr._warm_claims_succeeded_events.clear()
+    wbr._claim_skipped_events.clear()
+
+
+def test_funnel_counters_and_snapshot():
+    """Each record_* function increments its stage counter; get_reuse_funnel_snapshot
+    returns accurate per-stage and per-reason totals."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_funnel_events(wbr)
+    try:
+        wbr.record_vm_with_eligible_backlog()
+        wbr.record_vm_with_eligible_backlog()
+        wbr.record_teardown_defer()
+        wbr.record_next_role_poll_during_defer()
+        wbr.record_warm_claim_succeeded()
+        wbr.record_claim_skipped("no_eligible")
+        wbr.record_claim_skipped("lost_claim_race")
+        wbr.record_claim_skipped("no_eligible")
+
+        snap = wbr.get_reuse_funnel_snapshot()
+        assert snap["window_hours"] == 24
+        assert snap["completed_vms_with_eligible_backlog"] == 2
+        assert snap["teardown_defers_scheduled"] == 1
+        assert snap["next_role_polls_during_defer"] == 1
+        assert snap["warm_claims_succeeded"] == 1
+        assert snap["claim_skipped_total"] == 3
+        assert snap["claim_skipped_by_reason"]["no_eligible"] == 2
+        assert snap["claim_skipped_by_reason"]["lost_claim_race"] == 1
+    finally:
+        _clear_funnel_events(wbr)
+
+
+def test_funnel_claim_skipped_circuit_breaker():
+    """record_claim_skipped('circuit_breaker_tripped') is tracked in the snapshot."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_funnel_events(wbr)
+    try:
+        wbr.record_claim_skipped("circuit_breaker_tripped")
+        snap = wbr.get_reuse_funnel_snapshot()
+        assert snap["claim_skipped_by_reason"].get("circuit_breaker_tripped") == 1
+        assert snap["claim_skipped_total"] == 1
+    finally:
+        _clear_funnel_events(wbr)
+
+
+@pytest.mark.asyncio
+async def test_funnel_warm_claim_increments_succeeded(
+    client: AsyncClient, db_session, mocker
+):
+    """A successful /next-role backlog claim increments warm_claims_succeeded
+    and leaves claim_skipped_total at zero."""
+    import app.warm_backlog_reuse as wbr
+
+    _patch_broadcast(mocker)
+    _clear_funnel_events(wbr)
+    try:
+        with _FlagGuard(backlog=True):
+            project = await _make_project(db_session, name="Funnel Claim")
+            vm_id = "agent-vm-funnel-claim"
+            prior = await _make_backlog_task(
+                db_session,
+                project.id,
+                status=TaskStatus.COMPLETED,
+                vm_instance_id=vm_id,
+            )
+            await _make_backlog_task(db_session, project.id)
+            token = create_agent_token(
+                str(prior.id), vm_id, task_type="create", project_id=str(project.id)
+            )
+            resp = await client.post(
+                "/api/agent/next-role",
+                json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+                headers={"x-agent-token": token},
+            )
+            assert resp.status_code == 200, resp.text
+
+        snap = wbr.get_reuse_funnel_snapshot()
+        assert snap["warm_claims_succeeded"] >= 1
+        assert snap["claim_skipped_total"] == 0
+    finally:
+        _clear_funnel_events(wbr)
+
+
+@pytest.mark.asyncio
+async def test_funnel_no_eligible_increments_skipped(
+    client: AsyncClient, db_session, mocker
+):
+    """A /next-role poll with an empty backlog increments claim_skipped no_eligible."""
+    import app.warm_backlog_reuse as wbr
+
+    _patch_broadcast(mocker)
+    _clear_funnel_events(wbr)
+    try:
+        with _FlagGuard(backlog=True):
+            project = await _make_project(db_session, name="Funnel No Eligible")
+            vm_id = "agent-vm-funnel-noelig"
+            prior = await _make_backlog_task(
+                db_session,
+                project.id,
+                status=TaskStatus.COMPLETED,
+                vm_instance_id=vm_id,
+            )
+            # No QUEUED backlog task — queue is empty.
+            token = create_agent_token(
+                str(prior.id), vm_id, task_type="create", project_id=str(project.id)
+            )
+            resp = await client.post(
+                "/api/agent/next-role",
+                json={"vm_instance_id": vm_id, "prior_task_id": str(prior.id)},
+                headers={"x-agent-token": token},
+            )
+            assert resp.status_code == 204
+
+        snap = wbr.get_reuse_funnel_snapshot()
+        assert snap["warm_claims_succeeded"] == 0
+        assert snap["claim_skipped_by_reason"].get("no_eligible", 0) >= 1
+    finally:
+        _clear_funnel_events(wbr)

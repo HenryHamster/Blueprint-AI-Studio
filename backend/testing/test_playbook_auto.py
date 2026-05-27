@@ -84,6 +84,24 @@ async def _make_completed_task(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def test_review_learning_symbols_reexported_from_playbook_learning():
+    import app.playbook_learning as playbook_learning
+    import app.review_learning as review_learning
+
+    assert (
+        playbook_learning.cache_first_attempt_classification
+        is review_learning.cache_first_attempt_classification
+    )
+    assert (
+        playbook_learning.compute_review_effectiveness
+        is review_learning.compute_review_effectiveness
+    )
+    assert (
+        playbook_learning.extract_review_feedback_to_playbook
+        is review_learning.extract_review_feedback_to_playbook
+    )
+
+
 @pytest.mark.asyncio
 async def test_three_failures_trigger_auto_entry(db_session: AsyncSession):
     """3 FAILED tasks with the same failure_class and keyword overlap creates an auto-entry."""
@@ -231,1502 +249,6 @@ async def test_old_failures_outside_7_day_window_ignored(db_session: AsyncSessio
     doc = project.design_doc or {}
     auto_keys = [k for k in doc if k.startswith("playbook/auto-")]
     assert len(auto_keys) == 0, "Old failures outside 7-day window should not count"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tests for capture_success_pattern
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_capture_success_creates_entry_after_threshold(db_session: AsyncSession):
-    """capture_success_pattern creates a success-pattern entry once the task type
-    has at least 3 total completions (success or failure) in the project."""
-    from app.playbook_learning import capture_success_pattern
-
-    project = await _make_project(db_session, design_doc={})
-    # 2 prior completions of the same type (makes total = 3 with current task)
-    await _make_completed_task(
-        db_session, project.id, task_type="create", scope="small"
-    )
-    await _make_completed_task(
-        db_session, project.id, task_type="create", scope="small"
-    )
-    task = await _make_completed_task(
-        db_session, project.id, task_type="create", scope="small"
-    )
-
-    key = await capture_success_pattern(task, db_session)
-    await db_session.flush()
-
-    assert key == "success-create-small"
-    doc = project.design_doc or {}
-    assert "playbook/success-create-small" in doc
-    entry = doc["playbook/success-create-small"]
-    assert entry["source"] == "success-pattern"
-    assert entry["success_count"] == 1
-    assert entry["confirmed_count"] == 0
-    assert "create" in entry["applicable_types"]
-    assert "small" in entry["content"]
-    assert "_meta" in doc
-
-
-@pytest.mark.asyncio
-async def test_capture_success_skips_below_threshold(db_session: AsyncSession):
-    """capture_success_pattern returns None when the task type has fewer than 3
-    total completions — the single task is not yet statistically meaningful."""
-    from app.playbook_learning import capture_success_pattern
-
-    project = await _make_project(db_session, design_doc={})
-    # Only 1 prior completion + current = 2 total (below threshold of 3)
-    await _make_completed_task(
-        db_session, project.id, task_type="create", scope="small"
-    )
-    task = await _make_completed_task(
-        db_session, project.id, task_type="create", scope="small"
-    )
-
-    key = await capture_success_pattern(task, db_session)
-    await db_session.flush()
-
-    assert key is None
-    doc = project.design_doc or {}
-    assert not any(k.startswith("playbook/success-") for k in doc)
-
-
-@pytest.mark.asyncio
-async def test_capture_success_skips_with_no_prior_completions(
-    db_session: AsyncSession,
-):
-    """capture_success_pattern returns None when this is the very first task of the type."""
-    from app.playbook_learning import capture_success_pattern
-
-    project = await _make_project(db_session, design_doc={})
-    task = await _make_completed_task(db_session, project.id, task_type="fix")
-
-    key = await capture_success_pattern(task, db_session)
-    assert key is None
-
-
-@pytest.mark.asyncio
-async def test_capture_success_updates_existing_entry(db_session: AsyncSession):
-    """capture_success_pattern increments success_count, updates scope_distribution,
-    and refreshes content on a second qualifying success of the same (type, scope)."""
-    from app.playbook_learning import capture_success_pattern
-
-    project = await _make_project(
-        db_session,
-        design_doc={
-            "playbook/success-fix-medium": {
-                "content": "First-attempt success pattern for fix tasks (1 observation, scope: medium).",
-                "source": "success-pattern",
-                "success_count": 1,
-                "confirmed_count": 2,
-                "applicable_types": ["fix"],
-                "scope": "medium",
-                "scope_distribution": {"medium": 1},
-                "num_files_changed": 3,
-                "tests_added": False,
-                "first_attempt_success": True,
-                "updated_at": _utcnow().isoformat(),
-            },
-        },
-    )
-    # 2 prior completions to satisfy noise filter
-    await _make_completed_task(db_session, project.id, task_type="fix", scope="medium")
-    await _make_completed_task(db_session, project.id, task_type="fix", scope="medium")
-    task = await _make_completed_task(
-        db_session, project.id, task_type="fix", scope="medium"
-    )
-
-    key = await capture_success_pattern(task, db_session)
-    await db_session.flush()
-
-    assert key == "success-fix-medium"
-    entry = (project.design_doc or {})["playbook/success-fix-medium"]
-    assert entry["success_count"] == 2
-    # confirmed_count is left untouched by capture_success_pattern
-    assert entry["confirmed_count"] == 2
-    assert "medium" in entry["content"]
-    assert "2 observations" in entry["content"]
-    assert entry["scope_distribution"] == {"medium": 2}
-
-
-@pytest.mark.asyncio
-async def test_capture_success_includes_related_files(db_session: AsyncSession):
-    """capture_success_pattern includes the files touched in the entry content."""
-    from app.playbook_learning import capture_success_pattern
-
-    project = await _make_project(db_session, design_doc={})
-    files = ["backend/app/foo.py", "backend/app/bar.py"]
-    # 2 prior completions to satisfy noise filter
-    await _make_completed_task(db_session, project.id, task_type="refactor")
-    await _make_completed_task(db_session, project.id, task_type="refactor")
-    task = await _make_completed_task(
-        db_session,
-        project.id,
-        task_type="refactor",
-        related_files=files,
-    )
-
-    key = await capture_success_pattern(task, db_session)
-    await db_session.flush()
-
-    assert key == "success-refactor-small"
-    entry = (project.design_doc or {})["playbook/success-refactor-small"]
-    assert "foo.py" in entry["content"]
-    assert "bar.py" in entry["content"]
-
-
-@pytest.mark.asyncio
-async def test_capture_success_new_type_without_failures(db_session: AsyncSession):
-    """capture_success_pattern works for task types that have never failed
-    (cold-start fix: no failure-gate required)."""
-    from app.playbook_learning import capture_success_pattern
-
-    project = await _make_project(db_session, design_doc={})
-    # Simulate a brand-new task type ('migrate') with 3 completions, no failures
-    await _make_completed_task(
-        db_session, project.id, task_type="migrate", scope="small"
-    )
-    await _make_completed_task(
-        db_session, project.id, task_type="migrate", scope="small"
-    )
-    task = await _make_completed_task(
-        db_session, project.id, task_type="migrate", scope="small"
-    )
-
-    key = await capture_success_pattern(task, db_session)
-    await db_session.flush()
-
-    assert key == "success-migrate-small"
-    assert "playbook/success-migrate-small" in (project.design_doc or {})
-
-
-@pytest.mark.asyncio
-async def test_capture_success_metadata_fields(db_session: AsyncSession):
-    """New entries include num_files_changed, tests_added, first_attempt_success,
-    scope, and scope_distribution fields."""
-    from app.playbook_learning import capture_success_pattern
-
-    project = await _make_project(db_session, design_doc={})
-    files = ["backend/app/foo.py", "backend/testing/test_foo.py"]
-    await _make_completed_task(
-        db_session, project.id, task_type="create", scope="medium"
-    )
-    await _make_completed_task(
-        db_session, project.id, task_type="create", scope="medium"
-    )
-    task = await _make_completed_task(
-        db_session,
-        project.id,
-        task_type="create",
-        scope="medium",
-        related_files=files,
-    )
-
-    key = await capture_success_pattern(task, db_session)
-    await db_session.flush()
-
-    assert key == "success-create-medium"
-    entry = (project.design_doc or {})["playbook/success-create-medium"]
-    assert entry["num_files_changed"] == 2
-    assert entry["tests_added"] is True  # test_foo.py matches /testing/ pattern
-    assert entry["first_attempt_success"] is True
-    assert entry["scope"] == "medium"
-    assert entry["scope_distribution"] == {"medium": 1}
-
-
-@pytest.mark.asyncio
-async def test_capture_success_metadata_detects_tests_dir(db_session: AsyncSession):
-    """Files under /tests/ count as test files for tests_added/test_file_count."""
-    from app.playbook_learning import capture_success_pattern
-
-    project = await _make_project(db_session, design_doc={})
-    files = ["backend/tests/test_router.py", "backend/app/foo.py"]
-    await _make_completed_task(
-        db_session, project.id, task_type="create", scope="small"
-    )
-    await _make_completed_task(
-        db_session, project.id, task_type="create", scope="small"
-    )
-    task = await _make_completed_task(
-        db_session, project.id, task_type="create", scope="small", related_files=files
-    )
-
-    key = await capture_success_pattern(task, db_session)
-    await db_session.flush()
-
-    assert key == "success-create-small"
-    entry = (project.design_doc or {})["playbook/success-create-small"]
-    assert entry["tests_added"] is True
-    assert entry["test_file_count"] == 1
-
-
-@pytest.mark.asyncio
-async def test_capture_success_per_scope_key(db_session: AsyncSession):
-    """Different scopes produce separate playbook entries."""
-    from app.playbook_learning import capture_success_pattern
-
-    project = await _make_project(db_session, design_doc={})
-    # 2 prior of each scope to satisfy threshold
-    await _make_completed_task(
-        db_session, project.id, task_type="create", scope="small"
-    )
-    await _make_completed_task(
-        db_session, project.id, task_type="create", scope="small"
-    )
-    await _make_completed_task(
-        db_session, project.id, task_type="create", scope="medium"
-    )
-    await _make_completed_task(
-        db_session, project.id, task_type="create", scope="medium"
-    )
-
-    task_small = await _make_completed_task(
-        db_session, project.id, task_type="create", scope="small"
-    )
-    key_small = await capture_success_pattern(task_small, db_session)
-
-    task_medium = await _make_completed_task(
-        db_session, project.id, task_type="create", scope="medium"
-    )
-    key_medium = await capture_success_pattern(task_medium, db_session)
-
-    await db_session.flush()
-
-    assert key_small == "success-create-small"
-    assert key_medium == "success-create-medium"
-    doc = project.design_doc or {}
-    assert "playbook/success-create-small" in doc
-    assert "playbook/success-create-medium" in doc
-
-
-@pytest.mark.asyncio
-async def test_capture_success_scope_distribution_accumulates(db_session: AsyncSession):
-    """scope_distribution tracks the count of successes at each scope level."""
-    from app.playbook_learning import capture_success_pattern
-
-    project = await _make_project(db_session, design_doc={})
-    # Pre-seed 2 prior completions for the threshold
-    await _make_completed_task(db_session, project.id, task_type="fix", scope="small")
-    await _make_completed_task(db_session, project.id, task_type="fix", scope="small")
-
-    # First success: creates the entry
-    t1 = await _make_completed_task(
-        db_session, project.id, task_type="fix", scope="small"
-    )
-    await capture_success_pattern(t1, db_session)
-    await db_session.flush()
-
-    # Second success: updates scope_distribution
-    t2 = await _make_completed_task(
-        db_session, project.id, task_type="fix", scope="small"
-    )
-    await capture_success_pattern(t2, db_session)
-    await db_session.flush()
-
-    entry = (project.design_doc or {}).get("playbook/success-fix-small", {})
-    assert entry.get("success_count") == 2
-    assert entry.get("scope_distribution") == {"small": 2}
-
-
-@pytest.mark.asyncio
-async def test_capture_success_direction_affinity(db_session: AsyncSession):
-    """direction_successes accumulates per-direction counts; file_type_distribution
-    records extension breakdown; test_file_count reflects actual test file count."""
-    from app.playbook_learning import capture_success_pattern
-
-    project = await _make_project(db_session, design_doc={})
-    files = ["backend/app/foo.py", "backend/app/bar.py", "backend/testing/test_foo.py"]
-    dir_id = "dir-abc"
-    await _make_completed_task(
-        db_session, project.id, task_type="create", scope="small"
-    )
-    await _make_completed_task(
-        db_session, project.id, task_type="create", scope="small"
-    )
-    t1 = await _make_completed_task(
-        db_session,
-        project.id,
-        task_type="create",
-        scope="small",
-        related_files=files,
-        direction_id=dir_id,
-    )
-
-    await capture_success_pattern(t1, db_session)
-    await db_session.flush()
-
-    entry = (project.design_doc or {})["playbook/success-create-small"]
-    assert entry["direction_successes"] == {dir_id: 1}
-    assert entry["file_type_distribution"] == {"py": 3}
-    assert entry["test_file_count"] == 1
-
-    # Second success for the same direction increments its count
-    t2 = await _make_completed_task(
-        db_session,
-        project.id,
-        task_type="create",
-        scope="small",
-        related_files=files,
-        direction_id=dir_id,
-    )
-    await capture_success_pattern(t2, db_session)
-    await db_session.flush()
-
-    entry = (project.design_doc or {})["playbook/success-create-small"]
-    assert entry["direction_successes"] == {dir_id: 2}
-    assert entry["success_count"] == 2
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tests for summarize_recent_successes
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _make_success_entry(
-    success_count: int,
-    *,
-    file_type_distribution: dict | None = None,
-    test_file_count: int = 0,
-    tests_added: bool = False,
-    direction_successes: dict | None = None,
-    updated_at: str | None = None,
-) -> dict:
-    return {
-        "content": f"success ({success_count}x)",
-        "source": "success-pattern",
-        "success_count": success_count,
-        "scope_distribution": {"small": success_count},
-        "direction_successes": direction_successes or {},
-        "file_type_distribution": file_type_distribution or {},
-        "test_file_count": test_file_count,
-        "tests_added": tests_added,
-        "updated_at": updated_at or _utcnow().isoformat(),
-    }
-
-
-def test_summarize_recent_successes_omitted_when_no_entries():
-    """Empty design_doc → returns None."""
-    from app.playbook_learning import summarize_recent_successes
-
-    assert summarize_recent_successes({}, "create", "d-1", "small") is None
-
-
-def test_summarize_recent_successes_omitted_when_only_singletons():
-    """Entries with success_count < 2 are filtered out."""
-    from app.playbook_learning import summarize_recent_successes
-
-    doc = {
-        "playbook/success-create-small": _make_success_entry(
-            1, file_type_distribution={"py": 1}
-        ),
-    }
-    assert summarize_recent_successes(doc, "create", None, "small") is None
-
-
-def test_summarize_recent_successes_omitted_for_other_task_type():
-    """Entries for a different task_type → returns None."""
-    from app.playbook_learning import summarize_recent_successes
-
-    doc = {
-        "playbook/success-fix-small": _make_success_entry(
-            5, file_type_distribution={"py": 5}
-        ),
-    }
-    assert summarize_recent_successes(doc, "create", None, "small") is None
-
-
-def test_summarize_recent_successes_includes_matching_entries():
-    """Section header + at least one bullet referencing seeded entry shape."""
-    from app.playbook_learning import summarize_recent_successes
-
-    doc = {
-        "playbook/success-create-small": _make_success_entry(
-            8,
-            file_type_distribution={"py": 6, "ts": 2},
-            test_file_count=2,
-            tests_added=True,
-        ),
-        "playbook/success-create-medium": _make_success_entry(
-            3,
-            file_type_distribution={"py": 3},
-        ),
-    }
-    out = summarize_recent_successes(doc, "create", None, "small")
-    assert out is not None
-    assert "## Recent successes" in out
-    assert "create-small" in out
-    assert "8x" in out
-    assert "py" in out
-    # File-type signal surfaced
-    assert "files:" in out
-    # Tests-added signal surfaced
-    assert "tests added" in out
-
-
-def test_summarize_recent_successes_prefers_direction_affinity():
-    """Entries with this direction_id in direction_successes rank first."""
-    from app.playbook_learning import summarize_recent_successes
-
-    doc = {
-        # Higher overall success_count but no direction affinity
-        "playbook/success-create-small": _make_success_entry(
-            10, file_type_distribution={"py": 10}
-        ),
-        # Lower overall success_count but matches the direction
-        "playbook/success-create-medium": _make_success_entry(
-            3,
-            file_type_distribution={"ts": 3},
-            direction_successes={"d-target": 3},
-        ),
-    }
-    out = summarize_recent_successes(doc, "create", "d-target", "small")
-    assert out is not None
-    lines = out.splitlines()
-    # First bullet should be the direction-affined entry (medium scope, ts files)
-    assert "create-medium" in lines[1]
-    assert "this direction: 3" in lines[1]
-
-
-def test_summarize_recent_successes_caps_bullets():
-    """At most max_bullets bullets are emitted regardless of how many qualify."""
-    from app.playbook_learning import summarize_recent_successes
-
-    doc = {
-        f"playbook/success-create-scope{i}": _make_success_entry(
-            5, file_type_distribution={"py": 1}
-        )
-        for i in range(10)
-    }
-    out = summarize_recent_successes(
-        doc, "create", None, "small", max_bullets=3, char_budget=2000
-    )
-    assert out is not None
-    # 1 header + at most 3 bullets
-    assert len(out.splitlines()) <= 4
-    bullet_lines = [ln for ln in out.splitlines() if ln.startswith("- ")]
-    assert len(bullet_lines) == 3
-
-
-def test_summarize_recent_successes_enforces_char_budget():
-    """Output never exceeds char_budget; truncation drops trailing bullets, not mid-line."""
-    from app.playbook_learning import summarize_recent_successes
-
-    # 10 large entries — header + each bullet is ~50 chars, so a 200-char
-    # budget should fit only a handful of bullets cleanly.
-    doc = {
-        f"playbook/success-create-suffix{i:02d}": _make_success_entry(
-            5,
-            file_type_distribution={"py": 5, "ts": 3, "tsx": 2},
-            test_file_count=1,
-            tests_added=True,
-        )
-        for i in range(10)
-    }
-    out = summarize_recent_successes(doc, "create", None, "small", char_budget=200)
-    assert out is not None
-    assert len(out) <= 200, f"Output exceeds budget: {len(out)} chars"
-    # Every line must be either the header or a complete bullet — no partial lines.
-    for ln in out.splitlines():
-        assert ln.startswith("## ") or ln.startswith("- "), (
-            f"Truncated mid-line: {ln!r}"
-        )
-
-
-def test_summarize_recent_successes_returns_none_when_budget_too_small():
-    """When even one bullet doesn't fit, return None rather than malformed output."""
-    from app.playbook_learning import summarize_recent_successes
-
-    doc = {
-        "playbook/success-create-small": _make_success_entry(
-            5, file_type_distribution={"py": 5}
-        ),
-    }
-    # 10 chars cannot fit even the header
-    assert (
-        summarize_recent_successes(doc, "create", None, "small", char_budget=10) is None
-    )
-
-
-def test_summarize_recent_successes_task_type_agnostic():
-    """Helper itself does not gate by task_type — call sites enforce the allowlist."""
-    from app.playbook_learning import (
-        summarize_recent_successes,
-        RECENT_SUCCESSES_TASK_TYPES,
-    )
-
-    # Non-allowlisted type 'qa'; helper still surfaces matching entries.
-    doc = {
-        "playbook/success-qa-small": _make_success_entry(
-            5, file_type_distribution={"py": 5}
-        ),
-    }
-    out = summarize_recent_successes(doc, "qa", None, "small")
-    assert out is not None
-    assert "qa-small" in out
-    # Confirm 'qa' is not in the call-site allowlist
-    assert "qa" not in RECENT_SUCCESSES_TASK_TYPES
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tests for age-based flagging
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def test_old_unconfirmed_entry_gets_age_penalty():
-    """Entries older than 30 days with confirmed_count < 3 receive age_penalty=1 in the sort tuple."""
-    # Mirrors the same logic used in the claim endpoint (both use naive UTC datetimes).
-    old_date = (_utcnow() - timedelta(days=31)).isoformat()
-    recent_date = _utcnow().isoformat()
-
-    def _age_penalty(updated_at_str: str, confirmed: int) -> int:
-        if confirmed >= 3:
-            return 0
-        try:
-            updated_dt = datetime.fromisoformat(updated_at_str.replace("Z", "+00:00"))
-            # Strip tzinfo so comparison stays naive (matches _utcnow() which is naive UTC)
-            if updated_dt.tzinfo is not None:
-                updated_dt = updated_dt.replace(tzinfo=None)
-            return 1 if (_utcnow() - updated_dt).days > 30 else 0
-        except (ValueError, TypeError):
-            return 0
-
-    assert _age_penalty(old_date, confirmed=0) == 1, (
-        "Old entry with no confirmations should get penalty"
-    )
-    assert _age_penalty(old_date, confirmed=2) == 1, (
-        "Old entry with 2 confirmations should get penalty"
-    )
-    assert _age_penalty(old_date, confirmed=3) == 0, (
-        "Old entry with 3+ confirmations should NOT get penalty"
-    )
-    assert _age_penalty(recent_date, confirmed=0) == 0, (
-        "Recent entry should NOT get penalty"
-    )
-
-
-def test_stale_file_refs_penalty():
-    """Entries with stale_file_refs=True receive stale_penalty=1 in the sort tuple."""
-    stale_entry = {"confirmed_count": 5, "stale_file_refs": True, "content": "x"}
-    clean_entry = {"confirmed_count": 5, "stale_file_refs": False, "content": "y"}
-    no_flag_entry = {"confirmed_count": 5, "content": "z"}
-
-    def stale_penalty(v):
-        return 1 if v.get("stale_file_refs") else 0
-
-    assert stale_penalty(stale_entry) == 1
-    assert stale_penalty(clean_entry) == 0
-    assert stale_penalty(no_flag_entry) == 0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tests for file-reference validation
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def test_extract_file_paths_basic():
-    """_extract_file_paths correctly extracts backend/agent/admin-ui paths from content."""
-    from app.playbook_learning import _extract_file_paths
-
-    content = (
-        "See backend/app/models.py and agent/src/index.ts. "
-        "Also admin-ui/src/App.tsx for the UI."
-    )
-    paths = _extract_file_paths(content)
-    assert "backend/app/models.py" in paths
-    assert "agent/src/index.ts" in paths
-    assert "admin-ui/src/App.tsx" in paths
-
-
-def test_extract_file_paths_no_matches():
-    """_extract_file_paths returns an empty list when no file paths are present."""
-    from app.playbook_learning import _extract_file_paths
-
-    assert _extract_file_paths("No file references here.") == []
-
-
-def test_check_and_flag_stale_refs_no_repo_root():
-    """check_and_flag_stale_refs is a no-op when repo_root is falsy or missing."""
-    from app.playbook_learning import check_and_flag_stale_refs
-
-    doc = {
-        "playbook/tip": {
-            "content": "see backend/app/missing_file.py",
-            "confirmed_count": 0,
-            "updated_at": _utcnow().isoformat(),
-        }
-    }
-    result = check_and_flag_stale_refs(doc, "")
-    assert not result["playbook/tip"].get("stale_file_refs")
-
-
-def test_check_and_flag_stale_refs_marks_missing(tmp_path):
-    """check_and_flag_stale_refs sets stale_file_refs=True when referenced file is missing."""
-    from app.playbook_learning import check_and_flag_stale_refs
-
-    # Create a repo_root with one real file and reference a missing file
-    backend_dir = tmp_path / "backend" / "app"
-    backend_dir.mkdir(parents=True)
-    (backend_dir / "real_file.py").write_text("# exists")
-
-    doc = {
-        "playbook/tip": {
-            "content": "See backend/app/gone_file.py for the pattern.",
-            "confirmed_count": 0,
-            "updated_at": _utcnow().isoformat(),
-        }
-    }
-    result = check_and_flag_stale_refs(doc, str(tmp_path))
-    assert result["playbook/tip"].get("stale_file_refs") is True
-
-
-def test_check_and_flag_stale_refs_clears_when_file_restored(tmp_path):
-    """check_and_flag_stale_refs clears stale_file_refs when all referenced files exist."""
-    from app.playbook_learning import check_and_flag_stale_refs
-
-    backend_dir = tmp_path / "backend" / "app"
-    backend_dir.mkdir(parents=True)
-    (backend_dir / "models.py").write_text("# exists")
-
-    doc = {
-        "playbook/tip": {
-            "content": "See backend/app/models.py.",
-            "confirmed_count": 0,
-            "stale_file_refs": True,
-            "updated_at": _utcnow().isoformat(),
-        }
-    }
-    result = check_and_flag_stale_refs(doc, str(tmp_path))
-    assert result["playbook/tip"].get("stale_file_refs") is False
-
-
-def test_check_and_flag_stale_refs_no_file_paths_untouched(tmp_path):
-    """Entries with no file references are not modified by check_and_flag_stale_refs."""
-    from app.playbook_learning import check_and_flag_stale_refs
-
-    doc = {
-        "playbook/tip": {
-            "content": "General advice with no file references.",
-            "confirmed_count": 0,
-            "updated_at": _utcnow().isoformat(),
-        }
-    }
-    result = check_and_flag_stale_refs(doc, str(tmp_path))
-    assert "stale_file_refs" not in result["playbook/tip"]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tests for capacity-aware cleanup
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _make_doc_with_size(
-    num_entries: int, confirmed_counts: list[int] | None = None
-) -> dict:
-    """Build a doc dict whose playbook entries collectively approach *num_entries* * ~500 bytes."""
-    confirmed_counts = confirmed_counts or [0] * num_entries
-    doc: dict = {}
-    for i in range(num_entries):
-        doc[f"playbook/entry-{i:03d}"] = {
-            "content": "x" * 480,  # ~480 bytes per entry to keep math simple
-            "confirmed_count": confirmed_counts[i],
-            "updated_at": _utcnow().isoformat(),
-        }
-    return doc
-
-
-def test_archive_least_useful_entry_removes_and_archives():
-    """_archive_least_useful_entry moves the entry with lowest confirmed_count to playbook_archive."""
-    from app.playbook_learning import _archive_least_useful_entry
-
-    doc = {
-        "playbook/a": {
-            "content": "tip a",
-            "confirmed_count": 5,
-            "updated_at": _utcnow().isoformat(),
-        },
-        "playbook/b": {
-            "content": "tip b",
-            "confirmed_count": 0,
-            "updated_at": _utcnow().isoformat(),
-        },
-        "playbook/c": {
-            "content": "tip c",
-            "confirmed_count": 3,
-            "updated_at": _utcnow().isoformat(),
-        },
-    }
-    result = _archive_least_useful_entry(doc)
-
-    # 'b' has lowest confirmed_count — should be archived
-    assert "playbook/b" not in result
-    assert "playbook/a" in result
-    assert "playbook/c" in result
-    archive = result.get("playbook_archive", [])
-    assert len(archive) == 1
-    assert archive[0]["_archived_key"] == "playbook/b"
-
-
-def test_archive_prefers_stale_entries():
-    """_archive_least_useful_entry archives stale_file_refs entries first."""
-    from app.playbook_learning import _archive_least_useful_entry
-
-    doc = {
-        "playbook/a": {
-            "content": "tip a",
-            "confirmed_count": 0,
-            "stale_file_refs": False,
-            "updated_at": _utcnow().isoformat(),
-        },
-        "playbook/b": {
-            "content": "tip b",
-            "confirmed_count": 5,
-            "stale_file_refs": True,
-            "updated_at": _utcnow().isoformat(),
-        },
-    }
-    result = _archive_least_useful_entry(doc)
-    # Despite higher confirmed_count, b is stale so it should be archived first
-    assert "playbook/b" not in result
-    assert "playbook/a" in result
-
-
-def test_archive_prefers_older_entries_within_same_tier():
-    """_archive_least_useful_entry archives the oldest entry when stale and confirmed_count tie."""
-    from app.playbook_learning import _archive_least_useful_entry
-
-    old_date = (_utcnow() - timedelta(days=60)).isoformat()
-    recent_date = _utcnow().isoformat()
-
-    doc = {
-        "playbook/old": {
-            "content": "old tip",
-            "confirmed_count": 0,
-            "updated_at": old_date,
-        },
-        "playbook/recent": {
-            "content": "recent tip",
-            "confirmed_count": 0,
-            "updated_at": recent_date,
-        },
-    }
-    result = _archive_least_useful_entry(doc)
-    # Both entries have same stale flag and confirmed_count — oldest should be archived first
-    assert "playbook/old" not in result, "Oldest entry should have been archived"
-    assert "playbook/recent" in result
-
-
-def test_archive_caps_playbook_archive_length():
-    """_archive_least_useful_entry trims playbook_archive past the cap.
-
-    Without this cap the archive grows monotonically — a single project
-    observed 517 entries / 351 KB of archive, which bloated the design_doc
-    payload past the agent budget and caused silent pre-claim death."""
-    from app.playbook_learning import (
-        _archive_least_useful_entry,
-        _PLAYBOOK_ARCHIVE_MAX_DEFAULT,
-    )
-    from app.shared_state import runtime_config
-
-    # Pre-populate archive with cap+5 entries so the next archival exceeds the cap
-    existing_archive = [
-        {"_archived_key": f"playbook/old-{i}", "content": "x"}
-        for i in range(_PLAYBOOK_ARCHIVE_MAX_DEFAULT + 5)
-    ]
-    doc = {
-        "playbook_archive": existing_archive,
-        "playbook/victim": {
-            "content": "least useful",
-            "confirmed_count": 0,
-            "updated_at": _utcnow().isoformat(),
-        },
-    }
-
-    # Ensure runtime_config default is used
-    runtime_config.pop("playbook_archive_max", None)
-
-    result = _archive_least_useful_entry(doc)
-    archive = result["playbook_archive"]
-
-    # Length should be exactly the cap after trim + new entry
-    assert len(archive) == _PLAYBOOK_ARCHIVE_MAX_DEFAULT
-    # Oldest entries should have been dropped; the newly-archived one is the tail
-    assert archive[-1]["_archived_key"] == "playbook/victim"
-    # The very oldest entries (old-0, old-1, etc.) are gone
-    keys = [e["_archived_key"] for e in archive]
-    assert "playbook/old-0" not in keys
-
-
-def test_archive_cap_respects_runtime_config_override():
-    """Operators can tune playbook_archive_max via runtime_config."""
-    from app.playbook_learning import _archive_least_useful_entry
-    from app.shared_state import runtime_config
-
-    runtime_config["playbook_archive_max"] = 3
-    try:
-        existing_archive = [{"_archived_key": f"old-{i}"} for i in range(5)]
-        doc = {
-            "playbook_archive": existing_archive,
-            "playbook/new": {
-                "content": "least useful",
-                "confirmed_count": 0,
-                "updated_at": _utcnow().isoformat(),
-            },
-        }
-        result = _archive_least_useful_entry(doc)
-        assert len(result["playbook_archive"]) == 3
-    finally:
-        runtime_config.pop("playbook_archive_max", None)
-
-
-def test_archive_uses_rate_over_raw_count_when_enough_observations():
-    """_archive_least_useful_entry uses success rate when followed_count >= _MIN_FOLLOWED_FOR_RATE.
-
-    An entry with many raw confirmations but no follow tracking should be kept
-    over an entry that has few confirmations relative to many follows, because
-    the rate-based score (effectiveness = -(confirmed/followed)) of the
-    low-performer is higher (closer to 0) than the score of the well-confirmed
-    entry that lacks follow tracking (effectiveness = -confirmed).
-    """
-    from app.playbook_learning import _archive_least_useful_entry
-
-    doc = {
-        # Many raw confirmations but no follow tracking (old-style entry)
-        "playbook/well-confirmed": {
-            "content": "well-confirmed tip",
-            "confirmed_count": 5,
-            "followed_count": 0,  # below threshold → effectiveness = -5
-            "updated_at": _utcnow().isoformat(),
-        },
-        # Low success rate with enough follows — effectiveness = -(1/10) = -0.1
-        # This sorts higher than -5, so gets archived even though it has 1 confirmation
-        "playbook/low-performer": {
-            "content": "low performer tip",
-            "confirmed_count": 1,
-            "followed_count": 10,  # 10% success rate
-            "updated_at": _utcnow().isoformat(),
-        },
-    }
-    result = _archive_least_useful_entry(doc)
-    # The low-performer (10% success rate on 10 follows) archives before the
-    # 5-raw-confirmation entry, because -0.1 > -5 in the sort.
-    assert "playbook/low-performer" not in result, (
-        "Low-success-rate entry should be archived first"
-    )
-    assert "playbook/well-confirmed" in result
-    archive = result.get("playbook_archive", [])
-    assert archive[0]["_archived_key"] == "playbook/low-performer"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tests for record_playbook_applied / record_playbook_confirmed
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def test_record_playbook_applied_increments_followed_count():
-    from app.playbook_learning import record_playbook_applied
-
-    doc = {"playbook/my-tip": {"content": "x", "confirmed_count": 2}}
-    record_playbook_applied(doc, "my-tip")
-    assert doc["playbook/my-tip"]["followed_count"] == 1
-    record_playbook_applied(doc, "my-tip")
-    assert doc["playbook/my-tip"]["followed_count"] == 2
-
-
-def test_record_playbook_applied_accepts_full_key_form():
-    from app.playbook_learning import record_playbook_applied
-
-    doc = {"playbook/tip": {"content": "x"}}
-    record_playbook_applied(doc, "playbook/tip")
-    assert doc["playbook/tip"]["followed_count"] == 1
-
-
-def test_record_playbook_applied_noop_for_missing_key():
-    from app.playbook_learning import record_playbook_applied
-
-    doc = {}
-    record_playbook_applied(doc, "nonexistent")
-    assert doc == {}
-
-
-def test_record_playbook_confirmed_increments_confirmed_count():
-    from app.playbook_learning import record_playbook_confirmed
-
-    doc = {"playbook/tip": {"content": "x", "confirmed_count": 1}}
-    record_playbook_confirmed(doc, "tip")
-    assert doc["playbook/tip"]["confirmed_count"] == 2
-
-
-def test_record_playbook_confirmed_accepts_full_key_form():
-    from app.playbook_learning import record_playbook_confirmed
-
-    doc = {"playbook/tip": {"content": "x", "confirmed_count": 0}}
-    record_playbook_confirmed(doc, "playbook/tip")
-    assert doc["playbook/tip"]["confirmed_count"] == 1
-
-
-def test_record_playbook_confirmed_noop_for_missing_key():
-    from app.playbook_learning import record_playbook_confirmed
-
-    doc = {}
-    record_playbook_confirmed(doc, "nonexistent")
-    assert doc == {}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tests for retire_ineffective_patterns
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def test_retire_ineffective_patterns_retires_low_success_rate():
-    from app.playbook_learning import retire_ineffective_patterns, _RETIRE_MIN_FOLLOWED
-
-    doc = {
-        "playbook/bad": {
-            "content": "bad tip",
-            "source": "auto-generated",
-            "followed_count": _RETIRE_MIN_FOLLOWED,
-            "confirmed_count": 0,  # 0% success rate — below threshold
-        },
-    }
-    retired = retire_ineffective_patterns(doc)
-    assert retired == ["playbook/bad"]
-    assert "playbook/bad" not in doc
-    archive = doc.get("playbook_archive", [])
-    assert len(archive) == 1
-    assert archive[0]["_archived_key"] == "playbook/bad"
-    assert "low_success_rate" in archive[0].get("_retirement_reason", "")
-
-
-def test_retire_ineffective_patterns_keeps_sufficient_success_rate():
-    from app.playbook_learning import retire_ineffective_patterns, _RETIRE_MIN_FOLLOWED
-
-    doc = {
-        "playbook/good": {
-            "content": "good tip",
-            "source": "auto-generated",
-            "followed_count": _RETIRE_MIN_FOLLOWED,
-            "confirmed_count": _RETIRE_MIN_FOLLOWED,  # 100% — well above threshold
-        },
-    }
-    retired = retire_ineffective_patterns(doc)
-    assert retired == []
-    assert "playbook/good" in doc
-
-
-def test_retire_ineffective_patterns_skips_entries_below_min_followed():
-    from app.playbook_learning import retire_ineffective_patterns, _RETIRE_MIN_FOLLOWED
-
-    doc = {
-        "playbook/new": {
-            "content": "new tip",
-            "source": "auto-generated",
-            "followed_count": _RETIRE_MIN_FOLLOWED - 1,
-            "confirmed_count": 0,  # Would retire if followed enough
-        },
-    }
-    retired = retire_ineffective_patterns(doc)
-    assert retired == []
-    assert "playbook/new" in doc
-
-
-def test_retire_ineffective_patterns_retirement_reason_includes_rate():
-    from app.playbook_learning import retire_ineffective_patterns
-
-    doc = {
-        "playbook/tip": {
-            "content": "x",
-            "source": "auto-generated",
-            "followed_count": 10,
-            "confirmed_count": 1,  # 10% success rate
-        },
-    }
-    retire_ineffective_patterns(doc)
-    archive = doc.get("playbook_archive", [])
-    assert len(archive) == 1
-    reason = archive[0]["_retirement_reason"]
-    assert "0.10" in reason
-
-
-def test_retire_ineffective_patterns_skips_operator_curated():
-    """Operator-curated entries (non-auto source) must NOT be retired even if low success rate."""
-    from app.playbook_learning import retire_ineffective_patterns, _RETIRE_MIN_FOLLOWED
-
-    doc = {
-        "playbook/operator-tip": {
-            "content": "operator tip",
-            "source": "operator",
-            "followed_count": _RETIRE_MIN_FOLLOWED,
-            "confirmed_count": 0,
-        },
-        "playbook/review-tip": {
-            "content": "review tip",
-            "source": "review-extracted",
-            "followed_count": _RETIRE_MIN_FOLLOWED,
-            "confirmed_count": 0,
-        },
-    }
-    retired = retire_ineffective_patterns(doc)
-    assert retired == []
-    assert "playbook/operator-tip" in doc
-    assert "playbook/review-tip" in doc
-
-
-def test_retire_ineffective_patterns_skips_no_source():
-    """Entries with no source field must NOT be retired (treated as operator-curated)."""
-    from app.playbook_learning import retire_ineffective_patterns, _RETIRE_MIN_FOLLOWED
-
-    doc = {
-        "playbook/legacy": {
-            "content": "legacy tip",
-            "followed_count": _RETIRE_MIN_FOLLOWED,
-            "confirmed_count": 0,
-        },
-    }
-    retired = retire_ineffective_patterns(doc)
-    assert retired == []
-    assert "playbook/legacy" in doc
-
-
-def test_count_low_success_retired_within_window():
-    from app.playbook_learning import count_low_success_retired_within
-
-    now = _utcnow()
-    doc = {
-        "playbook_archive": [
-            # Within 24h, low_success_rate reason → counted
-            {
-                "_archived_key": "playbook/a",
-                "_archived_at": (now - timedelta(hours=2)).isoformat(),
-                "_retirement_reason": "low_success_rate:0.10",
-            },
-            # Within 24h, but idle reason → NOT counted
-            {
-                "_archived_key": "playbook/b",
-                "_archived_at": (now - timedelta(hours=2)).isoformat(),
-                "_retirement_reason": "idle_auto_entry:30d",
-            },
-            # low_success_rate but older than 24h → NOT counted
-            {
-                "_archived_key": "playbook/c",
-                "_archived_at": (now - timedelta(hours=48)).isoformat(),
-                "_retirement_reason": "low_success_rate:0.05",
-            },
-            # Within 24h, low_success_rate → counted
-            {
-                "_archived_key": "playbook/d",
-                "_archived_at": (now - timedelta(hours=23)).isoformat(),
-                "_retirement_reason": "low_success_rate:0.20",
-            },
-        ],
-    }
-    assert count_low_success_retired_within(doc, hours=24) == 2
-    assert count_low_success_retired_within({}, hours=24) == 0
-    assert count_low_success_retired_within({"playbook_archive": []}, hours=24) == 0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tests for retire_idle_auto_entries
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def test_retire_idle_auto_entries_archives_idle_auto():
-    from app.playbook_learning import retire_idle_auto_entries
-
-    old_ts = (_utcnow() - timedelta(days=31)).isoformat()
-    doc = {
-        "playbook/foo": {
-            "content": "stale tip",
-            "source": "auto-generated",
-            "last_referenced_at": old_ts,
-            "updated_at": old_ts,
-        },
-    }
-    retired = retire_idle_auto_entries(doc)
-    assert retired == ["playbook/foo"]
-    assert "playbook/foo" not in doc
-    archive = doc.get("playbook_archive", [])
-    assert len(archive) == 1
-    assert archive[0]["_archived_key"] == "playbook/foo"
-    assert archive[0]["_retirement_reason"].startswith("idle_auto_entry")
-
-
-def test_retire_idle_auto_entries_skips_operator_curated():
-    from app.playbook_learning import retire_idle_auto_entries
-
-    old_ts = (_utcnow() - timedelta(days=60)).isoformat()
-    doc = {
-        # Source missing entirely (treated as operator-curated)
-        "playbook/manual-no-source": {
-            "content": "manual tip",
-            "last_referenced_at": old_ts,
-            "updated_at": old_ts,
-        },
-        # Explicit non-auto source
-        "playbook/review-extracted-x": {
-            "content": "review tip",
-            "source": "review-extracted",
-            "last_referenced_at": old_ts,
-            "updated_at": old_ts,
-        },
-        "playbook/operator-x": {
-            "content": "operator tip",
-            "source": "operator",
-            "last_referenced_at": old_ts,
-            "updated_at": old_ts,
-        },
-    }
-    retired = retire_idle_auto_entries(doc)
-    assert retired == []
-    assert "playbook/manual-no-source" in doc
-    assert "playbook/review-extracted-x" in doc
-    assert "playbook/operator-x" in doc
-
-
-def test_retire_idle_auto_entries_skips_recently_referenced():
-    from app.playbook_learning import retire_idle_auto_entries
-
-    fresh_ts = (_utcnow() - timedelta(days=5)).isoformat()
-    old_updated_ts = (_utcnow() - timedelta(days=120)).isoformat()
-    doc = {
-        # Updated long ago, but referenced 5 days ago — should NOT retire
-        "playbook/active": {
-            "content": "active tip",
-            "source": "auto-generated",
-            "last_referenced_at": fresh_ts,
-            "updated_at": old_updated_ts,
-        },
-    }
-    retired = retire_idle_auto_entries(doc)
-    assert retired == []
-    assert "playbook/active" in doc
-
-
-def test_retire_idle_auto_entries_falls_back_to_updated_at():
-    """Entries lacking last_referenced_at fall back to updated_at."""
-    from app.playbook_learning import retire_idle_auto_entries
-
-    old_ts = (_utcnow() - timedelta(days=45)).isoformat()
-    doc = {
-        "playbook/never-shown": {
-            "content": "tip never shown to a claim",
-            "source": "auto-generated",
-            "updated_at": old_ts,
-        },
-    }
-    retired = retire_idle_auto_entries(doc)
-    assert retired == ["playbook/never-shown"]
-    assert "playbook/never-shown" not in doc
-
-
-def test_retire_idle_auto_entries_no_timestamps_kept():
-    """Defensive: entries with neither timestamp must NOT retire."""
-    from app.playbook_learning import retire_idle_auto_entries
-
-    doc = {
-        "playbook/timeless": {
-            "content": "tip with no timestamps",
-            "source": "auto-generated",
-        },
-    }
-    retired = retire_idle_auto_entries(doc)
-    assert retired == []
-    assert "playbook/timeless" in doc
-
-
-def test_retire_idle_auto_entries_respects_archive_cap():
-    """playbook_archive_max trim still applies after idle retirement."""
-    from app.playbook_learning import retire_idle_auto_entries
-    import app.shared_state as _ss
-
-    old_ts = (_utcnow() - timedelta(days=40)).isoformat()
-    doc = {
-        # Pre-fill archive at the cap
-        "playbook_archive": [
-            {"_archived_key": f"playbook/old-{i}", "_archived_at": old_ts}
-            for i in range(50)
-        ],
-        "playbook/idle1": {
-            "content": "tip 1",
-            "source": "auto-generated",
-            "last_referenced_at": old_ts,
-            "updated_at": old_ts,
-        },
-        "playbook/idle2": {
-            "content": "tip 2",
-            "source": "auto-generated",
-            "last_referenced_at": old_ts,
-            "updated_at": old_ts,
-        },
-    }
-    prev_max = _ss.runtime_config.get("playbook_archive_max")
-    _ss.runtime_config["playbook_archive_max"] = 50
-    try:
-        retired = retire_idle_auto_entries(doc)
-    finally:
-        if prev_max is None:
-            _ss.runtime_config.pop("playbook_archive_max", None)
-        else:
-            _ss.runtime_config["playbook_archive_max"] = prev_max
-    assert sorted(retired) == ["playbook/idle1", "playbook/idle2"]
-    assert len(doc["playbook_archive"]) == 50  # cap preserved
-    # Newest entries (idle1/idle2) should be at the tail after trim
-    tail_keys = {e.get("_archived_key") for e in doc["playbook_archive"][-2:]}
-    assert tail_keys == {"playbook/idle1", "playbook/idle2"}
-
-
-def test_count_idle_auto_retired_within_window():
-    from app.playbook_learning import count_idle_auto_retired_within
-
-    now = _utcnow()
-    doc = {
-        "playbook_archive": [
-            # Within 24h, idle reason → counted
-            {
-                "_archived_key": "playbook/a",
-                "_archived_at": (now - timedelta(hours=2)).isoformat(),
-                "_retirement_reason": "idle_auto_entry:30d",
-            },
-            # Within 24h, but different reason → NOT counted
-            {
-                "_archived_key": "playbook/b",
-                "_archived_at": (now - timedelta(hours=2)).isoformat(),
-                "_retirement_reason": "low_success_rate:0.10",
-            },
-            # Idle reason but older than 24h → NOT counted
-            {
-                "_archived_key": "playbook/c",
-                "_archived_at": (now - timedelta(hours=48)).isoformat(),
-                "_retirement_reason": "idle_auto_entry:30d",
-            },
-            # Within 24h, idle reason → counted
-            {
-                "_archived_key": "playbook/d",
-                "_archived_at": (now - timedelta(hours=23)).isoformat(),
-                "_retirement_reason": "idle_auto_entry:30d",
-            },
-        ],
-    }
-    assert count_idle_auto_retired_within(doc, hours=24) == 2
-    # Empty / missing doc handling
-    assert count_idle_auto_retired_within({}, hours=24) == 0
-    assert count_idle_auto_retired_within({"playbook_archive": []}, hours=24) == 0
-
-
-def test_maybe_archive_for_capacity_triggers_at_threshold():
-    """maybe_archive_for_capacity archives when combined size exceeds 30KB."""
-    from app.playbook_learning import (
-        maybe_archive_for_capacity,
-        _PLAYBOOK_CAPACITY_BYTES,
-    )
-
-    # Build a doc just below capacity, then add a large entry estimate
-    doc: dict = {}
-    # Fill doc to just below capacity
-    big_content = "x" * 500
-    entry_count = _PLAYBOOK_CAPACITY_BYTES // (len(big_content) + 50)  # rough estimate
-    for i in range(entry_count):
-        doc[f"playbook/entry-{i:03d}"] = {
-            "content": big_content,
-            "confirmed_count": 0,
-            "updated_at": _utcnow().isoformat(),
-        }
-
-    from app.playbook_learning import _playbook_size_bytes
-
-    current_size = _playbook_size_bytes(doc)
-
-    # If already over capacity, archiving should trigger and loop until under cap
-    if current_size >= _PLAYBOOK_CAPACITY_BYTES:
-        from app.playbook_learning import _playbook_size_bytes
-
-        keys_before = {k for k in doc if k.startswith("playbook/")}
-        result = maybe_archive_for_capacity(doc, 0)
-        keys_after = {k for k in result if k.startswith("playbook/")}
-        assert len(keys_after) < len(keys_before), (
-            "At least one entry should have been archived"
-        )
-        # Loop must evict enough entries to bring size under cap
-        assert _playbook_size_bytes(result) <= _PLAYBOOK_CAPACITY_BYTES
-
-
-def test_maybe_archive_for_capacity_no_op_when_under_limit():
-    """maybe_archive_for_capacity is a no-op when total size is below threshold."""
-    from app.playbook_learning import maybe_archive_for_capacity
-
-    doc = {
-        "playbook/tiny": {
-            "content": "small entry",
-            "confirmed_count": 1,
-            "updated_at": _utcnow().isoformat(),
-        }
-    }
-    result = maybe_archive_for_capacity(doc, 0)
-    assert "playbook/tiny" in result
-    assert "playbook_archive" not in result
-
-
-def test_maybe_archive_for_capacity_loops_multiple_times_for_large_estimate():
-    """Loop evicts multiple entries when a single eviction is insufficient for the estimate."""
-    from app.playbook_learning import (
-        maybe_archive_for_capacity,
-        _PLAYBOOK_CAPACITY_BYTES,
-        _playbook_size_bytes,
-    )
-
-    # Build a doc over capacity with many small entries so one eviction won't suffice.
-    entry_count = 60
-    doc: dict = {}
-    for i in range(entry_count):
-        doc[f"playbook/entry-{i:03d}"] = {
-            "content": "x" * 430,  # ~450 B per entry → ~27 KB total
-            "confirmed_count": 0,
-            "updated_at": (_utcnow() - timedelta(days=i)).isoformat(),
-        }
-
-    # A large estimate forces multiple evictions to make room.
-    large_estimate = 5 * 1024  # 5 KB
-
-    keys_before = {k for k in doc if k.startswith("playbook/")}
-    result = maybe_archive_for_capacity(doc, large_estimate)
-    keys_after = {k for k in result if k.startswith("playbook/")}
-
-    evicted = len(keys_before) - len(keys_after)
-    assert evicted > 1, (
-        f"Expected more than 1 eviction for a {large_estimate}-byte estimate, got {evicted}"
-    )
-    archive = result.get("playbook_archive", [])
-    assert len(archive) == evicted, (
-        "Every evicted entry should appear in playbook_archive"
-    )
-    # Remaining playbook + estimate must fit within capacity.
-    assert _playbook_size_bytes(result) + large_estimate <= _PLAYBOOK_CAPACITY_BYTES
-
-
-def test_maybe_archive_for_capacity_exits_gracefully_when_no_evictable_entries():
-    """Loop exits without archiving when there are no playbook/* entries to evict."""
-    from app.playbook_learning import (
-        maybe_archive_for_capacity,
-        _PLAYBOOK_CAPACITY_BYTES,
-    )
-
-    # Non-playbook keys only — nothing archiveable.
-    doc: dict = {
-        "_meta": {"revision": 1},
-        "some_other_key": "not a playbook entry",
-    }
-
-    large_estimate = (
-        _PLAYBOOK_CAPACITY_BYTES + 1000
-    )  # would need eviction if entries existed
-    result = maybe_archive_for_capacity(doc, large_estimate)
-
-    assert "playbook_archive" not in result, (
-        "No archive created when nothing was evictable"
-    )
-    assert result is doc or result == doc, (
-        "Doc returned unchanged when nothing to evict"
-    )
-
-
-def test_maybe_archive_for_capacity_evicted_entry_triggers_resurrection_cooldown():
-    """An entry evicted via capacity management retains _archived_at, which blocks
-    _is_auto_playbook_suppressed from re-creating it within the cooldown window.
-    """
-    from app.playbook_learning import (
-        maybe_archive_for_capacity,
-        _is_auto_playbook_suppressed,
-        _PLAYBOOK_CAPACITY_BYTES,
-    )
-
-    victim_key = "playbook/auto-test-pattern"
-    # Two large entries so the playbook is over capacity; the older one (victim) evicts first.
-    half = _PLAYBOOK_CAPACITY_BYTES // 2
-    doc: dict = {
-        victim_key: {
-            "content": "y" * (half - 50),
-            "confirmed_count": 0,
-            "source": "auto-generated",
-            "updated_at": (_utcnow() - timedelta(days=60)).isoformat(),
-        },
-        "playbook/newer-entry": {
-            "content": "z" * (half - 50),
-            "confirmed_count": 5,
-            "source": "auto-generated",
-            "updated_at": _utcnow().isoformat(),
-        },
-    }
-
-    result = maybe_archive_for_capacity(doc, 500)
-
-    archive = result.get("playbook_archive", [])
-    assert any(e.get("_archived_key") == victim_key for e in archive), (
-        "Evicted entry must appear in playbook_archive"
-    )
-    assert victim_key not in result, (
-        "Evicted key must be removed from the active playbook"
-    )
-    # The cooldown must now block re-creation of the same key.
-    assert _is_auto_playbook_suppressed(result, victim_key), (
-        "Entry evicted for capacity should be suppressed within the resurrection cooldown window"
-    )
-
-
-@pytest.mark.asyncio
-async def test_capture_success_archives_when_over_capacity(db_session: AsyncSession):
-    """capture_success_pattern archives the least-useful entry when total size exceeds 30KB."""
-    from app.playbook_learning import capture_success_pattern, _PLAYBOOK_CAPACITY_BYTES
-
-    # Build a design_doc clearly over capacity: 35 entries × ~1050 bytes ≈ 35.6 KB
-    big_content = "x" * 900
-    existing_doc: dict = {
-        # A failure-derived entry (pre-existing playbook content)
-        "playbook/review-test-coverage": {
-            "content": "test coverage issues",
-            "source": "review-extracted",
-            "applicable_types": ["create"],
-            "confirmed_count": 0,
-            "updated_at": _utcnow().isoformat(),
-        },
-    }
-    for i in range(34):
-        existing_doc[f"playbook/old-entry-{i:03d}"] = {
-            "content": big_content,
-            "confirmed_count": 0,
-            "source": "auto-generated",
-            "updated_at": (_utcnow() - timedelta(days=10)).isoformat(),
-        }
-
-    project = await _make_project(db_session, design_doc=dict(existing_doc))
-    # Create 3 completed tasks of the same type to satisfy the noise filter (>= 3 completions).
-    await _make_completed_task(
-        db_session, project.id, task_type="create", scope="small"
-    )
-    await _make_completed_task(
-        db_session, project.id, task_type="create", scope="small"
-    )
-    task = await _make_completed_task(
-        db_session, project.id, task_type="create", scope="small"
-    )
-
-    from app.playbook_learning import _playbook_size_bytes
-
-    size_before = _playbook_size_bytes(project.design_doc)
-    assert size_before > _PLAYBOOK_CAPACITY_BYTES, (
-        "Doc must be over capacity before the test"
-    )
-
-    key = await capture_success_pattern(task, db_session)
-    await db_session.flush()
-
-    assert key == "success-create-small", "New entry should have been created"
-    doc = project.design_doc or {}
-    archive = doc.get("playbook_archive", [])
-    assert len(archive) >= 1, (
-        "At least one entry should have been archived for capacity"
-    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3365,7 +1887,7 @@ async def test_extract_review_feedback_marks_unobserved_entry_potentially_stale(
 
 def test_mark_stale_review_entries_ignores_non_review_and_fresh():
     """Stale-marker only touches review-extracted entries past the 60-day threshold."""
-    from app.playbook_learning import _mark_stale_review_entries
+    from app.playbook_capacity import _mark_stale_review_entries
 
     now = _utcnow()
     doc = {
@@ -5454,12 +3976,15 @@ async def test_compute_sr_catch_rate_trends_by_direction_trend_increasing(
     project = await _make_project(db_session)
     direction_id = "d-trend-increasing"
 
-    # Seed prior state: miss_rate was 0.0 (all caught)
+    # Seed prior state: miss_rate was 0.0 (all caught) over 4 prior samples.
+    # sample_count is required for the two-proportion z-test that now gates the
+    # trend label; with n=4 prior and n=4 current the 0.0→1.0 jump is significant.
     project.design_doc = {
         "sr_catch_rate_trends": {
             "by_direction": {
                 direction_id: {
                     "miss_rate": 0.0,
+                    "sample_count": 4,
                     "rate_history": [0.0],
                 }
             }
@@ -5501,12 +4026,15 @@ async def test_compute_sr_catch_rate_trends_by_direction_trend_decreasing(
     project = await _make_project(db_session)
     direction_id = "d-trend-decreasing"
 
-    # Seed prior state: miss_rate was 1.0 (all missed)
+    # Seed prior state: miss_rate was 1.0 (all missed) over 4 prior samples.
+    # sample_count is required for the two-proportion z-test that now gates the
+    # trend label; with n=4 prior and n=4 current the 1.0→0.0 drop is significant.
     project.design_doc = {
         "sr_catch_rate_trends": {
             "by_direction": {
                 direction_id: {
                     "miss_rate": 1.0,
+                    "sample_count": 4,
                     "rate_history": [1.0],
                 }
             }
@@ -5769,6 +4297,134 @@ async def test_compute_sr_catch_rate_trends_by_direction_stores_direction_text(
     assert result is not None
     entry = result["by_direction"][direction_id]
     assert entry.get("direction_text") == "Fix the login regression"
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_by_direction_significance_gates_trend(
+    db_session: AsyncSession,
+):
+    """Per-direction trends require both significance AND delta threshold.
+
+    With small sample size (n=5), a delta of 0.2 is noise (z < 1.28) → 'stable'.
+    With large sample size (n=30), the same delta is significant (z >= 1.28) → 'increasing'.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    # --- Small n: direction with 5 tasks, previous hit_rate=0.4, current hit_rate=0.6 ---
+    project_small = await _make_project(db_session)
+    direction_id_small = "d-small-n"
+
+    # Seed prior state: hit_rate was 0.4 (2 caught, 3 missed)
+    project_small.design_doc = {
+        "sr_catch_rate_trends": {
+            "by_direction": {
+                direction_id_small: {
+                    "miss_rate": 0.6,  # 1 - 0.4
+                    "sample_count": 5,
+                    "rate_history": [0.6],
+                }
+            }
+        }
+    }
+    await db_session.flush()
+
+    # Current window: 3 caught, 2 missed → hit_rate 0.6, miss_rate 0.4 (delta = -0.2)
+    tasks_small = []
+    for _ in range(3):
+        t = _make_sr_task_with_direction(
+            project_small.id,
+            direction_id_small,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],  # SR caught (flagged the human-flagged cat)
+        )
+        db_session.add(t)
+        tasks_small.append(t)
+    for _ in range(2):
+        t = _make_sr_task_with_direction(
+            project_small.id,
+            direction_id_small,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],  # SR missed (did not flag the human-flagged cat)
+        )
+        db_session.add(t)
+        tasks_small.append(t)
+    for t in _make_window_padding(project_small.id, age_days=2):
+        db_session.add(t)
+        tasks_small.append(t)
+    for t in _make_window_padding(project_small.id, age_days=20):
+        db_session.add(t)
+        tasks_small.append(t)
+
+    # --- Large n: direction with 30 tasks, same delta but z-test significant ---
+    project_large = await _make_project(db_session)
+    direction_id_large = "d-large-n"
+
+    # Seed prior state: hit_rate was 0.4 (12 caught, 18 missed)
+    project_large.design_doc = {
+        "sr_catch_rate_trends": {
+            "by_direction": {
+                direction_id_large: {
+                    "miss_rate": 0.6,  # 1 - 0.4
+                    "sample_count": 30,
+                    "rate_history": [0.6],
+                }
+            }
+        }
+    }
+    await db_session.flush()
+
+    # Current window: 18 caught, 12 missed → hit_rate 0.6, miss_rate 0.4 (delta = -0.2)
+    tasks_large = []
+    for _ in range(18):
+        t = _make_sr_task_with_direction(
+            project_large.id,
+            direction_id_large,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],  # SR caught (flagged the human-flagged cat)
+        )
+        db_session.add(t)
+        tasks_large.append(t)
+    for _ in range(12):
+        t = _make_sr_task_with_direction(
+            project_large.id,
+            direction_id_large,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=[],  # SR missed (did not flag the human-flagged cat)
+        )
+        db_session.add(t)
+        tasks_large.append(t)
+    for t in _make_window_padding(project_large.id, age_days=2):
+        db_session.add(t)
+        tasks_large.append(t)
+    for t in _make_window_padding(project_large.id, age_days=20):
+        db_session.add(t)
+        tasks_large.append(t)
+
+    await db_session.flush()
+
+    result_small = await compute_sr_catch_rate_trends(
+        project_small.id, db_session, tasks_small
+    )
+    result_large = await compute_sr_catch_rate_trends(
+        project_large.id, db_session, tasks_large
+    )
+
+    assert result_small is not None
+    assert result_large is not None
+    entry_small = result_small["by_direction"][direction_id_small]
+    entry_large = result_large["by_direction"][direction_id_large]
+
+    # Same delta (-0.2), but different significance at n=5 vs n=30
+    assert entry_small["trend"] == "stable", (
+        "n=5, delta=-0.2: z < 1.28, not significant → stable"
+    )
+    assert entry_large["trend"] == "decreasing", (
+        "n=30, delta=-0.2: z >= 1.28, significant → decreasing"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -7295,12 +5951,18 @@ async def test_compute_sr_catch_rate_trends_by_scope_rate_history_and_trend(
 
     project = await _make_project(db_session)
     # Seed existing by_scope: small/test-coverage had hit_rate=0.8 last window.
+    # sample_count must be >= _MIN_SR_FINDINGS so the two-proportion z-test
+    # gate added by the significance-gating change can fire a directional verdict.
     doc = dict(project.design_doc or {})
     doc["sr_catch_rate_trends"] = {
         "computed_at": (_utcnow() - timedelta(days=15)).isoformat(),
         "by_scope": {
             "small": {
-                "test-coverage": {"hit_rate": 0.8, "rate_history": [0.8]},
+                "test-coverage": {
+                    "hit_rate": 0.8,
+                    "rate_history": [0.8],
+                    "sample_count": 5,
+                },
             }
         },
         "categories": {},
@@ -7756,6 +6418,73 @@ async def test_compute_sr_catch_rate_trends_example_cap_per_category(
     assert result is not None
     examples = result["categories"]["error-handling"].get("examples", [])
     assert len(examples) <= _EXAMPLE_MAX_PER_CAT
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 'other' bucket exclusion from SR catch-rate denominator
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_compute_sr_catch_rate_trends_excludes_other_from_denominator(
+    db_session: AsyncSession,
+):
+    """'other' category must not appear as a 0% catch-rate row nor depress overall_hit_rate.
+
+    Self-review never emits 'other', so any task whose human-truth set contains
+    'other' would otherwise be a guaranteed miss that silently drags the headline
+    down.  This test builds two windows where the only human-flagged category in
+    some tasks is 'other', verifies that 'other' is absent from the categories
+    dict, and that overall_hit_rate reflects only the canonical categories.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Current window: 5 canonical 'correctness' tasks (SR hits all 5) + 2 tasks
+    # flagging only 'other' (SR can never emit 'other').  Without filtering,
+    # overall_hit_rate would be 5/7 ≈ 0.714; with 'other' excluded it must be 5/5 = 1.0.
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(2):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"other": 1},
+            sr_failed_cats=[],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window: 5 tasks all hitting 'correctness' (needed for trend gating)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    cats = result.get("categories", {})
+    assert "other" not in cats, "'other' must not appear as a catch-rate category"
+    assert "correctness" in cats, "canonical categories must still be present"
+    # overall_hit_rate must reflect only canonical categories (5 hits / 5 findings = 1.0)
+    assert result.get("overall_hit_rate") == 1.0, (
+        f"overall_hit_rate should be 1.0 (5/5 canonical hits) but got "
+        f"{result.get('overall_hit_rate')} — 'other' is depressing it"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -8800,6 +7529,351 @@ async def test_compute_sr_catch_rate_trends_by_severity_persisted_to_design_doc(
 
 
 # ---------------------------------------------------------------------------
+# Significance-gate tests for FP and severity sub-trends
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_severity_small_sample_swing_suppressed_no_alert(
+    db_session: AsyncSession,
+):
+    """Small CRITICAL bucket (n=2) suppresses directional verdict even with large delta.
+
+    Without the z-test gate a miss-rate jump of 1.0 would label 'regressing' and
+    fire a spurious alert.  With the gate (n < _MIN_SR_FINDINGS=5 → stable) no
+    alert should fire and the trend label must be 'stable'.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    review_crit = {
+        "description": "Unhandled exception bypasses guard",
+        "severity": "CRITICAL",
+    }
+
+    # Current window — 5 base tasks (meets finding-count gate, no severity samples)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Current window — 2 tasks with CRITICAL review issue; SR misses error-handling
+    # → CRITICAL human_count=2, hit=0, miss_rate=1.0
+    for _ in range(2):
+        t = _make_sr_task_with_review(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            review_issues=[review_crit],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window — 5 base tasks
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # Previous window — 2 tasks with CRITICAL; SR catches error-handling
+    # → CRITICAL human_count=2, hit=2, miss_rate=0.0
+    for _ in range(2):
+        t = _make_sr_task_with_review(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness", "error-handling"],
+            review_issues=[review_crit],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ) as mock_dispatch,
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
+        result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    # n=2 < _MIN_SR_FINDINGS → must be suppressed to 'stable'
+    assert result["by_severity"]["CRITICAL"]["trend"] == "stable"
+    # No spurious alert
+    mock_post.assert_not_called()
+    mock_dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_severity_large_sample_swing_fires_alert(
+    db_session: AsyncSession,
+):
+    """Sufficient CRITICAL bucket (n=10) with large delta correctly fires a regression alert.
+
+    This is the positive-control counterpart: the same logical scenario as the
+    small-sample test but with n=10 ≥ _MIN_SR_FINDINGS and a z-score >> 1.28.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    review_crit = {
+        "description": "Unhandled exception bypasses guard",
+        "severity": "CRITICAL",
+    }
+
+    # Current: 5 base tasks + 10 CRITICAL tasks where SR misses error-handling
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(10):
+        t = _make_sr_task_with_review(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+            review_issues=[review_crit],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous: 5 base tasks + 10 CRITICAL tasks where SR catches error-handling
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(10):
+        t = _make_sr_task_with_review(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness", "error-handling"],
+            review_issues=[review_crit],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ) as mock_dispatch,
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
+        result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    # n=10 ≥ 5, delta=1.0 → z >> 1.28 → must fire
+    assert result["by_severity"]["CRITICAL"]["trend"] == "regressing"
+    mock_post.assert_called_once()
+    payload = (
+        mock_dispatch.call_args.kwargs.get("payload") or mock_dispatch.call_args.args[2]
+        if mock_dispatch.called
+        else {}
+    )
+    assert mock_dispatch.called
+    sevs = payload.get("regressing_severities", [])
+    assert any(s["severity"] == "CRITICAL" for s in sevs)
+
+
+@pytest.mark.asyncio
+async def test_fp_trend_small_sample_suppressed_no_alert(
+    db_session: AsyncSession,
+):
+    """Small SR-failed bucket (n=3) suppresses fp_trend directional verdict.
+
+    A jump from fp_rate=0.0 to fp_rate=1.0 exceeds the raw 5pp threshold but
+    the z-test gate (n < _MIN_SR_FINDINGS=5) must suppress it to 'stable' and
+    prevent a spurious alert.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # Current window:
+    # 5 base tasks (meet main finding gate); SR correctly flags correctness.
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # 3 tasks where SR also flags "error-handling" but humans never flag it → FP
+    # sr_failed_count["error-handling"]=3, fp_count["error-handling"]=3, fp_rate=1.0
+    for _ in range(3):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness", "error-handling"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window:
+    # 5 base tasks
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    # 3 tasks where SR flags "error-handling" AND humans also flag it → NOT FP
+    # sr_failed_count["error-handling"]=3, fp_count["error-handling"]=0, fp_rate=0.0
+    for _ in range(3):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1, "error-handling": 1},
+            sr_failed_cats=["correctness", "error-handling"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ) as mock_dispatch,
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
+        result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    # error-handling FP: sr_failed_count=3 < 5 → must be 'stable', no alert
+    eh = result["categories"].get("error-handling") or {}
+    assert eh.get("fp_trend") == "stable"
+    mock_post.assert_not_called()
+    mock_dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fp_trend_large_sample_fires_alert(
+    db_session: AsyncSession,
+):
+    """Sufficient SR-failed bucket (n=8) with large FP-rate jump fires an alert.
+
+    Positive control: n=8 ≥ _MIN_SR_FINDINGS with fp_rate jump 0→1 produces
+    z >> 1.28 → fp_trend='increasing' and alert fires.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+
+    # Current window: 5 base + 8 FP tasks
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(8):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness", "error-handling"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    # Previous window: 5 base + 8 tasks where error-handling is confirmed (not FP)
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for _ in range(8):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1, "error-handling": 1},
+            sr_failed_cats=["correctness", "error-handling"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+
+    await db_session.flush()
+
+    with (
+        patch(
+            "app.notification_dispatch.post_failure_alert_message",
+            new_callable=AsyncMock,
+        ) as mock_post,
+        patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ) as mock_dispatch,
+        patch("asyncio.ensure_future", side_effect=lambda coro: coro.close() or None),
+    ):
+        result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    # n=8 ≥ 5, delta=1.0 → z >> 1.28 → fp_trend must be 'increasing'
+    eh = result["categories"].get("error-handling") or {}
+    assert eh.get("fp_trend") == "increasing"
+    mock_post.assert_called_once()
+    assert mock_dispatch.called
+
+
+# ---------------------------------------------------------------------------
 # LLM categorization helpers
 # ---------------------------------------------------------------------------
 
@@ -8968,7 +8042,7 @@ async def test_cache_first_attempt_classification_writes_buckets_and_method():
 
 def test_compute_sr_prediction_accuracy_uses_cached_categories():
     """When _first_attempt_categorized_issues is present, _categorize_review_issues is not called."""
-    from app.routers.admin_digest import _compute_sr_prediction_accuracy
+    from app.digest_metrics import compute_sr_prediction_accuracy
     from app.playbook_learning import _categorize_review_issues
     from app.models import Task, TaskStatus
     import uuid
@@ -9016,8 +8090,8 @@ def test_compute_sr_prediction_accuracy_uses_cached_categories():
             call_count["n"] += 1
         return original(review_history, cached=cached)
 
-    with patch("app.routers.admin_digest._categorize_review_issues", side_effect=spy):
-        result = _compute_sr_prediction_accuracy(tasks)
+    with patch("app.digest_metrics._categorize_review_issues", side_effect=spy):
+        result = compute_sr_prediction_accuracy(tasks)
 
     assert result is not None
     # The keyword scan should NOT have been called (cached path was taken for all 5 tasks).
@@ -9194,6 +8268,72 @@ async def test_fallback_to_calendar_windows_when_no_completed_cycles(
     assert result["bucket_mode"] == "calendar"
     assert result["current_cycle_id"] is None
     assert "test-coverage" in result["categories"]
+
+
+@pytest.mark.asyncio
+async def test_cycle_mode_fetches_full_cycle_independent_of_all_tasks(
+    db_session: AsyncSession,
+):
+    """Cycle-mode compares complete cycles even when all_tasks is empty.
+
+    Simulates a high-throughput scenario where the caller's recency-capped
+    all_tasks list no longer contains any previous-cycle tasks.  The targeted
+    per-cycle DB fetch inside compute_sr_catch_rate_trends must still recover
+    the full previous-cycle task set and produce the correct hit rate.
+    """
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    c_cycle = _make_cycle(project.id, age_days=2)
+    p_cycle = _make_cycle(project.id, age_days=20)
+    db_session.add(c_cycle)
+    db_session.add(p_cycle)
+    await db_session.flush()
+
+    # Current cycle: 5 tasks, 3/5 hit.
+    for i in range(3):
+        t = _make_sr_task(
+            project.id,
+            age_days=1,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        t.strategic_cycle_id = c_cycle.id
+        db_session.add(t)
+    for i in range(2):
+        t = _make_sr_task(
+            project.id, age_days=1, human_cats={"correctness": 1}, sr_failed_cats=[]
+        )
+        t.strategic_cycle_id = c_cycle.id
+        db_session.add(t)
+    # Previous cycle: 5 tasks, 5/5 hit — would be evicted by a flat recency cap.
+    for i in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=19,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        t.strategic_cycle_id = p_cycle.id
+        db_session.add(t)
+    await db_session.flush()
+
+    # Pass all_tasks=[] to simulate the previous cycle being absent from the
+    # caller's recency-capped window.  The function must fetch cycle tasks itself.
+    result = await compute_sr_catch_rate_trends(project.id, db_session, [])
+
+    assert result is not None, "expected cycle-mode result even with empty all_tasks"
+    assert result["bucket_mode"] == "cycle"
+    assert result["current_cycle_id"] == c_cycle.id
+    assert result["previous_cycle_id"] == p_cycle.id
+    cat = result["categories"]["correctness"]
+    # Previous cycle must reflect all 5 tasks (5/5 hit), not a truncated tail.
+    assert cat["previous_hit_rate"] == 1.0, (
+        f"previous hit rate {cat['previous_hit_rate']} != 1.0 — "
+        "previous cycle was truncated by recency cap instead of fetched directly"
+    )
+    assert cat["current_hit_rate"] == round(3 / 5, 3)
+    assert cat["trend"] == "decreasing"
 
 
 @pytest.mark.asyncio
@@ -9639,18 +8779,20 @@ async def test_compute_sr_catch_rate_trends_all_fields_always_present(
         "by_fix_iteration",
         "by_scope",
         "by_severity",
-        "edges_considered_stats",
         "sr_skip_rate",
         "sr_skip_reason_distribution",
         "by_direction",
-        "execution_evidence_miss_rates",
+        "overall_trend_verdict",
+        "overall_trend_significant",
+        "overall_trend_data_sufficient",
     ]
     for key in required_keys:
         assert key in result, f"missing required key: {key}"
 
     assert isinstance(result["sr_skip_reason_distribution"], dict)
     assert isinstance(result["by_direction"], dict)
-    assert isinstance(result["execution_evidence_miss_rates"], dict)
+    assert "execution_evidence_miss_rates" not in result
+    assert "edges_considered_stats" not in result
 
 
 @pytest.mark.asyncio
@@ -10448,7 +9590,13 @@ def test_compute_sr_quality_by_fingerprint_groups_metrics_and_gates_low_sr_sampl
 
 @pytest.mark.parametrize(
     "origin",
-    ["reviewer", "reviewer_disagreement", "reviewer_recovery_after_incomplete_sr"],
+    [
+        "reviewer",
+        "reviewer_disagreement",
+        "reviewer_recovery_after_incomplete_sr",
+        "lone_checker_recovery",
+        "operator_requested_recovery",
+    ],
 )
 def test_compute_sr_quality_by_fingerprint_excludes_reviewer_origin(origin):
     """Reviewer-stamped passed=False entries must not inflate sr_catch_rate.
@@ -10499,7 +9647,13 @@ def test_compute_sr_quality_by_fingerprint_excludes_reviewer_origin(origin):
 
 @pytest.mark.parametrize(
     "origin",
-    ["reviewer", "reviewer_disagreement", "reviewer_recovery_after_incomplete_sr"],
+    [
+        "reviewer",
+        "reviewer_disagreement",
+        "reviewer_recovery_after_incomplete_sr",
+        "lone_checker_recovery",
+        "operator_requested_recovery",
+    ],
 )
 def test_compute_cat_fp_stats_excludes_reviewer_origin_from_sr_failed(origin):
     """A reviewer-stamped failure must NOT count toward the author SR's TP/FP totals."""
@@ -10550,7 +9704,13 @@ def test_compute_cat_fp_stats_legacy_no_origin_still_counts():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "origin",
-    ["reviewer", "reviewer_disagreement", "reviewer_recovery_after_incomplete_sr"],
+    [
+        "reviewer",
+        "reviewer_disagreement",
+        "reviewer_recovery_after_incomplete_sr",
+        "lone_checker_recovery",
+        "operator_requested_recovery",
+    ],
 )
 async def test_compute_fresh_reviewer_trend_added_value_excludes_reviewer_origin(
     db_session: AsyncSession, origin
@@ -12993,6 +12153,67 @@ def test_stats_for_tasks_lone_checker_recovery_excluded_from_sr_failed_author():
     assert security.get("fp_count", 0) == 0
 
 
+def test_stats_for_tasks_operator_requested_recovery_is_reviewer_save():
+    """operator_requested_recovery origin counts as reviewer_save, not sr_alone."""
+    import uuid as _uuid
+    from app.playbook_learning import _stats_for_tasks
+
+    project_id = _uuid.uuid4()
+    check_results = {
+        "security": {
+            "passed": False,
+            "origin": "operator_requested_recovery",
+            "issue": "operator-requested re-review caught this",
+        }
+    }
+    ctx = {
+        "_self_review_outcome": {"check_results": check_results},
+        "_first_attempt_rejection_categories": {"security": 1},
+    }
+    t = Task(
+        project_id=project_id,
+        title="operator requested recovery task",
+        payloads=[{"type": "create", "prompt": "p"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    _, cat_stats, _, _, _, _ = _stats_for_tasks([t])
+    assert "security" in cat_stats
+    assert cat_stats["security"]["reviewer_save_hit_count"] == 1
+    assert cat_stats["security"]["sr_alone_hit_count"] == 0
+
+
+def test_stats_for_tasks_operator_requested_recovery_excluded_from_sr_failed_author():
+    """operator_requested_recovery findings are not counted as author SR false positives."""
+    import uuid as _uuid
+    from app.playbook_learning import _stats_for_tasks
+
+    project_id = _uuid.uuid4()
+    # SR passed (operator-requested reviewer flagged security), human did NOT reject.
+    check_results = {
+        "security": {
+            "passed": False,
+            "origin": "operator_requested_recovery",
+            "issue": "operator-requested re-review only",
+        }
+    }
+    ctx = {
+        "_self_review_outcome": {"check_results": check_results},
+        "_first_attempt_rejection_categories": {},
+    }
+    t = Task(
+        project_id=project_id,
+        title="operator requested recovery no human rejection",
+        payloads=[{"type": "create", "prompt": "p"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    _, cat_stats, _, _, _, _ = _stats_for_tasks([t])
+    # operator_requested_recovery is not an author SR failure, so fp_count must be 0.
+    security = cat_stats.get("security", {})
+    assert security.get("fp_count", 0) == 0
+
+
 # ---------------------------------------------------------------------------
 # miss_mode_breakdown per-category breakdown in compute_sr_catch_rate_trends
 # ---------------------------------------------------------------------------
@@ -13919,4 +13140,322 @@ async def test_compute_sr_catch_rate_trends_e2e_production_shaped(
     )
     assert rr["previous_hit_rate"] == 1.0, (
         f"regression_risk previous_hit_rate wrong: {rr['previous_hit_rate']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_overall_trend_verdict_improving_when_significant(
+    db_session: AsyncSession,
+):
+    """overall_trend_verdict='improving' with sufficient data and a significant delta."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for _ in range(8):  # current: 8/8 hits → 1.0
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    for i in range(8):  # previous: 1/8 hits → 0.125 (delta=0.875, z>1.28)
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"] if i == 0 else [],
+        )
+        db_session.add(t)
+        tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    assert result["overall_trend_verdict"] == "improving"
+    assert result["overall_trend_significant"] is True
+    assert result["overall_trend_data_sufficient"] is True
+
+
+@pytest.mark.asyncio
+async def test_overall_trend_verdict_stable_when_not_significant(
+    db_session: AsyncSession,
+):
+    """overall_trend_verdict='stable' when delta is above threshold but not statistically
+    significant (z < _TREND_Z_MIN=1.28 with small sample sizes)."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    for cnt, hit in [(3, True), (2, False)]:  # current: 3/5 = 0.6
+        for _ in range(cnt):
+            t = _make_sr_task(
+                project.id,
+                age_days=2,
+                human_cats={"correctness": 1},
+                sr_failed_cats=["correctness"] if hit else [],
+            )
+            db_session.add(t)
+            tasks.append(t)
+    for cnt, hit in [
+        (4, True),
+        (1, False),
+    ]:  # previous: 4/5 = 0.8; delta=0.2>0.05 but z≈0.69<1.28
+        for _ in range(cnt):
+            t = _make_sr_task(
+                project.id,
+                age_days=20,
+                human_cats={"correctness": 1},
+                sr_failed_cats=["correctness"] if hit else [],
+            )
+            db_session.add(t)
+            tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+    assert result is not None
+    assert result["overall_trend_verdict"] == "stable"
+    assert result["overall_trend_significant"] is False
+    assert result["overall_trend_data_sufficient"] is True
+
+
+@pytest.mark.asyncio
+async def test_sr_catch_rate_previous_bucket_not_starved_by_throughput(
+    db_session: AsyncSession,
+):
+    """Regression: when the current window has more tasks than the old fetch cap (200),
+    the previous window must still be populated. The fix in agent.py uses a 28-day
+    time-bounded query instead of a flat row-count cap so both 14-day buckets are
+    always loaded regardless of current-window throughput."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    OLD_CAP = 200
+    # Create more tasks than the old cap in the current window (last 7 days).
+    current_tasks = []
+    for _ in range(OLD_CAP + 10):
+        t = _make_sr_task(
+            project.id,
+            age_days=2,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        current_tasks.append(t)
+    # Create 5 tasks in the previous window (15-28 days ago).
+    previous_tasks = []
+    for _ in range(5):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+        previous_tasks.append(t)
+    await db_session.flush()
+
+    # OLD behaviour: only the most-recent OLD_CAP rows — all land in the current
+    # window (age_days=2), previous bucket is empty → metric freezes at None.
+    old_cap_rows = sorted(
+        current_tasks + previous_tasks,
+        key=lambda t: t.created_at,
+        reverse=True,
+    )[:OLD_CAP]
+    result_old = await compute_sr_catch_rate_trends(
+        project.id, db_session, old_cap_rows
+    )
+    assert result_old is None, (
+        "flat cap fetch should leave the previous bucket empty and return None"
+    )
+
+    # NEW behaviour: time-bounded fetch (28 days) loads both windows → both
+    # buckets populated → real result returned with data_sufficient=True.
+    all_tasks = current_tasks + previous_tasks
+    result_new = await compute_sr_catch_rate_trends(project.id, db_session, all_tasks)
+    assert result_new is not None, (
+        "window-bounded fetch must populate both buckets and return a real result"
+    )
+    assert result_new.get("data_sufficient") is True
+
+
+@pytest.mark.asyncio
+async def test_refresh_sr_catch_rate_fetch_covers_both_windows(
+    db_session: AsyncSession,
+):
+    """Integration: _refresh_sr_catch_rate must fetch tasks from both the current
+    and previous calendar windows (0-14 days and 14-28 days ago) so the metric
+    is data_sufficient=True even when the current window alone saturates a
+    row-count cap.  Catches fetch-window regressions that bypass compute_sr_catch_rate_trends
+    unit tests (which accept hand-built task lists)."""
+    from app.routers.agent import _refresh_sr_catch_rate
+
+    project = await _make_project(db_session)
+
+    # 6 SR tasks in current window (age_days=3 → inside 0–14-day bucket)
+    for _ in range(6):
+        t = _make_sr_task(
+            project.id,
+            age_days=3,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+
+    # 6 SR tasks in previous window (age_days=20 → inside 14–28-day bucket)
+    for _ in range(6):
+        t = _make_sr_task(
+            project.id,
+            age_days=20,
+            human_cats={"correctness": 1},
+            sr_failed_cats=["correctness"],
+        )
+        db_session.add(t)
+
+    # Non-SR tasks that must NOT affect the metric (no _self_review_outcome)
+    for _ in range(3):
+        t = Task(
+            project_id=project.id,
+            title="non-SR task",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.COMPLETED,
+            context={"scope": "small"},
+        )
+        db_session.add(t)
+
+    await db_session.flush()
+
+    # Call the router-level helper that performs the actual DB fetch
+    await _refresh_sr_catch_rate(session=db_session, project_id=project.id)
+    await db_session.flush()
+
+    trends = (project.design_doc or {}).get("sr_catch_rate_trends")
+    assert trends is not None, "_refresh_sr_catch_rate must write sr_catch_rate_trends"
+    assert trends.get("data_sufficient") is True, (
+        "fetch must cover both 0-14 and 14-28 day windows; "
+        "data_sufficient=False means the previous window was starved"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tests for overall SR-alone (author-only) catch rate
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_overall_sr_alone_low_when_all_catches_are_reviewer_saves(
+    db_session: AsyncSession,
+):
+    """When all catches carry origin='reviewer', combined overall is high but SR-alone is 0."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Both windows: 6 tasks per window, all flagged by reviewer (not author).
+    for age in (2, 20):
+        for _ in range(6):
+            t = _make_sr_task(
+                project.id,
+                age_days=age,
+                human_cats={"correctness": 1},
+                sr_failed_cats=["correctness"],
+                check_result_overrides={"correctness": {"origin": "reviewer"}},
+            )
+            db_session.add(t)
+            tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    # Combined: all 6 correctness findings were caught → hit rate = 1.0
+    assert result["overall_hit_rate"] == 1.0, (
+        f"combined overall should be 1.0 but got {result['overall_hit_rate']}"
+    )
+    # SR-alone: none were caught by the author → rate = 0.0
+    assert result["overall_sr_alone_hit_rate"] == 0.0, (
+        f"SR-alone overall should be 0.0 but got {result['overall_sr_alone_hit_rate']}"
+    )
+    # Trend fields must be present
+    assert "overall_sr_alone_trend_verdict" in result
+    assert "overall_sr_alone_trend_significant" in result
+    assert "overall_sr_alone_trend_data_sufficient" in result
+
+
+@pytest.mark.asyncio
+async def test_overall_sr_alone_trend_data_sufficiency_gate(
+    db_session: AsyncSession,
+):
+    """SR-alone trend reports None for trend_significant when data is below threshold."""
+    from app.playbook_learning import compute_sr_catch_rate_trends, _MIN_SR_FINDINGS
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Build _MIN_SR_FINDINGS tasks in each window — exactly at the threshold.
+    # Both windows have identical sr_alone rates so the z-test gives "stable".
+    for age in (2, 20):
+        for _ in range(_MIN_SR_FINDINGS):
+            t = _make_sr_task(
+                project.id,
+                age_days=age,
+                human_cats={"correctness": 1},
+                sr_failed_cats=["correctness"],  # sr_alone catch
+            )
+            db_session.add(t)
+            tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    # Data is sufficient and rates identical → verdict is "stable", not None
+    assert result["overall_sr_alone_trend_verdict"] == "stable"
+    # trend_significant is False (not None) when data sufficient but no change
+    assert result["overall_sr_alone_trend_significant"] is not None or (
+        result["overall_sr_alone_trend_data_sufficient"] is False
+    ), "trend_significant must be a bool (not None) when data is sufficient"
+
+
+@pytest.mark.asyncio
+async def test_overall_sr_alone_fields_present_when_data_insufficient(
+    db_session: AsyncSession,
+):
+    """When compute_sr_catch_rate_trends returns a result, all SR-alone keys are present."""
+    from app.playbook_learning import compute_sr_catch_rate_trends
+
+    project = await _make_project(db_session)
+    tasks = []
+    # Mix: some SR-alone, some reviewer saves in both windows (>= 5 each).
+    for age in (2, 20):
+        for i in range(6):
+            overrides = {"correctness": {"origin": "reviewer"}} if i % 2 == 0 else None
+            t = _make_sr_task(
+                project.id,
+                age_days=age,
+                human_cats={"correctness": 1},
+                sr_failed_cats=["correctness"],
+                check_result_overrides=overrides,
+            )
+            db_session.add(t)
+            tasks.append(t)
+    await db_session.flush()
+
+    result = await compute_sr_catch_rate_trends(project.id, db_session, tasks)
+
+    assert result is not None
+    expected_keys = {
+        "overall_sr_alone_hit_rate",
+        "previous_overall_sr_alone_hit_rate",
+        "overall_sr_alone_trend_verdict",
+        "overall_sr_alone_trend_significant",
+        "overall_sr_alone_trend_data_sufficient",
+    }
+    missing = expected_keys - set(result.keys())
+    assert not missing, f"Missing SR-alone keys in result: {missing}"
+    # Rates must be floats in [0, 1], not None (we have both sr_alone and reviewer catches)
+    rate = result["overall_sr_alone_hit_rate"]
+    assert isinstance(rate, float) and 0.0 <= rate <= 1.0, (
+        f"overall_sr_alone_hit_rate should be float in [0,1], got {rate!r}"
     )

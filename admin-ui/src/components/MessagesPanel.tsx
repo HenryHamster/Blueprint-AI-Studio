@@ -3,7 +3,13 @@ import { X, MessageSquare, Send, Check, AlertTriangle, HelpCircle, Bug, StickyNo
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders } from '../api';
 import { parseTimestamp } from '../utils/time';
-import { routineSummary, effectiveSignal, loadEventPrefs, saveEventPrefs, type EventPref, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, getToastSeverity, type RoutineRow, loadLastSeen, saveLastSeen, formatTimestamp, formatSinceTimestamp, insertTimeDividers, type MessageWithDivider, ESCALATION_BADGE_LABELS, HIGH_SIGNAL_NOTE_BADGE_LABELS, isCriticalSeverity, type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown, type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP, type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes, ROUTINE_EVENT_LABELS, countHighSignalMessages, fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews, fetchServerTempMutes, saveServerTempMutes, fetchServerMuteWindow, saveServerMuteWindow } from './MessagesPanel.utils';
+import { type EventPref, loadEventPrefs, saveEventPrefs, effectiveSignal, getToastSeverity, isCriticalSeverity, ESCALATION_BADGE_LABELS, HIGH_SIGNAL_NOTE_BADGE_LABELS, ROUTINE_EVENT_LABELS, countHighSignalMessages } from './eventPrefs';
+import { type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown } from './muteWindow';
+import { type SavedView, loadSavedViews, saveSavedViews, SAVED_VIEWS_CAP } from './savedViews';
+import { type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes } from './temporaryMutes';
+import { type RoutineRow, type MessageWithDivider, routineSummary, groupRoutineMessages, collapseStaleRoutineRows, formatDailyDigestSummary, outcomeBreakdown, isFailingGroup, insertTimeDividers, formatTimestamp, formatSinceTimestamp } from './messageGrouping';
+import { loadLastSeen, saveLastSeen } from './lastSeen';
+import { fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews, fetchServerTempMutes, saveServerTempMutes, fetchServerMuteWindow, saveServerMuteWindow } from './serverSync';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -64,10 +70,12 @@ interface WebhookStats {
 interface MessagesPanelProps {
   selectedProjectId: string | null;
   githubRepo?: string | null;
+  defaultBranch?: string;
   onClose: () => void;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onMessageCountChange?: (count: number) => void;
   onOpenTask?: (taskId: string) => void;
+  notifyOnHighSignalMessage?: boolean;
 }
 
 type MessagesPanelPrefs = { version: 1; routineExpanded: boolean; showResolved: boolean; criticalOnly: boolean };
@@ -245,7 +253,7 @@ async function postBackendLastSeen(projectId: string, timestamp: number): Promis
   } catch { /* ignore — localStorage already saved */ }
 }
 
-export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast, onMessageCountChange, onOpenTask }: MessagesPanelProps) {
+export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage }: MessagesPanelProps) {
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [loading, setLoading] = useState(true);
   // Compose
@@ -344,11 +352,14 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
 
   // Refs for scrolling to sections from summary card
   const blockersRefEl = useRef<HTMLDivElement>(null);
+  const questionsRefEl = useRef<HTMLDivElement>(null);
   const routineRefEl = useRef<HTMLDivElement>(null);
 
   // Stable ref for addToast
   const addToastRef = useRef(addToast);
   addToastRef.current = addToast;
+  const notifyOnHighSignalMessageRef = useRef(notifyOnHighSignalMessage);
+  notifyOnHighSignalMessageRef.current = notifyOnHighSignalMessage;
 
   // Track seen messages to detect new arrivals and avoid initial-load toast spam
   const seenMessageIdsRef = useRef<Set<string>>(new Set());
@@ -522,8 +533,17 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
           parseTimestamp(m.created_at).getTime() > dividerTime &&
           effectiveSignal(m, eventPrefs, tempMutes) === 'high'
         ).length,
+        questions: openMessages.filter(m =>
+          m.message_type === 'QUESTION' &&
+          m.created_at &&
+          parseTimestamp(m.created_at).getTime() > dividerTime &&
+          // Match pinnedQuestions predicate (effectiveSignal === 'high'): the summary card
+          // scrolls to the pinned-questions section, so it must not announce QUESTIONs that
+          // were demoted to 'routine' and live elsewhere in the list.
+          effectiveSignal(m, eventPrefs, tempMutes) === 'high'
+        ).length,
       }
-    : { blockers: 0, feedback: 0, bugReports: 0, routine: 0, highSignalNotes: 0 },
+    : { blockers: 0, feedback: 0, bugReports: 0, routine: 0, highSignalNotes: 0, questions: 0 },
   [openMessages, dividerTime, eventPrefs, tempMutes]);
 
   // Total new count: each message counted exactly once (high-signal and routine are disjoint)
@@ -563,9 +583,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openMessages, eventPrefs, tempMutes, searchQuery, sortMode, showOnlyNew, dividerTime]);
 
-  // In importance mode, pin BLOCKERs at the top with a visual divider
+  // In importance mode, pin BLOCKERs and unanswered QUESTIONs at the top with visual dividers
   const pinnedBlockers = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type === 'BLOCKER') : [];
-  const otherHighSignal = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type !== 'BLOCKER') : highSignalOpen;
+  const pinnedQuestions = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type === 'QUESTION') : [];
+  const otherHighSignal = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type !== 'BLOCKER' && m.message_type !== 'QUESTION') : highSignalOpen;
 
   // Failing routine groups auto-promoted above the routine ops section
   const { promotedGroups, remainingRoutineRows, autoExpandedKeys, visibleRoutineCount, mutedRoutineCount } = useMemo(() => {
@@ -852,6 +873,13 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
           // Use the highest severity among the new messages
           const toastSeverity = newHighSignal.some(m => getToastSeverity(m) === 'error') ? 'error' : 'info';
           addToastRef.current(summary, toastSeverity);
+
+          // Fire desktop notifications for each high-signal message when opted in
+          if (notifyOnHighSignalMessageRef.current && 'Notification' in window && Notification.permission === 'granted') {
+            for (const msg of newHighSignal) {
+              new Notification(msg.message_type, { body: msg.content.slice(0, 100) });
+            }
+          }
         }
       }
 
@@ -1072,7 +1100,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
           github_repo: githubRepo,
           title,
           prompt,
-          base_branch: 'main',
+          ...(defaultBranch ? { base_branch: defaultBranch } : {}),
           task_type: 'investigate',
         }),
       });
@@ -1794,9 +1822,34 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                     renderBubble(item.msg, false, false, messages)
                   )
                 )}
-                {otherHighSignal.length > 0 && <div className="border-t border-neutral-800/60" />}
+                {(pinnedQuestions.length > 0 || otherHighSignal.length > 0) && <div className="border-t border-neutral-800/60" />}
               </>
             )}
+
+            {/* Pinned QUESTIONs (importance mode only) — awaiting operator reply */}
+            <div ref={questionsRefEl}>
+              {pinnedQuestions.length > 0 && (
+                <>
+                  <div className="flex items-center gap-1.5 text-[11px] text-blue-400/70 font-semibold uppercase tracking-wide px-1">
+                    <HelpCircle className="w-3 h-3" />
+                    <span>Awaiting reply · Questions</span>
+                    <span className="ml-auto bg-blue-500/20 text-blue-300 border border-blue-500/40 rounded-full px-1.5 py-0.5 text-[10px]">{pinnedQuestions.length} waiting</span>
+                  </div>
+                  {insertTimeDividers(pinnedQuestions).map((item, idx) =>
+                    item.kind === 'divider' ? (
+                      <div key={`divider-questions-${idx}`} className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2">
+                        <div className="flex-1 border-t border-neutral-800/60" />
+                        <span className="shrink-0">{item.label}</span>
+                        <div className="flex-1 border-t border-neutral-800/60" />
+                      </div>
+                    ) : (
+                      renderBubble(item.msg, false, false, messages)
+                    )
+                  )}
+                  {otherHighSignal.length > 0 && <div className="border-t border-neutral-800/60" />}
+                </>
+              )}
+            </div>
 
             {/* Divider: show before first new message if divider time is set and not dismissed */}
             {dividerTime && totalNewCount > 0 && !dividerDismissedRef.current && (
@@ -1820,7 +1873,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
             )}
 
             {/* Summary card: show counts of new messages if divider is active */}
-            {dividerTime && !dividerDismissedRef.current && (newMessageCounts.blockers > 0 || newMessageCounts.feedback > 0 || newMessageCounts.bugReports > 0 || newMessageCounts.routine > 0 || newMessageCounts.highSignalNotes > 0) && (
+            {dividerTime && !dividerDismissedRef.current && (newMessageCounts.blockers > 0 || newMessageCounts.questions > 0 || newMessageCounts.feedback > 0 || newMessageCounts.bugReports > 0 || newMessageCounts.routine > 0 || newMessageCounts.highSignalNotes > 0) && (
               <div className="mx-2 my-3 p-3 rounded-lg bg-gradient-to-r from-blue-950/40 to-blue-900/30 border border-blue-800/40 text-[11px] text-blue-200/90">
                 <div className="font-semibold mb-2 text-blue-300">Since you last looked</div>
                 <div className="space-y-1.5">
@@ -1833,6 +1886,17 @@ export function MessagesPanel({ selectedProjectId, githubRepo, onClose, addToast
                       data-testid="summary-card-blockers"
                     >
                       <span className="font-medium text-amber-300">{newMessageCounts.blockers}</span> new blocker{newMessageCounts.blockers !== 1 ? 's' : ''}
+                    </button>
+                  )}
+                  {newMessageCounts.questions > 0 && (
+                    <button
+                      onClick={() => {
+                        questionsRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                      }}
+                      className="block w-full text-left hover:text-blue-100 transition-colors"
+                      data-testid="summary-card-questions"
+                    >
+                      <span className="font-medium text-blue-300">{newMessageCounts.questions}</span> question{newMessageCounts.questions !== 1 ? 's' : ''} waiting
                     </button>
                   )}
                   {newMessageCounts.bugReports > 0 && (

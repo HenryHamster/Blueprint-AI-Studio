@@ -63,6 +63,14 @@ _vm_zones: dict[str, str] = {}
 
 # Track per-VM image identity reported via heartbeats: vm_id -> (image_name, build_ts)
 _vm_images: dict[str, tuple[str | None, int | None]] = {}
+
+# Track per-VM agent runtime fingerprint (64-hex SHA-256) reported via heartbeat.
+_vm_runtime_fingerprints: dict[str, str] = {}
+
+# Track when each VM's provisioning slot was actually acquired (ISO timestamp string).
+# Written by _provision_gcp after both Redis and local semaphore guards are passed;
+# read by the orchestrator to populate _cold_start_stages["provision_slot_acquired_at"].
+_vm_provision_slot_times: dict[str, str] = {}
 _IMAGE_STALENESS_THRESHOLD_HOURS = int(os.getenv("VM_IMAGE_STALENESS_HOURS", "24"))
 
 # Semaphores to cap concurrent GCP API calls — prevents thread pool starvation
@@ -519,6 +527,33 @@ def get_vm_image(vm_instance_id: str) -> tuple[str | None, int | None]:
     return _vm_images.get(vm_instance_id, (None, None))
 
 
+def record_vm_runtime_fingerprint(vm_instance_id: str, fingerprint: str) -> None:
+    """Record the agent-runtime SHA-256 fingerprint reported by a VM via heartbeat."""
+    if not vm_instance_id:
+        return
+    _vm_runtime_fingerprints[vm_instance_id] = fingerprint
+    logger.debug(
+        f"[COMPUTE] VM {vm_instance_id} agent_runtime_fingerprint={fingerprint[:12]}…"
+    )
+
+
+def get_vm_runtime_fingerprint(vm_instance_id: str) -> str | None:
+    """Return the agent-runtime fingerprint for a VM, or None if not yet reported."""
+    return _vm_runtime_fingerprints.get(vm_instance_id)
+
+
+def get_provision_slot_acquired_at(vm_instance_id: str) -> str | None:
+    """Return the ISO timestamp when this VM's provisioning slot was acquired, or None."""
+    return _vm_provision_slot_times.get(vm_instance_id)
+
+
+def _clear_vm_heartbeat_state(vm_instance_id: str) -> None:
+    """Drop heartbeat-derived metadata once a VM is no longer running."""
+    _vm_images.pop(vm_instance_id, None)
+    _vm_runtime_fingerprints.pop(vm_instance_id, None)
+    _vm_provision_slot_times.pop(vm_instance_id, None)
+
+
 def get_stale_image_vms(threshold_hours: int | None = None) -> list[dict]:
     """Return VMs whose image build_ts is older than threshold_hours.
 
@@ -540,6 +575,7 @@ def get_stale_image_vms(threshold_hours: int | None = None) -> list[dict]:
                     "image_name": image_name,
                     "build_ts": build_ts,
                     "age_hours": round((time.time() - build_ts) / 3600, 1),
+                    "agent_runtime_fingerprint": _vm_runtime_fingerprints.get(vm_id),
                 }
             )
     return stale
@@ -721,6 +757,7 @@ async def _provision_local(
                 await asyncio.to_thread(proc.wait)
             finally:
                 _local_processes.pop(vm_instance_id, None)
+                _clear_vm_heartbeat_state(vm_instance_id)
                 logger.info(
                     f"[LOCAL] Agent subprocess exited (PID: {proc.pid}, code: {proc.returncode})"
                 )
@@ -755,6 +792,7 @@ async def _delete_local(vm_instance_id: str):
             shutil.rmtree(local_root, ignore_errors=True)
     except Exception:
         logger.warning(f"[LOCAL] Failed to clean manifest files for {vm_instance_id}")
+    _clear_vm_heartbeat_state(vm_instance_id)
     return True
 
 
@@ -1169,8 +1207,14 @@ async def _provision_gcp(
                 )
                 zone_region = "-".join(zone.split("-")[:-1])
                 network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{subnet_name}"
+                # pd-balanced (SSD-backed) boots faster than the pd-standard
+                # (HDD) default; disk_type is zone-qualified so it must track the
+                # zone being attempted. Mutate disk.initialize_params (not the
+                # pre-loop local) because the proto copied the params on assignment.
+                disk.initialize_params.disk_type = f"zones/{zone}/diskTypes/pd-balanced"
                 # Re-assign to ensure protobuf picks up the change
                 instance_config.network_interfaces = [network_interface]
+                instance_config.disks = [disk]
 
                 # Delete any existing VM with this name first (stale from retries)
                 try:
@@ -1369,6 +1413,12 @@ async def _provision_gcp(
                     )
                     zone_region = "-".join(wait_zone.split("-")[:-1])
                     network_interface.subnetwork = f"projects/{GCP_PROJECT_ID}/regions/{zone_region}/subnetworks/{wait_subnet}"
+                    disk.initialize_params.disk_type = (
+                        f"zones/{wait_zone}/diskTypes/pd-balanced"
+                    )
+                    # Re-assign to ensure protobuf picks up the change
+                    instance_config.network_interfaces = [network_interface]
+                    instance_config.disks = [disk]
                     operation = instance_client.insert(
                         project=GCP_PROJECT_ID,
                         zone=wait_zone,
@@ -1413,6 +1463,11 @@ async def _provision_gcp(
 
     try:
         async with _gcp_provision_semaphore:  # Local guard still useful for thread pool
+            # Both Redis slot and local semaphore are now held — stamp queue-wait boundary
+            # so the orchestrator can split dispatch→slot (throttle time) from slot→boot.
+            _vm_provision_slot_times[vm_instance_id] = datetime.now(
+                timezone.utc
+            ).isoformat()
             # 420s outer = 240s inner insert + 180s headroom for stale-delete,
             # zone iteration, and secret setup. Previously 360s, which routinely
             # cancelled near-complete GCP operations (surfaced as
@@ -1585,7 +1640,6 @@ async def _delete_gcp(vm_instance_id: str):
         zones_to_try = []
         with _zone_lock:
             known_zone = _vm_zones.pop(vm_instance_id, None)
-        _vm_images.pop(vm_instance_id, None)
         if known_zone:
             zones_to_try.append(known_zone)
         zones_to_try.extend(z for z, _ in FALLBACK_ZONES if z not in zones_to_try)
@@ -1623,6 +1677,7 @@ async def _delete_gcp(vm_instance_id: str):
             _deleted_zone, serial_tail = await asyncio.wait_for(
                 asyncio.to_thread(_find_capture_and_delete), timeout=240
             )
+        _clear_vm_heartbeat_state(vm_instance_id)
 
         if serial_tail:
             logger.info(f"[VM-SERIAL] {vm_instance_id} last output:\n{serial_tail}")

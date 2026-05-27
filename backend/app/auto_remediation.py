@@ -27,6 +27,7 @@ from app.github import (
 from app.models import Project, Task, TaskStatus
 from app.notification_dispatch import post_auto_fix_spawned_message
 from app.task_completion import _stamp_remediation_spawn_on_direction
+from app.task_locking import with_directions_locked
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -68,8 +69,6 @@ async def _try_auto_recover_suspension(
     remediation), False if still in cooldown or permanently suspended.
     Persists changes to the project's _auto_remediation config.
     """
-    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
-
     meta = (config.get("suspension_metadata") or {}).get(branch) or {}
     now = _utcnow()
 
@@ -195,8 +194,8 @@ async def _handle_main_branch_ci_failure_inner(
             meta = (config.get("suspension_metadata") or {}).get(head_branch) or {}
             if int(meta.get("recovery_attempts", 0) or 0) >= MAX_AUTO_RECOVERY_ATTEMPTS:
                 try:
-                    from app.main import _send_webhook_notification  # noqa: PLC0415
-                    import asyncio  # noqa: PLC0415
+                    from app.main import _send_webhook_notification
+                    import asyncio
 
                     asyncio.ensure_future(
                         _send_webhook_notification(
@@ -504,7 +503,7 @@ async def _handle_main_branch_ci_failure_inner(
         structured_signals=structured_signals,
     )
 
-    from app.failure_classification import _external_api_subtype_from_message  # noqa: PLC0415
+    from app.failure_classification import _external_api_subtype_from_message
 
     _ext_api_subtype = (
         _external_api_subtype_from_message(error_summary) if error_summary else None
@@ -595,15 +594,15 @@ async def _handle_main_branch_ci_failure_inner(
     await session.flush()  # assign task.id
     direction_id = task_context.get("direction_id")
     if direction_id:
-        project = await session.get(Project, project_id)
-        if project:
-            directions = list(project.directions or [])
+
+        def _stamp_direction(directions: list) -> None:
             target = next((d for d in directions if d.get("id") == direction_id), None)
             if target is not None:
                 _stamp_remediation_spawn_on_direction(target, task)
-                project.directions = directions
-                flag_modified(project, "directions")
-                session.add(project)
+
+        await with_directions_locked(
+            session, project_id, _stamp_direction, skip_locked=False
+        )
 
     # ── Notifications ──
     try:
@@ -750,7 +749,7 @@ async def _extract_ci_context(
         # before generic ones to avoid "Build failed" matching as "test"
         if raw_logs:
             logs_lower = raw_logs.lower()
-            from app.failure_classification import _MIGRATION_PATTERNS  # noqa: PLC0415
+            from app.failure_classification import _MIGRATION_PATTERNS
 
             if any(p in logs_lower for p in _MIGRATION_PATTERNS):
                 failure_type = "migration"

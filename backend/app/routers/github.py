@@ -36,7 +36,11 @@ from app.models import (
     UserIntegration,
 )
 from app.secrets_manager import store_user_secret
-from app.shared_state import limiter
+from app.shared_state import (
+    get_project_integration_branch,
+    get_project_promotion_target,
+    limiter,
+)
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -480,7 +484,9 @@ async def github_webhook(
                     )
                     if auto_review_config.get("enabled"):
                         branch = pr_data.get("head", {}).get("ref", "")
-                        base_branch = pr_data.get("base", {}).get("ref", "main")
+                        base_branch = pr_data.get("base", {}).get(
+                            "ref"
+                        ) or get_project_integration_branch(auto_review_project)
                         pr_title = pr_data.get("title", "")
                         from app.auto_review import _handle_auto_review  # noqa: PLC0415
 
@@ -639,8 +645,14 @@ async def github_webhook(
                 branch_whitelist = auto_remediation_config.get(
                     "branch_whitelist", ["main", "master"]
                 )
+                # Always include the configured integration branch so CI failures
+                # on the working trunk are self-healed without manual whitelist edits.
+                effective_whitelist = set(branch_whitelist) | {
+                    get_project_integration_branch(project),
+                    get_project_promotion_target(project),
+                }
 
-                if not enabled or head_branch not in branch_whitelist:
+                if not enabled or head_branch not in effective_whitelist:
                     return {"status": "ignored_auto_remediation_disabled"}
 
                 from app.auto_remediation import _handle_main_branch_ci_failure
@@ -894,7 +906,7 @@ async def github_webhook(
                 if project:
                     config = (project.design_doc or {}).get("_issue_implementation", {})
                     if config.get("enabled") and label_name == config.get(
-                        "trigger_label", "blueprint:implement"
+                        "trigger_label", "auto:implement"
                     ):
                         from app.issue_implementation import (
                             _handle_issue_implementation,

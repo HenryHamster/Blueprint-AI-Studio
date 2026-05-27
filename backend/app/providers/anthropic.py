@@ -20,6 +20,8 @@ _RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     "you've hit your usage limit",
     "you've hit your session limit",
     "session limit · resets",
+    "you've hit your weekly limit",
+    "weekly limit · resets",
     "claude ai usage limit reached",
     "you're out of extra usage",
     "5-hour limit reached",
@@ -32,7 +34,6 @@ _RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     # burned its general retry budget and terminal-FAILED instead of being held
     # + rerouted. Also listed in _QUOTA_EXHAUSTED_PATTERNS so it earns the flat
     # 24h cooldown (the weekly reset is ~a day out, not a 5-hour throttle).
-    "you've hit your weekly limit",
     "weekly limit reached",
 )
 

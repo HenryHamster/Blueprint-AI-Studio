@@ -45,6 +45,10 @@ interface NewTaskModalProps {
   useManualBranch: boolean;
   setUseManualBranch: React.Dispatch<React.SetStateAction<boolean>>;
   setBranchOptions: React.Dispatch<React.SetStateAction<string[]>>;
+  taskBranchDefaultsReady: boolean;
+  taskBranchDefaultsLoading: boolean;
+  taskBranchDefaultsError: string | null;
+  integrationBranch?: string;
   onRepoChange: (value: string) => void;
   onSubmit: (e: React.FormEvent) => Promise<void>;
   onClose: () => void;
@@ -82,6 +86,10 @@ export function NewTaskModal({
   useManualBranch,
   setUseManualBranch,
   setBranchOptions,
+  taskBranchDefaultsReady,
+  taskBranchDefaultsLoading,
+  taskBranchDefaultsError,
+  integrationBranch,
   onRepoChange,
   onSubmit,
   onClose,
@@ -104,6 +112,7 @@ export function NewTaskModal({
     e.preventDefault();
     setSubmitAttempted(true);
     if (repoError || branchError) return;
+    if (!taskBranchDefaultsReady) return;
     if ((newTaskType === 'review' || newTaskType === 'fix') && !isPrNumberValid(newTaskPrNumber)) {
       setPrNumberError(true);
       prNumberRef.current?.focus();
@@ -198,7 +207,7 @@ export function NewTaskModal({
                     value={newTaskBranch}
                     onChange={e => setNewTaskBranch(e.target.value)}
                     className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 font-mono ${submitAttempted && branchError ? 'border-red-500' : 'border-neutral-800'}`}
-                    placeholder="main"
+                    placeholder={integrationBranch || "main"}
                   />
                   {branchError && <p className="text-[10px] text-amber-500 mt-1">{branchError}</p>}
                 </>
@@ -334,8 +343,13 @@ export function NewTaskModal({
             )}
           </div>
           <div className="flex justify-end gap-2 items-center">
-            {submitAttempted && (repoError || branchError) && (
+            {submitAttempted && (repoError || branchError || taskBranchDefaultsError) && (
               <span className="text-[11px] text-red-400 mr-auto">Fix errors above before launching.</span>
+            )}
+            {!taskBranchDefaultsReady && (
+              <span className="text-[11px] text-amber-400 mr-auto">
+                {taskBranchDefaultsLoading ? 'Loading project branch config...' : taskBranchDefaultsError || 'Project branch config unavailable.'}
+              </span>
             )}
             <button
               type="button"
@@ -346,7 +360,7 @@ export function NewTaskModal({
             </button>
             <button
               type="submit"
-              disabled={submitting}
+              disabled={submitting || !taskBranchDefaultsReady}
               className="px-4 py-1.5 min-h-[44px] sm:min-h-0 bg-white text-neutral-950 text-xs font-semibold hover:bg-neutral-200 rounded transition-colors disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-1.5"
             >
               {submitting && <Loader2 className="animate-spin" style={{ width: 14, height: 14 }} />}

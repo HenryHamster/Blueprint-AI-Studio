@@ -1,5 +1,5 @@
 import React, { useMemo, useState, useRef, useCallback, useEffect } from 'react';
-import { Archive, ArrowDownUp } from 'lucide-react';
+import { ArrowDownUp } from 'lucide-react';
 import {
   DndContext,
   closestCenter,
@@ -12,16 +12,17 @@ import type { DragEndEvent, DragStartEvent } from '@dnd-kit/core';
 import { arrayMove, SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable';
 import { TASK_TYPE_STYLES } from './TaskCard';
 import type { Task, TaskStatus } from './TaskCard';
-import { parseTimestamp } from '../utils/time';
+import { sortTasks, type TaskSortBy } from '../utils/taskCsv';
 import type { Project } from './ProjectDashboard';
 import {
   KanbanColumn as KanbanColumnComponent,
   SortableCard,
   TaskItem,
   ColumnSelectCheckbox,
+  ColumnArchiveButton,
 } from './KanbanColumn';
 
-export type SortBy = 'newest' | 'oldest' | 'type' | 'title' | 'duration' | 'attempts';
+export type SortBy = TaskSortBy;
 
 const COLLAPSED_COLUMNS_KEY = 'kanban_collapsed_columns';
 
@@ -52,29 +53,6 @@ const SORT_LABELS: Record<SortBy, string> = {
   attempts: 'Most retried',
 };
 
-function sortTasks(tasks: Task[], sortBy: SortBy): Task[] {
-  return [...tasks].sort((a, b) => {
-    switch (sortBy) {
-      case 'newest':
-        return parseTimestamp(b.created_at).getTime() - parseTimestamp(a.created_at).getTime();
-      case 'oldest':
-        return parseTimestamp(a.created_at).getTime() - parseTimestamp(b.created_at).getTime();
-      case 'type':
-        return (a.task_type ?? '').localeCompare(b.task_type ?? '');
-      case 'title':
-        return (a.title ?? '').localeCompare(b.title ?? '');
-      case 'duration': {
-        const now = Date.now();
-        const aDur = now - parseTimestamp(a.started_at ?? a.created_at).getTime();
-        const bDur = now - parseTimestamp(b.started_at ?? b.created_at).getTime();
-        return bDur - aDur;
-      }
-      case 'attempts':
-        return (b.attempt_count ?? 0) - (a.attempt_count ?? 0);
-    }
-  });
-}
-
 interface KanbanBoardProps {
   tasks: Task[];
   columns: KanbanColumn[];
@@ -100,6 +78,7 @@ interface KanbanBoardProps {
   onViewLogs: (task: Task) => void;
   onTrack?: (task: Task) => void;
   trackedTaskIds?: Set<string>;
+  onDuplicate?: (task: Task) => void;
   hasActiveFilters?: boolean;
   searchQuery?: string;
   onDirectionClick?: (directionId: string) => void;
@@ -147,6 +126,7 @@ export function KanbanBoard({
   onViewLogs,
   onTrack,
   trackedTaskIds,
+  onDuplicate,
   searchQuery,
   onDirectionClick,
 }: KanbanBoardProps) {
@@ -296,6 +276,34 @@ export function KanbanBoard({
   }, [taskColumnMap, tasksByColumn]);
 
   const columnRefs = useRef<(HTMLDivElement | null)[][]>([]);
+
+  // Stable factory that returns a cached ref callback for (colIdx, cardIdx).
+  // Uses a plain-object cache inside useMemo so no ref is accessed during render.
+  const makeCardRef = useMemo(() => {
+    const cache: Record<string, (el: HTMLDivElement | null) => void> = {};
+    return (colIdx: number, cardIdx: number): (el: HTMLDivElement | null) => void => {
+      const key = `${colIdx}:${cardIdx}`;
+      if (!cache[key]) {
+        cache[key] = (el: HTMLDivElement | null) => {
+          if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = [];
+          columnRefs.current[colIdx][cardIdx] = el;
+        };
+      }
+      return cache[key];
+    };
+  }, []);
+
+  // Curried variant for KanbanColumnComponent's getCardRef prop.
+  const makeGetCardRef = useMemo(() => {
+    const cache: Record<number, (cardIdx: number) => (el: HTMLDivElement | null) => void> = {};
+    return (colIdx: number): (cardIdx: number) => (el: HTMLDivElement | null) => void => {
+      if (!cache[colIdx]) {
+        cache[colIdx] = (cardIdx: number) => makeCardRef(colIdx, cardIdx);
+      }
+      return cache[colIdx];
+    };
+  }, [makeCardRef]);
+
   const tasksByColumnRef = useRef(tasksByColumn);
   // eslint-disable-next-line react-hooks/refs
   tasksByColumnRef.current = tasksByColumn;
@@ -357,7 +365,42 @@ export function KanbanBoard({
     return map;
   }, [tasks]);
 
-  const taskProps = { selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery, onDirectionClick };
+  const taskProps = useMemo(() => ({ selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery, onDirectionClick }), [selectionMode, selectedTaskIds, onToggleTaskSelection, onCtrlClick, maxRetries, actionLoadingMap, compact, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onTrack, searchQuery, onDirectionClick]);
+
+  const mobileGroupedSorted = useMemo(() => {
+    if (groupBy !== 'type') return {} as Record<string, Array<[string, Task[]]>>;
+    const result: Record<string, Array<[string, Task[]]>> = {};
+    for (const col of columns) {
+      const colTasks = tasksByColumn[col.id] ?? [];
+      const groups = new Map<string, Task[]>();
+      for (const task of colTasks) {
+        const type = task.task_type || 'create';
+        const list = groups.get(type) ?? [];
+        list.push(task);
+        groups.set(type, list);
+      }
+      result[col.id] = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    }
+    return result;
+  }, [groupBy, columns, tasksByColumn]);
+
+  const mobileTaskFlatIndex = useMemo(() => {
+    if (groupBy !== 'type') return {} as Record<string, Map<string, number>>;
+    const result: Record<string, Map<string, number>> = {};
+    for (const col of columns) {
+      const colTasks = tasksByColumn[col.id] ?? [];
+      result[col.id] = new Map(colTasks.map((t, i) => [t.id, i]));
+    }
+    return result;
+  }, [groupBy, columns, tasksByColumn]);
+
+  const taskIdsByColumn = useMemo(() => {
+    const result: Record<string, string[]> = {};
+    for (const col of columns) {
+      result[col.id] = (tasksByColumn[col.id] ?? []).map(t => t.id);
+    }
+    return result;
+  }, [columns, tasksByColumn]);
 
   return (
     <DndContext
@@ -399,23 +442,15 @@ export function KanbanBoard({
           if (col.id !== effectiveActiveColId) return null;
           const columnTasks = tasksByColumn[col.id] ?? [];
           const isArchivable = ARCHIVABLE_COLUMNS.includes(col.id);
-          const taskIds = columnTasks.map(t => t.id);
-          const columnTaskIds = taskIds;
+          const taskIds = taskIdsByColumn[col.id] ?? [];
           const shiftClickHandler = onShiftSelect
-            ? (taskId: string) => onShiftSelect(taskId, columnTaskIds)
+            ? (taskId: string) => onShiftSelect(taskId, taskIds)
             : undefined;
 
           let mobileContent: React.ReactNode;
           if (groupBy === 'type') {
-            const groups = new Map<string, Task[]>();
-            for (const task of columnTasks) {
-              const type = task.task_type || 'create';
-              const list = groups.get(type) ?? [];
-              list.push(task);
-              groups.set(type, list);
-            }
-            const sorted = [...groups.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-            const taskFlatIndex = new Map(columnTasks.map((t, i) => [t.id, i]));
+            const sorted = mobileGroupedSorted[col.id] ?? [];
+            const taskFlatIndex = mobileTaskFlatIndex[col.id] ?? new Map<string, number>();
             mobileContent = sorted.length === 0 && !loading ? (
               <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">No tasks</div>
             ) : (
@@ -442,7 +477,7 @@ export function KanbanBoard({
                               isTracked={trackedTaskIds?.has(task.id)}
                               colIdx={colIdx}
                               cardIdx={flatIdx}
-                              cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][flatIdx] = el; }}
+                              cardRef={makeCardRef(colIdx, flatIdx)}
                               onNavigate={handleNavigate}
                             />
                           );
@@ -494,7 +529,7 @@ export function KanbanBoard({
                               isTracked={trackedTaskIds?.has(task.id)}
                               colIdx={colIdx}
                               cardIdx={flatIdx}
-                              cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][flatIdx] = el; }}
+                              cardRef={makeCardRef(colIdx, flatIdx)}
                               onNavigate={handleNavigate}
                             />
                           );
@@ -524,7 +559,7 @@ export function KanbanBoard({
                       blockingCount={blockingMap[task.id]}
                       colIdx={colIdx}
                       cardIdx={cardIdx}
-                      cardRef={(el) => { if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = []; columnRefs.current[colIdx][cardIdx] = el; }}
+                      cardRef={makeCardRef(colIdx, cardIdx)}
                       onNavigate={handleNavigate}
                       onApprove={onApprove}
                       onRequestChanges={onRequestChanges}
@@ -536,6 +571,7 @@ export function KanbanBoard({
                       onViewLogs={onViewLogs}
                       onTrack={onTrack}
                       isTracked={trackedTaskIds?.has(task.id)}
+                      onDuplicate={onDuplicate}
                       searchQuery={searchQuery}
                       onDirectionClick={onDirectionClick}
                     />
@@ -569,13 +605,12 @@ export function KanbanBoard({
                     {columnTasks.length}
                   </span>
                   {isArchivable && columnTasks.length > 0 && (
-                    <button
-                      onClick={() => onArchiveColumn(columnTasks.map(t => t.id), col.label)}
-                      title={`Archive all ${col.label} tasks`}
-                      className="p-1 min-h-11 min-w-11 flex items-center justify-center rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50 transition-colors"
-                    >
-                      <Archive className="w-3.5 h-3.5" />
-                    </button>
+                    <ColumnArchiveButton
+                      taskIds={taskIds}
+                      columnLabel={col.label}
+                      onArchiveColumn={onArchiveColumn}
+                      extraClassName="min-h-11 min-w-11 flex items-center justify-center"
+                    />
                   )}
                 </div>
               </div>
@@ -628,16 +663,14 @@ export function KanbanBoard({
               onArchiveColumn={onArchiveColumn}
               onViewLogs={onViewLogs}
               onTrack={onTrack}
+              onDuplicate={onDuplicate}
               onToggleTaskSelection={onToggleTaskSelection}
               onCtrlClick={onCtrlClick}
               toggleCollapse={toggleCollapse}
               handleResizeStart={handleResizeStart}
               showResizeHandle={showResizeHandle}
               prevColId={prevColId}
-              getCardRef={(cardIdx) => (el) => {
-                if (!columnRefs.current[colIdx]) columnRefs.current[colIdx] = [];
-                columnRefs.current[colIdx][cardIdx] = el;
-              }}
+              getCardRef={makeGetCardRef(colIdx)}
               handleNavigate={handleNavigate}
               onDirectionClick={onDirectionClick}
             />
@@ -668,6 +701,7 @@ export function KanbanBoard({
             onViewLogs={onViewLogs}
             onTrack={onTrack}
             isTracked={trackedTaskIds?.has(activeTask.id)}
+            onDuplicate={onDuplicate}
             searchQuery={searchQuery}
             onDirectionClick={onDirectionClick}
             isOverlay

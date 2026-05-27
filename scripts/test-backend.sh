@@ -188,6 +188,15 @@ if [ "$USE_DOCKER" = "1" ] && [ -d ../admin-ui/src ]; then
   ENV_ARGS="$ENV_ARGS -v ${ADMIN_UI_HOST_PATH}:/admin-ui/src:ro"
 fi
 
+# Mount agent/src read-only so test_invariants.py's SR category parity
+# check can parse the live prompt.ts instead of relying on the static
+# AGENT_SELF_REVIEW_CATEGORIES mirror. The mount target /agent/src is
+# one of the candidate paths in `_resolve_prompt_ts_path()`.
+if [ "$USE_DOCKER" = "1" ] && [ -d ../agent/src ]; then
+  MSYS_NO_PATHCONV=1 AGENT_SRC_HOST_PATH="$(cd ../agent/src && pwd)"
+  ENV_ARGS="$ENV_ARGS -v ${AGENT_SRC_HOST_PATH}:/agent/src:ro"
+fi
+
 ENV_VARS="DATABASE_URL=postgresql+asyncpg://x:x@localhost/x \
   GCP_PROJECT_ID=test-project \
   LOCAL_MODE=true \

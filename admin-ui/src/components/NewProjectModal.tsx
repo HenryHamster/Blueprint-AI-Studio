@@ -54,6 +54,8 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
 
   // Repo picker state
   const [detectedDefaultBranch, setDetectedDefaultBranch] = useState('');
+  const [previewDefaultBranch, setPreviewDefaultBranch] = useState('');
+  const [promotionTargetInput, setPromotionTargetInput] = useState('');
 
   // Feature configs for the post-install setup guide
   const [autoRemediationConfig, setAutoRemediationConfig] = useState<AutoRemediationConfig | null>(null);
@@ -137,10 +139,13 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
     setStep('submitting');
     setSubmitError('');
     try {
+      const effectivePromotionTarget = promotionTargetInput.trim() || undefined;
       const data = await onboardProject(
         parsed.owner,
         parsed.repo,
         projectName.trim() || undefined,
+        undefined,
+        effectivePromotionTarget,
       );
       const projectId = data.project_id;
       setCreatedProjectId(projectId);
@@ -299,6 +304,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                             onClick={() => {
                               setRepoInput(r.full_name);
                               setRepoError('');
+                              setPreviewDefaultBranch(r.default_branch);
                             }}
                             className={`w-full flex items-center justify-between px-3 py-2 min-h-[44px] text-left hover:bg-neutral-800 transition-colors border-b border-neutral-800/50 last:border-b-0 ${
                               repoInput === r.full_name ? 'bg-neutral-800' : ''
@@ -321,7 +327,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                     )}
                     <button
                       type="button"
-                      onClick={() => { setUseManualRepo(true); setRepoInput(''); setRepoFilter(''); }}
+                      onClick={() => { setUseManualRepo(true); setRepoInput(''); setRepoFilter(''); setPreviewDefaultBranch(''); }}
                       className="min-h-[44px] flex items-center text-[10px] text-neutral-500 hover:text-neutral-300 underline transition-colors"
                     >
                       Enter manually
@@ -412,6 +418,36 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                   </div>
                 )}
               </div>
+
+              {previewDefaultBranch && (
+                <div className="mb-4">
+                  <label className="block text-[11px] font-semibold text-neutral-400 uppercase tracking-wider mb-2">
+                    Branch Configuration
+                  </label>
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2 text-[10px]">
+                      <span className="text-neutral-500 w-28 shrink-0">Integration</span>
+                      <span className="font-mono text-neutral-300">{previewDefaultBranch}</span>
+                      <span className="text-neutral-600">(auto-detected)</span>
+                    </div>
+                    <div className="flex items-start gap-2">
+                      <span className="text-[10px] text-neutral-500 w-28 shrink-0 pt-2">Promotion target</span>
+                      <div className="flex-1">
+                        <input
+                          type="text"
+                          value={promotionTargetInput}
+                          onChange={e => setPromotionTargetInput(e.target.value)}
+                          placeholder={`${previewDefaultBranch} (same as integration)`}
+                          className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded px-2 py-1.5 text-[10px] font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700"
+                        />
+                        <p className="text-[9px] text-neutral-600 mt-1">
+                          Leave blank to use the same as integration. Set a different branch for LTS workflows (e.g. <span className="font-mono">main</span> when integration is <span className="font-mono">automain</span>).
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               <p className="text-xs text-neutral-400 mb-4 leading-relaxed">
                 Build configuration will be auto-detected from the repository's root files
@@ -571,7 +607,7 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                             <div className="text-[10px] text-neutral-500 mt-0.5">
                               Label an issue{' '}
                               <code className="font-mono text-[9px] bg-neutral-700 px-1 py-0.5 rounded">
-                                {issueImplementationConfig?.trigger_label ?? 'blueprint:implement'}
+                                {issueImplementationConfig?.trigger_label ?? 'auto:implement'}
                               </code>
                               {' '}to spawn a task
                             </div>
@@ -604,10 +640,10 @@ export function NewProjectModal({ onClose, onSuccess, setupProject }: NewProject
                     <ArrowRight className="w-3 h-3 text-neutral-600 mt-0.5 shrink-0" />
                     <span>Open a PR and Blueprint will automatically review it in the Checks tab</span>
                   </li>
-                  {autoRemediationConfig?.enabled && (
+                  {autoRemediationConfig?.enabled && detectedDefaultBranch && (
                     <li className="flex items-start gap-2">
                       <ArrowRight className="w-3 h-3 text-neutral-600 mt-0.5 shrink-0" />
-                      <span>CI failures on <span className="font-mono text-neutral-300">{detectedDefaultBranch || 'main'}</span> will trigger an automatic fix PR</span>
+                      <span>CI failures on <span className="font-mono text-neutral-300">{detectedDefaultBranch}</span> will trigger an automatic fix PR</span>
                     </li>
                   )}
                   {issueImplementationConfig?.enabled && (

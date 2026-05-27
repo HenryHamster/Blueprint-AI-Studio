@@ -6,6 +6,7 @@ import {
   persistAndPostStatus, git, setupWorkspace, runClaudeCode,
   captureTestBaseline, getProviderRunner, setCurrentPromptFingerprint, sendHeartbeatSync,
   apiPost,
+  resolveBaseBranch,
 } from '../index.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
@@ -76,6 +77,12 @@ const ALEMBIC_VERSIONS_DIR = 'backend/alembic/versions/';
 export function needsMigrationGeneration(changedPaths: string[]): boolean {
   if (!changedPaths.some(p => p === MODELS_PATH)) return false;
   return !changedPaths.some(p => p.startsWith(ALEMBIC_VERSIONS_DIR) && p.endsWith('.py'));
+}
+
+function resolvePrTitlePrefix(task: Record<string, unknown>): string {
+  const buildConfig = task.build_config as Record<string, unknown> | undefined;
+  const prefix = buildConfig?.pr_title_prefix;
+  return typeof prefix === 'string' ? prefix.trim() : '';
 }
 
 export interface StandardHandlerOpts {
@@ -757,8 +764,21 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
   const buildConfig = resolveBuildConfig(task);
   const ctx = (task.context as Record<string, unknown> | undefined) || {};
-  const rawBaseBranch = strVal(payload.base_branch) || strVal(ctx.research_branch) || strVal(ctx.original_base) || 'main';
+  // Cascade: explicit payload override → research-mode context branches →
+  // per-project integration_branch → 'main'. resolveBaseBranch supplies the
+  // final two steps so non-Blueprint projects whose integration branch is
+  // not 'main' (e.g. 'master', 'production') do not silently fall through.
+  const rawBaseBranch =
+    strVal(payload.base_branch)
+    || strVal(ctx.research_branch)
+    || strVal(ctx.original_base)
+    || resolveBaseBranch({} as Record<string, unknown>, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
+  const projectMetaForPromotion = task.project_metadata as Record<string, unknown> | undefined;
+  const promotionTarget =
+    strVal(payload.promotion_target) ||
+    strVal(projectMetaForPromotion?.promotion_target) ||
+    undefined;
   const rawTitle = strVal(task.title) || strVal(payload.title) || 'automated changes';
   const taskTitle = rawTitle.replace(/[`$\\!"';&|<>(){}[\]]/g, '');
 
@@ -772,7 +792,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const rawPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
   const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   const taskTypeKey = strVal(payload.type);
-  const taskTypeHintsMap = getTaskTypeHints(buildConfig);
+  const taskTypeHintsMap = getTaskTypeHints(buildConfig, promotionTarget);
   const taskTypeHint = includeTaskTypeHints && taskTypeHintsMap[taskTypeKey]
     ? `\n\n${taskTypeHintsMap[taskTypeKey].replace(/\{\{BASE_BRANCH\}\}/g, baseBranch)}`
     : '';
@@ -791,7 +811,11 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const coFailurePairsSection = formatSrCoFailurePairsForSrPrompt(coFailurePairs);
   const severityCalibrationHintSection = formatSeverityCalibrationHintForSrPrompt(srCategories);
   const precisionRecallQuadrantHintSection = formatPrecisionRecallQuadrantHintForSrPrompt(srCategories);
-  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix;
+  const prTitlePrefix = opts.prTitlePrefix.trim();
+  const prTitlePrefixNote = prTitlePrefix
+    ? `\n\nWhen you open the PR with ./pr open, start the title with ${prTitlePrefix}.`
+    : '';
+  const finalPrompt = claudeMdPrefix + playbookSection + retryContext + buildPrompt({ contextPrefix, parentCtx, rawPrompt }) + taskTypeHint + firstTaskSection + CODE_CHANGE_HELPER_GUIDANCE + taskTypeFocusBlock + loosenHintSection + coFailurePairsSection + severityCalibrationHintSection + precisionRecallQuadrantHintSection + executionEvidenceSection + PLAYBOOK_GUIDANCE + `\nNote: If lint or test fixes required non-obvious steps, save them to the playbook (e.g., ./playbook set "lint-gotcha" "description").\n` + assembleFailureGuidanceBlocks() + VIEWPORT_INFRA_SKIP_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}` + promptSuffix + prTitlePrefixNote;
 
   const { workBranch } = await setupWorkspace(owner, repo, ghToken, baseBranch, branchPrefix, taskId, ws, statusRef, buildConfig);
   writePlaybookHelper(taskId);
@@ -855,7 +879,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const isAutoRemediation = Boolean(
     (task.context as Record<string, unknown> | undefined)?.auto_remediation
   );
-  if (captureBaseline && runTestFix && baseBranch === 'main' && !isAutoRemediation) {
+  if (captureBaseline && runTestFix && baseBranch === (promotionTarget ?? resolveBaseBranch({}, task)) && !isAutoRemediation) {
     const relatedFiles = (
       (payload.related_files as string[] | undefined) ||
       ((task.context as Record<string, unknown> | undefined)?.related_files as string[] | undefined) ||
@@ -1051,7 +1075,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     baseBranch,
     owner,
     repo,
-    testsOnMainBranch: baseBranch === 'main',
+    testsOnMainBranch: baseBranch === (promotionTarget ?? resolveBaseBranch({}, task)),
     baseCommit,
     model,
     effort,
@@ -1059,16 +1083,15 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     noChangesMessage,
     analysisContext,
     regressingCategories: reasoningGateCats.length > 0 ? reasoningGateCats : undefined,
+    buildConfig,
   });
 
   // Fresh reviewer pass: read-only second session to catch what the implementing
-  // session missed. Enabled per-project via project_metadata.enable_fresh_reviewer,
-  // and auto-on for self-repo projects (the Blueprint repo measuring itself) so
-  // the cycle-over-cycle catch-rate measurement always has a meaningful sample.
+  // session missed. Enabled per-project via project_metadata.enable_fresh_reviewer.
   // Skipped for auto-remediation tasks (their job IS to fix what a reviewer would flag).
   const projectMeta = task.project_metadata as Record<string, unknown> | undefined;
   const freshReviewerEnabled =
-    projectMeta?.enable_fresh_reviewer === true || projectMeta?.is_self_repo === true;
+    projectMeta?.enable_fresh_reviewer === true;
   let freshReviewerAlreadyRan = false;
   if (freshReviewerEnabled && !isAutoRemediation) {
     freshReviewerAlreadyRan = true;
@@ -1091,7 +1114,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
   // Auto-trigger fresh-reviewer when lone-checker categories overlap this task's
   // risk surface. SR is the sole corroborator for these categories, so a PASS is
-  // uncorroborated. Fires regardless of enable_fresh_reviewer / is_self_repo.
+  // uncorroborated. Fires regardless of enable_fresh_reviewer.
   if (!isAutoRemediation && !freshReviewerAlreadyRan) {
     const loneCheckerRelatedFiles = (
       (payload.related_files as string[] | undefined) ||
@@ -1115,8 +1138,8 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
 
   // Auto-trigger fresh-reviewer recovery when SR admits incomplete_review and
   // the normal fresh-reviewer path hasn't already run. Fires regardless of
-  // project_metadata.enable_fresh_reviewer / is_self_repo. Skipped for
-  // auto-remediation tasks (same exclusion as the normal path).
+  // project_metadata.enable_fresh_reviewer. Skipped for auto-remediation tasks
+  // (same exclusion as the normal path).
   if (!isAutoRemediation && !freshReviewerAlreadyRan) {
     const srRecoveryPath = `/tmp/self_review_${taskId}.json`;
     let srRecovery: Record<string, unknown> = {};
@@ -1191,8 +1214,34 @@ export async function handleCreate(
   const operatorReviewFor = taskCtx?.operator_requested_review_for as string | undefined;
   if (operatorReviewFor) {
     const prBranch = validateBranchName(strVal(payload.branch), 'branch');
-    const prBaseBranch = validateBranchName(strVal(payload.base_branch, 'main'), 'base_branch');
+    const prBaseBranch = validateBranchName(resolveBaseBranch(payload, task), 'base_branch');
     const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+
+    // Check the branch still exists before cloning — auto-delete-on-merge removes
+    // the head branch as soon as the PR is merged, making clone fatal. This is a
+    // permanent state (not a transient error), so short-circuit cleanly.
+    let branchExists = false;
+    try {
+      const lsOut = execFileSync('git', ['ls-remote', '--heads', cloneUrl, prBranch], { timeout: 30000 });
+      branchExists = lsOut.toString().trim().length > 0;
+    } catch {
+      // ls-remote itself failed (auth error, network, etc.) — let the clone attempt
+      // proceed and fail loudly so non-branch errors still surface.
+      branchExists = true;
+    }
+    if (!branchExists) {
+      const skipMsg = `PR head branch '${prBranch}' no longer exists on ${owner}/${repo} — likely merged and auto-deleted. Skipping review (nothing to review).`;
+      sendLog(ws, `[FreshReview] ${skipMsg}\n`);
+      await persistAndPostStatus(taskId, {
+        task_id: taskId,
+        status: 'COMPLETED',
+        artifact_type: 'ERROR_LOG',
+        logs: skipMsg,
+        failure_category: 'PR_BRANCH_DELETED',
+      });
+      return;
+    }
+
     sendLog(ws, `[FreshReview] Operator-requested pass — cloning ${owner}/${repo} branch ${prBranch}\n`);
     await prepareWorkspaceForRole({ workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken, branch: prBranch, baseBranch: prBaseBranch, depth: DEFAULT_CLONE_DEPTH });
     try { git(['fetch', 'origin', `+refs/heads/${prBaseBranch}:refs/remotes/origin/${prBaseBranch}`, '--depth', String(DEFAULT_CLONE_DEPTH)]); } catch { /* ok */ }
@@ -1228,7 +1277,7 @@ export async function handleCreate(
     branchPrefix: 'task',
     buildPrompt: ({ contextPrefix, parentCtx }) => `${contextPrefix}${parentCtx}${moduleInterfaceContext}${affectedConsumersContext}${relatedTestContext}${overlapWarningText}${mediumScopePlanningNote}${createScopeBudgetNote}${prompt}${siblingNote}`,
     commitPrefix: 'blueprint',
-    prTitlePrefix: '[Blueprint]',
+    prTitlePrefix: resolvePrTitlePrefix(task),
     noChangesMessage: 'No file changes.',
     runLintFix: true,
     runTestFix: true,

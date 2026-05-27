@@ -26,7 +26,7 @@ vi.mock('../api', () => ({
         JSON.stringify({
           config: {
             enabled: true,
-            trigger_label: 'blueprint:implement',
+            trigger_label: 'auto:implement',
             max_per_hour: 10,
             max_concurrent: 3,
             base_branch: 'main',

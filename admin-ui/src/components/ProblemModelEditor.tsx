@@ -84,13 +84,8 @@ export function ProblemModelEditor({
   }
 
   return (
-    // Dense admin-only modal: close glyph, constraint remove buttons, and the
-    // compact Cancel/Save row are intentionally below 44px. Mirrors the
-    // existing eslint-disable-next-line viewport/min-touch-target comments on
-    // the buttons below.
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
-      data-viewport-allow-small-target
     >
       <div className="bg-neutral-950 border border-neutral-800 rounded-lg w-full max-w-2xl max-h-[90vh] flex flex-col">
         <div className="flex items-center justify-between px-5 py-3 border-b border-neutral-800">
@@ -100,6 +95,7 @@ export function ProblemModelEditor({
             onClick={onClose}
             className="text-neutral-500 hover:text-neutral-200 transition"
             aria-label="Close"
+            data-viewport-allow-small-target
           >
             <X size={16} />
           </button>
@@ -206,22 +202,22 @@ export function ProblemModelEditor({
                     placeholder="e.g., Don't modify .github/workflows/"
                     className="flex-1 px-3 py-1.5 text-sm bg-neutral-900 border border-neutral-800 rounded text-neutral-100 placeholder-neutral-600 focus:border-neutral-600 outline-none"
                   />
-                  {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
                   <button
                     type="button"
                     onClick={() => removeConstraint(i)}
                     className="shrink-0 p-1.5 text-neutral-500 hover:text-rose-400 transition"
                     aria-label="Remove constraint"
+                    data-viewport-allow-small-target
                   >
                     <Trash2 size={14} />
                   </button>
                 </div>
               ))}
-              {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
               <button
                 type="button"
                 onClick={addConstraint}
                 className="inline-flex items-center gap-1 px-2 py-1 text-xs text-neutral-400 hover:text-neutral-100 transition"
+                data-viewport-allow-small-target
               >
                 <Plus size={12} />
                 Add constraint
@@ -235,7 +231,7 @@ export function ProblemModelEditor({
             type="button"
             onClick={onClose}
             disabled={saving}
-            className="px-3 py-1.5 text-xs font-medium rounded border border-neutral-800 text-neutral-400 hover:bg-neutral-800/50 hover:text-neutral-200 transition"
+            className="min-h-[44px] px-3 py-1.5 text-xs font-medium rounded border border-neutral-800 text-neutral-400 hover:bg-neutral-800/50 hover:text-neutral-200 transition"
           >
             Cancel
           </button>
@@ -243,7 +239,7 @@ export function ProblemModelEditor({
             type="button"
             onClick={handleSave}
             disabled={saving}
-            className="px-3 py-1.5 text-xs font-medium rounded border border-cyan-500/40 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 transition disabled:opacity-40"
+            className="min-h-[44px] px-3 py-1.5 text-xs font-medium rounded border border-cyan-500/40 bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20 transition disabled:opacity-40"
           >
             {saving ? 'Saving…' : 'Save'}
           </button>

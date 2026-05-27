@@ -591,12 +591,21 @@ export function useSettings(addToast: AddToast) {
 
   const updateBuildConfig = async (projectId: string, config: BuildConfig) => {
     const prev = buildConfig;
-    setBuildConfig(config);
+    // Operator-configured fields are not auto-detectable; preserve them from the
+    // current state when the caller doesn't supply them (e.g. detect replaced
+    // buildConfig without these fields, and the component spread passed undefined).
+    const merged: BuildConfig = {
+      ...config,
+      task_branch_namespace: config.task_branch_namespace ?? prev?.task_branch_namespace,
+      task_branch_prefix: config.task_branch_prefix ?? prev?.task_branch_prefix,
+      pr_title_prefix: config.pr_title_prefix ?? prev?.pr_title_prefix,
+    };
+    setBuildConfig(merged);
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/projects/${projectId}`, {
         method: 'PATCH',
         headers: await authHeaders(),
-        body: JSON.stringify({ build_config: config }),
+        body: JSON.stringify({ build_config: merged }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
     } catch {

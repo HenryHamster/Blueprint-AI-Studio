@@ -8,18 +8,20 @@ import {
   runClaudeCode, sendHeartbeatSync, setCurrentPromptFingerprint,
   captureTestBaseline, testFixLoop, extractPytestSelectorsFromOutput,
   snapshotToolTrace, extractInvestigatedFiles,
+  resolveBaseBranch,
 } from '../index.js';
 import { runCodeChangeTask } from './code-change.js';
 import { runFreshReviewerPass } from './standard.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
-import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT, FRONTEND_NPM_TIMEOUT } from '../constants.js';
+import { DEFAULT_CLONE_DEPTH, SCOPE_OVERFLOW_THRESHOLDS, PUSH_FORCE_WITH_LEASE_MAX_RETRIES, PUSH_FORCE_WITH_LEASE_RETRY_DELAY, CONFLICT_CHECK_TIMEOUT, FRONTEND_NPM_TIMEOUT, shouldFanOutReview, shouldFanOutFix } from '../constants.js';
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
-  FIX_TASK_FOCUS, getTaskTypeFocusBlock,
+  FIX_TASK_FOCUS, getTaskTypeFocusBlock, PARALLEL_REVIEW_GUIDANCE, PARALLEL_FIX_GUIDANCE,
   assembleFailureGuidanceBlocks,
   readClaudeMd, formatProjectContext, configureAgentPermissions, computePromptFingerprint,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, discoverRelatedTests, formatSelfReviewBlindSpots, type PlaybookEntry,
+  buildScopedLintOneliner, detectLinterKind,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 
@@ -111,6 +113,11 @@ type ReviewPromptFingerprintOptions = {
   branch?: string;
   baseBranch?: string;
   includePlannedFilesClassificationGuidance?: boolean;
+  // When the parent's enable_parallel_review flag is on AND the helper says
+  // fan-out is worth it, handleReview injects PARALLEL_REVIEW_GUIDANCE. The
+  // fingerprint MUST move so reviewer telemetry can A/B the two modes — same
+  // fingerprint for both would silently mix parallel and serial outcomes.
+  includeParallelReviewGuidance?: boolean;
 };
 
 // ── Static review-guidance fragments (shared with prompt fingerprint) ────────
@@ -184,7 +191,7 @@ function buildReviewDiffAccessHint(baseBranch: string): string {
   return `You have full access to the codebase. Read any files you need to understand the changes in context. Use \`git diff origin/${baseBranch}...HEAD\` to see the full diff, or \`git diff origin/${baseBranch}...HEAD -- <file>\` for specific files.`;
 }
 
-function buildReviewChecklistSection(buildConfig?: BuildConfig): string {
+function buildReviewChecklistSection(buildConfig?: BuildConfig, baseBranch?: string): string {
   return `Review the changes thoroughly using this checklist:
 
 **Correctness & Logic:**
@@ -209,7 +216,7 @@ function buildReviewChecklistSection(buildConfig?: BuildConfig): string {
 - Are there tests for the new/changed behavior?
 - Do existing tests still pass given these changes?
 
-${buildTypeCheckInstructions(buildConfig)}`;
+${buildTypeCheckInstructions(buildConfig, baseBranch)}`;
 }
 
 function buildReviewSeverityGuideSection(): string {
@@ -256,8 +263,12 @@ For each issue in the \`issues\` array:
 IMPORTANT: Also write your verdict JSON to /tmp/review_verdict_${taskId}.json (NOT in the repository). The file should contain ONLY the JSON object, no markdown wrapping.`;
 }
 
-function buildRollupReviewGuidance(branch: string, baseBranch: string): string {
-  const isRollupHead = branch.startsWith('research/') || branch.startsWith('plan/');
+function buildRollupReviewGuidance(
+  branch: string,
+  baseBranch: string,
+  stagingPrefixes: string[] = ['research/', 'plan/'],
+): string {
+  const isRollupHead = stagingPrefixes.some(p => branch.startsWith(p));
   return isRollupHead
     ? `
 **Rollup-PR verification (IMPORTANT — head branch "${branch}" looks like a rollup):**
@@ -289,8 +300,8 @@ function buildPlannedFilesClassificationGuidance(): string {
 If unsure on edge cases, do not flag — let the operator decide.`;
 }
 
-function buildReviewCoreGuidance(buildConfig: BuildConfig | undefined, taskId: string): string {
-  return `${buildReviewChecklistSection(buildConfig)}
+function buildReviewCoreGuidance(buildConfig: BuildConfig | undefined, taskId: string, baseBranch?: string): string {
+  return `${buildReviewChecklistSection(buildConfig, baseBranch)}
 
 ${buildReviewSeverityGuideSection()}
 
@@ -330,6 +341,9 @@ function buildReviewPromptFingerprintContent(
   if (rollupGuidance) sections.push(rollupGuidance.trim());
   if (options.includePlannedFilesClassificationGuidance) {
     sections.push(buildPlannedFilesClassificationGuidance());
+  }
+  if (options.includeParallelReviewGuidance) {
+    sections.push(PARALLEL_REVIEW_GUIDANCE);
   }
   sections.push(DEFAULT_TOOL_GUIDANCE);
   return sections.join('\n\n');
@@ -643,9 +657,9 @@ export function buildBlueprintPrFooter(opts: {
 // Medium-scope priority hint based on which subsystem the PR touches. The
 // reviewer otherwise weights every checklist section equally, accumulating
 // off-target findings (e.g. SQL injection notes on agent-only TypeScript
-// changes) that drive extra fix iterations. Returns '' for mixed-subsystem
-// PRs so they keep full scrutiny.
-export function detectMediumScopeSubsystemHint(changedFiles: string): string {
+// changes) that drive extra fix iterations. Returns '' when no buildConfig
+// directories are configured, or when files don't match any configured dir.
+export function detectMediumScopeSubsystemHint(changedFiles: string, buildConfig?: BuildConfig): string {
   const paths = changedFiles
     .split('\n')
     .map(l => l.trim())
@@ -653,28 +667,47 @@ export function detectMediumScopeSubsystemHint(changedFiles: string): string {
     .map(l => l.split(/\s+/).pop() || '')
     .filter(Boolean);
   if (paths.length === 0) return '';
-  if (paths.every(p => p.startsWith('agent/'))) {
-    return 'This is a medium-scope change confined to agent/ (TypeScript agent code). The agent does not touch the database, so deprioritize SQL injection and database query checks. Focus on Correctness & Logic, Build & Type Safety, and TypeScript-specific concerns.\n\n';
-  }
-  if (paths.every(p => p.startsWith('admin-ui/'))) {
-    return 'This is a medium-scope change confined to admin-ui/ (frontend). Deprioritize backend-specific checks like SQL injection, server-side authorization, and database query review. Focus on Correctness & Logic, Build & Type Safety, XSS risks, and frontend-specific concerns.\n\n';
-  }
-  if (paths.every(p => p.startsWith('backend/'))) {
-    if (paths.every(p => p.startsWith('backend/testing/') || /(^|\/)test_[^/]+\.py$|(^|\/)conftest\.py$/.test(p))) {
-      return 'This is a medium-scope change confined to backend test files (backend/testing/). Deprioritize SQL injection, authorization, and input-validation checks — these tests do not handle real user input or production database connections. Focus on test quality: correct assertions, test isolation, fixture cleanup, and coverage of the intended behavior.\n\n';
+
+  const dirs = buildConfig?.directories;
+  if (!dirs?.length) return '';
+
+  // Match each path to the first configured directory whose path it starts with.
+  const matchedDirPaths = new Set<string>();
+  for (const p of paths) {
+    for (const d of dirs) {
+      const prefix = d.path.endsWith('/') ? d.path : d.path + '/';
+      if (p === d.path || p.startsWith(prefix)) {
+        matchedDirPaths.add(d.path);
+        break;
+      }
     }
-    return 'This is a medium-scope change confined to backend/. Apply full security scrutiny — review SQL injection, authorization checks, input validation, and server-side concerns thoroughly.\n\n';
   }
-  const topDirs = new Set(paths.map(p => p.split('/')[0]).filter(Boolean));
-  const subsystems = new Set<string>();
-  for (const d of topDirs) {
-    if (d === 'backend' || d === 'agent' || d === 'admin-ui') subsystems.add(d);
-  }
-  if (subsystems.size >= 2) {
-    const list = Array.from(subsystems).sort().join(', ');
+
+  if (matchedDirPaths.size === 0) return '';
+
+  if (matchedDirPaths.size >= 2) {
+    const list = Array.from(matchedDirPaths).sort().join(', ');
     return `This is a medium-scope cross-system change touching multiple subsystems (${list}). Prioritize interface consistency between subsystems over single-file style concerns: shared types, API contracts, payload shapes, and field names must match across boundaries. Verify both sides of every integration point are updated together — e.g., a backend response field has a corresponding frontend/agent reader, a new payload key is produced and consumed, schema changes are reflected in serializers and TypeScript types. Cross-file inconsistencies (mismatched names, missing updates on one side, divergent assumptions about shape/nullability) are higher severity than local style issues.\n\n`;
   }
-  return '';
+
+  const dirPath = Array.from(matchedDirPaths)[0];
+  const dir = dirs.find(d => d.path === dirPath);
+  if (!dir) return '';
+
+  if (dir.type === 'python') {
+    const dirPrefix = dir.path.endsWith('/') ? dir.path : dir.path + '/';
+    const matchedPaths = paths.filter(p => p === dir.path || p.startsWith(dirPrefix));
+    const isAllTests = matchedPaths.every(p =>
+      p.includes('/testing/') || /(^|\/)test_[^/]+\.py$|(^|\/)conftest\.py$/.test(p)
+    );
+    if (isAllTests) {
+      return `This is a medium-scope change confined to test files in ${dir.path}/. Deprioritize SQL injection, authorization, and input-validation checks — these tests do not handle real user input or production database connections. Focus on test quality: correct assertions, test isolation, fixture cleanup, and coverage of the intended behavior.\n\n`;
+    }
+    return `This is a medium-scope change confined to ${dir.path}/. Apply full security scrutiny — review SQL injection, authorization checks, input validation, and server-side concerns thoroughly.\n\n`;
+  }
+
+  // node or other types — deprioritize database/SQL checks
+  return `This is a medium-scope change confined to ${dir.path}/ (TypeScript/Node.js). This code does not directly access the database, so deprioritize SQL injection and database query checks. Focus on Correctness & Logic, Build & Type Safety, and TypeScript-specific concerns.\n\n`;
 }
 
 // Pre-install node_modules in every node-typed directory in the reviewer's
@@ -683,8 +716,9 @@ export function detectMediumScopeSubsystemHint(changedFiles: string): string {
 // reviewers to install before building, this is the belt to that suspenders.
 //
 // For repos with a configured BuildConfig, iterates buildConfig.directories.
-// For Blueprint's self-repo (is_self_repo=true → undefined buildConfig), uses
-// the same hardcoded admin-ui/agent/root list as the fallback prompt.
+// For projects with buildConfig.directories, iterates the configured node directories.
+// Otherwise scans the workspace root and immediate subdirectories for package.json and
+// installs in every directory it finds.
 function preinstallNodeDeps(
   workspace: string,
   buildConfig: BuildConfig | undefined,
@@ -697,8 +731,17 @@ function preinstallNodeDeps(
       if (d.type === 'node') targets.push(d.path.replace(/\/$/, ''));
     }
   } else {
-    // Blueprint self-repo fallback: every node directory the reviewer might touch.
-    for (const candidate of ['admin-ui', 'agent', '']) {
+    // Generic fallback: scan root and top-level directories for package.json,
+    // mirroring the detectTestRunners pattern in index.ts.
+    const candidates: string[] = [''];  // '' = workspace root
+    try {
+      for (const entry of fs.readdirSync(workspace, { withFileTypes: true })) {
+        if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules') {
+          candidates.push(entry.name);
+        }
+      }
+    } catch { /* best-effort: directory listing failed */ }
+    for (const candidate of candidates) {
       const checkPath = candidate ? `${workspace}/${candidate}` : workspace;
       if (fs.existsSync(`${checkPath}/package.json`)) {
         targets.push(candidate);
@@ -726,23 +769,35 @@ function preinstallNodeDeps(
 // always has dependencies available — without the prefix, every reviewer on a
 // fresh VM hits "cannot resolve <package>" and flags it as a build-gate
 // failure even when the underlying PR is fine.
-function buildTypeCheckInstructions(buildConfig?: BuildConfig): string {
+export function buildTypeCheckInstructions(buildConfig?: BuildConfig, baseBranch?: string): string {
   if (!buildConfig || !buildConfig.directories || buildConfig.directories.length === 0) {
     return `**Build & Type Safety (MUST run these — do not skip):**
-- For frontend changes (admin-ui/): run \`cd admin-ui && npm ci && npm run build\` — report any errors
-- For agent changes (agent/): run \`cd agent && npm ci && npx tsc --noEmit\` — report any type errors
-- For backend changes (backend/): run \`cd backend && python -m py_compile app/main.py\` or check imports
-- Only run the build commands listed above. The repo root may have its own \`npm run build\`, but it is NOT a required gate — do not invent additional build invocations.
-- For ANY code changes: run the relevant build command above and include results in your verdict. A build failure is an automatic REQUEST_CHANGES — but FIRST verify your workspace is fully installed: a missing-package error like "cannot resolve <foo>" is almost always a stale workspace, not a real defect. Re-run with the install step prefix above before flagging.`;
+- For TypeScript/JavaScript changes: find the package root for each changed file (the nearest parent directory with a package.json), then run \`npm ci && npm run build\` (or \`npx tsc --noEmit\` for TypeScript-only packages) — report any errors
+- For Python changes: run \`python -m ruff check <changed_files>\` or \`python -m py_compile <changed_files>\` to verify syntax/style — report any errors
+- For Go changes: run \`go build ./...\` — report any errors; for Rust: run \`cargo check\`
+- Only run checks for the subsystems touched by the changed files. Do not invent additional build invocations.
+- For ANY code changes: run the relevant command above and include results in your verdict. A build failure is an automatic REQUEST_CHANGES — but FIRST verify your workspace is fully installed: a missing-package error like "cannot resolve <foo>" is almost always a stale workspace, not a real defect. Re-run with the install step prefix above before flagging.`;
   }
+  const base = baseBranch ?? 'main';
   const checks = buildConfig.directories
     .filter(d => d.build_cmd || d.lint_cmd)
     .map(d => {
-      const cmd = d.build_cmd || d.lint_cmd;
       const installPrefix = d.type === 'node'
         ? 'npm ci && '
         : d.install_cmd ? `${d.install_cmd} && ` : '';
-      return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && ${installPrefix}${cmd}\` — report any errors`;
+      if (d.build_cmd) {
+        return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && ${installPrefix}${d.build_cmd}\` — report any errors`;
+      }
+      // lint_cmd only: delegate to shared helper so scoping logic stays in sync
+      // with the ./check fix path (buildScopedLintOneliner in prompt.ts).
+      const lintCmd = d.lint_cmd ?? '';
+      const scopedOneliner = buildScopedLintOneliner(lintCmd, d.path, base, 'git-diff');
+      if (scopedOneliner) {
+        const kind = detectLinterKind(lintCmd);
+        const fileDesc = kind === 'eslint' ? 'JS/TS' : '.py';
+        return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && ${scopedOneliner}\` — report any errors (scoped to changed ${fileDesc} files)`;
+      }
+      return `- For changes in \`${d.path}/\`: run \`cd ${d.path} && ${installPrefix}${lintCmd}\` — report any errors`;
     });
   if (checks.length === 0) {
     return '**Build & Type Safety:** No build commands configured — review code manually for type correctness.';
@@ -762,7 +817,7 @@ export async function handleReview(
   const prNumber = Number(payload.pr_number);
   if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Invalid pr_number: ${String(payload.pr_number)}`);
   const branch = validateBranchName(strVal(payload.branch), 'branch');
-  const baseBranch = validateBranchName(strVal(payload.base_branch, 'main'), 'base_branch');
+  const baseBranch = validateBranchName(resolveBaseBranch(payload, task), 'base_branch');
   const originalPrompt = strVal(payload.original_prompt);
 
   // Read review iteration from task context
@@ -777,6 +832,30 @@ export async function handleReview(
   statusRef.value = `Cloning ${owner}/${repo} (PR #${prNumber})...`;
   sendLog(ws, `Reviewing PR #${prNumber} on branch ${branch} (iteration ${iteration})\n`);
   const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  // Check the branch still exists before cloning — auto-delete-on-merge removes
+  // the head branch as soon as the PR is merged, making clone fatal. This is a
+  // permanent state (not a transient error), so short-circuit cleanly.
+  let reviewBranchExists = false;
+  try {
+    const lsOut = execFileSync('git', ['ls-remote', '--heads', cloneUrl, branch], { timeout: 30000 });
+    reviewBranchExists = lsOut.toString().trim().length > 0;
+  } catch {
+    // ls-remote itself failed (auth error, network, etc.) — let the clone attempt
+    // proceed and fail loudly so non-branch errors still surface.
+    reviewBranchExists = true;
+  }
+  if (!reviewBranchExists) {
+    const skipMsg = `PR head branch '${branch}' no longer exists on ${owner}/${repo} — likely merged and auto-deleted. Skipping review (nothing to review).`;
+    sendLog(ws, skipMsg + '\n');
+    await persistAndPostStatus(taskId, {
+      task_id: taskId,
+      status: 'COMPLETED',
+      artifact_type: 'ERROR_LOG',
+      logs: skipMsg,
+      failure_category: 'PR_BRANCH_DELETED',
+    });
+    return;
+  }
   // Shallow clone of the PR branch directly — avoids fetch+checkout issues with --single-branch
   await prepareWorkspaceForRole({
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
@@ -856,7 +935,7 @@ export async function handleReview(
       : taskScope === 'large'
         ? REVIEW_LARGE_SCOPE_PREAMBLE
         : taskScope === 'medium'
-          ? detectMediumScopeSubsystemHint(changedFiles)
+          ? detectMediumScopeSubsystemHint(changedFiles, reviewBuildConfig)
           : '';
 
   // Read CLAUDE.md for codebase instructions
@@ -898,7 +977,7 @@ export async function handleReview(
   // the rollup branch. We've seen reviewers misread these as "already-on-main"
   // and flag perfectly valid rollup PRs as empty, looping the fix agent on
   // nothing. Make the verification steps explicit.
-  const rollupGuidance = buildRollupReviewGuidance(branch, baseBranch);
+  const rollupGuidance = buildRollupReviewGuidance(branch, baseBranch, reviewBuildConfig?.staging_branch_prefixes);
 
   // Surface which files the create task's self-review verified vs. left unread
   // (truncation blind spots). Only present when _self_review_outcome was
@@ -980,13 +1059,23 @@ ${selfReviewBlindSpotsSection}
 ${plannedFilesSection}
 
 ${buildReviewDiffAccessHint(baseBranch)}
-${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCoreGuidance(reviewBuildConfig, taskId)}`;
+${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCoreGuidance(reviewBuildConfig, taskId, baseBranch)}`;
 
-  const launchedReviewPrompt = reviewPrompt + `\n\n${DEFAULT_TOOL_GUIDANCE}`;
+  // Parallel-review fan-out gating: per-project flag AND helper-threshold both
+  // required. False positives (extra fan-out) are cheap subagent overhead;
+  // false negatives are wall-clock that subagent investigation would have
+  // saved. Inject the guidance just before DEFAULT_TOOL_GUIDANCE so prompt
+  // ordering stays deterministic for the fingerprint.
+  const reviewProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
+  const parallelReviewFlag = reviewProjectMeta?.enable_parallel_review === true;
+  const parallelReviewInjected = parallelReviewFlag && shouldFanOutReview(changedFilePathList, reviewBuildConfig);
+  const parallelReviewBlock = parallelReviewInjected ? `\n\n${PARALLEL_REVIEW_GUIDANCE}` : '';
+  const launchedReviewPrompt = reviewPrompt + parallelReviewBlock + `\n\n${DEFAULT_TOOL_GUIDANCE}`;
   const promptFingerprint = computeReviewPromptFingerprint(reviewBuildConfig, {
     branch,
     baseBranch,
     includePlannedFilesClassificationGuidance: plannedFiles.length > 0 && plannedFilesSection.includes('Files changed but NOT in the original plan:'),
+    includeParallelReviewGuidance: parallelReviewInjected,
   });
   statusRef.value = 'Running code review...';
   setCurrentPromptFingerprint(promptFingerprint);
@@ -1015,6 +1104,9 @@ ${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCore
         // schemas.StatusUpdate.verdict_json max_length=10000.
         if (investigatedFiles.length > 0 && !parsed.investigated_files) {
           parsed.investigated_files = investigatedFiles.slice(0, 25);
+        }
+        if (parallelReviewInjected) {
+          parsed.review_was_parallelized = true;
         }
         const augmented = JSON.stringify(parsed);
         verdictJsonField = augmented;
@@ -1056,12 +1148,13 @@ export async function handleFix(
   model?: string, effort?: string
 ) {
   const branch = validateBranchName(strVal(payload.branch), 'branch');
-  const baseBranch = validateBranchName(strVal(payload.base_branch, 'main'), 'base_branch');
+  const baseBranch = validateBranchName(resolveBaseBranch(payload, task), 'base_branch');
   const prompt = strVal(payload.prompt);
   const prNumber = Number(payload.pr_number);
   if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Invalid pr_number: ${String(payload.pr_number)}`);
   const originalPrompt = strVal(payload.original_prompt);
   const fixOrigTaskType = strVal(payload.original_task_type || '');
+  const promotionTarget = strVal(payload.promotion_target) || strVal((task.project_metadata as Record<string, unknown> | undefined)?.promotion_target) || undefined;
 
   if (!prompt) throw new Error('Fix task missing prompt');
 
@@ -1199,6 +1292,24 @@ export async function handleFix(
   if (fixSelfReviewSection) {
     basePrompt = `${fixSelfReviewSection}${basePrompt}`;
   }
+
+  // Parallel fix fan-out gating: per-project flag AND helper-threshold both
+  // required. Inject PARALLEL_FIX_GUIDANCE near DEFAULT_TOOL_GUIDANCE so the
+  // fingerprint is stable and telemetry can A/B by fingerprint.
+  const fixProjectMetaEarly = task.project_metadata as Record<string, unknown> | undefined;
+  const parallelFixFlag = fixProjectMetaEarly?.enable_parallel_fix === true;
+  const latestIssuesForFanOut = reviewHistory[reviewHistory.length - 1]?.issues ?? [];
+  const reviewIssueFilesForFanOut = latestIssuesForFanOut
+    .map(i => i.file)
+    .filter((f): f is string => typeof f === 'string' && f.length > 0);
+  const parallelFixInjected =
+    parallelFixFlag &&
+    shouldFanOutFix(
+      fixChangedFilePathList,
+      latestIssuesForFanOut.length,
+      reviewIssueFilesForFanOut,
+      fixBuildConfig,
+    );
 
   // Always check for conflict markers — even if rebase/merge appeared to succeed
   let enrichedPrompt = basePrompt;
@@ -1393,7 +1504,8 @@ export async function handleFix(
       fixSrFocusBlock += `\n4. **Repeating-issues verification** — these CRITICAL/MAJOR issues appeared in multiple prior iterations. Verify each is now resolved and record under \`correctness\` or \`regression_risk\` in your self-review JSON:\n${repeating.map(d => `- ${d}`).join('\n')}\n`;
     }
   }
-  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${CODE_CHANGE_HELPER_GUIDANCE}${fixSrFocusBlock}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${assembleFailureGuidanceBlocks()}\n\n${DEFAULT_TOOL_GUIDANCE}`;
+  const parallelFixBlock = parallelFixInjected ? `\n\n${PARALLEL_FIX_GUIDANCE}` : '';
+  enrichedPrompt = `${enrichedPrompt}${fixFirstTaskSection}${CODE_CHANGE_HELPER_GUIDANCE}${fixSrFocusBlock}${PLAYBOOK_GUIDANCE}\nNote: If the review feedback revealed a recurring pattern or non-obvious codebase rule, save it to the playbook.\n${assembleFailureGuidanceBlocks()}${parallelFixBlock}\n\n${DEFAULT_TOOL_GUIDANCE}`;
 
   // Structured-response invitation: when the agent disagrees with a reviewer
   // issue (e.g. an unplanned file is actually caller-impact, not scope-creep),
@@ -1477,12 +1589,19 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
   }
 
   // Run Claude with the review feedback as the prompt
-  const promptFingerprint = computePromptFingerprint('fix', fixBuildConfig);
+  const promptFingerprint = computePromptFingerprint('fix', fixBuildConfig, { includeParallelFixGuidance: parallelFixInjected, promotionTarget });
   statusRef.value = 'Addressing review feedback...';
   setCurrentPromptFingerprint(promptFingerprint);
   // Emit once before the fix session starts so fast fix/rebase tasks still
   // persist the stable code-change fingerprint on the backend.
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
+  // Telemetry: persist parallelization marker so orchestrator can attribute outcomes.
+  if (parallelFixInjected) {
+    try {
+      const parallelMarker = JSON.stringify({ fix_was_parallelized: true, task_id: taskId });
+      fs.writeFileSync(`/tmp/fix_parallelized_${taskId}.json`, parallelMarker, 'utf-8');
+    } catch { /* non-fatal */ }
+  }
   const fixBaseCommit = git(['rev-parse', 'HEAD']);
   // 2026-05-04: post-Claude lint/test/push pipeline replaced with
   // runCodeChangeTask. Claude calls ./check + ./pr open (which pushes
@@ -1498,21 +1617,20 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
     owner,
     repo,
     existingPrNumber: prNumber,
-    testsOnMainBranch: baseBranch === 'main',
+    testsOnMainBranch: baseBranch === (promotionTarget ?? resolveBaseBranch({}, task)),
     baseCommit: fixBaseCommit,
     model,
     effort,
     disallowedTools: disallowedToolsFix,
     noChangesMessage: 'No file changes after review-fix iteration.',
+    buildConfig: fixBuildConfig,
   });
 
   // Fresh reviewer pass: read-only second session to catch issues the fix
-  // agent missed. Enabled per-project via project_metadata.enable_fresh_reviewer,
-  // and auto-on for self-repo projects so cycle-over-cycle catch-rate has a
-  // meaningful sample without an operator toggling the flag.
+  // agent missed. Enabled per-project via project_metadata.enable_fresh_reviewer.
   const fixProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
   const freshReviewerEnabled =
-    fixProjectMeta?.enable_fresh_reviewer === true || fixProjectMeta?.is_self_repo === true;
+    fixProjectMeta?.enable_fresh_reviewer === true;
   if (freshReviewerEnabled) {
     const fixTaskTitle = strVal(task.title) || originalPrompt.slice(0, 80) || 'Fix task';
     await runFreshReviewerPass(

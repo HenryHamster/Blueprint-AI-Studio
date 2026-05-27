@@ -25,6 +25,7 @@ Related bug history (see comments on each check for details):
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -622,6 +623,812 @@ def test_static_script_bash_syntax(path: Path, bash_executable: str | None):
         [bash_executable, "-n", str(path)], capture_output=True, text=True, timeout=10
     )
     assert result.returncode == 0, f"bash -n failed on {path}:\n{result.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# Packer bake-time memo smoke contract
+# ---------------------------------------------------------------------------
+# These tests lock in the memo-handler exercise that agent.pkr.hcl runs
+# before tagging blueprint-agent-v2. A future packer edit that silently
+# drops or weakens the smoke step will fail here before any image is tagged.
+
+
+_PACKER_HCL = (
+    Path(__file__).resolve().parent.parent.parent / "infra" / "packer" / "agent.pkr.hcl"
+)
+_AGENT_DIR = Path(__file__).resolve().parent.parent.parent / "agent"
+_PACKER_MEMO_SMOKE = _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke.ts"
+_PACKER_CODEX_SMOKE = _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke-codex.ts"
+_PACKER_INVESTIGATION_SMOKE = (
+    _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke-investigation.ts"
+)
+_PACKER_PRIMARY_SMOKE = _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke-primary.ts"
+_PACKER_REOPEN_SMOKE = _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke-reopen.ts"
+
+
+def _read_packer_hcl() -> str:
+    if not _PACKER_HCL.exists():
+        pytest.skip("infra/packer/agent.pkr.hcl not present (backend-only Docker run)")
+    return _PACKER_HCL.read_text(encoding="utf-8")
+
+
+def _read_packer_memo_smoke() -> str:
+    if not _PACKER_MEMO_SMOKE.exists():
+        pytest.skip("agent/src/handlers/memo-bake-smoke.ts not present")
+    return _PACKER_MEMO_SMOKE.read_text(encoding="utf-8")
+
+
+def _read_packer_codex_smoke() -> str:
+    if not _PACKER_CODEX_SMOKE.exists():
+        pytest.skip("agent/src/handlers/memo-bake-smoke-codex.ts not present")
+    return _PACKER_CODEX_SMOKE.read_text(encoding="utf-8")
+
+
+def _read_packer_investigation_smoke() -> str:
+    if not _PACKER_INVESTIGATION_SMOKE.exists():
+        pytest.skip("agent/src/handlers/memo-bake-smoke-investigation.ts not present")
+    return _PACKER_INVESTIGATION_SMOKE.read_text(encoding="utf-8")
+
+
+def _read_packer_primary_smoke() -> str:
+    if not _PACKER_PRIMARY_SMOKE.exists():
+        pytest.skip("agent/src/handlers/memo-bake-smoke-primary.ts not present")
+    return _PACKER_PRIMARY_SMOKE.read_text(encoding="utf-8")
+
+
+def _read_packer_reopen_smoke() -> str:
+    if not _PACKER_REOPEN_SMOKE.exists():
+        pytest.skip("agent/src/handlers/memo-bake-smoke-reopen.ts not present")
+    return _PACKER_REOPEN_SMOKE.read_text(encoding="utf-8")
+
+
+def _read_agent_package_json() -> dict[str, object]:
+    package_json = _AGENT_DIR / "package.json"
+    if not package_json.exists():
+        pytest.skip("agent/package.json not present")
+    return json.loads(package_json.read_text(encoding="utf-8"))
+
+
+def _read_agent_tsconfig() -> dict[str, object]:
+    tsconfig_json = _AGENT_DIR / "tsconfig.json"
+    if not tsconfig_json.exists():
+        pytest.skip("agent/tsconfig.json not present")
+    return json.loads(tsconfig_json.read_text(encoding="utf-8"))
+
+
+class TestPackerMemoBakeContract:
+    """agent.pkr.hcl must gate image tagging on a live memo smoke run."""
+
+    def test_chromium_smoke_sentinel_present(self):
+        """Build must emit PACKER_CHROMIUM_LAUNCH_OK so the provisioner can
+        gate on a real browser launch, not just a binary lookup."""
+        assert "PACKER_CHROMIUM_LAUNCH_OK" in _read_packer_hcl(), (
+            "agent.pkr.hcl must emit PACKER_CHROMIUM_LAUNCH_OK after the Chromium launch smoke."
+        )
+
+    def test_smoke_sentinel_present(self):
+        """Build must emit PACKER_MEMO_SMOKE_OK so the provisioner can gate
+        on the sentinel; without it a silent failure passes undetected."""
+        assert "PACKER_MEMO_SMOKE_OK" in _read_packer_hcl(), (
+            "agent.pkr.hcl must emit PACKER_MEMO_SMOKE_OK after the memo smoke. "
+            "Restore the step or re-add the sentinel."
+        )
+
+    def test_packer_runs_dedicated_smoke_file(self):
+        """The provisioner must execute a repo source file directly so the
+        smoke no longer depends on fragile multi-layer quoting."""
+        hcl = _read_packer_hcl()
+        assert "./src/handlers/memo-bake-smoke.ts" in hcl, (
+            "agent.pkr.hcl must execute ./src/handlers/memo-bake-smoke.ts."
+        )
+        assert "--eval" not in hcl, (
+            "agent.pkr.hcl memo smoke must not use node --eval after extraction."
+        )
+
+    def test_smoke_imports_runtime_entrypoint(self):
+        """Smoke must exercise src/handlers/index.ts — the actual shipped
+        entrypoint — not a test double. Wrong module defeats the purpose."""
+        smoke = _read_packer_memo_smoke()
+        assert "./index.ts" in smoke, (
+            "memo-bake-smoke.ts must import src/handlers/index.ts."
+        )
+        assert "handlers.memo(" in smoke, (
+            "memo-bake-smoke.ts must call handlers.memo()."
+        )
+
+    def test_smoke_validates_completed_status(self):
+        """Fetch stub must assert COMPLETED; accepting any status cannot
+        catch a handler that swallows the completion path."""
+        assert "COMPLETED" in _read_packer_memo_smoke(), (
+            "memo-bake-smoke.ts must assert status=COMPLETED."
+        )
+
+    def test_smoke_validates_log_fragment(self):
+        """Fetch stub must also check log content so a handler that posts
+        COMPLETED with empty logs is still caught at bake time."""
+        assert "stale memo runtime" in _read_packer_memo_smoke(), (
+            "memo-bake-smoke.ts must validate logs contain 'stale memo runtime'."
+        )
+
+    def test_smoke_file_is_in_agent_typecheck_surface(self):
+        """The dedicated smoke file must stay inside the existing agent
+        `tsc --noEmit` surface so syntax drift is caught by agent builds."""
+        package_json = _read_agent_package_json()
+        scripts = package_json.get("scripts")
+        assert isinstance(scripts, dict), "agent/package.json must define scripts."
+        build_cmd = scripts.get("build")
+        assert isinstance(build_cmd, str) and "tsc --noEmit" in build_cmd, (
+            "agent/package.json build script must typecheck with `tsc --noEmit`."
+        )
+
+        tsconfig = _read_agent_tsconfig()
+        includes = tsconfig.get("include")
+        assert isinstance(includes, list) and "src" in includes, (
+            "agent/tsconfig.json must include `src` so memo-bake-smoke.ts is typechecked."
+        )
+
+        relative_smoke_path = _PACKER_MEMO_SMOKE.relative_to(_AGENT_DIR).as_posix()
+        assert relative_smoke_path.startswith("src/"), (
+            "memo-bake-smoke.ts must live under agent/src so the agent typecheck covers it."
+        )
+
+    # ── Codex-extractor path (runClaudeCode arm) ────────────────────────────
+    #
+    # The dispatcher-path smoke above never invokes runClaudeCode, so the
+    # historical bug zone (Codex item.text truncation, JSONL envelope parsing,
+    # JSON extractor edge cases) goes uncovered without a second smoke. These
+    # assertions lock in that second smoke; like the dispatcher smoke it lives
+    # under agent/src/handlers/ so the agent typecheck covers it.
+
+    def test_claude_path_smoke_sentinel_present(self):
+        """Build must emit PACKER_MEMO_CLAUDE_PATH_OK so the provisioner can
+        gate on the sentinel; without it a silent failure passes undetected."""
+        assert "PACKER_MEMO_CLAUDE_PATH_OK" in _read_packer_codex_smoke(), (
+            "Codex-extractor memo smoke must emit PACKER_MEMO_CLAUDE_PATH_OK."
+        )
+
+    def test_packer_runs_codex_smoke_file(self):
+        """The provisioner must execute the codex-path smoke source file."""
+        hcl = _read_packer_hcl()
+        assert "./src/handlers/memo-bake-smoke-codex.ts" in hcl, (
+            "agent.pkr.hcl must execute ./src/handlers/memo-bake-smoke-codex.ts."
+        )
+
+    def test_claude_path_smoke_invokes_override_hook(self):
+        """The smoke must replace runClaudeCode with a deterministic stub via
+        the __setRunClaudeCodeOverrideForSmoke hook — otherwise the bake would
+        try to spawn a real Claude/Codex subprocess and fail."""
+        codex = _read_packer_codex_smoke()
+        assert "__setRunClaudeCodeOverrideForSmoke" in codex, (
+            "Codex-extractor memo smoke must stub runClaudeCode via "
+            "__setRunClaudeCodeOverrideForSmoke."
+        )
+
+    def test_claude_path_smoke_emits_codex_jsonl_envelope(self):
+        """Smoke must construct a Codex item.completed agent_message envelope
+        so extractCodexAgentMessageText runs end-to-end at bake time."""
+        codex = _read_packer_codex_smoke()
+        assert "item.completed" in codex, (
+            "Codex-extractor memo smoke must emit a Codex item.completed envelope."
+        )
+        assert "agent_message" in codex, (
+            "Codex-extractor memo smoke must emit a Codex agent_message envelope."
+        )
+
+    def test_claude_path_smoke_exceeds_200_chars(self):
+        """The memo JSON inside the envelope must exceed 200 chars so the
+        historical Codex item.text 200-char truncation regression is exercised
+        on every bake."""
+        codex = _read_packer_codex_smoke()
+        # The smoke guards against accidental shrinkage by throwing if the
+        # serialized memo JSON is <=200 chars. Lock that guard in here.
+        assert "memo JSON must exceed 200 chars" in codex or (
+            "memoJsonString.length <= 200" in codex and "throw" in codex
+        ), (
+            "Codex-extractor memo smoke must enforce memoJsonString length > 200 "
+            "to lock in the Codex item.text 200-char truncation regression fix."
+        )
+
+    def test_claude_path_smoke_bypasses_dispatcher_short_circuit(self):
+        """Payload must NOT match the dispatcher short-circuit conditions
+        (regression_false_positive / investigation_unactionable with a
+        source_finding object) — otherwise the synth path fires and
+        runClaudeCode is never reached."""
+        codex = _read_packer_codex_smoke()
+        # Dispatcher reasoning_kind values that route to _synthesizeDispatcherMemo.
+        assert "regression_false_positive" not in codex, (
+            "Codex-extractor memo smoke payload must NOT use a dispatcher "
+            "reasoning_kind or the synth short-circuit will skip runClaudeCode."
+        )
+        assert "investigation_unactionable" not in codex, (
+            "Codex-extractor memo smoke payload must NOT use a dispatcher "
+            "reasoning_kind or the synth short-circuit will skip runClaudeCode."
+        )
+        # Even with a non-dispatcher reasoning_kind, the short-circuit can also
+        # fire when source_finding is an object with the right shape; cleanest
+        # is to omit source_finding entirely from the payload.
+        assert "source_finding" not in codex, (
+            "Codex-extractor memo smoke payload must omit source_finding to "
+            "guarantee dispatcher short-circuit cannot fire."
+        )
+
+    def test_claude_path_smoke_validates_completed_status(self):
+        """Fetch stub for the Codex-path smoke must also assert COMPLETED."""
+        assert "COMPLETED" in _read_packer_codex_smoke(), (
+            "Codex-extractor memo smoke must assert status=COMPLETED."
+        )
+
+    def test_claude_path_smoke_validates_log_fragment(self):
+        """Fetch stub must check that the memo content sentinel travels all
+        the way from the Codex envelope's item.text into the COMPLETED logs —
+        proving extractCodexAgentMessageText + the JSON extractor ran."""
+        codex = _read_packer_codex_smoke()
+        assert "codex-path memo smoke" in codex, (
+            "Codex-extractor memo smoke must embed a distinct content sentinel "
+            "inside the Codex envelope's item.text and assert it appears in "
+            "the COMPLETED logs."
+        )
+
+    def test_codex_smoke_file_is_in_agent_typecheck_surface(self):
+        """The codex-path smoke must stay inside the agent `tsc --noEmit`
+        surface so syntax drift is caught by agent builds."""
+        relative_smoke_path = _PACKER_CODEX_SMOKE.relative_to(_AGENT_DIR).as_posix()
+        assert relative_smoke_path.startswith("src/"), (
+            "memo-bake-smoke-codex.ts must live under agent/src so the agent typecheck covers it."
+        )
+
+    def test_dispatcher_path_smoke_still_runs(self):
+        """The dispatcher-path smoke must not be regressed by the Codex-path
+        addition. Both cases must run on every bake."""
+        hcl = _read_packer_hcl()
+        assert "PACKER_MEMO_SMOKE_OK" in hcl, (
+            "Dispatcher-path memo smoke sentinel was dropped — both smokes "
+            "must run on every bake."
+        )
+
+    # ── investigation_unactionable dispatcher arm ────────────────────────────
+    #
+    # _synthesizeDispatcherMemo in handlers/memo.ts has two arms:
+    # regression_false_positive (covered by memo-bake-smoke.ts) and
+    # investigation_unactionable (root_cause / recommended_fix / summary /
+    # outcome). The second arm is emitted in production by
+    # backend/app/task_completion.py, so a regression there could ship inside
+    # a baked image without the bake catching it. These assertions lock in a
+    # dedicated third bake smoke that exercises the investigation arm so any
+    # future packer edit cannot silently drop it.
+
+    def test_investigation_smoke_sentinel_present(self):
+        """Build must emit PACKER_MEMO_INVESTIGATION_OK so the provisioner can
+        gate on the sentinel; without it a silent failure passes undetected."""
+        hcl = _read_packer_hcl()
+        assert "PACKER_MEMO_INVESTIGATION_OK" in hcl, (
+            "agent.pkr.hcl must emit PACKER_MEMO_INVESTIGATION_OK after the "
+            "investigation_unactionable memo smoke."
+        )
+
+    def test_packer_runs_investigation_smoke_file(self):
+        """The provisioner must execute the investigation-path smoke source
+        file directly so the smoke is exercised on every bake."""
+        hcl = _read_packer_hcl()
+        assert "./src/handlers/memo-bake-smoke-investigation.ts" in hcl, (
+            "agent.pkr.hcl must execute "
+            "./src/handlers/memo-bake-smoke-investigation.ts."
+        )
+
+    def test_investigation_smoke_imports_runtime_entrypoint(self):
+        """Smoke must exercise src/handlers/index.ts — the actual shipped
+        entrypoint — not a test double. Wrong module defeats the purpose."""
+        smoke = _read_packer_investigation_smoke()
+        assert "./index.ts" in smoke, (
+            "memo-bake-smoke-investigation.ts must import src/handlers/index.ts."
+        )
+        assert "handlers.memo(" in smoke, (
+            "memo-bake-smoke-investigation.ts must call handlers.memo()."
+        )
+
+    def test_investigation_smoke_uses_dispatcher_reasoning_kind(self):
+        """Payload must use reasoning_kind=investigation_unactionable so the
+        sibling arm of _synthesizeDispatcherMemo fires (otherwise the smoke
+        is testing the wrong code path)."""
+        smoke = _read_packer_investigation_smoke()
+        assert "investigation_unactionable" in smoke, (
+            "memo-bake-smoke-investigation.ts must set "
+            "reasoning_kind=investigation_unactionable so the synth branch "
+            "for that dispatcher arm actually runs."
+        )
+
+    def test_investigation_smoke_exercises_root_cause_field(self):
+        """The investigation_unactionable synth branch reads root_cause from
+        the source_finding object. The smoke must populate it so the branch's
+        distinctive field-extraction logic runs end-to-end."""
+        smoke = _read_packer_investigation_smoke()
+        assert "root_cause" in smoke, (
+            "memo-bake-smoke-investigation.ts must populate "
+            "source_finding.root_cause — that is the distinctive field of the "
+            "investigation_unactionable synth arm."
+        )
+
+    def test_investigation_smoke_validates_completed_status(self):
+        """Fetch stub must assert COMPLETED; accepting any status cannot
+        catch a handler that swallows the completion path."""
+        assert "COMPLETED" in _read_packer_investigation_smoke(), (
+            "memo-bake-smoke-investigation.ts must assert status=COMPLETED."
+        )
+
+    def test_investigation_smoke_validates_log_sentinel(self):
+        """Fetch stub must check that a distinctive content sentinel travels
+        all the way from the source_finding into the COMPLETED logs. The
+        chosen sentinel ('Root cause:' prefix and/or a custom embedded
+        sentinel string) can ONLY appear if the investigation_unactionable
+        synth branch produced the memo — regression_false_positive emits a
+        different prefix ('Verdict reason:')."""
+        smoke = _read_packer_investigation_smoke()
+        # The `Root cause:` prefix is unique to the investigation_unactionable
+        # synth arm — regression_false_positive emits `Verdict reason:` instead.
+        assert "Root cause:" in smoke, (
+            "memo-bake-smoke-investigation.ts must assert the logs contain the "
+            "`Root cause:` prefix that is unique to the investigation_unactionable "
+            "synth branch (regression_false_positive emits `Verdict reason:` "
+            "instead, so this prefix proves the correct arm fired)."
+        )
+        # A custom embedded sentinel inside root_cause is the strongest
+        # signal — it round-trips the payload through the memo JSON.
+        assert "investigation-unactionable bake smoke" in smoke, (
+            "memo-bake-smoke-investigation.ts must embed a custom content "
+            "sentinel (e.g. 'investigation-unactionable bake smoke') in the "
+            "root_cause payload and assert it appears in the COMPLETED logs."
+        )
+
+    def test_investigation_smoke_file_is_in_agent_typecheck_surface(self):
+        """The investigation-path smoke must live under agent/src so the
+        existing tsconfig include + `tsc --noEmit` build covers it."""
+        relative_smoke_path = _PACKER_INVESTIGATION_SMOKE.relative_to(
+            _AGENT_DIR
+        ).as_posix()
+        assert relative_smoke_path.startswith("src/"), (
+            "memo-bake-smoke-investigation.ts must live under agent/src so "
+            "the agent typecheck covers it."
+        )
+
+    def test_existing_dispatcher_and_codex_smokes_not_regressed(self):
+        """Adding the investigation smoke must not drop the dispatcher or
+        Codex-path smokes — all three must run on every bake."""
+        hcl = _read_packer_hcl()
+        assert "PACKER_MEMO_SMOKE_OK" in hcl, (
+            "Dispatcher-path memo smoke sentinel was dropped — all three "
+            "memo smokes must run on every bake."
+        )
+        assert "PACKER_MEMO_CLAUDE_PATH_OK" in hcl, (
+            "Codex-path memo smoke sentinel was dropped — all three memo "
+            "smokes must run on every bake."
+        )
+        assert "./src/handlers/memo-bake-smoke.ts" in hcl, (
+            "Dispatcher-path memo smoke file invocation was dropped from agent.pkr.hcl."
+        )
+        assert "./src/handlers/memo-bake-smoke-codex.ts" in hcl, (
+            "Codex-path memo smoke file invocation was dropped from agent.pkr.hcl."
+        )
+
+    # ── Primary lastResultText path (runClaudeCode happy path) ──────────────
+    #
+    # The dispatcher-path smoke never invokes runClaudeCode and the codex-path
+    # smoke deliberately truncates lastResultText to force the Codex JSONL
+    # fallback. Neither covers the most common production outcome:
+    # lastResultText already contains a clean memo JSON and the FIRST extractor
+    # source (lastResultText) succeeds without ever touching allOutput or the
+    # Codex envelope fallback. These assertions lock in a third smoke that
+    # exercises that path end-to-end on every bake.
+
+    def test_primary_path_smoke_sentinel_present(self):
+        """Build must emit PACKER_MEMO_PRIMARY_PATH_OK so the provisioner can
+        gate on the sentinel; without it a silent failure passes undetected."""
+        assert "PACKER_MEMO_PRIMARY_PATH_OK" in _read_packer_primary_smoke(), (
+            "Primary-path memo smoke must emit PACKER_MEMO_PRIMARY_PATH_OK."
+        )
+
+    def test_packer_runs_primary_smoke_file(self):
+        """The provisioner must execute the primary-path smoke source file."""
+        hcl = _read_packer_hcl()
+        assert "./src/handlers/memo-bake-smoke-primary.ts" in hcl, (
+            "agent.pkr.hcl must execute ./src/handlers/memo-bake-smoke-primary.ts."
+        )
+
+    def test_primary_path_smoke_invokes_override_hook(self):
+        """The smoke must replace runClaudeCode with a deterministic stub via
+        the __setRunClaudeCodeOverrideForSmoke hook — otherwise the bake would
+        try to spawn a real Claude/Codex subprocess and fail."""
+        primary = _read_packer_primary_smoke()
+        assert "__setRunClaudeCodeOverrideForSmoke" in primary, (
+            "Primary-path memo smoke must stub runClaudeCode via "
+            "__setRunClaudeCodeOverrideForSmoke."
+        )
+
+    def test_primary_path_smoke_returns_exit_code_zero(self):
+        """The override must return exitCode: 0 so the handler proceeds into
+        the buildSources/tryExtractMemoObject path rather than the failure
+        branch."""
+        primary = _read_packer_primary_smoke()
+        assert "exitCode: 0" in primary, (
+            "Primary-path memo smoke override must return exitCode: 0 so the "
+            "lastResultText extractor path is reached."
+        )
+
+    def test_primary_path_smoke_uses_lastResultText_source(self):
+        """The override must surface a non-truncated memo JSON via
+        lastResultText so the FIRST extractor source wins. A truncated value
+        would force the codex-envelope fallback (already covered by the
+        codex-path smoke)."""
+        primary = _read_packer_primary_smoke()
+        assert "lastResultText: memoJsonString" in primary, (
+            "Primary-path memo smoke must hand the full memo JSON to "
+            "lastResultText (not a truncated slice) so the primary extractor "
+            "source resolves the memo without falling back to allOutput."
+        )
+
+    def test_primary_path_smoke_does_not_emit_codex_envelope(self):
+        """allOutput must not contain a Codex item.completed/agent_message
+        envelope — otherwise we cannot distinguish whether the primary source
+        or the codex-envelope fallback resolved the memo. Equivalently, the
+        absence of these tokens (combined with an empty allOutput, asserted
+        separately) proves the lastResultText source is the one exercised."""
+        primary = _read_packer_primary_smoke()
+        assert "item.completed" not in primary, (
+            "Primary-path memo smoke must NOT include 'item.completed' — that "
+            "would mean allOutput carries a Codex envelope and the test could "
+            "no longer prove the lastResultText primary source was exercised."
+        )
+        assert "agent_message" not in primary, (
+            "Primary-path memo smoke must NOT include 'agent_message' — that "
+            "would mean allOutput carries a Codex envelope and the test could "
+            "no longer prove the lastResultText primary source was exercised."
+        )
+
+    def test_primary_path_smoke_uses_empty_allOutput(self):
+        """Positive marker: allOutput must be assigned to an empty/innocuous
+        value so the buildSources call has only lastResultText as a viable
+        primary source."""
+        primary = _read_packer_primary_smoke()
+        assert "const allOutput = ''" in primary, (
+            "Primary-path memo smoke must set allOutput to an empty string so "
+            "the lastResultText source is unambiguously the one that wins."
+        )
+
+    def test_primary_path_smoke_bypasses_dispatcher_short_circuit(self):
+        """Payload must NOT match the dispatcher short-circuit conditions
+        (regression_false_positive / investigation_unactionable with a
+        source_finding object) — otherwise the synth path fires and
+        runClaudeCode is never reached."""
+        primary = _read_packer_primary_smoke()
+        assert "regression_false_positive" not in primary, (
+            "Primary-path memo smoke payload must NOT use a dispatcher "
+            "reasoning_kind or the synth short-circuit will skip runClaudeCode."
+        )
+        assert "investigation_unactionable" not in primary, (
+            "Primary-path memo smoke payload must NOT use a dispatcher "
+            "reasoning_kind or the synth short-circuit will skip runClaudeCode."
+        )
+        assert "source_finding" not in primary, (
+            "Primary-path memo smoke payload must omit source_finding to "
+            "guarantee dispatcher short-circuit cannot fire."
+        )
+
+    def test_primary_path_smoke_validates_completed_status(self):
+        """Fetch stub for the primary-path smoke must assert COMPLETED."""
+        assert "COMPLETED" in _read_packer_primary_smoke(), (
+            "Primary-path memo smoke must assert status=COMPLETED."
+        )
+
+    def test_primary_path_smoke_validates_log_fragment(self):
+        """Fetch stub must check that the memo content sentinel travels all
+        the way from lastResultText through tryExtractMemoObject into the
+        COMPLETED logs — proving the primary extractor source ran end-to-end."""
+        primary = _read_packer_primary_smoke()
+        assert "primary-path memo smoke" in primary, (
+            "Primary-path memo smoke must embed a distinct content sentinel "
+            "inside the memo JSON and assert it appears in the COMPLETED logs."
+        )
+
+    def test_primary_smoke_file_is_in_agent_typecheck_surface(self):
+        """The primary-path smoke must stay inside the agent `tsc --noEmit`
+        surface so syntax drift is caught by agent builds."""
+        relative_smoke_path = _PACKER_PRIMARY_SMOKE.relative_to(_AGENT_DIR).as_posix()
+        assert relative_smoke_path.startswith("src/"), (
+            "memo-bake-smoke-primary.ts must live under agent/src so the "
+            "agent typecheck covers it."
+        )
+
+    def test_existing_smokes_still_run_after_primary_addition(self):
+        """The two existing smokes must not be regressed by the primary-path
+        addition. All three sentinels must remain wired into the bake."""
+        hcl = _read_packer_hcl()
+        assert "PACKER_MEMO_SMOKE_OK" in hcl, (
+            "Dispatcher-path memo smoke sentinel was dropped — all three "
+            "smokes must run on every bake."
+        )
+        assert "./src/handlers/memo-bake-smoke-codex.ts" in hcl, (
+            "Codex-path memo smoke invocation was dropped — all three smokes "
+            "must run on every bake."
+        )
+        assert "PACKER_MEMO_CLAUDE_PATH_OK" in _read_packer_codex_smoke(), (
+            "Codex-path memo smoke sentinel was dropped — all three smokes "
+            "must run on every bake."
+        )
+
+
+class TestPackerMemoReopenContract:
+    """agent.pkr.hcl must also gate image tagging on the reopen-retry smoke.
+
+    The reopen continuation retry path in memo.ts fires when the first
+    runClaudeCode call returns exitCode=0 with no parseable memo JSON.
+    The codex-path smoke covers a single-call success path and never
+    exercises this branch; these assertions lock in a dedicated third smoke.
+    """
+
+    def test_packer_runs_reopen_smoke_file(self):
+        """The provisioner must execute the reopen-path smoke source file."""
+        hcl = _read_packer_hcl()
+        assert "./src/handlers/memo-bake-smoke-reopen.ts" in hcl, (
+            "agent.pkr.hcl must execute ./src/handlers/memo-bake-smoke-reopen.ts "
+            "so the reopen continuation retry path is exercised on every bake."
+        )
+
+    def test_reopen_smoke_sentinel_present(self):
+        """Smoke must emit PACKER_MEMO_REOPEN_RETRY_OK so the provisioner can
+        detect a silent failure via the sentinel; an exception alone is not
+        surfaced unless the exit code is non-zero."""
+        smoke = _read_packer_reopen_smoke()
+        assert "PACKER_MEMO_REOPEN_RETRY_OK" in smoke, (
+            "memo-bake-smoke-reopen.ts must emit PACKER_MEMO_REOPEN_RETRY_OK "
+            "on success."
+        )
+
+    def test_reopen_smoke_invokes_override_hook(self):
+        """Smoke must replace runClaudeCode with a deterministic stub via
+        the __setRunClaudeCodeOverrideForSmoke hook so no real Claude/Codex
+        subprocess is spawned at bake time."""
+        smoke = _read_packer_reopen_smoke()
+        assert "__setRunClaudeCodeOverrideForSmoke" in smoke, (
+            "memo-bake-smoke-reopen.ts must stub runClaudeCode via "
+            "__setRunClaudeCodeOverrideForSmoke."
+        )
+
+    def test_reopen_smoke_first_call_returns_no_json(self):
+        """Override body must distinguish call indices and return non-JSON
+        output on the first call so tryExtractMemoObject returns null and
+        the reopen branch fires."""
+        import re
+
+        smoke = _read_packer_reopen_smoke()
+        # The smoke must reference a call index check (idx === 0 / callIndex === 0
+        # or similar) whose branch does NOT include the JSON string.  A simple
+        # check: the file must contain a reference to a zero-index guard AND the
+        # first return must lack the retryMemo JSON variable.
+        has_idx_zero = bool(
+            re.search(r"(idx|callIndex|call_index)\s*===?\s*0", smoke)
+        ) or bool(re.search(r"0\s*===?\s*(idx|callIndex|call_index)", smoke))
+        assert has_idx_zero, (
+            "memo-bake-smoke-reopen.ts must distinguish call indices via a "
+            "zero-index guard (e.g. `idx === 0`) so the first call returns "
+            "non-JSON output and triggers the reopen branch."
+        )
+
+    def test_reopen_smoke_second_call_returns_valid_json(self):
+        """The second override call must return a valid memo JSON string
+        containing all four required schema keys."""
+        smoke = _read_packer_reopen_smoke()
+        for key in ("summary", "reasoning", "citations", "tags"):
+            assert key in smoke, (
+                f"memo-bake-smoke-reopen.ts must include '{key}' in the second-call "
+                "memo JSON so all four required schema keys are present."
+            )
+
+    def test_reopen_smoke_asserts_call_count(self):
+        """After invoking handlers.memo(), the smoke must assert that the
+        override was called at least twice so a future refactor that
+        short-circuits the retry cannot silently pass."""
+        smoke = _read_packer_reopen_smoke()
+        assert "callIndex" in smoke or "callCount" in smoke or "call_count" in smoke, (
+            "memo-bake-smoke-reopen.ts must track override call count."
+        )
+        # Must contain a guard that checks the counter is >= 2 (or > 1).
+        import re
+
+        has_count_guard = bool(
+            re.search(r"(callIndex|callCount|call_count)\s*[<>]=?\s*2", smoke)
+        ) or bool(re.search(r"2\s*[<>]=?\s*(callIndex|callCount|call_count)", smoke))
+        assert has_count_guard, (
+            "memo-bake-smoke-reopen.ts must assert the override call count is "
+            ">= 2 after handlers.memo() completes, so a refactor that drops the "
+            "second runClaudeCode call is caught at bake time."
+        )
+
+    def test_reopen_smoke_validates_completed_status(self):
+        """Fetch stub must assert COMPLETED status; accepting any status
+        cannot catch a handler that swallows the completion path."""
+        smoke = _read_packer_reopen_smoke()
+        assert "COMPLETED" in smoke, (
+            "memo-bake-smoke-reopen.ts must assert status=COMPLETED in the fetch stub."
+        )
+
+    def test_reopen_smoke_validates_log_sentinel(self):
+        """Fetch stub must verify the second-call memo sentinel travels from
+        the retry output all the way into the COMPLETED logs, proving the
+        retry result was surfaced into the status post."""
+        smoke = _read_packer_reopen_smoke()
+        assert "reopen-retry memo smoke" in smoke, (
+            "memo-bake-smoke-reopen.ts must embed the 'reopen-retry memo smoke' "
+            "sentinel in the second-call memo and assert it appears in the "
+            "COMPLETED logs."
+        )
+
+    def test_reopen_smoke_bypasses_dispatcher_short_circuit(self):
+        """Payload must NOT match the dispatcher short-circuit conditions
+        (regression_false_positive / investigation_unactionable with a
+        source_finding object) — otherwise the synth path fires and
+        runClaudeCode is never reached."""
+        smoke = _read_packer_reopen_smoke()
+        assert "regression_false_positive" not in smoke, (
+            "memo-bake-smoke-reopen.ts payload must NOT use a dispatcher "
+            "reasoning_kind or the synth short-circuit will skip runClaudeCode."
+        )
+        assert "investigation_unactionable" not in smoke, (
+            "memo-bake-smoke-reopen.ts payload must NOT use a dispatcher "
+            "reasoning_kind or the synth short-circuit will skip runClaudeCode."
+        )
+        assert "source_finding" not in smoke, (
+            "memo-bake-smoke-reopen.ts payload must omit source_finding to "
+            "guarantee dispatcher short-circuit cannot fire."
+        )
+
+    def test_reopen_smoke_file_is_in_agent_typecheck_surface(self):
+        """The reopen smoke must stay inside the agent `tsc --noEmit` surface
+        so TypeScript syntax drift is caught by agent builds."""
+        relative_smoke_path = _PACKER_REOPEN_SMOKE.relative_to(_AGENT_DIR).as_posix()
+        assert relative_smoke_path.startswith("src/"), (
+            "memo-bake-smoke-reopen.ts must live under agent/src so the agent "
+            "typecheck covers it."
+        )
+
+    def test_prior_smokes_still_run(self):
+        """Neither of the two prior memo smoke sentinels must be dropped when
+        the reopen smoke is added — all three must run on every bake."""
+        hcl = _read_packer_hcl()
+        assert "PACKER_MEMO_SMOKE_OK" in hcl, (
+            "Dispatcher-path memo smoke sentinel (PACKER_MEMO_SMOKE_OK) was "
+            "dropped — all three memo smokes must run on every bake."
+        )
+        assert (
+            "PACKER_MEMO_CLAUDE_PATH_OK" in hcl or "memo-bake-smoke-codex.ts" in hcl
+        ), (
+            "Codex-extractor memo smoke (PACKER_MEMO_CLAUDE_PATH_OK / "
+            "memo-bake-smoke-codex.ts) was dropped — all three memo smokes "
+            "must run on every bake."
+        )
+
+
+_PACKER_LIFECYCLE_SMOKE = (
+    _AGENT_DIR / "src" / "handlers" / "memo-bake-smoke-lifecycle.ts"
+)
+
+
+def _read_packer_lifecycle_smoke() -> str:
+    if not _PACKER_LIFECYCLE_SMOKE.exists():
+        pytest.skip("agent/src/handlers/memo-bake-smoke-lifecycle.ts not present")
+    return _PACKER_LIFECYCLE_SMOKE.read_text(encoding="utf-8")
+
+
+class TestPackerMemoLifecycleContract:
+    """agent.pkr.hcl must gate tagging on a full claim→dispatch→complete lifecycle smoke.
+
+    Unlike the per-handler smokes that call handlers.memo() directly, this smoke
+    spawns the main agent entry point (src/index.ts) as a subprocess so the
+    dispatcher routing, handler registration, and end-to-end status post chain
+    are all validated at bake time.
+    """
+
+    def test_packer_runs_lifecycle_smoke_file(self):
+        """The provisioner must invoke the lifecycle smoke source file directly."""
+        assert "./src/handlers/memo-bake-smoke-lifecycle.ts" in _read_packer_hcl(), (
+            "agent.pkr.hcl must execute ./src/handlers/memo-bake-smoke-lifecycle.ts "
+            "so the full agent claim/dispatch/complete cycle is validated at bake time."
+        )
+
+    def test_lifecycle_smoke_sentinel_present(self):
+        """Smoke must print PACKER_MEMO_LIFECYCLE_OK so a silent failure is detectable."""
+        assert "PACKER_MEMO_LIFECYCLE_OK" in _read_packer_lifecycle_smoke(), (
+            "memo-bake-smoke-lifecycle.ts must emit PACKER_MEMO_LIFECYCLE_OK on success."
+        )
+
+    def test_lifecycle_smoke_spawns_agent_entry_point(self):
+        """Smoke must spawn src/index.ts as a subprocess, not call handlers directly."""
+        smoke = _read_packer_lifecycle_smoke()
+        assert "index.ts" in smoke, (
+            "memo-bake-smoke-lifecycle.ts must reference the main agent entry point "
+            "(src/index.ts) so dispatcher routing and handler registration are exercised."
+        )
+        assert "spawn" in smoke, (
+            "memo-bake-smoke-lifecycle.ts must spawn a subprocess, not call handlers directly."
+        )
+
+    def test_lifecycle_smoke_validates_completed_status_and_sentinel(self):
+        """Stub server must assert COMPLETED status and a round-trip sentinel in logs."""
+        smoke = _read_packer_lifecycle_smoke()
+        assert "COMPLETED" in smoke, (
+            "memo-bake-smoke-lifecycle.ts must assert status=COMPLETED."
+        )
+        assert "memo-lifecycle-bake-smoke" in smoke or "LIFECYCLE_SENTINEL" in smoke, (
+            "memo-bake-smoke-lifecycle.ts must assert a content sentinel appears in "
+            "the COMPLETED logs, proving the payload round-tripped through the handler."
+        )
+
+    def test_lifecycle_smoke_bypasses_secret_token_validation(self):
+        """Smoke must set BLUEPRINT_SMOKE_SKIP_VALIDATION so the agent startup
+        secret-token check does not block execution at bake time."""
+        assert "BLUEPRINT_SMOKE_SKIP_VALIDATION" in _read_packer_lifecycle_smoke(), (
+            "memo-bake-smoke-lifecycle.ts must set BLUEPRINT_SMOKE_SKIP_VALIDATION=1 "
+            "so the agent entry point skips the VM secret-token check at bake time."
+        )
+
+    def test_prior_smokes_still_run_after_lifecycle_addition(self):
+        """All prior smoke sentinels must remain in the bake after the lifecycle addition."""
+        hcl = _read_packer_hcl()
+        for sentinel in (
+            "PACKER_MEMO_SMOKE_OK",
+            "PACKER_MEMO_INVESTIGATION_OK",
+            "./src/handlers/memo-bake-smoke-reopen.ts",
+        ):
+            assert sentinel in hcl, (
+                f"Prior memo smoke marker {sentinel!r} was dropped — all memo "
+                "smokes must run on every bake."
+            )
+
+    def test_lifecycle_smoke_file_is_in_agent_typecheck_surface(self):
+        """The lifecycle smoke must live under agent/src so the existing tsc --noEmit
+        build covers it."""
+        relative_smoke_path = _PACKER_LIFECYCLE_SMOKE.relative_to(_AGENT_DIR).as_posix()
+        assert relative_smoke_path.startswith("src/"), (
+            "memo-bake-smoke-lifecycle.ts must live under agent/src so the agent "
+            "typecheck covers it."
+        )
+
+
+class TestPackerFingerprintBakeContract:
+    """agent.pkr.hcl must run the production readAgentRuntimeFingerprint()
+    reader at bake time so a drift between the AGENT_RUNTIME_FINGERPRINT
+    write line and the strict regex in agent/src/index.ts fails the bake
+    instead of silently shipping a broken stale-image-detection pipeline."""
+
+    def test_readback_sentinel_present(self):
+        """Build must emit PACKER_FINGERPRINT_READBACK_OK so the provisioner
+        can gate on the sentinel; without it a silent failure passes
+        undetected."""
+        assert "PACKER_FINGERPRINT_READBACK_OK" in _read_packer_hcl(), (
+            "agent.pkr.hcl must emit PACKER_FINGERPRINT_READBACK_OK after the "
+            "fingerprint readback smoke. Restore the step or re-add the sentinel."
+        )
+
+    def test_readback_invokes_smoke_entrypoint(self):
+        """Smoke must invoke the dedicated fingerprint-bake-smoke.ts script
+        via the runtime tsx loader so the production reader path executes."""
+        hcl = _read_packer_hcl()
+        assert "fingerprint-bake-smoke.ts" in hcl, (
+            "agent.pkr.hcl must invoke fingerprint-bake-smoke.ts for the "
+            "readback smoke."
+        )
+        assert "node --import tsx" in hcl, (
+            "agent.pkr.hcl fingerprint smoke must use `node --import tsx` to "
+            "exercise the production TS source path (not a separate compile)."
+        )
+
+    def test_readback_runs_as_agent_user(self):
+        """The fingerprint file is chowned to agent:agent, so the smoke must
+        run as that user (matching production heartbeat reads) — otherwise
+        a permissions regression slips past the bake."""
+        hcl = _read_packer_hcl()
+        assert "sudo -u agent" in hcl and "fingerprint-bake-smoke.ts" in hcl, (
+            "agent.pkr.hcl fingerprint smoke must run as the agent user "
+            "(sudo -u agent) to match post-chown file ownership."
+        )
 
 
 @pytest.mark.parametrize("path", _STATIC_PARAMS)

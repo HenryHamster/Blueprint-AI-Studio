@@ -187,7 +187,7 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         TaskType.release_audit,
         "Release Audit",
         "read_only",
-        description="Audit the main...automain diff for the release qualifier.",
+        description="Differential audit of the promotion-candidate commit against the base branch for the release qualifier.",
     ),
     TaskCapability(
         TaskType.memo,

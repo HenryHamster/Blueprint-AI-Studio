@@ -2,9 +2,9 @@ import { describe, it, expect } from 'vitest';
 import { resolveBuildConfig } from './build-config.js';
 
 describe('resolveBuildConfig', () => {
-  it('returns undefined when project_metadata.is_self_repo is true', () => {
+  it('returns undefined when project_metadata.skip_build_config is true', () => {
     const task = {
-      project_metadata: { is_self_repo: true },
+      project_metadata: { skip_build_config: true },
       build_config: { directories: [{ path: 'src', type: 'node' }] },
     };
     expect(resolveBuildConfig(task)).toBeUndefined();
@@ -272,5 +272,67 @@ describe('resolveBuildConfig', () => {
       },
     };
     expect(resolveBuildConfig(task)).toBeUndefined();
+  });
+
+  it('rejects shell-unsafe directory paths and command values', () => {
+    const task = {
+      build_config: {
+        directories: [
+          { path: 'svc$(whoami)`rm`;echo|cat&', type: 'node', lint_cmd: 'npm run lint' },
+          { path: 'backend', type: 'python', build_cmd: 'python -m build' },
+          { path: 'worker', type: 'python', install_cmd: 'pip install -e . && echo bad' },
+        ],
+      },
+    };
+    expect(resolveBuildConfig(task)).toEqual({
+      directories: [
+        { path: 'backend', type: 'python', build_cmd: 'python -m build' },
+      ],
+    });
+  });
+
+  it('surfaces valid staging_branch_prefixes onto the resolved config', () => {
+    const task = {
+      build_config: {
+        directories: [{ path: 'src', type: 'node' }],
+        staging_branch_prefixes: ['stage/', 'integration/'],
+      },
+    };
+    expect(resolveBuildConfig(task)?.staging_branch_prefixes).toEqual(['stage/', 'integration/']);
+  });
+
+  it('drops malformed staging_branch_prefixes entries but keeps valid siblings', () => {
+    const task = {
+      build_config: {
+        directories: [{ path: 'src', type: 'node' }],
+        staging_branch_prefixes: ['stage/', '', '../escape', '/abs', 'evil$(x)', 42, 'integration/'],
+      },
+    };
+    expect(resolveBuildConfig(task)?.staging_branch_prefixes).toEqual(['stage/', 'integration/']);
+  });
+
+  it('leaves staging_branch_prefixes unset when the field is absent', () => {
+    const task = { build_config: { directories: [{ path: 'src', type: 'node' }] } };
+    expect(resolveBuildConfig(task)?.staging_branch_prefixes).toBeUndefined();
+  });
+
+  it('leaves staging_branch_prefixes unset when no entry survives validation', () => {
+    const task = {
+      build_config: {
+        directories: [{ path: 'src', type: 'node' }],
+        staging_branch_prefixes: ['', '/abs', '../x'],
+      },
+    };
+    expect(resolveBuildConfig(task)?.staging_branch_prefixes).toBeUndefined();
+  });
+
+  it('ignores staging_branch_prefixes when it is not an array', () => {
+    const task = {
+      build_config: {
+        directories: [{ path: 'src', type: 'node' }],
+        staging_branch_prefixes: 'stage/',
+      },
+    };
+    expect(resolveBuildConfig(task)?.staging_branch_prefixes).toBeUndefined();
   });
 });

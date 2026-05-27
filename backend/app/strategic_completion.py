@@ -623,6 +623,7 @@ async def _spawn_retirement_memos(
         return 0
     from app.payload_schemas import validate_internal_payload
     from app.plan_completion import TASK_PRIORITY_MAP
+    from app.task_completion import _apply_synthesized_memo
 
     ninety_days_ago = _utcnow() - timedelta(days=90)
     existing_rows = (
@@ -686,11 +687,27 @@ async def _spawn_retirement_memos(
             priority=TASK_PRIORITY_MAP.get("low", 0),
         )
         session.add(memo_task)
+        # Synthesize the memo artifact at spawn time when rationale is available
+        # so the task is immediately COMPLETED and citable without provisioning a VM.
+        synthesized = False
+        if rationale:
+            parts = [f"Retirement rationale: {rationale}"]
+            if direction_text:
+                parts.insert(0, f"Direction: {direction_text}")
+            synth_memo = {
+                "summary": rationale[:200],
+                "reasoning": "\n\n".join(parts),
+                "citations": [f"direction:{did}", f"task:{task.id}"],
+                "tags": ["direction-retirement"],
+            }
+            _apply_synthesized_memo(memo_task, synth_memo, session)
+            synthesized = True
         spawned += 1
         logger.info(
-            "[STRATEGIC] Spawned retirement memo task %s for direction %s",
+            "[STRATEGIC] Spawned retirement memo task %s for direction %s (synthesized=%s)",
             memo_task.id,
             did,
+            synthesized,
         )
     return spawned
 
@@ -904,14 +921,17 @@ def _check_direction_health(direction: dict) -> str | None:
         )
         if churn_threshold > 0:
             metrics = _compute_churn_metrics(direction)
-            if metrics and metrics["non_merge_finished"] >= churn_threshold:
-                if metrics["merge_rate"] < churn_min_merge_rate:
-                    return (
-                        f"Churn guardrail: {metrics['non_merge_finished']} tasks finished "
-                        f"without merging, {metrics['merged']} merged in last "
-                        f"{metrics['window_cycles']} cycles "
-                        f"(merge rate {metrics['merge_rate']:.0%})"
-                    )
+            if (
+                metrics
+                and metrics["non_merge_finished"] >= churn_threshold
+                and metrics["merge_rate"] < churn_min_merge_rate
+            ):
+                return (
+                    f"Churn guardrail: {metrics['non_merge_finished']} tasks finished "
+                    f"without merging, {metrics['merged']} merged in last "
+                    f"{metrics['window_cycles']} cycles "
+                    f"(merge rate {metrics['merge_rate']:.0%})"
+                )
 
         # Rule 6: Lifetime cumulative burn backstop — catches slow-burn directions that stay
         # just under the rolling-window threshold every window but accumulate hundreds of
@@ -926,13 +946,16 @@ def _check_direction_health(direction: dict) -> str | None:
         )
         if lifetime_threshold > 0:
             lm = _compute_lifetime_burn_metrics(direction)
-            if lm and lm["lifetime_non_merge_finished"] >= lifetime_threshold:
-                if lm["lifetime_merge_rate"] < lifetime_min_merge_rate:
-                    return (
-                        f"Lifetime burn backstop: {lm['lifetime_non_merge_finished']} tasks "
-                        f"finished without merging lifetime, {lm['lifetime_merged']} merged "
-                        f"(lifetime merge rate {lm['lifetime_merge_rate']:.0%})"
-                    )
+            if (
+                lm
+                and lm["lifetime_non_merge_finished"] >= lifetime_threshold
+                and lm["lifetime_merge_rate"] < lifetime_min_merge_rate
+            ):
+                return (
+                    f"Lifetime burn backstop: {lm['lifetime_non_merge_finished']} tasks "
+                    f"finished without merging lifetime, {lm['lifetime_merged']} merged "
+                    f"(lifetime merge rate {lm['lifetime_merge_rate']:.0%})"
+                )
 
     return None
 
@@ -1008,8 +1031,10 @@ def _check_direction_completion(direction: dict) -> str | None:
 # with a HEALTHY merge rate that keeps shipping refactor/scaffolding PRs while
 # never advancing its stated success_evidence. Such a direction scores high on
 # quality_score and looks 'stable' on merge-rate trend, so it can burn dozens of
-# cycles unnoticed. This is SURFACING-only — it sets an advisory flag for the
-# strategic agent / operator and never auto-pauses (no 7th pause rule).
+# cycles unnoticed. The flag drives a persistence-pressure ladder (in
+# direction_lifecycle): it never adds a 7th auto-PAUSE rule, but escalates over
+# consecutive flagged cycles — surfacing to the strategic agent / operator and,
+# if the flag persists to max_flagged_cycles, auto-RETIRING the direction.
 
 _OUTCOME_PROGRESS_HISTORY_HARD_CAP = 20
 
@@ -1043,25 +1068,75 @@ def _outcome_progress_config() -> dict:
             "direction_outcome_progress_history_max",
             _OUTCOME_PROGRESS_HISTORY_HARD_CAP,
         ),
+        "escalation_cycles": _int("direction_outcome_progress_escalation_cycles", 3),
+        "max_flagged_cycles": _int("direction_outcome_progress_max_flagged_cycles", 6),
     }
 
 
 def _compute_outcome_progress_signal(direction: dict) -> int:
-    """Deterministic outcome-progress proxy: count of confirmed established findings.
+    """Deterministic outcome-progress proxy: cumulative confirmed established findings.
 
-    Counts confirmed (non-proposed) entries in the direction's accumulated
-    research_context. This grows when a direction lands durable confirmed evidence
-    toward its success_evidence and stays flat when it merely ships
-    scaffolding/refactor PRs that produce no new confirmed findings — which is
-    exactly the signal the scaffolding detector keys off of.
+    Counts confirmed (non-proposed, non-failed) entries currently visible in the
+    direction's research_context PLUS confirmed findings that were evicted from
+    the document once it reached its character cap. Both halves apply the SAME
+    confirmed-only filter: the visible count excludes ``(proposed)`` /
+    ``(failed:)`` entries, and the evicted half reads ``established_confirmed`` —
+    the eviction summary's sub-count of durable evictions — NOT the raw
+    ``established`` total (which also tallies evicted proposed/failed entries).
+    This keeps the two halves consistent, so a saturated long-running direction
+    that evicts only churn (proposed/failed) entries does NOT appear to advance,
+    while genuine confirmed findings still increment the signal whether they sit
+    below the cap (visible) or were trimmed at the cap (evicted_confirmed). The
+    combined value is monotonically non-decreasing for confirmed progress.
     """
-    from app.research_context import _parse_research_context
+    from app.research_context import _parse_eviction_counts, _parse_research_context
 
     ctx = direction.get("research_context") or ""
     if not ctx:
         return 0
     parsed = _parse_research_context(ctx)
-    return sum(1 for item in parsed.get("established", []) if "(proposed)" not in item)
+    # Count only durably-landed findings: exclude proposed (not yet shipped) and
+    # failed (retagged after an unsuccessful fix attempt) so churn-only directions
+    # don't appear to advance.
+    visible = sum(
+        1
+        for item in parsed.get("established", [])
+        if "(proposed)" not in item and "(failed:" not in item
+    )
+    evicted_confirmed = _parse_eviction_counts(parsed.get("eviction_summary")).get(
+        "established_confirmed", 0
+    )
+    return visible + evicted_confirmed
+
+
+def outcome_progress_summary_fields(direction: dict) -> dict:
+    """Cumulative confirmed-finding count + trend from outcome_progress_history.
+
+    Single source of truth for the eviction-robust signal surfaced to the
+    strategic cycle. Shared by both producers — strategic_analysis
+    (_build_outcome_evaluation) and strategic_spawning (_spawn_strategic_review)
+    — so the count selection and trend thresholds cannot drift between them.
+    Returns {} when no snapshots exist; otherwise {"confirmed_finding_count": int}
+    plus "confirmed_finding_trend" ("improving"/"declining"/"stable") once ≥2
+    snapshots are available. Trend compares the mean of the first half of
+    snapshots against the second half (±30% band).
+    """
+    snaps = direction.get("outcome_progress_history") or []
+    if not snaps:
+        return {}
+    progress_vals = [int(s.get("progress", 0) or 0) for s in snaps]
+    fields: dict = {"confirmed_finding_count": progress_vals[-1]}
+    if len(progress_vals) >= 2:
+        mid = len(progress_vals) // 2
+        first_avg = sum(progress_vals[:mid]) / max(mid, 1)
+        second_avg = sum(progress_vals[mid:]) / max(len(progress_vals) - mid, 1)
+        if second_avg > first_avg * 1.3:
+            fields["confirmed_finding_trend"] = "improving"
+        elif second_avg < first_avg * 0.7:
+            fields["confirmed_finding_trend"] = "declining"
+        else:
+            fields["confirmed_finding_trend"] = "stable"
+    return fields
 
 
 def record_outcome_progress_snapshot(direction: dict) -> None:
@@ -1100,10 +1175,80 @@ def record_outcome_progress_snapshot(direction: dict) -> None:
     if len(snaps) > cap:
         snaps = snaps[-cap:]
     direction["outcome_progress_history"] = snaps
-    if _check_direction_completion(direction) is not None or direction.get(
-        "possibly_complete"
+    # Latch ``outcome_progress_ever_met`` only when the completion heuristic
+    # trips with evidence accumulated UNDER the current outcome. Both
+    # `_check_direction_completion` and the lifecycle-derived
+    # `possibly_complete` flag are independent of success_evidence /
+    # retirement_condition — they fire purely on cumulative cycle counts and
+    # PR-merge totals. Without a post-reset gate, a direction that was 'complete'
+    # under an old goal would have this flag re-latched on the very next
+    # snapshot after the outcome is redefined, permanently exempting it from
+    # future scaffolding detection. We require post-reset cycle / merge deltas
+    # that meet the heuristic's own gates (>=4 cycles, >=3 merges) before
+    # treating completion as meaningful under the new outcome.
+    reset_cycle = direction.get("outcome_progress_reset_at_cycle")
+    reset_merged = direction.get("outcome_progress_reset_at_merged")
+    if reset_cycle is None:
+        latch_eligible = True
+    else:
+        post_cycles = total_cycles - int(reset_cycle)
+        post_merged = total_merged - int(reset_merged or 0)
+        latch_eligible = post_cycles >= 4 and post_merged >= 3
+    if latch_eligible and (
+        _check_direction_completion(direction) is not None
+        or direction.get("possibly_complete")
     ):
         direction["outcome_progress_ever_met"] = True
+
+
+# Fields that encode either past outcome progress / completion state or the
+# advisory scaffolding-flag ladder. ALL of these must be cleared when the
+# direction's success_evidence or retirement_condition is redefined — they
+# were judged against the OLD outcome and would otherwise surface stale
+# evidence into strategic_analysis / strategic_spawning until the next
+# lifecycle sweep clears them, or permanently exempt the direction from
+# future scaffolding detection.
+_OUTCOME_RESET_FIELDS: tuple[str, ...] = (
+    "outcome_progress_ever_met",
+    "outcome_progress_history",
+    "evidence_progress",
+    "outcome_scaffolding_flagged",
+    "outcome_scaffolding_flagged_at",
+    "outcome_scaffolding_flagged_cycles",
+    "outcome_scaffolding_evidence",
+    "possibly_complete",
+    "completion_suggestion",
+)
+
+
+def _reset_scaffolding_state_on_outcome_change(direction: dict) -> bool:
+    """Clear outcome-progress + scaffolding-flag state on outcome redefinition.
+
+    Pops every field listed in ``_OUTCOME_RESET_FIELDS`` so future cycles judge
+    the direction against the NEW goal rather than stale progress, stale
+    completion state, or stale scaffolding-flag evidence. Also stamps a
+    post-reset baseline (``outcome_progress_reset_at_cycle`` /
+    ``outcome_progress_reset_at_merged``) that ``record_outcome_progress_snapshot``
+    consults to keep ``outcome_progress_ever_met`` from re-latching on the very
+    next snapshot — the completion heuristic is independent of the redefined
+    outcome, so we require fresh post-reset cycles and merges before treating
+    its verdict as meaningful under the new goal. Returns True if any tracked
+    field was actually removed (caller may persist on truthy result).
+    """
+    cleared = False
+    for _field in _OUTCOME_RESET_FIELDS:
+        if _field in direction:
+            direction.pop(_field)
+            cleared = True
+    history = direction.get("research_history") or []
+    agg = direction.get("history_aggregate") or {}
+    total_cycles = len(history) + (agg.get("total_cycles") or 0)
+    total_merged = sum(e.get("prs_merged", 0) for e in history) + (
+        agg.get("total_prs_merged") or 0
+    )
+    direction["outcome_progress_reset_at_cycle"] = total_cycles
+    direction["outcome_progress_reset_at_merged"] = total_merged
+    return cleared
 
 
 def _evidence_progress_suppresses_scaffolding(
@@ -1141,12 +1286,12 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
         rate >= min_merge_rate, so churn/burn directions (low merge rate / high
         non-merge volume) are explicitly EXCLUDED — those are handled by the churn
         guardrail and lifetime-burn backstop in _check_direction_health;
-      - sustained no progress: the success_evidence fingerprint is unchanged
+      - sustained no progress: the cumulative confirmed-finding count did not grow
         across the last stall_run snapshots AND the direction has never reached a
         'met' outcome.
     Guards hard against false positives: requires a FULL stall_run window of
-    snapshots, so a single stalled cycle cannot trip the flag, and any change in
-    the success_evidence fingerprint anywhere in the window clears it.
+    snapshots, so a single stalled cycle cannot trip the flag, and any growth in
+    the confirmed-finding count anywhere in the window clears it.
     """
     if direction.get("outcome_progress_ever_met"):
         return None
@@ -1171,11 +1316,25 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
     snaps = direction.get("outcome_progress_history") or []
     if run < 2 or len(snaps) < run:
         return None
-    window = snaps[-run:]
+    # Filter snapshots to the current contract fingerprint so that contract rewrites
+    # (success_evidence, retirement_condition, etc.) cannot mix old-contract measurements
+    # into the stall-run window. If fewer than run snapshots exist under the current
+    # contract, the window is insufficient and we return None — a direction whose contract
+    # was just rewritten needs time to build up new-contract evidence before the detector
+    # can fire. This is a defense-in-depth layer; callers should also call
+    # _reset_outcome_detection_state on contract changes to clear the history outright.
+    se_text = ((direction.get("context") or {}).get("success_evidence") or "").encode()
+    current_fp = hashlib.sha256(se_text).hexdigest()[:16]
+    contract_snaps = [s for s in snaps if s.get("success_evidence_fp") == current_fp]
+    if len(contract_snaps) < run:
+        return None
+    window = contract_snaps[-run:]
     progress_vals = [int(s.get("progress", 0) or 0) for s in window]
-    fp_vals = [s.get("success_evidence_fp") for s in window]
-    if len(set(fp_vals)) != 1:
-        return None  # success_evidence changed across the window -> advancing
+    # Gate on whether the cumulative confirmed-finding count grew during the stall window.
+    # The signal from _compute_outcome_progress_signal is visible + evicted confirmed
+    # findings — monotonically non-decreasing regardless of research_context cap saturation.
+    if max(progress_vals) > progress_vals[0]:
+        return None  # finding count grew -> direction is advancing
     # Never met its outcome (current completion detector must also be negative).
     if _check_direction_completion(direction) is not None:
         return None
@@ -1191,7 +1350,7 @@ def _check_outcome_scaffolding(direction: dict) -> dict | None:
         "stall_run_cycles": run,
         "progress_signal": progress_vals[-1],
         "outcome_progress_window": progress_vals,
-        "success_evidence_unchanged_cycles": run,
+        "progress_stagnant_cycles": run,
     }
 
 
@@ -1291,6 +1450,33 @@ def _find_matching_direction(
     return None
 
 
+def _find_recent_rejected_proposal(
+    proposal_text: str, rejected_proposals: list
+) -> dict | None:
+    """Return a recent rejected proposal that overlaps with proposal_text.
+
+    Uses the same tokenization/threshold as `_is_direction_duplicate`, but only
+    scans rejections from the last 30 days so strategic-agent create paths can
+    hard-block recent operator/user rejections while keeping older overlaps
+    advisory-only.
+    """
+    words = set(proposal_text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS
+    if len(words) < 2:
+        return None
+    text_lower = proposal_text.lower().strip()
+    cutoff = (_utcnow() - timedelta(days=30)).isoformat()
+    for entry in rejected_proposals:
+        if entry.get("rejected_at", "") < cutoff:
+            continue
+        rejected_text = (entry.get("text") or "").lower().strip()
+        if rejected_text == text_lower:
+            return entry
+        rejected_words = set(rejected_text.split()) - _DIRECTION_DEDUP_STOPWORDS
+        if len(words & rejected_words) >= 4:
+            return entry
+    return None
+
+
 async def _check_direction_starvation(
     project: Any, dirs_created: int, session: AsyncSession
 ) -> None:
@@ -1356,9 +1542,12 @@ async def _check_direction_starvation(
                 rejected_proposals = list(
                     (vision or {}).get("rejected_proposals") or []
                 )
-                if _is_direction_duplicate(
-                    fallback_text, directions, rejected_proposals
-                ):
+                is_dup = _is_direction_duplicate(
+                    fallback_text,
+                    directions,
+                    rejected_proposals,
+                )
+                if is_dup:
                     logger.warning(
                         f"[STRATEGIC] Starvation fallback dedup'd for project {project.id}: "
                         f"text '{fallback_text}' overlaps with existing/rejected direction. "
@@ -1398,9 +1587,12 @@ async def _check_direction_starvation(
                 if fallback_category:
                     fallback_dir["category"] = fallback_category
 
-                updated_directions = [*list(directions), fallback_dir]
-                project.directions = updated_directions
-                flag_modified(project, "directions")
+                from app.task_locking import with_directions_locked
+
+                _fd = fallback_dir
+                await with_directions_locked(
+                    session, project.id, lambda dirs: dirs.append(_fd)
+                )
 
                 vision["_direction_starvation_count"] = 0
                 vision.pop("_strategic_frequency_override", None)
@@ -1585,7 +1777,11 @@ async def _handle_strategic_completion(
         dirs_retired = (task.context or {}).get("_strategic_dirs_retired", 0)
         created_ids = list((task.context or {}).get("_strategic_created_ids", []))
         retired_ids = list((task.context or {}).get("_strategic_retired_ids", []))
-        retired_rationales: Dict[str, str] = {}
+        # Collect rationales regardless of cycle_id so synthesized memos always
+        # have the retirement reason available at spawn time.
+        retired_rationales: Dict[str, str] = _collect_rationales(
+            project, retired_ids, _RETIRED_NOTE_PREFIX
+        )
         if cycle_id:
             _vision_updated = (task.context or {}).get(
                 "_strategic_vision_set", False
@@ -1595,9 +1791,7 @@ async def _handle_strategic_completion(
             created_rationales = _collect_rationales(
                 project, created_ids, _CREATED_NOTE_PREFIX
             )
-            retired_rationales = _collect_rationales(
-                project, retired_ids, _RETIRED_NOTE_PREFIX
-            )
+            # retired_rationales already populated above (outside cycle_id guard)
             created_predictions = _collect_creation_predictions(project, created_ids)
             retired_final_metrics = _collect_retirement_metrics(project, retired_ids)
             # Audit W2: cycle outcome lives on the StrategicCycle row;
@@ -2212,6 +2406,12 @@ async def _handle_strategic_completion(
                     continue
                 for d in directions:
                     if d.get("id") == dir_id:
+                        # Snapshot contract fields before mutation to detect real changes.
+                        _pre_text = d.get("text")
+                        _pre_paths = list(d.get("paths") or [])
+                        _pre_ctx = d.get("context") or {}
+                        _pre_se = _pre_ctx.get("success_evidence")
+                        _pre_rc = _pre_ctx.get("retirement_condition")
                         if "text" in changes:
                             new_text = str(changes["text"])
                             if len(new_text) > STRATEGIC_DIRECTION_TEXT_MAX:
@@ -2255,6 +2455,7 @@ async def _handle_strategic_completion(
                             else:
                                 d["status"] = changes["status"]
                                 if changes["status"] == "superseded":
+                                    d["completed_at"] = _utcnow().isoformat()
                                     superseded_by = changes.get("superseded_by")
                                     if not superseded_by:
                                         succ_id = (
@@ -2332,6 +2533,41 @@ async def _handle_strategic_completion(
                                 "Strategic review: recommended_mode=pause"
                             )
                             d["paused_at"] = _utcnow().isoformat()
+                        # Persist context-structured fields (same cap as CREATE path)
+                        _DIR_FIELD_MAX = 500
+                        ctx = d.get("context") or {}
+                        _old_se = ctx.get("success_evidence")
+                        _old_rc = ctx.get("retirement_condition")
+                        for _ctx_field in (
+                            "success_evidence",
+                            "retirement_condition",
+                            "implementation_constraints",
+                        ):
+                            if _ctx_field in changes:
+                                val = str(changes[_ctx_field] or "").strip()
+                                if val:
+                                    ctx[_ctx_field] = val[:_DIR_FIELD_MAX]
+                                else:
+                                    ctx.pop(_ctx_field, None)
+                        if (
+                            ctx.get("success_evidence") != _old_se
+                            or ctx.get("retirement_condition") != _old_rc
+                        ):
+                            _reset_scaffolding_state_on_outcome_change(d)
+                        d["context"] = ctx
+                        # Reset outcome-detection state when any contract field changed.
+                        _new_ctx = d.get("context") or {}
+                        if (
+                            d.get("text") != _pre_text
+                            or list(d.get("paths") or []) != _pre_paths
+                            or _new_ctx.get("success_evidence") != _pre_se
+                            or _new_ctx.get("retirement_condition") != _pre_rc
+                        ):
+                            from app.direction_lifecycle import (
+                                _reset_outcome_detection_state,
+                            )
+
+                            _reset_outcome_detection_state(d)
                         # Record rationale as a note
                         if rationale:
                             notes = d.get("notes", [])
@@ -2358,7 +2594,8 @@ async def _handle_strategic_completion(
                     continue
                 for d in directions:
                     if d.get("id") == dir_id:
-                        d["status"] = "expired"
+                        d["status"] = "retired"
+                        d["retired_at"] = _utcnow().isoformat()
                         if rationale:
                             notes = d.get("notes", [])
                             notes.append(
@@ -2385,8 +2622,10 @@ async def _handle_strategic_completion(
                         break
 
         if ops_applied > 0:
-            project.directions = directions
-            flag_modified(project, "directions")
+            from app.task_locking import with_directions_locked
+
+            _dirs = list(directions)
+            await with_directions_locked(session, task.project_id, lambda _: _dirs)
 
     # Apply version_phase_decision + qualify_request from the parsed output
     # (fallback / log-parse path). In practice the agent emits both fields

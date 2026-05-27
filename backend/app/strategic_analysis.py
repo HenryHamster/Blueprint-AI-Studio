@@ -57,8 +57,10 @@ def _build_retired_directions_summary(
         if status not in retired_statuses and not is_expired_with_disposition:
             continue
 
-        # Time-window filter: use retired_at, auto_completed_at, or last history entry
-        retired_at = d.get("retired_at") or d.get("auto_completed_at")
+        # Time-window filter: use the timestamp each writer already produces.
+        # Writers: retire op -> retired_at, saturation/code-failure/scaffolding -> completed_at,
+        # proposal expiry -> expired_at. Fall back to last history entry timestamp.
+        retired_at = d.get("retired_at") or d.get("completed_at") or d.get("expired_at")
         if not retired_at:
             history_list = d.get("research_history") or []
             retired_at = history_list[-1].get("timestamp") if history_list else None
@@ -336,6 +338,12 @@ def _build_outcome_evaluation(
             outcome["proposed"] = proposed[:10]
         if failed_approaches:
             outcome["failed_approaches"] = failed_approaches[:10]
+        # Surface cumulative confirmed-finding count and trend from
+        # outcome_progress_history (eviction-robust signal used by scaffolding
+        # detector). Shared helper keeps thresholds in sync with strategic_spawning.
+        from app.strategic_completion import outcome_progress_summary_fields
+
+        outcome.update(outcome_progress_summary_fields(d))
         # Include recent diagnosis if available
         diagnosis_summary = (d.get("diagnosis_summary") or "").strip()
         if diagnosis_summary:

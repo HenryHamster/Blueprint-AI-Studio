@@ -13,6 +13,8 @@ from typing import Any, Dict
 
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from sqlalchemy.orm import object_session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.failure_classification import INFRA_CLASSES as _DIRECTION_INFRA_CLASSES
 from app.time_utils import _utcnow
@@ -60,11 +62,73 @@ TASK_TYPE_BRANCH_PREFIX: Dict[str, str] = {
 }
 
 
-def derive_task_branch(task_id: Any, task_type: str | None) -> str:
-    """Derive an agent work branch name (``blueprint/{prefix}-{8hex}``)
-    from the task type and id, matching the agent's branch derivation."""
+# Default namespace (the "blueprint" segment of ``blueprint/{prefix}-{8hex}``).
+# Per-project overrides come from project.task_branch_namespace (see
+# get_project_task_branch_namespace below); a non-Blueprint install can ship
+# its own namespace by setting build_config.task_branch_namespace.
+TASK_BRANCH_NAMESPACE_DEFAULT = "blueprint"
+
+
+_missing_project_branch_alerts: set[tuple[str, str]] = set()
+
+
+def derive_task_branch(
+    task_id: Any,
+    task_type: str | None,
+    namespace: str = TASK_BRANCH_NAMESPACE_DEFAULT,
+) -> str:
+    """Derive an agent work branch name (``{namespace}/{prefix}-{8hex}``)
+    from the task type and id, matching the agent's branch derivation.
+
+    ``namespace`` defaults to ``"blueprint"`` so call sites that pre-date the
+    per-project namespace work unchanged for the self-repo. Callers that have
+    a project in hand should resolve the namespace via
+    :func:`get_project_task_branch_namespace` and pass it through.
+    """
     prefix = TASK_TYPE_BRANCH_PREFIX.get(task_type or "", "task")
-    return f"blueprint/{prefix}-{str(task_id).replace('-', '')[:8]}"
+    return f"{namespace}/{prefix}-{str(task_id).replace('-', '')[:8]}"
+
+
+def _signal_missing_project_branch(project, column_name: str, alert_title: str) -> None:
+    project_id = getattr(project, "id", None)
+    project_id_str = str(project_id) if project_id is not None else "<unknown>"
+    dedupe_key = (project_id_str, column_name)
+    if dedupe_key in _missing_project_branch_alerts:
+        return
+    _missing_project_branch_alerts.add(dedupe_key)
+    logger.warning(
+        "[BRANCH_RESOLVER] project %s missing %s; falling back to main",
+        project_id_str,
+        column_name,
+    )
+
+    try:
+        session = object_session(project)
+    except Exception:  # noqa: BLE001
+        session = None
+    if session is None or project_id is None:
+        return
+
+    from app.models import Alert, AlertSeverity
+
+    try:
+        session.add(
+            Alert(
+                project_id=project_id,
+                severity=AlertSeverity.ERROR,
+                title=alert_title,
+                message=(
+                    f"Project {project_id_str} has NULL {column_name}; "
+                    "falling back to main until the column is populated."
+                ),
+            )
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[BRANCH_RESOLVER] project %s missing %s; alert could not be staged",
+            project_id_str,
+            column_name,
+        )
 
 
 def resolve_task_branch(task: Any) -> str:
@@ -170,9 +234,7 @@ runtime_config: Dict = {
     # ``get_check_runs_cached(treat_missing_as_success=True)`` lenient path; kept
     # as the operator-side rollback handle if the strict mode causes false
     # negatives in prod.
-    "ci_resolution_strict_mode": os.getenv(
-        "CI_RESOLUTION_STRICT_MODE", "true"
-    ).lower()
+    "ci_resolution_strict_mode": os.getenv("CI_RESOLUTION_STRICT_MODE", "true").lower()
     not in ("0", "false", "no"),
     # Hard cap on ``ci_wait_started`` clock resets when GitHub responds with
     # "checks in progress" / "status check pending" to a merge attempt.  Each
@@ -456,6 +518,14 @@ runtime_config: Dict = {
     "auto_archive_terminal_after_days": 7,
     "auto_archive_max_terminal_tasks_per_project": 200,
     "auto_archive_interval_minutes": 60,
+    # Reaper cycle-level circuit breaker. After reaper_cycle_halt_threshold
+    # consecutive whole-cycle exceptions the reaper enters a soft HALTED state.
+    # After reaper_cycle_halt_cooldown_seconds it attempts a half-open probe.
+    # After reaper_half_open_probe_limit consecutive failed probes it escalates
+    # to a hard halt that requires operator reset.
+    "reaper_cycle_halt_threshold": 5,
+    "reaper_cycle_halt_cooldown_seconds": 300,
+    "reaper_half_open_probe_limit": 3,
     # Per-scope heartbeat-stale thresholds (seconds). Large-scope tasks
     # legitimately run longer stretches without a heartbeat, so reaping at the
     # small-scope bar flags them as dead while they're still making progress.
@@ -500,12 +570,11 @@ runtime_config: Dict = {
     # window and the typical role transition cadence; tunable down for
     # tighter slot budgets.
     "next_role_poll_timeout_secs": 180,
-    # Integration trunk branch. Autonomous spawn-time base_branch defaults
-    # route through this value so Phase 1 can retarget all pipeline work
-    # from "main" to "automain" with a single config flip. Default "main"
-    # preserves existing behavior until Phase 1 activates.
-    # Operator-tunable via runtime_config_json; persisted across restarts.
-    "integration_branch": "main",
+    # Task-branch namespace (the leading segment of ``{namespace}/{prefix}-{8hex}``
+    # agent work branches). DEPRECATED transitional global fallback — per-project
+    # ``build_config.task_branch_namespace`` is the real source of truth. Default
+    # ``"blueprint"`` preserves byte-identical behavior for the self-repo.
+    "task_branch_namespace": "blueprint",
     # Release qualifier (Phase 3+). promotion_enabled gates whether the
     # qualifier may promote a qualified automain candidate to main — default
     # False ships the qualifier in dry-run (score + log, never promote).
@@ -513,6 +582,11 @@ runtime_config: Dict = {
     # runtime_config_json; persisted across restarts.
     "promotion_enabled": False,
     "smoketest_enabled": False,
+    # Broadcast alert safety cap — limits the number of projects receiving
+    # orchestrator-wide broadcast alerts (errors, halts, rollbacks, recovery).
+    # Global orchestrator safety cap, not per-project. Operator-tunable via
+    # runtime_config_json; persisted across restarts.
+    "project_broadcast_limit": 1000,
 }
 
 # Scope-aware per-class retry budgets. When a task's context includes a scope
@@ -533,6 +607,307 @@ SCOPE_AWARE_RETRY_BUDGETS: Dict[str, Dict[str, int]] = {
     "AGENT_TIMEOUT": {"small": 2, "medium": 3, "large": 4},
     "EXTERNAL_API": {"small": 3, "medium": 4, "large": 5},
 }
+
+
+def get_project_integration_branch(project) -> str:
+    """Return the integration branch for a project.
+
+    Fallback chain:
+      1. project.integration_branch (per-project column, added by migration 0122+)
+      2. "main"
+
+    The deprecated runtime_config bridge was removed after the per-project
+    column stabilized across the migration/backfill rollout.
+    """
+    integration_branch = getattr(project, "integration_branch", None)
+    if integration_branch:
+        return integration_branch
+    _signal_missing_project_branch(
+        project, "integration_branch", "Missing integration_branch"
+    )
+    return "main"
+
+
+def get_project_task_branch_namespace(project) -> str:
+    """Return the task-branch namespace for a project.
+
+    Fallback chain:
+      1. project.build_config['task_branch_namespace'] (per-project override)
+      2. runtime_config['task_branch_namespace'] (DEPRECATED global fallback)
+      3. ``TASK_BRANCH_NAMESPACE_DEFAULT`` (``"blueprint"``)
+
+    A non-Blueprint install (e.g. a project named ``autoproj``) configures its
+    namespace through ``build_config`` so its agent work branches land under
+    ``autoproj/{prefix}-{8hex}`` instead of the Blueprint default.
+    """
+    if project is not None:
+        build_config = getattr(project, "build_config", None) or {}
+        per_project = build_config.get("task_branch_namespace")
+        if per_project:
+            return str(per_project)
+    return runtime_config.get("task_branch_namespace", TASK_BRANCH_NAMESPACE_DEFAULT)
+
+
+def get_project_pr_title_prefix(project) -> str:
+    """Return the PR title prefix string for a project, with a trailing space.
+
+    Reads ``build_config['pr_title_prefix']``.  If set, returns the value with
+    a single trailing space so callers can write ``f"{prefix}Rollup: ..."``
+    directly.  If absent or empty, returns ``""`` so no prefix is injected.
+
+    Example ``build_config`` entry::
+
+        {"pr_title_prefix": "[Blueprint]"}
+    """
+    if project is not None:
+        build_config = getattr(project, "build_config", None) or {}
+        per_project = build_config.get("pr_title_prefix")
+        if per_project:
+            return f"{per_project} "
+    return ""
+
+
+def ensure_project_pr_title_prefix(project, title: str) -> str:
+    """Return *title* with the project's PR title prefix prepended if absent.
+
+    Used by the backend PR-creation endpoint (``/api/agent/github/pull-requests``)
+    to normalise agent-authored PR titles so they carry the project's configured
+    branding prefix even when the agent's prompt did not include it explicitly.
+
+    Idempotent: if *title* already starts with the prefix token (ignoring the
+    trailing space that :func:`get_project_pr_title_prefix` appends), returns
+    *title* unchanged.  When no prefix is configured returns *title* as-is.
+    """
+    prefix = get_project_pr_title_prefix(project)
+    if not prefix:
+        return title
+    # prefix already carries a trailing space (e.g. "[Blueprint] ").
+    # Compare against the bare token so "[Blueprint] feat: x" is not re-prefixed.
+    if title.startswith(prefix.rstrip()):
+        return title
+    return f"{prefix}{title}"
+
+
+def get_project_promotion_target(project) -> str:
+    """Return the promotion target branch for a project.
+
+    Fallback chain:
+      1. project.promotion_target (per-project column, added by migration 0125+)
+      2. "main"
+
+    The deprecated runtime_config bridge was removed after the per-project
+    column stabilized across the migration/backfill rollout.
+    """
+    promotion_target = getattr(project, "promotion_target", None)
+    if promotion_target:
+        return promotion_target
+    _signal_missing_project_branch(
+        project, "promotion_target", "Missing promotion_target"
+    )
+    return "main"
+
+
+async def backfill_branch_columns(session, project_id=None) -> dict:
+    """Populate NULL integration_branch / promotion_target from GitHub defaults.
+
+    Runs once at startup (called from main.py lifespan) after migrations finish.
+    Only writes to columns that are still NULL — skips rows already populated so
+    the function is safe to re-run.  Self-repo projects with NULL integration_branch
+    are left untouched (migration 0124 already set them to 'automain'; if still NULL
+    they are in a state the LTS workflow manages separately).  Self-repo projects
+    with NULL promotion_target get 'main' without a GitHub round-trip.
+
+    For non-self-repo projects, resolves GitHub credentials and calls
+    get_repo_default_branch().  When the GitHub API call fails, emits a per-project
+    Alert so an operator can fix credentials and re-run rather than silently falling
+    back to 'main'.
+
+    When project_id is provided, only that project is processed.  Used by
+    POST /api/admin/projects/{id}/backfill-branches to re-run the backfill for a
+    single project without restarting the service.
+
+    Returns a summary dict:
+      {
+        "filled": int,     # columns written
+        "skipped": int,    # projects already fully populated
+        "errored": int,    # projects where GitHub API call failed
+        "self_repo_skipped": int,  # self-repo integration_branch left as-is
+      }
+    """
+    from app.models import Alert, AlertSeverity, Project
+    from app.release_promotion import _resolve_github_with_session
+    from app import github as _github
+    from sqlmodel import select
+
+    summary = {"filled": 0, "skipped": 0, "errored": 0, "self_repo_skipped": 0}
+
+    try:
+        query = select(Project).where(
+            (Project.integration_branch.is_(None))
+            | (Project.promotion_target.is_(None))
+        )
+        if project_id is not None:
+            query = query.where(Project.id == project_id)
+        result = await session.execute(query)
+        projects = result.scalars().all()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[BRANCH_BACKFILL] Could not query projects: %s", exc)
+        return summary
+
+    for project in projects:
+        need_integration = project.integration_branch is None
+        need_promotion = project.promotion_target is None
+
+        if not need_integration and not need_promotion:
+            summary["skipped"] += 1
+            continue
+
+        # Self-repo: integration_branch managed by the LTS workflow — leave NULL
+        # as-is (migration 0124 already backfilled is_self_repo rows to 'automain').
+        if project.is_self_repo and need_integration:
+            summary["self_repo_skipped"] += 1
+            need_integration = False
+
+        # Self-repo promotion_target: no GitHub round-trip needed.
+        if project.is_self_repo and need_promotion:
+            project.promotion_target = "main"
+            flag_modified(project, "promotion_target")
+            session.add(project)
+            summary["filled"] += 1
+            need_promotion = False
+
+        if not need_integration and not need_promotion:
+            continue
+
+        # Non-self-repo: resolve GitHub credentials and fetch the default branch.
+        try:
+            resolved = await _resolve_github_with_session(session, project)
+            if resolved is None:
+                raise ValueError("no GitHub credentials available")
+            token, owner, repo = resolved
+            default_branch = await _github.get_repo_default_branch(token, owner, repo)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[BRANCH_BACKFILL] project %s (%s/%s): GitHub call failed: %s",
+                project.id,
+                getattr(project, "github_owner", "?"),
+                getattr(project, "github_repo", "?"),
+                exc,
+            )
+            try:
+                alert = Alert(
+                    project_id=project.id,
+                    severity=AlertSeverity.WARNING,
+                    title="Branch backfill failed — integration_branch or promotion_target still NULL",
+                    message=(
+                        f"Could not populate integration_branch/promotion_target for project "
+                        f"{project.id} from GitHub: {str(exc)[:300]}. "
+                        "Fix GitHub credentials and re-run the backfill (restart the service or "
+                        "call POST /api/admin/projects/{id}/backfill-branches)."
+                    ),
+                )
+                session.add(alert)
+            except Exception:  # noqa: BLE001
+                pass
+            summary["errored"] += 1
+            continue
+
+        if need_integration:
+            project.integration_branch = default_branch
+            flag_modified(project, "integration_branch")
+            summary["filled"] += 1
+        if need_promotion:
+            project.promotion_target = default_branch
+            flag_modified(project, "promotion_target")
+            summary["filled"] += 1
+        session.add(project)
+
+    if summary["filled"] or summary["errored"]:
+        logger.info(
+            "[BRANCH_BACKFILL] complete: filled=%d skipped=%d errored=%d self_repo_skipped=%d",
+            summary["filled"],
+            summary["skipped"],
+            summary["errored"],
+            summary["self_repo_skipped"],
+        )
+
+    return summary
+
+
+async def backfill_task_branch_namespace(session, project_id=None) -> dict:
+    """Populate missing task_branch_namespace in build_config for legacy projects.
+
+    Runs at startup and via the admin backfill endpoint.  Idempotent: only
+    writes projects where build_config['task_branch_namespace'] is absent or
+    empty.  Self-repo (Blueprint) projects always get 'blueprint'; all others
+    get the slugified GitHub repo name (matching _derive_task_branch_namespace
+    in admin_onboard.py).
+
+    When project_id is provided, only that project is processed.
+
+    Returns a summary dict:
+      {
+        "namespace_filled": int,   # projects updated
+        "namespace_skipped": int,  # projects already had a value
+      }
+    """
+    import re as _re
+
+    from app.models import Project
+    from sqlmodel import select
+
+    summary = {"namespace_filled": 0, "namespace_skipped": 0}
+
+    try:
+        query = select(Project)
+        if project_id is not None:
+            query = query.where(Project.id == project_id)
+        result = await session.execute(query)
+        projects = result.scalars().all()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[NS_BACKFILL] Could not query projects: %s", exc)
+        return summary
+
+    for project in projects:
+        build_config = project.build_config or {}
+        if build_config.get("task_branch_namespace"):
+            summary["namespace_skipped"] += 1
+            continue
+
+        github_repo = getattr(project, "github_repo", "") or ""
+        if project.is_self_repo:
+            namespace = "blueprint"
+        else:
+            slug = _re.sub(r"[^a-z0-9]+", "-", github_repo.lower()).strip("-")
+            namespace = slug[:40] if slug else "project"
+
+        project.build_config = {**build_config, "task_branch_namespace": namespace}
+        flag_modified(project, "build_config")
+        session.add(project)
+        summary["namespace_filled"] += 1
+
+    if summary["namespace_filled"]:
+        logger.info(
+            "[NS_BACKFILL] complete: namespace_filled=%d namespace_skipped=%d",
+            summary["namespace_filled"],
+            summary["namespace_skipped"],
+        )
+
+    return summary
+
+
+def get_project_broadcast_limit(project) -> int:
+    """Return the broadcast alert limit for a project.
+
+    Fallback chain:
+      1. project.design_doc['_broadcast_limit'] (per-project override via admin endpoint)
+      2. runtime_config["project_broadcast_limit"] (global default)
+      3. 1000
+    """
+    per_project = (getattr(project, "design_doc", None) or {}).get("_broadcast_limit")
+    if per_project is not None:
+        return int(per_project)
+    return runtime_config.get("project_broadcast_limit", 1000)
 
 
 def _migrate_legacy_provider_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -786,6 +1161,10 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "warm_continuity_cooldown_seconds",
                     "warm_backlog_reuse_failure_rate_threshold",
                     "warm_backlog_reuse_cooldown_seconds",
+                    "project_broadcast_limit",
+                    "reaper_cycle_halt_threshold",
+                    "reaper_cycle_halt_cooldown_seconds",
+                    "reaper_half_open_probe_limit",
                 ):
                     if int_key in config_json:
                         _set(int_key, int(config_json[int_key]))
@@ -800,8 +1179,6 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "reserved_slots_for_types",
                         config_json["reserved_slots_for_types"],
                     )
-                if "integration_branch" in config_json:
-                    _set("integration_branch", str(config_json["integration_branch"]))
                 if "promotion_enabled" in config_json:
                     _set(
                         "promotion_enabled",
@@ -924,6 +1301,29 @@ async def hydrate_persistent_anomalies(session) -> int:
     return loaded
 
 
+async def with_design_doc_locked(
+    session,
+    project_id: str,
+    mutate_fn: Any,
+) -> None:
+    """Read-modify-write project.design_doc under a project row lock.
+
+    Thin wrapper over the canonical ``task_locking.with_design_doc_locked``
+    that additionally coerces ``project_id`` (which background callers pass
+    as a str) to ``UUID`` and silently no-ops on malformed input. The
+    lock/mutate/flag_modified logic lives in exactly one place — the
+    canonical helper — so the two never drift apart.
+    """
+    from app.task_locking import with_design_doc_locked as _canonical
+    import uuid as _uuid
+
+    try:
+        pid = _uuid.UUID(str(project_id))
+    except (TypeError, ValueError):
+        return
+    await _canonical(session, pid, mutate_fn)
+
+
 async def persist_anomaly_snapshot(
     project_id: str, proj_anomalies: dict, session
 ) -> None:
@@ -932,24 +1332,13 @@ async def persist_anomaly_snapshot(
     Called after each anomaly detection cycle so the state survives the next
     pod restart. Safe to call within an already-open session (caller commits).
     """
-    from app.models import Project
-    from sqlalchemy.orm.attributes import flag_modified
-    import uuid as _uuid
 
-    try:
-        pid = _uuid.UUID(project_id)
-    except (TypeError, ValueError):
-        return
-    project = await session.get(Project, pid)
-    if project is None:
-        return
-    doc = dict(project.design_doc or {})
-    doc[_ANOMALY_FINGERPRINTS_KEY] = {
-        k: dict(v) if isinstance(v, dict) else v for k, v in proj_anomalies.items()
-    }
-    project.design_doc = doc
-    flag_modified(project, "design_doc")
-    session.add(project)
+    def _mutate(doc: dict) -> None:
+        doc[_ANOMALY_FINGERPRINTS_KEY] = {
+            k: dict(v) if isinstance(v, dict) else v for k, v in proj_anomalies.items()
+        }
+
+    await with_design_doc_locked(session, project_id, _mutate)
 
 
 # --- Regression Signal State (first-tripped timestamps for MTTD) ---
@@ -1194,6 +1583,55 @@ def count_recent_warm_pin_clears(window_seconds: int = 3600) -> int:
 # Auto-suppression deadline set by is_warm_continuity_suppressed() when the
 # pin-clear rate exceeds warm_pin_clear_rate_threshold. None means not suppressed.
 warm_continuity_suppressed_until: datetime | None = None
+
+
+# Per-call-site counter for pr_is_not_behind() outcomes. Keyed by a stable
+# label that names the calling site (e.g. "ci_completion", "rollup_pre_merge").
+# Each inner dict has integer buckets for the True/False/None outcomes plus a
+# total. Updated synchronously by record_pr_is_not_behind() and snapshotted by
+# the admin diagnostics endpoint. In-process only — not persisted.
+PR_IS_NOT_BEHIND_CALL_SITES: tuple[str, ...] = (
+    "ci_completion",
+    "rollup_pre_merge",
+    "rollup_post_merge",
+    "orchestrator_ci",
+)
+pr_is_not_behind_counts: Dict[str, Dict[str, int]] = {}
+
+
+def _empty_pr_is_not_behind_bucket() -> Dict[str, int]:
+    return {"true": 0, "false": 0, "none": 0, "total": 0}
+
+
+def record_pr_is_not_behind(call_site: str, result: bool | None) -> None:
+    """Increment the bucket matching ``result`` for ``call_site``."""
+    if not call_site:
+        return
+    bucket = pr_is_not_behind_counts.setdefault(
+        call_site, _empty_pr_is_not_behind_bucket()
+    )
+    if result is True:
+        bucket["true"] += 1
+    elif result is False:
+        bucket["false"] += 1
+    else:
+        bucket["none"] += 1
+    bucket["total"] += 1
+
+
+def snapshot_pr_is_not_behind_counts() -> Dict[str, Dict[str, int]]:
+    """Return a deep-copied snapshot keyed by call site.
+
+    Always includes the four canonical call sites with zeroed buckets so the
+    response shape is stable from process start. Any other call sites that have
+    been recorded (future expansions) are included as well.
+    """
+    snapshot: Dict[str, Dict[str, int]] = {
+        site: _empty_pr_is_not_behind_bucket() for site in PR_IS_NOT_BEHIND_CALL_SITES
+    }
+    for site, bucket in pr_is_not_behind_counts.items():
+        snapshot[site] = dict(bucket)
+    return snapshot
 
 
 def is_warm_continuity_suppressed() -> bool:
@@ -2001,3 +2439,71 @@ def get_dispatcher_cycles(
         if r.get("cycle_started_at", "") >= cutoff
         and (project_id is None or r.get("project_id") == project_id)
     ]
+
+
+# --- Reaper Cycle-Level Halt State Access ---
+# The authoritative halt state lives in reaper._reaper_halt_state (module-local
+# to avoid a circular import — reaper.py already imports from shared_state.py).
+# These helpers provide cross-module access via lazy imports so admin routers
+# and the metrics endpoint can read and reset the halt state without importing
+# reaper.py directly.
+
+
+def get_reaper_halt_state() -> Dict[str, Any]:
+    """Snapshot of the reaper's cycle-level circuit breaker state.
+
+    Lazily imports from app.reaper to avoid circular imports at module load.
+    Returns a safe default dict when the reaper module is not yet imported.
+    """
+    try:
+        import app.reaper as _reaper_mod  # noqa: PLC0415
+
+        state = _reaper_mod._reaper_halt_state
+        ts = state.get("halt_timestamp")
+        return {
+            "halted": bool(state.get("halted")),
+            "halt_timestamp": ts.isoformat() if ts else None,
+            "last_error": state.get("last_error"),
+            "crash_count": state.get("crash_count", 0),
+            "hard_halted": bool(state.get("hard_halted")),
+            "half_open_failures": state.get("half_open_failures", 0),
+        }
+    except Exception:  # noqa: BLE001
+        return {
+            "halted": False,
+            "halt_timestamp": None,
+            "last_error": None,
+            "crash_count": 0,
+            "hard_halted": False,
+            "half_open_failures": 0,
+        }
+
+
+def reset_reaper_halt_state() -> bool:
+    """Reset the reaper cycle-level circuit breaker (operator manual reset).
+
+    Clears the in-memory halt state so the reaper service resumes on its next
+    iteration.  Returns True if the reaper was halted and is now cleared,
+    False if it was not halted.
+    """
+    try:
+        import app.reaper as _reaper_mod  # noqa: PLC0415
+
+        state = _reaper_mod._reaper_halt_state
+        if not state.get("halted"):
+            return False
+        state.update(
+            {
+                "halted": False,
+                "halt_timestamp": None,
+                "last_error": None,
+                "crash_count": 0,
+                "hard_halted": False,
+                "half_open_failures": 0,
+            }
+        )
+        logger.info("[REAPER] Halt state cleared by operator reset.")
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[REAPER] reset_reaper_halt_state failed: {e}")
+        return False

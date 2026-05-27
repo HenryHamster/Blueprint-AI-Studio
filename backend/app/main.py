@@ -14,8 +14,6 @@ from fastapi import (
     Depends,
     HTTPException,
     Request,
-    WebSocket,
-    WebSocketDisconnect,
 )
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -42,7 +40,7 @@ from app.models import (
     RegressionCaseStatus,
 )
 from app.compute import delete_agent_vm, provision_agent_vm  # noqa: F401  (provision_agent_vm re-exported for test patches; see main.py:108 docstring)
-from app.auth import get_current_user, verify_agent_jwt
+from app.auth import get_current_user
 from app.telemetry import setup_telemetry
 from app.admin import router as admin_router
 from app.routers.admin_projects import router as admin_projects_router
@@ -56,6 +54,7 @@ from app.routers.agent_credentials import router as agent_credentials_router
 from app.routers.github import router as github_router
 from app.routers.projects import router as projects_router
 from app.routers.directions import router as directions_router
+from app.direction_lifecycle import _reset_outcome_detection_state
 from app.routers.deploy import router as deploy_router
 from app.routers.admin_users import router as admin_users_router
 from app.routers.admin_notifications import router as admin_notifications_router
@@ -71,11 +70,14 @@ from app.routers.agent_status import router as agent_status_router
 from app.routers.admin_onboard import router as admin_onboard_router
 from app.shared_state import limiter
 import app.shared_state as _shared_state
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import (
+    runtime_config as _runtime_config,
+    get_project_integration_branch as _get_project_integration_branch,
+)
 from app import orchestrator as _orch
 from app.lifecycle import lifespan
 from app.time_utils import _utcnow
-from app.broadcast import manager, broadcast_to_project, _sanitize_log
+from app.broadcast import broadcast_to_project
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +123,7 @@ from app.strategic_constants import (
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0114"
+EXPECTED_SCHEMA_REVISION = "0127"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -943,6 +945,18 @@ async def _send_webhook_notification(event_type: str, title: str, details: str) 
         logger.warning(f"[WEBHOOK] Failed to send notification: {e}")
 
 
+def _get_broadcast_limit(design_doc: "dict | None" = None) -> int:
+    """Return the broadcast limit for a project, falling back to the global default.
+
+    Per-project override: store ``_broadcast_limit`` in project.design_doc.
+    Set to 0 to opt a project out of system-wide broadcast alerts.
+    """
+    per_project = (design_doc or {}).get("_broadcast_limit")
+    if per_project is not None:
+        return int(per_project)
+    return _runtime_config.get("project_broadcast_limit", 1000)
+
+
 async def _create_orchestrator_error_alerts(
     session: AsyncSession, consecutive_errors: int
 ) -> None:
@@ -952,16 +966,17 @@ async def _create_orchestrator_error_alerts(
         f"The orchestrator has encountered {consecutive_errors} consecutive errors. "
         "The pipeline may be stalled. Check logs for details."
     )
-    _PROJECT_BROADCAST_LIMIT = 1000
-    project_ids = (
-        (await session.execute(select(Project.id).limit(_PROJECT_BROADCAST_LIMIT)))
-        .scalars()
-        .all()
-    )
-    if len(project_ids) == _PROJECT_BROADCAST_LIMIT:
+    global_limit = _runtime_config.get("project_broadcast_limit", 1000)
+    rows = (
+        await session.execute(
+            select(Project.id, Project.design_doc).limit(global_limit)
+        )
+    ).all()
+    project_ids = [pid for pid, doc in rows if _get_broadcast_limit(doc) > 0]
+    if len(rows) == global_limit:
         logger.warning(
             "_create_orchestrator_error_alerts: project_ids capped at %d",
-            _PROJECT_BROADCAST_LIMIT,
+            global_limit,
         )
     existing_rows = (
         (
@@ -1010,16 +1025,15 @@ async def _create_halted_alerts(
         f"Halted at: {halted_at.isoformat()}. "
         "Pipeline will auto-recover after 1h cooldown, or manually set max VMs > 0."
     )
-    _PROJECT_BROADCAST_LIMIT = 1000
-    project_ids = (
-        (await session.execute(select(Project.id).limit(_PROJECT_BROADCAST_LIMIT)))
-        .scalars()
-        .all()
-    )
-    if len(project_ids) == _PROJECT_BROADCAST_LIMIT:
-        logger.warning(
-            "_create_halted_alerts: project_ids capped at %d", _PROJECT_BROADCAST_LIMIT
+    global_limit = _runtime_config.get("project_broadcast_limit", 1000)
+    rows = (
+        await session.execute(
+            select(Project.id, Project.design_doc).limit(global_limit)
         )
+    ).all()
+    project_ids = [pid for pid, doc in rows if _get_broadcast_limit(doc) > 0]
+    if len(rows) == global_limit:
+        logger.warning("_create_halted_alerts: project_ids capped at %d", global_limit)
     for pid in project_ids:
         alert = Alert(
             project_id=pid,
@@ -1046,16 +1060,17 @@ async def _create_rollback_alerts(
         f"Deployment automatically rolled back from {rolled_back_from[:8]} "
         f"to {rolled_back_to[:8]}."
     )
-    _PROJECT_BROADCAST_LIMIT = 1000
-    project_ids = (
-        (await session.execute(select(Project.id).limit(_PROJECT_BROADCAST_LIMIT)))
-        .scalars()
-        .all()
-    )
-    if len(project_ids) == _PROJECT_BROADCAST_LIMIT:
+    global_limit = _runtime_config.get("project_broadcast_limit", 1000)
+    rows = (
+        await session.execute(
+            select(Project.id, Project.design_doc).limit(global_limit)
+        )
+    ).all()
+    project_ids = [pid for pid, doc in rows if _get_broadcast_limit(doc) > 0]
+    if len(rows) == global_limit:
         logger.warning(
             "_create_rollback_alerts: project_ids capped at %d",
-            _PROJECT_BROADCAST_LIMIT,
+            global_limit,
         )
     existing_rows = (
         (
@@ -1093,16 +1108,17 @@ async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
     """Create INFO alerts and dismiss existing HALTED ERROR alerts when deployment auto-recovers."""
     recovery_title = "Deployment auto-recovered from HALTED state after 1h cooldown"
     now = _utcnow()
-    _PROJECT_BROADCAST_LIMIT = 1000
-    project_ids = (
-        (await session.execute(select(Project.id).limit(_PROJECT_BROADCAST_LIMIT)))
-        .scalars()
-        .all()
-    )
-    if len(project_ids) == _PROJECT_BROADCAST_LIMIT:
+    global_limit = _runtime_config.get("project_broadcast_limit", 1000)
+    rows = (
+        await session.execute(
+            select(Project.id, Project.design_doc).limit(global_limit)
+        )
+    ).all()
+    project_ids = [pid for pid, doc in rows if _get_broadcast_limit(doc) > 0]
+    if len(rows) == global_limit:
         logger.warning(
             "_create_halted_recovery_alerts: project_ids capped at %d",
-            _PROJECT_BROADCAST_LIMIT,
+            global_limit,
         )
     # Single batched query for all undismissed HALTED ERROR alerts across all projects
     halted_alerts = (
@@ -2019,11 +2035,12 @@ def _apply_cors_headers(resp: JSONResponse, request: Request) -> JSONResponse:
     deployment via ALLOWED_ORIGINS env; resolve at call time.
     """
     origin = request.headers.get("origin")
-    if origin and (origin in allowed_origins or "*" in allowed_origins):
+    if origin and origin in allowed_origins:
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         resp.headers["Vary"] = "Origin"
     elif "*" in allowed_origins:
+        # Non-credentialed wildcard only — browsers forbid Allow-Credentials with *.
         resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
@@ -2090,20 +2107,36 @@ async def generic_exception_handler(request: Request, exc: Exception):
 # Add CORS Middleware so the frontend can call these APIs
 # In production, set ALLOWED_ORIGINS to the specific frontend domain (e.g., "https://my-app.com")
 # Multiple origins can be comma-separated.
+def _resolve_allowed_origins(env_value: str) -> list[str]:
+    """Parse ALLOWED_ORIGINS env value and reject any wildcard entry.
+
+    A '*' anywhere in the list (whether ALLOWED_ORIGINS='*' or
+    ALLOWED_ORIGINS='*,https://foo.com') combined with our
+    allow_credentials=True CORS config would let Starlette's CORSMiddleware
+    echo arbitrary origins back with credentials — the bypass this guard
+    prevents.
+    """
+    if not env_value:
+        return [
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:5173",
+        ]
+    parsed = [origin.strip() for origin in env_value.split(",") if origin.strip()]
+    if any(o == "*" for o in parsed):
+        raise ValueError(
+            "ALLOWED_ORIGINS may not contain '*' when Firebase auth is configured: "
+            "a wildcard origin with allow_credentials=True lets any site send "
+            "authenticated requests on behalf of logged-in users. "
+            "Set ALLOWED_ORIGINS to a comma-separated list of explicit origins "
+            f"(e.g. 'https://my-app.web.app,http://localhost:3000'). Got: {env_value!r}"
+        )
+    return parsed
+
+
 allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
-if allowed_origins_env == "*":
-    allowed_origins = ["*"]
-elif allowed_origins_env:
-    allowed_origins = [
-        origin.strip() for origin in allowed_origins_env.split(",") if origin.strip()
-    ]
-else:
-    allowed_origins = [
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173",
-    ]
+allowed_origins = _resolve_allowed_origins(allowed_origins_env)
 
 app.add_middleware(
     CORSMiddleware,
@@ -2125,99 +2158,17 @@ def read_root():
     return {"status": "online", "service": "Blueprint Orchestrator"}
 
 
-# --- Agent APIs ---
-
-
-@app.websocket("/api/agent/ws/{task_id}")
-async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
-    """
-    WebSocket endpoint for agents to stream high-throughput logs and real-time events.
-    """
-    await websocket.accept()
-
-    # Require the client to send the token as the first message
-    try:
-        auth_message = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
-        token = auth_message.get("token")
-        if not token:
-            await websocket.close(code=1008, reason="Missing token")
-            return
-
-        payload = verify_agent_jwt(token)
-        if payload.get("sub") != str(task_id):
-            await websocket.close(code=1008, reason="Task ID mismatch")
-            return
-    except asyncio.TimeoutError:
-        await websocket.close(code=1008, reason="Authentication timeout")
-        return
-    except Exception:
-        await websocket.close(code=1008, reason="Authentication failed")
-        return
-
-    # Get project_id for this task
-    async with AsyncSessionLocal() as session:
-        stmt = select(Task).where(Task.id == task_id)
-        task = (await session.execute(stmt)).scalars().first()
-        if not task:
-            await websocket.close(code=1008)
-            return
-        project_id = str(task.project_id)
-
-    if not await manager.check_and_add_ip(websocket):
-        return
-
-    try:
-        import time
-
-        last_message_time = time.time()
-        message_count = 0
-        while True:
-            text_data = await websocket.receive_text()
-            if len(text_data) > 100000:  # 100KB limit for agent logs
-                await websocket.close(code=1009, reason="Message too big")
-                return
-
-            # Simple rate limiting: 20 messages per second
-            current_time = time.time()
-            if current_time - last_message_time < 1.0:
-                message_count += 1
-                if message_count > 20:
-                    await websocket.close(code=1008, reason="Rate limit exceeded")
-                    return
-            else:
-                last_message_time = current_time
-                message_count = 1
-
-            try:
-                data = json.loads(text_data)
-            except json.JSONDecodeError:
-                continue
-
-            if data.get("type") == "log":
-                await broadcast_to_project(
-                    project_id,
-                    "agent_log",
-                    {
-                        "task_id": str(task_id),
-                        "log": _sanitize_log(data.get("content", "")),
-                    },
-                )
-            elif data.get("type") == "status":
-                # Optionally handle status updates via WS too
-                pass
-    except WebSocketDisconnect:
-        pass
-    finally:
-        manager.remove_ip(websocket)
-
-
 from app.strategic_completion import (
     _find_matching_direction,
     _normalize_recommended_mode,
+    _reset_scaffolding_state_on_outcome_change,
 )
 
 
-from app.task_locking import lock_project_or_429 as _lock_project_or_429
+from app.task_locking import (
+    lock_project_or_429 as _lock_project_or_429,
+    with_directions_locked as _with_directions_locked,
+)
 # Backward-compat re-export. Canonical home is ``app.task_locking`` (Phase A1).
 
 
@@ -2353,7 +2304,7 @@ from app.payload_schemas import (
     ALL_TASK_TYPES as _VALID_TASK_TYPES,
     validate_internal_payload as _validate_internal_payload,
 )
-from app.playbook_learning import (
+from app.playbook_storage import (
     maybe_archive_for_capacity as _maybe_archive_for_capacity,
     _playbook_size_bytes,
     _PLAYBOOK_CAPACITY_BYTES,
@@ -2362,7 +2313,7 @@ from app.playbook_learning import (
 
 class PlaybookUpdate(BaseModel):
     task_id: uuid.UUID
-    op: str  # "get", "set", "delete", "list"
+    op: str  # "get", "set", "list"
     key: str | None = None  # alphanumeric + hyphens, max 50 chars
     value: str | None = None  # plain text, max 2KB
     applicable_types: List[str] | None = (
@@ -2391,7 +2342,11 @@ async def update_playbook(
         raise HTTPException(status_code=404, detail="Task not found")
 
     op = payload.op
-    if op not in ("get", "set", "delete", "list"):
+    if op == "delete":
+        raise HTTPException(
+            status_code=403, detail="Playbook delete is not allowed for agents"
+        )
+    if op not in ("get", "set", "list"):
         raise HTTPException(status_code=400, detail=f"Unknown op: {op}")
 
     if op == "list":
@@ -2430,9 +2385,9 @@ async def update_playbook(
                 }
         return {"status": "ok", "op": op, "entries": entries}
 
-    # set / delete require a valid key
+    # set requires a valid key
     if not payload.key:
-        raise HTTPException(status_code=400, detail="key is required for set/delete")
+        raise HTTPException(status_code=400, detail="key is required for set")
     key = payload.key.strip()
     if key.startswith("_") or not _PLAYBOOK_KEY_RE.match(key):
         raise HTTPException(
@@ -2501,9 +2456,6 @@ async def update_playbook(
                 status_code=400,
                 detail=f"Playbook too large ({playbook_total} bytes, max {_PLAYBOOK_CAPACITY_BYTES} bytes) and no evictable entries",
             )
-    elif op == "delete":
-        doc.pop(f"playbook/{key}", None)
-
     meta["revision"] = meta.get("revision", 0) + 1
     meta["last_updated"] = _utcnow().isoformat()
     meta["updated_by_task"] = str(task.id)
@@ -2868,9 +2820,8 @@ async def strategic_operation(
             if mode:
                 new_dir["recommended_mode"] = mode
         directions.append(new_dir)
-        project.directions = directions
-        flag_modified(project, "directions")
-        session.add(project)
+        _d = directions
+        await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
         created_ids = list(ctx.get("_strategic_created_ids", []))
         created_ids.append(new_dir["id"])
@@ -2903,6 +2854,9 @@ async def strategic_operation(
         updated = False
         for d in directions:
             if d.get("id") == dir_id:
+                _pre_text = d.get("text")
+                _pre_se = (d.get("context") or {}).get("success_evidence")
+                _pre_rc = (d.get("context") or {}).get("retirement_condition")
                 if "text" in changes:
                     d["text"] = _cap_str(
                         changes["text"],
@@ -2951,6 +2905,7 @@ async def strategic_operation(
                         )
                     d["status"] = changes["status"]
                     if changes["status"] == "superseded":
+                        d["completed_at"] = _utcnow().isoformat()
                         superseded_by = changes.get("superseded_by")
                         if not superseded_by:
                             succ_id = (
@@ -2972,33 +2927,37 @@ async def strategic_operation(
                         d["recommended_mode"] = mode
                 # Handle success_evidence and retirement_condition in context
                 _DIR_FIELD_MAX = 500
-                if "success_evidence" in changes:
-                    ctx = d.get("context", {})
-                    se = changes["success_evidence"]
-                    if se is None or se == "":
-                        # Clear success_evidence
-                        ctx.pop("success_evidence", None)
-                    else:
-                        ctx["success_evidence"] = _cap_str(
-                            se,
-                            _DIR_FIELD_MAX,
-                            "changes.success_evidence",
-                            warnings,
-                        )
-                    d["context"] = ctx
-                if "retirement_condition" in changes:
-                    ctx = d.get("context", {})
-                    rc = changes["retirement_condition"]
-                    if rc is None or rc == "":
-                        # Clear retirement_condition
-                        ctx.pop("retirement_condition", None)
-                    else:
-                        ctx["retirement_condition"] = _cap_str(
-                            rc,
-                            _DIR_FIELD_MAX,
-                            "changes.retirement_condition",
-                            warnings,
-                        )
+                if "success_evidence" in changes or "retirement_condition" in changes:
+                    ctx = dict(d.get("context") or {})
+                    old_success_evidence = ctx.get("success_evidence")
+                    old_retirement_condition = ctx.get("retirement_condition")
+                    if "success_evidence" in changes:
+                        se = changes["success_evidence"]
+                        if se is None or se == "":
+                            ctx.pop("success_evidence", None)
+                        else:
+                            ctx["success_evidence"] = _cap_str(
+                                se,
+                                _DIR_FIELD_MAX,
+                                "changes.success_evidence",
+                                warnings,
+                            )
+                    if "retirement_condition" in changes:
+                        rc = changes["retirement_condition"]
+                        if rc is None or rc == "":
+                            ctx.pop("retirement_condition", None)
+                        else:
+                            ctx["retirement_condition"] = _cap_str(
+                                rc,
+                                _DIR_FIELD_MAX,
+                                "changes.retirement_condition",
+                                warnings,
+                            )
+                    if (
+                        ctx.get("success_evidence") != old_success_evidence
+                        or ctx.get("retirement_condition") != old_retirement_condition
+                    ):
+                        _reset_scaffolding_state_on_outcome_change(d)
                     d["context"] = ctx
                 if rationale:
                     notes = d.get("notes", [])
@@ -3011,13 +2970,18 @@ async def strategic_operation(
                     d["notes"] = _cap_list(
                         notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
                     )
+                if (
+                    d.get("text") != _pre_text
+                    or (d.get("context") or {}).get("success_evidence") != _pre_se
+                    or (d.get("context") or {}).get("retirement_condition") != _pre_rc
+                ):
+                    _reset_outcome_detection_state(d)
                 updated = True
                 break
         if not updated:
             raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
-        project.directions = directions
-        flag_modified(project, "directions")
-        session.add(project)
+        _d = directions
+        await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
         task.context = {**ctx, "_strategic_api_called": True}
         flag_modified(task, "context")
@@ -3052,9 +3016,8 @@ async def strategic_operation(
                 break
         if not retired:
             raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
-        project.directions = directions
-        flag_modified(project, "directions")
-        session.add(project)
+        _d = directions
+        await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
         retired_ids = list(ctx.get("_strategic_retired_ids", []))
         retired_ids.append(dir_id)
@@ -3124,9 +3087,8 @@ async def strategic_operation(
         target["notes"] = _cap_list(
             notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
         )
-        project.directions = directions
-        flag_modified(project, "directions")
-        session.add(project)
+        _d = directions
+        await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
         task.context = {
             **ctx,
@@ -3201,9 +3163,8 @@ async def strategic_operation(
             session.add(t)
             if t.vm_instance_id:
                 vm_ids_to_delete.append(t.vm_instance_id)
-        project.directions = remaining
-        flag_modified(project, "directions")
-        session.add(project)
+        _d = remaining
+        await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
         task.context = {
             **ctx,
@@ -3322,7 +3283,7 @@ async def strategic_operation(
             "type": spawn_type,
             "prompt": prompt,
             "title": title,
-            "base_branch": _runtime_config.get("integration_branch", "main"),
+            "base_branch": _get_project_integration_branch(project),
         }
         if direction_id:
             spawn_payload["direction_id"] = direction_id

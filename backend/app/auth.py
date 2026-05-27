@@ -70,9 +70,13 @@ def verify_ws_ticket(ticket: str) -> dict:
         raise HTTPException(status_code=401, detail="Invalid ticket")
 
 
-AGENT_TOKEN_TTL_HOURS = (
-    8  # was 2; raised so long-running tasks don't 401 mid-execution.
-)
+# 1h is the maximum replay window for any path that lacks per-request
+# revalidation (e.g. the WS receive loop). The agent MUST call
+# /api/agent/refresh-token proactively (at ~45 min) before the token
+# expires; tryRefreshToken() in index.ts handles this. Raising this
+# value extends the post-termination replay window — do not increase
+# without also shortening the proactive refresh interval.
+AGENT_TOKEN_TTL_HOURS = 1
 
 
 def create_agent_token(
@@ -84,11 +88,10 @@ def create_agent_token(
 ) -> str:
     """Generate a short-lived JWT for a specific agent VM.
 
-    Audit 2026-04-25 (W3): claims now include project_id (E10) and a
-    longer 8h TTL with refresh endpoint, so long-running tasks don't
-    self-terminate when the token expires mid-execution. task_type and
-    vm_instance_id remain so per-endpoint authz (E2/E3) can validate
-    without an extra DB lookup.
+    Audit 2026-04-25 (W3): claims include project_id (E10) so per-endpoint
+    authz (E2/E3/E10) can validate without an extra DB lookup. TTL is 1h;
+    the agent refreshes proactively at ~45 min via /api/agent/refresh-token
+    so long-running tasks never hit a mid-execution 401.
     """
     expire = datetime.now(timezone.utc) + timedelta(hours=ttl_hours)
     to_encode = {

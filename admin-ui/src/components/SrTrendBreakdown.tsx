@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { TrendingUp, TrendingDown, Minus, ChevronRight, ChevronDown, AlertTriangle, ArrowDownRight, ArrowUpRight, Search, Loader2 } from 'lucide-react';
 
 export interface SrMissExample {
@@ -44,6 +44,8 @@ export interface SrCategoryTrend {
   precision_delta?: number | null;
   /** Cycle-over-cycle change in recall (hit_rate). */
   recall_delta?: number | null;
+  /** Backend-computed flag: reasoning engagement below threshold. Prefers backend calculation when present. */
+  engagement_thinning?: boolean | null;
   /** Median seconds between SR completion and reviewer rejection for misses in this category. */
   time_to_miss_detect_p50_sec?: number | null;
   /** 95th-percentile seconds between SR completion and reviewer rejection for misses. */
@@ -127,12 +129,6 @@ export interface SrSeverityBucket {
   trend?: 'improving' | 'stable' | 'regressing';
 }
 
-export interface ExecutionEvidenceMissRate {
-  miss_rate?: number | null;
-  miss_count?: number | null;
-  sample_count?: number | null;
-}
-
 export interface SrCoFailurePair {
   cat_a: string;
   cat_b: string;
@@ -191,6 +187,14 @@ export interface SrTrendData {
   mixed_prompt_versions?: boolean | null;
   /** True when the current window's prompt version differs from the previous window's — cycle-over-cycle delta may reflect guidance change, not genuine catch-rate change. */
   prompt_version_changed?: boolean | null;
+  /** Aggregate SR catch rate for the current measurement window (hits / total reviewer-flagged findings). */
+  overall_hit_rate?: number | null;
+  /** Aggregate SR catch rate for the previous measurement window — used for cycle-over-cycle delta. */
+  previous_overall_hit_rate?: number | null;
+  /** Significance-gated overall trend verdict computed by the backend using the same two-proportion z-test as per-category trends. Null when insufficient data for either window. */
+  overall_trend_verdict?: 'improving' | 'declining' | 'stable' | null;
+  /** True when the overall delta passes the significance test; false = adequate data but within noise; null = insufficient data. */
+  overall_trend_significant?: boolean | null;
   categories?: Record<string, SrCategoryTrend> | null;
   by_task_type?: Record<string, Record<string, SrTaskTypeCategoryStats>> | null;
   by_scope?: Record<string, Record<string, SrTaskTypeCategoryStats>> | null;
@@ -199,8 +203,6 @@ export interface SrTrendData {
   sr_skip_reason_distribution?: Record<string, number> | null;
   by_severity?: Record<string, SrSeverityBucket> | null;
   by_direction?: Record<string, Record<string, DirectionSrCatStat>> | null;
-  execution_evidence_miss_rates?: Record<string, ExecutionEvidenceMissRate> | null;
-  edges_considered_stats?: Record<string, number> | null;
   co_failure_pairs?: SrCoFailurePair[] | null;
   reviewer_hallucination_rate?: ReviewerHallucinationRate | null;
 }
@@ -288,6 +290,10 @@ function isBelowFloor(c: SrCategoryTrend, floorHitRate = FLOOR_HIT_RATE, minWind
   const history = c.rate_history;
   if (!history || history.length < minWindows) return false;
   return history.slice(-minWindows).every(r => r < floorHitRate);
+}
+
+function isEngagementThinning(c: SrCategoryTrend, thinningThreshold = ENGAGEMENT_THINNING_THRESHOLD, minPasses = ENGAGEMENT_THINNING_MIN_PASSES): boolean {
+  return c.reasoning_engagement_rate != null && c.reasoning_engagement_rate < thinningThreshold && (c.reasoning_engagement_total ?? 0) >= minPasses;
 }
 
 // SR `trend` `decreasing` = hit-rate falling = miss-rate rising = regression (red).
@@ -1188,9 +1194,10 @@ function CategoryRow({
   const sampleTooSmall = isSampleTooSmall(findingCount);
   const deltaLowConfidence = sampleTooSmall || isSampleTooSmall(prevFindingCount);
 
+  const thinning = c.engagement_thinning != null ? c.engagement_thinning : isEngagementThinning(c);
   const activeSignals: string[] = [
     ...(c.below_floor ? ['below_floor'] : []),
-    ...(c.reasoning_engagement_rate != null && c.reasoning_engagement_rate < ENGAGEMENT_THINNING_THRESHOLD && (c.reasoning_engagement_total ?? 0) >= ENGAGEMENT_THINNING_MIN_PASSES ? ['thinning'] : []),
+    ...(thinning ? ['thinning'] : []),
     ...(c.severity_calibration && c.severity_calibration.total >= 5 && c.severity_calibration.under_rated / c.severity_calibration.total >= 0.30 ? ['under_calibration'] : []),
     ...(c.time_to_miss_detect_lone_checker ? ['lone_checker'] : []),
   ];
@@ -1259,11 +1266,11 @@ function CategoryRow({
           </span>
         )}
         {c.reasoning_engagement_rate != null && (c.reasoning_engagement_total ?? 0) > 0 && (() => {
-          const thinning = c.reasoning_engagement_rate < ENGAGEMENT_THINNING_THRESHOLD && (c.reasoning_engagement_total ?? 0) >= ENGAGEMENT_THINNING_MIN_PASSES;
+          const displayThinning = c.engagement_thinning != null ? c.engagement_thinning : isEngagementThinning(c);
           return (
             <span
-              className={`font-mono tabular-nums ${thinning ? 'text-amber-400' : 'text-cyan-500'}`}
-              title={thinning
+              className={`font-mono tabular-nums ${displayThinning ? 'text-amber-400' : 'text-cyan-500'}`}
+              title={displayThinning
                 ? `Reasoning thinning: only ${c.reasoning_engagement_with}/${c.reasoning_engagement_total} PASS verdicts include substantial reasoning — may regress soon`
                 : `Reasoning engagement: ${c.reasoning_engagement_with}/${c.reasoning_engagement_total} PASS verdicts with substantial reasoning`}
             >
@@ -1408,11 +1415,11 @@ function CategoryRow({
         </span>
       )}
       {c.reasoning_engagement_rate != null && (c.reasoning_engagement_total ?? 0) > 0 && (() => {
-        const thinning = c.reasoning_engagement_rate < ENGAGEMENT_THINNING_THRESHOLD && (c.reasoning_engagement_total ?? 0) >= ENGAGEMENT_THINNING_MIN_PASSES;
+        const displayThinning = c.engagement_thinning != null ? c.engagement_thinning : isEngagementThinning(c);
         return (
           <span
-            className={`font-mono ${thinning ? 'text-amber-400' : 'text-cyan-500'}`}
-            title={thinning
+            className={`font-mono ${displayThinning ? 'text-amber-400' : 'text-cyan-500'}`}
+            title={displayThinning
               ? `Reasoning thinning: only ${c.reasoning_engagement_with}/${c.reasoning_engagement_total} PASS verdicts include substantial reasoning — may regress soon`
               : `Reasoning engagement: ${c.reasoning_engagement_with}/${c.reasoning_engagement_total} PASS verdicts with substantial reasoning`}
           >
@@ -1854,13 +1861,19 @@ const WINDOW_OPTIONS: { label: string; days: number }[] = [
 interface SrMissedRetrospectiveProps {
   tasks: SrMissedTask[];
   onTaskClick?: (taskId: string) => void;
-  initialCategory?: string;
+  selectedCategory?: string;
+  windowDays?: 7 | 14 | 30;
+  onWindowDaysChange?: (days: 7 | 14 | 30) => void;
 }
 
-export function SrMissedRetrospective({ tasks, onTaskClick, initialCategory }: SrMissedRetrospectiveProps) {
-  const [categoryFilter, setCategoryFilter] = useState(initialCategory ?? '');
+export function SrMissedRetrospective({ tasks, onTaskClick, selectedCategory, windowDays = 14, onWindowDaysChange }: SrMissedRetrospectiveProps) {
+  const [categoryFilter, setCategoryFilter] = useState(selectedCategory ?? '');
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- prop-driven reset, not async fetch
+    setCategoryFilter(selectedCategory ?? '');
+  }, [selectedCategory]);
   const [typeFilter, setTypeFilter] = useState('');
-  const [windowDays, setWindowDays] = useState(14);
   const [openTaskIds, setOpenTaskIds] = useState<Set<string>>(() => new Set());
   const [mountedAt] = useState(() => Date.now());
 
@@ -1888,7 +1901,7 @@ export function SrMissedRetrospective({ tasks, onTaskClick, initialCategory }: S
           // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
             key={w.days}
-            onClick={() => setWindowDays(w.days)}
+            onClick={() => onWindowDaysChange?.(w.days as 7 | 14 | 30)}
             className={`px-1.5 py-0.5 rounded border ${windowDays === w.days ? 'border-blue-500 text-blue-300' : 'border-neutral-700 text-neutral-400 hover:border-neutral-500'}`}
           >{w.label}</button>
         ))}
@@ -2001,11 +2014,12 @@ export interface SrUnhandledEdgesTask {
 interface SrUnhandledEdgesRetrospectiveProps {
   tasks: SrUnhandledEdgesTask[];
   onTaskClick?: (taskId: string) => void;
+  windowDays?: 7 | 14 | 30;
+  onWindowDaysChange?: (days: 7 | 14 | 30) => void;
 }
 
-export function SrUnhandledEdgesRetrospective({ tasks, onTaskClick }: SrUnhandledEdgesRetrospectiveProps) {
+export function SrUnhandledEdgesRetrospective({ tasks, onTaskClick, windowDays = 14, onWindowDaysChange }: SrUnhandledEdgesRetrospectiveProps) {
   const [typeFilter, setTypeFilter] = useState('');
-  const [windowDays, setWindowDays] = useState(14);
   const [openTaskIds, setOpenTaskIds] = useState<Set<string>>(() => new Set());
   const [mountedAt] = useState(() => Date.now());
 
@@ -2031,7 +2045,7 @@ export function SrUnhandledEdgesRetrospective({ tasks, onTaskClick }: SrUnhandle
           // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
             key={w.days}
-            onClick={() => setWindowDays(w.days)}
+            onClick={() => onWindowDaysChange?.(w.days as 7 | 14 | 30)}
             className={`px-1.5 py-0.5 rounded border ${windowDays === w.days ? 'border-blue-500 text-blue-300' : 'border-neutral-700 text-neutral-400 hover:border-neutral-500'}`}
           >{w.label}</button>
         ))}

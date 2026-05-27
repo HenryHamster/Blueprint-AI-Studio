@@ -280,8 +280,8 @@ describe('classifySignalLevel', () => {
     expect(classifySignalLevel({ ...base, context: {} })).toBe('routine');
   });
 
-  test('QUESTION is routine (not in high-signal list)', () => {
-    expect(classifySignalLevel({ ...base, message_type: 'QUESTION' })).toBe('routine');
+  test('QUESTION is high-signal (awaiting operator reply)', () => {
+    expect(classifySignalLevel({ ...base, message_type: 'QUESTION' })).toBe('high');
   });
 
   test('failing group of ≥3 account_model_regression_quarantined (≥50% failed) would be promoted via isFailingGroup', () => {
@@ -1451,8 +1451,8 @@ describe('isCriticalSeverity', () => {
     expect(isCriticalSeverity({ message_type: 'FEEDBACK', context: {} })).toBe(false);
   });
 
-  test('returns false for QUESTION', () => {
-    expect(isCriticalSeverity({ message_type: 'QUESTION', context: {} })).toBe(false);
+  test('returns true for QUESTION', () => {
+    expect(isCriticalSeverity({ message_type: 'QUESTION', context: {} })).toBe(true);
   });
 
   test('returns true for NOTE with failure_alert event_type', () => {
@@ -1547,17 +1547,19 @@ describe('MessagesPanel critical-only severity filter', () => {
     expect(el.textContent).not.toContain('feedback msg');
   });
 
-  test('critical-only filter hides QUESTION when active', async () => {
+  test('critical-only filter shows QUESTION when active', async () => {
     const bug = makeMsg({ id: 'b1', message_type: 'BUG_REPORT', from_type: 'agent', content: 'bug msg' });
-    const question = makeMsg({ id: 'q1', message_type: 'QUESTION', from_type: 'user', content: 'question msg' });
-    const el = await renderPanel([bug, question]);
+    const question = makeMsg({ id: 'q1', message_type: 'QUESTION', from_type: 'agent', content: 'question msg' });
+    const feedback = makeMsg({ id: 'f1', message_type: 'FEEDBACK', from_type: 'user', content: 'feedback msg' });
+    const el = await renderPanel([bug, question, feedback]);
 
     // Toggle critical-only
     const filterBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Critical only'));
     await act(async () => { (filterBtn as HTMLButtonElement).click(); });
 
     expect(el.textContent).toContain('bug msg');
-    expect(el.textContent).not.toContain('question msg');
+    expect(el.textContent).toContain('question msg');
+    expect(el.textContent).not.toContain('feedback msg');
   });
 
   test('critical-only filter shows critical NOTEs (failure_alert)', async () => {

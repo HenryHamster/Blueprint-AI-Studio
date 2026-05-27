@@ -315,6 +315,33 @@ describe('SrMissedRetrospective drilldown', () => {
     expect(screen.getByText('origin: reviewer')).toBeInTheDocument();
     expect(screen.getByText('origin: author')).toBeInTheDocument();
   });
+
+  it('re-syncs the visible list when selectedCategory prop changes', () => {
+    const tasks = [
+      {
+        task_id: 'c1',
+        title: 'Correctness task',
+        created_at: new Date().toISOString(),
+        missed_categories: ['correctness'],
+        caught_categories: [],
+      },
+      {
+        task_id: 's1',
+        title: 'Security task',
+        created_at: new Date().toISOString(),
+        missed_categories: ['security'],
+        caught_categories: [],
+      },
+    ];
+
+    const { rerender } = render(<SrMissedRetrospective tasks={tasks} selectedCategory="correctness" />);
+    expect(screen.getByText('Correctness task')).toBeInTheDocument();
+    expect(screen.queryByText('Security task')).not.toBeInTheDocument();
+
+    rerender(<SrMissedRetrospective tasks={tasks} selectedCategory="security" />);
+    expect(screen.queryByText('Correctness task')).not.toBeInTheDocument();
+    expect(screen.getByText('Security task')).toBeInTheDocument();
+  });
 });
 
 describe('SrTrendBreakdown skip rate line', () => {
@@ -1202,6 +1229,63 @@ describe('SrTrendBreakdown reasoning engagement', () => {
     render(<SrTrendBreakdown trends={trends} variant="inline" />);
     const engEl = screen.getByTitle(/Reasoning engagement/i);
     expect(engEl).toHaveTextContent('eng:50%');
+  });
+
+  it('backend engagement_thinning=true wins over local computation (even when rate > 0.5)', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.2,
+          trend: 'stable',
+          reasoning_engagement_rate: 0.7, // > 0.5, would NOT show thinning locally
+          reasoning_engagement_with: 7,
+          reasoning_engagement_total: 10,
+          engagement_thinning: true, // backend flag overrides
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const engEl = screen.getByTitle(/Reasoning thinning/i);
+    expect(engEl).toHaveTextContent('eng:70%');
+    expect(engEl.className).toContain('amber'); // thinning color
+  });
+
+  it('backend engagement_thinning=false wins over local computation (even when rate < 0.5)', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.2,
+          trend: 'stable',
+          reasoning_engagement_rate: 0.3, // < 0.5, would show thinning locally
+          reasoning_engagement_with: 3,
+          reasoning_engagement_total: 10,
+          engagement_thinning: false, // backend flag overrides
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const engEl = screen.getByTitle(/Reasoning engagement/i);
+    expect(engEl).toHaveTextContent('eng:30%');
+    expect(engEl.className).toContain('cyan'); // non-thinning color
+  });
+
+  it('falls back to local computation when backend engagement_thinning is absent (backward compat)', () => {
+    const trends: SrTrendData = {
+      categories: {
+        correctness: {
+          miss_rate: 0.2,
+          trend: 'stable',
+          reasoning_engagement_rate: 0.3,
+          reasoning_engagement_with: 3,
+          reasoning_engagement_total: 10,
+          // engagement_thinning is absent
+        },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    const engEl = screen.getByTitle(/Reasoning thinning/i);
+    expect(engEl).toHaveTextContent('eng:30%');
+    expect(engEl.className).toContain('amber'); // shows thinning via local logic
   });
 });
 
@@ -2127,5 +2211,36 @@ describe('SrTrendBreakdown is_stale badge', () => {
     render(<SrTrendBreakdown trends={trends} variant="inline" />);
     expect(screen.getByTestId('sr-trend-stale-badge')).toBeInTheDocument();
     expect(screen.getByTestId('sr-trend-stale-badge').textContent).toContain('[stale]');
+  });
+});
+
+describe('SrTrendData overall verdict fields', () => {
+  it('SrTrendData accepts overall_hit_rate and overall_trend_verdict fields', () => {
+    const trends: SrTrendData = {
+      overall_hit_rate: 0.72,
+      previous_overall_hit_rate: 0.68,
+      overall_trend_verdict: 'improving',
+      overall_trend_significant: true,
+      categories: {
+        correctness: { miss_rate: 0.28, trend: 'stable' },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.getByTestId('sr-trend-breakdown')).toBeInTheDocument();
+  });
+
+  it('SrTrendData accepts null overall verdict when data is insufficient', () => {
+    const trends: SrTrendData = {
+      overall_hit_rate: 0.65,
+      previous_overall_hit_rate: null,
+      overall_trend_verdict: null,
+      overall_trend_significant: null,
+      data_sufficient: false,
+      categories: {
+        correctness: { miss_rate: 0.35, trend: 'stable' },
+      },
+    };
+    render(<SrTrendBreakdown trends={trends} variant="card" />);
+    expect(screen.getByTestId('sr-trend-insufficient-badge')).toBeInTheDocument();
   });
 });

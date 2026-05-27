@@ -6,6 +6,7 @@ import {
   WORKSPACE, strVal, sanitize, sendLog, readHandlerOutput,
   persistAndPostStatus, runClaudeCode,
   getProviderRunner, apiPost,
+  resolveBaseBranch,
 } from '../index.js';
 import * as indexMod from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
@@ -817,13 +818,18 @@ Only request qualification from the **stabilize** phase — it is ignored in **b
  */
 export function buildMemoCitationsSection(memoCitations: unknown): string {
   if (!Array.isArray(memoCitations) || memoCitations.length === 0) return '';
-  const lines: string[] = ['\n## Memo Citations (recent terminal reasoning artifacts)'];
+  const lines: string[] = ['\n## Memo Citations (cross-cycle institutional memory)'];
   lines.push(
-    'Memos are short reasoning notes spawned from research findings dropped ' +
-    'under budget pressure in earlier cycles. Each is a completed, terminal ' +
-    'artifact. When a memo informs a gap or direction, cite it by its short handle ' +
-    '(e.g. "memo M0", "memo M1") — the handle is easy to reproduce and maps reliably ' +
-    'back to the full task_id for traceability.',
+    'Memos are durable cross-cycle institutional memory: reasoning artifacts from ' +
+    'prior cycles that capture why findings were set aside, why directions were ' +
+    'retired, or why patterns emerged. Each memo is a completed terminal reasoning ' +
+    'task — genuinely useful context that transcends a single cycle.\n' +
+    'As you reason about gaps and directions below, actively check whether any memo ' +
+    'is relevant to your thinking. If a memo genuinely informs a decision or shapes ' +
+    'your understanding of a pattern, cite it by its short handle (e.g., "memo M0", ' +
+    '"memo M1"). The handle is stable and maps reliably back to the full task_id for ' +
+    'traceability. Cite only when a memo authentically informs your reasoning — ' +
+    'valuable citations strengthen the record; performative ones do not.',
   );
   for (let i = 0; i < memoCitations.length; i++) {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
@@ -1037,7 +1043,7 @@ export async function handlePlan(
   model?: string, effort?: string
 ) {
   const prompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
-  const baseBranch = strVal(payload.base_branch, 'main');
+  const baseBranch = resolveBaseBranch(payload, task);
   const planPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
 
   if (!prompt) throw new Error('Plan task missing prompt');
@@ -1357,11 +1363,11 @@ status: advancing | stalled | met
 rationale: 1 sentence — the observable evidence behind this verdict
 \`\`\`
 
-- **advancing** — landing real progress toward \`success_evidence\` (suppresses the advisory scaffolding flag — the agent confirms genuine movement).
+- **advancing** — landing real progress toward \`success_evidence\` (suppresses the advisory scaffolding flag — the agent confirms genuine movement). Look for increasing cumulative confirmed findings or an "improving" trend across recent cycles.
 - **met** — \`success_evidence\` is satisfied; the direction is effectively done (suppresses the flag; consider retiring it).
-- **stalled** — still shipping merges but NOT advancing \`success_evidence\` (outcome-less scaffolding; reinforces the flag).
+- **stalled** — still shipping merges but NOT advancing \`success_evidence\` (outcome-less scaffolding; reinforces the flag). Flat or declining cumulative confirmed findings, or "declining" trend despite ongoing work, signals stalled progress.
 
-A deterministic detector already flags stalled scaffolding on its own, so this verdict is OPTIONAL precision-tuning — only assess directions you have a genuine read on, and skip the section if none qualify. The Executor persists these via \`./strategic set-evidence-progress\`.
+Each direction in the "Direction outcomes" section above lists its cumulative confirmed-finding count and recent trend (improving/stable/declining) — use these signals when assessing whether a direction is advancing. A deterministic detector already flags stalled scaffolding on its own, so this verdict is OPTIONAL precision-tuning — only assess directions you have a genuine read on, and skip the section if none qualify. The Executor persists these via \`./strategic set-evidence-progress\`.
 
 ## 4. Running update document (for the user)
 Write the full refined running_update as markdown to \`/tmp/running_update_${p.taskId}.md\` (also show it as a code block in your analysis for auditability — the file is the authoritative handoff to the Executor). This is the document the user sees as "project current state" — rewrite, don't append. Under 400 words. Follow the section guidance above.
@@ -1482,7 +1488,7 @@ export async function handleResearch(
 ) {
   const directions = Array.isArray(payload.directions) ? payload.directions as Array<Record<string, unknown>> : [];
   const currentDirectionId = payload.current_direction_id as string | undefined;
-  const baseBranch = strVal(payload.base_branch, 'main');
+  const baseBranch = resolveBaseBranch(payload, task);
   const userPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
 
   // Full clone — research needs history context
@@ -1860,6 +1866,16 @@ ${hotspotsSection}
           const lifetime = d.lifetime as Record<string, number> | undefined;
           if (lifetime) {
             lines.push(`Lifetime: ${lifetime.cycles || 0} total cycles, ${lifetime.merged || 0} total merged`);
+          }
+
+          const confirmedFindingCount = typeof d.confirmed_finding_count === 'number' ? d.confirmed_finding_count : null;
+          const confirmedFindingTrend = typeof d.confirmed_finding_trend === 'string' ? d.confirmed_finding_trend : null;
+          if (confirmedFindingCount !== null) {
+            let countLine = `Cumulative confirmed findings: ${confirmedFindingCount}`;
+            if (confirmedFindingTrend) {
+              countLine += ` (${confirmedFindingTrend})`;
+            }
+            lines.push(countLine);
           }
 
           const confirmed = Array.isArray(d.confirmed) ? d.confirmed as string[] : [];
@@ -2312,7 +2328,7 @@ echo ""
     const selfReflectionEntries = Array.isArray(payload.self_reflection_log)
       ? payload.self_reflection_log as Array<Record<string, unknown>>
       : [];
-    const isSelfRepo = payload.is_self_repo === true;
+    const isSelfRepo = payload.enable_self_improvement === true;
 
     const renderRunningUpdateDoc = (doc: string): string => {
       if (!doc.trim()) {
@@ -2413,7 +2429,7 @@ echo ""
 
     const pastRetirementCritiquesSection = formatPastRetirementCritiques(payload.past_retirement_critiques);
 
-    const selfImprovementBlock = isSelfRepo ? `
+    const selfImprovementBlock = payload.enable_self_improvement === true ? `
 
 # Self-improvement
 

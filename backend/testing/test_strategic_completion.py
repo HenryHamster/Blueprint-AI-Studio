@@ -39,6 +39,7 @@ from app.strategic_completion import (
     record_outcome_progress_snapshot,
     _check_outcome_scaffolding,
     _apply_evidence_progress_verdicts,
+    _reset_scaffolding_state_on_outcome_change,
     EVIDENCE_PROGRESS_CONTEXT_KEY,
     _CREATED_NOTE_PREFIX,
     _RETIRED_NOTE_PREFIX,
@@ -48,6 +49,7 @@ from app.strategic_spawning import (
     _build_past_retirement_critiques,
 )
 from app.strategic_analysis import _build_outcome_evaluation
+from app.direction_lifecycle import _reset_outcome_detection_state
 from app.models import Project, Task
 
 
@@ -956,6 +958,7 @@ class TestIsDirectionDuplicate:
         ]
         # Overlap: migrate, authentication, service, oauth, token = 5 >= 4 → True
         assert _is_direction_duplicate(proposal, existing, []) is True
+
 
 # ── _record_strategic_task_failure ───────────────────────────────────────────
 
@@ -1917,6 +1920,277 @@ async def test_strategic_completion_persists_recommended_mode_on_update(
     await db_session.refresh(project)
     target = next(d for d in (project.directions or []) if d.get("id") == "d-upd1")
     assert target.get("recommended_mode") == "fundamentals"
+
+
+@pytest.mark.asyncio
+async def test_strategic_update_persists_success_evidence_and_retirement_condition(
+    db_session, mocker
+):
+    """Direction-op `update` with success_evidence and retirement_condition persists
+    both into direction['context'], matching the CREATE path behaviour."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P-upd-ctx",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-ctx1",
+                "text": "Existing direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-ctx1",
+                    "rationale": "clarifying success criteria",
+                    "changes": {
+                        "success_evidence": "All login flows pass SAML e2e",
+                        "retirement_condition": "3 cycles with zero auth failures",
+                    },
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in (project.directions or []) if d.get("id") == "d-ctx1")
+    ctx = target.get("context") or {}
+    assert ctx.get("success_evidence") == "All login flows pass SAML e2e"
+    assert ctx.get("retirement_condition") == "3 cycles with zero auth failures"
+
+
+@pytest.mark.asyncio
+async def test_strategic_update_persists_implementation_constraints(db_session, mocker):
+    """Direction-op `update` with implementation_constraints persists it into
+    direction['context'], matching the CREATE path behaviour."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P-upd-ic",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-ic1",
+                "text": "Existing direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "context": {"success_evidence": "prior evidence"},
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-ic1",
+                    "rationale": "adding constraints",
+                    "changes": {
+                        "implementation_constraints": "Must not modify public API surface",
+                    },
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in (project.directions or []) if d.get("id") == "d-ic1")
+    ctx = target.get("context") or {}
+    assert ctx.get("implementation_constraints") == "Must not modify public API surface"
+    # Existing context field should be preserved
+    assert ctx.get("success_evidence") == "prior evidence"
+
+
+@pytest.mark.asyncio
+async def test_strategic_update_clears_context_fields_when_none(db_session, mocker):
+    """Direction-op `update` with None value for a context field removes it from context."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P-upd-clr",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-clr1",
+                "text": "Existing direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "context": {
+                    "success_evidence": "Old evidence",
+                    "retirement_condition": "Old condition",
+                },
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-clr1",
+                    "rationale": "clearing stale criteria",
+                    "changes": {
+                        "success_evidence": None,
+                        "retirement_condition": None,
+                    },
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in (project.directions or []) if d.get("id") == "d-clr1")
+    ctx = target.get("context") or {}
+    assert "success_evidence" not in ctx
+    assert "retirement_condition" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_strategic_update_caps_context_fields_at_500(db_session, mocker):
+    """Direction-op `update` truncates oversized context field values to 500 chars."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P-upd-cap",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-cap1",
+                "text": "Existing direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    long_value = "x" * 800
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-cap1",
+                    "rationale": "testing cap",
+                    "changes": {
+                        "success_evidence": long_value,
+                        "retirement_condition": long_value,
+                    },
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    target = next(d for d in (project.directions or []) if d.get("id") == "d-cap1")
+    ctx = target.get("context") or {}
+    assert len(ctx.get("success_evidence", "")) == 500
+    assert len(ctx.get("retirement_condition", "")) == 500
 
 
 @pytest.mark.asyncio
@@ -2935,7 +3209,9 @@ async def test_dedup_overlap_creates_advisory_fallback(db_session, mocker):
 
     await db_session.refresh(project)
     new_dirs = [d for d in (project.directions or []) if d.get("id") != "d-existing1"]
-    assert len(new_dirs) == 1, "Near-duplicate should be created (advisory, not blocked)"
+    assert len(new_dirs) == 1, (
+        "Near-duplicate should be created (advisory, not blocked)"
+    )
     created = new_dirs[0]
     assert created.get("status") == "active"
     notes = created.get("notes") or []
@@ -3295,9 +3571,7 @@ async def test_replace_retired_direction_creates_advisory_fallback(db_session, m
 
 
 @pytest.mark.asyncio
-async def test_active_direction_overlap_creates_advisory_fallback(
-    db_session, mocker
-):
+async def test_active_direction_overlap_creates_advisory_fallback(db_session, mocker):
     """Fallback path: a near-duplicate of an ACTIVE direction is created (advisory)
     on the strategic-agent path — the old hard block is gone."""
     import json
@@ -4018,6 +4292,178 @@ async def test_strategic_http_update_direction_superseded_persists_superseded_by
     }
 
 
+@pytest.mark.asyncio
+async def test_strategic_http_update_direction_clears_scaffolding_state_on_outcome_change(
+    client, db_session, mocker
+):
+    """HTTP update_direction resets stale scaffolding state when outcome fields change."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="SCAFFOLD-HTTP",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-http-scaffold",
+                "text": "Track outcome change resets",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "context": {
+                    "success_evidence": "Existing goal",
+                    "retirement_condition": "Existing exit",
+                },
+                "outcome_progress_ever_met": True,
+                "outcome_progress_history": [{"progress": 4, "cycle_index": 9}],
+                "evidence_progress": {
+                    "status": "advancing",
+                    "rationale": "stale evidence",
+                },
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-scaffold-http",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-scaffold-http", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-http-scaffold",
+                "changes": {"success_evidence": "New goal: zero P0 incidents"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(project)
+    target = next(
+        d for d in (project.directions or []) if d.get("id") == "d-http-scaffold"
+    )
+    assert target["context"]["success_evidence"] == "New goal: zero P0 incidents"
+    assert target["context"]["retirement_condition"] == "Existing exit"
+    assert "outcome_progress_ever_met" not in target
+    # Either popped (scaffolding reset) or reset to [] (outcome-detection reset).
+    # Both forms mean "cleared" and consumers read via `... or []`.
+    assert not target.get("outcome_progress_history")
+    assert "evidence_progress" not in target
+
+
+@pytest.mark.asyncio
+async def test_strategic_http_update_direction_superseded_stamps_completed_at_and_appears_in_summary(
+    client, db_session, mocker
+):
+    """HTTP update_direction with status=superseded must stamp completed_at so
+    _build_retired_directions_summary's 90-day time-window filter includes it."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+    from app.strategic_analysis import _build_retired_directions_summary
+
+    project = Project(
+        name="SUP-HTTP-COMPLETED-AT",
+        user_id="u-completed-at",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-http-sup-window",
+                "text": "HTTP direction to be superseded",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-sup-window",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-sup-window", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-http-sup-window",
+                "rationale": "superseded via HTTP path",
+                "changes": {
+                    "status": "superseded",
+                    "superseded_by": {
+                        "direction_id": "d-http-successor",
+                        "set_at": "2026-01-01T00:00:00",
+                    },
+                },
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(project)
+    target = next(
+        d for d in (project.directions or []) if d.get("id") == "d-http-sup-window"
+    )
+    assert target.get("status") == "superseded"
+    assert target.get("completed_at"), (
+        "HTTP update_direction -> status=superseded must stamp completed_at"
+    )
+
+    summary = _build_retired_directions_summary(project, window_days=90)
+    summary_ids = [e.get("id") for e in summary]
+    assert "d-http-sup-window" in summary_ids, (
+        f"superseded direction (via HTTP) should appear in retired summary; got ids={summary_ids}"
+    )
+
+
 # ── _strategic_dedup_rejections persistence ───────────────────────────────────
 
 
@@ -4098,7 +4544,9 @@ async def test_strategic_http_create_direction_dedup_creates_advisory(
     assert new_id
 
     await db_session.refresh(project)
-    assert len(project.directions or []) == 2, "Directions list should have grown by one"
+    assert len(project.directions or []) == 2, (
+        "Directions list should have grown by one"
+    )
     created = next(d for d in project.directions if d.get("id") == new_id)
     assert created.get("status") == "active"
     notes = created.get("notes") or []
@@ -4189,7 +4637,9 @@ async def test_api_path_overlap_retired_direction_creates_advisory(
     assert new_id
 
     await db_session.refresh(project)
-    assert len(project.directions or []) == 2, "Directions list should have grown by one"
+    assert len(project.directions or []) == 2, (
+        "Directions list should have grown by one"
+    )
     created = next(d for d in project.directions if d.get("id") == new_id)
     assert created.get("status") == "active"
     notes = created.get("notes") or []
@@ -4273,7 +4723,9 @@ async def test_api_path_active_direction_overlap_creates_advisory(
     assert new_id
 
     await db_session.refresh(project)
-    assert len(project.directions or []) == 2, "Directions list should have grown by one"
+    assert len(project.directions or []) == 2, (
+        "Directions list should have grown by one"
+    )
     created = next(d for d in project.directions if d.get("id") == new_id)
     assert created.get("status") == "active"
     notes = created.get("notes") or []
@@ -4398,6 +4850,164 @@ class TestBuildOutcomeEvaluationEvidence:
         ev = result["directions"][0].get("evidence")
         assert ev is not None
         assert len(ev) <= 5
+
+    # ── confirmed_finding_count and confirmed_finding_trend ───────────────────
+
+    def test_confirmed_finding_count_from_outcome_progress_history(self):
+        # outcome_progress_history contains cumulative confirmed-finding counts
+        # from the eviction-robust signal; the count should be the latest value.
+        project = self._make_project(
+            outcome_progress_history=[
+                {"progress": 2},
+                {"progress": 3},
+                {"progress": 5},
+            ]
+        )
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert direction.get("confirmed_finding_count") == 5
+
+    def test_confirmed_finding_count_omitted_when_no_history(self):
+        # No outcome_progress_history → confirmed_finding_count should not be present.
+        project = self._make_project()
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert "confirmed_finding_count" not in direction
+
+    def test_confirmed_finding_count_omitted_when_history_empty(self):
+        # Empty outcome_progress_history → confirmed_finding_count should not be present.
+        project = self._make_project(outcome_progress_history=[])
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert "confirmed_finding_count" not in direction
+
+    def test_confirmed_finding_trend_improving(self):
+        # Trend is improving when second half avg > first half avg * 1.3.
+        # [1, 1, 5, 5, 5, 5] -> first_avg = 1, second_avg = 5, 5 > 1.3 -> improving
+        project = self._make_project(
+            outcome_progress_history=[
+                {"progress": 1},
+                {"progress": 1},
+                {"progress": 5},
+                {"progress": 5},
+                {"progress": 5},
+                {"progress": 5},
+            ]
+        )
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert direction.get("confirmed_finding_trend") == "improving"
+
+    def test_confirmed_finding_trend_declining(self):
+        # Trend is declining when second half avg < first half avg * 0.7.
+        # [10, 10, 2, 2, 2, 2] -> first_avg = 10, second_avg = 2, 2 < 7 -> declining
+        project = self._make_project(
+            outcome_progress_history=[
+                {"progress": 10},
+                {"progress": 10},
+                {"progress": 2},
+                {"progress": 2},
+                {"progress": 2},
+                {"progress": 2},
+            ]
+        )
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert direction.get("confirmed_finding_trend") == "declining"
+
+    def test_confirmed_finding_trend_stable(self):
+        # Trend is stable when between 0.7 and 1.3 thresholds.
+        # [5, 5, 5, 5, 5, 5] -> both halves same -> stable
+        project = self._make_project(
+            outcome_progress_history=[
+                {"progress": 5},
+                {"progress": 5},
+                {"progress": 5},
+                {"progress": 5},
+                {"progress": 5},
+                {"progress": 5},
+            ]
+        )
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert direction.get("confirmed_finding_trend") == "stable"
+
+    def test_confirmed_finding_trend_omitted_with_single_snapshot(self):
+        # Trend requires at least 2 snapshots to compute.
+        project = self._make_project(outcome_progress_history=[{"progress": 3}])
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert direction.get("confirmed_finding_count") == 3
+        assert "confirmed_finding_trend" not in direction
+
+    def test_confirmed_finding_trend_handles_odd_length_history(self):
+        # Odd-length history: [1, 1, 1, 7, 7, 7, 7] -> first_avg = 1, second_avg ≈ 6.67
+        # 6.67 > 1.3 -> improving
+        project = self._make_project(
+            outcome_progress_history=[
+                {"progress": 1},
+                {"progress": 1},
+                {"progress": 1},
+                {"progress": 7},
+                {"progress": 7},
+                {"progress": 7},
+                {"progress": 7},
+            ]
+        )
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert direction.get("confirmed_finding_trend") == "improving"
+
+    def test_confirmed_finding_trend_with_zero_progress(self):
+        # All zeros: first_avg = 0, second_avg = 0 -> stable (within 0.7-1.3 range)
+        project = self._make_project(
+            outcome_progress_history=[
+                {"progress": 0},
+                {"progress": 0},
+                {"progress": 0},
+                {"progress": 0},
+            ]
+        )
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert direction.get("confirmed_finding_count") == 0
+        assert direction.get("confirmed_finding_trend") == "stable"
+
+    def test_confirmed_finding_count_handles_none_progress_values(self):
+        # Some snapshots may have None or missing progress field; treat as 0.
+        project = self._make_project(
+            outcome_progress_history=[
+                {"progress": 2},
+                {"progress": None},
+                {"progress": 5},
+            ]
+        )
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        # Latest progress should be 5, not None
+        assert direction.get("confirmed_finding_count") == 5
+
+    def test_confirmed_finding_fields_coexist_with_evidence(self):
+        # Both evidence and confirmed-finding fields should appear together.
+        evidence = [
+            {
+                "title": "Finding A",
+                "claims": ["c1"],
+                "source_refs": [{"ref": "backend/foo.py"}],
+            }
+        ]
+        project = self._make_project(
+            recent_findings_evidence=evidence,
+            outcome_progress_history=[
+                {"progress": 2},
+                {"progress": 5},
+            ],
+        )
+        result = _build_outcome_evaluation(project)
+        direction = result["directions"][0]
+        assert "evidence" in direction
+        assert direction.get("confirmed_finding_count") == 5
+        assert direction.get("confirmed_finding_trend") == "improving"
 
 
 class TestFormatFindingsForPrompt:
@@ -5040,8 +5650,8 @@ class TestComputeLifetimeBurnMetrics:
         assert m["lifetime_merged"] == 0
 
     def test_healthy_direction_high_merge_rate(self):
-        # 5 cycles × (5 completed, 4 merged) → 25 completed, 20 merged
-        # non_merge=max(0,25-20)=5, total_finished=25 → merge_rate=20/25=80%
+        # 5 cycles x (5 completed, 4 merged) -> 25 completed, 20 merged
+        # non_merge=max(0,25-20)=5, total_finished=25 -> merge_rate=20/25=80%
         d = _direction(
             research_history=_history(
                 5, tasks_completed=5, tasks_failed=0, prs_merged=4
@@ -5081,9 +5691,9 @@ class TestComputeLifetimeBurnMetrics:
 
 class TestRule6LifetimeBurnBackstop:
     def test_fires_when_aggregate_plus_window_exceed_threshold(self, mocker):
-        # Window: 5 cycles × 2 completed, 0 merged = 10 non-merge (below Rule 5 threshold 15)
+        # Window: 5 cycles x 2 completed, 0 merged = 10 non-merge (below Rule 5 threshold 15)
         # Aggregate: 145 completed, 0 merged
-        # Lifetime total: 155 > 150 → Rule 6 fires, merge_rate = 0%
+        # Lifetime total: 155 > 150 -> Rule 6 fires, merge_rate = 0%
         # tasks_created=5 > tasks_completed=2 prevents Rule 2 in-flight guard from firing
         mocker.patch.dict(
             "app.strategic_completion._runtime_config",
@@ -5142,9 +5752,9 @@ class TestRule6LifetimeBurnBackstop:
             },
             clear=False,
         )
-        # Window: 5 cycles × 2 completed, 0 merged = 10 non_merge (below Rule 5 threshold 15)
+        # Window: 5 cycles x 2 completed, 0 merged = 10 non_merge (below Rule 5 threshold 15)
         # Aggregate: 145 completed, 0 merged
-        # Lifetime total: 10 + 145 = 155 > 150 → Rule 6 fires
+        # Lifetime total: 10 + 145 = 155 > 150 -> Rule 6 fires
         # tasks_created=5 > finished=2 keeps tasks in-flight so Rule 2's
         # zero-merge guard does not fire before Rule 6.
         agg = {
@@ -5272,9 +5882,84 @@ class TestComputeOutcomeProgressSignal:
         d = {"research_context": ctx}
         assert _compute_outcome_progress_signal(d) == 2
 
+    def test_excludes_failed_findings(self):
+        # Findings retagged (failed: ...) must NOT count as progress.
+        ctx = (
+            "## Established Findings\n"
+            "- Finding A (failed: test_failure)\n"
+            "- Finding B (failed: unknown)\n"
+            "- Finding C (merged)\n"
+        )
+        d = {"research_context": ctx}
+        assert _compute_outcome_progress_signal(d) == 1  # only C counts
+
     def test_empty_context_returns_zero(self):
         assert _compute_outcome_progress_signal({}) == 0
         assert _compute_outcome_progress_signal({"research_context": ""}) == 0
+
+    def test_includes_evicted_confirmed_count(self):
+        # Evicted CONFIRMED findings must be counted even though they are no longer
+        # in the visible list. 1 visible confirmed + 2 evicted-confirmed = 3.
+        # The eviction summary's "(2 confirmed)" sub-count — not the raw
+        # established total — is what the signal credits.
+        ctx = (
+            "## Established Findings\n"
+            "- Finding A\n"
+            "## Eviction Summary\n"
+            "2 established (2 confirmed), 1 failed evicted\n"
+        )
+        d = {"research_context": ctx}
+        assert _compute_outcome_progress_signal(d) == 3
+
+    def test_evicted_proposed_or_failed_do_not_inflate_signal(self):
+        # A saturated direction that evicts only proposed/failed (churn) entries
+        # must NOT appear to advance: the established total is high but the
+        # confirmed sub-count is 0, so only the visible confirmed finding counts.
+        # This is the false-negative the confirmed-only filter guards against.
+        ctx = (
+            "## Established Findings\n"
+            "- Finding A\n"
+            "## Eviction Summary\n"
+            "5 established (0 confirmed), 1 failed evicted\n"
+        )
+        d = {"research_context": ctx}
+        assert (
+            _compute_outcome_progress_signal(d) == 1
+        )  # 1 visible + 0 confirmed-evicted
+
+    def test_legacy_eviction_summary_credits_zero_confirmed(self):
+        # Pre-existing summaries written before the "(N confirmed)" sub-count
+        # parse to 0 confirmed — a safe undercount, never an over-count.
+        ctx = (
+            "## Established Findings\n"
+            "- Finding A\n"
+            "## Eviction Summary\n"
+            "2 established evicted, 0 failed evicted\n"
+        )
+        d = {"research_context": ctx}
+        assert _compute_outcome_progress_signal(d) == 1  # only the visible finding
+
+    def test_signal_grows_as_confirmed_eviction_count_increases(self):
+        # Simulate two consecutive cycles where the visible confirmed count is
+        # pinned at 1 (research_context at cap) but the confirmed-eviction counter
+        # grows because each new confirmed finding evicts an old confirmed one.
+        ctx_cycle1 = (
+            "## Established Findings\n"
+            "- Finding B\n"
+            "## Eviction Summary\n"
+            "1 established (1 confirmed) evicted, 0 failed evicted\n"
+        )
+        ctx_cycle2 = (
+            "## Established Findings\n"
+            "- Finding C\n"
+            "## Eviction Summary\n"
+            "2 established (2 confirmed) evicted, 0 failed evicted\n"
+        )
+        sig1 = _compute_outcome_progress_signal({"research_context": ctx_cycle1})
+        sig2 = _compute_outcome_progress_signal({"research_context": ctx_cycle2})
+        assert sig1 == 2  # 1 visible + 1 confirmed-evicted
+        assert sig2 == 3  # 1 visible + 2 confirmed-evicted
+        assert sig2 > sig1  # cumulative grows even though visible count is flat
 
 
 class TestRecordOutcomeProgressSnapshot:
@@ -5348,8 +6033,21 @@ class TestCheckOutcomeScaffolding:
         assert ev["stall_run_cycles"] == 6
         assert ev["progress_signal"] == 5
 
-    def test_does_not_fire_when_success_evidence_advancing(self):
-        # success_evidence fingerprint varies across the window -> not stalled.
+    def test_does_not_fire_when_progress_rising(self):
+        # confirmed-finding count grew during the window -> not stalled.
+        d = _scaffolding_direction([5, 5, 5, 6, 7, 8])
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_does_not_fire_when_progress_rose_then_evicted(self):
+        # Progress peaked mid-window but then dropped (eviction). max() > first
+        # value so we must not flag.
+        d = _scaffolding_direction([5, 5, 7, 7, 5, 5])
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_fires_when_only_fp_changes_but_progress_flat(self):
+        # After a contract change where none of the existing snapshots match the
+        # current contract fingerprint, the detector lacks sufficient new-contract
+        # data and returns None — it does not fire on stale old-contract snapshots.
         fps = [f"fp{i:015d}" for i in range(6)]
         d = _scaffolding_direction([5, 5, 5, 5, 5, 5], success_evidence_fps=fps)
         assert _check_outcome_scaffolding(d) is None
@@ -5406,6 +6104,28 @@ class TestCheckOutcomeScaffolding:
         # lifetime_merged = 0 + 2 = 2 < default merge_floor (8)
         assert _check_outcome_scaffolding(d) is None
 
+    def test_fires_when_churning_only_failed_findings(self):
+        # A direction that keeps shipping PRs but all its established findings
+        # are retagged (failed: ...) — the progress signal must stay at 0 and
+        # the scaffolding flag must still fire.
+        ctx = (
+            "## Established Findings\n"
+            "- Finding A (failed: test_failure)\n"
+            "- Finding B (failed: unknown)\n"
+        )
+        # All snapshots show 0 progress because the only established items are
+        # failed. Simulate that with progress_window=[0, 0, 0, 0, 0, 0] and
+        # inject the research_context so _compute_outcome_progress_signal would
+        # also return 0 if called fresh.
+        d = _scaffolding_direction(
+            [0, 0, 0, 0, 0, 0],
+            research_context=ctx,
+        )
+        ev = _check_outcome_scaffolding(d)
+        assert ev is not None
+        assert ev["progress_signal"] == 0
+        assert ev["progress_stagnant_cycles"] == 6
+
     # ── Agent evidence_progress verdict refinement ──────────────────────────
     # _scaffolding_direction has total_cycles=14, stall_run=6, so a verdict at
     # cycle_index >= 9 is "current" (14 - cycle_index < 6) and one at <= 8 is stale.
@@ -5455,26 +6175,54 @@ class TestCheckOutcomeScaffolding:
         )
         assert _check_outcome_scaffolding(d) is None
 
+    def test_not_flagged_when_evicted_count_grows_across_window(self):
+        # Saturated-but-advancing direction: the research_context visible count is
+        # pinned at the cap (5 entries), but each cycle a new confirmed finding
+        # evicts an old one so the cumulative (visible + evicted) signal grows.
+        # The snapshots reflect the cumulative count from _compute_outcome_progress_signal,
+        # so the detector sees a growing window and correctly returns None.
+        # Under the old visible-only signal the window would have been [5,5,5,5,5,5]
+        # and the direction would have been wrongly flagged as stalled scaffolding.
+        ctx = (
+            "## Established Findings\n"
+            + "".join(f"- Finding {i}\n" for i in range(5))
+            + "\n## Eviction Summary\n"
+            "5 established (5 confirmed) evicted, 0 failed evicted\n"
+        )
+        d = _scaffolding_direction(
+            [5, 6, 7, 8, 9, 10],
+            research_context=ctx,
+        )
+        assert _check_outcome_scaffolding(d) is None
+
 
 class TestOutcomeScaffoldingSuccessEvidenceFp:
-    def test_unchanged_success_evidence_with_merges_flagged(self):
-        # All snapshots share the same fp -> success_evidence never advanced -> flagged.
+    def test_flat_progress_with_merges_flagged(self):
+        # Confirmed-finding count never grew -> stalled -> flagged.
         d = _scaffolding_direction([5, 5, 5, 5, 5, 5])
         ev = _check_outcome_scaffolding(d)
         assert ev is not None
-        assert ev["success_evidence_unchanged_cycles"] == 6
+        assert ev["progress_stagnant_cycles"] == 6
 
-    def test_changing_success_evidence_not_flagged(self):
-        # success_evidence text changed mid-window -> not flagged even with steady merges.
-        fps = [
-            _EMPTY_SE_FP,
-            _EMPTY_SE_FP,
-            _EMPTY_SE_FP,
-            "aabbccdd00112233",
-            "aabbccdd00112233",
-            "aabbccdd00112233",
-        ]
-        d = _scaffolding_direction([5, 5, 5, 5, 5, 5], success_evidence_fps=fps)
+    def test_rising_progress_with_unchanged_fp_not_flagged(self):
+        # Progress grew even though success_evidence fp is static — must NOT flag.
+        d = _scaffolding_direction([5, 5, 6, 7, 8, 9])
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_new_contract_flat_progress_fires_despite_old_snapshots(self):
+        # When enough new-contract snapshots (>= run) exist and all show flat progress,
+        # the detector fires — old-contract snapshots are filtered out but the 6 matching
+        # new-contract snapshots still constitute a full stall window.
+        old_fp = "aabbccdd00112233"
+        fps = [old_fp] * 3 + [_EMPTY_SE_FP] * 6
+        d = _scaffolding_direction([5] * 9, success_evidence_fps=fps)
+        assert _check_outcome_scaffolding(d) is not None
+
+    def test_insufficient_new_contract_snapshots_suppresses_flag(self):
+        # Fewer than run new-contract snapshots after a contract change → None.
+        old_fp = "aabbccdd00112233"
+        fps = [old_fp] * 6 + [_EMPTY_SE_FP] * 3
+        d = _scaffolding_direction([5] * 9, success_evidence_fps=fps)
         assert _check_outcome_scaffolding(d) is None
 
     def test_snapshot_records_success_evidence_fp(self):
@@ -5888,7 +6636,17 @@ async def test_spawn_retirement_memo_api_path(db_session, mocker):
     memo = retirement_memos[0]
     assert memo.context.get("memo_source_direction_id") == direction_id
     assert "Build the feature X" in (memo.payloads[0].get("topic") or "")
-    assert memo.status == TaskStatus.QUEUED
+    # Memo with rationale is synthesized at spawn time → immediately COMPLETED
+    assert memo.status == TaskStatus.COMPLETED
+    assert isinstance(memo.plan_output, dict) and "memo" in memo.plan_output
+    from app.models import Artifact, ArtifactType
+
+    artifacts = (
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == memo.id)))
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1 and artifacts[0].artifact_type == ArtifactType.MEMO
 
 
 @pytest.mark.asyncio
@@ -5971,8 +6729,18 @@ async def test_spawn_retirement_memo_fallback_path(db_session, mocker):
     )
     memo = retirement_memos[0]
     assert memo.context.get("memo_source_direction_id") == direction_id
-    assert memo.status == TaskStatus.QUEUED
     assert (memo.payloads[0].get("topic") or "").startswith("Direction retired:")
+    # Memo with rationale is synthesized at spawn time → immediately COMPLETED
+    assert memo.status == TaskStatus.COMPLETED
+    assert isinstance(memo.plan_output, dict) and "memo" in memo.plan_output
+    from app.models import Artifact, ArtifactType
+
+    artifacts = (
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == memo.id)))
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1 and artifacts[0].artifact_type == ArtifactType.MEMO
 
 
 @pytest.mark.asyncio
@@ -6065,3 +6833,724 @@ async def test_retirement_memo_dedup_guard(db_session, mocker):
     assert len(retirement_memos) == 1, (
         f"dedup guard should prevent second memo; got {len(retirement_memos)}"
     )
+
+
+@pytest.mark.asyncio
+async def test_retire_op_sets_retired_status_and_appears_in_summary(db_session, mocker):
+    """Regression: retire op must stamp status='retired' (not 'expired') and
+    retired_at, so _build_retired_directions_summary includes the direction."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+    from app.strategic_analysis import _build_retired_directions_summary
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    direction_id = "d-retire-status-fix"
+    direction = {
+        "id": direction_id,
+        "text": "Improve CI pipeline speed to reduce developer wait time",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+    project = Project(
+        name="RetireStatusFix",
+        user_id="u-retire-status",
+        vision={"purpose": "test", "revision": 0},
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "retire",
+                    "direction_id": direction_id,
+                    "rationale": "CI speed goal fully met",
+                }
+            ],
+        }
+    )
+    sr_task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(sr_task)
+    await db_session.commit()
+    await db_session.refresh(sr_task)
+
+    await _handle_strategic_completion(sr_task, logs, db_session)
+    await db_session.refresh(project)
+
+    retired = [d for d in (project.directions or []) if d.get("id") == direction_id]
+    assert len(retired) == 1, "direction should still exist after retire op"
+    d = retired[0]
+
+    # Core fix: status must be 'retired', not 'expired'
+    assert d["status"] == "retired", (
+        f"retire op should set status='retired', got {d['status']!r}"
+    )
+    # Timestamp must be stamped so the time-window filter in
+    # _build_retired_directions_summary can include this direction
+    assert d.get("retired_at"), "retire op should stamp retired_at timestamp"
+
+    # End-to-end: direction must appear in the retired summary
+    summary = _build_retired_directions_summary(project, window_days=90)
+    summary_ids = [e.get("id") for e in summary]
+    assert direction_id in summary_ids, (
+        f"strategically-retired direction should appear in _build_retired_directions_summary; "
+        f"got ids={summary_ids}"
+    )
+
+
+# ── _reset_outcome_detection_state ───────────────────────────────────────────
+
+
+class TestResetOutcomeDetectionState:
+    """Unit tests for _reset_outcome_detection_state, the canonical helper that
+    clears per-direction outcome-detection state after a contract field changes."""
+
+    def test_clears_outcome_progress_history(self):
+        d = {"outcome_progress_history": [{"progress": 5}, {"progress": 5}]}
+        _reset_outcome_detection_state(d)
+        assert d["outcome_progress_history"] == []
+
+    def test_removes_outcome_progress_ever_met(self):
+        d = {
+            "outcome_progress_ever_met": True,
+            "outcome_progress_history": [{"progress": 5}],
+        }
+        _reset_outcome_detection_state(d)
+        assert "outcome_progress_ever_met" not in d
+
+    def test_removes_evidence_progress(self):
+        d = {
+            "evidence_progress": {"status": "advancing", "cycle_index": 5},
+            "outcome_progress_history": [],
+        }
+        _reset_outcome_detection_state(d)
+        assert "evidence_progress" not in d
+
+    def test_removes_possibly_complete(self):
+        d = {"possibly_complete": True, "outcome_progress_history": []}
+        _reset_outcome_detection_state(d)
+        assert "possibly_complete" not in d
+
+    def test_removes_completion_suggestion(self):
+        d = {
+            "completion_suggestion": "Direction looks complete",
+            "outcome_progress_history": [],
+        }
+        _reset_outcome_detection_state(d)
+        assert "completion_suggestion" not in d
+
+    def test_removes_scaffolding_flags(self):
+        d = {
+            "outcome_scaffolding_flagged": True,
+            "outcome_scaffolding_flagged_at": "2026-01-01T00:00:00",
+            "outcome_scaffolding_flagged_cycles": 3,
+            "outcome_progress_history": [],
+        }
+        _reset_outcome_detection_state(d)
+        assert "outcome_scaffolding_flagged" not in d
+        assert "outcome_scaffolding_flagged_at" not in d
+        assert "outcome_scaffolding_flagged_cycles" not in d
+
+    def test_preserves_non_outcome_detection_keys(self):
+        d = {
+            "id": "d-1",
+            "text": "some direction",
+            "research_history": [{"prs_merged": 1}],
+            "context": {"success_evidence": "new criteria"},
+            "outcome_progress_history": [{"progress": 5}],
+            "outcome_progress_ever_met": True,
+        }
+        _reset_outcome_detection_state(d)
+        assert d["id"] == "d-1"
+        assert d["text"] == "some direction"
+        assert d["research_history"] == [{"prs_merged": 1}]
+        assert d["context"] == {"success_evidence": "new criteria"}
+
+    def test_safe_on_empty_direction(self):
+        d = {}
+        _reset_outcome_detection_state(d)
+        assert d["outcome_progress_history"] == []
+
+    def test_safe_when_optional_keys_absent(self):
+        # Only outcome_progress_history is always written; optional keys absent → no crash.
+        d = {"outcome_progress_history": []}
+        _reset_outcome_detection_state(d)
+        assert d["outcome_progress_history"] == []
+
+    def test_clears_all_keys_at_once(self):
+        # All eight _OUTCOME_DETECTION_KEYS populated simultaneously.
+        d = {
+            "outcome_progress_history": [{"progress": 5}],
+            "outcome_progress_ever_met": True,
+            "evidence_progress": {"status": "met"},
+            "possibly_complete": True,
+            "completion_suggestion": "done",
+            "outcome_scaffolding_flagged": True,
+            "outcome_scaffolding_flagged_at": "2026-01-01T00:00:00",
+            "outcome_scaffolding_flagged_cycles": 2,
+        }
+        _reset_outcome_detection_state(d)
+        assert d["outcome_progress_history"] == []
+        for key in (
+            "outcome_progress_ever_met",
+            "evidence_progress",
+            "possibly_complete",
+            "completion_suggestion",
+            "outcome_scaffolding_flagged",
+            "outcome_scaffolding_flagged_at",
+            "outcome_scaffolding_flagged_cycles",
+        ):
+            assert key not in d, f"key {key!r} should be removed after reset"
+
+
+# ── Contract-change integration: reset + fingerprint-filter defense ───────────
+
+
+class TestScaffoldingDetectorContractResetIntegration:
+    """Integration tests showing that _reset_outcome_detection_state + the
+    fingerprint-filter defense in _check_outcome_scaffolding together prevent
+    old-contract snapshots from poisoning the stall-window detector."""
+
+    def test_reset_silences_detector_immediately_after_contract_change(self):
+        # Direction with a full stall window that WOULD fire the detector.
+        d = _scaffolding_direction([5, 5, 5, 5, 5, 5])
+        assert _check_outcome_scaffolding(d) is not None, "precondition: detector fires"
+
+        # Simulate a contract change: update success_evidence and call reset.
+        d["context"] = {"success_evidence": "new success criteria after operator edit"}
+        _reset_outcome_detection_state(d)
+
+        # After reset the history is empty — no snapshots, so detector is silent.
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_fingerprint_filter_alone_suppresses_detector_when_reset_omitted(self):
+        # Defense-in-depth: even if a writer forgets to call _reset_outcome_detection_state,
+        # the fingerprint filter in _check_outcome_scaffolding suppresses the flag because
+        # none of the old-contract snapshots match the new contract fingerprint.
+        old_fp = "aabbccdd00112233"
+        fps = [old_fp] * 6
+        d = _scaffolding_direction([5, 5, 5, 5, 5, 5], success_evidence_fps=fps)
+        # direction.context.success_evidence is unset → FP = sha256("")[:16] ≠ old_fp
+        assert _check_outcome_scaffolding(d) is None
+
+    def test_reset_removes_stale_scaffolding_flag_set_by_prior_cycle(self):
+        # A direction that was flagged as scaffolding under the old contract must
+        # have that flag cleared after a contract reset so it is not re-escalated.
+        d = _scaffolding_direction([5, 5, 5, 5, 5, 5])
+        d["outcome_scaffolding_flagged"] = True
+        d["outcome_scaffolding_flagged_cycles"] = 3
+        d["context"] = {"success_evidence": "new goal after strategic update"}
+        _reset_outcome_detection_state(d)
+        assert "outcome_scaffolding_flagged" not in d
+        assert "outcome_scaffolding_flagged_cycles" not in d
+
+    def test_reset_removes_stale_ever_met_latch(self):
+        # outcome_progress_ever_met was set under the old contract. After a contract
+        # change the new goal has never been met, so the latch must be cleared.
+        d = _scaffolding_direction([5, 5, 5, 5, 5, 5], outcome_progress_ever_met=True)
+        # Detector stays silent due to ever_met latch.
+        assert _check_outcome_scaffolding(d) is None
+
+        d["context"] = {"success_evidence": "entirely new success criteria"}
+        _reset_outcome_detection_state(d)
+        # Latch cleared — new contract has never been met.
+        assert "outcome_progress_ever_met" not in d
+
+    def test_new_contract_snapshots_accumulate_and_can_fire_after_reset(self):
+        # After reset + enough new-contract snapshots, the detector fires again
+        # if progress is genuinely flat under the new contract.
+        d = _scaffolding_direction([5, 5, 5, 5, 5, 5])
+        d["context"] = {"success_evidence": "new success criteria"}
+        _reset_outcome_detection_state(d)
+        assert _check_outcome_scaffolding(d) is None  # empty history → no fire
+
+        # Accumulate 6 new-contract snapshots with flat progress.
+        for _ in range(6):
+            record_outcome_progress_snapshot(d)
+
+        # Now the detector should fire (6 new-contract snapshots, progress = 0).
+        ev = _check_outcome_scaffolding(d)
+        assert ev is not None
+
+
+# ── Contract-reset integration tests (strategic _handle_strategic_completion) ──
+#
+# These tests verify that when _handle_strategic_completion applies an update
+# op that changes a contract field (text, paths, success_evidence,
+# retirement_condition), it calls _reset_outcome_detection_state on the
+# direction so stale outcome snapshots don't poison the next research cycle.
+#
+# completion_criteria is NOT in the strategic update op's change set (only
+# reachable via the operator PATCH path), so it is omitted here.
+
+
+_STALE_OUTCOME_KEYS = (
+    "outcome_progress_ever_met",
+    "evidence_progress",
+    "possibly_complete",
+    "completion_suggestion",
+    "outcome_scaffolding_flagged",
+    "outcome_scaffolding_flagged_at",
+    "outcome_scaffolding_flagged_cycles",
+)
+
+
+def _stale_direction(direction_id: str, **extra) -> dict:
+    """Build a direction dict pre-populated with all 8 stale outcome-detection fields."""
+    base = {
+        "id": direction_id,
+        "text": "Original direction text",
+        "status": "active",
+        "priority": "medium",
+        "paths": ["src/old/"],
+        "notes": [],
+        "research_history": [],
+        "context": {
+            "success_evidence": "Old success evidence",
+            "retirement_condition": "Old retirement condition",
+        },
+        # All 8 stale outcome-detection fields
+        "outcome_progress_history": [
+            {"progress": 5, "success_evidence_fp": "stale-fp"}
+        ],
+        "outcome_progress_ever_met": True,
+        "evidence_progress": {"status": "advancing"},
+        "possibly_complete": True,
+        "completion_suggestion": "Looks done already",
+        "outcome_scaffolding_flagged": True,
+        "outcome_scaffolding_flagged_at": "2026-01-01T00:00:00",
+        "outcome_scaffolding_flagged_cycles": 3,
+    }
+    base.update(extra)
+    return base
+
+
+def _assert_stale_state_reset(d: dict) -> None:
+    """Assert that all outcome-detection state is at a clean baseline after reset."""
+    assert d["outcome_progress_history"] == [], (
+        "outcome_progress_history must be set to [] by the contract-reset guard"
+    )
+    for key in _STALE_OUTCOME_KEYS:
+        assert key not in d, (
+            f"{key} must be removed from direction after a contract field changes"
+        )
+
+
+@pytest.mark.asyncio
+async def test_strategic_update_text_resets_outcome_detection_state(db_session, mocker):
+    """Strategic update op changing direction text must reset outcome-detection state.
+
+    The text field is the direction's goal statement — changing it is a contract
+    change that invalidates all prior outcome snapshots.
+    """
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P-cr-text",
+        user_id="u-cr-text",
+        vision={"purpose": "test", "revision": 1},
+        directions=[_stale_direction("d-cr-text")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-cr-text",
+                    "rationale": "rewriting goal statement",
+                    "changes": {"text": "Completely rewritten direction text"},
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in (project.directions or []) if x.get("id") == "d-cr-text")
+    assert d["text"] == "Completely rewritten direction text", "text must be updated"
+    _assert_stale_state_reset(d)
+
+
+@pytest.mark.asyncio
+async def test_strategic_update_paths_resets_outcome_detection_state(
+    db_session, mocker
+):
+    """Strategic update op changing direction paths must reset outcome-detection state.
+
+    Changing the file-scope paths redefines the evidence surface, so all
+    prior outcome snapshots are stale relative to the new contract.
+    """
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P-cr-paths",
+        user_id="u-cr-paths",
+        vision={"purpose": "test", "revision": 1},
+        directions=[_stale_direction("d-cr-paths")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-cr-paths",
+                    "rationale": "expanding file scope",
+                    "changes": {"paths": ["src/new/", "backend/new/"]},
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in (project.directions or []) if x.get("id") == "d-cr-paths")
+    assert d.get("paths") == ["src/new/", "backend/new/"], "paths must be updated"
+    _assert_stale_state_reset(d)
+
+
+@pytest.mark.asyncio
+async def test_strategic_update_success_evidence_resets_outcome_detection_state(
+    db_session, mocker
+):
+    """Strategic update op changing success_evidence must reset outcome-detection state.
+
+    success_evidence is the primary fingerprint used by the outcome scaffolding
+    detector.  Changing it invalidates all accumulated fingerprinted snapshots.
+    """
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P-cr-se",
+        user_id="u-cr-se",
+        vision={"purpose": "test", "revision": 1},
+        directions=[_stale_direction("d-cr-se")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-cr-se",
+                    "rationale": "tightening success criteria",
+                    "changes": {
+                        "success_evidence": "All auth unit tests green for 3 consecutive cycles"
+                    },
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in (project.directions or []) if x.get("id") == "d-cr-se")
+    ctx = d.get("context") or {}
+    assert ctx.get("success_evidence") == (
+        "All auth unit tests green for 3 consecutive cycles"
+    ), "success_evidence must be updated"
+    _assert_stale_state_reset(d)
+
+
+@pytest.mark.asyncio
+async def test_strategic_update_retirement_condition_resets_outcome_detection_state(
+    db_session, mocker
+):
+    """Strategic update op changing retirement_condition must reset outcome-detection state.
+
+    Changing when the direction should be retired is a contract change that may
+    make previously-accumulated outcome progress measurements irrelevant.
+    """
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.main._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P-cr-rc",
+        user_id="u-cr-rc",
+        vision={"purpose": "test", "revision": 1},
+        directions=[_stale_direction("d-cr-rc")],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-cr-rc",
+                    "rationale": "adjusting retirement trigger",
+                    "changes": {
+                        "retirement_condition": "Zero P1 regressions for 5 cycles"
+                    },
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in (project.directions or []) if x.get("id") == "d-cr-rc")
+    ctx = d.get("context") or {}
+    assert ctx.get("retirement_condition") == "Zero P1 regressions for 5 cycles", (
+        "retirement_condition must be updated"
+    )
+    _assert_stale_state_reset(d)
+
+
+# ── _reset_scaffolding_state_on_outcome_change ───────────────────────────────
+
+
+class TestResetScaffoldingStateOnOutcomeChange:
+    def test_clears_all_three_fields_and_returns_true(self):
+        d = {
+            "outcome_progress_ever_met": True,
+            "outcome_progress_history": [{"progress": 5}],
+            "evidence_progress": {"status": "advancing"},
+        }
+        result = _reset_scaffolding_state_on_outcome_change(d)
+        assert result is True
+        assert "outcome_progress_ever_met" not in d
+        assert "outcome_progress_history" not in d
+        assert "evidence_progress" not in d
+
+    def test_returns_false_when_no_fields_present(self):
+        d = {"text": "some direction", "status": "active"}
+        result = _reset_scaffolding_state_on_outcome_change(d)
+        assert result is False
+        # Even when nothing was cleared, the reset baseline must be stamped so a
+        # subsequent snapshot can't re-latch based on pre-reset history.
+        assert d["outcome_progress_reset_at_cycle"] == 0
+        assert d["outcome_progress_reset_at_merged"] == 0
+
+    def test_clears_only_fields_that_are_present(self):
+        d = {"outcome_progress_ever_met": True, "text": "direction"}
+        _reset_scaffolding_state_on_outcome_change(d)
+        assert "outcome_progress_ever_met" not in d
+        assert d["text"] == "direction"
+
+    def test_does_not_touch_unrelated_fields(self):
+        d = {
+            "outcome_progress_ever_met": True,
+            "research_history": [{"prs_merged": 2}],
+            "context": {"success_evidence": "x"},
+        }
+        _reset_scaffolding_state_on_outcome_change(d)
+        assert "research_history" in d
+        assert "context" in d
+
+    def test_clears_scaffolding_flag_fields(self):
+        """Reset must also clear the advisory scaffolding-flag ladder so a
+        strategic cycle running before the next lifecycle sweep cannot reason
+        from stale scaffolding evidence judged against the OLD outcome."""
+        d = {
+            "outcome_scaffolding_flagged": True,
+            "outcome_scaffolding_flagged_at": "2026-01-01T00:00:00+00:00",
+            "outcome_scaffolding_flagged_cycles": 3,
+            "outcome_scaffolding_evidence": {"reason": "stalled-under-old-goal"},
+            "possibly_complete": True,
+            "completion_suggestion": "old-goal complete",
+        }
+        result = _reset_scaffolding_state_on_outcome_change(d)
+        assert result is True
+        for f in (
+            "outcome_scaffolding_flagged",
+            "outcome_scaffolding_flagged_at",
+            "outcome_scaffolding_flagged_cycles",
+            "outcome_scaffolding_evidence",
+            "possibly_complete",
+            "completion_suggestion",
+        ):
+            assert f not in d, f"reset failed to clear {f!r}"
+
+    def test_stamps_post_reset_baseline_from_history(self):
+        d = {
+            "research_history": [
+                {"prs_merged": 2},
+                {"prs_merged": 1},
+            ],
+            "history_aggregate": {"total_cycles": 5, "total_prs_merged": 4},
+            "outcome_progress_ever_met": True,
+        }
+        _reset_scaffolding_state_on_outcome_change(d)
+        # 2 visible history entries + 5 aggregated cycles = 7
+        assert d["outcome_progress_reset_at_cycle"] == 7
+        # 3 merged in history + 4 aggregated merged = 7
+        assert d["outcome_progress_reset_at_merged"] == 7
+
+
+class TestRecordOutcomeProgressSnapshotPostReset:
+    """After an outcome reset, the cumulative completion heuristic must NOT
+    immediately re-latch ``outcome_progress_ever_met`` — fresh post-reset
+    evidence is required before treating completion as meaningful under the
+    redefined outcome."""
+
+    def _direction_meeting_completion_heuristic(self):
+        # _check_direction_completion requires len(history)>=4, total_merged>=3,
+        # and last 2 cycles low-yield (created<=2 AND merged<=1).
+        return {
+            "research_history": [
+                {"prs_merged": 2, "tasks_created": 2},
+                {"prs_merged": 2, "tasks_created": 2},
+                {"prs_merged": 1, "tasks_created": 1},
+                {"prs_merged": 0, "tasks_created": 0},
+            ],
+            "context": {"success_evidence": "new-goal"},
+        }
+
+    def test_heuristic_does_not_re_latch_immediately_after_reset(self):
+        from app.strategic_completion import record_outcome_progress_snapshot
+
+        d = self._direction_meeting_completion_heuristic()
+        # Confirm the cumulative heuristic does fire on this fixture pre-reset.
+        from app.strategic_completion import _check_direction_completion
+
+        assert _check_direction_completion(d) is not None
+        # Simulate the operator/strategic-agent redefining the outcome.
+        _reset_scaffolding_state_on_outcome_change(d)
+        assert "outcome_progress_ever_met" not in d
+        # The very next snapshot must NOT re-set the latch even though the
+        # cumulative heuristic still trips — that heuristic is independent of
+        # the newly defined outcome.
+        record_outcome_progress_snapshot(d)
+        assert d.get("outcome_progress_ever_met") is not True, (
+            "snapshot re-latched ever_met immediately after reset — the "
+            "cumulative completion heuristic is independent of the new outcome "
+            "and must not drive the latch until post-reset cycles/merges "
+            "accumulate"
+        )
+
+    def test_possibly_complete_alone_does_not_re_latch_after_reset(self):
+        """Lifecycle sets ``possibly_complete`` from the same cumulative
+        heuristic. Even if it gets re-set after our reset, the snapshot latch
+        must still gate on post-reset baselines."""
+        from app.strategic_completion import record_outcome_progress_snapshot
+
+        d = self._direction_meeting_completion_heuristic()
+        _reset_scaffolding_state_on_outcome_change(d)
+        # Simulate lifecycle re-setting possibly_complete on the next sweep
+        # using the same (now stale-under-new-outcome) heuristic.
+        d["possibly_complete"] = True
+        record_outcome_progress_snapshot(d)
+        assert d.get("outcome_progress_ever_met") is not True
+
+    def test_latches_once_enough_post_reset_evidence_accumulates(self):
+        from app.strategic_completion import record_outcome_progress_snapshot
+
+        d = self._direction_meeting_completion_heuristic()
+        _reset_scaffolding_state_on_outcome_change(d)
+        # Accumulate >=4 post-reset cycles AND >=3 post-reset merges, keeping
+        # the recent-window low-yield gate satisfied.
+        d["research_history"].extend(
+            [
+                {"prs_merged": 2, "tasks_created": 2},
+                {"prs_merged": 2, "tasks_created": 2},
+                {"prs_merged": 1, "tasks_created": 1},
+                {"prs_merged": 0, "tasks_created": 0},
+            ]
+        )
+        record_outcome_progress_snapshot(d)
+        assert d.get("outcome_progress_ever_met") is True
+
+    def test_no_reset_baseline_preserves_legacy_latch_behavior(self):
+        """Directions that never had an outcome reset (no baseline stamped)
+        must continue to latch on the heuristic the same as before."""
+        from app.strategic_completion import record_outcome_progress_snapshot
+
+        d = self._direction_meeting_completion_heuristic()
+        # No _reset_scaffolding_state_on_outcome_change call → no baseline.
+        record_outcome_progress_snapshot(d)
+        assert d.get("outcome_progress_ever_met") is True

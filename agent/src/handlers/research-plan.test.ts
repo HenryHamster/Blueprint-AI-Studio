@@ -15,6 +15,12 @@ vi.mock('../index.js', () => ({
   runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
   persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
   strVal: (v: unknown, def = '') => (typeof v === 'string' ? v : def),
+  resolveBaseBranch: (payload: Record<string, unknown>, task: Record<string, unknown>, fallback = 'main') => {
+    if (typeof payload.base_branch === 'string' && payload.base_branch) return payload.base_branch;
+    const meta = task.project_metadata as Record<string, unknown> | undefined;
+    if (typeof meta?.integration_branch === 'string' && meta.integration_branch) return meta.integration_branch;
+    return fallback;
+  },
   sanitize: (s: string) => s,
   readHandlerOutput: vi.fn().mockReturnValue(null),
   log: vi.fn(),
@@ -1395,6 +1401,34 @@ describe('buildMemoCitationsSection', () => {
     expect(result).toContain('M0 (task_id: memo-ccc): (no summary)');
     expect(result).toContain('M1 (task_id: ?): no id here');
   });
+
+  it('reframes memos as cross-cycle institutional memory (not budget scraps)', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-aaa', summary_excerpt: 'A finding.' },
+    ]);
+    expect(result).toContain('cross-cycle institutional memory');
+    expect(result).toContain('durable');
+    expect(result).toContain('why findings were set aside');
+    expect(result).toContain('why directions were retired');
+    // Should NOT contain the old "budget pressure" framing
+    expect(result).not.toMatch(/dropped.*budget|budget.*pressure/i);
+  });
+
+  it('explicitly prompts agent to actively check memos for relevance', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-aaa', summary_excerpt: 'A finding.' },
+    ]);
+    expect(result).toMatch(/actively check.*memo.*relevant/i);
+    expect(result).toMatch(/as you reason about gaps and directions/i);
+  });
+
+  it('emphasizes authentic citation over performative citation', () => {
+    const result = buildMemoCitationsSection([
+      { task_id: 'memo-aaa', summary_excerpt: 'A finding.' },
+    ]);
+    expect(result).toMatch(/authentic|genuinely informs/i);
+    expect(result).toMatch(/performative.*not|valuable citations.*strengthen/i);
+  });
 });
 
 describe('resolveMemoHandles', () => {
@@ -1667,15 +1701,14 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('some data');
   });
 
-  it('self-improvement block rendered only when isSelfRepo=true', () => {
+  it('self-improvement block rendered when selfImprovementBlock is non-empty', () => {
     const selfRepoPrompt = buildThinkerPrompt({
       ...base,
-      isSelfRepo: true,
       selfImprovementBlock: '\n\n# Self-improvement\n\nThis project\'s codebase includes your own prompts.',
     });
     expect(selfRepoPrompt).toContain('# Self-improvement');
 
-    const notSelfRepo = buildThinkerPrompt({ ...base, isSelfRepo: false, selfImprovementBlock: '' });
+    const notSelfRepo = buildThinkerPrompt({ ...base, selfImprovementBlock: '' });
     expect(notSelfRepo).not.toContain('# Self-improvement');
   });
 

@@ -1,0 +1,15 @@
+{
+  "audit_score": 0.9,
+  "findings": [
+    {
+      "severity": "low",
+      "summary": "Minor style issue in handler.",
+      "file": "app/foo.py"
+    }
+  ],
+  "test_erosion": {
+    "deleted_test_files": [],
+    "assertion_delta": 3,
+    "test_count_delta": 1
+  }
+}

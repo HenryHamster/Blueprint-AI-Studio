@@ -16,6 +16,7 @@ from typing import Callable, Coroutine, Any
 
 from sqlmodel import select
 
+from app.migration_path import is_migration_file
 from app.models import Task, TaskStatus
 from app.shared_state import is_direction_held, DEFAULT_TASK_SCOPE
 
@@ -338,7 +339,7 @@ def _is_migration_task(task: Task) -> bool:
         if not f:
             continue
         normalized = f.replace("\\", "/")
-        if "backend/alembic/versions/" in normalized:
+        if is_migration_file(normalized):
             return True
         if normalized == "backend/app/models.py" or normalized.endswith(
             "/backend/app/models.py"

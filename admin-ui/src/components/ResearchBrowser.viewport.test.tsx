@@ -14,6 +14,9 @@ vi.mock('../api', () => ({
   apiFetch: vi.fn(() =>
     Promise.resolve({ ok: false, status: 503, json: () => Promise.resolve({}) }),
   ),
+  fetchRecentFindings: vi.fn(() =>
+    Promise.resolve({ findings: [], grade_distribution: { HIGH: 0, MEDIUM: 0, LOW: 0 }, grade_distribution_pct: { HIGH: 0, MEDIUM: 0, LOW: 0 }, total: 0 }),
+  ),
 }));
 
 // Stub the directions fetch to bail harmlessly.

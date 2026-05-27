@@ -1,6 +1,6 @@
 """Issue-to-implementation: spawn create tasks when issues are labeled.
 
-When a GitHub issue receives the configured trigger label (default: 'blueprint:implement'),
+When a GitHub issue receives the configured trigger label (default: 'auto:implement'),
 this module fetches issue context and spawns a create-type task.  Guard rails prevent
 runaway spawning (rate limit, duplicate detection, concurrent limit).
 """
@@ -21,8 +21,11 @@ from app.github import (
     get_repo_installation_token,
     get_single_issue,
 )
-from app.models import Task, TaskStatus
+from app.models import Project, Task, TaskStatus
 from app.notification_dispatch import post_issue_implementation_spawned_message
+from app.shared_state import (
+    get_project_integration_branch as _get_project_integration_branch,
+)
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -74,6 +77,7 @@ async def _handle_issue_implementation_inner(
     session: AsyncSession,
 ) -> None:
     """Inner implementation, called with a live session."""
+    project_obj = await session.get(Project, project_id)
     max_per_hour = config.get("max_per_hour", 3)
     max_concurrent = config.get("max_concurrent", 3)
     now = _utcnow()
@@ -199,7 +203,7 @@ async def _handle_issue_implementation_inner(
             {
                 "type": "create",
                 "effort": config.get("default_effort", "high"),
-                "base_branch": config.get("base_branch", "main"),
+                "base_branch": _get_project_integration_branch(project_obj),
                 "title": f"feat: {issue_title[:60]}",
                 "prompt": prompt,
             }

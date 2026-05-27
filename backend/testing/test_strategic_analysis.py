@@ -866,6 +866,146 @@ def test_confirmed_and_proposed_findings():
     assert any("Finding proposed" in c for c in d["proposed"])
 
 
+def test_cumulative_confirmed_finding_count_and_trend():
+    """Verify outcome includes cumulative confirmed-finding count and trend."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [],
+            "outcome_progress_history": [
+                {"progress": 1},
+                {"progress": 2},
+                {"progress": 3},
+                {"progress": 5},  # improving trend
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    d = result["directions"][0]
+
+    assert "confirmed_finding_count" in d
+    assert d["confirmed_finding_count"] == 5
+    assert "confirmed_finding_trend" in d
+    assert d["confirmed_finding_trend"] == "improving"
+
+
+def test_outcome_scaffolding_flag_surfaces_in_outcome():
+    """outcome_scaffolding_flagged and _evidence appear for flagged direction, absent for unflagged."""
+    directions = [
+        {
+            "id": "dir-flagged",
+            "status": "active",
+            "research_history": [],
+            "outcome_scaffolding_flagged": True,
+            "outcome_scaffolding_evidence": {"reason": "no progress", "cycles": 5},
+        },
+        {
+            "id": "dir-clean",
+            "status": "active",
+            "research_history": [],
+        },
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project, [])
+    by_id = {d["id"]: d for d in result["directions"]}
+
+    flagged = by_id["dir-flagged"]
+    assert flagged.get("outcome_scaffolding_flagged") is True
+    assert flagged.get("outcome_scaffolding_evidence") == {
+        "reason": "no progress",
+        "cycles": 5,
+    }
+
+    clean = by_id["dir-clean"]
+    assert "outcome_scaffolding_flagged" not in clean
+    assert "outcome_scaffolding_evidence" not in clean
+
+
+def test_confirmed_finding_trend_declining():
+    """Verify declining trend detection."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [],
+            "outcome_progress_history": [
+                {"progress": 10},
+                {"progress": 9},
+                {"progress": 5},
+                {"progress": 4},  # declining trend
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    d = result["directions"][0]
+
+    assert d["confirmed_finding_trend"] == "declining"
+
+
+def test_confirmed_finding_trend_stable():
+    """Verify stable trend detection."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [],
+            "outcome_progress_history": [
+                {"progress": 5},
+                {"progress": 5},
+                {"progress": 5},
+                {"progress": 6},  # stable trend (6 is not > 5*1.3 and not < 5*0.7)
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    d = result["directions"][0]
+
+    assert d["confirmed_finding_trend"] == "stable"
+
+
+def test_confirmed_finding_count_no_history():
+    """Verify missing outcome_progress_history doesn't add the field."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [],
+            # No outcome_progress_history
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    d = result["directions"][0]
+
+    assert "confirmed_finding_count" not in d
+    assert "confirmed_finding_trend" not in d
+
+
+def test_confirmed_finding_trend_single_snapshot():
+    """Verify trend not added with single snapshot."""
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [],
+            "outcome_progress_history": [
+                {"progress": 5},
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(project)
+    d = result["directions"][0]
+
+    assert "confirmed_finding_count" in d
+    assert d["confirmed_finding_count"] == 5
+    assert "confirmed_finding_trend" not in d  # no trend with only 1 snapshot
+
+
 # ---------------------------------------------------------------------------
 # difficulty_index
 # ---------------------------------------------------------------------------
@@ -2597,3 +2737,86 @@ def test_retired_approaches_block_respects_max_entries_across_directions():
     # Should have at most 3 entries
     entry_count = block.count("\n- ") + (1 if block.startswith("- ") else 0)
     assert entry_count <= 3
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: time-window filter uses fields that writers actually produce
+# ---------------------------------------------------------------------------
+
+
+def test_retired_at_field_excludes_old_direction():
+    """Direction with retired_at 91 days ago is excluded from the window."""
+    directions = [
+        {
+            "id": "dir-old-retired",
+            "text": "Old retired direction",
+            "status": "retired",
+            "retired_at": _old_iso(),
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project)
+    assert result == [], (
+        "direction with retired_at beyond the window should be excluded"
+    )
+
+
+def test_completed_at_used_for_completed_direction():
+    """completed_at is used for completed directions; old ones are excluded, recent ones included."""
+    recent_dir = {
+        "id": "dir-recent-completed",
+        "text": "Recent completed direction",
+        "status": "completed",
+        "completed_at": _recent_iso(5),
+    }
+    old_dir = {
+        "id": "dir-old-completed",
+        "text": "Old completed direction",
+        "status": "completed",
+        "completed_at": _old_iso(),
+    }
+    project = _make_project(directions=[recent_dir, old_dir])
+    result = _build_retired_directions_summary(project)
+    ids = [r["id"] for r in result]
+    assert "dir-recent-completed" in ids, (
+        "recent completed direction should be included"
+    )
+    assert "dir-old-completed" not in ids, (
+        "completed direction older than window should be excluded"
+    )
+
+
+def test_expired_at_used_for_expired_direction():
+    """expired_at is used for expired directions; old ones are excluded."""
+    directions = [
+        {
+            "id": "dir-old-expired",
+            "text": "Old expired direction",
+            "status": "expired",
+            "auto_completed_reason": "Proposal deadline passed",
+            "expired_at": _old_iso(),
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project)
+    assert result == [], (
+        "expired direction with expired_at beyond the window should be excluded"
+    )
+
+
+def test_superseded_direction_with_completed_at_included():
+    """superseded direction with a recent completed_at is included in the window."""
+    directions = [
+        {
+            "id": "dir-superseded",
+            "text": "Superseded direction",
+            "status": "superseded",
+            "completed_at": _recent_iso(3),
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project)
+    ids = [r["id"] for r in result]
+    assert "dir-superseded" in ids, (
+        "superseded direction with recent completed_at should be included"
+    )

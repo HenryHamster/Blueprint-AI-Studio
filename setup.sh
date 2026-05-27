@@ -56,7 +56,7 @@ if [ "${1:-}" = "-f" ]; then
   # Wave F4 M6: pass _INITIAL_ADMIN_EMAIL through to cloudbuild.yaml
   # so the operator email is no longer hardcoded.
   gcloud builds submit --config=cloudbuild.yaml \
-    --substitutions="_ALLOWED_ORIGINS=*,_ORCHESTRATOR_URL=$ORCHESTRATOR_URL,_INITIAL_ADMIN_EMAIL=${ADMIN_EMAIL:-}" \
+    --substitutions="_ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000},_ORCHESTRATOR_URL=$ORCHESTRATOR_URL,_INITIAL_ADMIN_EMAIL=${ADMIN_EMAIL:-}" \
     --project="$PROJECT_ID"
   cd ..
   ok "Backend redeployed to $ORCHESTRATOR_URL"
@@ -117,7 +117,7 @@ run_phase2() {
   cd backend
   # Wave F4 M6: pass _INITIAL_ADMIN_EMAIL through to cloudbuild.yaml.
   gcloud builds submit --config=cloudbuild.yaml \
-    --substitutions="_ALLOWED_ORIGINS=*,_ORCHESTRATOR_URL=$ORCHESTRATOR_URL,_INITIAL_ADMIN_EMAIL=${ADMIN_EMAIL:-}" \
+    --substitutions="_ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000},_ORCHESTRATOR_URL=$ORCHESTRATOR_URL,_INITIAL_ADMIN_EMAIL=${ADMIN_EMAIL:-}" \
     --project="$PROJECT_ID" --quiet
   cd ..
   ok "Backend re-deployed"
@@ -470,7 +470,7 @@ gcloud run deploy blueprint-orchestrator \
   --image="$IMAGE_TAG" \
   --region="$REGION" \
   --service-account="$ORCHESTRATOR_SA" \
-  --set-env-vars="GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=${ZONE},VPC_NETWORK=agent-sandbox-vpc,VPC_SUBNET=agent-sandbox-subnet,AGENT_SERVICE_ACCOUNT_EMAIL=agent-naked-sa@${PROJECT_ID}.iam.gserviceaccount.com,ARTIFACT_BUCKET_NAME=${PROJECT_ID}-agent-artifacts,ALLOWED_ORIGINS=*,ORCHESTRATOR_URL=${ORCHESTRATOR_URL},LOCAL_MODE=false,MAX_CONCURRENT_VMS=10,INITIAL_ADMIN_EMAIL=${ADMIN_EMAIL:-},VM_PROVISIONING_MODEL=SPOT,DISABLED_REGIONS=us-east1;us-east4;us-west1" \
+  --set-env-vars="GCP_PROJECT_ID=$PROJECT_ID,GCP_ZONE=${ZONE},VPC_NETWORK=agent-sandbox-vpc,VPC_SUBNET=agent-sandbox-subnet,AGENT_SERVICE_ACCOUNT_EMAIL=agent-naked-sa@${PROJECT_ID}.iam.gserviceaccount.com,ARTIFACT_BUCKET_NAME=${PROJECT_ID}-agent-artifacts,ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:3000},ORCHESTRATOR_URL=${ORCHESTRATOR_URL},LOCAL_MODE=false,MAX_CONCURRENT_VMS=10,INITIAL_ADMIN_EMAIL=${ADMIN_EMAIL:-},VM_PROVISIONING_MODEL=SPOT,DISABLED_REGIONS=us-east1;us-east4;us-west1" \
   --set-secrets="DATABASE_URL=DATABASE_URL:latest,AGENT_JWT_SECRET=AGENT_JWT_SECRET:latest,WS_TICKET_SECRET=WS_TICKET_SECRET:latest,GITHUB_APP_ID=GITHUB_APP_ID:latest,GITHUB_CLIENT_ID=GITHUB_CLIENT_ID:latest,GITHUB_CLIENT_SECRET=GITHUB_CLIENT_SECRET:latest,GITHUB_PRIVATE_KEY=GITHUB_PRIVATE_KEY:latest,GITHUB_WEBHOOK_SECRET=GITHUB_WEBHOOK_SECRET:latest,ADMIN_API_KEY=ADMIN_API_KEY:latest" \
   --no-cpu-throttling --cpu-boost \
   --vpc-egress=all-traffic --network=agent-sandbox-vpc --subnet=agent-sandbox-subnet \

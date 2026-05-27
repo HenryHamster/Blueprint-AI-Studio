@@ -7,7 +7,7 @@ from collections import defaultdict
 from typing import Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy import text, or_
 from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +24,15 @@ from app.models import (
     _utcnow,
 )
 from app.auth import get_current_user, require_admin
+from app.vm_cost_rates import get_vm_rate_per_second, VM_COST_RATES
+from app.shared_state import (
+    get_project_integration_branch,
+    get_project_promotion_target,
+)
+
+# Re-export for test and internal use (single source of truth is vm_cost_rates)
+ON_DEMAND_RATE = VM_COST_RATES["e2-standard-2"][0] / 3600  # $/sec
+SPOT_RATE = VM_COST_RATES["e2-standard-2"][1] / 3600  # $/sec
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +68,17 @@ def _derive_completed_at(t: "Task") -> datetime:
     return _strip_tz(t.created_at)
 
 
-ON_DEMAND_RATE = 0.067 / 3600  # $/sec
-SPOT_RATE = 0.020 / 3600  # $/sec
+_TASK_COST_WINDOW_MS: Dict[str, int] = {
+    "15m": 15 * 60 * 1000,
+    "30m": 30 * 60 * 1000,
+    "1h": 60 * 60 * 1000,
+    "2h": 2 * 60 * 60 * 1000,
+    "3h": 3 * 60 * 60 * 1000,
+    "6h": 6 * 60 * 60 * 1000,
+    "12h": 12 * 60 * 60 * 1000,
+    "24h": 24 * 60 * 60 * 1000,
+    "all": 0,
+}
 
 router = APIRouter(
     prefix="/api/admin",
@@ -210,6 +228,164 @@ async def get_direction_auto_pause_stats(
     return _compute_direction_auto_pause_stats(projects, events, now, window_hours)
 
 
+def _task_completed_at(task: Task) -> datetime:
+    """Return the task completion timestamp used for cost windowing."""
+    return _derive_completed_at(task)
+
+
+def _task_estimated_cost_usd(task: Task) -> float | None:
+    """Return the VM cost for a task, or None when timing data is incomplete."""
+    if not task.vm_provisioned_at or not task.vm_stopped_at:
+        return None
+    rate = get_vm_rate_per_second(spot=task.vm_spot)
+    return (task.vm_stopped_at - task.vm_provisioned_at).total_seconds() * rate
+
+
+@router.get("/task-cost-breakdown")
+async def get_task_cost_breakdown(
+    project_id: uuid.UUID | None = Query(None),
+    window: str = Query("1h"),
+    top_n: int = Query(5, ge=1, le=20),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return spend breakdowns by task type, direction, and most expensive tasks."""
+    if window not in _TASK_COST_WINDOW_MS:
+        raise HTTPException(status_code=400, detail=f"Unsupported window '{window}'")
+
+    cutoff = None
+    if window != "all":
+        cutoff = _utcnow() - timedelta(milliseconds=_TASK_COST_WINDOW_MS[window])
+
+    filters = [
+        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED])
+    ]
+    if project_id is not None:
+        filters.append(Task.project_id == project_id)
+
+    tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.project_id,
+                        Task.title,
+                        Task.status,
+                        Task.created_at,
+                        Task.status_log,
+                        Task.payloads,
+                        Task.context,
+                        Task.vm_provisioned_at,
+                        Task.vm_stopped_at,
+                        Task.vm_spot,
+                    )
+                )
+                .where(*filters)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    rows: List[Dict[str, Any]] = []
+    for task in tasks:
+        completed_at = _task_completed_at(task)
+        if cutoff is not None and completed_at < cutoff:
+            continue
+        cost = _task_estimated_cost_usd(task)
+        if cost is None:
+            continue
+        payload = task.first_payload or {}
+        task_type = str(payload.get("type") or "create")
+        ctx = task.context or {}
+        direction_id = ctx.get("direction_id") or payload.get("current_direction_id")
+        direction_id_str = str(direction_id).strip() if direction_id else None
+        rows.append(
+            {
+                "task_id": str(task.id),
+                "task_title": task.title,
+                "task_type": task_type,
+                "direction_id": direction_id_str,
+                "completed_at": completed_at,
+                "estimated_cost_usd": cost,
+            }
+        )
+
+    by_task_type: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {"task_count": 0, "estimated_cost_usd": 0.0}
+    )
+    by_direction: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {"task_count": 0, "estimated_cost_usd": 0.0}
+    )
+    total_cost = 0.0
+
+    for row in rows:
+        total_cost += row["estimated_cost_usd"]
+        type_entry = by_task_type[row["task_type"]]
+        type_entry["task_count"] += 1
+        type_entry["estimated_cost_usd"] += row["estimated_cost_usd"]
+
+        direction_key = row["direction_id"] or "unassigned"
+        direction_entry = by_direction[direction_key]
+        direction_entry["task_count"] += 1
+        direction_entry["estimated_cost_usd"] += row["estimated_cost_usd"]
+
+    task_type_breakdown = [
+        {
+            "task_type": task_type,
+            "task_count": data["task_count"],
+            "estimated_cost_usd": round(data["estimated_cost_usd"], 2),
+        }
+        for task_type, data in sorted(
+            by_task_type.items(),
+            key=lambda item: (-item[1]["estimated_cost_usd"], item[0]),
+        )
+    ]
+    direction_breakdown = [
+        {
+            "direction_id": None if direction_id == "unassigned" else direction_id,
+            "task_count": data["task_count"],
+            "estimated_cost_usd": round(data["estimated_cost_usd"], 2),
+        }
+        for direction_id, data in sorted(
+            by_direction.items(),
+            key=lambda item: (-item[1]["estimated_cost_usd"], item[0]),
+        )
+    ]
+    top_tasks = [
+        {
+            "task_id": row["task_id"],
+            "task_title": row["task_title"],
+            "task_type": row["task_type"],
+            "direction_id": row["direction_id"],
+            "completed_at": row["completed_at"].isoformat(),
+            "estimated_cost_usd": round(row["estimated_cost_usd"], 2),
+        }
+        for row in sorted(
+            rows,
+            key=lambda row: (
+                -row["estimated_cost_usd"],
+                row["completed_at"],
+                row["task_title"],
+            ),
+        )[:top_n]
+    ]
+
+    return {
+        "project_id": str(project_id) if project_id else None,
+        "window": window,
+        "window_ms": _TASK_COST_WINDOW_MS[window] if window != "all" else None,
+        "window_start": cutoff.isoformat() if cutoff else None,
+        "task_count": len(rows),
+        "total_estimated_cost_usd": round(total_cost, 2),
+        "task_type_breakdown": task_type_breakdown,
+        "direction_breakdown": direction_breakdown,
+        "top_tasks": top_tasks,
+    }
+
+
 @router.get("/task-duration-stats")
 async def get_task_duration_stats(
     project_id: uuid.UUID | None = Query(None),
@@ -239,7 +415,25 @@ async def get_task_duration_stats(
         if project_id:
             filters.append(Task.project_id == project_id)
         completed = (
-            (await session.execute(select(Task).where(*filters).limit(50000)))
+            (
+                await session.execute(
+                    select(Task)
+                    .options(
+                        load_only(
+                            Task.status_log,
+                            Task.created_at,
+                            Task.started_at,
+                            Task.payloads,
+                            Task.context,
+                            Task.vm_provisioned_at,
+                            Task.vm_started_at,
+                            Task.vm_stopped_at,
+                        )
+                    )
+                    .where(*filters)
+                    .limit(10000)
+                )
+            )
             .scalars()
             .all()
         )
@@ -596,12 +790,17 @@ async def get_open_prs(
                 "pr_url": pr_url,
                 "pr_title": gh_pr.get("title", ""),
                 "pr_branch": (gh_pr.get("head") or {}).get("ref", ""),
+                "pr_base_branch": (gh_pr.get("base") or {}).get("ref", ""),
                 "pr_created_at": gh_pr.get("created_at"),
                 "tasks": tasks_payload,
                 "is_orphaned": len(tasks_payload) == 0,
             }
         )
 
-    payload = {"open_prs": result}
+    payload = {
+        "open_prs": result,
+        "project_integration_branch": get_project_integration_branch(project),
+        "project_promotion_target": get_project_promotion_target(project),
+    }
     _open_prs_cache[project_id] = (time.time(), payload)
     return payload

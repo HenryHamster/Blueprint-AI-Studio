@@ -1,31 +1,30 @@
-"""``main → automain`` back-merge — keep the integration trunk in sync with ``main``.
+"""Periodic back-merge of the LTS branch into the integration trunk.
 
-Phase 5 of the automain LTS design (docs/plans/automain-lts-plan-v1.md), since
-generalised so the back-merge runs for ANY advance of ``main``, not only
-hotfixes.
+Ensures the integration trunk stays in sync with the LTS branch. In Blueprint's
+case, this is a ``main → automain`` back-merge; in other repos with different
+branch configuration, the back-merge adapts to the configured ``promotion_target``
+and ``integration_branch`` names.
 
-``main`` is the human-grade LTS branch; ``automain`` is the pipeline's
-integration trunk.  ``main`` advances two ways the integration trunk does not
-automatically pick up:
+The integration trunk and LTS branch can diverge when:
 
-  * a **hotfix** — an expedited fix branched off ``main`` that merges straight
-    to ``main`` so ``deploy.yml`` fires (the post-rollup-merge handler in
-    task_lifecycle.py calls :func:`open_backmerge_pr` once per hotfix);
-  * a **direct push** to ``main`` — a human landing a fix straight on the LTS
-    branch, which carries no task and no ``hotfix:true`` marker at all.
+  * a **hotfix** — an expedited fix branched off the LTS branch that merges
+    straight back (the post-rollup-merge handler in task_lifecycle.py calls
+    :func:`open_backmerge_pr` once per hotfix);
+  * a **direct push** to the LTS branch — a human landing a fix straight on the
+    LTS branch, which carries no task and no ``hotfix:true`` marker.
 
-Either way ``main`` diverges past ``automain``.  A missed back-merge makes the
-next ``automain → main`` promotion conflict — so every advance of ``main`` MUST
-be followed by a ``main → automain`` back-merge.
+Either way, the branches diverge. A missed back-merge makes the next
+promotion from integration trunk to LTS conflict — so every advance of the LTS
+branch MUST be followed by a back-merge into the integration trunk.
 
 Two entry points:
 
-  * :func:`open_backmerge_pr` — opens + merges one ``main → automain`` PR.  The
-    exact inverse of ``release_qualifier.promote()``.  Called once by the
+  * :func:`open_backmerge_pr` — opens + merges one back-merge PR. The exact
+    inverse of ``release_qualifier.promote()``. Called once by the
     hotfix-merge handler (``periodic=False``).
-  * :func:`reconcile_main_into_automain` — the periodic reconciler.  Runs every
+  * :func:`reconcile_main_into_automain` — the periodic reconciler. Runs every
     scheduler cycle and catches whatever the hotfix trigger missed — most
-    importantly direct pushes, which have no marker to trigger on.  Delegates
+    importantly direct pushes, which have no marker to trigger on. Delegates
     to :func:`open_backmerge_pr` with ``periodic=True``.
 
 It deliberately reuses ``promote``'s structure and the same GitHub helpers
@@ -34,7 +33,7 @@ It deliberately reuses ``promote``'s structure and the same GitHub helpers
 
 Failure philosophy (design doc §6 gotcha 6 — "the back-merge conflict-alert is
 mandatory, not optional"): a back-merge that does not complete must never pass
-silently.  The behaviour differs by caller:
+silently. The behaviour differs by caller:
 
   * ``periodic=False`` (a one-shot hotfix back-merge) — every non-merge raises
     an Alert; the operator must see a stuck one-shot back-merge.
@@ -42,7 +41,7 @@ silently.  The behaviour differs by caller:
     deduped, never suppressed: a blocked back-merge raises exactly one
     unresolved Alert per project (the first stuck cycle escalates; later cycles
     stay quiet until it is dismissed), and a genuine conflict's Alert +
-    resolution plan are likewise deduped project-wide.  So a persistent failure
+    resolution plan are likewise deduped project-wide. So a persistent failure
     surfaces once — not never, and not every cycle.
 
 ``open_backmerge_pr`` is idempotent: ``github.create_pull_request`` returns the
@@ -59,7 +58,7 @@ import logging
 import uuid
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import github
@@ -68,7 +67,7 @@ from app.broadcast import broadcast_to_project
 # release_qualifier does NOT import this module, so importing from it here is
 # safe — no circular import.  _resolve_github_with_session is the shared
 # credential resolver used by the whole LTS machinery.
-from app.release_qualifier import _resolve_github_with_session
+from app.release_qualifier import _lts_branch_names, _resolve_github_with_session
 from app.models import (
     Alert,
     AlertSeverity,
@@ -81,20 +80,6 @@ from app.payload_schemas import PayloadTooLargeError, validate_internal_payload
 from app.shared_state import runtime_config as _runtime_config
 
 logger = logging.getLogger(__name__)
-
-# Title of the conflict-resolution Alert.  Used both when creating the Alert
-# and when checking whether an unresolved one already exists, so a retried /
-# periodic back-merge does not stack duplicate alerts.
-_CONFLICT_ALERT_TITLE = "Back-merge conflict: main -> automain"
-
-# Title of the generic (non-conflict) failure Alert — a 405, a PR-creation
-# failure, or any unexpected exception.  Only raised for one-shot callers
-# (``periodic=False``); the periodic reconciler logs + retries instead.
-_BLOCKED_ALERT_TITLE = "Back-merge failed: main -> automain"
-
-# The conflict-resolution task always targets automain — it is a normal
-# automain-bound fix, NOT a hotfix.  It must NOT carry hotfix:true.
-_RESOLUTION_BASE_BRANCH = "automain"
 
 # Priority for the conflict-resolution task — expedited (design doc:
 # back-merge conflict resolution gates the next promotion; >= 90).
@@ -128,31 +113,33 @@ async def reconcile_main_into_automain(
     session: AsyncSession,
     project_id: uuid.UUID,
 ) -> dict[str, Any]:
-    """Periodically back-merge ``main`` into ``automain`` — the catch-all sync.
+    """Periodically back-merge the LTS branch into the integration trunk.
 
     The hotfix-triggered back-merge (:func:`open_backmerge_pr` from the
-    post-rollup-merge handler) only fires for tasks marked ``hotfix:true``.  A
-    *direct push* to ``main`` — a human landing a fix straight on the LTS
+    post-rollup-merge handler) only fires for tasks marked ``hotfix:true``. A
+    *direct push* to the LTS branch — a human landing a fix straight on the LTS
     branch — carries no such marker, so nothing back-merges it and the branches
-    silently diverge until the next ``automain → main`` promotion conflicts.
-    This reconciler closes that gap: it runs every scheduler cycle regardless
-    of HOW ``main`` advanced.
+    silently diverge until the next promotion conflicts. This reconciler closes
+    that gap: it runs every scheduler cycle regardless of HOW the LTS branch
+    advanced.
 
-    No-op unless ``integration_branch == "automain"`` — when the pipeline still
-    builds on ``main`` there is no separate trunk to reconcile (and a
-    ``main → main`` PR would be nonsense).
+    No-op when ``integration_branch == promotion_target`` (LTS model is inactive).
+    When these branches are the same, there is no separate trunk to reconcile.
 
     Delegates to :func:`open_backmerge_pr` with ``periodic=True``: a back-merge
     merely waiting on CI is logged and retried next cycle rather than raising
     an Alert every cycle; a genuine conflict still raises one Alert and spawns
     one resolution plan (deduped project-wide).
 
-    The caller commits the session.  Returns a status dict — ``open_backmerge_pr``'s
+    The caller commits the session. Returns a status dict — ``open_backmerge_pr``'s
     result, or ``{"status": "skipped", "reason": "lts_inactive"}`` when the LTS
     branch model is not active.
     """
-    integration_branch = str(_runtime_config.get("integration_branch", "main"))
-    if integration_branch != "automain":
+    project = await session.get(Project, project_id)
+    if project is None:
+        return {"status": "skipped", "reason": "project_not_found"}
+    integration_branch, promotion_target = _lts_branch_names(project)
+    if integration_branch == promotion_target:
         return {"status": "skipped", "reason": "lts_inactive"}
     return await open_backmerge_pr(session, project_id, periodic=True)
 
@@ -165,32 +152,30 @@ async def open_backmerge_pr(
     hotfix_task_id: uuid.UUID | str | None = None,
     periodic: bool = False,
 ) -> dict[str, Any]:
-    """Open and merge a ``main → automain`` back-merge PR.
+    """Open and merge a back-merge PR from the LTS branch into the integration trunk.
 
-    The inverse of ``release_qualifier.promote()``.  Steps:
+    The inverse of ``release_qualifier.promote()``. Steps:
 
       1. Load the project; resolve ``(token, owner, repo)``.
-      2. ``create_pull_request`` ``main → automain``.  Idempotent — on a 422
-         "already exists" ``create_pull_request`` returns the existing open PR,
-         so a repeated (periodic) call reuses the in-flight PR.
-      3. If the PR result has ``empty_diff`` truthy (``main == automain`` —
-         nothing to back-merge), return ``{"status": "noop_empty_diff"}``.
-      4. ``merge_pull_request`` with ``merge_method="merge"`` (preserve the
-         ``main`` commit history on ``automain``).
+      2. ``create_pull_request`` from promotion_target to integration_branch.
+         Idempotent — on a 422 "already exists" ``create_pull_request`` returns
+         the existing open PR, so a repeated (periodic) call reuses the in-flight PR.
+      3. If the PR result has ``empty_diff`` truthy (no differences to back-merge),
+         return ``{"status": "noop_empty_diff"}``.
+      4. ``merge_pull_request`` with ``merge_method="merge"`` (preserve commit history).
       5. On ``merged`` truthy, return ``{"status": "merged", "pr_url": ...}``.
       6. On ``conflict`` (a 409), raise an ``Alert`` AND spawn a high-priority
-         ``refactor`` task instructing a ``git merge origin/main`` conflict
-         resolution against ``automain``; return ``{"status": "conflict"}``.
-         The resolver task does NOT carry ``hotfix:true``.  Alert + resolver
+         ``create`` task instructing conflict resolution; return ``{"status": "conflict"}``.
+         The resolver task does NOT carry ``hotfix:true``. Alert + resolver
          are deduped project-wide — only one resolution is ever needed at a
-         time.  The resolver is a single direct task (not a plan/decomposer)
+         time. The resolver is a single direct task (not a plan/decomposer)
          so the resolution guardrails reach the executing agent verbatim.
       7. On any other non-merge (a 405) or any exception, raise an ``Alert``
          (``periodic=False``) — a one-shot back-merge that fails must never
          pass silently — and return ``{"status": "blocked"}``.
 
     ``periodic`` — set ``True`` by :func:`reconcile_main_into_automain`, which
-    calls this every scheduler cycle.  A periodic caller dedups its alerting so
+    calls this every scheduler cycle. A periodic caller dedups its alerting so
     it neither storms (an Alert every cycle) nor goes silent: a blocked
     non-merge (step 7) raises one unresolved Alert per project until dismissed,
     and the conflict path (step 6) raises one Alert + one resolver task, both
@@ -198,10 +183,10 @@ async def open_backmerge_pr(
 
     ``merged_pr_url`` / ``hotfix_task_id`` describe the hotfix that triggered
     this back-merge, when there was one; the periodic reconciler passes
-    neither.  They are recorded in the PR body, the Alert message, and the
+    neither. They are recorded in the PR body, the Alert message, and the
     resolver task's context for traceability.
 
-    The caller commits the session.  Returns a status dict.
+    The caller commits the session. Returns a status dict.
     """
     hotfix_task_id_str = str(hotfix_task_id) if hotfix_task_id is not None else None
     trigger_desc = _describe_trigger(merged_pr_url, hotfix_task_id_str)
@@ -222,18 +207,20 @@ async def open_backmerge_pr(
         )
         return {"status": "blocked", "error": "project_not_found"}
 
+    integration_branch, promotion_target = _lts_branch_names(project)
+
     # 1. Resolve GitHub credentials (App token → installation → PAT).
     resolved = await _resolve_github_with_session(session, project)
     if resolved is None:
         logger.warning(
-            "[BACKMERGE] no GitHub credentials for project %s — "
-            "cannot back-merge",
+            "[BACKMERGE] no GitHub credentials for project %s — cannot back-merge",
             project_id,
         )
         await _raise_blocked_alert(
             session,
             project_id,
             trigger_desc,
+            project=project,
             reason="no GitHub credentials available",
             periodic=periodic,
         )
@@ -249,15 +236,15 @@ async def open_backmerge_pr(
             token,
             owner,
             repo,
-            title="Back-merge: main -> automain",
-            head="main",
-            base="automain",
+            title=f"Back-merge: {promotion_target} -> {integration_branch}",
+            head=promotion_target,
+            base=integration_branch,
             body=(
-                "Automated back-merge of the LTS branch `main` into the "
-                "integration trunk `automain`.\n\n"
+                f"Automated back-merge of the LTS branch `{promotion_target}` into the "
+                f"integration trunk `{integration_branch}`.\n\n"
                 f"{trigger_line}"
-                "Without this back-merge `main` and `automain` diverge and the "
-                "next `automain -> main` promotion conflicts (see "
+                f"Without this back-merge `{promotion_target}` and `{integration_branch}` diverge and the "
+                f"next `{integration_branch} -> {promotion_target}` promotion conflicts (see "
                 "docs/plans/automain-lts-plan-v1.md Phase 5).\n\n"
                 "Opened by the back-merge machinery "
                 "(backend/app/hotfix_backmerge.py)."
@@ -274,6 +261,7 @@ async def open_backmerge_pr(
             session,
             project_id,
             trigger_desc,
+            project=project,
             reason=f"could not open the back-merge PR: {str(exc)[:200]}",
             periodic=periodic,
         )
@@ -301,6 +289,7 @@ async def open_backmerge_pr(
             session,
             project_id,
             trigger_desc,
+            project=project,
             reason="the back-merge PR was created without a PR number",
             periodic=periodic,
         )
@@ -319,8 +308,7 @@ async def open_backmerge_pr(
         )
     except Exception as exc:  # noqa: BLE001 — a 5xx raises HTTPException; treat as blocked
         logger.warning(
-            "[BACKMERGE] merge raised for back-merge PR #%s "
-            "(project %s): %s",
+            "[BACKMERGE] merge raised for back-merge PR #%s (project %s): %s",
             pr_number,
             project_id,
             exc,
@@ -329,6 +317,7 @@ async def open_backmerge_pr(
             session,
             project_id,
             trigger_desc,
+            project=project,
             reason=f"merging back-merge PR #{pr_number} raised: {str(exc)[:200]}",
             pr_url=pr_url,
             periodic=periodic,
@@ -338,8 +327,7 @@ async def open_backmerge_pr(
     # 5. Success.
     if merge_result.get("merged"):
         logger.info(
-            "[BACKMERGE] project %s: main -> automain back-merge "
-            "merged via PR #%s",
+            "[BACKMERGE] project %s: main -> automain back-merge merged via PR #%s",
             project_id,
             pr_number,
         )
@@ -373,8 +361,7 @@ async def open_backmerge_pr(
 
     if is_conflict:
         logger.warning(
-            "[BACKMERGE] back-merge PR #%s for project %s hit a merge "
-            "conflict: %s",
+            "[BACKMERGE] back-merge PR #%s for project %s hit a merge conflict: %s",
             pr_number,
             project_id,
             msg,
@@ -386,6 +373,7 @@ async def open_backmerge_pr(
             pr_url,
             hotfix_task_id_str,
             trigger_desc,
+            project=project,
             message=str(msg),
             periodic=periodic,
         )
@@ -404,6 +392,7 @@ async def open_backmerge_pr(
         session,
         project_id,
         trigger_desc,
+        project=project,
         reason=(
             f"back-merge PR #{pr_number} did not merge "
             f"(branch protection / checks): {str(msg)[:200]}"
@@ -466,9 +455,7 @@ async def _resolution_task_already_open(
         .scalars()
         .all()
     )
-    return any(
-        (task.context or {}).get("backmerge_conflict") is True for task in rows
-    )
+    return any((task.context or {}).get("backmerge_conflict") is True for task in rows)
 
 
 async def _handle_conflict(
@@ -481,6 +468,7 @@ async def _handle_conflict(
     *,
     message: str,
     periodic: bool,
+    project: Project | None = None,
 ) -> None:
     """Raise a conflict Alert and (if not already open) spawn a resolution task.
 
@@ -496,13 +484,38 @@ async def _handle_conflict(
         duplicate task is created, so a persistent conflict yields one of each
         instead of one per cycle.
 
-    Concurrency note: the dedup reads committed state, so two genuinely
-    concurrent callers — the promotion-conflict hook and the periodic
-    reconciler ticking in the same instant — can each pass the check before
-    either commits and both spawn.  Accepted as benign: the window is tiny and
-    both resolution tasks run the same ``git merge origin/main``, so a
-    duplicate is redundant, never destructive.
+    Concurrency note: two concurrent callers — the promotion-conflict hook and
+    the periodic reconciler ticking in the same instant — can each pass the
+    read-committed dedup check before either commits.  A transaction-scoped
+    PostgreSQL advisory lock serializes them: the first caller acquires the
+    lock and proceeds; the second fails to acquire it and returns immediately,
+    yielding exactly one plan task.  Non-PostgreSQL backends (SQLite in local
+    tests) do not support ``pg_try_advisory_xact_lock``; the except path falls
+    through to the existing read-committed dedup as a safe fallback.
     """
+    # Serialize concurrent _handle_conflict calls for the same project.
+    try:
+        lock_acquired = (
+            await session.execute(
+                text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"),
+                {"key": f"blueprint:backmerge_conflict_resolution:{project_id}"},
+            )
+        ).scalar()
+    except Exception as _lock_err:
+        # Non-PostgreSQL backend — fall through to read-committed dedup.
+        lock_acquired = True
+        logger.debug(
+            "[BACKMERGE] advisory lock unavailable (%s) — using read-committed dedup",
+            _lock_err,
+        )
+    if not lock_acquired:
+        logger.info(
+            "[BACKMERGE] advisory lock not acquired for project %s — "
+            "concurrent caller is mid-spawn; returning without spawning",
+            project_id,
+        )
+        return
+
     already_open = await _resolution_task_already_open(session, project_id)
 
     if periodic and already_open:
@@ -516,17 +529,21 @@ async def _handle_conflict(
         )
         return
 
+    integration_branch, promotion_target = _lts_branch_names(project)
+    conflict_alert_title = (
+        f"Back-merge conflict: {promotion_target} -> {integration_branch}"
+    )
     trigger_clause = f" (triggered by {trigger_desc})" if trigger_desc else ""
     alert = Alert(
         project_id=project_id,
         severity=AlertSeverity.ERROR,
-        title=_CONFLICT_ALERT_TITLE,
+        title=conflict_alert_title,
         message=(
-            f"The automated main -> automain back-merge "
+            f"The automated {promotion_target} -> {integration_branch} back-merge "
             f"(PR #{pr_number}{trigger_clause}) hit a merge conflict and "
             f"could not be merged automatically. A resolution task has "
-            f"been spawned. Until automain absorbs main, the next "
-            f"automain -> main promotion will conflict. ({message[:160]})"
+            f"been spawned. Until {integration_branch} absorbs {promotion_target}, the next "
+            f"{integration_branch} -> {promotion_target} promotion will conflict. ({message[:160]})"
         ),
     )
     session.add(alert)
@@ -547,6 +564,7 @@ async def _handle_conflict(
             pr_url,
             hotfix_task_id,
             trigger_desc,
+            project=project,
         )
 
     await _broadcast_alert(project_id, alert)
@@ -565,6 +583,8 @@ async def _spawn_resolution_task(
     pr_url: str,
     hotfix_task_id: str | None,
     trigger_desc: str,
+    *,
+    project: Project | None = None,
 ) -> Task:
     """Create + queue a high-priority refactor task to resolve the conflict.
 
@@ -586,45 +606,46 @@ async def _spawn_resolution_task(
     ``merge_method="merge"``, never squash — otherwise ``main`` does not
     appear as a parent of ``automain`` and the merge-base never advances).
     """
+    integration_branch, promotion_target = _lts_branch_names(project)
     trigger_clause = f" ({trigger_desc})" if trigger_desc else ""
     prompt = (
-        f"The automated `main -> automain` back-merge PR #{pr_number} "
+        f"The automated `{promotion_target} -> {integration_branch}` back-merge PR #{pr_number} "
         f"({pr_url or 'no URL'}) hit a merge conflict and could not be merged. "
-        f"`automain` must absorb `main`{trigger_clause}, or the next "
-        f"`automain -> main` promotion will conflict.\n\n"
-        f"From a fresh branch off `automain`, run `git merge origin/main`, "
+        f"`{integration_branch}` must absorb `{promotion_target}`{trigger_clause}, or the next "
+        f"`{integration_branch} -> {promotion_target}` promotion will conflict.\n\n"
+        f"From a fresh branch off `{integration_branch}`, run `git merge origin/{promotion_target}`, "
         f"resolve every conflict per the policy below, commit the merge, push, "
-        f"and open a PR back to `automain` so the orchestrator can land it.\n\n"
+        f"and open a PR back to `{integration_branch}` so the orchestrator can land it.\n\n"
         f"## How to reason about each conflict\n"
-        f"1. **Read intent on both sides first.** `main` commits are usually "
+        f"1. **Read intent on both sides first.** `{promotion_target}` commits are usually "
         f"small, targeted bugfixes / hotfixes / behavioral corrections — they "
-        f"were written to fix something specific. `automain` changes tend to "
+        f"were written to fix something specific. `{integration_branch}` changes tend to "
         f"be wider — decompositions, refactors, new modules being integrated. "
-        f"Use `git log --oneline HEAD..origin/main -- <file>` and the recent "
-        f"automain commits touching the same file before resolving each hunk.\n"
-        f"2. **Default rule: preserve both intents.** Re-apply `main`'s fix "
-        f"*on top of* automain's new structure. If automain renamed, moved, "
-        f"or decomposed code that `main` then patched, locate the equivalent "
+        f"Use `git log --oneline HEAD..origin/{promotion_target} -- <file>` and the recent "
+        f"`{integration_branch}` commits touching the same file before resolving each hunk.\n"
+        f"2. **Default rule: preserve both intents.** Re-apply `{promotion_target}`'s fix "
+        f"*on top of* `{integration_branch}`'s new structure. If `{integration_branch}` renamed, moved, "
+        f"or decomposed code that `{promotion_target}` then patched, locate the equivalent "
         f"spot in the new structure and apply the patch there. Don't discard "
         f"the fix because the surrounding code shifted.\n"
-        f"3. **When intents genuinely conflict** (e.g. `main` reverted a "
-        f"behavior automain depends on, or `main` deleted code automain still "
-        f"calls): `main` wins on behavior — it is the human-reviewed LTS "
-        f"branch — and automain's dependent code must be updated to match. "
-        f"Call out such cases in the PR body so reviewers can sanity-check.\n"
+        f"3. **When intents genuinely conflict** (e.g. `{promotion_target}` reverted a "
+        f"behavior `{integration_branch}` depends on, or `{promotion_target}` deleted code "
+        f"`{integration_branch}` still calls): `{promotion_target}` wins on behavior — it is the "
+        f"human-reviewed LTS branch — and `{integration_branch}`'s dependent code must be "
+        f"updated to match. Call out such cases in the PR body so reviewers can sanity-check.\n"
         f"4. **Pure additions on disjoint lines:** keep both.\n\n"
         f"## File-class policies\n"
         f"- `module_size_limits.json` and other size-cap files: take the "
         f"higher cap.\n"
         f"- Lockfiles (`package-lock.json`, `uv.lock`, etc.): regenerate, "
         f"don't hand-merge.\n"
-        f"- Generated files / snapshots: take `main` and regenerate if a "
+        f"- Generated files / snapshots: take `{promotion_target}` and regenerate if a "
         f"generator exists.\n"
         f"- Test files: keep both sides' tests; if they conflict on the same "
-        f"assertion, prefer `main`'s assertion and adjust automain's test "
+        f"assertion, prefer `{promotion_target}`'s assertion and adjust `{integration_branch}`'s test "
         f"infrastructure to satisfy it.\n\n"
         f"## Guardrails\n"
-        f"- This is a normal automain-targeted task, NOT a hotfix.\n"
+        f"- This is a normal {integration_branch}-targeted task, NOT a hotfix.\n"
         f"- Do NOT delete or skip tests just to make the merge build pass.\n"
         f"- Do NOT clobber either side wholesale — every conflict needs a "
         f"per-hunk decision per the rules above.\n"
@@ -635,7 +656,7 @@ async def _spawn_resolution_task(
     payload: dict[str, Any] = {
         "type": _RESOLUTION_TASK_TYPE,
         "prompt": prompt,
-        "base_branch": _RESOLUTION_BASE_BRANCH,
+        "base_branch": integration_branch,
     }
     type_model = (_runtime_config.get("task_type_models", {}) or {}).get(
         _RESOLUTION_TASK_TYPE
@@ -657,10 +678,10 @@ async def _spawn_resolution_task(
 
     task = Task(
         project_id=project_id,
-        title="Resolve back-merge conflict: main -> automain",
+        title=f"Resolve back-merge conflict: {promotion_target} -> {integration_branch}",
         description=(
-            f"The automated main -> automain back-merge PR #{pr_number} hit a "
-            f"merge conflict; resolve it on automain so the next promotion "
+            f"The automated {promotion_target} -> {integration_branch} back-merge PR #{pr_number} hit a "
+            f"merge conflict; resolve it on {integration_branch} so the next promotion "
             f"does not conflict."
         ),
         priority=_RESOLUTION_PRIORITY,
@@ -709,6 +730,7 @@ async def _raise_blocked_alert(
     project_id: uuid.UUID,
     trigger_desc: str,
     *,
+    project: Project | None = None,
     reason: str,
     pr_url: str | None = None,
     periodic: bool = False,
@@ -732,13 +754,17 @@ async def _raise_blocked_alert(
     No fix task is spawned either way — a 405 is a branch-protection / CI
     problem the operator resolves, not a code conflict.
     """
+    integration_branch, promotion_target = _lts_branch_names(project)
+    blocked_alert_title = (
+        f"Back-merge failed: {promotion_target} -> {integration_branch}"
+    )
     if periodic:
         existing = (
             (
                 await session.execute(
                     select(Alert).where(
                         Alert.project_id == project_id,
-                        Alert.title == _BLOCKED_ALERT_TITLE,
+                        Alert.title == blocked_alert_title,
                         Alert.dismissed_at.is_(None),
                     )
                 )
@@ -764,9 +790,9 @@ async def _raise_blocked_alert(
 
     trigger_clause = f" (triggered by {trigger_desc})" if trigger_desc else ""
     message = (
-        f"The automated main -> automain back-merge{trigger_clause} did not "
-        f"complete: {reason}. main and automain remain diverged — the next "
-        f"automain -> main promotion will conflict until this is resolved "
+        f"The automated {promotion_target} -> {integration_branch} back-merge{trigger_clause} did not "
+        f"complete: {reason}. {promotion_target} and {integration_branch} remain diverged — the next "
+        f"{integration_branch} -> {promotion_target} promotion will conflict until this is resolved "
         f"manually."
     )
     if pr_url:
@@ -774,7 +800,7 @@ async def _raise_blocked_alert(
     alert = Alert(
         project_id=project_id,
         severity=AlertSeverity.ERROR,
-        title=_BLOCKED_ALERT_TITLE,
+        title=blocked_alert_title,
         message=message,
     )
     session.add(alert)

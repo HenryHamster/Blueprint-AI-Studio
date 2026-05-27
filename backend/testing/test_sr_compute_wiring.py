@@ -42,7 +42,7 @@ async def test_compute_sr_false_attestation_trends_called_on_claim(
 
     mock_fn = AsyncMock()
     with patch(
-        "app.playbook_learning.compute_sr_false_attestation_trends",
+        "app.sr_analytics.compute_sr_false_attestation_trends",
         new=mock_fn,
     ):
         resp = await client.post("/api/agent/claim", headers=headers)
@@ -83,7 +83,7 @@ async def test_compute_sr_regression_risk_test_signal_trends_called_on_claim(
 
     mock_fn = AsyncMock()
     with patch(
-        "app.playbook_learning.compute_sr_regression_risk_test_signal_trends",
+        "app.sr_analytics.compute_sr_regression_risk_test_signal_trends",
         new=mock_fn,
     ):
         resp = await client.post("/api/agent/claim", headers=headers)
@@ -124,7 +124,7 @@ async def test_compute_fresh_reviewer_trend_called_on_claim(
 
     mock_fn = AsyncMock()
     with patch(
-        "app.playbook_learning.compute_fresh_reviewer_trend",
+        "app.sr_analytics.compute_fresh_reviewer_trend",
         new=mock_fn,
     ):
         resp = await client.post("/api/agent/claim", headers=headers)
@@ -169,15 +169,15 @@ async def test_sr_compute_functions_not_called_for_non_code_change_tasks(
 
     with (
         patch(
-            "app.playbook_learning.compute_sr_false_attestation_trends",
+            "app.sr_analytics.compute_sr_false_attestation_trends",
             new=mock_false_attestation,
         ),
         patch(
-            "app.playbook_learning.compute_sr_regression_risk_test_signal_trends",
+            "app.sr_analytics.compute_sr_regression_risk_test_signal_trends",
             new=mock_regression_risk,
         ),
         patch(
-            "app.playbook_learning.compute_fresh_reviewer_trend",
+            "app.sr_analytics.compute_fresh_reviewer_trend",
             new=mock_fresh_reviewer,
         ),
     ):

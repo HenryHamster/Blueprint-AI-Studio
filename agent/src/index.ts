@@ -38,13 +38,11 @@ import {
   PROCESS_KILL_GRACE_MS, CLAUDE_RESULT_GRACE_MS, CLAUDE_STREAM_STALL_MS, LOG_TAIL_BYTES,
   HEARTBEAT_INTERVAL, MAX_LOG_BUFFER,
   HEARTBEAT_API_TIMEOUT, HEARTBEAT_API_MAX_RETRIES,
+  TOKEN_REFRESH_FRACTION, TOKEN_REFRESH_FLOOR_MS, TOKEN_REFRESH_CEILING_MS,
   WITHIN_CHUNK_YIELD_LINES, WITHIN_CHUNK_YIELD_MS,
   GIT_CLONE_TIMEOUT, CLONE_MAX_RETRIES, CLONE_RETRY_BASE_DELAY,
   CONFLICT_CHECK_TIMEOUT,
-  MAX_LINT_FIX_ATTEMPTS, MAX_TEST_FIX_ATTEMPTS,
-  FRONTEND_NPM_TIMEOUT, FRONTEND_ESLINT_TIMEOUT, FRONTEND_BUILD_TIMEOUT, FRONTEND_PLAYWRIGHT_INSTALL_TIMEOUT,
-  AGENT_NPM_TIMEOUT, AGENT_TSC_TIMEOUT,
-  RUFF_TIMEOUT,
+  MAX_TEST_FIX_ATTEMPTS,
   TEST_RUNNER_TIMEOUT, TEST_RUNNER_DOCKER_TIMEOUT, TEST_BASELINE_TIMEOUT, TEST_BASELINE_DOCKER_TIMEOUT,
   claudeTimeoutForEffort, MAX_OUTPUT_BYTES, TOOL_USE_STALL_TIMEOUT_MS,
   FIX_LOOP_JACCARD_THRESHOLD, FIX_LOOP_DIFF_REVERT_THRESHOLD,
@@ -64,6 +62,7 @@ const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode
       "you've hit your usage limit",
       "you've hit your session limit",
       "you've hit your weekly limit",
+      "weekly limit · resets",
       'claude ai usage limit reached',
       "you're out of extra usage",
       '5-hour limit reached',
@@ -75,6 +74,7 @@ const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode
       "you've hit your usage limit",
       "you've hit your session limit",
       "you've hit your weekly limit",
+      "weekly limit · resets",
       'claude ai usage limit reached',
       "you're out of extra usage",
       '5-hour limit reached',
@@ -285,6 +285,17 @@ export interface BuildConfig {
   git_user_name?: string;
   git_user_email?: string;
   enable_fresh_reviewer?: boolean;
+  enable_parallel_review?: boolean;
+  /** Namespace prefix for agent work branches (``{namespace}/{prefix}-{8hex}``).
+   *  Defaults to ``"blueprint"`` so the self-repo's branch names are unchanged.
+   *  Mirrors ``project.task_branch_namespace`` on the backend (resolved via
+   *  ``shared_state.get_project_task_branch_namespace``). */
+  task_branch_namespace?: string;
+  /** Ordered staging-branch prefixes that identify research/plan rollup heads.
+   *  Defaults to ``["research/", "plan/"]`` when unset. Mirrors
+   *  ``project.staging_branch_prefixes`` on the backend (see
+   *  ``backend/app/models.py``). */
+  staging_branch_prefixes?: string[];
 }
 
 // ── Environment ─────────────────────────────────────────────────────────────
@@ -305,6 +316,11 @@ export const GIT_REFERENCE_CACHE_ROOT = process.env.GIT_REFERENCE_CACHE_ROOT || 
 // compute._vm_images and skew get_stale_image_vms accounting).
 let vmImageName: string | null = null;
 let vmImageTs: number | null = null;
+// Content-hash fingerprint of /opt/agent/src baked into the image by packer
+// (see infra/packer/agent.pkr.hcl). Read once at startup and included in
+// vm-heartbeats and task heartbeats so stale-image diagnostics can identify
+// the exact agent runtime revision independently of image name or build timestamp.
+let agentRuntimeFingerprint: string | null = null;
 
 /** Fetch the GCP boot-disk image path from the instance metadata service.
  *  Returns the short image name and extracted unix build timestamp, or
@@ -332,6 +348,20 @@ export async function fetchVmImageIdentity(): Promise<{ image_name: string | nul
   }
 }
 
+/** Read the baked agent-runtime fingerprint from the well-known path written
+ *  by the packer provisioner. Returns null in local dev / test environments
+ *  where the file is absent so callers can distinguish "no fingerprint" from
+ *  a real hash. */
+export function readAgentRuntimeFingerprint(): string | null {
+  try {
+    const raw = fs.readFileSync('/opt/agent/AGENT_RUNTIME_FINGERPRINT', 'utf-8').trim();
+    const m = /^AGENT_RUNTIME_FINGERPRINT=([0-9a-f]{64})$/.exec(raw);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Get the current agent token (may have been refreshed since startup). */
 export function getAgentToken(): string { return AGENT_TOKEN; }
 
@@ -349,6 +379,29 @@ const apiHeaders: Record<string, string> = {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 export function strVal(v: unknown, fallback = ''): string {
   return typeof v === 'string' ? v : fallback;
+}
+
+/**
+ * Resolve a task's base branch through the per-project cascade:
+ * ``payload.base_branch`` → ``task.project_metadata.integration_branch`` → ``fallback``.
+ *
+ * The backend stamps every claim response's ``project_metadata.integration_branch``
+ * (see backend/app/routers/agent.py), so any handler that defaults to ``'main'``
+ * without consulting that field silently breaks projects whose integration branch
+ * is something else (e.g. ``master``, ``production``, ``develop``). Use this helper
+ * everywhere a handler needs the project's integration branch.
+ */
+export function resolveBaseBranch(
+  payload: Record<string, unknown>,
+  task: Record<string, unknown>,
+  fallback = 'main',
+): string {
+  const fromPayload = strVal(payload.base_branch);
+  if (fromPayload) return fromPayload;
+  const meta = task.project_metadata as Record<string, unknown> | undefined;
+  const fromMeta = strVal(meta?.integration_branch);
+  if (fromMeta) return fromMeta;
+  return fallback;
 }
 
 
@@ -833,7 +886,7 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
         const res = await fetch(`${apiBase}/api/agent/vm-heartbeat`, {
           method: 'POST',
           headers,
-          body: JSON.stringify({ vm_instance_id: vmInstanceId, vm_image_name: vmImageName, vm_image_build_ts: vmImageTs }),
+          body: JSON.stringify({ vm_instance_id: vmInstanceId, vm_image_name: vmImageName, vm_image_build_ts: vmImageTs, agent_runtime_fingerprint: agentRuntimeFingerprint }),
         });
         if (res.status === 401 || res.status === 403) {
           log(`pollForNextRole vm-heartbeat got ${String(res.status)} — auth revoked, will exit poll`);
@@ -854,7 +907,7 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
       const res = await fetch(`${apiBase}/api/agent/vm-heartbeat`, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ vm_instance_id: vmInstanceId, vm_image_name: vmImageName, vm_image_build_ts: vmImageTs }),
+        body: JSON.stringify({ vm_instance_id: vmInstanceId, vm_image_name: vmImageName, vm_image_build_ts: vmImageTs, agent_runtime_fingerprint: agentRuntimeFingerprint }),
       });
       if (res.status === 401 || res.status === 403) {
         log(`pollForNextRole initial vm-heartbeat got ${String(res.status)} — auth revoked, will exit poll`);
@@ -996,6 +1049,11 @@ export function _getWarmStartForTesting(): boolean {
   return isWarmStart;
 }
 
+/** Test-only: set the baked agent-runtime fingerprint used in heartbeats. */
+export function _setAgentRuntimeFingerprintForTesting(value: string | null): void {
+  agentRuntimeFingerprint = value;
+}
+
 export function snapshotToolTrace(): ToolTraceEntry[] {
   return _toolTrace.slice();
 }
@@ -1059,6 +1117,59 @@ export function extractInvestigatedFiles(trace: ToolTraceEntry[]): string[] {
 // ── Heartbeat ───────────────────────────────────────────────────────────────
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
+// Proactive JWT refresh — derives timing from the token's real exp claim so
+// the refresh interval stays correct across any future TTL changes.
+let tokenRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+function decodeJwtExp(token: string): number | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length < 2) return null;
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const json = Buffer.from(b64, 'base64').toString('utf8');
+    const payload = JSON.parse(json) as { exp?: number };
+    return typeof payload.exp === 'number' ? payload.exp : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Compute how many ms from `now` to schedule the next proactive refresh.
+ *  Uses TOKEN_REFRESH_FRACTION * remaining lifetime, clamped to [FLOOR, CEILING]. */
+export function computeRefreshDelayMs(token: string, now = Date.now()): number {
+  const exp = decodeJwtExp(token);
+  if (exp === null) return TOKEN_REFRESH_FLOOR_MS;
+  const remainingMs = exp * 1000 - now;
+  const target = remainingMs * TOKEN_REFRESH_FRACTION;
+  return Math.max(TOKEN_REFRESH_FLOOR_MS, Math.min(TOKEN_REFRESH_CEILING_MS, target));
+}
+
+function scheduleProactiveTokenRefresh(token: string): void {
+  // Defensively clear any existing timer so callers that re-schedule without
+  // an intervening stop (e.g. warm-poll rotation then runRoleOnce) don't orphan
+  // a self-re-scheduling setTimeout, which would otherwise accumulate one extra
+  // refresh schedule per warm-VM rotation.
+  stopProactiveTokenRefresh();
+  const delay = computeRefreshDelayMs(token);
+  log(`Proactive token refresh: next refresh in ${Math.round(delay / 1000)}s`);
+  tokenRefreshTimer = setTimeout(() => {
+    void (async () => {
+      log('Proactive token refresh: refreshing agent JWT before expiry');
+      const ok = await tryRefreshToken();
+      if (ok) {
+        log('Proactive token refresh: succeeded');
+      } else {
+        log('Proactive token refresh: failed — reactive 401 path will retry');
+      }
+      scheduleProactiveTokenRefresh(AGENT_TOKEN);
+    })();
+  }, delay);
+}
+
+function stopProactiveTokenRefresh(): void {
+  if (tokenRefreshTimer) { clearTimeout(tokenRefreshTimer); tokenRefreshTimer = null; }
+}
+
 function collectMetrics(): { rss_mb: number; heap_used_mb: number; cgroup_mb?: number; cgroup_limit_mb?: number; disk_free_mb?: number; disk_total_mb?: number } {
   const mem = process.memoryUsage();
   const rss_mb = Math.round(mem.rss / 1024 / 1024 * 10) / 10;
@@ -1117,6 +1228,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         tool_trace: snapshotToolTrace(),
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
         ...(currentPromptFingerprint ? { prompt_fingerprint: currentPromptFingerprint } : {}),
+        ...(agentRuntimeFingerprint ? { agent_runtime_fingerprint: agentRuntimeFingerprint } : {}),
         ...getLlmTelemetry(),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('initial', start, Date.now(), 'ok');
@@ -1161,6 +1273,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         tool_trace: snapshotToolTrace(),
         ...(fix_loop_events.length > 0 ? { fix_loop_events } : {}),
         ...(currentPromptFingerprint ? { prompt_fingerprint: currentPromptFingerprint } : {}),
+        ...(agentRuntimeFingerprint ? { agent_runtime_fingerprint: agentRuntimeFingerprint } : {}),
         ...getLlmTelemetry(),
       }, HEARTBEAT_API_MAX_RETRIES, HEARTBEAT_API_TIMEOUT);
       traceHeartbeat('periodic', start, Date.now(), 'ok');
@@ -1218,11 +1331,22 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
 
 function stopHeartbeat() {
   if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+  stopProactiveTokenRefresh();
   // Reset mutex so warm-VM continuity (one agent process, multiple sequential
   // tasks) starts the next task with a clean in-flight state. Without this,
   // a stuck heartbeat at role-end would leave the flag true and the new
   // task's first periodic tick would skip-and-log instead of firing.
   heartbeatInFlight = false;
+}
+
+/** Test-only: drive the heartbeat loop without running main(). */
+export function _startHeartbeatForTesting(taskId: string, getMessage: () => string): void {
+  startHeartbeat(taskId, getMessage);
+}
+
+/** Test-only: stop the heartbeat loop between unit tests. */
+export function _stopHeartbeatForTesting(): void {
+  stopHeartbeat();
 }
 
 /** Synchronous heartbeat — use between blocking execFileSync calls to prevent reaper from killing us.
@@ -1386,6 +1510,35 @@ export function validateBranchName(branch: string, label: string): string {
   if (branch.includes('..')) throw new Error(`Invalid ${label} (contains ..): ${branch}`);
   if (branch.startsWith('-')) throw new Error(`Invalid ${label} (starts with -): ${branch}`);
   return branch;
+}
+
+// Canonical task-type → branch-prefix mapping.
+// Convention: {namespace}/{prefix}-{first-8-hex-of-task-uuid}
+// Mirrors backend/app/shared_state.py TASK_TYPE_BRANCH_PREFIX (Python single source); keep in sync.
+// Types absent from this map default to the 'task' prefix.
+export const TASK_TYPE_BRANCH_PREFIX: Record<string, string> = {
+  refactor: 'refactor',
+  docs: 'docs',
+  deps: 'deps',
+  migrate: 'migrate',
+};
+
+/** Default task-branch namespace — preserves Blueprint self-repo behavior. */
+export const TASK_BRANCH_NAMESPACE_DEFAULT = 'blueprint';
+
+/** Return the canonical git branch name for a task.
+ *
+ *  ``namespace`` defaults to ``"blueprint"`` so existing call sites stay
+ *  byte-identical; the per-project namespace flows in from
+ *  ``buildConfig.task_branch_namespace`` (mirrors the backend resolver). */
+export function deriveTaskBranch(
+  taskType: string,
+  taskId: string,
+  namespace: string = TASK_BRANCH_NAMESPACE_DEFAULT,
+): string {
+  const prefix = TASK_TYPE_BRANCH_PREFIX[taskType] ?? 'task';
+  const shortId = taskId.replace(/-/g, '').slice(0, 8);
+  return `${namespace}/${prefix}-${shortId}`;
 }
 
 export function sendLog(ws: WebSocket | null, content: string) {
@@ -1616,7 +1769,8 @@ export async function setupWorkspace(
   git(['config', 'user.email', buildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', buildConfig?.git_user_name || 'Blueprint Agent']);
   const shortId = taskId.replace(/-/g, '').slice(0, 8);
-  const workBranch = `blueprint/${branchPrefix}-${shortId}`;
+  const namespace = buildConfig?.task_branch_namespace || TASK_BRANCH_NAMESPACE_DEFAULT;
+  const workBranch = `${namespace}/${branchPrefix}-${shortId}`;
   // Clean up stale remote branch from previous attempt (requeue scenario).
   // CRITICAL: if the stale branch has an open PR, deleting it auto-closes the PR
   // and triggers head_ref_deleted on GitHub — silently destroying the previous
@@ -1721,249 +1875,6 @@ export async function pushAndCreatePR(
   return prUrl;
 }
 
-function installPlaywrightChromium(cwd: string) {
-  const playwrightCacheDir = `${process.env.HOME}/.cache/ms-playwright`;
-  const chromiumPresent = fs.existsSync(playwrightCacheDir) &&
-    fs.readdirSync(playwrightCacheDir).some(d => d.startsWith('chromium-'));
-
-  if (chromiumPresent) {
-    return;
-  }
-
-  try {
-    execFileSync('npx', ['playwright', 'install', 'chromium'], {
-      cwd,
-      encoding: 'utf-8',
-      timeout: FRONTEND_PLAYWRIGHT_INSTALL_TIMEOUT,
-    });
-  } catch {
-    execFileSync('npx', ['playwright', 'install', '--with-deps', 'chromium'], {
-      cwd,
-      encoding: 'utf-8',
-      timeout: FRONTEND_PLAYWRIGHT_INSTALL_TIMEOUT,
-    });
-  }
-}
-
-// ── Viewport Bootstrap Fallback ─────────────────────────────────────────────
-
-// Missing-library / missing-install signatures. Deliberately excludes
-// 'browserType.launch:' and 'failed to launch browser' which are too broad
-// and would match sandbox crashes and OOMs.
-const VIEWPORT_BOOTSTRAP_PATTERNS = [
-  /libatk/,
-  /libnss/,
-  /libgbm/,
-  /libxkbcommon/,
-  /libxcomposite/,
-  /libasound/,
-  /cannot open shared object file/,
-  /host system is missing dependencies/,
-  /executable doesn't exist at/,
-];
-
-export function isViewportBootstrapFailure(msg: string): boolean {
-  return VIEWPORT_BOOTSTRAP_PATTERNS.some(re => re.test(msg));
-}
-
-/** Find screenshot files captured on viewport test failures. Returns relative paths within the cwd. */
-function findViewportScreenshots(cwd: string): string[] {
-  const screenshotDir = `${cwd}/.vitest`;
-  if (!fs.existsSync(screenshotDir)) return [];
-  const screenshots: string[] = [];
-  const walkDir = (dir: string, baseDir: string) => {
-    try {
-      const files = fs.readdirSync(dir);
-      for (const file of files) {
-        const fullPath = `${dir}/${file}`;
-        if (fs.statSync(fullPath).isDirectory()) {
-          walkDir(fullPath, baseDir);
-        } else if (file.endsWith('.png')) {
-          screenshots.push(fullPath.slice(baseDir.length + 1));
-        }
-      }
-    } catch {
-      // Ignore errors reading directories
-    }
-  };
-  walkDir(screenshotDir, cwd);
-  return screenshots;
-}
-
-/** Run `npm run test:viewport` locally; on a bootstrap failure retry inside the
- *  Playwright Docker image where all native deps are baked in. Real assertion
- *  failures (non-bootstrap errors) propagate immediately without Docker retry. */
-export function runViewportSuiteWithFallback(
-  cwd: string,
-  env: NodeJS.ProcessEnv,
-  timeout: number,
-  ws: WebSocket | null = null,
-): void {
-  try {
-    execFileSync('npm', ['run', 'test:viewport'], { cwd, encoding: 'utf-8', timeout, env });
-    return;
-  } catch (localErr: unknown) {
-    const msg = localErr instanceof Error ? localErr.message : String(localErr);
-    if (!isViewportBootstrapFailure(msg)) {
-      throw localErr;
-    }
-  }
-  // Bootstrap failure — retry inside the Playwright image where deps are baked in
-  const envFlags = Object.entries(env)
-    .filter(([k]) => k.startsWith('VITE_'))
-    .flatMap(([k, v]) => ['--env', `${k}=${v ?? ''}`]);
-  try {
-    execFileSync(
-      'docker',
-      ['run', '--rm', '-v', `${WORKSPACE}:/workspace`, '-w', '/workspace/admin-ui', ...envFlags,
-        'mcr.microsoft.com/playwright:v1.59.1-jammy', 'npm', 'run', 'test:viewport'],
-      { cwd, encoding: 'utf-8', timeout },
-    );
-  } catch (dockerErr: unknown) {
-    const dockerMsg = dockerErr instanceof Error ? dockerErr.message : String(dockerErr);
-    // Check if docker itself is unavailable vs test assertions failed in docker
-    if (dockerMsg.includes('command not found') || dockerMsg.includes('ENOENT') ||
-        dockerMsg.includes('Cannot connect to Docker daemon')) {
-      sendLog(ws, '[WARNING] viewport suite skipped — Chromium unavailable, CI will enforce coverage\n');
-      return;
-    }
-    // Check if docker had file-import errors (pre-existing env issues) vs test assertion failures
-    if (!dockerMsg.includes('Tests') || !dockerMsg.includes('failed')) {
-      sendLog(ws, '[WARNING] viewport suite has import errors in Docker (pre-existing env issue); CI will enforce full coverage\n');
-      return;
-    }
-    // Test assertion failures must propagate
-    throw dockerErr;
-  }
-}
-
-// ── Lint / Build Checks ─────────────────────────────────────────────────────
-/** Run lint/build checks on changed files. Throws with error details on failure.
- *  Each blocking execFileSync starves the event loop (and heartbeat setInterval),
- *  so we inject sendHeartbeatSync between operations to prevent the reaper from
- *  killing us mid-check.  The taskId is read from process.env (set after claim). */
-export function runProjectLintChecks(changedPaths: string[], ws: WebSocket | null, buildConfig?: BuildConfig) {
-  const taskId = process.env.TASK_ID || '';
-
-  // If project provides explicit directory configuration, use it instead of hardcoded paths
-  if (buildConfig?.directories && buildConfig.directories.length > 0) {
-    const extraEnv = buildConfig.env_vars ? { ...process.env, ...buildConfig.env_vars } : process.env;
-    for (const dir of buildConfig.directories) {
-      const dirPrefix = dir.path.replace(/\/$/, '');
-      const touchesDir = changedPaths.some(p => p === dirPrefix || p.startsWith(dirPrefix + '/'));
-      if (!touchesDir) continue;
-
-      const cwd = `${WORKSPACE}/${dirPrefix}`;
-      if (dir.install_cmd) {
-        sendLog(ws, `Running install in ${dirPrefix}...\n`);
-        sendHeartbeatSync(taskId, `${dir.install_cmd} (${dirPrefix})...`);
-        const [cmd, ...args] = dir.install_cmd.split(' ');
-        execFileSync(cmd, args, { cwd, encoding: 'utf-8', timeout: FRONTEND_NPM_TIMEOUT, env: extraEnv });
-      }
-      if (dir.lint_cmd) {
-        sendLog(ws, `Running lint in ${dirPrefix}...\n`);
-        sendHeartbeatSync(taskId, `${dir.lint_cmd} (${dirPrefix})...`);
-        const [cmd, ...args] = dir.lint_cmd.split(' ');
-        execFileSync(cmd, args, { cwd, encoding: 'utf-8', timeout: FRONTEND_ESLINT_TIMEOUT, env: extraEnv });
-      }
-      if (dir.build_cmd) {
-        sendLog(ws, `Running build in ${dirPrefix}...\n`);
-        sendHeartbeatSync(taskId, `${dir.build_cmd} (${dirPrefix})...`);
-        const [cmd, ...args] = dir.build_cmd.split(' ');
-        execFileSync(cmd, args, { cwd, encoding: 'utf-8', timeout: FRONTEND_BUILD_TIMEOUT, env: extraEnv });
-      }
-      sendLog(ws, `Checks passed for ${dirPrefix}.\n`);
-    }
-    return;
-  }
-
-  // Fallback: hardcoded Blueprint project structure
-  const touchesFrontend = changedPaths.some(p => p.startsWith('admin-ui/'));
-  const touchesAgent = changedPaths.some(p => p.startsWith('agent/'));
-  const touchesBackend = changedPaths.some(p => p.startsWith('backend/'));
-  if (touchesFrontend) {
-    const adminUiEnv = {
-      ...process.env,
-      VITE_API_URL: 'http://localhost:8080',
-      VITE_FIREBASE_API_KEY: 'ci',
-      VITE_FIREBASE_AUTH_DOMAIN: 'ci.firebaseapp.com',
-      VITE_FIREBASE_PROJECT_ID: 'ci',
-    };
-    const viewportFailureGuidance = '\nadmin-ui viewport regression suite requires Playwright Chromium. If this VM is missing it, run `cd admin-ui && npx playwright install --with-deps chromium` and rerun the check.';
-    sendLog(ws, 'Running frontend lint + viewport + build...\n');
-    sendHeartbeatSync(taskId, 'npm ci (admin-ui)...');
-    execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_NPM_TIMEOUT });
-    sendHeartbeatSync(taskId, 'eslint (admin-ui)...');
-    execFileSync('npx', ['eslint', '.'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_ESLINT_TIMEOUT });
-    try {
-      sendHeartbeatSync(taskId, 'playwright chromium install (admin-ui)...');
-      installPlaywrightChromium(`${WORKSPACE}/admin-ui`);
-      sendHeartbeatSync(taskId, 'npm run test:viewport (admin-ui)...');
-      runViewportSuiteWithFallback(`${WORKSPACE}/admin-ui`, adminUiEnv, FRONTEND_BUILD_TIMEOUT, ws);
-    } catch (err: unknown) {
-      const screenshotPaths = findViewportScreenshots(`${WORKSPACE}/admin-ui`);
-      const screenshotGuidance = screenshotPaths.length > 0
-        ? `\nViewport test screenshots:\n${screenshotPaths.map(p => `  admin-ui/${p}`).join('\n')}`
-        : '';
-      if (err instanceof Error) {
-        err.message += viewportFailureGuidance + screenshotGuidance;
-        throw err;
-      }
-      throw new Error(`${String(err)}${viewportFailureGuidance}${screenshotGuidance}`);
-    }
-    sendHeartbeatSync(taskId, 'npm run build (admin-ui)...');
-    execFileSync('npm', ['run', 'build'], { cwd: `${WORKSPACE}/admin-ui`, encoding: 'utf-8', timeout: FRONTEND_BUILD_TIMEOUT, env: adminUiEnv });
-    sendLog(ws, 'Frontend checks passed.\n');
-  }
-  if (touchesAgent) {
-    sendLog(ws, 'Running agent type check...\n');
-    sendHeartbeatSync(taskId, 'npm ci (agent)...');
-    execFileSync('npm', ['ci'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: AGENT_NPM_TIMEOUT });
-    sendHeartbeatSync(taskId, 'tsc --noEmit (agent)...');
-    execFileSync('npx', ['tsc', '--noEmit'], { cwd: `${WORKSPACE}/agent`, encoding: 'utf-8', timeout: AGENT_TSC_TIMEOUT });
-    sendLog(ws, 'Agent type check passed.\n');
-  }
-  if (touchesBackend) {
-    // Scope ruff to changed *.py files. Repo-wide ruff is enforced in CI on
-    // main; on PRs the pre-existing baseline is not actionable for fix tasks
-    // and would block unrelated work. Filter to files that still exist so
-    // deletions don't ENOENT.
-    const backendPy = changedPaths.filter(p =>
-      p.startsWith('backend/') && p.endsWith('.py') && fs.existsSync(`${WORKSPACE}/${p}`),
-    );
-    if (backendPy.length === 0) {
-      sendLog(ws, 'No backend/*.py files changed, skipping backend ruff.\n');
-    } else {
-      sendLog(ws, `Running backend ruff lint on ${backendPy.length} changed file(s)...\n`);
-      try {
-        const lintOut = execFileSync('python3', ['-m', 'ruff', 'check', '--select', 'E,F,W', '--ignore', 'E501', ...backendPy], { cwd: WORKSPACE, encoding: 'utf-8', timeout: RUFF_TIMEOUT });
-        sendLog(ws, lintOut || 'Backend ruff lint passed.\n');
-      } catch (err: unknown) {
-        const errCode = (err as NodeJS.ErrnoException).code;
-        const errMsg = err instanceof Error ? err.message : String(err);
-        if (errCode === 'ENOENT' || errMsg.includes('No module named ruff')) {
-          sendLog(ws, 'ruff not installed, skipping backend lint.\n');
-        } else {
-          throw err;
-        }
-      }
-      sendLog(ws, 'Running backend ruff format check on changed files...\n');
-      try {
-        const fmtOut = execFileSync('python3', ['-m', 'ruff', 'format', '--check', ...backendPy], { cwd: WORKSPACE, encoding: 'utf-8', timeout: RUFF_TIMEOUT });
-        sendLog(ws, fmtOut || 'Backend ruff format check passed.\n');
-      } catch (err: unknown) {
-        const errCode = (err as NodeJS.ErrnoException).code;
-        const errMsg = err instanceof Error ? err.message : String(err);
-        if (errCode === 'ENOENT' || errMsg.includes('No module named ruff')) {
-          sendLog(ws, 'ruff not installed, skipping backend format check.\n');
-        } else {
-          throw err;
-        }
-      }
-    }
-  }
-}
-
 /** Normalized error fingerprint for detecting identical consecutive failures. */
 export function errorFingerprint(msg: string): string {
   return msg.replace(/\s+/g, ' ').trim().slice(0, 2000);
@@ -2034,6 +1945,13 @@ export function resetLlmTelemetry(): void {
   _llmCallCount = 0;
   _totalInputTokens = 0;
   _totalOutputTokens = 0;
+}
+
+/** Estimate token count from character count (4 chars ≈ 1 token).
+ *  Used for providers that run in plain-text output mode (e.g. Gemini CLI with
+ *  -o text) and don't emit structured token-usage blocks in their output. */
+export function estimateTokensFromChars(chars: number): number {
+  return Math.ceil(chars / 4);
 }
 
 // ── Divergence detection helpers ─────────────────────────────────────────────
@@ -2161,145 +2079,6 @@ function captureFixIterationDiffStat(): string {
 
 function buildFixLoopGuidanceSuffix(): string {
   return `\n\n${READ_THE_FAILURE_MESSAGE}\n${SIZE_GUARDRAIL_GUIDANCE}\n${PRIOR_ATTEMPT_DIVERGENCE}`;
-}
-
-/**
- * Detect infrastructure-class failures that cannot be fixed by Claude.
- * These include missing tools, Docker unavailability, OOM, DNS/network issues.
- * Pattern set is conservative. Used by lintFixLoop's first-attempt abandon
- * check; testFixLoop does its own runner-level setup-error detection and does
- * not call this.
- */
-export function isInfrastructureFailure(msg: string): boolean {
-  const lower = msg.toLowerCase();
-  // Tool/command unavailable
-  if (lower.includes('command not found') || lower.includes('enoent')) return true;
-  // Docker daemon unavailable (Playwright, Docker-based tests)
-  if (lower.includes('cannot connect to docker daemon')) return true;
-  // OOM / SIGKILL (exit 137 shown as "killed" or "EOOM" code)
-  if (lower.includes('exit 137') || lower.includes('eoom') || lower.includes('out of memory')) return true;
-  if (lower.includes('killed') && (lower.includes('sigkill') || lower.includes('oom'))) return true;
-  // Process timeout / cannot spawn (ETIMEDOUT, spawn timeout)
-  if (lower.includes('etimedout') || lower.includes('spawn timeout')) return true;
-  // DNS / network errors
-  if (lower.includes('econnrefused') || lower.includes('enotfound') || lower.includes('enetunreach')) return true;
-  // Chromium/Playwright installation infrastructure failures
-  if (lower.includes('chromium') && (lower.includes('sudo') || lower.includes('permission denied'))) return true;
-  // Docker/container infrastructure issues
-  if (lower.includes('docker') && (lower.includes('daemon') || lower.includes('unavailable'))) return true;
-  return false;
-}
-
-export interface LintFixLoopResult {
-  /** True if lint converged green within MAX_LINT_FIX_ATTEMPTS. */
-  passed: boolean;
-  /** Last lint error message (tail). Set when passed=false; undefined on success. */
-  lastErrorTail?: string;
-  /** Why the loop stopped. */
-  exitReason?: 'early_unchanged' | 'max_attempts' | 'divergence_oscillation' | 'divergence_similar_error' | 'divergence_diff_revert';
-  /** Infrastructure/setup failure detected; no fixer invoked. */
-  setupFailed?: boolean;
-  /** Summary of infrastructure failure when setupFailed=true. */
-  infraFailureSummary?: string;
-  /** Per-attempt diff/error history, useful for downstream diagnosis. */
-  attempts: FixAttempt[];
-}
-
-export async function lintFixLoop(
-  changedPaths: string[], ws: WebSocket | null, statusRef: { value: string },
-  context: string = 'the code you just wrote', model?: string, effort?: string,
-  buildConfig?: BuildConfig
-): Promise<LintFixLoopResult> {
-  const fingerprintHistory: string[] = [];
-  const errorTextHistory: string[] = [];
-  const prevAttempts: FixAttempt[] = [];
-  let lastErrorTail: string | undefined;
-  let prevDiff: DiffLines | null = null;
-  let currDiff: DiffLines | null = null;
-  for (let attempt = 0; attempt < MAX_LINT_FIX_ATTEMPTS; attempt++) {
-    const iterStartedAt = new Date().toISOString();
-    try {
-      statusRef.value = attempt === 0 ? 'Running pre-commit checks...' : `Re-running lint (attempt ${attempt + 1}/${MAX_LINT_FIX_ATTEMPTS})...`;
-      runProjectLintChecks(changedPaths, ws, buildConfig);
-      emitWrapperFixLoopEvent({
-        loop: 'lint', iteration: attempt + 1, errorMessage: '',
-        exitReason: 'passed', startedAt: iterStartedAt,
-      });
-      return { passed: true, attempts: prevAttempts };
-    } catch (lintErr: unknown) {
-      const msg = lintErr instanceof Error ? lintErr.message : String(lintErr);
-      lastErrorTail = msg;
-      const fingerprint = errorFingerprint(msg);
-
-      // Infrastructure failure detection: on the first attempt, if the error
-      // is infrastructure-class (missing tool, Docker unavailable, OOM, DNS),
-      // abandon immediately without invoking Claude. This reduces wasted API
-      // calls on the failing tail and improves failure classification.
-      // Do NOT emit a fix-loop event here: this is not a lint outcome, and any
-      // exit_reason would either be misclassified as success ('passed' is in
-      // the backend's _FIX_LOOP_SUCCESS_REASONS) or be a misleading lint
-      // terminal reason. The infra abandon is surfaced via setupFailed=true so
-      // the caller classifies the task as an infra failure — matching the
-      // testFixLoop setup-failure precedent, which also returns without
-      // emitting a fix-loop event.
-      if (attempt === 0 && isInfrastructureFailure(msg)) {
-        sendLog(ws, `Lint check failed due to infrastructure issue (not a code/lint failure). Not invoking fixer.\n${msg.slice(0, 2000)}\n`);
-        return { passed: false, lastErrorTail, setupFailed: true, infraFailureSummary: msg.slice(0, 2000), attempts: prevAttempts };
-      }
-
-      // Early exit: byte-identical consecutive error (existing behaviour).
-      if (fingerprintHistory.length > 0 && fingerprint === fingerprintHistory[fingerprintHistory.length - 1]) {
-        emitWrapperFixLoopEvent({
-          loop: 'lint', iteration: attempt + 1, errorMessage: msg,
-          exitReason: 'early_unchanged', startedAt: iterStartedAt,
-        });
-        sendLog(ws, `Lint error unchanged from previous attempt — exiting early (persistent, unfixable by Claude).\n`);
-        return { passed: false, lastErrorTail, exitReason: 'early_unchanged', attempts: prevAttempts };
-      }
-      fingerprintHistory.push(fingerprint);
-      errorTextHistory.push(msg);
-      // Divergence detection: oscillation, Jaccard-similar errors, diff revert.
-      // Requires ≥ 3 iterations of history to avoid false-positive abandons.
-      const divergence = detectLoopDivergence(fingerprintHistory, errorTextHistory, prevDiff, currDiff);
-      if (divergence !== null) {
-        emitWrapperFixLoopEvent({
-          loop: 'lint', iteration: attempt + 1, errorMessage: msg,
-          exitReason: divergence, startedAt: iterStartedAt,
-        });
-        sendLog(ws, `Lint fix loop divergence detected (${divergence}) — abandoning to avoid wasted iterations.\n`);
-        return { passed: false, lastErrorTail, exitReason: divergence, attempts: prevAttempts };
-      }
-      // Final iteration with a non-duplicate failure means the budget ran
-      // out; mark it terminal so downstream telemetry sees the actual exit
-      // reason rather than an orphaned in_progress.
-      const isLastAttempt = attempt === MAX_LINT_FIX_ATTEMPTS - 1;
-      emitWrapperFixLoopEvent({
-        loop: 'lint', iteration: attempt + 1, errorMessage: msg,
-        exitReason: isLastAttempt ? 'max_attempts' : 'in_progress',
-        startedAt: iterStartedAt,
-      });
-      // On retry (attempt >= 1), record what the previous Claude call
-      // actually did + the failure that persisted, so the next iteration's
-      // prompt can pivot away from approaches that didn't work.
-      if (attempt >= 1) {
-        prevAttempts.push({
-          attemptNumber: attempt,
-          diffStat: captureFixIterationDiffStat(),
-          errorTail: msg.slice(-800),
-        });
-      }
-      sendLog(ws, `Pre-commit check failed (attempt ${attempt + 1}/${MAX_LINT_FIX_ATTEMPTS}):\n${msg.slice(0, 3000)}\nClaude will attempt to fix...\n`);
-      const historySection = prevAttempts.length > 0 ? `${formatFixIterationHistory(prevAttempts)}\n\n` : '';
-      const guidanceSuffix = attempt >= 1 ? buildFixLoopGuidanceSuffix() : '';
-      const fixPrompt = `${historySection}The following lint/build errors were found in ${context}. Fix ALL of them — do not use \`any\` types.\n\n${msg.slice(0, 5000)}${guidanceSuffix}`;
-      await runClaudeCode(fixPrompt, ws, statusRef, model, effort);
-      git(['add', '-A']);
-      prevDiff = currDiff;
-      currDiff = captureDiffLines();
-    }
-  }
-  sendLog(ws, `WARNING: Lint checks still failing after ${MAX_LINT_FIX_ATTEMPTS} attempts.\n`);
-  return { passed: false, lastErrorTail, exitReason: 'max_attempts', attempts: prevAttempts };
 }
 
 // ── Test runner detection (shared by testFixLoop and captureTestBaseline) ───
@@ -3356,6 +3135,9 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
 }
 
 async function validateProviderAuth(runner: ProviderRunner, reportPreClaimFailure: (reason: string) => void, model?: string): Promise<void> {
+  // Bake-time lifecycle smoke: skip all credential checks so the smoke can
+  // exercise the full claim→dispatch→complete chain without real LLM creds.
+  if (process.env.BLUEPRINT_SMOKE_SKIP_VALIDATION === '1') return;
   const missing = runner.missingCredentials();
   if (missing.length > 0) {
     const reason = `missing provider credentials: ${missing.join(', ')}`;
@@ -3393,6 +3175,20 @@ async function validateProviderAuth(runner: ProviderRunner, reportPreClaimFailur
   }
 }
 
+// Smoke-only override slot. The packer agent image bake substitutes this with
+// a deterministic stub so handlers.memo() can exercise the runClaudeCode +
+// Codex-extractor path without spawning a real Claude/Codex subprocess. Never
+// set this in production — there is no auth on the setter, by design (the
+// bake-time process is the only caller and runs before the VM is tagged).
+type RunClaudeCodeOverride = (
+  prompt: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean,
+) => Promise<{ exitCode: number; allOutput: string; lastResultText: string }>;
+let _runClaudeCodeOverride: RunClaudeCodeOverride | null = null;
+export function __setRunClaudeCodeOverrideForSmoke(fn: RunClaudeCodeOverride | null): void {
+  _runClaudeCodeOverride = fn;
+}
+
 /**
  * Pure scan over a Codex `--json` (JSONL) stdout transcript: returns true iff
  * any `{"type":"turn.completed", ...}` event is present. Mirrors the
@@ -3412,7 +3208,7 @@ export function codexStreamHasTurnCompleted(transcript: string): boolean {
     } catch {
       continue;
     }
-    if (obj && typeof obj.type === 'string' && obj.type === 'turn.completed') {
+    if (typeof obj.type === 'string' && obj.type === 'turn.completed') {
       return true;
     }
   }
@@ -3439,6 +3235,9 @@ export async function runClaudeCode(prompt: string, ws: WebSocket | null, status
   // Optional for the same reason as codexTurnCompleted (test stubs).
   stderrTail?: string;
 }> {
+  if (_runClaudeCodeOverride) {
+    return _runClaudeCodeOverride(prompt, ws, statusRef, model, effort, disallowedTools, enableCheckWatchdog);
+  }
   return runProviderAgent(prompt, ws, statusRef, model, effort, disallowedTools, enableCheckWatchdog);
 }
 
@@ -4134,6 +3933,18 @@ echo ""
     });
   });
 
+  // Text-mode providers (Gemini CLI with -o text) don't emit a structured usage
+  // block, so recordLlmTokens never fires inside the stream handler. Estimate
+  // token counts from char lengths (4 chars ≈ 1 token) so llm_cost_per_merged_pr
+  // can price Gemini tasks. Runs unconditionally here — before flags checks — so
+  // tokens are captured even on timeout or external kill.
+  if (runCommand.outputMode === 'text') {
+    recordLlmTokens(
+      estimateTokensFromChars(prompt.length),
+      estimateTokensFromChars(lastResultText.length),
+    );
+  }
+
   sendLog(ws, `\n--- ${runner.displayName} exited (code: ${exitCode}) ---\n`);
 
   if (flags.timedOut) {
@@ -4258,6 +4069,8 @@ async function main() {
     vmImageTs = id.image_ts;
     log(`VM image: ${vmImageName ?? '<unknown>'}${vmImageTs ? ` (ts=${vmImageTs})` : ''}`);
   }
+  agentRuntimeFingerprint = readAgentRuntimeFingerprint();
+  log(`Agent runtime fingerprint: ${agentRuntimeFingerprint ?? '<not available>'}`);
 
   // Retry any stale result files from previous runs (network failure / VM kill mid-POST)
   try {
@@ -4387,6 +4200,9 @@ async function main() {
       if (pollResult.agentToken) {
         AGENT_TOKEN = pollResult.agentToken;
         apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
+        // Re-schedule proactive refresh based on the new task token's real expiry.
+        stopProactiveTokenRefresh();
+        scheduleProactiveTokenRefresh(AGENT_TOKEN);
       } else {
         // Backend always mints one for warm claims; missing it indicates
         // a deploy mismatch (old backend, new agent). Treat as fatal so
@@ -4522,17 +4338,14 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
 
   // Capture the task's base_branch so the role-loop can pass it to
   // resetForNextRole(...) and the optional fetch+rebase step actually runs
-  // between warm roles. Default to 'main' when unspecified — matches the
-  // handlers' own strVal(payload.base_branch, 'main') fallback.
-  const rawBaseBranch = payload.base_branch;
-  const baseBranchForReset =
-    typeof rawBaseBranch === 'string' && rawBaseBranch.trim()
-      ? rawBaseBranch.trim()
-      : 'main';
+  // between warm roles. Routes through resolveBaseBranch so projects whose
+  // integration branch is not 'main' do not silently fall through to 'main'.
+  const baseBranchForReset = resolveBaseBranch(payload, task).trim();
 
   // Start heartbeat & log stream
   const statusRef = { value: 'Initializing...' };
   startHeartbeat(taskId, () => statusRef.value);
+  scheduleProactiveTokenRefresh(AGENT_TOKEN);
   const ws = await connectLogStream(taskId);
   if (!ws) {
     log('WARNING: WebSocket log stream unavailable — logs will be sent via status updates only');

@@ -23,6 +23,9 @@ from app.task_locking import (
     lock_project_or_429,
     project_lock,
     task_lock,
+    with_design_doc_locked,
+    with_directions_locked,
+    with_vision_locked,
 )
 
 
@@ -736,3 +739,545 @@ async def test_acquire_pr_spawn_lock_different_prs_dont_block(db_session):
             await session.commit()
 
     await asyncio.gather(hold_a(), acquire_b())
+
+
+# ── with_design_doc_locked ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_with_design_doc_locked_applies_mutation(db_session):
+    """with_design_doc_locked must atomically apply the mutate_fn and preserve
+    pre-existing keys so callers writing disjoint key sets don't clobber each other."""
+    project = Project(name="design-doc-lock", user_id="user")
+    project.design_doc = {"existing": "kept"}
+    db_session.add(project)
+    await db_session.commit()
+
+    await with_design_doc_locked(
+        db_session, project.id, lambda doc: doc.update({"added": "yes"})
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert project.design_doc == {"existing": "kept", "added": "yes"}
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
+@pytest.mark.asyncio
+async def test_with_design_doc_locked_serializes_concurrent_writers(db_session):
+    """Two concurrent callers writing disjoint keys via with_design_doc_locked
+    must both survive — the second must see the first's committed write."""
+    project = Project(name="design-doc-concurrent", user_id="user")
+    project.design_doc = {}
+    db_session.add(project)
+    await db_session.commit()
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def write_key(key: str) -> None:
+        async with Session() as s:
+            await with_design_doc_locked(
+                s, project.id, lambda doc: doc.update({key: "v"})
+            )
+            await s.commit()
+
+    await asyncio.gather(write_key("key_a"), write_key("key_b"))
+
+    async with Session() as verify:
+        result = await verify.execute(select(Project).where(Project.id == project.id))
+        doc = result.scalar_one().design_doc
+    assert doc.get("key_a") == "v", f"key_a missing from {doc}"
+    assert doc.get("key_b") == "v", f"key_b missing from {doc}"
+
+
+# ── with_directions_locked ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_with_directions_locked_in_place_mutation(db_session):
+    """A mutate_fn that edits the list in place and returns None must persist
+    the edit and preserve pre-existing entries."""
+    project = Project(name="dir-lock-inplace", user_id="user")
+    project.directions = [{"id": "d-1", "status": "active"}]
+    db_session.add(project)
+    await db_session.commit()
+
+    def _append(dirs: list) -> None:
+        dirs.append({"id": "d-2", "status": "proposed"})
+
+    await with_directions_locked(db_session, project.id, _append)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    ids = [d["id"] for d in project.directions]
+    assert ids == ["d-1", "d-2"], project.directions
+
+
+@pytest.mark.asyncio
+async def test_with_directions_locked_whole_array_overwrite(db_session):
+    """A mutate_fn returning a replacement list must overwrite the array."""
+    project = Project(name="dir-lock-replace", user_id="user")
+    project.directions = [{"id": "d-1"}, {"id": "d-2"}]
+    db_session.add(project)
+    await db_session.commit()
+
+    await with_directions_locked(db_session, project.id, lambda dirs: [{"id": "d-9"}])
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert project.directions == [{"id": "d-9"}]
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
+@pytest.mark.asyncio
+async def test_with_directions_locked_serializes_concurrent_appends(db_session):
+    """Two concurrent appends via with_directions_locked must both survive —
+    the second writer must see the first's committed append (no lost update)."""
+    project = Project(name="dir-lock-concurrent", user_id="user")
+    project.directions = []
+    db_session.add(project)
+    await db_session.commit()
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def append_dir(dir_id: str) -> None:
+        async with Session() as s:
+            await with_directions_locked(
+                s, project.id, lambda dirs: dirs.append({"id": dir_id})
+            )
+            await s.commit()
+
+    await asyncio.gather(append_dir("d-a"), append_dir("d-b"))
+
+    async with Session() as verify:
+        result = await verify.execute(select(Project).where(Project.id == project.id))
+        dirs = result.scalar_one().directions
+    ids = {d["id"] for d in dirs}
+    assert ids == {"d-a", "d-b"}, f"lost update: {dirs}"
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
+@pytest.mark.asyncio
+async def test_expire_stale_proposals_serializes_with_concurrent_append(db_session):
+    """The _expire_stale_proposals cron now reads project.directions under the
+    canonical project row lock. An interleaved direction append via
+    with_directions_locked must survive AND the stale proposal must still expire
+    — before the lock, the cron's whole-array write-back could clobber the
+    concurrent append (lost update)."""
+    from datetime import timedelta
+
+    from app.anomaly_detection import _expire_stale_proposals
+    from app.time_utils import _utcnow
+
+    old_iso = (_utcnow() - timedelta(days=40)).isoformat()
+    project = Project(name="expire-lock-concurrent", user_id="user")
+    project.directions = [{"id": "d-old", "status": "proposed", "proposed_at": old_iso}]
+    db_session.add(project)
+    await db_session.commit()
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def expire():
+        async with Session() as s:
+            await _expire_stale_proposals(s)  # commits internally
+
+    async def append():
+        async with Session() as s:
+            await with_directions_locked(
+                s,
+                project.id,
+                lambda dirs: dirs.append({"id": "d-new", "status": "active"}),
+            )
+            await s.commit()
+
+    await asyncio.gather(expire(), append())
+
+    async with Session() as verify:
+        result = await verify.execute(select(Project).where(Project.id == project.id))
+        dirs = result.scalar_one().directions
+    by_id = {d["id"]: d for d in dirs}
+    assert by_id.get("d-new", {}).get("status") == "active", (
+        f"lost concurrent append: {dirs}"
+    )
+    assert by_id.get("d-old", {}).get("status") == "expired", (
+        f"stale-proposal expiry not applied: {dirs}"
+    )
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
+@pytest.mark.asyncio
+async def test_remediation_direction_stamp_serializes_with_concurrent_writer(
+    db_session,
+):
+    """The direction-stamp in auto_remediation now uses with_directions_locked.
+    A concurrent writer's mutation must survive alongside the stamp fields —
+    no lost update when the remediation task insert races a directions write."""
+    from app.task_completion import _stamp_remediation_spawn_on_direction
+
+    dir_id = "d-target"
+    project = Project(name="remediation-stamp-lock", user_id="user")
+    project.directions = [{"id": dir_id, "status": "active"}]
+    db_session.add(project)
+    await db_session.commit()
+
+    stamp_task = Task(
+        project_id=project.id,
+        title="auto-fix: CI failure",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create"}],
+    )
+    db_session.add(stamp_task)
+    await db_session.commit()
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def stamp_direction() -> None:
+        async with Session() as s:
+
+            def _mutate(directions: list) -> None:
+                target = next((d for d in directions if d.get("id") == dir_id), None)
+                if target is not None:
+                    _stamp_remediation_spawn_on_direction(target, stamp_task)
+
+            await with_directions_locked(s, project.id, _mutate)
+            await s.commit()
+
+    async def concurrent_writer() -> None:
+        async with Session() as s:
+            await with_directions_locked(
+                s,
+                project.id,
+                lambda dirs: next(
+                    (d for d in dirs if d.get("id") == dir_id), {}
+                ).update({"concurrent_key": "set"}),
+            )
+            await s.commit()
+
+    await asyncio.gather(stamp_direction(), concurrent_writer())
+
+    async with Session() as verify:
+        result = await verify.execute(select(Project).where(Project.id == project.id))
+        dirs = result.scalar_one().directions
+    by_id = {d["id"]: d for d in dirs}
+    target = by_id.get(dir_id, {})
+    assert target.get("last_remediation_task_id") == str(stamp_task.id), (
+        f"stamp fields lost in concurrent write: {target}"
+    )
+    assert target.get("concurrent_key") == "set", (
+        f"concurrent writer's update lost: {target}"
+    )
+
+
+# ── with_vision_locked ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_with_vision_locked_applies_mutation(db_session):
+    """with_vision_locked must atomically apply the mutate_fn and preserve
+    pre-existing keys so callers writing disjoint key sets don't clobber each other."""
+    project = Project(name="vision-lock", user_id="user")
+    project.vision = {"existing": "kept"}
+    db_session.add(project)
+    await db_session.commit()
+
+    await with_vision_locked(
+        db_session, project.id, lambda v: v.update({"added": "yes"})
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert project.vision == {"existing": "kept", "added": "yes"}
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
+@pytest.mark.asyncio
+async def test_concurrent_research_outcomes_preserve_both_directions(db_session):
+    """Two concurrent _update_direction_research_outcomes calls for DIFFERENT
+    directions of the same project must both persist — no lost update."""
+    from app.direction_outcomes import _update_direction_research_outcomes
+
+    project = Project(name="research-outcome-lock", user_id="user")
+    project.directions = []
+    db_session.add(project)
+    await db_session.commit()
+
+    research_task_a = Task(
+        project_id=project.id,
+        title="research A",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+    )
+    research_task_b = Task(
+        project_id=project.id,
+        title="research B",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+    )
+    db_session.add(research_task_a)
+    db_session.add(research_task_b)
+    await db_session.commit()
+
+    child_a = Task(
+        project_id=project.id,
+        parent_task_id=research_task_a.id,
+        title="child A",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"pr_merged": True},
+    )
+    child_b = Task(
+        project_id=project.id,
+        parent_task_id=research_task_b.id,
+        title="child B",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"pr_merged": True},
+    )
+    db_session.add(child_a)
+    db_session.add(child_b)
+    await db_session.commit()
+
+    dir_id_a = "dir-ro-a"
+    dir_id_b = "dir-ro-b"
+    project.directions = [
+        {
+            "id": dir_id_a,
+            "status": "active",
+            "research_history": [
+                {"task_id": str(research_task_a.id), "tasks_created": 1}
+            ],
+        },
+        {
+            "id": dir_id_b,
+            "status": "active",
+            "research_history": [
+                {"task_id": str(research_task_b.id), "tasks_created": 1}
+            ],
+        },
+    ]
+    db_session.add(project)
+    await db_session.commit()
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def run_outcomes(direction_id: str, research_task_id: str) -> None:
+        async with Session() as s:
+            await _update_direction_research_outcomes(
+                project.id, direction_id, research_task_id, s
+            )
+
+    await asyncio.gather(
+        run_outcomes(dir_id_a, str(research_task_a.id)),
+        run_outcomes(dir_id_b, str(research_task_b.id)),
+    )
+
+    async with Session() as verify:
+        result = await verify.execute(select(Project).where(Project.id == project.id))
+        dirs = result.scalar_one().directions
+
+    by_id = {d["id"]: d for d in dirs}
+    entry_a = by_id[dir_id_a]["research_history"][0]
+    entry_b = by_id[dir_id_b]["research_history"][0]
+    assert entry_a.get("tasks_completed") == 1, f"dir-a lost update: {entry_a}"
+    assert entry_b.get("tasks_completed") == 1, f"dir-b lost update: {entry_b}"
+
+
+@pytest.mark.asyncio
+async def test_with_directions_locked_refreshes_stale_identity_map(db_session):
+    """Regression: project_lock must use populate_existing=True so a Project
+    already in the session's identity map gets refreshed from the DB before
+    mutate_fn runs, not the stale cached snapshot from before the lock.
+
+    Scenario: session A loads the project (caching directions=[old]); session B
+    commits directions=[new]; session A calls with_directions_locked — without
+    populate_existing the mutate_fn would see [old] and overwrite [new].
+    """
+    project = Project(name="populate-existing-test", user_id="user")
+    project.directions = [{"id": "d-original", "status": "active"}]
+    db_session.add(project)
+    await db_session.commit()
+
+    # Pull the project into db_session's identity map.
+    result = await db_session.execute(select(Project).where(Project.id == project.id))
+    cached = result.scalar_one()
+    assert cached.directions == [{"id": "d-original", "status": "active"}]
+
+    # Commit a direction change from a second session (simulates another writer).
+    Session = sessionmaker(
+        bind=db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with Session() as second_session:
+        r2 = await second_session.execute(
+            select(Project).where(Project.id == project.id)
+        )
+        proj2 = r2.scalar_one()
+        from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+        proj2.directions = [{"id": "d-updated", "status": "active"}]
+        _flag_modified(proj2, "directions")
+        second_session.add(proj2)
+        await second_session.commit()
+
+    # with_directions_locked must refresh the identity-mapped instance via
+    # populate_existing=True and pass the committed [d-updated] to mutate_fn.
+    seen_directions: list = []
+
+    def _capture(dirs: list) -> None:
+        seen_directions.extend(dirs)
+
+    await with_directions_locked(db_session, project.id, _capture)
+    await db_session.commit()
+
+    ids_seen = [d["id"] for d in seen_directions]
+    assert "d-updated" in ids_seen, (
+        f"with_directions_locked passed stale cached directions to mutate_fn: "
+        f"{seen_directions!r} — populate_existing=True is required on the lock SELECT"
+    )
+    assert "d-original" not in ids_seen, (
+        f"stale direction 'd-original' was not evicted by populate_existing=True: "
+        f"{seen_directions!r}"
+    )
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
+@pytest.mark.asyncio
+async def test_with_vision_locked_serializes_concurrent_writers(db_session):
+    """Two concurrent callers writing disjoint keys via with_vision_locked
+    must both survive — the second must see the first's committed write."""
+    project = Project(name="vision-lock-concurrent", user_id="user")
+    project.vision = {}
+    db_session.add(project)
+    await db_session.commit()
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def write_key(key: str) -> None:
+        async with Session() as s:
+            await with_vision_locked(s, project.id, lambda v: v.update({key: "v"}))
+            await s.commit()
+
+    await asyncio.gather(write_key("key_a"), write_key("key_b"))
+
+    async with Session() as verify:
+        result = await verify.execute(select(Project).where(Project.id == project.id))
+        vision = result.scalar_one().vision
+    assert vision.get("key_a") == "v", f"key_a missing from {vision}"
+    assert vision.get("key_b") == "v", f"key_b missing from {vision}"
+
+
+# ── post_auto_fix_result_message concurrent writers ─────────────────────────
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
+@pytest.mark.asyncio
+async def test_post_auto_fix_result_message_serializes_concurrent_writers(db_session):
+    """Two concurrent post_auto_fix_result_message calls writing disjoint branches
+    via with_design_doc_locked must both persist — no lost update."""
+    from app.notification_dispatch import post_auto_fix_result_message
+
+    project = Project(name="autofix-concurrent", user_id="user")
+    project.design_doc = {}
+    db_session.add(project)
+    await db_session.commit()
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def write_branch(branch: str) -> None:
+        async with Session() as s:
+            await post_auto_fix_result_message(
+                s, project.id, branch=branch, result="failed"
+            )
+            await s.commit()
+
+    await asyncio.gather(write_branch("main"), write_branch("feat/x"))
+
+    async with Session() as verify:
+        result = await verify.execute(select(Project).where(Project.id == project.id))
+        doc = result.scalar_one().design_doc
+    ar = doc.get("_auto_remediation", {})
+    counts = ar.get("branch_failure_counts", {})
+    assert counts.get("main") == 1, f"main branch count missing from {doc}"
+    assert counts.get("feat/x") == 1, f"feat/x branch count missing from {doc}"
+
+
+# ── _check_anomaly_proposals concurrent appends ──────────────────────────────
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
+@pytest.mark.asyncio
+async def test_check_anomaly_proposals_serializes_concurrent_appends(db_session):
+    """Two concurrent _check_anomaly_proposals calls for the same project must
+    both append their direction proposals — no lost update."""
+    import app.shared_state as _shared_state
+    from app.anomaly_detection import _check_anomaly_proposals
+
+    project = Project(name="anomaly-concurrent", user_id="user")
+    project.directions = []
+    db_session.add(project)
+    await db_session.commit()
+
+    proj_key = str(project.id)
+    # Two distinct anomaly keys, both above the occurrence threshold. Use the
+    # ``Direction_`` proposal template with disjoint detail words so the two
+    # generated proposal texts share fewer than 4 non-stopword tokens and are
+    # NOT treated as duplicates of each other (the non-Direction template shares
+    # "investigate reduce task failures —", 5 tokens, which would make the dedup
+    # guard block the second proposal regardless of locking). Both anomalies stay
+    # visible to every runner — no coroutine mutates another's anomaly state — so
+    # the only behaviour under test is whether two concurrent
+    # ``with_directions_locked`` appends both persist.
+    _shared_state.persistent_anomalies[proj_key] = {
+        "Direction_aaaaaaaa": {
+            "occurrence_count": 5,
+            "severity": "high",
+            "latest_details": "alpha beta gamma",
+            "first_seen": "2026-01-01T00:00:00",
+        },
+        "Direction_bbbbbbbb": {
+            "occurrence_count": 4,
+            "severity": "medium",
+            "latest_details": "delta epsilon zeta",
+            "first_seen": "2026-01-02T00:00:00",
+        },
+    }
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def run_check() -> None:
+        # The project row lock serializes the two _mutate closures: whichever
+        # commits first appends its highest-count proposal; the second reads that
+        # committed append fresh under the lock (via session.expire), dedups it,
+        # and proposes the remaining anomaly. If the lock/expire were missing the
+        # second runner would read a stale empty list and whole-array-overwrite
+        # the first append, leaving only one proposal.
+        async with Session() as s:
+            result = await s.execute(select(Project).where(Project.id == project.id))
+            proj = result.scalar_one()
+            await _check_anomaly_proposals(proj, s)
+            await s.commit()
+
+    await asyncio.gather(run_check(), run_check())
+
+    async with Session() as verify:
+        result = await verify.execute(select(Project).where(Project.id == project.id))
+        dirs = result.scalar_one().directions
+    proposed = [d for d in dirs if d.get("status") == "proposed"]
+    assert len(proposed) == 2, f"expected 2 proposals, got {len(proposed)}: {dirs}"

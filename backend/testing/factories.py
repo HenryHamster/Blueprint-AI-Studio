@@ -12,12 +12,22 @@ def _utcnow() -> datetime:
 
 
 def make_project(**kwargs) -> Project:
-    """Create a Project instance with test defaults. Pass kwargs to override."""
+    """Create a Project instance with test defaults. Pass kwargs to override.
+
+    ``integration_branch`` / ``promotion_target`` default to ``"main"`` so the
+    branch resolver in ``shared_state.get_project_integration_branch`` doesn't
+    stage a defensive "Missing integration_branch" Alert during tests — that
+    alert (added with the per-project trunk column) is intended for production
+    projects whose NULL columns slipped past the backfill, and would otherwise
+    inflate Alert counts in unrelated tests that assert on exact alert totals.
+    """
     defaults = dict(
         name="Test Project",
         user_id="test-user-123",
         autonomous_enabled=False,
         directions=[],
+        integration_branch="main",
+        promotion_target="main",
     )
     defaults.update(kwargs)
     return Project(**defaults)

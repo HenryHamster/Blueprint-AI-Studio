@@ -38,11 +38,41 @@ from app.models import (
 )
 from app.payload_schemas import validate_task_payload
 from app.schemas import DeployPayload
-from app.shared_state import limiter
+from app.shared_state import backfill_branch_columns, limiter
 from app.broadcast import manager, broadcast_to_project, _sanitize_log
+from app.event_fanout import enqueue_agent_log
 from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 
 logger = logging.getLogger(__name__)
+
+
+def _truncate_vm_instance_id(vm_instance_id: object) -> str:
+    if vm_instance_id is None:
+        return "none"
+    value = str(vm_instance_id)
+    if len(value) <= 12:
+        return value
+    return f"{value[:12]}..."
+
+
+def _log_agent_auth_reject(
+    reason: str,
+    *,
+    path: str,
+    task_id: object,
+    token_vm_instance_id: object = None,
+    token_project_id: object = None,
+    error: object | None = None,
+) -> None:
+    logger.info(
+        "[AGENT_AUTH_REJECT] reason=%s path=%s task_id=%s token_vm_instance_id=%s token_project_id=%s error=%s",
+        reason,
+        path,
+        task_id,
+        _truncate_vm_instance_id(token_vm_instance_id),
+        token_project_id or "none",
+        error if error is not None else "none",
+    )
 
 
 async def _safe_ws_close(ws: WebSocket, code: int, reason: str = "") -> None:
@@ -137,6 +167,12 @@ async def deploy_blueprint(
         session.add(task)
         created_tasks.append(task)
 
+    await session.commit()
+
+    # Populate branch columns from GitHub immediately so that the first task
+    # spawned via this path resolves the correct base branch rather than
+    # silently falling back to 'main' for repos with a different default.
+    await backfill_branch_columns(session, project_id=project.id)
     await session.commit()
 
     # 3. The Orchestrator Worker will automatically pick up QUEUED tasks
@@ -377,6 +413,9 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
         await _safe_ws_close(websocket, code=1008, reason="Authentication failed")
         return
 
+    user_id = payload.get("sub")
+    last_membership_check = time.time()
+
     if not await manager.connect(websocket, project_id):
         return
     try:
@@ -442,6 +481,22 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
             else:
                 last_message_time = current_time
                 message_count = 1
+
+            # Re-validate project membership at most once per minute
+            if (time.time() - last_membership_check) >= 60:
+                async with AsyncSessionLocal() as ms:
+                    member = (
+                        await ms.execute(
+                            select(ProjectMember).where(
+                                ProjectMember.project_id == project_id,
+                                ProjectMember.user_id == user_id,
+                            )
+                        )
+                    ).scalar_one_or_none()
+                if not member:
+                    await _safe_ws_close(websocket, code=1008, reason="Access revoked")
+                    return
+                last_membership_check = time.time()
             # We can handle client-to-server messages here if needed
     except WebSocketDisconnect:
         pass
@@ -457,6 +512,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
     """
     WebSocket endpoint for agents to stream high-throughput logs and real-time events.
     """
+    path = f"/api/agent/ws/{task_id}"
     await websocket.accept()
 
     # Require the client to send the token as the first message
@@ -464,17 +520,39 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
         auth_message = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
         token = auth_message.get("token")
         if not token:
+            _log_agent_auth_reject(
+                "ws_initial_auth_failure_missing_token",
+                path=path,
+                task_id=task_id,
+            )
             await _safe_ws_close(websocket, code=1008, reason="Missing token")
             return
 
         payload = verify_agent_jwt(token)
         if payload.get("sub") != str(task_id):
+            _log_agent_auth_reject(
+                "ws_initial_auth_failure_task_id_mismatch",
+                path=path,
+                task_id=task_id,
+                token_vm_instance_id=payload.get("vm_instance_id"),
+                token_project_id=payload.get("project_id"),
+            )
             await _safe_ws_close(websocket, code=1008, reason="Task ID mismatch")
             return
     except asyncio.TimeoutError:
+        _log_agent_auth_reject(
+            "ws_initial_auth_failure_timeout",
+            path=path,
+            task_id=task_id,
+        )
         await _safe_ws_close(websocket, code=1008, reason="Authentication timeout")
         return
     except Exception:
+        _log_agent_auth_reject(
+            "ws_initial_auth_failure",
+            path=path,
+            task_id=task_id,
+        )
         await _safe_ws_close(websocket, code=1008, reason="Authentication failed")
         return
 
@@ -483,55 +561,246 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
         stmt = select(Task).where(Task.id == task_id)
         task = (await session.execute(stmt)).scalars().first()
         if not task:
+            _log_agent_auth_reject(
+                "ws_task_missing",
+                path=path,
+                task_id=task_id,
+                token_vm_instance_id=payload.get("vm_instance_id"),
+                token_project_id=payload.get("project_id"),
+            )
             await _safe_ws_close(websocket, code=1008)
             return
+
+        from app.routers.agent import _terminated_task_ids  # noqa: PLC0415
+
+        if str(task.id) in _terminated_task_ids or task.status in (
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+        ):
+            _log_agent_auth_reject(
+                "ws_task_terminal",
+                path=path,
+                task_id=task_id,
+                token_vm_instance_id=payload.get("vm_instance_id"),
+                token_project_id=payload.get("project_id"),
+            )
+            await _safe_ws_close(
+                websocket, code=1008, reason="Task is no longer active"
+            )
+            return
+
+        token_project = payload.get("project_id")
+        if token_project and token_project != str(task.project_id):
+            _log_agent_auth_reject(
+                "ws_project_mismatch",
+                path=path,
+                task_id=task_id,
+                token_vm_instance_id=payload.get("vm_instance_id"),
+                token_project_id=token_project,
+            )
+            await _safe_ws_close(websocket, code=1008, reason="Project mismatch")
+            return
+
+        token_vm = payload.get("vm_instance_id")
+        if token_vm and task.vm_instance_id and token_vm != task.vm_instance_id:
+            _log_agent_auth_reject(
+                "ws_vm_instance_mismatch",
+                path=path,
+                task_id=task_id,
+                token_vm_instance_id=token_vm,
+                token_project_id=token_project,
+            )
+            await _safe_ws_close(websocket, code=1008, reason="VM instance mismatch")
+            return
+
         project_id = str(task.project_id)
 
     if not await manager.check_and_add_ip(websocket):
         return
 
+    _terminated_task_ids_ref = _terminated_task_ids
+    _RECHECK_INTERVAL = 5  # timer tick: seconds between termination checks
+    # DB fallback runs on every tick so a deny-list miss (after restart,
+    # listener gap, or cache desync) still revokes within the 5s window the
+    # direction requires. Per-connection DB load: ~1 SELECT every 5s.
+    _DB_RECHECK_INTERVAL = _RECHECK_INTERVAL
+    last_recheck = 0.0  # force first DB recheck on first tick
+
+    receive_task: Optional[asyncio.Task] = None
     try:
         last_message_time = time.time()
         message_count = 0
+        receive_task = asyncio.create_task(websocket.receive_text())
         while True:
-            text_data = await websocket.receive_text()
-            if len(text_data) > 100000:  # 100KB limit for agent logs
-                await _safe_ws_close(websocket, code=1009, reason="Message too big")
-                return
+            # Race message receipt against a timer so termination is detected
+            # even when the agent sends no messages.
+            timer_task = asyncio.create_task(asyncio.sleep(_RECHECK_INTERVAL))
+            done, _pending = await asyncio.wait(
+                {receive_task, timer_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
 
-            # Simple rate limiting: 20 messages per second
-            current_time = time.time()
-            if current_time - last_message_time < 1.0:
-                message_count += 1
-                if message_count > 20:
+            if receive_task in done:
+                # A message arrived — cancel the unused timer.
+                timer_task.cancel()
+                try:
+                    await timer_task
+                except asyncio.CancelledError:
+                    pass
+
+                try:
+                    text_data = receive_task.result()
+                except WebSocketDisconnect:
+                    return
+                except Exception:
+                    return
+
+                # Termination recheck: deny-list fast path + DB fallback
+                if str(task_id) in _terminated_task_ids_ref:
+                    _log_agent_auth_reject(
+                        "ws_deny_list_hit",
+                        path=path,
+                        task_id=task_id,
+                        token_vm_instance_id=payload.get("vm_instance_id"),
+                        token_project_id=payload.get("project_id"),
+                    )
                     await _safe_ws_close(
-                        websocket, code=1008, reason="Rate limit exceeded"
+                        websocket, code=1008, reason="Task is no longer active"
                     )
                     return
+                now = time.time()
+                if now - last_recheck >= _DB_RECHECK_INTERVAL:
+                    async with AsyncSessionLocal() as rs:
+                        fresh = await rs.get(Task, task_id)
+                    if (
+                        fresh is None
+                        or fresh.status
+                        in (
+                            TaskStatus.COMPLETED,
+                            TaskStatus.FAILED,
+                            TaskStatus.CANCELLED,
+                        )
+                        or (
+                            payload.get("vm_instance_id")
+                            and fresh is not None
+                            and fresh.vm_instance_id
+                            and fresh.vm_instance_id != payload.get("vm_instance_id")
+                        )
+                    ):
+                        _log_agent_auth_reject(
+                            "ws_periodic_recheck_terminal",
+                            path=path,
+                            task_id=task_id,
+                            token_vm_instance_id=payload.get("vm_instance_id"),
+                            token_project_id=payload.get("project_id"),
+                        )
+                        await _safe_ws_close(
+                            websocket, code=1008, reason="Task is no longer active"
+                        )
+                        return
+                    last_recheck = now
+
+                if len(text_data) > 100000:  # 100KB limit for agent logs
+                    await _safe_ws_close(websocket, code=1009, reason="Message too big")
+                    return
+
+                # Simple rate limiting: 20 messages per second
+                current_time = time.time()
+                if current_time - last_message_time < 1.0:
+                    message_count += 1
+                    if message_count > 20:
+                        await _safe_ws_close(
+                            websocket, code=1008, reason="Rate limit exceeded"
+                        )
+                        return
+                else:
+                    last_message_time = current_time
+                    message_count = 1
+
+                try:
+                    data = json.loads(text_data)
+                except json.JSONDecodeError:
+                    receive_task = asyncio.create_task(websocket.receive_text())
+                    continue
+
+                if data.get("type") == "log":
+                    sanitized = _sanitize_log(data.get("content", ""))
+                    await broadcast_to_project(
+                        project_id,
+                        "agent_log",
+                        {"task_id": str(task_id), "log": sanitized},
+                    )
+                    # Additionally buffer the line for batched cross-instance
+                    # relay so an operator whose viewer WebSocket landed on a
+                    # DIFFERENT Cloud Run instance also sees the live log. No-op
+                    # on single-instance / non-Postgres backends (the line is
+                    # already delivered locally above), so no double delivery.
+                    enqueue_agent_log(project_id, str(task_id), sanitized)
+                elif data.get("type") == "status":
+                    # Optionally handle status updates via WS too
+                    pass
+
+                receive_task = asyncio.create_task(websocket.receive_text())
+
             else:
-                last_message_time = current_time
-                message_count = 1
+                # Timer fired before a message arrived — run termination check.
+                # receive_task is still pending; keep it for the next iteration.
 
-            try:
-                data = json.loads(text_data)
-            except json.JSONDecodeError:
-                continue
+                # Fast path: deny-list
+                if str(task_id) in _terminated_task_ids_ref:
+                    _log_agent_auth_reject(
+                        "ws_deny_list_hit",
+                        path=path,
+                        task_id=task_id,
+                        token_vm_instance_id=payload.get("vm_instance_id"),
+                        token_project_id=payload.get("project_id"),
+                    )
+                    receive_task.cancel()
+                    await _safe_ws_close(
+                        websocket, code=1008, reason="Task is no longer active"
+                    )
+                    return
 
-            if data.get("type") == "log":
-                await broadcast_to_project(
-                    project_id,
-                    "agent_log",
-                    {
-                        "task_id": str(task_id),
-                        "log": _sanitize_log(data.get("content", "")),
-                    },
-                )
-            elif data.get("type") == "status":
-                # Optionally handle status updates via WS too
-                pass
+                # Slow path: DB recheck (rate-limited)
+                now = time.time()
+                if now - last_recheck >= _DB_RECHECK_INTERVAL:
+                    async with AsyncSessionLocal() as rs:
+                        fresh = await rs.get(Task, task_id)
+                    if (
+                        fresh is None
+                        or fresh.status
+                        in (
+                            TaskStatus.COMPLETED,
+                            TaskStatus.FAILED,
+                            TaskStatus.CANCELLED,
+                        )
+                        or (
+                            payload.get("vm_instance_id")
+                            and fresh is not None
+                            and fresh.vm_instance_id
+                            and fresh.vm_instance_id != payload.get("vm_instance_id")
+                        )
+                    ):
+                        _log_agent_auth_reject(
+                            "ws_periodic_recheck_terminal",
+                            path=path,
+                            task_id=task_id,
+                            token_vm_instance_id=payload.get("vm_instance_id"),
+                            token_project_id=payload.get("project_id"),
+                        )
+                        receive_task.cancel()
+                        await _safe_ws_close(
+                            websocket, code=1008, reason="Task is no longer active"
+                        )
+                        return
+                    last_recheck = now
+
     except WebSocketDisconnect:
         pass
     finally:
+        if receive_task is not None and not receive_task.done():
+            receive_task.cancel()
         manager.remove_ip(websocket)
 
 
@@ -548,20 +817,11 @@ async def cancel_project(
     Halts the project, marks pending tasks as cancelled, and immediately terminates all associated running VMs.
     """
     from app.main import _ensure_vm_deleted  # noqa: PLC0415
+    from app.admin import _get_user_project_with_role  # noqa: PLC0415
 
-    member = (
-        await session.execute(
-            select(ProjectMember).where(
-                ProjectMember.project_id == project_id,
-                ProjectMember.user_id == current_user["user_id"],
-            )
-        )
-    ).scalar_one_or_none()
-    if not member:
-        raise HTTPException(status_code=404, detail="Project not found or unauthorized")
-    project = await session.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found or unauthorized")
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, min_role="owner"
+    )
 
     if project.status in [
         ProjectStatus.COMPLETED,

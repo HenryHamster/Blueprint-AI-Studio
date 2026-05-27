@@ -50,6 +50,7 @@ class TestParseEvictionCounts:
         result = _parse_eviction_counts(None)
         assert result == {
             "established": 0,
+            "established_confirmed": 0,
             "failed": 0,
             "open_questions": 0,
             "failed_titles": [],
@@ -67,8 +68,23 @@ class TestParseEvictionCounts:
         body = "5 established evicted"
         result = _parse_eviction_counts(body)
         assert result["established"] == 5
+        assert result["established_confirmed"] == 0
         assert result["failed"] == 0
         assert result["failed_titles"] == []
+
+    def test_parses_confirmed_subcount(self):
+        body = "5 established (2 confirmed), 1 failed evicted"
+        result = _parse_eviction_counts(body)
+        assert result["established"] == 5
+        assert result["established_confirmed"] == 2
+        assert result["failed"] == 1
+
+    def test_legacy_summary_without_confirmed_parses_zero(self):
+        """Summaries written before the confirmed sub-count existed parse to 0."""
+        body = "5 established, 1 failed evicted"
+        result = _parse_eviction_counts(body)
+        assert result["established"] == 5
+        assert result["established_confirmed"] == 0
 
 
 # ── _format_eviction_body ────────────────────────────────────────────────────
@@ -95,6 +111,19 @@ class TestFormatEvictionBody:
         body = _format_eviction_body(0, 0, 1, [])
         assert "1 open question evicted" in body
         assert "1 open questions" not in body
+
+    def test_confirmed_subcount_emitted_and_roundtrips(self):
+        body = _format_eviction_body(5, 1, 0, [], established_confirmed=2)
+        assert "5 established (2 confirmed)" in body
+        parsed = _parse_eviction_counts(body)
+        assert parsed["established"] == 5
+        assert parsed["established_confirmed"] == 2
+        assert parsed["failed"] == 1
+
+    def test_confirmed_subcount_omitted_when_zero(self):
+        body = _format_eviction_body(5, 0, 0, [], established_confirmed=0)
+        assert "5 established" in body
+        assert "confirmed" not in body
 
 
 # ── _build_research_context: no eviction when under limit ───────────────────

@@ -125,6 +125,7 @@ import {
 import { runCodeChangeTask } from './code-change.js';
 import { execFileSync } from 'child_process';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
+import { PARALLEL_AUDIT_GUIDANCE } from '../prompt.js';
 
 // ── Shared test helpers ───────────────────────────────────────────────────────
 const TASK_ID = 'task-abc123';
@@ -394,6 +395,30 @@ describe('handleSmoketest — URL health checks', () => {
     expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('ERROR_LOG');
   });
+
+  it('sets failure_category to smoketest_result_unparseable when exitCode=0 but result file is missing', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: 'output but no result file', lastResultText: '' });
+
+    await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.artifact_type).toBe('ERROR_LOG');
+    expect(call.failure_category).toBe('smoketest_result_unparseable');
+  });
+
+  it('sets failure_category to claude_code_failed when exitCode≠0 and result file is missing', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 1, allOutput: 'agent crashed', lastResultText: '' });
+
+    await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.artifact_type).toBe('ERROR_LOG');
+    expect(call.failure_category).toBe('claude_code_failed');
+  });
 });
 
 // ── handleDebug — report file reading and status mapping ─────────────────────
@@ -565,6 +590,32 @@ describe('handleInvestigate — report reading and status mapping', () => {
     expect(call.artifact_type).toBe('ERROR_LOG');
   });
 
+  it('posts rate_limited instead of parse_failed when transcript contains a weekly-limit message', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    const rateLimitTranscript = "You've hit your weekly limit · resets 9pm (UTC)\nNo output produced.";
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 1, allOutput: rateLimitTranscript, lastResultText: '' });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('rate_limited');
+  });
+
+  it('posts rate_limited instead of parse_failed when lastResultText contains a weekly-limit message', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 1,
+      allOutput: '',
+      lastResultText: "You've hit your weekly limit · resets 9pm (UTC)",
+    });
+
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.failure_category).toBe('rate_limited');
+  });
+
   it('throws when no prompt is provided in payload or task', async () => {
     await expect(
       handleInvestigate(
@@ -627,6 +678,75 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
     const opts = capturedMigrateOpts();
     expect(opts.baseBranch).toBe('feature/parent');
     expect(opts.testsOnMainBranch).toBe(false);
+  });
+
+  it('falls back to project_metadata.integration_branch when payload.base_branch is absent', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { prompt: 'Add column' },
+      { ...BASE_TASK, project_metadata: { integration_branch: 'trunk' } },
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const opts = capturedMigrateOpts();
+    expect(opts.baseBranch).toBe('trunk');
+    // No promotion_target → testsOnMainBranch falls back to the resolved
+    // integration branch ('trunk'), which equals baseBranch → true. The
+    // migration must capture the backend baseline on a non-'main' trunk.
+    expect(opts.testsOnMainBranch).toBe(true);
+  });
+
+  it('treats a non-main integration branch as the trunk for testsOnMainBranch', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { prompt: 'Add column' },
+      { ...BASE_TASK, project_metadata: { integration_branch: 'master' } },
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const opts = capturedMigrateOpts();
+    expect(opts.baseBranch).toBe('master');
+    expect(opts.testsOnMainBranch).toBe(true);
+  });
+
+  it('disables tests-on-main when base_branch diverges from a non-main resolved trunk', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { base_branch: 'feature/x', prompt: 'Add column' },
+      { ...BASE_TASK, project_metadata: { integration_branch: 'master' } },
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const opts = capturedMigrateOpts();
+    expect(opts.baseBranch).toBe('feature/x');
+    // base_branch ('feature/x') ≠ resolved trunk ('master') → false.
+    expect(opts.testsOnMainBranch).toBe(false);
+  });
+
+  it('falls back to main when both payload.base_branch and project_metadata.integration_branch are absent', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { prompt: 'Add column' },
+      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const opts = capturedMigrateOpts();
+    expect(opts.baseBranch).toBe('main');
+    expect(opts.testsOnMainBranch).toBe(true);
+  });
+
+  it('falls back to project_metadata.promotion_target when payload.promotion_target is absent', async () => {
+    await handleMigrate(
+      TASK_ID,
+      { prompt: 'Add column' },
+      { ...BASE_TASK, project_metadata: { integration_branch: 'trunk', promotion_target: 'trunk' } },
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const opts = capturedMigrateOpts();
+    expect(opts.baseBranch).toBe('trunk');
+    // base_branch matches promotion_target → testsOnMainBranch=true
+    expect(opts.testsOnMainBranch).toBe(true);
   });
 
   it('throws when stale remote branch has open PRs (refuses to delete)', async () => {
@@ -1374,6 +1494,84 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
     expect(stored.test_erosion.assertion_delta).toBe(9);
     expect(stored.test_erosion.test_count_delta).toBe(2);
   });
+
+  it('fails loudly with release_audit_report_unparseable when the report cannot be parsed', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: 'no json object here',
+      lastResultText: 'raw tail fallback text',
+    });
+
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.artifact_type).toBe('ERROR_LOG');
+    expect(call.failure_category).toBe('release_audit_report_unparseable');
+    expect(call.logs).toContain('raw tail fallback text');
+  });
+
+  it('prompt includes verification_note in the findings JSON schema', async () => {
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('verification_note');
+  });
+
+  it('prompt instructs agent to read full-repo context before recording a high/medium/critical finding', async () => {
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // The prompt must require whole-repo verification, not just diff inspection.
+    expect(prompt).toMatch(/substantiation required/i);
+    expect(prompt).toMatch(/read the relevant unchanged files/i);
+  });
+
+  describe('release_audit prompt false-positive disclaimers', () => {
+    it('guards the hardcoded-constant-is-not-injection disclaimer', async () => {
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+      // This disclaimer protects against the false positive: a hardcoded value in the
+      // source flowing to a sink (e.g. hardcoded SQL fragment reaching a query) is NOT
+      // injection if the hardcoded value is the only possible input.
+      expect(prompt).toContain('A hardcoded constant reaching a sink is NOT injection.');
+    });
+
+    it('guards the per-request-check-is-not-replay-gap disclaimer', async () => {
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+      // This disclaimer protects against the false positive: a per-request check
+      // (e.g. token validation) is NOT a token-replay vulnerability when the token
+      // is genuinely validated on each request.
+      expect(prompt).toContain('A per-request DB check is NOT a replay gap.');
+    });
+
+    it('guards the exception-guarded-comparison-is-not-type-error disclaimer', async () => {
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+      // This disclaimer protects against the false positive: a comparison operation
+      // guarded by an exception handler (e.g. try/except or if type check) is NOT
+      // a TypeError vulnerability.
+      expect(prompt).toContain('A comparison that is exception-guarded is NOT a TypeError.');
+    });
+
+    it('guards the verification-note exclusion contract for unsubstantiated findings', async () => {
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+      // This contract is critical: high/medium/critical findings without a substantive
+      // verification_note are silently excluded from the score. If this contract is
+      // dropped, unsubstantiated findings could cause false-positive audit_score collapses.
+      expect(prompt).toContain('Findings at severity high/medium/critical WITHOUT a substantive `verification_note` are silently excluded from the score');
+    });
+
+    it('guards the substantiation requirement and whole-repo context guidance', async () => {
+      await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+      const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+      // The substantiation rule must remain: before recording high/medium/critical findings,
+      // the agent must read unchanged files to check for mitigations.
+      expect(prompt).toContain('Before recording any finding at severity high, medium, or critical, read the relevant unchanged files in the full repository');
+      expect(prompt).toContain('check for existing mitigations');
+    });
+  });
 });
 
 // ── resolveCandidateSha — payload/context SHA resolution + validation ─────────
@@ -1511,5 +1709,194 @@ describe('handleSmoketest — candidate-SHA pinning', () => {
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('FAILED');
     expect(call.failure_category).toBe('clone_failed');
+  });
+});
+
+// ── PARALLEL_AUDIT_GUIDANCE injection ────────────────────────────────────────
+describe('Parallel audit guidance injection', () => {
+  const PARALLEL_TASK = { ...BASE_TASK, project_metadata: { enable_parallel_review: true } };
+  const SERIAL_TASK = { ...BASE_TASK, project_metadata: { enable_parallel_review: false } };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+  });
+
+  it('handleSecurityAudit injects PARALLEL_AUDIT_GUIDANCE when flag is on', async () => {
+    await handleSecurityAudit(TASK_ID, BASE_PAYLOAD, PARALLEL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(PARALLEL_AUDIT_GUIDANCE);
+  });
+
+  it('handleSecurityAudit omits PARALLEL_AUDIT_GUIDANCE when flag is off', async () => {
+    await handleSecurityAudit(TASK_ID, BASE_PAYLOAD, SERIAL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).not.toContain(PARALLEL_AUDIT_GUIDANCE);
+  });
+
+  it('handleInvestigate injects PARALLEL_AUDIT_GUIDANCE when flag is on', async () => {
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, PARALLEL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(PARALLEL_AUDIT_GUIDANCE);
+  });
+
+  it('handleInvestigate omits PARALLEL_AUDIT_GUIDANCE when flag is off', async () => {
+    await handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, SERIAL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).not.toContain(PARALLEL_AUDIT_GUIDANCE);
+  });
+
+  it('handleDebug injects PARALLEL_AUDIT_GUIDANCE when flag is on', async () => {
+    const debugPayload = { ...BASE_PAYLOAD, error_logs: 'some error', failed_task_title: 'bad task' };
+    await handleDebug(TASK_ID, debugPayload, PARALLEL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(PARALLEL_AUDIT_GUIDANCE);
+  });
+
+  it('handleDebug omits PARALLEL_AUDIT_GUIDANCE when flag is off', async () => {
+    const debugPayload = { ...BASE_PAYLOAD, error_logs: 'some error', failed_task_title: 'bad task' };
+    await handleDebug(TASK_ID, debugPayload, SERIAL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).not.toContain(PARALLEL_AUDIT_GUIDANCE);
+  });
+
+  it('handlePerf injects PARALLEL_AUDIT_GUIDANCE when flag is on', async () => {
+    await handlePerf(TASK_ID, BASE_PAYLOAD, PARALLEL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(PARALLEL_AUDIT_GUIDANCE);
+  });
+
+  it('handleSelfAudit injects PARALLEL_AUDIT_GUIDANCE when flag is on', async () => {
+    await handleSelfAudit(TASK_ID, BASE_PAYLOAD, PARALLEL_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain(PARALLEL_AUDIT_GUIDANCE);
+  });
+});
+
+// ── Per-project integration_branch cascade (resolveBaseBranch) ───────────────
+// Each analysis-style handler must clone the per-project integration branch
+// when payload.base_branch is absent. Without the cascade, projects whose
+// integration branch is not 'main' (e.g. 'master', 'production') would
+// silently clone the wrong branch.
+describe('resolveBaseBranch cascade — analysis handlers honor project_metadata.integration_branch', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+
+  const TASK_WITH_INTEGRATION = {
+    ...BASE_TASK,
+    project_metadata: { integration_branch: 'master' },
+  };
+  const PAYLOAD_NO_BASE_BRANCH = {}; // no base_branch
+
+  it('handleSecurityAudit clones project_metadata.integration_branch when payload.base_branch is absent', async () => {
+    await handleSecurityAudit(
+      TASK_ID, PAYLOAD_NO_BASE_BRANCH, TASK_WITH_INTEGRATION,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
+    expect(opts.branch).toBe('master');
+    expect(opts.baseBranch).toBe('master');
+  });
+
+  it('handlePerf clones project_metadata.integration_branch when payload.base_branch is absent', async () => {
+    await handlePerf(
+      TASK_ID, PAYLOAD_NO_BASE_BRANCH, TASK_WITH_INTEGRATION,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
+    expect(opts.branch).toBe('master');
+    expect(opts.baseBranch).toBe('master');
+  });
+
+  it('handleInvestigate clones project_metadata.integration_branch when payload.base_branch is absent', async () => {
+    await handleInvestigate(
+      TASK_ID, { prompt: 'investigate' }, TASK_WITH_INTEGRATION,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
+    expect(opts.branch).toBe('master');
+    expect(opts.baseBranch).toBe('master');
+  });
+
+  it('handleSelfAudit clones project_metadata.integration_branch when payload.base_branch is absent', async () => {
+    await handleSelfAudit(
+      TASK_ID, PAYLOAD_NO_BASE_BRANCH, TASK_WITH_INTEGRATION,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
+    expect(opts.branch).toBe('master');
+    expect(opts.baseBranch).toBe('master');
+  });
+
+  it('falls back to main when both payload.base_branch and project_metadata.integration_branch are absent', async () => {
+    await handleSecurityAudit(
+      TASK_ID, PAYLOAD_NO_BASE_BRANCH, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
+    expect(opts.branch).toBe('main');
+    expect(opts.baseBranch).toBe('main');
+  });
+
+  it('payload.base_branch overrides project_metadata.integration_branch when both are present', async () => {
+    await handleSecurityAudit(
+      TASK_ID, { base_branch: 'feature/x' }, TASK_WITH_INTEGRATION,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+    const opts = vi.mocked(prepareWorkspaceForRole).mock.calls[0][0];
+    expect(opts.branch).toBe('feature/x');
+    expect(opts.baseBranch).toBe('feature/x');
+  });
+});
+
+// ── Release audit JSON schema contract ───────────────────────────────────────
+// Guards the shape contract between the agent prompt and backend score parser.
+// If the prompt is rewritten to document 'issues'/'level', these tests break.
+describe('handleReleaseAudit — JSON schema field name contract', () => {
+  const CANDIDATE_SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+  const RELEASE_PAYLOAD = { base_branch: 'main', candidate_sha: CANDIDATE_SHA };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(git).mockReturnValue('');
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+    vi.mocked(readHandlerOutput).mockReturnValue(null);
+  });
+
+  /** Capture the prompt string passed to runClaudeCode by handleReleaseAudit. */
+  async function captureReleaseAuditPrompt(): Promise<string> {
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+    const calls = vi.mocked(runClaudeCode).mock.calls;
+    if (calls.length === 0) throw new Error('runClaudeCode was not invoked');
+    return calls[calls.length - 1][0];
+  }
+
+  it('prompt documents "findings" as the top-level array key', async () => {
+    const prompt = await captureReleaseAuditPrompt();
+    expect(prompt).toContain('"findings"');
+  });
+
+  it('prompt documents "severity" as the finding severity field', async () => {
+    const prompt = await captureReleaseAuditPrompt();
+    expect(prompt).toContain('"severity"');
+  });
+
+  it('prompt JSON schema block does not use "issues" as the findings key', async () => {
+    const prompt = await captureReleaseAuditPrompt();
+    // Extract the fenced JSON block containing audit_score to scope the check.
+    const match = prompt.match(/```json\s*([\s\S]*?)```/);
+    const block = match ? match[1] : prompt;
+    expect(block).not.toContain('"issues"');
+  });
+
+  it('prompt JSON schema block does not use "level" as the severity field', async () => {
+    const prompt = await captureReleaseAuditPrompt();
+    const match = prompt.match(/```json\s*([\s\S]*?)```/);
+    const block = match ? match[1] : prompt;
+    expect(block).not.toContain('"level"');
   });
 });

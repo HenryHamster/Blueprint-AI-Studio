@@ -12,6 +12,7 @@ Uses isolated in-memory SQLite DB (same pattern as test_pipeline_reliability.py)
 """
 
 import asyncio
+import uuid as _uuid
 import pytest
 import pytest_asyncio
 from datetime import datetime, timedelta, timezone
@@ -35,12 +36,15 @@ from app.models import (
 )
 from app.routers.agent_status import _check_daily_cost_ceiling
 from app.services import (
-    _persist_circuit_breakers,
-    _persist_zone_health,
+    _derive_task_branch,
     _recover_orphaned_tasks,
     _run_auto_archive_cycle,
     _sweep_post_commit_pending,
     gcp_cleanup_service,
+)
+from app.state_persistence import (
+    _persist_circuit_breakers,
+    _persist_zone_health,
 )
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler as _SQLiteTypeCompiler
 
@@ -311,6 +315,53 @@ async def test_orphan_recovery_skips_too_recent_tasks(svc_db, mocker):
     await _recover_orphaned_tasks()
 
     mock_get_token.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_orphan_recovery_uses_project_namespace(svc_db, mocker):
+    """review-respawn derives branches under the project's task_branch_namespace, not hardcoded 'blueprint'."""
+    project = Project(
+        name="AutoProj",
+        user_id="user1",
+        build_config={"task_branch_namespace": "autoproj"},
+    )
+    svc_db.add(project)
+    await svc_db.commit()
+    await svc_db.refresh(project)
+
+    await _make_completed_task(svc_db, project.id, task_type="create")
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh_token", "owner", "repo"),
+    )
+
+    pr_url = "https://github.com/owner/repo/pull/42"
+    mock_gh_resp = MagicMock()
+    mock_gh_resp.status_code = 200
+    mock_gh_resp.json.return_value = [{"html_url": pr_url, "number": 42}]
+    mocker.patch("app.github._github_request", AsyncMock(return_value=mock_gh_resp))
+
+    mock_review_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review"}],
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    mock_spawn = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(mock_review_task, True),
+    )
+
+    await _recover_orphaned_tasks()
+
+    mock_spawn.assert_called_once()
+    _spawned_branch = mock_spawn.call_args[0][4]
+    assert _spawned_branch.startswith("autoproj/"), (
+        f"expected autoproj/* branch, got {_spawned_branch!r}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1713,6 +1764,272 @@ async def test_post_commit_sweep_bump_failure_does_not_poison_batch(svc_db, mock
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# stale_branch_prefixes (project-driven branch cleanup)
+# stale_branch_prefixes (project-driven branch cleanup)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_stale_branch_prefixes_default_when_not_configured(svc_db):
+    """Project without build_config returns the default Blueprint prefixes."""
+    project = await _make_project(svc_db)
+    # Project has no build_config set
+    assert project.build_config is None
+    # Should return the Blueprint defaults
+    assert project.stale_branch_prefixes == ("blueprint/", "research/", "plan/")
+
+
+@pytest.mark.asyncio
+async def test_stale_branch_prefixes_follows_namespace_override(svc_db):
+    """Project with task_branch_namespace override picks up the new prefix."""
+    project = Project(
+        name="Autoproj Project",
+        user_id="user1",
+        build_config={"task_branch_namespace": "autoproj"},
+    )
+    svc_db.add(project)
+    await svc_db.commit()
+    await svc_db.refresh(project)
+    assert project.task_branch_namespace == "autoproj"
+    # Without an explicit stale_branch_prefixes override, the namespace flows
+    # into the default cleanup-prefix tuple so per-project work branches stay
+    # eligible for sweep.
+    assert project.stale_branch_prefixes == ("autoproj/", "research/", "plan/")
+
+
+@pytest.mark.asyncio
+async def test_stale_branch_prefixes_custom_from_build_config(svc_db):
+    """Project with custom prefixes in build_config uses them."""
+    project = Project(
+        name="Custom Project",
+        user_id="user1",
+        build_config={"stale_branch_prefixes": ["feature/", "hotfix/"]},
+    )
+    svc_db.add(project)
+    await svc_db.commit()
+    await svc_db.refresh(project)
+    assert project.stale_branch_prefixes == ("feature/", "hotfix/")
+
+
+@pytest.mark.asyncio
+async def test_stale_branch_prefixes_empty_list_disables_cleanup(svc_db):
+    """Project with empty prefix list in build_config disables cleanup."""
+    project = Project(
+        name="No Cleanup Project",
+        user_id="user1",
+        build_config={"stale_branch_prefixes": []},
+    )
+    svc_db.add(project)
+    await svc_db.commit()
+    await svc_db.refresh(project)
+    # Empty list should be returned as-is (cleanup disabled for this project)
+    assert project.stale_branch_prefixes == ()
+
+
+@pytest.mark.asyncio
+async def test_stale_branch_prefixes_preserves_single_prefix(svc_db):
+    """Project with single custom prefix works correctly."""
+    project = Project(
+        name="Single Prefix Project",
+        user_id="user1",
+        build_config={"stale_branch_prefixes": ["task/"]},
+    )
+    svc_db.add(project)
+    await svc_db.commit()
+    await svc_db.refresh(project)
+    assert project.stale_branch_prefixes == ("task/",)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# protected_branches (project-driven cleanup safety)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_protected_branches_default_when_not_configured(svc_db):
+    """Project without build_config returns the default protected branch set."""
+    project = await _make_project(svc_db)
+    assert project.build_config is None
+    protected = project.protected_branches
+    assert "main" in protected
+    assert "master" in protected
+    assert "develop" in protected
+    assert "dev" in protected
+
+
+@pytest.mark.asyncio
+async def test_protected_branches_custom_from_build_config(svc_db):
+    """Project with custom protected_branches in build_config uses them."""
+    project = Project(
+        name="Custom Protected Project",
+        user_id="user1",
+        build_config={"protected_branches": ["trunk", "stable"]},
+    )
+    svc_db.add(project)
+    await svc_db.commit()
+    await svc_db.refresh(project)
+    protected = project.protected_branches
+    assert "trunk" in protected
+    assert "stable" in protected
+
+
+@pytest.mark.asyncio
+async def test_protected_branches_always_includes_integration_branch(svc_db):
+    """integration_branch is always in the protected set regardless of config."""
+    project = Project(
+        name="Integration Branch Project",
+        user_id="user1",
+        integration_branch="develop-lts",
+        build_config={"protected_branches": ["trunk"]},
+    )
+    svc_db.add(project)
+    await svc_db.commit()
+    await svc_db.refresh(project)
+    assert "develop-lts" in project.protected_branches
+
+
+@pytest.mark.asyncio
+async def test_protected_branches_always_includes_promotion_target(svc_db):
+    """promotion_target is always in the protected set regardless of config."""
+    project = Project(
+        name="Promotion Target Project",
+        user_id="user1",
+        promotion_target="release-lts",
+        build_config={"protected_branches": ["trunk"]},
+    )
+    svc_db.add(project)
+    await svc_db.commit()
+    await svc_db.refresh(project)
+    assert "release-lts" in project.protected_branches
+
+
+# ── _derive_task_branch: task-type -> branch prefix mapping ──────────────────
+
+
+def test_derive_task_branch_known_prefixes():
+    """Each task type with a non-default prefix maps correctly."""
+    task_id = _uuid.UUID("12345678-abcd-ef01-2345-678abcdef012")
+    short = "12345678"
+    assert _derive_task_branch(task_id, "refactor") == f"blueprint/refactor-{short}"
+    assert _derive_task_branch(task_id, "docs") == f"blueprint/docs-{short}"
+    assert _derive_task_branch(task_id, "deps") == f"blueprint/deps-{short}"
+    assert _derive_task_branch(task_id, "migrate") == f"blueprint/migrate-{short}"
+
+
+def test_derive_task_branch_default_prefix():
+    """Task types that map to 'task' all yield blueprint/task-{short_id}."""
+    task_id = _uuid.UUID("12345678-abcd-ef01-2345-678abcdef012")
+    short = "12345678"
+    for task_type in (
+        "create",
+        "qa",
+        "fix",
+        "perf",
+        "security_audit",
+        "debug",
+        "smoketest",
+        None,
+        "",
+    ):
+        assert _derive_task_branch(task_id, task_type) == f"blueprint/task-{short}", (
+            task_type
+        )
+
+
+def test_derive_task_branch_short_id_derivation():
+    """short_id is exactly the first 8 hex chars of the UUID with dashes stripped."""
+    task_id = _uuid.UUID("aabbccdd-1122-3344-5566-778899aabbcc")
+    branch = _derive_task_branch(task_id, "create")
+    assert branch == "blueprint/task-aabbccdd"
+
+
+# ── derive_task_branch: per-project namespace override ───────────────────────
+
+
+def test_derive_task_branch_custom_namespace():
+    """Passing namespace= overrides the leading 'blueprint/' segment."""
+    task_id = _uuid.UUID("12345678-abcd-ef01-2345-678abcdef012")
+    short = "12345678"
+    assert (
+        _derive_task_branch(task_id, "refactor", "autoproj")
+        == f"autoproj/refactor-{short}"
+    )
+    assert _derive_task_branch(task_id, "docs", "bot") == f"bot/docs-{short}"
+    # Default kw matches pre-namespace call sites byte-for-byte.
+    assert _derive_task_branch(task_id, "refactor") == f"blueprint/refactor-{short}"
+
+
+def test_get_project_task_branch_namespace_fallback_chain():
+    """Resolver returns project override → runtime_config → 'blueprint'."""
+    from app.shared_state import (
+        get_project_task_branch_namespace,
+        runtime_config,
+    )
+
+    class _StubProject:
+        def __init__(self, build_config):
+            self.build_config = build_config
+
+    # Per-project build_config wins
+    assert (
+        get_project_task_branch_namespace(
+            _StubProject({"task_branch_namespace": "autoproj"})
+        )
+        == "autoproj"
+    )
+    # Empty build_config falls through to runtime_config default
+    assert get_project_task_branch_namespace(_StubProject({})) == runtime_config.get(
+        "task_branch_namespace", "blueprint"
+    )
+    # No project at all returns runtime_config default
+    assert get_project_task_branch_namespace(None) == runtime_config.get(
+        "task_branch_namespace", "blueprint"
+    )
+
+
+def test_build_branch_short_id_re_custom_namespace():
+    """Per-project regex recognizes branches under a custom namespace."""
+    from app.services import _build_branch_short_id_re
+
+    pattern = _build_branch_short_id_re("autoproj")
+    assert pattern.match("autoproj/refactor-abcdef12").group(1) == "abcdef12"
+    assert pattern.match("autoproj/fix-12345678").group(1) == "12345678"
+    # Default staging prefixes still recognized
+    assert pattern.match("research/abcdef12").group(1) == "abcdef12"
+    assert pattern.match("plan/abcdef12").group(1) == "abcdef12"
+    # The default Blueprint namespace is NOT matched by an autoproj regex.
+    assert pattern.match("blueprint/refactor-abcdef12") is None
+
+
+def test_build_branch_short_id_re_custom_staging_prefixes():
+    """Custom staging prefixes replace the default research/plan pair."""
+    from app.services import _build_branch_short_id_re
+
+    pattern = _build_branch_short_id_re(
+        "autoproj", staging_prefixes=("feature/", "experiment/")
+    )
+    # Custom staging prefixes are matched
+    assert pattern.match("feature/abcdef12").group(1) == "abcdef12"
+    assert pattern.match("experiment/12345678").group(1) == "12345678"
+    # Task namespace branches still matched
+    assert pattern.match("autoproj/fix-abcdef12").group(1) == "abcdef12"
+    # Blueprint defaults NOT matched when overridden
+    assert pattern.match("research/abcdef12") is None
+    assert pattern.match("plan/abcdef12") is None
+
+
+def test_build_branch_short_id_re_default_staging_prefixes_preserved():
+    """Blueprint default staging prefixes work without explicit override."""
+    from app.services import _build_branch_short_id_re, _DEFAULT_STAGING_PREFIXES
+
+    assert _DEFAULT_STAGING_PREFIXES == ("research/", "plan/")
+    pattern = _build_branch_short_id_re("blueprint")
+    assert pattern.match("research/abcdef12").group(1) == "abcdef12"
+    assert pattern.match("plan/abcdef12").group(1) == "abcdef12"
+    assert pattern.match("blueprint/task-abcdef12").group(1) == "abcdef12"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # _ci_backstop_timeout_reason — reason-picker for the CI-wait backstop.
 #
 # Contract test for Fix 2A: when both pipeline gates are open
@@ -1814,17 +2131,14 @@ def test_ci_backstop_reason_existing_branches_unaffected():
     )
 
     # Review approved, CI never completed.
-    assert (
-        "review approved but CI never completed"
-        in _ci_backstop_timeout_reason(
-            ci_ws_val="2026-01-01T00:00:00",
-            ci_ws_valid=True,
-            ci_passed=False,
-            review_approved=True,
-            was_escalated=True,
-            review_summary=None,
-            review_loop={},
-        )
+    assert "review approved but CI never completed" in _ci_backstop_timeout_reason(
+        ci_ws_val="2026-01-01T00:00:00",
+        ci_ws_valid=True,
+        ci_passed=False,
+        review_approved=True,
+        was_escalated=True,
+        review_summary=None,
+        review_loop={},
     )
 
     # Neither gate, escalated.

@@ -1,5 +1,11 @@
-import { useState, useEffect } from 'react';
-import { Plus, Trash2, RefreshCw } from 'lucide-react';
+import { useState, useEffect, useRef } from 'react';
+import { Plus, Trash2, RefreshCw, AlertTriangle } from 'lucide-react';
+
+function isRecognizedLintCmd(cmd: string): boolean {
+  if (!cmd.trim()) return true;
+  const base = cmd.replace(/^(python3?\s+-m\s+|npx\s+|pnpm\s+exec\s+)/, '');
+  return /^(ruff|eslint|mypy|flake8|pyright)\b/.test(base);
+}
 import type { BuildConfig, BuildConfigDirectory } from '../types/project';
 import { apiFetch } from '../api';
 import { SR_CANONICAL_CATEGORIES } from './SrTrendBreakdown';
@@ -55,9 +61,28 @@ export function ProjectBuildConfigSection({
   const [enableFreshReviewer, setEnableFreshReviewer] = useState(
     buildConfig?.enable_fresh_reviewer ?? false
   );
+  const [enableParallelReview, setEnableParallelReview] = useState(
+    buildConfig?.enable_parallel_review ?? false
+  );
+  const [enableParallelFix, setEnableParallelFix] = useState(
+    buildConfig?.enable_parallel_fix ?? false
+  );
+  const [taskBranchNamespace, setTaskBranchNamespace] = useState(
+    buildConfig?.task_branch_namespace ?? ''
+  );
+  const [taskBranchPrefix, setTaskBranchPrefix] = useState(
+    buildConfig?.task_branch_prefix ?? ''
+  );
+  const [prTitlePrefix, setPrTitlePrefix] = useState(
+    buildConfig?.pr_title_prefix ?? ''
+  );
+  const [stagingPrefixes, setStagingPrefixes] = useState<string[]>([]);
+  const [stagingPrefixesIsDefault, setStagingPrefixesIsDefault] = useState(true);
+  const [stagingPrefixesSaving, setStagingPrefixesSaving] = useState(false);
   const [saving, setSaving] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [srTargets, setSrTargets] = useState<Record<string, number>>({});
+  const preservedBranchOnDetect = useRef<{ namespace: string; prefix: string; prTitlePrefix: string } | null>(null);
 
   // Sync state when buildConfig prop changes (e.g. after detect or project switch)
   useEffect(() => {
@@ -65,7 +90,26 @@ export function ProjectBuildConfigSection({
     setGitEmail(buildConfig?.git_user_email ?? 'blueprint-agent@automated.dev');
     setGitName(buildConfig?.git_user_name ?? 'Blueprint Agent');
     setEnableFreshReviewer(buildConfig?.enable_fresh_reviewer ?? false);
+    setEnableParallelReview(buildConfig?.enable_parallel_review ?? false);
+    setEnableParallelFix(buildConfig?.enable_parallel_fix ?? false);
+    const preserved = preservedBranchOnDetect.current;
+    setTaskBranchNamespace(buildConfig?.task_branch_namespace ?? preserved?.namespace ?? '');
+    setTaskBranchPrefix(buildConfig?.task_branch_prefix ?? preserved?.prefix ?? '');
+    setPrTitlePrefix(buildConfig?.pr_title_prefix ?? preserved?.prTitlePrefix ?? '');
+    preservedBranchOnDetect.current = null;
   }, [buildConfig]);
+
+  // Load staging-branch-prefixes from the dedicated endpoint
+  useEffect(() => {
+    if (!projectId) { setStagingPrefixes([]); setStagingPrefixesIsDefault(true); return; }
+    apiFetch(`/api/admin/projects/${projectId}/staging-branch-prefixes`)
+      .then(r => r.json())
+      .then((resp: { staging_branch_prefixes: string[]; is_default: boolean }) => {
+        setStagingPrefixes(resp.staging_branch_prefixes);
+        setStagingPrefixesIsDefault(resp.is_default);
+      })
+      .catch(() => {});
+  }, [projectId]);
 
   // Load SR catch-rate targets from the project when projectId changes
   useEffect(() => {
@@ -88,6 +132,11 @@ export function ProjectBuildConfigSection({
         git_user_email: gitEmail,
         git_user_name: gitName,
         enable_fresh_reviewer: enableFreshReviewer,
+        enable_parallel_review: enableParallelReview,
+        enable_parallel_fix: enableParallelFix,
+        task_branch_namespace: taskBranchNamespace.trim() || undefined,
+        task_branch_prefix: taskBranchPrefix.trim() || undefined,
+        pr_title_prefix: prTitlePrefix.trim() || undefined,
       });
       if (projectId) {
         await apiFetch(`/api/admin/projects/${projectId}`, {
@@ -100,7 +149,41 @@ export function ProjectBuildConfigSection({
     }
   };
 
+  const handleSaveStagingPrefixes = async () => {
+    if (!projectId) return;
+    const trimmed = stagingPrefixes.map(p => p.trim()).filter(Boolean);
+    setStagingPrefixesSaving(true);
+    try {
+      const resp = await apiFetch(`/api/admin/projects/${projectId}/staging-branch-prefixes`, {
+        method: 'PATCH',
+        body: JSON.stringify({ staging_branch_prefixes: trimmed }),
+      });
+      const data = await resp.json();
+      setStagingPrefixes(data.staging_branch_prefixes);
+      setStagingPrefixesIsDefault(data.is_default);
+    } finally {
+      setStagingPrefixesSaving(false);
+    }
+  };
+
+  const handleRevertStagingPrefixes = async () => {
+    if (!projectId) return;
+    setStagingPrefixesSaving(true);
+    try {
+      const resp = await apiFetch(`/api/admin/projects/${projectId}/staging-branch-prefixes`, {
+        method: 'PATCH',
+        body: JSON.stringify({ staging_branch_prefixes: null }),
+      });
+      const data = await resp.json();
+      setStagingPrefixes(data.staging_branch_prefixes);
+      setStagingPrefixesIsDefault(data.is_default);
+    } finally {
+      setStagingPrefixesSaving(false);
+    }
+  };
+
   const handleDetect = async () => {
+    preservedBranchOnDetect.current = { namespace: taskBranchNamespace, prefix: taskBranchPrefix, prTitlePrefix };
     setDetecting(true);
     try {
       await onDetect();
@@ -193,7 +276,7 @@ export function ProjectBuildConfigSection({
             </div>
           </div>
           <p className="text-[11px] text-neutral-600 mb-3">
-            Configure lint, test, and build commands per directory. The agent runs these in CI validation.
+            Configure lint, test, and build commands per directory. The agent runs these in CI validation. Leave <code className="font-mono text-neutral-400">lint</code> empty to auto-infer from directory type and scope to changed files.
           </p>
           <div className="space-y-3">
             {dirs.map((dir, i) => (
@@ -236,9 +319,15 @@ export function ProjectBuildConfigSection({
                       type="text"
                       value={dir.lint_cmd ?? ''}
                       onChange={e => updateDir(i, 'lint_cmd', e.target.value)}
-                      placeholder="ruff check ."
+                      placeholder="(auto-infer by type)"
                       className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded px-2 py-1 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
                     />
+                    {!isRecognizedLintCmd(dir.lint_cmd ?? '') && (
+                      <p className="mt-1 flex items-start gap-1 text-[10px] text-yellow-400" data-testid="lint-cmd-warning">
+                        <AlertTriangle className="w-3 h-3 shrink-0 mt-px" />
+                        Unrecognized — runs against full tree. Use ruff, eslint, mypy, flake8, or pyright for scoped lint.
+                      </p>
+                    )}
                   </div>
                   <div>
                     <label className="block text-[10px] text-neutral-500 mb-0.5 uppercase">Test</label>
@@ -310,7 +399,7 @@ export function ProjectBuildConfigSection({
 
       {/* Agent Behavior */}
       {hasConfig && (
-        <div>
+        <div className="space-y-4">
           <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Agent Behavior</h3>
           <label className="flex items-start gap-3 cursor-pointer group">
             <div className="mt-0.5 shrink-0">
@@ -341,6 +430,183 @@ export function ProjectBuildConfigSection({
               )}
             </div>
           </label>
+          <label className="flex items-start gap-3 cursor-pointer group">
+            <div className="mt-0.5 shrink-0">
+              <input
+                type="checkbox"
+                checked={enableParallelReview}
+                onChange={e => setEnableParallelReview(e.target.checked)}
+                className="sr-only peer"
+                id="parallel-review-toggle"
+              />
+              <div
+                onClick={() => setEnableParallelReview(v => !v)}
+                className={`w-8 h-4 rounded-full transition-colors cursor-pointer ${enableParallelReview ? 'bg-blue-600' : 'bg-neutral-700'} relative`}
+              >
+                <div className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${enableParallelReview ? 'translate-x-4' : 'translate-x-0'}`} />
+              </div>
+            </div>
+            <div>
+              <span className="text-xs text-neutral-200 font-medium">Parallel Review Fan-Out</span>
+              <p className="text-[11px] text-neutral-500 mt-0.5">
+                On rollup PRs touching multiple modules, the reviewer fans out per-module investigation subagents
+                and then does its own cross-module coherence pass. Reduces wall-clock on big reviews; auto-skipped
+                for trivial diffs.
+              </p>
+            </div>
+          </label>
+          <label className="flex items-start gap-3 cursor-pointer group">
+            <div className="mt-0.5 shrink-0">
+              <input
+                type="checkbox"
+                checked={enableParallelFix}
+                onChange={e => setEnableParallelFix(e.target.checked)}
+                className="sr-only peer"
+                id="parallel-fix-toggle"
+              />
+              <div
+                onClick={() => setEnableParallelFix(v => !v)}
+                className={`w-8 h-4 rounded-full transition-colors cursor-pointer ${enableParallelFix ? 'bg-blue-600' : 'bg-neutral-700'} relative`}
+              >
+                <div className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform ${enableParallelFix ? 'translate-x-4' : 'translate-x-0'}`} />
+              </div>
+            </div>
+            <div>
+              <span className="text-xs text-neutral-200 font-medium">Parallel Fix Investigation</span>
+              <p className="text-[11px] text-neutral-500 mt-0.5">
+                On fix iterations with multi-module diffs or many reviewer issues, the fix agent fans out
+                root-cause investigation subagents (investigation only — parent applies all edits).
+                Reduces wall-clock on large rollup fixes; auto-skipped for trivial diffs.
+              </p>
+            </div>
+          </label>
+        </div>
+      )}
+
+      {/* Task Branch Naming */}
+      {hasConfig && (
+        <div>
+          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Task Branch Naming</h3>
+          <p className="text-[11px] text-neutral-600 mb-3">
+            Controls the leading segment of agent task branches. Default namespace is <code className="font-mono text-neutral-400">blueprint</code>.
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs text-neutral-400 mb-1">Namespace</label>
+              <input
+                type="text"
+                value={taskBranchNamespace}
+                onChange={e => setTaskBranchNamespace(e.target.value)}
+                placeholder="blueprint"
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              />
+              <p className="text-[11px] text-neutral-600 mt-1">
+                Leading segment of agent task branches, e.g. <code className="font-mono text-neutral-400">{(taskBranchNamespace.trim() || 'blueprint')}/task-…</code>.
+              </p>
+            </div>
+            <div>
+              <label className="block text-xs text-neutral-400 mb-1">Prefix</label>
+              <input
+                type="text"
+                value={taskBranchPrefix}
+                onChange={e => setTaskBranchPrefix(e.target.value)}
+                placeholder="blueprint/"
+                className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+              />
+              <p className="text-[11px] text-neutral-600 mt-1">
+                Legacy override. Leave blank to derive from namespace.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Staging Branch Prefixes */}
+      {hasConfig && projectId && (
+        <div>
+          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Staging Branch Prefixes</h3>
+          <p className="text-[11px] text-neutral-600 mb-3">
+            Branch prefixes Blueprint treats as staging branches. Gates rollup and auto-merge routing. Defaults to <code className="font-mono text-neutral-400">research/</code> and <code className="font-mono text-neutral-400">plan/</code>.
+          </p>
+          <div className="flex items-center gap-2 mb-3">
+            {stagingPrefixesIsDefault ? (
+              <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-500 border border-neutral-700">global default</span>
+            ) : (
+              <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-cyan-950/40 text-cyan-400 border border-cyan-900/50">override</span>
+            )}
+          </div>
+          <div className="space-y-2 mb-3">
+            {stagingPrefixes.map((prefix, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={prefix}
+                  onChange={e => setStagingPrefixes(prev => prev.map((p, j) => j === i ? e.target.value : p))}
+                  placeholder="research/"
+                  className="flex-1 bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+                />
+                {/* reason: inline icon-only remove button in dense prefix list */}
+                <button
+                  data-viewport-allow-small-target
+                  onClick={() => setStagingPrefixes(prev => prev.filter((_, j) => j !== i))}
+                  className="text-neutral-600 hover:text-red-400 transition-colors shrink-0"
+                  title="Remove prefix"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+          {/* reason: inline text link to add prefix; text-xs single-line button in config section */}
+          <button
+            data-viewport-allow-small-target
+            onClick={() => setStagingPrefixes(prev => [...prev, ''])}
+            className="flex items-center gap-1.5 text-xs text-neutral-500 hover:text-neutral-300 transition-colors mb-4"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            Add prefix
+          </button>
+          <div className="flex items-center gap-3 flex-wrap">
+            {!stagingPrefixesIsDefault && (
+              <button
+                onClick={handleRevertStagingPrefixes}
+                disabled={stagingPrefixesSaving}
+                className="inline-flex items-center justify-center min-h-[44px] bg-neutral-800 hover:bg-neutral-700 text-neutral-400 rounded-lg px-4 py-2 text-xs transition-colors disabled:opacity-50"
+              >
+                {stagingPrefixesSaving ? 'Reverting...' : 'Revert to default'}
+              </button>
+            )}
+            <button
+              onClick={handleSaveStagingPrefixes}
+              disabled={stagingPrefixesSaving || stagingPrefixes.length === 0 || stagingPrefixes.some(p => !p.trim())}
+              className="inline-flex items-center justify-center min-h-[44px] bg-neutral-700 hover:bg-neutral-600 text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50 ml-auto"
+            >
+              {stagingPrefixesSaving ? 'Saving...' : 'Save Staging Prefixes'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* PR Title Prefix */}
+      {hasConfig && (
+        <div>
+          <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Pull Request</h3>
+          <p className="text-[11px] text-neutral-600 mb-3">
+            Optional prefix prepended to agent-authored PR titles. Leave blank to use no prefix.
+          </p>
+          <div>
+            <label className="block text-xs text-neutral-400 mb-1">PR Title Prefix</label>
+            <input
+              type="text"
+              value={prTitlePrefix}
+              onChange={e => setPrTitlePrefix(e.target.value)}
+              placeholder="[Bot]"
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-xs font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+            <p className="text-[11px] text-neutral-600 mt-1">
+              e.g. <code className="font-mono text-neutral-400">{prTitlePrefix.trim() || '[Bot]'}</code>{' '}feat: add new feature
+            </p>
+          </div>
         </div>
       )}
 
@@ -385,12 +651,10 @@ export function ProjectBuildConfigSection({
       {/* Save button */}
       {hasConfig && (
         <div className="flex justify-end pt-2">
-          {/* reason: settings save button; text-xs py-2 is operator-density convention for config panels */}
           <button
-            data-viewport-allow-small-target
             onClick={handleSave}
             disabled={saving}
-            className="bg-neutral-700 hover:bg-neutral-600 text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50"
+            className="inline-flex items-center justify-center min-h-[44px] bg-neutral-700 hover:bg-neutral-600 text-neutral-100 rounded-lg px-5 py-2 text-xs font-medium transition-colors disabled:opacity-50"
           >
             {saving ? 'Saving...' : 'Save Build Config'}
           </button>

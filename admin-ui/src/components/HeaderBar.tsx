@@ -1,13 +1,14 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Network, Compass, Microscope, Archive, Plus, MoreHorizontal, Settings, LayoutGrid, LayoutDashboard, MessageSquare } from 'lucide-react';
+import { Activity, Network, Compass, Microscope, Archive, Plus, MoreHorizontal, Settings, LayoutGrid, LayoutDashboard, MessageSquare, CalendarClock } from 'lucide-react';
 import { MetricsBar } from './MetricsBar';
 import { AutonomousStatus } from './AutonomousStatus';
 import { SettingsDropdown, type MaxPlanAccount, type SectionId } from './SettingsDropdown';
 import type { AuthMode, CategoryRoutingEntry, DeployState, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
 import type { Task } from '../types/task';
-import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, AutoReviewConfig } from '../types/project';
+import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, IssueImplementationConfigUpdate, AutoReviewConfig } from '../types/project';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
+import type { ViewMode } from '../hooks/useViewPreferences';
 
 export interface HeaderBarProps {
   tasks: Task[];
@@ -19,14 +20,15 @@ export interface HeaderBarProps {
   maxConcurrentVMs: number;
   lastRefresh: Date | null;
   onRefresh: () => void;
-  viewMode: 'kanban' | 'pipeline' | 'home';
-  onSetViewMode: (mode: 'kanban' | 'pipeline' | 'home') => void;
+  viewMode: ViewMode;
+  onSetViewMode: (mode: ViewMode) => void;
   showResearchBrowser: boolean;
   onToggleResearchBrowser: () => void;
   showArchive: boolean;
   onToggleArchive: () => void;
   showMessages: boolean;
   onToggleMessages: () => void;
+  onOpenActivityFeed?: () => void;
   openMessageCount: number;
   newSinceLastVisitCount?: number;
   needsAttentionCount?: number;
@@ -53,6 +55,8 @@ export interface HeaderBarProps {
   onUpdateNotifyOnApprovalNeeded: (value: boolean) => void;
   soundOnComplete: boolean;
   onUpdateSoundOnComplete: (value: boolean) => void;
+  notifyOnHighSignalMessage: boolean;
+  onUpdateNotifyOnHighSignalMessage: (value: boolean) => void;
   maxRetries: number;
   maxAutonomousTasksPerHour: number;
   requireApprovalGates: boolean;
@@ -167,9 +171,13 @@ export interface HeaderBarProps {
   onUpdateAutoRemediationConfig: (config: AutoRemediationConfig) => Promise<void>;
   // Issue implementation config (project-scoped)
   issueImplementationConfig: IssueImplementationConfig | null;
-  onUpdateIssueImplementationConfig: (config: IssueImplementationConfig) => Promise<void>;
+  onUpdateIssueImplementationConfig: (config: IssueImplementationConfigUpdate) => Promise<void>;
   autoReviewConfig: AutoReviewConfig | null;
   onUpdateAutoReviewConfig: (patch: Partial<AutoReviewConfig>) => Promise<void>;
+  integrationBranchData: { integration_branch: string; is_default: boolean } | null;
+  onUpdateIntegrationBranch: (branch: string | null) => Promise<void>;
+  promotionTargetData: { promotion_target: string; is_default: boolean } | null;
+  onUpdatePromotionTarget: (branch: string | null) => Promise<void>;
 }
 
 
@@ -190,6 +198,7 @@ export function HeaderBar(props: HeaderBarProps) {
     onToggleArchive,
     showMessages,
     onToggleMessages,
+    onOpenActivityFeed,
     onOpenNewTaskModal,
     onShowDirections,
     wsRef,
@@ -207,6 +216,8 @@ export function HeaderBar(props: HeaderBarProps) {
     onUpdateNotifyOnApprovalNeeded,
     soundOnComplete,
     onUpdateSoundOnComplete,
+    notifyOnHighSignalMessage,
+    onUpdateNotifyOnHighSignalMessage,
     maxRetries,
     maxAutonomousTasksPerHour,
     requireApprovalGates,
@@ -286,6 +297,8 @@ export function HeaderBar(props: HeaderBarProps) {
     anyAutonomousEnabled,
     onPauseAllAutonomous,
   } = props;
+  const currentViewMode = viewMode;
+  const setViewMode = onSetViewMode;
 
   const [showMobileMenu, setShowMobileMenu] = useState(false);
   const [showMobileShortcuts, setShowMobileShortcuts] = useState(false);
@@ -389,6 +402,14 @@ export function HeaderBar(props: HeaderBarProps) {
             >
               <Network className="w-4 h-4" />
             </button>
+            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
+            <button
+              onClick={() => setViewMode('timeline')}
+              className={`p-2 text-xs transition-colors ${currentViewMode === 'timeline' ? 'bg-neutral-700/80 text-neutral-100' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
+              title="Timeline view"
+            >
+              <CalendarClock className="w-4 h-4" />
+            </button>
           </div>
           {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
           <button
@@ -421,6 +442,8 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateNotifyOnApprovalNeeded={onUpdateNotifyOnApprovalNeeded}
           soundOnComplete={soundOnComplete}
           onUpdateSoundOnComplete={onUpdateSoundOnComplete}
+          notifyOnHighSignalMessage={notifyOnHighSignalMessage}
+          onUpdateNotifyOnHighSignalMessage={onUpdateNotifyOnHighSignalMessage}
           maxConcurrentVMs={maxConcurrentVMs}
           onUpdateMaxVMs={onUpdateMaxVMs}
           maxRetries={maxRetries}
@@ -534,6 +557,10 @@ export function HeaderBar(props: HeaderBarProps) {
           onUpdateIssueImplementationConfig={props.onUpdateIssueImplementationConfig}
           autoReviewConfig={props.autoReviewConfig}
           onUpdateAutoReviewConfig={props.onUpdateAutoReviewConfig}
+          integrationBranchData={props.integrationBranchData}
+          onUpdateIntegrationBranch={props.onUpdateIntegrationBranch}
+          promotionTargetData={props.promotionTargetData}
+          onUpdatePromotionTarget={props.onUpdatePromotionTarget}
         />
 
         {/* More secondary buttons — desktop only */}
@@ -568,6 +595,19 @@ export function HeaderBar(props: HeaderBarProps) {
               </span>
             )}
           </button>
+          {onOpenActivityFeed && (
+            <>
+              {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
+              <button
+                onClick={onOpenActivityFeed}
+                className="p-2 rounded-md text-xs transition-colors flex items-center gap-1.5 text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800"
+                title="Chronological activity stream"
+              >
+                <Activity className="w-4 h-4" />
+                <span className="hidden xl:inline">Activity</span>
+              </button>
+            </>
+          )}
           {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
           <button
             onClick={onToggleResearchBrowser}
@@ -627,6 +667,13 @@ export function HeaderBar(props: HeaderBarProps) {
                 <span>Pipeline view</span>
               </button>
               <button
+                onClick={() => { setViewMode('timeline'); setShowMobileMenu(false); }}
+                className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${currentViewMode === 'timeline' ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
+              >
+                <CalendarClock className="w-4 h-4 shrink-0" />
+                <span>Timeline view</span>
+              </button>
+              <button
                 onClick={() => { onToggleResearchBrowser(); setShowMobileMenu(false); }}
                 className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
               >
@@ -663,6 +710,15 @@ export function HeaderBar(props: HeaderBarProps) {
                   </span>
                 )}
               </button>
+              {onOpenActivityFeed && (
+                <button
+                  onClick={() => { onOpenActivityFeed(); setShowMobileMenu(false); }}
+                  className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
+                >
+                  <Activity className="w-4 h-4 shrink-0" />
+                  <span>Activity stream</span>
+                </button>
+              )}
               <button
                 onClick={() => { onShowDirections(); setShowMobileMenu(false); }}
                 className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
@@ -686,6 +742,7 @@ export function HeaderBar(props: HeaderBarProps) {
                       ['R', 'Refresh tasks'],
                       ['1', 'Kanban view'],
                       ['2', 'Pipeline view'],
+                      ['3', 'Timeline view'],
                       ['D', 'Toggle directions'],
                       ['S', 'Toggle settings'],
                       ['M', 'Toggle metrics'],

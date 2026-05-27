@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import type { Task } from './types/task';
-import type { Project, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, AutoReviewConfig } from './types/project';
+import type { Project, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, IssueImplementationConfigUpdate, AutoReviewConfig } from './types/project';
 import type { Alert } from './types/alert';
 import { API_BASE_URL, apiFetch, authHeaders, authGet } from './api';
 import { useToasts } from './components/Toasts';
@@ -54,6 +54,8 @@ export function useAppState() {
   } = useArchive(addToast);
 
   const fetchTasksRef = useRef<() => Promise<void>>(async () => {});
+  const defaultTaskBranchRef = useRef<string | null>(null);
+  const selectedProjectRepoRef = useRef<string | null>(null);
 
   // Moved before useDeploymentState so it can be passed as a parameter
   const [selectedProjectId, setSelectedProjectId] = usePersistedState<string | null>('selectedProject', null);
@@ -73,7 +75,7 @@ export function useAppState() {
     trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
   } = useLogViewer({ fetchTasksRef, setDeployState });
 
-  const { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds } = useSearchFilters();
+  const { searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter } = useSearchFilters();
 
   const {
     showResearchBrowser, setShowResearchBrowser,
@@ -99,8 +101,8 @@ export function useAppState() {
     setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
-    openNewTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
-  } = useTaskModal(defaultTaskType, addToast, fetchTasksRef);
+    openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
+  } = useTaskModal(defaultTaskType, addToast, fetchTasksRef, defaultTaskBranchRef, selectedProjectRepoRef);
 
   const {
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour,
@@ -176,6 +178,7 @@ export function useAppState() {
   const [notifyOnFail, setNotifyOnFail] = usePersistedState<boolean>('notifyOnFail', false);
   const [notifyOnApprovalNeeded, setNotifyOnApprovalNeeded] = usePersistedState<boolean>('notifyOnApprovalNeeded', false);
   const [soundOnComplete, setSoundOnComplete] = usePersistedState<boolean>('soundOnComplete', false);
+  const [notifyOnHighSignalMessage, setNotifyOnHighSignalMessage] = usePersistedState<boolean>('notifyOnHighSignalMessage', false);
   const prevTasksRef = useRef<Task[]>([]);
   const notifyRef = useRef(notifyOnComplete);
   useEffect(() => { notifyRef.current = notifyOnComplete; }, [notifyOnComplete]);
@@ -185,6 +188,8 @@ export function useAppState() {
   useEffect(() => { notifyOnApprovalNeededRef.current = notifyOnApprovalNeeded; }, [notifyOnApprovalNeeded]);
   const soundOnCompleteRef = useRef(soundOnComplete);
   useEffect(() => { soundOnCompleteRef.current = soundOnComplete; }, [soundOnComplete]);
+  const notifyOnHighSignalMessageRef = useRef(notifyOnHighSignalMessage);
+  useEffect(() => { notifyOnHighSignalMessageRef.current = notifyOnHighSignalMessage; }, [notifyOnHighSignalMessage]);
 
   // Project dashboard state
   const [projects, setProjects] = useState<Project[]>([]);
@@ -375,6 +380,9 @@ export function useAppState() {
           break;
         case '2':
           setViewMode('pipeline');
+          break;
+        case '3':
+          setViewMode('timeline');
           break;
         case 'd':
           setShowDirections(prev => !prev);
@@ -1011,15 +1019,17 @@ export function useAppState() {
       .catch(() => {});
   }, [selectedProjectId]);
 
-  const handleUpdateIssueImplementationConfig = async (config: IssueImplementationConfig) => {
+  const handleUpdateIssueImplementationConfig = async (update: IssueImplementationConfigUpdate) => {
     if (!selectedProjectId) return;
     const prev = issueImplementationConfig;
-    setIssueImplementationConfig(config);
+    // Optimistic update: preserve server-derived base_branch from prev/default.
+    if (prev) setIssueImplementationConfig({ ...prev, ...update });
     try {
       const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/issue-implementation`, {
         method: 'PATCH',
         headers: await authHeaders(),
-        body: JSON.stringify(config),
+        // base_branch is server-derived from project.integration_branch and rejected by the PATCH validator.
+        body: JSON.stringify(update),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
@@ -1065,6 +1075,128 @@ export function useAppState() {
     }
   };
 
+  // ── Integration branch config (project-scoped) ───────────────────────────
+  const [integrationBranchData, setIntegrationBranchData] = useState<{ integration_branch: string; is_default: boolean } | null>(null);
+  const [integrationBranchLoaded, setIntegrationBranchLoaded] = useState(false);
+  const [integrationBranchError, setIntegrationBranchError] = useState<string | null>(null);
+
+  // ── Promotion target config (project-scoped) ─────────────────────────────
+  const [promotionTargetData, setPromotionTargetData] = useState<{ promotion_target: string; is_default: boolean } | null>(null);
+  const [promotionTargetLoaded, setPromotionTargetLoaded] = useState(false);
+  const [promotionTargetError, setPromotionTargetError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setIntegrationBranchData(null);
+      setIntegrationBranchLoaded(false);
+      setIntegrationBranchError(null);
+      return;
+    }
+    authGet(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/integration-branch`)
+      .then(res => res.ok ? res.json() : null)
+      .then(data => {
+        if (data?.integration_branch !== undefined) setIntegrationBranchData({ integration_branch: data.integration_branch, is_default: data.is_default });
+        setIntegrationBranchLoaded(true);
+        setIntegrationBranchError(null);
+      })
+      .catch(() => {
+        setIntegrationBranchLoaded(true);
+        setIntegrationBranchError('Failed to load integration branch');
+      });
+  }, [selectedProjectId]);
+
+  const handleUpdateIntegrationBranch = async (branch: string | null) => {
+    if (!selectedProjectId) return;
+    const prev = integrationBranchData;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/integration-branch`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify({ integration_branch: branch }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setIntegrationBranchData({ integration_branch: data.integration_branch, is_default: data.is_default });
+      addToast('Integration branch saved', 'success');
+    } catch {
+      setIntegrationBranchData(prev);
+      addToast('Failed to save integration branch', 'error');
+      throw new Error('Failed to save integration branch');
+    }
+  };
+
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setPromotionTargetData(null);
+      setPromotionTargetLoaded(false);
+      setPromotionTargetError(null);
+      return;
+    }
+    authGet(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/promotion-target`)
+      .then(res => res.ok ? res.json() : null)
+      .then(data => {
+        if (data?.promotion_target !== undefined) setPromotionTargetData({ promotion_target: data.promotion_target, is_default: data.is_default });
+        setPromotionTargetLoaded(true);
+        setPromotionTargetError(null);
+      })
+      .catch(() => {
+        setPromotionTargetLoaded(true);
+        setPromotionTargetError('Failed to load promotion target');
+      });
+  }, [selectedProjectId]);
+
+  useEffect(() => {
+    const project = projects.find(p => p.id === selectedProjectId) ?? null;
+    selectedProjectRepoRef.current = project ? `${project.github_owner}/${project.github_repo}` : null;
+    const branchConfigReady = !selectedProjectId || (
+      integrationBranchLoaded &&
+      promotionTargetLoaded &&
+      !integrationBranchError &&
+      !promotionTargetError
+    );
+    defaultTaskBranchRef.current = branchConfigReady
+      ? promotionTargetData?.promotion_target || integrationBranchData?.integration_branch || null
+      : null;
+  }, [
+    projects,
+    selectedProjectId,
+    promotionTargetData,
+    integrationBranchData,
+    integrationBranchLoaded,
+    promotionTargetLoaded,
+    integrationBranchError,
+    promotionTargetError,
+  ]);
+
+  const taskBranchDefaultsReady = !selectedProjectId || (
+    integrationBranchLoaded &&
+    promotionTargetLoaded &&
+    !integrationBranchError &&
+    !promotionTargetError
+  );
+  const taskBranchDefaultsLoading = Boolean(selectedProjectId) && !taskBranchDefaultsReady && !integrationBranchError && !promotionTargetError;
+  const taskBranchDefaultsError = integrationBranchError || promotionTargetError;
+
+  const handleUpdatePromotionTarget = async (branch: string | null) => {
+    if (!selectedProjectId) return;
+    const prev = promotionTargetData;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${selectedProjectId}/promotion-target`, {
+        method: 'PATCH',
+        headers: await authHeaders(),
+        body: JSON.stringify({ promotion_target: branch }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setPromotionTargetData({ promotion_target: data.promotion_target, is_default: data.is_default });
+      addToast('Promotion target saved', 'success');
+    } catch {
+      setPromotionTargetData(prev);
+      addToast('Failed to save promotion target', 'error');
+      throw new Error('Failed to save promotion target');
+    }
+  };
+
   return {
     // Auth
     user, authLoading, userRole, accessDenied, error, setError,
@@ -1087,7 +1219,7 @@ export function useAppState() {
     // Column preferences
     columnPrefs, setColumnPrefs,
     // Search/filter
-    searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds,
+    searchQuery, setSearchQuery, taskTypeFilter, setTaskTypeFilter, statusFilter, setStatusFilter, dateRange, setDateRange, blockedFilter, setBlockedFilter, requiresApproval, setRequiresApproval, stuckFilter, setStuckFilter, stuckMinSeconds, setStuckMinSeconds, failureClassFilter, setFailureClassFilter,
     // Projects
     projects, projectsFetchError, selectedProjectId, setSelectedProjectId, handlePauseAllAutonomous, fetchProjects,
     // Log viewer
@@ -1106,13 +1238,15 @@ export function useAppState() {
     setNewTaskType, setNewTaskPrNumber, setNewTaskPrBranch, setNewTaskModel, setNewTaskEffort,
     repoOptions, repoLoading, repoError, useManualRepo, setUseManualRepo,
     branchOptions, branchLoading, branchError, useManualBranch, setUseManualBranch, setBranchOptions,
-    openNewTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
+    taskBranchDefaultsReady, taskBranchDefaultsLoading, taskBranchDefaultsError,
+    openNewTaskModal, openDuplicateTaskModal, openPrefilledTaskModal, handleRepoChange, handleCreateTask, getDefaultModelForType, getDefaultEffortForType,
     // Defaults
     defaultTaskType, setDefaultTaskType,
     notifyOnComplete, setNotifyOnComplete,
     notifyOnFail, setNotifyOnFail,
     notifyOnApprovalNeeded, setNotifyOnApprovalNeeded,
     soundOnComplete, setSoundOnComplete,
+    notifyOnHighSignalMessage, setNotifyOnHighSignalMessage,
     // Settings
     showSettings, settingsRef, handleToggleSettings,
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour, usingMaxPlan,
@@ -1131,6 +1265,8 @@ export function useAppState() {
     autoRemediationConfig, autoRemediationStats, handleUpdateAutoRemediationConfig,
     issueImplementationConfig, handleUpdateIssueImplementationConfig,
     autoReviewConfig, handleUpdateAutoReviewConfig,
+    integrationBranchData, handleUpdateIntegrationBranch,
+    promotionTargetData, handleUpdatePromotionTarget,
     // Max plan accounts
     maxPlanAccounts, newAccountName, setNewAccountName, newAccountProvider, setNewAccountProvider,
     newAccountAuthMode, setNewAccountAuthMode, newAccountToken, setNewAccountToken,

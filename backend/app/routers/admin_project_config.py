@@ -7,6 +7,7 @@ with module-level defaults, then persists partial updates back into
 ``Project.design_doc``.
 """
 
+import re
 import uuid
 import logging
 from typing import Dict, Any
@@ -23,6 +24,16 @@ from app.database import get_session
 from app.models import Task, TaskStatus, _utcnow
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project_with_role
+from app.task_locking import lock_project_or_429, with_design_doc_locked
+from app.playbook_storage import archive_playbook_entry
+from app.shared_state import (
+    backfill_branch_columns,
+    backfill_task_branch_namespace,
+    get_project_integration_branch,
+    get_project_promotion_target,
+    get_project_task_branch_namespace,
+)
+from app.vm_cost_rates import VM_COST_RATES
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +50,9 @@ async def cost_summary(
     days: int = Query(7, ge=1, le=365),
     current_user: dict = Depends(require_admin),
 ):
-    # e2-standard-2 pricing: ~$0.067/hr on-demand, ~$0.020/hr spot
-    ON_DEMAND_RATE = 0.067 / 3600  # per second
-    SPOT_RATE = 0.020 / 3600
+    # VM cost rates are sourced from vm_cost_rates.py for e2-standard-2
+    ON_DEMAND_RATE = VM_COST_RATES["e2-standard-2"][0] / 3600  # per second
+    SPOT_RATE = VM_COST_RATES["e2-standard-2"][1] / 3600
 
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
     duration_seconds = func.extract(
@@ -94,12 +105,19 @@ async def cost_summary(
 
 _AUTO_REMEDIATION_DEFAULTS: Dict[str, Any] = {
     "enabled": False,
-    "branch_whitelist": ["main", "master"],
+    "branch_whitelist": [],
     "max_per_hour": 2,
     "max_concurrent": 2,
     "require_review": True,
     "suspended_branches": [],
 }
+
+
+def _build_auto_remediation_defaults(project) -> Dict[str, Any]:
+    integration = get_project_integration_branch(project)
+    promotion = get_project_promotion_target(project)
+    branch_whitelist = list(dict.fromkeys([integration, promotion]))
+    return {**_AUTO_REMEDIATION_DEFAULTS, "branch_whitelist": branch_whitelist}
 
 
 @router.get("/projects/{project_id}/auto-remediation")
@@ -113,7 +131,7 @@ async def get_auto_remediation_config(
         project_id, current_user["user_id"], session, "member"
     )
     stored = (project.design_doc or {}).get("_auto_remediation", {})
-    config = {**_AUTO_REMEDIATION_DEFAULTS, **stored}
+    config = {**_build_auto_remediation_defaults(project), **stored}
 
     # Compute activity stats from tasks spawned by auto-remediation
     now = _utcnow()
@@ -192,7 +210,7 @@ async def update_auto_remediation_config(
     current_user: dict = Depends(get_current_user),
 ):
     """Update auto-remediation config fields (partial update)."""
-    project = await _get_user_project_with_role(
+    await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
     )
 
@@ -243,7 +261,8 @@ async def update_auto_remediation_config(
                 status_code=422, detail="'suspended_branches' must be a list of strings"
             )
 
-    # Merge into existing stored config
+    # Lock project row before read-modify-write to prevent lost updates.
+    project = await lock_project_or_429(session, project_id)
     design_doc = dict(project.design_doc or {})
     stored = dict(design_doc.get("_auto_remediation", {}))
     stored.update(body)
@@ -253,7 +272,7 @@ async def update_auto_remediation_config(
     session.add(project)
     await session.commit()
 
-    config = {**_AUTO_REMEDIATION_DEFAULTS, **stored}
+    config = {**_build_auto_remediation_defaults(project), **stored}
     return {"project_id": str(project_id), "config": config}
 
 
@@ -263,12 +282,18 @@ async def update_auto_remediation_config(
 
 _ISSUE_IMPLEMENTATION_DEFAULTS: Dict[str, Any] = {
     "enabled": False,
-    "trigger_label": "blueprint:implement",
+    "trigger_label": "auto:implement",
     "max_per_hour": 3,
     "max_concurrent": 3,
-    "base_branch": "main",
     "default_effort": "high",
 }
+
+
+def _build_issue_implementation_defaults(project) -> Dict[str, Any]:
+    return {
+        **_ISSUE_IMPLEMENTATION_DEFAULTS,
+        "base_branch": get_project_integration_branch(project),
+    }
 
 
 @router.get("/projects/{project_id}/issue-implementation")
@@ -281,8 +306,12 @@ async def get_issue_implementation_config(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
-    stored = (project.design_doc or {}).get("_issue_implementation", {})
-    config = {**_ISSUE_IMPLEMENTATION_DEFAULTS, **stored}
+    stored = {
+        k: v
+        for k, v in (project.design_doc or {}).get("_issue_implementation", {}).items()
+        if k != "base_branch"
+    }
+    config = {**_build_issue_implementation_defaults(project), **stored}
     return {"project_id": str(project_id), "config": config}
 
 
@@ -294,7 +323,7 @@ async def update_issue_implementation_config(
     current_user: dict = Depends(get_current_user),
 ):
     """Update issue-implementation config fields (partial update)."""
-    project = await _get_user_project_with_role(
+    await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
     )
 
@@ -332,13 +361,6 @@ async def update_issue_implementation_config(
                 detail="'max_concurrent' must be an integer between 1 and 5",
             )
 
-    if "base_branch" in body:
-        v = body["base_branch"]
-        if not isinstance(v, str) or not v.strip():
-            raise HTTPException(
-                status_code=422, detail="'base_branch' must be a non-empty string"
-            )
-
     if "default_effort" in body:
         v = body["default_effort"]
         if not isinstance(v, str) or v not in ("low", "medium", "high"):
@@ -347,9 +369,14 @@ async def update_issue_implementation_config(
                 detail="'default_effort' must be one of: low, medium, high",
             )
 
-    # Merge into existing stored config
+    # Lock project row before read-modify-write to prevent lost updates.
+    project = await lock_project_or_429(session, project_id)
     design_doc = dict(project.design_doc or {})
-    stored = dict(design_doc.get("_issue_implementation", {}))
+    stored = {
+        k: v
+        for k, v in design_doc.get("_issue_implementation", {}).items()
+        if k != "base_branch"
+    }
     stored.update(body)
     design_doc["_issue_implementation"] = stored
     project.design_doc = design_doc
@@ -357,7 +384,7 @@ async def update_issue_implementation_config(
     session.add(project)
     await session.commit()
 
-    config = {**_ISSUE_IMPLEMENTATION_DEFAULTS, **stored}
+    config = {**_build_issue_implementation_defaults(project), **stored}
     return {"project_id": str(project_id), "config": config}
 
 
@@ -395,7 +422,7 @@ async def update_auto_review_config(
     current_user: dict = Depends(get_current_user),
 ):
     """Update auto-review config fields (partial update)."""
-    project = await _get_user_project_with_role(
+    await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
     )
 
@@ -426,7 +453,8 @@ async def update_auto_review_config(
                 detail="'max_concurrent' must be an integer between 1 and 10",
             )
 
-    # Merge into existing stored config
+    # Lock project row before read-modify-write to prevent lost updates.
+    project = await lock_project_or_429(session, project_id)
     design_doc = dict(project.design_doc or {})
     stored = dict(design_doc.get("_auto_review", {}))
     stored.update(body)
@@ -438,6 +466,475 @@ async def update_auto_review_config(
 
     config = {**_AUTO_REVIEW_DEFAULTS, **stored}
     return {"project_id": str(project_id), "config": config}
+
+
+# ---------------------------------------------------------------------------
+# Integration-branch config endpoints
+# ---------------------------------------------------------------------------
+
+_VALID_BRANCH_RE = re.compile(r"^[a-zA-Z0-9._/\-]+$")
+
+
+async def _validate_branch_exists_on_remote(project, branch: str) -> None:
+    """Confirm that branch exists on the project's GitHub remote.
+
+    Raises HTTP 422 if the branch is not found, HTTP 502 if the GitHub
+    credential cannot be resolved.  Does nothing when the project has no
+    GitHub integration configured (github_owner/github_repo are None).
+    """
+    if not project.github_owner or not project.github_repo:
+        return
+
+    from app.github import get_branch_sha, get_repo_installation_token
+
+    token = await get_repo_installation_token(project.github_owner, project.github_repo)
+    if token is None:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"GitHub credential unavailable for "
+                f"{project.github_owner}/{project.github_repo} — "
+                "cannot validate branch existence"
+            ),
+        )
+
+    try:
+        await get_branch_sha(token, project.github_owner, project.github_repo, branch)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f'Branch "{branch}" does not exist on '
+                    f"{project.github_owner}/{project.github_repo}"
+                ),
+            )
+        raise
+
+
+@router.get("/projects/{project_id}/integration-branch")
+async def get_integration_branch_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the per-project integration branch (trunk for autonomous spawns)."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    return {
+        "project_id": str(project_id),
+        "integration_branch": get_project_integration_branch(project),
+        "is_default": project.integration_branch is None,
+    }
+
+
+@router.patch("/projects/{project_id}/integration-branch")
+async def update_integration_branch_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Set the per-project integration branch. Pass null to revert to global default."""
+    precheck_project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if "integration_branch" not in body:
+        raise HTTPException(
+            status_code=422, detail="Request body must include 'integration_branch'"
+        )
+
+    branch = body["integration_branch"]
+    if branch is not None:
+        if not isinstance(branch, str) or not branch.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="'integration_branch' must be a non-empty string or null",
+            )
+        if not _VALID_BRANCH_RE.match(branch):
+            raise HTTPException(
+                status_code=422,
+                detail="'integration_branch' contains invalid characters",
+            )
+        await _validate_branch_exists_on_remote(precheck_project, branch)
+
+    project = await lock_project_or_429(session, project_id)
+    project.integration_branch = branch
+    session.add(project)
+    await session.commit()
+
+    return {
+        "project_id": str(project_id),
+        "integration_branch": get_project_integration_branch(project),
+        "is_default": project.integration_branch is None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Promotion-target config endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/projects/{project_id}/promotion-target")
+async def get_promotion_target_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the per-project promotion/LTS target branch."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    return {
+        "project_id": str(project_id),
+        "promotion_target": get_project_promotion_target(project),
+        "is_default": project.promotion_target is None,
+    }
+
+
+@router.patch("/projects/{project_id}/promotion-target")
+async def update_promotion_target_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Set the per-project promotion/LTS target branch. Pass null to revert to global default."""
+    precheck_project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if "promotion_target" not in body:
+        raise HTTPException(
+            status_code=422, detail="Request body must include 'promotion_target'"
+        )
+
+    branch = body["promotion_target"]
+    if branch is not None:
+        if not isinstance(branch, str) or not branch.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="'promotion_target' must be a non-empty string or null",
+            )
+        if not _VALID_BRANCH_RE.match(branch):
+            raise HTTPException(
+                status_code=422,
+                detail="'promotion_target' contains invalid characters",
+            )
+        await _validate_branch_exists_on_remote(precheck_project, branch)
+
+    project = await lock_project_or_429(session, project_id)
+    project.promotion_target = branch
+    session.add(project)
+    await session.commit()
+
+    return {
+        "project_id": str(project_id),
+        "promotion_target": get_project_promotion_target(project),
+        "is_default": project.promotion_target is None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Task-branch namespace / prefix config endpoints
+# ---------------------------------------------------------------------------
+
+
+def _build_config_has_key(project, key: str) -> bool:
+    value = (project.build_config or {}).get(key)
+    return value not in (None, "")
+
+
+@router.get("/projects/{project_id}/task-branch-namespace")
+async def get_task_branch_namespace_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the per-project task-branch namespace (leading segment of agent task branches)."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    return {
+        "project_id": str(project_id),
+        "task_branch_namespace": get_project_task_branch_namespace(project),
+        "is_default": not _build_config_has_key(project, "task_branch_namespace"),
+    }
+
+
+@router.patch("/projects/{project_id}/task-branch-namespace")
+async def update_task_branch_namespace_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Set the per-project task-branch namespace. Pass null to revert to the global default."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if "task_branch_namespace" not in body:
+        raise HTTPException(
+            status_code=422,
+            detail="Request body must include 'task_branch_namespace'",
+        )
+
+    namespace = body["task_branch_namespace"]
+    if namespace is not None:
+        if not isinstance(namespace, str) or not namespace.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="'task_branch_namespace' must be a non-empty string or null",
+            )
+        if not _VALID_BRANCH_RE.match(namespace):
+            raise HTTPException(
+                status_code=422,
+                detail="'task_branch_namespace' contains invalid characters",
+            )
+        if "/" in namespace:
+            raise HTTPException(
+                status_code=422,
+                detail="'task_branch_namespace' must be a single segment (no '/')",
+            )
+
+    project = await lock_project_or_429(session, project_id)
+    build_config = dict(project.build_config or {})
+    if namespace is None:
+        build_config.pop("task_branch_namespace", None)
+    else:
+        build_config["task_branch_namespace"] = namespace
+    project.build_config = build_config
+    flag_modified(project, "build_config")
+    session.add(project)
+    await session.commit()
+
+    return {
+        "project_id": str(project_id),
+        "task_branch_namespace": get_project_task_branch_namespace(project),
+        "is_default": not _build_config_has_key(project, "task_branch_namespace"),
+    }
+
+
+@router.get("/projects/{project_id}/task-branch-prefix")
+async def get_task_branch_prefix_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the per-project task-branch prefix (defaults to ``{namespace}/`` when unset)."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    return {
+        "project_id": str(project_id),
+        "task_branch_prefix": project.task_branch_prefix,
+        "is_default": not _build_config_has_key(project, "task_branch_prefix"),
+    }
+
+
+@router.patch("/projects/{project_id}/task-branch-prefix")
+async def update_task_branch_prefix_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Set the per-project task-branch prefix. Pass null to revert to the derived default."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if "task_branch_prefix" not in body:
+        raise HTTPException(
+            status_code=422,
+            detail="Request body must include 'task_branch_prefix'",
+        )
+
+    prefix = body["task_branch_prefix"]
+    if prefix is not None:
+        if not isinstance(prefix, str) or not prefix.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="'task_branch_prefix' must be a non-empty string or null",
+            )
+        if not _VALID_BRANCH_RE.match(prefix):
+            raise HTTPException(
+                status_code=422,
+                detail="'task_branch_prefix' contains invalid characters",
+            )
+
+    project = await lock_project_or_429(session, project_id)
+    build_config = dict(project.build_config or {})
+    if prefix is None:
+        build_config.pop("task_branch_prefix", None)
+    else:
+        build_config["task_branch_prefix"] = prefix
+    project.build_config = build_config
+    flag_modified(project, "build_config")
+    session.add(project)
+    await session.commit()
+
+    return {
+        "project_id": str(project_id),
+        "task_branch_prefix": project.task_branch_prefix,
+        "is_default": not _build_config_has_key(project, "task_branch_prefix"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Staging-branch-prefixes config endpoints
+# ---------------------------------------------------------------------------
+
+_DEFAULT_STAGING_BRANCH_PREFIXES = ["research/", "plan/"]
+
+
+def _get_staging_branch_prefixes(project) -> list[str]:
+    configured = (project.build_config or {}).get("staging_branch_prefixes")
+    if configured is not None:
+        prefixes = [str(p).strip() for p in configured if str(p).strip()]
+        if prefixes:
+            return prefixes
+    return list(_DEFAULT_STAGING_BRANCH_PREFIXES)
+
+
+@router.get("/projects/{project_id}/staging-branch-prefixes")
+async def get_staging_branch_prefixes_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the per-project staging-branch prefixes (gates rollup/auto-merge routing)."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    return {
+        "project_id": str(project_id),
+        "staging_branch_prefixes": _get_staging_branch_prefixes(project),
+        "is_default": not _build_config_has_key(project, "staging_branch_prefixes"),
+    }
+
+
+@router.patch("/projects/{project_id}/staging-branch-prefixes")
+async def update_staging_branch_prefixes_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Set the per-project staging-branch prefixes. Pass null to revert to the global default."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if "staging_branch_prefixes" not in body:
+        raise HTTPException(
+            status_code=422,
+            detail="Request body must include 'staging_branch_prefixes'",
+        )
+
+    prefixes = body["staging_branch_prefixes"]
+    if prefixes is not None:
+        if not isinstance(prefixes, list):
+            raise HTTPException(
+                status_code=422,
+                detail="'staging_branch_prefixes' must be a list of strings or null",
+            )
+        trimmed = [p.strip() if isinstance(p, str) else None for p in prefixes]
+        if any(p is None or not p for p in trimmed):
+            raise HTTPException(
+                status_code=422,
+                detail="'staging_branch_prefixes' must not contain empty or whitespace-only entries",
+            )
+        if not trimmed:
+            raise HTTPException(
+                status_code=422,
+                detail="'staging_branch_prefixes' must contain at least one prefix",
+            )
+        prefixes = trimmed
+
+    project = await lock_project_or_429(session, project_id)
+    build_config = dict(project.build_config or {})
+    if prefixes is None:
+        build_config.pop("staging_branch_prefixes", None)
+    else:
+        build_config["staging_branch_prefixes"] = prefixes
+    project.build_config = build_config
+    flag_modified(project, "build_config")
+    session.add(project)
+    await session.commit()
+
+    return {
+        "project_id": str(project_id),
+        "staging_branch_prefixes": _get_staging_branch_prefixes(project),
+        "is_default": not _build_config_has_key(project, "staging_branch_prefixes"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Broadcast-limit config endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/projects/{project_id}/broadcast-limit")
+async def get_broadcast_limit_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the per-project broadcast limit (None means use the global default)."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    stored = (project.design_doc or {}).get("_broadcast_limit")
+    return {
+        "project_id": str(project_id),
+        "broadcast_limit": stored,
+        "is_default": stored is None,
+    }
+
+
+@router.patch("/projects/{project_id}/broadcast-limit")
+async def update_broadcast_limit_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Set the per-project broadcast limit. Pass null to revert to the global default."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    if "broadcast_limit" not in body:
+        raise HTTPException(
+            status_code=422, detail="Request body must include 'broadcast_limit'"
+        )
+
+    value = body["broadcast_limit"]
+    if value is not None:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise HTTPException(
+                status_code=422,
+                detail="'broadcast_limit' must be a non-negative integer or null",
+            )
+
+    def _apply(doc: dict) -> None:
+        if value is None:
+            doc.pop("_broadcast_limit", None)
+        else:
+            doc["_broadcast_limit"] = value
+
+    await with_design_doc_locked(session, project_id, _apply)
+    await session.commit()
+
+    return {
+        "project_id": str(project_id),
+        "broadcast_limit": value,
+        "is_default": value is None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -460,9 +957,11 @@ async def update_playbook_entry(
             status_code=422, detail="'action' must be one of: promote, demote, archive"
         )
 
-    project = await _get_user_project_with_role(
+    await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+    # Lock project row before read-modify-write to prevent lost updates.
+    project = await lock_project_or_429(session, project_id)
     doc = dict(project.design_doc or {})
     full_key = f"playbook/{key}"
     if full_key not in doc or not isinstance(doc[full_key], dict):
@@ -485,12 +984,7 @@ async def update_playbook_entry(
         entry["updated_at"] = now_iso
         doc[full_key] = entry
     elif action == "archive":
-        victim = dict(doc.pop(full_key))
-        victim["_archived_key"] = full_key
-        victim["_archived_at"] = now_iso
-        archive = list(doc.get("playbook_archive") or [])
-        archive.append(victim)
-        doc["playbook_archive"] = archive[-50:]
+        archive_playbook_entry(doc, full_key, archived_at=now_iso)
 
     project.design_doc = doc
     flag_modified(project, "design_doc")
@@ -517,3 +1011,29 @@ async def update_playbook_entry(
             "effectiveness_score": min(round(confirmed / max(referenced, 1), 3), 1.0),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Branch-column backfill endpoint
+# ---------------------------------------------------------------------------
+
+
+@router.post("/projects/{project_id}/backfill-branches")
+async def backfill_project_branches(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Re-run the integration_branch / promotion_target backfill for a single project.
+
+    Only writes NULL columns — populated columns are left untouched.  Useful when
+    a project was onboarded before migrations 0124/0125 or when the initial GitHub
+    API call failed and the operator has since fixed credentials.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    summary = await backfill_branch_columns(session, project_id=project_id)
+    ns_summary = await backfill_task_branch_namespace(session, project_id=project_id)
+    await session.commit()
+    return {"project_id": str(project_id), **summary, **ns_summary}

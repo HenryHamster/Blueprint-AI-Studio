@@ -635,6 +635,10 @@ export interface MttaActiveCase {
   live_elapsed_sec: number | null;
   live_elapsed_investigate_sec: number | null;
   recovery_check_in_sec: number | null;
+  elapsed_since_merge_sec: number | null;
+  eta_to_investigate_sec: number | null;
+  eta_to_merge_sec: number | null;
+  eta_to_recovery_sec: number | null;
 }
 
 export interface MttaClassRow {
@@ -673,11 +677,13 @@ export async function onboardProject(
   owner: string,
   repo: string,
   name?: string,
-  buildConfigOverride?: Record<string, unknown>
+  buildConfigOverride?: Record<string, unknown>,
+  promotionTarget?: string,
 ): Promise<{ project_id: string; build_config: Record<string, unknown> }> {
   const body: Record<string, unknown> = { github_owner: owner, github_repo: repo };
   if (name) body.name = name;
   if (buildConfigOverride) body.build_config_override = buildConfigOverride;
+  if (promotionTarget) body.promotion_target = promotionTarget;
   const res = await apiFetch('/api/admin/projects/onboard', { method: 'POST', body: JSON.stringify(body) });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
@@ -731,7 +737,32 @@ export type QualificationStatus =
   | 'promoted'
   | 'promotion_failed'
   | 'error'
-  | 'sha_error';
+  | 'sha_error'
+  | 'infra_failure';
+
+export interface AuditReconciliation {
+  model_reported_score: number | null;
+  findings_derived_score: number | null;
+  score_delta: number | null;
+  excluded_findings_count: number;
+}
+
+export interface AuditFinding {
+  severity: string;
+  summary: string;
+}
+
+export interface LatestAudit {
+  audit_task_id: string;
+  task_status: string;
+  candidate_sha: string | null;
+  created_at: string | null;
+  report: {
+    findings?: AuditFinding[];
+    audit_score?: number | null;
+    test_erosion?: number | null;
+  } | null;
+}
 
 export interface VersionQualification {
   status: QualificationStatus | null;
@@ -741,6 +772,15 @@ export interface VersionQualification {
   ci_resolution: CiResolution | null;
   blocker: string | null;
   finalized_at: string | null;
+  // Infra-failure context (populated only when status=infra_failure).
+  error?: string | null;
+  consecutive_infra_errors?: number | null;
+  // Audit observability: why the audit sub-score is missing/unscoreable.
+  audit_missing_reason?: string | null;
+  // Audit reconciliation: model vs findings-derived scores and excluded count.
+  audit_reconciliation?: AuditReconciliation | null;
+  // Audit findings carried from the qualification run (severity + summary per finding).
+  audit_findings?: AuditFinding[] | null;
 }
 
 export interface CurrentVersion {
@@ -753,6 +793,7 @@ export interface CurrentVersion {
   qualification_attempts: number;
   merged_task_count: number;
   last_qualification: VersionQualification | null;
+  latest_audit?: LatestAudit | null;
 }
 
 export interface RecentVersion {
@@ -854,6 +895,7 @@ export interface QualificationVerdictRecord {
   confidence: number | null;
   sub_scores: VersionQualificationSubScores | null;
   blocker: string | null;
+  audit_missing_reason: string | null;
   would_promote: boolean | null;
   promotion_enabled: boolean | null;
   terminal_status: string | null;
@@ -863,9 +905,15 @@ export interface QualificationVerdictRecord {
   created_at: string;
 }
 
+export interface QualificationVerdictsInfraContext {
+  infra_failure_count: number;
+  consecutive_infra_errors: number;
+}
+
 export interface QualificationVerdictsResponse {
   verdicts: QualificationVerdictRecord[];
   total: number;
+  infra_context?: QualificationVerdictsInfraContext;
 }
 
 export async function fetchQualificationVerdicts(
@@ -876,5 +924,115 @@ export async function fetchQualificationVerdicts(
     `/api/admin/projects/${encodeURIComponent(projectId)}/qualification-verdicts?limit=${limit}`,
   );
   if (!res.ok) throw new Error(`Failed to fetch qualification verdicts: ${res.status}`);
+  return res.json();
+}
+
+export interface PrFileEntry {
+  filename: string;
+  status: string;
+  additions: number;
+  deletions: number;
+  changes: number;
+  patch?: string;
+}
+
+export interface PrFilesResponse {
+  files: PrFileEntry[] | null;
+  pr_number: number | null;
+  reason?: string;
+}
+
+export async function fetchTaskPrFiles(
+  taskId: string,
+  includePatch = false,
+): Promise<PrFilesResponse> {
+  const url = `/api/admin/tasks/${encodeURIComponent(taskId)}/pr-files${includePatch ? '?include_patch=true' : ''}`;
+  const res = await apiFetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch PR files: ${res.status}`);
+  return res.json();
+}
+
+export interface RecentFinding {
+  task_id: string;
+  title: string;
+  type: string;
+  scope: string;
+  priority: string;
+  actionability_grade: 'HIGH' | 'MEDIUM' | 'LOW';
+  direction_id: string | null;
+  researched_at: string | null;
+}
+
+export interface RecentFindingsResponse {
+  findings: RecentFinding[];
+  grade_distribution: { HIGH: number; MEDIUM: number; LOW: number };
+  grade_distribution_pct: { HIGH: number; MEDIUM: number; LOW: number };
+  total: number;
+}
+
+export async function fetchRecentFindings(
+  projectId: string,
+  limit = 50,
+): Promise<RecentFindingsResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/recent-findings?limit=${limit}`,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch recent findings: ${res.status}`);
+  return res.json();
+}
+
+export interface StagingBranchPrefixesResponse {
+  project_id: string;
+  staging_branch_prefixes: string[];
+  is_default: boolean;
+}
+
+export async function fetchStagingBranchPrefixes(
+  projectId: string,
+): Promise<StagingBranchPrefixesResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/staging-branch-prefixes`);
+  if (!res.ok) throw new Error(`Failed to fetch staging branch prefixes: ${res.status}`);
+  return res.json();
+}
+
+export async function updateStagingBranchPrefixes(
+  projectId: string,
+  prefixes: string[] | null,
+): Promise<StagingBranchPrefixesResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/staging-branch-prefixes`,
+    { method: 'PATCH', body: JSON.stringify({ staging_branch_prefixes: prefixes }) },
+  );
+  if (!res.ok) throw new Error(`Failed to update staging branch prefixes: ${res.status}`);
+  return res.json();
+}
+
+export interface NullBranchConfigEntry {
+  id: string;
+  name: string;
+  github_owner: string;
+  github_repo: string;
+  is_self_repo: boolean;
+  created_at: string | null;
+}
+
+export interface NullBranchConfigResponse {
+  projects: NullBranchConfigEntry[];
+  self_repo_skipped: NullBranchConfigEntry[];
+  total: number;
+}
+
+export async function fetchNullBranchConfig(): Promise<NullBranchConfigResponse> {
+  const res = await apiFetch('/api/admin/diagnostics/null-branch-config');
+  if (!res.ok) throw new Error(`Failed to fetch null branch config: ${res.status}`);
+  return res.json();
+}
+
+export async function backfillProjectBranches(projectId: string): Promise<unknown> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/backfill-branches`,
+    { method: 'POST' },
+  );
+  if (!res.ok) throw new Error(`Failed to backfill branches: ${res.status}`);
   return res.json();
 }

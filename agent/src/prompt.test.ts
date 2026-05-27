@@ -63,6 +63,8 @@ import {
   formatProjectBlindSpotSummary,
   formatFixIterationHistory,
   formatSelfReviewCalibrationSection,
+  detectLinterKind,
+  buildScopedLintOneliner,
   type FixAttempt,
 } from './prompt.js';
 import { READ_ONLY_TASK_TYPES, WRITE_TASK_TYPES } from './taskCapabilities.js';
@@ -2093,6 +2095,31 @@ describe('getTaskTypeHints', () => {
     // No npm commands configured for this python-only directory
     expect(result).not.toContain('npm run lint');
   });
+
+  it('substitutes promotionTarget into release_audit hint when provided', () => {
+    const result = getTaskTypeHints(undefined, 'production')['release_audit'];
+    expect(result).toContain('(production)');
+    expect(result).toContain("production's standards");
+    expect(result).not.toContain('(main)');
+  });
+
+  it('substitutes non-main promotionTarget like release/v2 into release_audit hint', () => {
+    const result = getTaskTypeHints(undefined, 'release/v2')['release_audit'];
+    expect(result).toContain('(release/v2)');
+    expect(result).toContain("release/v2's standards");
+  });
+
+  it('uses generic LTS / promotion branch wording in release_audit hint when no promotionTarget provided', () => {
+    const result = getTaskTypeHints(undefined)['release_audit'];
+    expect(result).toContain('LTS / promotion branch');
+    expect(result).not.toContain('(main)');
+  });
+
+  it('keeps generic LTS / promotion branch wording in release_audit when promotionTarget is absent and buildConfig has dirs', () => {
+    const result = getTaskTypeHints({ directories: [{ path: 'src', type: 'node' }] })['release_audit'];
+    expect(result).toContain('LTS / promotion branch');
+    expect(result).not.toContain('(main)');
+  });
 });
 
 // ── discoverRelatedTests ──────────────────────────────────────────────────────
@@ -3630,6 +3657,30 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     expect(doneScript).toContain('# No regressing categories for this task type');
   });
 
+  it('generates ./done script with PR URL shape validation', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-123',
+      workBranch: 'blueprint/test-task-123',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+    });
+
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+
+    // The regex variable must be present and reject non-pull URLs.
+    expect(doneScript).toContain("PR_URL_RE='^https://github");
+    expect(doneScript).toContain('/pull/');
+    // Validation must exit non-zero on mismatch.
+    expect(doneScript).toContain('grep -qE "$PR_URL_RE"');
+    expect(doneScript).toContain('canonical pull URL');
+    // Reference to co-located validation in code-change.ts.
+    expect(doneScript).toContain('code-change.ts');
+  });
+
   it('generates ./done with regressing-category reasoning gate when regressingCategories is set', async () => {
     const { writeCodeChangeHelpers } = await import('./prompt.js');
     writeCodeChangeHelpers({
@@ -3817,6 +3868,42 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     ])).toBe(0);
   });
 
+  it('generates migration chain guard block in ./check when alembic/versions changed', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-123',
+      workBranch: 'blueprint/test-task-123',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: true,
+    });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+    // Guard is inside the backend block and gated on alembic/versions
+    expect(checkScript).toContain('backend/alembic/versions/');
+    expect(checkScript).toContain('python3 backend/app/migration_chain.py');
+    expect(checkScript).toContain('backend migration chain');
+  });
+
+  it('migration chain guard is absent from buildConfig-driven check (non-blueprint repos)', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-123',
+      workBranch: 'blueprint/test-task-123',
+      baseBranch: 'main',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+      buildConfig: {
+        directories: [{ path: 'src', type: 'node' }],
+      },
+    });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+    expect(checkScript).not.toContain('python3 backend/app/migration_chain.py');
+  });
+
   it('generates ./pr script with SR section injection for new PR path', async () => {
     const { writeCodeChangeHelpers } = await import('./prompt.js');
     writeCodeChangeHelpers({
@@ -3865,6 +3952,44 @@ describe('writeCodeChangeHelpers — self-review fallback', () => {
     expect(prScript).toContain('PATCH');
     expect(prScript).toContain('/pulls/42');
     expect(prScript).toContain('SR body update');
+  });
+  it('generates ./check and ./pr with test gate when promotionTarget matches baseBranch', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-promo',
+      workBranch: 'blueprint/test-task-promo',
+      baseBranch: 'production',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+      promotionTarget: 'production',
+    });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    const prScript = capturedScripts['/tmp/workspace/pr'];
+    expect(checkScript).toBeDefined();
+    expect(prScript).toBeDefined();
+    // Test gate fires because baseBranch === promotionTarget === 'production'
+    expect(checkScript).toContain('"1" = "1"');
+    expect(prScript).toContain('LTS branch');
+    expect(prScript).toContain('mandatory test gate');
+  });
+
+  it('does not generate test gate when promotionTarget does not match baseBranch', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      taskId: 'test-task-feat',
+      workBranch: 'blueprint/test-task-feat',
+      baseBranch: 'feature/xyz',
+      owner: 'test-owner',
+      repo: 'test-repo',
+      testsOnMainBranch: false,
+      promotionTarget: 'production',
+    });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    const prScript = capturedScripts['/tmp/workspace/pr'];
+    // baseBranch !== promotionTarget, so no mandatory gate
+    expect(checkScript).toContain('"0" = "1"');
+    expect(prScript).not.toContain('mandatory test gate');
   });
 });
 
@@ -4956,5 +5081,401 @@ describe('writeCodeChangeHelpers — shell injection validation', () => {
   it('accepts owner/repo with dots and hyphens', async () => {
     const { writeCodeChangeHelpers } = await import('./prompt.js');
     expect(() => { writeCodeChangeHelpers({ ...validCfg, owner: 'my.org-123', repo: 'my-repo.v2' }); }).not.toThrow();
+  });
+
+  it('rejects build_config command with shell metacharacters', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => {
+      writeCodeChangeHelpers({
+        ...validCfg,
+        buildConfig: { directories: [{ path: 'svc', type: 'node', build_cmd: 'npm run build; rm -rf /' }] },
+      });
+    }).toThrow(/build_cmd/);
+  });
+
+  it('rejects build_config env_var value with command substitution', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => {
+      writeCodeChangeHelpers({
+        ...validCfg,
+        buildConfig: { directories: [{ path: 'svc', type: 'node' }], env_vars: { API: '$(whoami)' } },
+      });
+    }).toThrow(/env_var value/);
+  });
+
+  it('rejects build_config env_var name with shell metacharacters', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => {
+      writeCodeChangeHelpers({
+        ...validCfg,
+        buildConfig: { directories: [{ path: 'svc', type: 'node' }], env_vars: { 'A;B': 'x' } },
+      });
+    }).toThrow(/env_var name/);
+  });
+
+  it('rejects build_config directory path with shell metacharacters', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => {
+      writeCodeChangeHelpers({
+        ...validCfg,
+        buildConfig: { directories: [{ path: 'svc`whoami`', type: 'node', build_cmd: 'npm run build' }] },
+      });
+    }).toThrow(/directory path/);
+  });
+
+  it('accepts build_config with typical install/lint/build/test commands', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    expect(() => {
+      writeCodeChangeHelpers({
+        ...validCfg,
+        buildConfig: {
+          directories: [{
+            path: 'service/api',
+            type: 'python',
+            install_cmd: 'pip install -e .',
+            lint_cmd: 'python3 -m ruff check --select E,F,W --ignore E501',
+            build_cmd: 'python3 -m build',
+            test_cmd: 'pytest -q',
+          }],
+          env_vars: { API_URL: 'http://localhost:8080', NODE_ENV: 'ci' },
+        },
+      });
+    }).not.toThrow();
+  });
+});
+
+// ── writeCheckHelper — config-driven (build_config) path ──────────────────────
+describe('writeCheckHelper — config-driven build_config path', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  const buildConfig = {
+    directories: [
+      {
+        path: 'service/api',
+        type: 'python',
+        install_cmd: 'pip install -e .',
+        lint_cmd: 'python3 -m ruff check',
+        build_cmd: 'python3 -m build',
+        test_cmd: 'pytest -q',
+      },
+      {
+        path: 'web/',
+        type: 'node',
+        install_cmd: 'npm ci',
+        lint_cmd: 'npm run lint',
+        build_cmd: 'npm run build',
+      },
+    ],
+    env_vars: { API_URL: 'http://localhost:8080', NODE_ENV: 'ci' },
+  };
+
+  const baseCfg = {
+    taskId: 'task-cfg-1',
+    workBranch: 'blueprint/task-cfg-1',
+    baseBranch: 'main',
+    owner: 'acme',
+    repo: 'other-repo',
+    testsOnMainBranch: true,
+  };
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('generates per-directory blocks from buildConfig and omits hardcoded Blueprint blocks', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({ ...baseCfg, buildConfig });
+
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+    // Configured directories + commands are present.
+    expect(checkScript).toContain('if touches "service/api/"; then');
+    expect(checkScript).toContain(`run "service/api install" bash -c 'cd "service/api" && pip install -e .'`);
+    // Recognized ruff lint_cmd is scoped to changed files (FULL_SCOPE=1 runs verbatim).
+    expect(checkScript).toContain('if [ "$FULL_SCOPE" = "1" ]; then');
+    expect(checkScript).toContain(`run "service/api lint" bash -c 'cd "service/api" && python3 -m ruff check'`);
+    expect(checkScript).toContain('ruff check --select E,F,W --ignore E501');
+    expect(checkScript).toContain(`run "service/api build" bash -c 'cd "service/api" && python3 -m build'`);
+    // Trailing slash in the configured path is normalized.
+    expect(checkScript).toContain('if touches "web/"; then');
+    expect(checkScript).toContain(`run "web build" bash -c 'cd "web" && npm run build'`);
+    // The hardcoded Blueprint stack blocks must NOT run on the config-driven
+    // path (the `admin_ui_runtime_touched` helper is still defined in the
+    // shared header, but it must not be invoked, and no hardcoded stack
+    // commands should appear).
+    expect(checkScript).not.toContain('if admin_ui_runtime_touched; then');
+    expect(checkScript).not.toContain('run "agent tsc"');
+    expect(checkScript).not.toContain('backend ruff (changed)');
+    expect(checkScript).not.toContain('npm run test:viewport');
+  });
+
+  it('falls back to hardcoded Blueprint blocks when buildConfig is undefined', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({ ...baseCfg });
+
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+    expect(checkScript).toContain('admin_ui_runtime_touched');
+    expect(checkScript).toContain('run "agent tsc"');
+    expect(checkScript).toContain('backend ruff (changed)');
+    expect(checkScript).toContain('npm run test:viewport');
+    // And the config-driven marker is absent.
+    expect(checkScript).not.toContain('Config-driven checks');
+  });
+
+  it('falls back to hardcoded blocks when buildConfig has empty directories', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({ ...baseCfg, buildConfig: { directories: [] } });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toContain('admin_ui_runtime_touched');
+    expect(checkScript).not.toContain('Config-driven checks');
+  });
+
+  it('gates configured test_cmd on ./check test (WITH_TESTS)', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({ ...baseCfg, buildConfig });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    // test_cmd is wrapped in a WITH_TESTS guard.
+    expect(checkScript).toContain('if [ "$WITH_TESTS" = "1" ]; then');
+    expect(checkScript).toContain(`run "service/api test" bash -c 'cd "service/api" && pytest -q'`);
+    // The directory with no test_cmd produces no test run line.
+    expect(checkScript).not.toContain('web test');
+  });
+
+  it('exports env_vars from buildConfig in the generated ./check', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({ ...baseCfg, buildConfig });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toContain(`export API_URL='http://localhost:8080'`);
+    expect(checkScript).toContain(`export NODE_ENV='ci'`);
+  });
+
+  it('generated config-driven ./check passes `bash -n` syntax check', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({ ...baseCfg, buildConfig });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toBeDefined();
+
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/check_cfg_smoke_${process.pid}_${Date.now()}.sh`;
+    realFs.writeFileSync(tmp, checkScript);
+    try {
+      realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+    } finally {
+      try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  });
+});
+
+// ── detectLinterKind ──────────────────────────────────────────────────────────
+describe('detectLinterKind', () => {
+  it.each([
+    ['ruff check .', 'ruff'],
+    ['python3 -m ruff check .', 'ruff'],
+    ['python -m ruff check', 'ruff'],
+    ['npx eslint .', 'eslint'],
+    ['pnpm exec eslint .', 'eslint'],
+    ['mypy .', 'mypy'],
+    ['python3 -m mypy src/', 'mypy'],
+    ['flake8 .', 'flake8'],
+    ['pyright .', 'pyright'],
+    ['npx pyright', 'pyright'],
+  ])('detects %s as %s', (cmd, expected) => {
+    expect(detectLinterKind(cmd)).toBe(expected);
+  });
+
+  it.each([
+    ['npm run lint'],
+    ['custom-lint-script'],
+    ['bash lint.sh'],
+  ])('returns null for unrecognized command %s', (cmd) => {
+    expect(detectLinterKind(cmd)).toBeNull();
+  });
+});
+
+// ── buildScopedLintOneliner ────────────────────────────────────────────────────
+describe('buildScopedLintOneliner', () => {
+  it('returns null for unrecognized lint_cmd', () => {
+    expect(buildScopedLintOneliner('bash custom-lint.sh', 'svc', 'main', 'git-diff')).toBeNull();
+    expect(buildScopedLintOneliner('npm run lint', 'svc', 'main', 'check-tmpfile')).toBeNull();
+  });
+
+  it.each([
+    ['ruff check .', 'svc', 'main'],
+    ['python3 -m mypy', 'backend', 'develop'],
+    ['flake8 .', 'src', 'main'],
+    ['npx eslint .', 'admin-ui', 'main'],
+    ['pyright .', 'agent', 'main'],
+  ] as [string, string, string][])(
+    'check-tmpfile output for %s in dir=%s does not contain verbatim lint_cmd trailing dot',
+    (lintCmd, dir, _base) => {
+      const result = buildScopedLintOneliner(lintCmd, dir, _base, 'check-tmpfile');
+      expect(result).not.toBeNull();
+      // Trailing '.' should be stripped — the file list drives scope
+      expect(result).not.toMatch(/\s\.\s*$/);
+      // Should reference the tmp file for that directory
+      const slug = dir.replace(/\//g, '_');
+      expect(result).toContain(`/tmp/check_${slug}_lint.txt`);
+    },
+  );
+
+  it.each([
+    ['ruff check .', 'svc', 'main'],
+    ['python3 -m mypy', 'backend', 'develop'],
+    ['flake8 .', 'src', 'main'],
+    ['npx eslint .', 'admin-ui', 'main'],
+    ['pyright .', 'agent', 'main'],
+  ] as [string, string, string][])(
+    'git-diff output for %s in dir=%s uses git diff pipeline against base branch',
+    (lintCmd, dir, base) => {
+      const result = buildScopedLintOneliner(lintCmd, dir, base, 'git-diff');
+      expect(result).not.toBeNull();
+      expect(result).toContain(`git diff origin/${base}...HEAD --name-only`);
+      expect(result).toContain(`xargs -r`);
+    },
+  );
+
+  it('ruff is rewritten to narrow ruleset for check-tmpfile', () => {
+    const result = buildScopedLintOneliner('ruff check .', 'svc', 'main', 'check-tmpfile');
+    expect(result).toContain('python3 -m ruff check --select E,F,W --ignore E501');
+  });
+
+  it('ruff is rewritten to narrow ruleset for git-diff', () => {
+    const result = buildScopedLintOneliner('ruff check .', 'svc', 'main', 'git-diff');
+    expect(result).toContain('python3 -m ruff check --select E,F,W --ignore E501');
+  });
+
+  it('check-tmpfile and git-diff produce semantically equivalent linter invocations for same lint_cmd', () => {
+    const lintCmds = ['ruff check .', 'python3 -m mypy', 'flake8', 'npx eslint .'];
+    for (const lintCmd of lintCmds) {
+      const tmpfile = buildScopedLintOneliner(lintCmd, 'svc', 'main', 'check-tmpfile');
+      const gitdiff = buildScopedLintOneliner(lintCmd, 'svc', 'main', 'git-diff');
+      expect(tmpfile).not.toBeNull();
+      expect(gitdiff).not.toBeNull();
+      // Both must end with the same effective linter invocation (neither running verbatim full tree)
+      expect(tmpfile).not.toMatch(/\s\.\s*$|\/\.\s*$/);
+      expect(gitdiff).not.toMatch(/\s\.\s*$|\/\.\s*$/);
+    }
+  });
+
+  it('python linters filter .py files for check-tmpfile', () => {
+    for (const cmd of ['python3 -m mypy .', 'flake8 .', 'pyright .']) {
+      const result = buildScopedLintOneliner(cmd, 'svc', 'main', 'git-diff');
+      expect(result).toContain('\\.py');
+      expect(result).not.toContain('ts|tsx');
+    }
+  });
+
+  it('eslint filters JS/TS files for git-diff', () => {
+    const result = buildScopedLintOneliner('npx eslint .', 'admin-ui', 'main', 'git-diff');
+    expect(result).toContain('\\.(ts|tsx|js|jsx|cjs|mjs)');
+    expect(result).not.toContain('\\.py');
+  });
+
+  it('strips trailing dot from mypy for check-tmpfile', () => {
+    const result = buildScopedLintOneliner('python3 -m mypy .', 'svc', 'main', 'check-tmpfile');
+    expect(result).not.toBeNull();
+    // The xargs invocation should use 'python3 -m mypy' without trailing dot
+    expect(result).toContain('python3 -m mypy');
+    expect(result).not.toMatch(/mypy \. /);
+  });
+
+  it('strips trailing ./ from lint_cmd', () => {
+    const result = buildScopedLintOneliner('flake8 ./', 'svc', 'main', 'check-tmpfile');
+    expect(result).not.toBeNull();
+    expect(result).not.toContain('./');
+  });
+
+  it('check-tmpfile output snapshot for ruff', () => {
+    const result = buildScopedLintOneliner('ruff check .', 'svc', 'main', 'check-tmpfile');
+    expect(result).toBe('xargs -0 -a /tmp/check_svc_lint.txt python3 -m ruff check --select E,F,W --ignore E501 2>&1');
+  });
+
+  it('git-diff output snapshot for ruff', () => {
+    const result = buildScopedLintOneliner('ruff check .', 'svc', 'main', 'git-diff');
+    expect(result).toBe("git diff origin/main...HEAD --name-only | grep -E '\\.py$' | sed 's|svc/||' | xargs -r python3 -m ruff check --select E,F,W --ignore E501");
+  });
+
+  it('git-diff output snapshot for mypy', () => {
+    const result = buildScopedLintOneliner('python3 -m mypy', 'backend', 'main', 'git-diff');
+    expect(result).toBe("git diff origin/main...HEAD --name-only | grep -E '\\.py$' | sed 's|backend/||' | xargs -r python3 -m mypy");
+  });
+
+  it('git-diff output snapshot for eslint', () => {
+    const result = buildScopedLintOneliner('npx eslint .', 'admin-ui', 'main', 'git-diff');
+    expect(result).toBe("git diff origin/main...HEAD --name-only | grep -E '\\.(ts|tsx|js|jsx|cjs|mjs)$' | sed 's|admin-ui/||' | xargs -r npx eslint");
+  });
+});
+
+// ── buildConfigDrivenStackBlocks — scoped lint ─────────────────────────────
+describe('writeCheckHelper — config-driven scoped lint', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  const baseCfg = {
+    taskId: 'task-lint-scope-1',
+    workBranch: 'blueprint/task-lint-scope-1',
+    baseBranch: 'main',
+    owner: 'acme',
+    repo: 'my-svc',
+    testsOnMainBranch: false,
+  };
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('scopes ruff check to changed .py files and uses narrow ruleset', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      ...baseCfg,
+      buildConfig: {
+        directories: [{ path: 'svc', type: 'python', lint_cmd: 'ruff check .' }],
+      },
+    });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    // Scoped block: FULL_SCOPE=1 branch has verbatim, else branch has scoped.
+    expect(checkScript).toContain('if [ "$FULL_SCOPE" = "1" ]; then');
+    expect(checkScript).toContain('ruff check --select E,F,W --ignore E501');
+    expect(checkScript).toContain(`grep -E '^svc/.*\\.py$'`);
+    // The verbatim form appears inside the FULL_SCOPE branch (not the default path).
+    expect(checkScript).toContain(`run "svc lint" bash -c 'cd "svc" && ruff check .'`);
+  });
+
+  it('scopes eslint check to changed .ts files and keeps the FULL_SCOPE escape hatch', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      ...baseCfg,
+      buildConfig: {
+        directories: [{ path: 'svc', type: 'node', lint_cmd: 'npx eslint .' }],
+      },
+    });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toContain('if [ "$FULL_SCOPE" = "1" ]; then');
+    expect(checkScript).toContain(`grep -E '^svc/.*\\.(ts|tsx|js|jsx|cjs|mjs)$'`);
+    expect(checkScript).toContain(`run "svc lint" bash -c 'cd "svc" && npx eslint .'`);
+  });
+
+  it('keeps verbatim invocation for unrecognized lint_cmd without adding FULL_SCOPE block', async () => {
+    const { writeCodeChangeHelpers } = await import('./prompt.js');
+    writeCodeChangeHelpers({
+      ...baseCfg,
+      buildConfig: {
+        directories: [{ path: 'svc', type: 'python', lint_cmd: 'bash custom-lint.sh' }],
+      },
+    });
+    const checkScript = capturedScripts['/tmp/workspace/check'];
+    expect(checkScript).toContain(`run "svc lint" bash -c 'cd "svc" && bash custom-lint.sh'`);
+    // No per-lint FULL_SCOPE conditional — verbatim commands run as-is.
+    expect(checkScript).not.toContain('if [ "$FULL_SCOPE" = "1" ]; then');
   });
 });

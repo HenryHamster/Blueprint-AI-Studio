@@ -39,6 +39,41 @@ function extractCodexAgentMessageText(text: string): string | null {
 // reasoning_kind, source_finding, etc.) and emits a single JSON object
 // describing the reasoning. The backend persists that object as an Artifact
 // of type MEMO. No cloning, no edits, no child spawning.
+
+// For dispatcher-sourced memos the backend already holds the complete
+// reasoning in source_finding at spawn time. Synthesize the artifact
+// directly instead of invoking Claude to paraphrase already-known text.
+function _synthesizeDispatcherMemo(
+  reasoningKind: string,
+  sf: Record<string, unknown>,
+  sourceTaskId: string,
+  sv: (v: unknown) => string,
+): Record<string, unknown> | null {
+  const cite = sourceTaskId ? [`task:${sourceTaskId}`] : [];
+  if (reasoningKind === 'regression_false_positive') {
+    const verdictReason = sv(sf.verdict_reason);
+    if (!verdictReason) return null;
+    const parts = [`Verdict reason: ${verdictReason}`];
+    const invSummary = sv(sf.investigation_summary);
+    if (invSummary) parts.push(`Investigation summary: ${invSummary}`);
+    const rc = sv(sf.regression_class);
+    return { summary: verdictReason.slice(0, 200), reasoning: parts.join('\n\n'), citations: cite, tags: ['regression-false-positive', ...(rc ? [rc] : [])] };
+  }
+  if (reasoningKind === 'investigation_unactionable') {
+    const rootCause = sv(sf.root_cause);
+    const summary = sv(sf.summary);
+    if (!rootCause && !summary) return null;
+    const parts: string[] = [];
+    if (rootCause) parts.push(`Root cause: ${rootCause}`);
+    const fix = sv(sf.recommended_fix);
+    if (fix) parts.push(`Recommended fix: ${fix}`);
+    const outcome = sv(sf.outcome);
+    if (outcome) parts.push(`Outcome: ${outcome}`);
+    return { summary: summary.slice(0, 200) || `Investigation concluded: ${outcome}`, reasoning: parts.join('\n\n'), citations: cite, tags: ['investigation-unactionable', ...(outcome ? [outcome] : [])] };
+  }
+  return null;
+}
+
 export async function handleMemo(
   taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
   _ghToken: string, _owner: string, _repo: string, ws: WebSocket | null, statusRef: { value: string },
@@ -50,6 +85,15 @@ export async function handleMemo(
   const directionId = strVal(payload.direction_id);
   const userPrompt = strVal(payload.prompt) || strVal(task.description);
   const sourceFinding = payload.source_finding;
+
+  // Short-circuit for dispatcher memos: synthesize from source_finding directly.
+  if (sourceFinding && typeof sourceFinding === 'object') {
+    const directMemo = _synthesizeDispatcherMemo(reasoningKind, sourceFinding as Record<string, unknown>, sourceTaskId, strVal);
+    if (directMemo !== null) {
+      await persistAndPostStatus(taskId, { task_id: taskId, status: 'COMPLETED', logs: sanitize(JSON.stringify(directMemo)) });
+      return;
+    }
+  }
 
   // Memo handlers must not touch the repo — configureAgentPermissions
   // installs the read_only hooks even without a clone (it tolerates a

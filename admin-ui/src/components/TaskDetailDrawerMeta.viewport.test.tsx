@@ -108,6 +108,16 @@ const memoTask: Task = {
   },
 };
 
+const llmTask: Task = {
+  ...richTask,
+  id: 'task-550e8400e29b41d4a716446655440004',
+  context: {
+    ...richTask.context,
+    llm_provider: 'openai',
+    llm_model: 'gpt-5-mini',
+  },
+};
+
 describe('TaskDetailDrawerMeta DetailsTab — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
@@ -227,5 +237,23 @@ describe('TaskDetailDrawerMeta DetailsTab — viewport regression', () => {
       root = r;
       await act(async () => { r.render(<DetailsTab task={memoTask} />); });
     });
+  });
+
+  test('shows LLM provider and model when present and hides them otherwise', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+
+    await act(async () => { r.render(<DetailsTab task={llmTask} />); });
+    expect(host.textContent ?? '').toContain('LLM Provider');
+    expect(host.textContent ?? '').toContain('openai');
+    expect(host.textContent ?? '').toContain('LLM Model');
+    expect(host.textContent ?? '').toContain('gpt-5-mini');
+
+    await act(async () => { r.render(<DetailsTab task={richTask} />); });
+    const content = host.textContent ?? '';
+    expect(content).not.toContain('LLM Provider');
+    expect(content).not.toContain('LLM Model');
   });
 });

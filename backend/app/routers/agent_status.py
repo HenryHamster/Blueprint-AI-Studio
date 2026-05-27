@@ -13,6 +13,7 @@ import contextlib
 import json
 import logging
 import random
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
@@ -23,17 +24,24 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 from app.database import get_session
 from app.models import (
-    Task,
-    Artifact,
-    TaskHistory,
     Alert,
     AlertSeverity,
-    TaskStatus,
+    Artifact,
     ArtifactType,
     Project,
+    Task,
+    TaskHistory,
+    TaskStatus,
+    bank_task_current_attempt,
+    get_task_total_vm_cost_usd,
+    with_task_attempt_banking,
 )
 from app.schemas import AgentStatusPayload
 from app.shared_state import limiter
+from app.shared_state import (
+    get_project_integration_branch as _get_project_integration_branch,
+    get_project_promotion_target as _get_project_promotion_target,
+)
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
 import app.orchestrator as _orch
@@ -50,11 +58,14 @@ from app.max_plan_pool import (
     _extract_task_model,
     clear_rate_limit_state_on_success,
     clear_regression_on_success,
+    db_account_was_rate_limited,
+    db_pool_wide_rate_limit_cooldown,
     disable_account_for_auth,
     disable_account_model,
     get_task_llm_account_id,
     get_task_llm_auth_mode,
     get_task_llm_execution_mode,
+    get_task_rate_limit_scope,
     get_task_llm_provider,
     record_completion_event,
     record_task_outcome,
@@ -319,7 +330,7 @@ async def _check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
                 t.status if isinstance(t.status, str) else "UNKNOWN"
             )
             bucket = (
-                classify_failure(t)
+                classify_failure(t, at_time=t.last_heartbeat or t.started_at)
                 if status_val == TaskStatus.FAILED.value
                 else status_val
             )
@@ -500,7 +511,7 @@ async def _check_recurring_failures(task: Task, session: AsyncSession) -> None:
     # Group by failure_class
     by_class: dict[str, list] = {}
     for t in all_failed:
-        fc = classify_failure(t)
+        fc = classify_failure(t, at_time=t.last_heartbeat or t.started_at)
         by_class.setdefault(fc, []).append(t)
 
     for failure_class, tasks_in_class in by_class.items():
@@ -526,104 +537,107 @@ async def _check_recurring_failures(task: Task, session: AsyncSession) -> None:
         if len(common_keywords) < 2:
             continue
 
-        # Check if an existing auto-entry already covers these keywords
-        project = await session.get(Project, task.project_id)
-        if not project:
-            continue
+        # Acquire project row lock before the design_doc read-modify-write.
+        # skip_locked=True: best-effort, contention degrades gracefully.
+        from app.task_locking import project_lock
 
-        doc = dict(project.design_doc or {})
-        existing_auto_keys = [k for k in doc if k.startswith("playbook/auto-")]
+        async with project_lock(session, task.project_id, skip_locked=True) as project:
+            if project is None:
+                continue
 
-        # Infer scope: direction-scoped only when ALL tasks have a direction_id
-        # and they all share the same one.  Tasks without a direction_id must NOT
-        # be silently dropped — their presence means the pattern is universal.
-        all_have_direction = all(
-            (t.context or {}).get("direction_id") for t in tasks_in_class
-        )
-        task_direction_ids = {
-            (t.context or {}).get("direction_id")
-            for t in tasks_in_class
-            if (t.context or {}).get("direction_id")
-        }
-        if all_have_direction and len(task_direction_ids) == 1:
-            inferred_scope = "direction"
-            inferred_direction: str | None = next(iter(task_direction_ids))
-        else:
-            inferred_scope = "universal"
-            inferred_direction = None
+            doc = dict(project.design_doc or {})
+            existing_auto_keys = [k for k in doc if k.startswith("playbook/auto-")]
 
-        # Check duplicate: look for any existing entry whose keywords overlap significantly
-        already_covered = False
-        keyword_set = set(common_keywords)
-        for existing_key in existing_auto_keys:
-            entry = doc.get(existing_key, {})
-            entry_content = entry.get("content", "").lower()
-            overlap = sum(1 for kw in keyword_set if kw in entry_content)
-            if overlap >= max(2, len(keyword_set) // 2):
-                # Update the count in the existing entry
-                updated_entry = dict(entry)
-                updated_entry["content"] = (
-                    f"WARNING: {failure_class} failures have occurred {len(tasks_in_class)} times recently. "
-                    f"Common pattern: {', '.join(common_keywords)}. "
-                    f"Recent examples: {_truncate_examples(tasks_in_class[-2:])}. "
-                    f"Agents should check for this issue before starting work."
-                )
-                updated_entry["updated_at"] = _utcnow().isoformat()
-                updated_entry["applicable_types"] = _get_applicable_types(
-                    tasks_in_class
-                )
-                updated_entry["scope"] = inferred_scope
-                updated_entry["learned_from_direction"] = inferred_direction
-                doc[existing_key] = updated_entry
-                project.design_doc = doc
-                flag_modified(project, "design_doc")
-                session.add(project)
-                logger.info(
-                    f"[PLAYBOOK] Updated existing auto-entry {existing_key} for {failure_class} pattern"
-                )
-                already_covered = True
-                break
-
-        if already_covered:
-            continue
-
-        # Cap at 5 auto-generated entries
-        if len(existing_auto_keys) >= _AUTO_PLAYBOOK_CAP:
-            logger.info(
-                f"[PLAYBOOK] Auto-playbook cap ({_AUTO_PLAYBOOK_CAP}) reached for project {task.project_id}, skipping"
+            # Infer scope: direction-scoped only when ALL tasks have a direction_id
+            # and they all share the same one.  Tasks without a direction_id must NOT
+            # be silently dropped — their presence means the pattern is universal.
+            all_have_direction = all(
+                (t.context or {}).get("direction_id") for t in tasks_in_class
             )
-            continue
+            task_direction_ids = {
+                (t.context or {}).get("direction_id")
+                for t in tasks_in_class
+                if (t.context or {}).get("direction_id")
+            }
+            if all_have_direction and len(task_direction_ids) == 1:
+                inferred_scope = "direction"
+                inferred_direction: str | None = next(iter(task_direction_ids))
+            else:
+                inferred_scope = "universal"
+                inferred_direction = None
 
-        # Create a new auto-entry
-        short_hash = _hashlib.md5(
-            ",".join(sorted(common_keywords)).encode()
-        ).hexdigest()[:6]
-        entry_key = f"playbook/auto-{failure_class.lower()}-{short_hash}"
+            # Check duplicate: look for any existing entry whose keywords overlap significantly
+            already_covered = False
+            keyword_set = set(common_keywords)
+            for existing_key in existing_auto_keys:
+                entry = doc.get(existing_key, {})
+                entry_content = entry.get("content", "").lower()
+                overlap = sum(1 for kw in keyword_set if kw in entry_content)
+                if overlap >= max(2, len(keyword_set) // 2):
+                    # Update the count in the existing entry
+                    updated_entry = dict(entry)
+                    updated_entry["content"] = (
+                        f"WARNING: {failure_class} failures have occurred {len(tasks_in_class)} times recently. "
+                        f"Common pattern: {', '.join(common_keywords)}. "
+                        f"Recent examples: {_truncate_examples(tasks_in_class[-2:])}. "
+                        f"Agents should check for this issue before starting work."
+                    )
+                    updated_entry["updated_at"] = _utcnow().isoformat()
+                    updated_entry["applicable_types"] = _get_applicable_types(
+                        tasks_in_class
+                    )
+                    updated_entry["scope"] = inferred_scope
+                    updated_entry["learned_from_direction"] = inferred_direction
+                    doc[existing_key] = updated_entry
+                    project.design_doc = doc
+                    flag_modified(project, "design_doc")
+                    session.add(project)
+                    logger.info(
+                        f"[PLAYBOOK] Updated existing auto-entry {existing_key} for {failure_class} pattern"
+                    )
+                    already_covered = True
+                    break
 
-        applicable_types = _get_applicable_types(tasks_in_class)
-        content = (
-            f"WARNING: {failure_class} failures have occurred {len(tasks_in_class)} times recently. "
-            f"Common pattern: {', '.join(common_keywords)}. "
-            f"Recent examples: {_truncate_examples(tasks_in_class[-2:])}. "
-            f"Agents should check for this issue before starting work."
-        )
+            if already_covered:
+                continue
 
-        doc[entry_key] = {
-            "content": content,
-            "source_task_id": None,
-            "updated_at": _utcnow().isoformat(),
-            "confirmed_count": 0,
-            "applicable_types": applicable_types,
-            "scope": inferred_scope,
-            "learned_from_direction": inferred_direction,
-        }
-        project.design_doc = doc
-        flag_modified(project, "design_doc")
-        session.add(project)
-        logger.info(
-            f"[PLAYBOOK] Auto-created entry {entry_key} for {failure_class} pattern "
-            f"({len(tasks_in_class)} occurrences, keywords: {common_keywords})"
-        )
+            # Cap at 5 auto-generated entries
+            if len(existing_auto_keys) >= _AUTO_PLAYBOOK_CAP:
+                logger.info(
+                    f"[PLAYBOOK] Auto-playbook cap ({_AUTO_PLAYBOOK_CAP}) reached for project {task.project_id}, skipping"
+                )
+                continue
+
+            # Create a new auto-entry
+            short_hash = _hashlib.md5(
+                ",".join(sorted(common_keywords)).encode()
+            ).hexdigest()[:6]
+            entry_key = f"playbook/auto-{failure_class.lower()}-{short_hash}"
+
+            applicable_types = _get_applicable_types(tasks_in_class)
+            content = (
+                f"WARNING: {failure_class} failures have occurred {len(tasks_in_class)} times recently. "
+                f"Common pattern: {', '.join(common_keywords)}. "
+                f"Recent examples: {_truncate_examples(tasks_in_class[-2:])}. "
+                f"Agents should check for this issue before starting work."
+            )
+
+            doc[entry_key] = {
+                "content": content,
+                "source_task_id": None,
+                "updated_at": _utcnow().isoformat(),
+                "confirmed_count": 0,
+                "applicable_types": applicable_types,
+                "scope": inferred_scope,
+                "learned_from_direction": inferred_direction,
+            }
+            project.design_doc = doc
+            flag_modified(project, "design_doc")
+            session.add(project)
+            logger.info(
+                f"[PLAYBOOK] Auto-created entry {entry_key} for {failure_class} pattern "
+                f"({len(tasks_in_class)} occurrences, keywords: {common_keywords})"
+            )
 
 
 def _truncate_examples(tasks: list) -> str:
@@ -1025,8 +1039,24 @@ async def update_agent_status(
     if payload.failure_category:
         from app.failure_classification import normalize_agent_failure_category
 
+        _fc_at_time = task.last_heartbeat or task.started_at
+        _fc_acct_id = get_task_llm_account_id(task)
+        _fc_scope = get_task_rate_limit_scope(task)
+        _db_rl = (
+            await db_account_was_rate_limited(_fc_acct_id, at_time=_fc_at_time)
+            if _fc_acct_id
+            else await db_pool_wide_rate_limit_cooldown(
+                at_time=_fc_at_time,
+                providers=_fc_scope.get("providers"),
+                model=_fc_scope.get("model"),
+                user_id=_fc_scope.get("user_id"),
+            )
+        )
         normalized_failure_category = normalize_agent_failure_category(
-            payload.failure_category, task
+            payload.failure_category,
+            task,
+            at_time=_fc_at_time,
+            db_rl_override=_db_rl,
         )
         ctx = dict(task.context or {})
         ctx["failure_category"] = normalized_failure_category
@@ -1037,6 +1067,10 @@ async def update_agent_status(
         # to distinguish "agent printed a diff but never shipped" (incomplete)
         # from real build/test failures.
         ctx["agent_failure_category_raw"] = payload.failure_category.strip().lower()
+        # Persist authoritative verdict so analytics paths that call
+        # classify_failure() hours later short-circuit to this value and
+        # cannot flip RATE_LIMIT→CODE_ERROR once the cooldown lifts.
+        ctx["failure_class"] = normalized_failure_category
         task.context = ctx
     if payload.scope_gate_triggered:
         ctx = dict(task.context or {})
@@ -1085,6 +1119,15 @@ async def update_agent_status(
     # IntegrityError; we catch it and treat as the dedup-skip path.
     if payload.artifact_type:
         if payload.artifact_type == ArtifactType.PULL_REQUEST:
+            _PR_URL_RE = r"^https://github\.com/[^/\s]+/[^/\s]+/pull/\d+$"
+            if payload.pr_url and not re.match(_PR_URL_RE, payload.pr_url):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "pr_url must match https://github.com/<owner>/<repo>/pull/<number>; "
+                        f"got: {payload.pr_url!r}"
+                    ),
+                )
             existing = (
                 (
                     await session.execute(
@@ -1302,179 +1345,202 @@ async def update_agent_status(
                             f"[SMOKETEST] Fix task {existing_fix.id} already exists for smoketest {task.id}, skipping duplicate"
                         )
                     else:
-                        base_branch = (task.first_payload).get("base_branch", "main")
-                        # A base_branch=="main" smoketest is a post-promotion
-                        # (production) failure only once the LTS cutover is done.
-                        # Before integration_branch flips to "automain", rollups
-                        # still merge to main, so a "main" smoketest is an ordinary
-                        # rollup-merge smoketest — not a promotion.
-                        is_post_promotion = base_branch == "main" and (
-                            _runtime_config.get("integration_branch") == "automain"
-                        )
-                        failure_summary = "\n".join(
-                            f"- {t['name']}: {t.get('message', 'no details')}"
-                            for t in failed_tests
-                        )
-
-                        # Determine priority based on which suite failed (higher = dispatched first)
-                        suite_results = smoketest_data.get("suites", {})
-                        if suite_results.get("startup", {}).get("passed") is False:
-                            fix_priority = 90  # Startup failure — critical
-                        elif suite_results.get("curated", {}).get("passed") is False:
-                            fix_priority = 70  # Curated test failure — high
+                        # A base_branch==promotion_target smoketest is a post-promotion
+                        # (production) failure only when the LTS model is active.
+                        # The LTS model is active when the integration trunk and
+                        # promotion target are distinct branches.
+                        _smoketest_project = await session.get(Project, task.project_id)
+                        if _smoketest_project is None:
+                            logger.warning(
+                                "[SMOKETEST] project not found for task %s "
+                                "(project_id=%s) — skipping fix spawn",
+                                task.id,
+                                task.project_id,
+                            )
                         else:
-                            fix_priority = 50  # Regression-only failure — normal
+                            _promotion_target = _get_project_promotion_target(
+                                _smoketest_project
+                            )
+                            _integration_branch = _get_project_integration_branch(
+                                _smoketest_project
+                            )
+                            base_branch = (task.first_payload).get(
+                                "base_branch"
+                            ) or _integration_branch
+                            is_post_promotion = base_branch == _promotion_target and (
+                                _integration_branch != _promotion_target
+                            )
+                            failure_summary = "\n".join(
+                                f"- {t['name']}: {t.get('message', 'no details')}"
+                                for t in failed_tests
+                            )
 
-                        # Post-promotion (production) smoketest failures are urgent:
-                        # override suite-based ladder so priority is always >= 90.
-                        if is_post_promotion:
-                            fix_priority = max(fix_priority, 90)
-
-                        type_model = (
-                            _runtime_config.get("task_type_models", {}).get("plan")
-                            or None
-                        )
-                        type_effort = (
-                            _runtime_config.get("task_type_efforts", {}).get("plan")
-                            or None
-                        )
-                        plan_task = Task(
-                            project_id=task.project_id,
-                            title=(
-                                f"[HOTFIX] Fix post-promotion smoketest failures on {base_branch}"
-                                if is_post_promotion
-                                else f"Fix smoketest failures on {base_branch}"
-                            ),
-                            description=f"{len(failed_tests)} smoke test(s) failed after merge to {base_branch}",
-                            parent_task_id=task.id,
-                            priority=fix_priority,
-                            payloads=[
-                                _validate_internal_payload(
-                                    {
-                                        "type": "plan",
-                                        "prompt": (
-                                            f"Smoke tests failed after a merge to {base_branch}. "
-                                            f"Investigate and plan fixes for these failures:\n\n"
-                                            f"{failure_summary}\n\n"
-                                            f"IMPORTANT GUARDRAILS:\n"
-                                            f"- Do NOT delete or skip tests just to make them pass\n"
-                                            f"- First diagnose: is the failure in the CODE or the TEST?\n"
-                                            f"- If the test is wrong, fix it to correctly test the intended behavior\n"
-                                            f"- If the code is wrong, fix the code\n"
-                                            f"- Tests may only be removed if the tested functionality was removed — explain why\n"
-                                            f"- Do NOT weaken assertions without justification\n"
-                                            f"Diagnose root causes, identify which recent changes caused each failure, "
-                                            f"and produce subtasks to fix them."
-                                        ),
-                                        "base_branch": base_branch,
-                                        **(
-                                            {"hotfix": True}
-                                            if is_post_promotion
-                                            else {}
-                                        ),
-                                        **({"model": type_model} if type_model else {}),
-                                        **(
-                                            {"effort": type_effort}
-                                            if type_effort
-                                            else {}
-                                        ),
-                                    },
-                                    "main:smoketest_fix_plan",
-                                )
-                            ],
-                            context={
-                                "smoketest_task_id": str(task.id),
-                                "failed_tests": [t["name"] for t in failed_tests],
-                                "suite_results": suite_results,
-                                "guardrail_violations": smoketest_data.get(
-                                    "guardrail_violations", []
-                                ),
-                                "total_tests": len(smoketest_data.get("tests", [])),
-                                "passed_count": len(
-                                    [
-                                        t
-                                        for t in smoketest_data.get("tests", [])
-                                        if t.get("status") == "pass"
-                                    ]
-                                ),
-                                "failed_count": len(failed_tests),
-                                **({"hotfix": True} if is_post_promotion else {}),
-                            },
-                            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-                            status=TaskStatus.QUEUED,
-                            created_by="ORCHESTRATOR",
-                        )
-                        session.add(plan_task)
-                        await session.flush()
-                        history = TaskHistory(
-                            task_id=plan_task.id,
-                            action="SPAWNED",
-                            details={
-                                "spawned_by": "SMOKETEST_FAILURE",
-                                "priority": fix_priority,
-                                "failed_tests": [t["name"] for t in failed_tests],
-                            },
-                        )
-                        session.add(history)
-
-                        # Build suite breakdown for alert message
-                        suite_detail = ""
-                        for suite_name, suite_data in suite_results.items():
-                            if (
-                                isinstance(suite_data, dict)
-                                and suite_data.get("passed") is False
+                            # Determine priority based on which suite failed (higher = dispatched first)
+                            suite_results = smoketest_data.get("suites", {})
+                            if suite_results.get("startup", {}).get("passed") is False:
+                                fix_priority = 90  # Startup failure — critical
+                            elif (
+                                suite_results.get("curated", {}).get("passed") is False
                             ):
-                                suite_fails = [
-                                    t
-                                    for t in suite_data.get("tests", [])
-                                    if t.get("status") == "fail"
-                                ]
-                                if suite_fails:
-                                    suite_detail += (
-                                        f" [{suite_name}: {len(suite_fails)} failed]"
+                                fix_priority = 70  # Curated test failure — high
+                            else:
+                                fix_priority = 50  # Regression-only failure — normal
+
+                            # Post-promotion (production) smoketest failures are urgent:
+                            # override suite-based ladder so priority is always >= 90.
+                            if is_post_promotion:
+                                fix_priority = max(fix_priority, 90)
+
+                            type_model = (
+                                _runtime_config.get("task_type_models", {}).get("plan")
+                                or None
+                            )
+                            type_effort = (
+                                _runtime_config.get("task_type_efforts", {}).get("plan")
+                                or None
+                            )
+                            plan_task = Task(
+                                project_id=task.project_id,
+                                title=(
+                                    f"[HOTFIX] Fix post-promotion smoketest failures on {base_branch}"
+                                    if is_post_promotion
+                                    else f"Fix smoketest failures on {base_branch}"
+                                ),
+                                description=f"{len(failed_tests)} smoke test(s) failed after merge to {base_branch}",
+                                parent_task_id=task.id,
+                                priority=fix_priority,
+                                payloads=[
+                                    _validate_internal_payload(
+                                        {
+                                            "type": "plan",
+                                            "prompt": (
+                                                f"Smoke tests failed after a merge to {base_branch}. "
+                                                f"Investigate and plan fixes for these failures:\n\n"
+                                                f"{failure_summary}\n\n"
+                                                f"IMPORTANT GUARDRAILS:\n"
+                                                f"- Do NOT delete or skip tests just to make them pass\n"
+                                                f"- First diagnose: is the failure in the CODE or the TEST?\n"
+                                                f"- If the test is wrong, fix it to correctly test the intended behavior\n"
+                                                f"- If the code is wrong, fix the code\n"
+                                                f"- Tests may only be removed if the tested functionality was removed — explain why\n"
+                                                f"- Do NOT weaken assertions without justification\n"
+                                                f"Diagnose root causes, identify which recent changes caused each failure, "
+                                                f"and produce subtasks to fix them."
+                                            ),
+                                            "base_branch": base_branch,
+                                            **(
+                                                {"hotfix": True}
+                                                if is_post_promotion
+                                                else {}
+                                            ),
+                                            **(
+                                                {"model": type_model}
+                                                if type_model
+                                                else {}
+                                            ),
+                                            **(
+                                                {"effort": type_effort}
+                                                if type_effort
+                                                else {}
+                                            ),
+                                        },
+                                        "main:smoketest_fix_plan",
                                     )
-
-                        alert = Alert(
-                            project_id=task.project_id,
-                            severity=AlertSeverity.ERROR,
-                            title=(
-                                f"[HOTFIX] Post-promotion smoke tests failed on {base_branch}"
-                                if is_post_promotion
-                                else f"Smoke tests failed on {base_branch}"
-                            ),
-                            message=(
-                                "[POST-PROMOTION PRODUCTION FAILURE] "
-                                if is_post_promotion
-                                else ""
+                                ],
+                                context={
+                                    "smoketest_task_id": str(task.id),
+                                    "failed_tests": [t["name"] for t in failed_tests],
+                                    "suite_results": suite_results,
+                                    "guardrail_violations": smoketest_data.get(
+                                        "guardrail_violations", []
+                                    ),
+                                    "total_tests": len(smoketest_data.get("tests", [])),
+                                    "passed_count": len(
+                                        [
+                                            t
+                                            for t in smoketest_data.get("tests", [])
+                                            if t.get("status") == "pass"
+                                        ]
+                                    ),
+                                    "failed_count": len(failed_tests),
+                                    **({"hotfix": True} if is_post_promotion else {}),
+                                },
+                                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                                status=TaskStatus.QUEUED,
+                                created_by="ORCHESTRATOR",
                             )
-                            + f"{len(failed_tests)} test(s) failed: {', '.join(t['name'] for t in failed_tests[:5])}"
-                            + (
-                                f" (+{len(failed_tests) - 5} more)"
-                                if len(failed_tests) > 5
-                                else ""
+                            session.add(plan_task)
+                            await session.flush()
+                            history = TaskHistory(
+                                task_id=plan_task.id,
+                                action="SPAWNED",
+                                details={
+                                    "spawned_by": "SMOKETEST_FAILURE",
+                                    "priority": fix_priority,
+                                    "failed_tests": [t["name"] for t in failed_tests],
+                                },
                             )
-                            + (suite_detail if suite_detail else ""),
-                            task_id=task.id,
-                        )
-                        session.add(alert)
+                            session.add(history)
 
-                        await broadcast_to_project(
-                            str(task.project_id),
-                            "task_updated",
-                            {"task_id": str(plan_task.id), "status": TaskStatus.QUEUED},
-                        )
-                        await broadcast_to_project(
-                            str(task.project_id),
-                            "alert_created",
-                            {
-                                "alert_id": str(alert.id),
-                                "severity": alert.severity,
-                                "title": alert.title,
-                            },
-                        )
-                        logger.error(
-                            f"[SMOKETEST] Spawned {'hotfix ' if is_post_promotion else ''}plan task {plan_task.id} (priority={fix_priority}) + alert for {len(failed_tests)} failed smoke tests"
-                        )
+                            # Build suite breakdown for alert message
+                            suite_detail = ""
+                            for suite_name, suite_data in suite_results.items():
+                                if (
+                                    isinstance(suite_data, dict)
+                                    and suite_data.get("passed") is False
+                                ):
+                                    suite_fails = [
+                                        t
+                                        for t in suite_data.get("tests", [])
+                                        if t.get("status") == "fail"
+                                    ]
+                                    if suite_fails:
+                                        suite_detail += f" [{suite_name}: {len(suite_fails)} failed]"
+
+                            alert = Alert(
+                                project_id=task.project_id,
+                                severity=AlertSeverity.ERROR,
+                                title=(
+                                    f"[HOTFIX] Post-promotion smoke tests failed on {base_branch}"
+                                    if is_post_promotion
+                                    else f"Smoke tests failed on {base_branch}"
+                                ),
+                                message=(
+                                    "[POST-PROMOTION PRODUCTION FAILURE] "
+                                    if is_post_promotion
+                                    else ""
+                                )
+                                + f"{len(failed_tests)} test(s) failed: {', '.join(t['name'] for t in failed_tests[:5])}"
+                                + (
+                                    f" (+{len(failed_tests) - 5} more)"
+                                    if len(failed_tests) > 5
+                                    else ""
+                                )
+                                + (suite_detail if suite_detail else ""),
+                                task_id=task.id,
+                            )
+                            session.add(alert)
+
+                            await broadcast_to_project(
+                                str(task.project_id),
+                                "task_updated",
+                                {
+                                    "task_id": str(plan_task.id),
+                                    "status": TaskStatus.QUEUED,
+                                },
+                            )
+                            await broadcast_to_project(
+                                str(task.project_id),
+                                "alert_created",
+                                {
+                                    "alert_id": str(alert.id),
+                                    "severity": alert.severity,
+                                    "title": alert.title,
+                                },
+                            )
+                            logger.error(
+                                f"[SMOKETEST] Spawned {'hotfix ' if is_post_promotion else ''}plan task {plan_task.id} (priority={fix_priority}) + alert for {len(failed_tests)} failed smoke tests"
+                            )
         except Exception as e:
             # Audit W5/A6: smoketest plan-task spawn used to silently log-and-continue.
             # That hid genuine breakage of the smoketest → fix-spawn → CI loop. Now
@@ -1537,7 +1603,10 @@ async def update_agent_status(
             # If confidence is high, auto-spawn a create task using the fix_prompt
             if debug_data.get("confidence") == "high" and debug_data.get("fix_prompt"):
                 failed_task_id = (task.context or {}).get("failed_task_id", "")
-                base_branch = (task.first_payload).get("base_branch", "main")
+                _debug_project = await session.get(Project, task.project_id)
+                base_branch = (task.first_payload).get(
+                    "base_branch"
+                ) or _get_project_integration_branch(_debug_project)
                 debug_title = task.title or ""
                 fix_title = (
                     debug_title.removeprefix("Debug: ")
@@ -1757,7 +1826,9 @@ async def update_agent_status(
             else:
                 from app.failure_classification import classify_failure_with_confidence
 
-                classification = classify_failure_with_confidence(task, payload.logs)
+                classification = classify_failure_with_confidence(
+                    task, payload.logs, at_time=task.last_heartbeat or task.started_at
+                )
                 failure_class = classification.failure_class
                 from app.failure_classification import (
                     EXTERNAL_API_SUBTYPE_PROVIDER_MODEL_CONFIG,
@@ -1983,6 +2054,9 @@ async def update_agent_status(
 
                     if should_requeue:
                         old_vm_id_rl = task.vm_instance_id  # Save BEFORE reassignment
+                        bank_task_current_attempt(task, stopped_at=_utcnow())
+                        ctx = with_task_attempt_banking(task, ctx)
+                        task.context = ctx
                         task.status = TaskStatus.QUEUED
                         # The earlier FAILED assignment fired the SQLAlchemy set event
                         # which added task.id to _terminated_task_ids, revoking the JWT.
@@ -2054,9 +2128,11 @@ async def update_agent_status(
                                     earliest_recovery - _utcnow()
                                 ).total_seconds() / 60
                                 set_retry_after(task, minutes_until)
+                                ctx = dict(task.context or {})
                                 task.latest_status_message = "Rate Limited — all accounts exhausted, waiting for recovery"
                             else:
                                 set_retry_after(task, 5)
+                                ctx = dict(task.context or {})
                                 task.latest_status_message = "Rate Limited — all accounts exhausted, retrying in 5min"
                         elif failure_class != "EXTERNAL_API":
                             task.retry_after_until = (
@@ -2111,9 +2187,27 @@ async def update_agent_status(
                         normalize_agent_failure_category,
                     )
 
+                    _fc_at_time2 = task.last_heartbeat or task.started_at
+                    _fc_acct_id2 = get_task_llm_account_id(task)
+                    _fc_scope2 = get_task_rate_limit_scope(task)
+                    _db_rl2 = (
+                        await db_account_was_rate_limited(
+                            _fc_acct_id2, at_time=_fc_at_time2
+                        )
+                        if _fc_acct_id2
+                        else await db_pool_wide_rate_limit_cooldown(
+                            at_time=_fc_at_time2,
+                            providers=_fc_scope2.get("providers"),
+                            model=_fc_scope2.get("model"),
+                            user_id=_fc_scope2.get("user_id"),
+                        )
+                    )
                     ctx = dict(task.context or {})
                     ctx["failure_category"] = normalize_agent_failure_category(
-                        payload.failure_category, task
+                        payload.failure_category,
+                        task,
+                        at_time=_fc_at_time2,
+                        db_rl_override=_db_rl2,
                     )
                     task.context = ctx
                     flag_modified(task, "context")
@@ -2138,17 +2232,17 @@ async def update_agent_status(
         task.model = str(_model) if _model else None
 
         task.vm_stopped_at = _utcnow()
-        if task.vm_provisioned_at:
-            _runtime_secs = (
-                task.vm_stopped_at - task.vm_provisioned_at
-            ).total_seconds()
-            _rate = SPOT_RATE if task.vm_spot else ON_DEMAND_RATE
+        _estimated_cost = get_task_total_vm_cost_usd(
+            task, stopped_at=task.vm_stopped_at
+        )
+        if _estimated_cost > 0:
             ctx = dict(task.context or {})
-            _estimated_cost = round(_runtime_secs * _rate, 4)
-            ctx["estimated_cost_usd"] = _estimated_cost
+            ctx["estimated_cost_usd"] = round(_estimated_cost, 4)
             task.context = ctx
-            task.estimated_cost_usd = _estimated_cost
+            task.estimated_cost_usd = round(_estimated_cost, 4)
             await _check_daily_cost_ceiling(task, session)
+        else:
+            task.estimated_cost_usd = None
         old_vm_id = task.vm_instance_id
         # Fire-and-forget: awaiting _ensure_vm_deleted holds the FOR UPDATE
         # row lock through 60-90s of GCP I/O. Concurrent /api/agent/status
@@ -2179,9 +2273,15 @@ async def update_agent_status(
 
                 if await has_eligible_backlog_task(session, task.project_id, old_vm_id):
                     from app.main import schedule_deferred_backlog_teardown
+                    from app.warm_backlog_reuse import (
+                        record_teardown_defer,
+                        record_vm_with_eligible_backlog,
+                    )
 
+                    record_vm_with_eligible_backlog()
                     _shared_state.register_backlog_first_refusal(str(task.project_id))
                     schedule_deferred_backlog_teardown(old_vm_id)
+                    record_teardown_defer()
                     _teardown_deferred = True
                     logger.info(
                         f"[BACKLOG-REUSE] Deferring teardown of VM {old_vm_id} "
@@ -2426,23 +2526,20 @@ async def update_agent_status(
                 session.add(task)
                 try:
                     from app.review_pipeline import _spawn_pipeline_task
+                    from app.shared_state import (
+                        derive_task_branch as _derive_task_branch,
+                    )
 
-                    _short_id = str(task.id).replace("-", "")[:8]
                     _task_type = (task.first_payload or {}).get("type", "") or ""
-                    _type_prefix_map = {
-                        "docs": "docs",
-                        "deps": "deps",
-                        "migrate": "migrate",
-                        "refactor": "refactor",
-                        "perf": "task",
-                        "qa": "task",
-                        "security_audit": "task",
-                        "debug": "task",
-                        "smoketest": "task",
-                    }
-                    _branch_prefix = _type_prefix_map.get(_task_type, "task")
-                    _branch = f"blueprint/{_branch_prefix}-{_short_id}"
-                    _base_branch = (task.first_payload or {}).get("base_branch", "main")
+                    _proj = await session.get(Project, task.project_id)
+                    _branch = _derive_task_branch(
+                        task.id,
+                        _task_type,
+                        _shared_state.get_project_task_branch_namespace(_proj),
+                    )
+                    _base_branch = (task.first_payload or {}).get(
+                        "base_branch"
+                    ) or _get_project_integration_branch(_proj)
                     _original_prompt = (task.first_payload or {}).get(
                         "prompt", task.description or ""
                     )
@@ -2498,6 +2595,7 @@ async def update_agent_status(
             and failure_class != SCOPE_EMPTY
         ):
             task.attempt_count += 1
+            bank_task_current_attempt(task, stopped_at=task.vm_stopped_at)
             task.status = TaskStatus.QUEUED
             # The earlier FAILED assignment fired the SQLAlchemy set event
             # which added task.id to _terminated_task_ids, revoking the JWT.
@@ -2743,8 +2841,10 @@ async def update_agent_status(
                         f"type={_task_type_str}"
                     )
                 # Increment confirmed_count and update effectiveness scoring for successful first attempts
-                if _ctx["_first_attempt_succeeded"] and _proj and _playbook_count > 0:
+                if _ctx["_first_attempt_succeeded"] and _playbook_count > 0:
                     try:
+                        from app.task_locking import project_lock as _proj_lock
+
                         _task_type = task.first_payload.get("type", "create")
                         _PLAYBOOK_DEFAULT_TYPES = {
                             "create",
@@ -2758,55 +2858,65 @@ async def update_agent_status(
                             "debug",
                             "docs",
                         }
-                        _doc = dict(_proj.design_doc or {})
-                        _confirmed_changed = False
-                        _now_iso = _utcnow().isoformat()
-                        # Keys shown to this task (stored at claim time for accurate outcome tracking)
-                        _shown_keys = {
-                            f"playbook/{k}"
-                            for k in (_ctx.get("_shown_playbook_keys") or [])
-                        }
-                        for _pk, _pv in list(_doc.items()):
-                            if _pk.startswith("playbook/") and isinstance(_pv, dict):
-                                _applicable = _pv.get("applicable_types")
-                                if _applicable is not None:
-                                    if _task_type not in _applicable:
-                                        continue
-                                elif _task_type not in _PLAYBOOK_DEFAULT_TYPES:
-                                    continue
-                                _entry = dict(_pv)
-                                _entry["confirmed_count"] = (
-                                    _entry.get("confirmed_count", 0) + 1
-                                )
-                                _entry["last_confirmed_at"] = _now_iso
-                                # Update rolling recent_outcomes only for entries shown to this task
-                                if _pk in _shown_keys:
-                                    _recent = list(_entry.get("recent_outcomes", []))
-                                    # Flip the most recent unconfirmed (False) outcome to True
-                                    _flipped = False
-                                    for _i in range(len(_recent) - 1, -1, -1):
-                                        if _recent[_i] is False:
-                                            _recent[_i] = True
-                                            _flipped = True
-                                            break
-                                    if not _flipped:
-                                        # No pending False; append True directly
-                                        _recent.append(True)
-                                        if len(_recent) > 10:
-                                            _recent = _recent[-10:]
-                                    _entry["recent_outcomes"] = _recent
-                                    _ref = _entry.get("reference_count", 0)
-                                    _conf = _entry.get("confirmed_count", 0)
-                                    if _conf > 0 or _ref > 0:
-                                        _entry["effectiveness_score"] = round(
-                                            _conf / max(_ref, 1), 4
+                        # Acquire project row lock before design_doc read-modify-write.
+                        # skip_locked=True: best-effort, contention degrades gracefully.
+                        async with _proj_lock(
+                            session, task.project_id, skip_locked=True
+                        ) as _proj_locked:
+                            if _proj_locked is not None:
+                                _doc = dict(_proj_locked.design_doc or {})
+                                _confirmed_changed = False
+                                _now_iso = _utcnow().isoformat()
+                                # Keys shown to this task (stored at claim time for accurate outcome tracking)
+                                _shown_keys = {
+                                    f"playbook/{k}"
+                                    for k in (_ctx.get("_shown_playbook_keys") or [])
+                                }
+                                for _pk, _pv in list(_doc.items()):
+                                    if _pk.startswith("playbook/") and isinstance(
+                                        _pv, dict
+                                    ):
+                                        _applicable = _pv.get("applicable_types")
+                                        if _applicable is not None:
+                                            if _task_type not in _applicable:
+                                                continue
+                                        elif _task_type not in _PLAYBOOK_DEFAULT_TYPES:
+                                            continue
+                                        _entry = dict(_pv)
+                                        _entry["confirmed_count"] = (
+                                            _entry.get("confirmed_count", 0) + 1
                                         )
-                                _doc[_pk] = _entry
-                                _confirmed_changed = True
-                        if _confirmed_changed:
-                            _proj.design_doc = _doc
-                            flag_modified(_proj, "design_doc")
-                            session.add(_proj)
+                                        _entry["last_confirmed_at"] = _now_iso
+                                        # Update rolling recent_outcomes only for entries shown to this task
+                                        if _pk in _shown_keys:
+                                            _recent = list(
+                                                _entry.get("recent_outcomes", [])
+                                            )
+                                            # Flip the most recent unconfirmed (False) outcome to True
+                                            _flipped = False
+                                            for _i in range(len(_recent) - 1, -1, -1):
+                                                if _recent[_i] is False:
+                                                    _recent[_i] = True
+                                                    _flipped = True
+                                                    break
+                                            if not _flipped:
+                                                # No pending False; append True directly
+                                                _recent.append(True)
+                                                if len(_recent) > 10:
+                                                    _recent = _recent[-10:]
+                                            _entry["recent_outcomes"] = _recent
+                                            _ref = _entry.get("reference_count", 0)
+                                            _conf = _entry.get("confirmed_count", 0)
+                                            if _conf > 0 or _ref > 0:
+                                                _entry["effectiveness_score"] = round(
+                                                    _conf / max(_ref, 1), 4
+                                                )
+                                        _doc[_pk] = _entry
+                                        _confirmed_changed = True
+                                if _confirmed_changed:
+                                    _proj_locked.design_doc = _doc
+                                    flag_modified(_proj_locked, "design_doc")
+                                    session.add(_proj_locked)
                     except Exception as _pce:
                         logger.warning(
                             f"[PLAYBOOK] Failed to increment confirmed_count for task {_task_id_str}: {_pce}"
@@ -2910,7 +3020,10 @@ async def update_agent_status(
             )
         )
         if should_auto_debug:
-            base_branch = failed_task_payload.get("base_branch", "main")
+            _auto_debug_project = await session.get(Project, task.project_id)
+            base_branch = failed_task_payload.get(
+                "base_branch"
+            ) or _get_project_integration_branch(_auto_debug_project)
             debug_task = Task(
                 project_id=task.project_id,
                 title=f"Debug: {task.title}",
@@ -2968,7 +3081,9 @@ async def update_agent_status(
         #  - infra_failure_count: infra wall (PROVISION_FAILURE, RATE_LIMIT, EXTERNAL_API) → opens at 5
         # Both walls block autonomous spawning, but infra opens use a shorter cooldown
         # because infra cascades typically self-heal faster than code regressions.
-        _cb_failure_class = classify_failure(task, payload.logs)
+        _cb_failure_class = classify_failure(
+            task, payload.logs, at_time=task.last_heartbeat or task.started_at
+        )
         if payload.status == TaskStatus.FAILED and task.created_by == "ORCHESTRATOR":
             project_key = str(task.project_id)
             breaker = _shared_state.get_circuit_breaker(project_key)

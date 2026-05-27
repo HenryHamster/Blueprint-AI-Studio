@@ -1,0 +1,257 @@
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight } from 'lucide-react';
+import { fetchSrMissedRetrospectives } from '../api';
+import type { SrMissedTask } from './SrTrendBreakdown';
+import { SR_CANONICAL_CATEGORIES } from './SrTrendBreakdown';
+import { timeAgo } from '../utils/time';
+
+const PAGE_SIZE = 20;
+const DAY_OPTIONS = [7, 14, 30, 90];
+
+export interface SrMissedRetrospectivesPanelProps {
+  selectedProjectId: string | null;
+  onSelectTask: (taskId: string) => void;
+}
+
+export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask }: SrMissedRetrospectivesPanelProps) {
+  const [items, setItems] = useState<SrMissedTask[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [days, setDays] = useState(14);
+  const [categoryFilter, setCategoryFilter] = useState('');
+  const [taskTypeFilter, setTaskTypeFilter] = useState('');
+  const [page, setPage] = useState(1);
+  const mountedRef = useRef(true);
+
+  const fetchData = useCallback(async () => {
+    if (!selectedProjectId) return;
+    setLoading(true);
+    setFetchError(null);
+    try {
+      const result = await fetchSrMissedRetrospectives(selectedProjectId, {
+        days,
+        category: categoryFilter || undefined,
+        task_type: taskTypeFilter || undefined,
+        page,
+        page_size: PAGE_SIZE,
+      });
+      if (!mountedRef.current) return;
+      setItems(result.items);
+      setTotal(result.total);
+    } catch (e) {
+      if (!mountedRef.current) return;
+      setFetchError(e instanceof Error ? e.message : 'network error');
+    } finally {
+      if (mountedRef.current) setLoading(false);
+    }
+  }, [selectedProjectId, days, categoryFilter, taskTypeFilter, page]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    fetchData();
+    return () => { mountedRef.current = false; };
+  }, [fetchData]);
+
+  // Reset page when filters change
+  const prevFiltersRef = useRef({ days, categoryFilter, taskTypeFilter, selectedProjectId });
+  useEffect(() => {
+    const prev = prevFiltersRef.current;
+    if (prev.days !== days || prev.categoryFilter !== categoryFilter || prev.taskTypeFilter !== taskTypeFilter || prev.selectedProjectId !== selectedProjectId) {
+      setPage(1);
+      prevFiltersRef.current = { days, categoryFilter, taskTypeFilter, selectedProjectId };
+    }
+  }, [days, categoryFilter, taskTypeFilter, selectedProjectId]);
+
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+  const catFreq = useMemo(() => {
+    const freq: Record<string, number> = {};
+    for (const t of items) {
+      for (const cat of t.missed_categories) {
+        freq[cat] = (freq[cat] ?? 0) + 1;
+      }
+    }
+    return Object.entries(freq).sort((a, b) => b[1] - a[1]);
+  }, [items]);
+
+  const allTypes = useMemo(
+    () => Array.from(new Set(items.map(t => t.task_type).filter((v): v is string => Boolean(v)))).sort(),
+    [items],
+  );
+
+  if (!selectedProjectId) return null;
+
+  return (
+    <section aria-label="SR missed retrospectives" data-testid="sr-missed-retrospectives-panel">
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">SR Missed Retrospectives</h2>
+
+      <div className="flex flex-wrap items-center gap-2 mb-2 text-[10px]">
+        {DAY_OPTIONS.map(d => (
+          // eslint-disable-next-line viewport/min-touch-target -- dense filter controls, consistent with adjacent panels
+          <button
+            key={d}
+            type="button"
+            onClick={() => setDays(d)}
+            className={`px-1.5 py-0.5 rounded border ${days === d ? 'border-blue-500 text-blue-300' : 'border-neutral-700 text-neutral-400 hover:border-neutral-500'}`}
+          >{d}d</button>
+        ))}
+        <select
+          value={categoryFilter}
+          onChange={e => setCategoryFilter(e.target.value)}
+          className="bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-neutral-300 text-[10px]"
+          aria-label="Filter by category"
+        >
+          <option value="">All categories</option>
+          {SR_CANONICAL_CATEGORIES.map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
+        </select>
+        {allTypes.length > 0 && (
+          <select
+            value={taskTypeFilter}
+            onChange={e => setTaskTypeFilter(e.target.value)}
+            className="bg-neutral-900 border border-neutral-700 rounded px-1 py-0.5 text-neutral-300 text-[10px]"
+            aria-label="Filter by task type"
+          >
+            <option value="">All types</option>
+            {allTypes.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
+        )}
+      </div>
+
+      {loading ? (
+        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 h-14 animate-pulse" />
+      ) : fetchError ? (
+        <div
+          className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex items-center gap-2"
+          role="status"
+        >
+          <AlertTriangle className="w-3.5 h-3.5 text-neutral-500 shrink-0" aria-hidden="true" />
+          <span>Error fetching SR data</span>
+          <span className="text-[10px] text-neutral-600 truncate" title={fetchError}>{fetchError}</span>
+        </div>
+      ) : items.length === 0 ? (
+        <div
+          className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-emerald-400 flex items-center gap-2"
+          role="status"
+          data-testid="sr-missed-empty"
+        >
+          <CheckCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+          <span>No SR misses in the last {days} days — self-review is catching everything</span>
+        </div>
+      ) : (
+        <>
+          {catFreq.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mb-2">
+              {catFreq.map(([cat, count]) => (
+                // eslint-disable-next-line viewport/min-touch-target -- dense filter controls, consistent with adjacent panels
+                <button
+                  key={cat}
+                  type="button"
+                  onClick={() => setCategoryFilter(cat === categoryFilter ? '' : cat)}
+                  className={`px-1.5 py-0.5 rounded text-[9px] border transition-colors ${cat === categoryFilter ? 'border-red-500/60 bg-red-950/30 text-red-300' : 'border-neutral-700 text-neutral-400 hover:border-red-500/40'}`}
+                  title={`Filter by ${cat}`}
+                >
+                  {cat} <span className="text-neutral-500">{count}</span>
+                </button>
+              ))}
+              <span className="text-[9px] text-neutral-600 self-center ml-1">{total} total</span>
+            </div>
+          )}
+          <div className="flex flex-col gap-1">
+            {items.map(t => (
+              <SrMissRow key={t.task_id} task={t} onClick={() => onSelectTask(t.task_id)} />
+            ))}
+          </div>
+          {totalPages > 1 && (
+            <div className="flex items-center gap-2 mt-2 text-[10px] text-neutral-400">
+              {/* eslint-disable-next-line viewport/min-touch-target -- compact pagination, consistent with adjacent panels */}
+              <button
+                type="button"
+                disabled={page === 1}
+                onClick={() => setPage(p => Math.max(1, p - 1))}
+                className="px-1.5 py-0.5 border border-neutral-700 rounded disabled:opacity-40 hover:border-neutral-500"
+                aria-label="Previous page"
+              >←</button>
+              <span>{page} / {totalPages}</span>
+              {/* eslint-disable-next-line viewport/min-touch-target -- compact pagination, consistent with adjacent panels */}
+              <button
+                type="button"
+                disabled={page >= totalPages}
+                onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                className="px-1.5 py-0.5 border border-neutral-700 rounded disabled:opacity-40 hover:border-neutral-500"
+                aria-label="Next page"
+              >→</button>
+            </div>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function SrMissRow({ task, onClick }: { task: SrMissedTask; onClick: () => void }) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    // eslint-disable-next-line viewport/min-touch-target -- dense row, consistent with SrMissedRetrospective
+    <div
+      className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-[10px] cursor-pointer hover:border-neutral-600"
+      onClick={onClick}
+      role="button"
+      tabIndex={0}
+      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick(); } }}
+      aria-label={`View task: ${task.title}`}
+    >
+      <div className="flex items-center gap-1.5">
+        <button
+          type="button"
+          className="text-neutral-500 hover:text-neutral-300 shrink-0"
+          aria-label={`${expanded ? 'collapse' : 'expand'} ${task.title}`}
+          aria-expanded={expanded}
+          onClick={e => { e.stopPropagation(); setExpanded(v => !v); }}
+        >
+          {expanded ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+        </button>
+        <span className="text-neutral-200 truncate flex-1 font-medium" title={task.title}>{task.title}</span>
+        {task.task_type && <span className="text-neutral-500 shrink-0">{task.task_type}</span>}
+        {task.created_at && (
+          <span className="text-neutral-600 shrink-0" title={task.created_at}>{timeAgo(task.created_at)}</span>
+        )}
+      </div>
+      <div className="flex flex-wrap gap-x-2 gap-y-0.5 mt-0.5 pl-4">
+        {task.missed_categories.map(cat => (
+          <span key={cat} className="bg-red-950/40 border border-red-800/30 rounded px-1 py-0.5 text-red-300 text-[9px]">{cat}</span>
+        ))}
+        {task.caught_categories.length > 0 && (
+          <span className="text-neutral-600 text-[9px]">{task.caught_categories.length} caught</span>
+        )}
+      </div>
+      {expanded && task.missed_categories.length > 0 && (
+        <div className="mt-1.5 pl-4 flex flex-col gap-1">
+          {task.missed_categories.map(cat => {
+            const sr = task.sr_check_results?.[cat];
+            const reviewer = task.reviewer_findings?.find(f => f.category === cat);
+            return (
+              <div key={cat} className="rounded border border-neutral-800/60 bg-neutral-950/50 p-1.5">
+                <div className="mb-1 text-neutral-400 font-medium">{cat}</div>
+                <div className="grid gap-1 grid-cols-2 text-[9px]">
+                  <div>
+                    <span className="text-neutral-500">SR: </span>
+                    {sr ? (
+                      <span className={sr.passed ? 'text-emerald-400' : 'text-red-400'}>{sr.passed ? 'passed' : 'failed'}</span>
+                    ) : <span className="text-neutral-600">—</span>}
+                  </div>
+                  <div>
+                    <span className="text-neutral-500">Reviewer: </span>
+                    {reviewer ? (
+                      <span className="text-amber-400">{reviewer.severity ?? 'flagged'}</span>
+                    ) : <span className="text-neutral-600">—</span>}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}

@@ -1,10 +1,12 @@
 import { useState, useRef, useEffect } from 'react';
-import { Terminal, X, Copy, Check, CheckCircle, Hash, Maximize2, Minimize2, Loader2, WifiOff, Download } from 'lucide-react';
+import { Terminal, X, Copy, Check, CheckCircle, Hash, Maximize2, Minimize2, Loader2, WifiOff, Download, Diff, ChevronDown, ChevronRight, Plus, Minus, CopyPlus } from 'lucide-react';
 import { LogsTab } from './TaskDetailDrawerLogs';
 import type { LogLevel } from './TaskDetailDrawerLogs';
 import { StatusBadge, TaskTypeBadge } from './TaskCard';
 import type { Task } from './TaskCard';
 import { DetailsTab } from './TaskDetailDrawerMeta';
+import { fetchTaskPrFiles } from '../api';
+import type { PrFileEntry } from '../api';
 
 interface TaskDetailDrawerProps {
   task: Task;
@@ -24,9 +26,10 @@ interface TaskDetailDrawerProps {
   onDismiss: (id: string) => void;
   onNavigateToTask?: (taskId: string) => void;
   onWidthChange?: (width: number) => void;
+  onDuplicate?: (task: Task) => void;
 }
 
-type Tab = 'details' | 'logs';
+type Tab = 'details' | 'logs' | 'changes';
 
 function hasMergedPr(task: Task): boolean {
   return !!(task.pr_url || task.artifacts?.some(a => a.pr_url));
@@ -37,6 +40,166 @@ function isAutonomousMerge(task: Task): boolean {
   const ctx = task.context ?? {};
   if (ctx['review_dismissed'] || ctx['user_overrode_review']) return false;
   return true;
+}
+
+function statusColor(status: string): string {
+  switch (status) {
+    case 'added': return 'text-emerald-400';
+    case 'removed': return 'text-red-400';
+    case 'renamed': return 'text-blue-400';
+    case 'modified': return 'text-amber-400';
+    default: return 'text-neutral-400';
+  }
+}
+
+interface ChangesTabContentProps {
+  prFiles: PrFileEntry[] | null;
+  prNumber: number | null;
+  loading: boolean;
+  error: string | null;
+  includePatch: boolean;
+  expandedPatches: Set<string>;
+  setExpandedPatches: (patches: Set<string>) => void;
+  onLoadWithDiff: () => void;
+  onReload: () => void;
+}
+
+function ChangesTabContent({
+  prFiles,
+  prNumber,
+  loading,
+  error,
+  includePatch,
+  expandedPatches,
+  setExpandedPatches,
+  onLoadWithDiff,
+  onReload,
+}: ChangesTabContentProps) {
+  const togglePatch = (filename: string) => {
+    const next = new Set(expandedPatches);
+    if (next.has(filename)) next.delete(filename);
+    else next.add(filename);
+    setExpandedPatches(next);
+  };
+
+  if (loading) {
+    return (
+      <div className="flex-1 flex items-center justify-center text-neutral-500 gap-2">
+        <Loader2 className="w-4 h-4 animate-spin" />
+        <span className="text-sm">Loading changed files…</span>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center gap-3 p-6">
+        <p className="text-sm text-red-400">{error}</p>
+        <button
+          onClick={onReload}
+          className="px-3 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-sm transition-colors"
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  if (prFiles === null) {
+    return (
+      <div className="flex-1 flex items-center justify-center text-neutral-600 text-sm">
+        No PR found for this task.
+      </div>
+    );
+  }
+
+  if (prFiles.length === 0) {
+    return (
+      <div className="flex-1 flex items-center justify-center text-neutral-600 text-sm">
+        No files changed in PR #{prNumber}.
+      </div>
+    );
+  }
+
+  const totalAdditions = prFiles.reduce((s, f) => s + f.additions, 0);
+  const totalDeletions = prFiles.reduce((s, f) => s + f.deletions, 0);
+
+  return (
+    <div className="flex-1 overflow-y-auto">
+      <div className="px-4 py-2 border-b border-neutral-800 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-3 text-xs text-neutral-500">
+          <span>{prFiles.length} file{prFiles.length !== 1 ? 's' : ''}</span>
+          <span className="text-emerald-400">+{totalAdditions}</span>
+          <span className="text-red-400">−{totalDeletions}</span>
+          {prNumber && (
+            <span className="text-neutral-600">PR #{prNumber}</span>
+          )}
+        </div>
+        {!includePatch && (
+          <button
+            onClick={onLoadWithDiff}
+            className="text-xs text-blue-400 hover:text-blue-300 transition-colors"
+          >
+            Load diffs
+          </button>
+        )}
+      </div>
+      <div className="divide-y divide-neutral-800/50">
+        {prFiles.map(file => (
+          <div key={file.filename} className="text-xs">
+            <button
+              onClick={() => file.patch ? togglePatch(file.filename) : undefined}
+              className={`w-full flex items-center gap-2 px-4 py-2.5 hover:bg-neutral-900/50 transition-colors text-left ${file.patch ? 'cursor-pointer' : 'cursor-default'}`}
+            >
+              {file.patch ? (
+                expandedPatches.has(file.filename)
+                  ? <ChevronDown className="w-3 h-3 text-neutral-500 shrink-0" />
+                  : <ChevronRight className="w-3 h-3 text-neutral-500 shrink-0" />
+              ) : (
+                <span className="w-3 h-3 shrink-0" />
+              )}
+              <span className={`shrink-0 w-14 ${statusColor(file.status)}`}>{file.status}</span>
+              <span className="flex-1 text-neutral-200 font-mono truncate">{file.filename}</span>
+              <span className="shrink-0 flex items-center gap-1.5 text-neutral-500">
+                {file.additions > 0 && (
+                  <span className="flex items-center gap-0.5 text-emerald-500">
+                    <Plus className="w-2.5 h-2.5" />{file.additions}
+                  </span>
+                )}
+                {file.deletions > 0 && (
+                  <span className="flex items-center gap-0.5 text-red-500">
+                    <Minus className="w-2.5 h-2.5" />{file.deletions}
+                  </span>
+                )}
+              </span>
+            </button>
+            {file.patch && expandedPatches.has(file.filename) && (
+              <div className="px-4 pb-3 bg-neutral-950">
+                <pre className="text-[11px] font-mono overflow-x-auto leading-relaxed whitespace-pre">
+                  {file.patch.split('\n').map((line, i) => (
+                    <div
+                      key={i}
+                      className={
+                        line.startsWith('+') && !line.startsWith('+++')
+                          ? 'bg-emerald-950/30 text-emerald-300'
+                          : line.startsWith('-') && !line.startsWith('---')
+                          ? 'bg-red-950/30 text-red-300'
+                          : line.startsWith('@@')
+                          ? 'text-blue-400'
+                          : 'text-neutral-500'
+                      }
+                    >
+                      {line || ' '}
+                    </div>
+                  ))}
+                </pre>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 export function TaskDetailDrawer({
@@ -57,6 +220,7 @@ export function TaskDetailDrawer({
   onDismiss,
   onNavigateToTask,
   onWidthChange,
+  onDuplicate,
 }: TaskDetailDrawerProps) {
   const [activeTab, setActiveTab] = useState<Tab>('details');
   const [logFilter, setLogFilter] = useState('');
@@ -70,6 +234,13 @@ export function TaskDetailDrawer({
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const dragCleanupRef = useRef<(() => void) | null>(null);
+  const [prFiles, setPrFiles] = useState<PrFileEntry[] | null>(null);
+  const [prFilesLoading, setPrFilesLoading] = useState(false);
+  const [prFilesError, setPrFilesError] = useState<string | null>(null);
+  const [prNumber, setPrNumber] = useState<number | null>(null);
+  const [prFilesLoaded, setPrFilesLoaded] = useState(false);
+  const [expandedPatches, setExpandedPatches] = useState<Set<string>>(new Set());
+  const [includePatch, setIncludePatch] = useState(false);
 
   // Detect mobile viewport (< 640px, Tailwind sm: breakpoint)
   useEffect(() => {
@@ -98,6 +269,40 @@ export function TaskDetailDrawer({
   useEffect(() => {
     return () => { dragCleanupRef.current?.(); };
   }, []);
+
+  // Reset changes tab state when task changes
+  useEffect(() => {
+    setPrFiles(null);
+    setPrFilesLoading(false);
+    setPrFilesError(null);
+    setPrNumber(null);
+    setPrFilesLoaded(false);
+    setExpandedPatches(new Set());
+    setIncludePatch(false);
+  }, [task.id]);
+
+  const loadPrFiles = async (withPatch: boolean) => {
+    setPrFilesLoading(true);
+    setPrFilesError(null);
+    try {
+      const data = await fetchTaskPrFiles(task.id, withPatch);
+      setPrFiles(data.files);
+      setPrNumber(data.pr_number ?? null);
+      setPrFilesLoaded(true);
+      setIncludePatch(withPatch);
+    } catch (e) {
+      setPrFilesError(e instanceof Error ? e.message : 'Failed to load PR files');
+    } finally {
+      setPrFilesLoading(false);
+    }
+  };
+
+  const handleChangesTabActivate = () => {
+    setActiveTab('changes');
+    if (!prFilesLoaded && !prFilesLoading) {
+      loadPrFiles(false);
+    }
+  };
 
   // Keyboard shortcut: f to toggle fullscreen
   useEffect(() => {
@@ -194,6 +399,15 @@ export function TaskDetailDrawer({
               </div>
             </div>
             <div className="flex items-center gap-1 shrink-0">
+              {onDuplicate && (
+                <button
+                  onClick={() => onDuplicate(task)}
+                  title="Duplicate task"
+                  className="p-2.5 md:p-1.5 rounded-lg hover:bg-neutral-800 text-neutral-400 hover:text-neutral-200 transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                >
+                  <CopyPlus className="w-5 h-5" />
+                </button>
+              )}
               <button
                 onClick={() => setIsFullscreen(prev => !prev)}
                 title={isFullscreen ? 'Exit fullscreen (f)' : 'Fullscreen (f)'}
@@ -236,6 +450,17 @@ export function TaskDetailDrawer({
               <span className="ml-1.5 text-xs text-neutral-500">({logLines.length})</span>
             )}
           </button>
+          <button
+            onClick={handleChangesTabActivate}
+            className={`px-4 py-2.5 min-h-[44px] text-sm font-medium transition-colors flex items-center gap-1.5 ${
+              activeTab === 'changes'
+                ? 'text-neutral-100 border-b-2 border-blue-500'
+                : 'text-neutral-500 hover:text-neutral-300'
+            }`}
+          >
+            <Diff className="w-3.5 h-3.5" />
+            Changes
+          </button>
           {activeTab === 'logs' && (
             <div className="ml-auto mr-2 flex items-center gap-1">
               <button
@@ -270,7 +495,7 @@ export function TaskDetailDrawer({
         </div>
 
         {/* Content */}
-        {wsDisconnected && (
+        {wsDisconnected && activeTab !== 'changes' && (
           <div className="flex items-center gap-2 px-4 py-2 bg-amber-950/40 border-b border-amber-800/50 text-amber-400 text-xs shrink-0">
             <WifiOff className="w-3.5 h-3.5 shrink-0" />
             Log stream disconnected
@@ -278,6 +503,18 @@ export function TaskDetailDrawer({
         )}
         {activeTab === 'details' ? (
           <DetailsTab task={task} tasks={tasks} gcpProjectId={gcpProjectId} onNavigateToTask={onNavigateToTask} />
+        ) : activeTab === 'changes' ? (
+          <ChangesTabContent
+            prFiles={prFiles}
+            prNumber={prNumber}
+            loading={prFilesLoading}
+            error={prFilesError}
+            includePatch={includePatch}
+            expandedPatches={expandedPatches}
+            setExpandedPatches={setExpandedPatches}
+            onLoadWithDiff={() => loadPrFiles(true)}
+            onReload={() => loadPrFiles(includePatch)}
+          />
         ) : (
           <>
             {wsDisconnected && (

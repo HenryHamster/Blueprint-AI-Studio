@@ -1,7 +1,70 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
+import { act } from 'react';
 import MetricsDashboard from './MetricsDashboard';
 import type { Task } from '../types/task';
+
+const { apiFetch } = vi.hoisted(() => ({
+  apiFetch: vi.fn(async (url: string) => {
+    if (url.includes('/task-cost-breakdown')) {
+      return new Response(JSON.stringify({
+        project_id: 'project-1',
+        window: '6h',
+        window_ms: 21600000,
+        window_start: '2026-04-24T06:00:00Z',
+        task_count: 3,
+        total_estimated_cost_usd: 24.5,
+        task_type_breakdown: [
+          { task_type: 'research', task_count: 2, estimated_cost_usd: 17.5 },
+          { task_type: 'create', task_count: 1, estimated_cost_usd: 7.0 },
+        ],
+        direction_breakdown: [
+          { direction_id: 'dir-123', task_count: 2, estimated_cost_usd: 17.5 },
+          { direction_id: null, task_count: 1, estimated_cost_usd: 7.0 },
+        ],
+        top_tasks: [
+          {
+            task_id: 'task-1',
+            task_title: 'Research expensive thing',
+            task_type: 'research',
+            direction_id: 'dir-123',
+            completed_at: '2026-04-24T11:00:00Z',
+            estimated_cost_usd: 12.5,
+          },
+          {
+            task_id: 'task-2',
+            task_title: 'Another expensive task',
+            task_type: 'create',
+            direction_id: null,
+            completed_at: '2026-04-24T10:30:00Z',
+            estimated_cost_usd: 7.0,
+          },
+        ],
+      }), { status: 200 });
+    }
+    return new Response(JSON.stringify({
+      axes: {
+        cost_per_merged_pr: {
+          current: 45.2, baseline: 50.0, drift_pct: -9.6,
+          history: [{ captured_at: '2026-05-01T00:00:00Z', value: 45.2 }],
+        },
+        vm_cold_start_p50_ms: {
+          current: 3200, baseline: 3500, drift_pct: -8.6,
+          history: [{ captured_at: '2026-05-01T00:00:00Z', value: 3200 }],
+        },
+        vm_reuse_rate: { current: 72, baseline: 68, drift_pct: 5.9, history: [] },
+        median_api_calls_per_task: { current: 12, baseline: 15, drift_pct: -20.0, history: [{ captured_at: '2026-05-01T00:00:00Z', value: 12 }] },
+        median_review_iterations: { current: 2.1, baseline: 2.5, drift_pct: -16.0 },
+      },
+      baseline_captured_at: '2026-05-01T00:00:00Z',
+      last_snapshot_at: '2026-05-08T00:00:00Z',
+    }), { status: 200 });
+  }),
+}));
+
+vi.mock('../api', () => ({
+  apiFetch,
+}));
 
 vi.mock('recharts', () => ({
   ResponsiveContainer: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
@@ -33,6 +96,7 @@ describe('MetricsDashboard', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-04-24T12:00:00Z'));
+    apiFetch.mockClear();
   });
 
   afterEach(() => {
@@ -92,5 +156,66 @@ describe('MetricsDashboard', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '6h' }));
     expect(onWindowChange).toHaveBeenCalledWith('6h');
+  });
+
+  it('exports the currently filtered metric series as CSV and JSON', () => {
+    const originalCreateElement = document.createElement.bind(document);
+    const createObjectURL = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:metrics');
+    const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+    const click = vi.fn();
+    vi.spyOn(document, 'createElement').mockImplementation(((tagName: string) =>
+      tagName === 'a' ? ({ click, set href(_value: string) {}, set download(_value: string) {} } as unknown as HTMLAnchorElement) : originalCreateElement(tagName)) as typeof document.createElement);
+
+    render(
+      <MetricsDashboard
+        metricsHistory={[
+          { timestamp: Date.now() - 4000000, activeVMs: 1, costPerHr: 1, completedCount: 1, failedCount: 0 },
+          { timestamp: Date.now() - 300000, activeVMs: 2, costPerHr: 2, completedCount: 3, failedCount: 1 },
+        ]}
+        cumulativeCost={0}
+        cumulativeVmHours={0}
+        maxConcurrentVMs={4}
+        tasks={[]}
+        metricsWindow="1h"
+        onWindowChange={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'CSV' }));
+    expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
+    expect(click).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole('button', { name: 'JSON' }));
+    expect(click).toHaveBeenCalledTimes(2);
+    expect(revokeObjectURL).toHaveBeenCalledTimes(2);
+  });
+
+  it('fetches and renders project-scoped cost breakdown rows', async () => {
+    render(
+      <MetricsDashboard
+        metricsHistory={[]}
+        cumulativeCost={12.34}
+        cumulativeVmHours={56.78}
+        maxConcurrentVMs={4}
+        tasks={[]}
+        metricsWindow="6h"
+        onWindowChange={vi.fn()}
+        projectId="project-1"
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(apiFetch).toHaveBeenCalledWith(
+      '/api/admin/task-cost-breakdown?project_id=project-1&window=6h&top_n=5',
+    );
+    expect(screen.getByText('Cost Breakdown')).toBeInTheDocument();
+    expect(screen.getByText('By task type')).toBeInTheDocument();
+    expect(screen.getAllByText('research').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('dir-123').length).toBeGreaterThan(0);
+    expect(screen.getByText('Research expensive thing')).toBeInTheDocument();
+    expect(screen.getByText('$24.50 across 3 tasks')).toBeInTheDocument();
   });
 });

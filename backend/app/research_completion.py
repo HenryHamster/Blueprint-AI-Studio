@@ -61,6 +61,7 @@ from app.research_context import (  # noqa: F401 — re-exported for callers/tes
     _build_research_context,
 )
 from app.research_direction_state import (  # noqa: F401 — re-exported for callers/tests
+    RETIRED_DIRECTION_STATUSES,
     _compute_saturation,
     _detect_dedup_deadlock,
     apply_post_spawn_state,
@@ -75,6 +76,7 @@ from app.shared_state import (
     runtime_config as _runtime_config,
     DEFAULT_TASK_SCOPE,
     scope_to_effort,
+    get_project_integration_branch as _get_project_integration_branch,
 )
 from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/callers
     _SCOPE_ORDER,
@@ -92,7 +94,9 @@ from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/call
 from app.task_completion import (
     _extract_json_array,
     _ensure_branch,
+    _apply_synthesized_memo,
 )
+from app.task_locking import with_design_doc_locked, with_directions_locked
 from app.plan_completion import (
     _validate_plan_dependencies,
     _log_file_overlaps,
@@ -147,6 +151,32 @@ def _trim_finding_for_memo(finding: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(related, list) and related:
         trimmed["related_files"] = [str(f) for f in related[:20]]
     return trimmed
+
+
+def _synthesize_deferred_finding_memo(
+    sf: Dict[str, Any],
+    drop_reason: str,
+    source_task_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Synthesize a memo dict for a deferred finding without a model call.
+
+    Returns None when the finding has no title or description (insufficient data).
+    The backend already holds the full finding at spawn time, so no VM is needed.
+    """
+    title = str(sf.get("title") or "").strip()
+    description = str(sf.get("description") or "").strip()
+    if not title and not description:
+        return None
+    parts = [f"Dropped finding: {title}"] if title else []
+    parts.append(f"Reason: {drop_reason}")
+    if description:
+        parts.append(f"Description: {description}")
+    return {
+        "summary": (title or description)[:200],
+        "reasoning": "\n\n".join(parts),
+        "citations": [f"task:{source_task_id}"] if source_task_id else [],
+        "tags": ["deferred-finding", drop_reason],
+    }
 
 
 def _parse_research_findings(text: str) -> Optional[List[Dict[str, Any]]]:
@@ -800,9 +830,7 @@ async def _shelve_findings_for_next_cycle(
             )
             t = res.scalars().one_or_none()
             if t is None:
-                logger.warning(
-                    f"[RESEARCH] shelve_findings: task {task_id} not found"
-                )
+                logger.warning(f"[RESEARCH] shelve_findings: task {task_id} not found")
                 return
             ctx = dict(t.context or {})
             existing = list(ctx.get("deferred_findings") or [])
@@ -871,8 +899,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # rather than at spawn time prevents the cascade observed on 2026-05-03
     # where one strategic_review spawned 4 research tasks AT ONCE and
     # immediately tripped the modulo-6 gate for the next strategic_review.
-    from sqlalchemy.orm.attributes import flag_modified
-
     project_obj = await session.get(Project, task.project_id)
     if project_obj is not None:
         new_count = ((project_obj.vision or {}).get("_research_spawn_count") or 0) + 1
@@ -1118,9 +1144,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             len(_batch_cap_deferred),
         )
 
-    original_base = (task.first_payload).get("base_branch", "main")
+    original_base = (task.first_payload).get(
+        "base_branch"
+    ) or _get_project_integration_branch(project_obj)
     short_id = str(task.id).replace("-", "")[:8]
-    research_branch = f"research/{short_id}"
+    research_branch_prefix = getattr(project_obj, "research_branch_prefix", "research/")
+    research_branch = f"{research_branch_prefix}{short_id}"
 
     # Create staging branch for this research batch.
     # Round 4 W1 (audit C2): _ensure_branch now returns Task | None.
@@ -1190,13 +1219,24 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         .scalars()
         .all()
     )
-    # Build set of finding hashes already memoed to prevent duplicate memo spawns
-    # across research cycles for the same underlying finding.
-    _existing_memo_finding_hashes: set[str] = {
-        h
-        for t in recent_tasks_for_dedup
-        if (h := (t.context or {}).get("memo_source_finding_hash"))
-    }
+    # Bounded projecting query for memo dedup — avoids filtering the full 90-day
+    # task scan in Python by projecting only the JSONB field we need.
+    _memo_hash_rows = (
+        (
+            await session.execute(
+                select(Task.context["memo_source_finding_hash"].as_string())
+                .where(
+                    Task.project_id == task.project_id,
+                    Task.created_at >= ninety_days_ago,
+                    Task.context["memo_source_finding_hash"].as_string().isnot(None),
+                )
+                .limit(500)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    _existing_memo_finding_hashes: set[str] = {h for h in _memo_hash_rows if h}
     # Collect parent IDs for COMPLETED+pr_merged tasks to detect ghost merges
     # (code merged to staging branch but parent rollup PR to main failed)
     potential_ghost_parent_ids = {
@@ -1248,7 +1288,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             p for p in parent_tasks_rows if p.status in _non_terminal_statuses
         ]
         if _non_terminal_parents:
-            _integration_branch_rc = _runtime_config.get("integration_branch", "main")
+            _integration_branch_rc = _get_project_integration_branch(project_obj)
             _gh_creds_rc: tuple | None = None
             try:
                 from app.release_qualifier import (
@@ -1325,11 +1365,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _pfh = _d.get("recently_filtered_finding_hashes") or []
             _previously_filtered_hashes = set(_pfh)
             break
-    _RETIRED_STATUSES = frozenset({"retired", "expired", "completed", "superseded"})
     _retired_ctx_list: list[dict] = []
     for _d in _dedup_project_dirs:
         if (
-            _d.get("status") in _RETIRED_STATUSES
+            _d.get("status") in RETIRED_DIRECTION_STATUSES
             and _d.get("id") != _direction_id_for_dedup
         ):
             _rc = _d.get("research_context", "") or ""
@@ -1340,8 +1379,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     "recently_completed_finding_titles": _parsed_rc.get(
                         "confirmed", []
                     ),
+                    "category": _d.get("category") or "mixed",
                 }
             )
+    _direction_categories: dict[str, str] = {
+        _d["id"]: _d.get("category") or "mixed"
+        for _d in _dedup_project_dirs
+        if _d.get("id")
+    }
     _retired_failed_approaches = extract_retired_failed_approaches(_retired_ctx_list)
     _archived_diagnoses = extract_archived_diagnoses(
         project_obj.design_doc if project_obj else None
@@ -1400,6 +1445,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         open_pr_files,
         retired_failed_approaches=_retired_failed_approaches,
         archived_diagnoses=_archived_diagnoses,
+        direction_categories=_direction_categories,
     )
     deduplicated = _dedup_outcome.deduplicated
     hash_dedup_count = _dedup_outcome.hash_dedup_count
@@ -1447,22 +1493,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         for f in _dedup_outcome.filtered
         if f.get("title") in _title_to_fhash
     }
-    if _new_filtered_hashes and _scope_cal_project and _scope_cal_project.directions:
-        _fh_dirs = list(_scope_cal_project.directions)
-        _fh_changed = False
-        for _d in _fh_dirs:
-            if _d.get("id") == _direction_id_for_dedup:
-                _existing_fh = _d.get("recently_filtered_finding_hashes") or []
-                _combined_fh = list(
-                    dict.fromkeys(_existing_fh + list(_new_filtered_hashes))
-                )
-                _d["recently_filtered_finding_hashes"] = _combined_fh[-50:]
-                _fh_changed = True
-                break
-        if _fh_changed:
-            _scope_cal_project.directions = _fh_dirs
-            flag_modified(_scope_cal_project, "directions")
-            session.add(_scope_cal_project)
+    if _new_filtered_hashes:
+
+        def _update_filtered_hashes(dirs: list) -> None:
+            for _d in dirs:
+                if _d.get("id") == _direction_id_for_dedup:
+                    _existing_fh = _d.get("recently_filtered_finding_hashes") or []
+                    _combined_fh = list(
+                        dict.fromkeys(_existing_fh + list(_new_filtered_hashes))
+                    )
+                    _d["recently_filtered_finding_hashes"] = _combined_fh[-50:]
+                    break
+
+        await with_directions_locked(session, task.project_id, _update_filtered_hashes)
 
     # Also index by parent_direction_id in task context as fallback
     _parent_direction_id = (task.context or {}).get("direction_id")
@@ -1555,24 +1598,21 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
         if finding_type == "design_doc_observation":
             # Append to design doc proposals for Phase 1 to review
-            obs_project = await session.get(Project, task.project_id)
-            if obs_project:
-                doc = dict(obs_project.design_doc or {})
+            _obs_entry = {
+                "id": f"pc-{uuid.uuid4().hex[:8]}",
+                "observation": finding.get("description", "")[:500],
+                "section": finding.get("section", "general"),
+                "proposed_by_task": str(task.id),
+                "proposed_at": _utcnow().isoformat(),
+                "status": "pending",
+            }
+
+            def _add_obs_proposal(doc: dict) -> None:
                 proposals = doc.get("proposed_changes", [])
-                proposals.append(
-                    {
-                        "id": f"pc-{uuid.uuid4().hex[:8]}",
-                        "observation": finding.get("description", "")[:500],
-                        "section": finding.get("section", "general"),
-                        "proposed_by_task": str(task.id),
-                        "proposed_at": _utcnow().isoformat(),
-                        "status": "pending",
-                    }
-                )
+                proposals.append(_obs_entry)
                 doc["proposed_changes"] = proposals[-30:]  # cap at 30 pending
-                obs_project.design_doc = doc
-                flag_modified(obs_project, "design_doc")
-                session.add(obs_project)
+
+            await with_design_doc_locked(session, task.project_id, _add_obs_proposal)
             type_filtered_count += 1
             continue  # Don't create a task
 
@@ -1582,29 +1622,30 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if not target_id:
                 type_filtered_count += 1
                 continue  # direction_update requires a target direction_id
-            dir_project = await session.get(Project, task.project_id)
-            if not dir_project:
-                type_filtered_count += 1
-                continue
-            directions = list(dir_project.directions or [])
-            for d in directions:
-                if d.get("id") == target_id:
-                    d["pending_update"] = {
-                        "suggested_text": finding.get("suggested_text", d.get("text")),
-                        "suggested_priority": finding.get(
-                            "suggested_priority", d.get("priority")
-                        ),
-                        "suggested_paths": finding.get(
-                            "suggested_paths", d.get("paths", [])
-                        ),
-                        "rationale": finding.get("description", "")[:300],
-                        "proposed_at": _utcnow().isoformat(),
-                        "proposed_by": str(task.id),
-                    }
-                    break
-            dir_project.directions = directions
-            flag_modified(dir_project, "directions")
-            session.add(dir_project)
+            _du_finding = finding
+            _du_target_id = target_id
+            _du_task_id = str(task.id)
+
+            def _set_pending_update(dirs: list) -> None:
+                for d in dirs:
+                    if d.get("id") == _du_target_id:
+                        d["pending_update"] = {
+                            "suggested_text": _du_finding.get(
+                                "suggested_text", d.get("text")
+                            ),
+                            "suggested_priority": _du_finding.get(
+                                "suggested_priority", d.get("priority")
+                            ),
+                            "suggested_paths": _du_finding.get(
+                                "suggested_paths", d.get("paths", [])
+                            ),
+                            "rationale": _du_finding.get("description", "")[:300],
+                            "proposed_at": _utcnow().isoformat(),
+                            "proposed_by": _du_task_id,
+                        }
+                        break
+
+            await with_directions_locked(session, task.project_id, _set_pending_update)
             type_filtered_count += 1
             continue  # Don't create a task for direction_update findings
 
@@ -2140,7 +2181,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # task_lifecycle._requeue_parent_task so re-spawned findings get the
             # same tailored prompt_suffix as directly requeued retries.
             try:
-                from app.task_lifecycle import _build_retry_prompt_suffix  # noqa: PLC0415
+                from app.retry_prompt import _build_retry_prompt_suffix  # noqa: PLC0415
 
                 _retry_prompt_suffix, _scope_override = _build_retry_prompt_suffix(
                     failure_class_val,
@@ -2433,6 +2474,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             priority=TASK_PRIORITY_MAP.get("low", 0),
         )
         session.add(_memo_task)
+        _synth = _synthesize_deferred_finding_memo(
+            _memo_payload.get("source_finding") or {},
+            _drop_reason,
+            str(task.id),
+        )
+        if _synth:
+            _apply_synthesized_memo(_memo_task, _synth, session)
         _spawned_memo_ids.append(str(_memo_task.id))
     if _spawned_memo_ids:
         logger.info(
@@ -2581,21 +2629,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         }
         if _spawned_memo_ids:
             _deferred_stats["memo_ids"] = _spawned_memo_ids
-        _proj = await session.get(Project, task.project_id)
-        if _proj and _proj.directions:
-            _dirs = list(_proj.directions)
-            _changed = False
-            for _d in _dirs:
+        _ds_task_id = str(task.id)
+
+        def _write_deferred_stats(dirs: list) -> None:
+            for _d in dirs:
                 _hist = _d.get("research_history") or []
-                if _hist and _hist[-1].get("task_id") == str(task.id):
+                if _hist and _hist[-1].get("task_id") == _ds_task_id:
                     _hist[-1]["deferred_stats"] = _deferred_stats
                     _d["research_history"] = _hist
-                    _changed = True
-            if _changed:
-                _proj.directions = _dirs
-                flag_modified(_proj, "directions")
-                session.add(_proj)
-                await session.commit()
+
+        await with_directions_locked(session, task.project_id, _write_deferred_stats)
+        await session.commit()
 
     # Mark per-direction cycle productivity so direction_lifecycle can pick
     # an adaptive cooldown: productive cycles (>=1 task spawned) get a shorter
@@ -2612,11 +2656,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     if current_direction_id:
         touched_dir_ids.add(current_direction_id)
     if touched_dir_ids:
-        project = await session.get(Project, task.project_id)
-        if project:
-            directions = list(project.directions or [])
-            changed = False
-            for d in directions:
+
+        def _update_productivity(dirs: list) -> None:
+            for d in dirs:
                 did = d.get("id")
                 if did in touched_dir_ids:
                     productive = tasks_by_dir.get(did, 0) > 0
@@ -2627,35 +2669,27 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         d["consecutive_unproductive_cycles"] = (
                             int(d.get("consecutive_unproductive_cycles", 0) or 0) + 1
                         )
-                    changed = True
-            if changed:
-                project.directions = directions
-                flag_modified(project, "directions")
-                session.add(project)
-                await session.commit()
+
+        await with_directions_locked(session, task.project_id, _update_productivity)
+        await session.commit()
 
     # Credit playbook entries shown to this research agent when research succeeded.
     # followed_count tracks how many times each entry was seen by a successful research agent,
     # giving a denominator for per-entry success rates used by the archival ranker.
     _shown_pb_keys = list((task.context or {}).get("_shown_playbook_keys") or [])
     if _shown_pb_keys and _impl_spawned > 0:
-        _pb_proj = await session.get(Project, task.project_id)
-        if _pb_proj and _pb_proj.design_doc:
-            _pb_doc = dict(_pb_proj.design_doc)
-            _pb_updated = False
+
+        def _credit_playbook_keys(doc: dict) -> None:
             for _pb_key in _shown_pb_keys:
                 _pb_full_key = f"playbook/{_pb_key}"
-                _pb_entry = _pb_doc.get(_pb_full_key)
+                _pb_entry = doc.get(_pb_full_key)
                 if isinstance(_pb_entry, dict):
                     _pb_entry = dict(_pb_entry)
                     _pb_entry["followed_count"] = _pb_entry.get("followed_count", 0) + 1
-                    _pb_doc[_pb_full_key] = _pb_entry
-                    _pb_updated = True
-            if _pb_updated:
-                _pb_proj.design_doc = _pb_doc
-                flag_modified(_pb_proj, "design_doc")
-                session.add(_pb_proj)
-                await session.commit()
+                    doc[_pb_full_key] = _pb_entry
+
+        await with_design_doc_locked(session, task.project_id, _credit_playbook_keys)
+        await session.commit()
 
 
 async def _record_research_task_failure(task: Task, session: AsyncSession) -> None:
@@ -2675,13 +2709,6 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
     )
     if not direction_id:
         return
-    project = await session.get(Project, task.project_id)
-    if not project:
-        return
-    directions = list(project.directions or [])
-    target = next((d for d in directions if d.get("id") == direction_id), None)
-    if not target:
-        return
     now_iso = _utcnow().isoformat()
     failure_category = classify_failure(task, task.latest_status_message or "")
     entry = {
@@ -2697,29 +2724,37 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
         "research_task_failed": True,
         "failure_category": failure_category,
     }
-    history = target.get("research_history", [])
-    new_history = history + [entry]
-    # Share the existing eviction/aggregate rule: keep last 10, aggregate older entries
-    if len(new_history) > 10:
-        target["history_aggregate"] = _fold_evicted_into_aggregate(
-            target.get("history_aggregate"), new_history[:-10]
-        )
-    target["research_history"] = new_history[-10:]
-    target["last_researched_at"] = now_iso
     # Infra failures are transient — use the shorter productive cooldown so the
     # direction is retried promptly instead of waiting out the full unproductive window.
     productive = failure_category in INFRA_CLASSES
-    target["last_cycle_productive"] = productive
-    if productive:
-        target["consecutive_unproductive_cycles"] = 0
-    else:
-        target["consecutive_unproductive_cycles"] = (
-            int(target.get("consecutive_unproductive_cycles", 0) or 0) + 1
+    _found = False
+
+    def _record_failure(dirs: list) -> None:
+        nonlocal _found
+        target = next((d for d in dirs if d.get("id") == direction_id), None)
+        if not target:
+            return
+        _found = True
+        history = target.get("research_history", [])
+        new_history = history + [entry]
+        # Share the existing eviction/aggregate rule: keep last 10, aggregate older entries
+        if len(new_history) > 10:
+            target["history_aggregate"] = _fold_evicted_into_aggregate(
+                target.get("history_aggregate"), new_history[:-10]
+            )
+        target["research_history"] = new_history[-10:]
+        target["last_researched_at"] = now_iso
+        target["last_cycle_productive"] = productive
+        if productive:
+            target["consecutive_unproductive_cycles"] = 0
+        else:
+            target["consecutive_unproductive_cycles"] = (
+                int(target.get("consecutive_unproductive_cycles", 0) or 0) + 1
+            )
+
+    await with_directions_locked(session, task.project_id, _record_failure)
+    if _found:
+        logger.warning(
+            f"[RESEARCH] Recorded failed research task {task.id} on direction "
+            f"{direction_id} ({failure_category})"
         )
-    project.directions = directions
-    flag_modified(project, "directions")
-    session.add(project)
-    logger.warning(
-        f"[RESEARCH] Recorded failed research task {task.id} on direction "
-        f"{direction_id} ({failure_category})"
-    )

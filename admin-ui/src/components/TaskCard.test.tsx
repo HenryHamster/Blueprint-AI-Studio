@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { TaskCard } from './TaskCard';
@@ -258,6 +258,79 @@ describe('TaskCard SrDisallowedBadge', () => {
   });
 });
 
+describe('TaskCard Direction Label', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('displays direction_title (truncated to ~24 chars) when present', () => {
+    const onDirectionClick = vi.fn();
+    const task = makeTask({
+      context: {
+        direction_id: 'd-abc123def456',
+        direction_title: 'Add user authentication with OAuth 2.0 flow for better security',
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} onDirectionClick={onDirectionClick} />);
+    // The title should be truncated to ~24 chars with ellipsis
+    const button = screen.getByRole('button', { name: /Add user authentication/ });
+    expect(button.textContent).toMatch(/Add user authentication.*…/);
+  });
+
+  it('displays direction_id (truncated to 10 chars) when title is absent', () => {
+    const onDirectionClick = vi.fn();
+    const task = makeTask({
+      context: {
+        direction_id: 'd-abc123def456',
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} onDirectionClick={onDirectionClick} />);
+    const label = screen.getByText('d-abc123de…');
+    expect(label).toBeInTheDocument();
+  });
+
+  it('shows full direction_title and direction_id in tooltip when title present', () => {
+    const onDirectionClick = vi.fn();
+    const task = makeTask({
+      context: {
+        direction_id: 'd-abc123def456',
+        direction_title: 'Add user authentication with OAuth 2.0 flow',
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} onDirectionClick={onDirectionClick} />);
+    const button = screen.getByRole('button', { name: /Add user authentication/ });
+    expect(button).toHaveAttribute('title', expect.stringContaining('Add user authentication with OAuth 2.0 flow'));
+    expect(button).toHaveAttribute('title', expect.stringContaining('d-abc123def456'));
+  });
+
+  it('shows only direction_id in tooltip when title absent', () => {
+    const onDirectionClick = vi.fn();
+    const task = makeTask({
+      context: {
+        direction_id: 'd-abc123def456',
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} onDirectionClick={onDirectionClick} />);
+    const button = screen.getByRole('button', { name: /d-abc123de/ });
+    expect(button).toHaveAttribute('title', 'Direction: d-abc123def456');
+  });
+
+  it('filters by direction_id (not label text) when clicked', async () => {
+    const user = userEvent.setup();
+    const onDirectionClick = vi.fn();
+    const task = makeTask({
+      context: {
+        direction_id: 'd-abc123def456',
+        direction_title: 'Add user authentication',
+      },
+    });
+    render(<TaskCard task={task} {...baseProps} onDirectionClick={onDirectionClick} />);
+    const button = screen.getByRole('button', { name: /Add user/ });
+    await user.click(button);
+    expect(onDirectionClick).toHaveBeenCalledWith('d-abc123def456');
+  });
+});
+
 describe('TaskCard SrDivergenceBadge', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -393,5 +466,70 @@ describe('TaskCard SrDivergenceBadge', () => {
     render(<TaskCard task={task} {...baseProps} />);
     const badge = screen.getByText('SR missed performance');
     expect(badge).toHaveAttribute('title', expect.stringContaining('all divergences'));
+  });
+});
+
+describe('TaskCard error logs copy', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('renders error logs when status is FAILED and error_logs exist', () => {
+    const errorText = 'This is a test error log';
+    const task = makeTask({
+      status: 'FAILED',
+      error_logs: errorText,
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText(errorText.slice(0, 500))).toBeInTheDocument();
+  });
+
+  it('does not render error logs when status is not FAILED', () => {
+    const task = makeTask({
+      status: 'COMPLETED',
+      error_logs: 'This should not be shown',
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.queryByText(/This should not be shown/)).toBeNull();
+  });
+
+  it('displays copy button on error logs block', () => {
+    const task = makeTask({
+      status: 'FAILED',
+      error_logs: 'test error',
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByTitle('Copy full error logs')).toBeInTheDocument();
+  });
+
+  it('copies full error logs to clipboard on button click', async () => {
+    const user = userEvent.setup();
+    const fullErrorLog = 'a'.repeat(600); // Longer than 500 char truncation
+    const task = makeTask({
+      status: 'FAILED',
+      error_logs: fullErrorLog,
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    const copyButton = screen.getByTitle('Copy full error logs');
+    await user.click(copyButton);
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(fullErrorLog);
+  });
+
+  it('prevents event propagation when copy button is clicked', async () => {
+    const user = userEvent.setup();
+    const task = makeTask({
+      status: 'FAILED',
+      error_logs: 'test error',
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    const copyButton = screen.getByTitle('Copy full error logs');
+    // Verify the button was clickable and clipboard was called
+    await user.click(copyButton);
+    expect(navigator.clipboard.writeText).toHaveBeenCalled();
   });
 });

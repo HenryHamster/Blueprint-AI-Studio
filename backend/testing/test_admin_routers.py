@@ -6,7 +6,7 @@ Tests for three admin routers:
 """
 
 import uuid
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient, ASGITransport
@@ -24,6 +24,7 @@ from app.models import (
     ProjectMessage,
     MessageType,
     SystemMaturity,
+    _on_task_terminal_callbacks,
 )
 from app.auth import get_current_user, require_admin
 
@@ -64,7 +65,7 @@ class TestListUsers:
 
         resp = await client.get("/api/admin/users")
         assert resp.status_code == 200
-        emails = [u["email"] for u in resp.json()]
+        emails = [u["email"] for u in resp.json()["users"]]
         assert "alice@example.com" in emails
 
     @pytest.mark.asyncio
@@ -215,9 +216,59 @@ class TestProjectMembers:
 
         resp = await client.get(f"/api/admin/projects/{project.id}/members")
         assert resp.status_code == 200
-        members = resp.json()
+        data = resp.json()
+        assert data["total"] == 1
+        assert data["limit"] == 50
+        assert data["offset"] == 0
+        members = data["members"]
         assert len(members) == 1
         assert members[0]["role"] == "owner"
+
+    @pytest.mark.asyncio
+    async def test_list_members_pagination(self, client: AsyncClient, db_session):
+        """limit/offset paginate the member list while total reflects the full count."""
+        project = await _make_project(db_session)
+        for i in range(5):
+            db_session.add(
+                ProjectMember(
+                    project_id=project.id, user_id=f"member-uid-{i}", role="member"
+                )
+            )
+        await db_session.commit()
+
+        # 6 members total (owner + 5). First page of 2.
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/members?limit=2&offset=0"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 6
+        assert data["limit"] == 2
+        assert data["offset"] == 0
+        assert len(data["members"]) == 2
+
+        # Offset past the first page.
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/members?limit=2&offset=4"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 6
+        assert data["offset"] == 4
+        assert len(data["members"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_list_members_invalid_limit_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """limit outside 1..500 is rejected."""
+        project = await _make_project(db_session)
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/members?limit=501")
+        assert resp.status_code == 422
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/members?offset=-1")
+        assert resp.status_code == 422
 
     @pytest.mark.asyncio
     async def test_list_members_non_member_returns_404(
@@ -378,6 +429,44 @@ class TestProjectMembers:
         assert resp.status_code == 400
 
 
+class TestNullBranchConfigDiagnostics:
+    @pytest.mark.asyncio
+    async def test_lists_null_branch_projects_and_separates_self_repo(
+        self, client: AsyncClient, db_session
+    ):
+        self_repo = Project(
+            name="Self Repo",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="self-repo",
+            is_self_repo=True,
+        )
+        configured = Project(
+            name="Configured",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="configured-repo",
+            integration_branch="develop",
+            promotion_target="release",
+        )
+        db_session.add_all([self_repo, configured])
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/diagnostics/null-branch-config")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 1
+        assert data["projects"] == []
+        assert len(data["self_repo_skipped"]) == 1
+        skipped = data["self_repo_skipped"][0]
+        assert skipped["id"] == str(self_repo.id)
+        assert skipped["name"] == "Self Repo"
+        assert skipped["github_owner"] == "acme"
+        assert skipped["github_repo"] == "self-repo"
+        assert skipped["is_self_repo"] is True
+        assert "created_at" in skipped
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_projects.py — Project CRUD + Autonomous Mode
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -422,6 +511,120 @@ class TestGetAllProjects:
         assert resp.status_code == 200
         assert all("my_role" in p for p in resp.json()["items"])
 
+    @pytest.mark.asyncio
+    async def test_owner_sees_env_vars_in_list(self, client: AsyncClient, db_session):
+        """Owner can see env_vars in build_config from the list endpoint."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="EnvVars Owner List")
+        project.build_config = {"env_vars": {"SECRET": "s3cr3t"}, "node_version": "18"}
+        flag_modified(project, "build_config")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/projects")
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        target = next(p for p in items if p["id"] == str(project.id))
+        assert target["my_role"] == "owner"
+        assert target["build_config"].get("env_vars") == {"SECRET": "s3cr3t"}
+        assert target["build_config"].get("node_version") == "18"
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_see_env_vars_in_list(
+        self, client: AsyncClient, db_session
+    ):
+        """Member role cannot see env_vars from the list endpoint but sees other fields."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        other_project = Project(name="Member EnvVars List", user_id="other-owner-list")
+        db_session.add(other_project)
+        await db_session.commit()
+        await db_session.refresh(other_project)
+        other_project.build_config = {
+            "env_vars": {"SECRET": "hidden"},
+            "node_version": "20",
+        }
+        flag_modified(other_project, "build_config")
+        db_session.add(
+            ProjectMember(
+                project_id=other_project.id, user_id="other-owner-list", role="owner"
+            )
+        )
+        db_session.add(
+            ProjectMember(
+                project_id=other_project.id, user_id=TEST_USER_ID, role="member"
+            )
+        )
+        db_session.add(other_project)
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/projects")
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        target = next(p for p in items if p["id"] == str(other_project.id))
+        assert target["my_role"] == "member"
+        assert "env_vars" not in target["build_config"]
+        assert target["build_config"].get("node_version") == "20"
+
+
+class TestGetProject:
+    @pytest.mark.asyncio
+    async def test_owner_sees_env_vars_in_detail(self, client: AsyncClient, db_session):
+        """Owner can see env_vars in build_config from the detail endpoint."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="EnvVars Owner Detail")
+        project.build_config = {"env_vars": {"TOKEN": "abc"}, "node_version": "18"}
+        flag_modified(project, "build_config")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["my_role"] == "owner"
+        assert data["build_config"].get("env_vars") == {"TOKEN": "abc"}
+        assert data["build_config"].get("node_version") == "18"
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_see_env_vars_in_detail(
+        self, client: AsyncClient, db_session
+    ):
+        """Member cannot see env_vars from the detail endpoint but sees other fields."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        other_project = Project(
+            name="Member EnvVars Detail", user_id="other-owner-detail"
+        )
+        db_session.add(other_project)
+        await db_session.commit()
+        await db_session.refresh(other_project)
+        other_project.build_config = {
+            "env_vars": {"SECRET": "hidden"},
+            "node_version": "20",
+        }
+        flag_modified(other_project, "build_config")
+        db_session.add(
+            ProjectMember(
+                project_id=other_project.id, user_id="other-owner-detail", role="owner"
+            )
+        )
+        db_session.add(
+            ProjectMember(
+                project_id=other_project.id, user_id=TEST_USER_ID, role="member"
+            )
+        )
+        db_session.add(other_project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{other_project.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["my_role"] == "member"
+        assert "env_vars" not in data["build_config"]
+        assert data["build_config"].get("node_version") == "20"
+
 
 class TestUpdateProject:
     @pytest.mark.asyncio
@@ -445,6 +648,46 @@ class TestUpdateProject:
         )
         assert resp.status_code == 200
         assert resp.json()["autonomous_enabled"] is True
+
+    @pytest.mark.asyncio
+    async def test_create_task_auto_backfills_branch_columns_before_base_branch(
+        self, client: AsyncClient, db_session
+    ):
+        with (
+            patch(
+                "app.release_promotion._resolve_github_with_session",
+                new_callable=AsyncMock,
+                return_value=("tok", "acme", "develop-repo"),
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="develop",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/tasks",
+                json={
+                    "github_repo": "acme/develop-repo",
+                    "title": "First task",
+                    "prompt": "Do the thing",
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        project = (
+            await db_session.execute(
+                select(Project).where(
+                    Project.github_owner == "acme",
+                    Project.github_repo == "develop-repo",
+                )
+            )
+        ).scalar_one()
+        assert project.integration_branch == "develop"
+        assert project.promotion_target == "develop"
+        task = (
+            await db_session.execute(select(Task).where(Task.project_id == project.id))
+        ).scalar_one()
+        assert task.payloads[0]["base_branch"] == "develop"
 
     @pytest.mark.asyncio
     async def test_viewer_cannot_update_project(self, client: AsyncClient, db_session):
@@ -475,6 +718,456 @@ class TestUpdateProject:
             json={"directions": [{"text": "Do thing", "priority": "ultra"}]},
         )
         assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_design_doc_stale_revision_returns_409(
+        self, client: AsyncClient, db_session
+    ):
+        """Supplying an outdated base_revision for design_doc returns 409."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        # Simulate one prior agent write that bumped _meta.revision to 3
+        project.design_doc = {"key": "value", "_meta": {"revision": 3}}
+        flag_modified(project, "design_doc")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"design_doc": {"key": "overwrite"}, "design_doc_base_revision": 1},
+        )
+        assert resp.status_code == 409
+        msg = resp.json()["error"]["message"]
+        assert "base_revision=1" in msg
+        assert "current=3" in msg
+
+    @pytest.mark.asyncio
+    async def test_design_doc_current_revision_succeeds_and_bumps_meta(
+        self, client: AsyncClient, db_session
+    ):
+        """Matching base_revision saves doc and advances _meta.revision."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.design_doc = {"key": "old", "_meta": {"revision": 2}}
+        flag_modified(project, "design_doc")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"design_doc": {"key": "new"}, "design_doc_base_revision": 2},
+        )
+        assert resp.status_code == 200
+
+        await db_session.refresh(project)
+        doc = project.design_doc or {}
+        assert doc.get("key") == "new"
+        assert doc.get("_meta", {}).get("revision") == 3
+        # Divergent top-level revision key must not be present
+        assert "revision" not in doc
+
+    @pytest.mark.asyncio
+    async def test_design_doc_no_base_revision_always_succeeds(
+        self, client: AsyncClient, db_session
+    ):
+        """Omitting base_revision skips the CAS check (backwards compat)."""
+        project = await _make_project(db_session)
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"design_doc": {"mykey": "hello"}},
+        )
+        assert resp.status_code == 200
+
+        await db_session.refresh(project)
+        doc = project.design_doc or {}
+        assert doc.get("mykey") == "hello"
+        assert doc.get("_meta", {}).get("revision") == 1
+
+    @pytest.mark.asyncio
+    async def test_vision_stale_revision_returns_409(
+        self, client: AsyncClient, db_session
+    ):
+        """Supplying an outdated base_revision for vision returns 409."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.vision = {"content": "v1", "revision": 5}
+        flag_modified(project, "vision")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"vision": {"content": "overwrite"}, "vision_base_revision": 2},
+        )
+        assert resp.status_code == 409
+        msg = resp.json()["error"]["message"]
+        assert "base_revision=2" in msg
+        assert "current=5" in msg
+
+    @pytest.mark.asyncio
+    async def test_concurrent_design_doc_write_no_data_loss(
+        self, client: AsyncClient, db_session
+    ):
+        """Second writer with a stale revision is rejected; first writer's data survives."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.design_doc = {"owner_key": "owner_value", "_meta": {"revision": 1}}
+        flag_modified(project, "design_doc")
+        db_session.add(project)
+        await db_session.commit()
+
+        # First writer succeeds with the correct base revision.
+        resp_a = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "design_doc": {"owner_key": "writer_a"},
+                "design_doc_base_revision": 1,
+            },
+        )
+        assert resp_a.status_code == 200
+
+        # Second writer tries to write with the old base revision — must be rejected.
+        resp_b = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "design_doc": {"owner_key": "writer_b_clobber"},
+                "design_doc_base_revision": 1,
+            },
+        )
+        assert resp_b.status_code == 409
+
+        # Writer A's data must be intact — not overwritten.
+        await db_session.refresh(project)
+        doc = project.design_doc or {}
+        assert doc.get("owner_key") == "writer_a"
+        assert doc.get("_meta", {}).get("revision") == 2
+
+
+class TestUpdateProjectOwnerOnlyFields:
+    """Members may not mutate owner-only fields; owners always can."""
+
+    async def _make_member_project(self, db_session):
+        """Project owned by 'other-owner', with TEST_USER_ID as a member."""
+        owner_project = Project(name="Owner Project", user_id="other-owner")
+        db_session.add(owner_project)
+        await db_session.commit()
+        await db_session.refresh(owner_project)
+        db_session.add(
+            ProjectMember(
+                project_id=owner_project.id, user_id="other-owner", role="owner"
+            )
+        )
+        db_session.add(
+            ProjectMember(
+                project_id=owner_project.id, user_id=TEST_USER_ID, role="member"
+            )
+        )
+        await db_session.commit()
+        return owner_project
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_update_build_config(
+        self, client: AsyncClient, db_session
+    ):
+        """Member gets 403 when trying to change build_config."""
+        project = await self._make_member_project(db_session)
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"build_config": {"env_vars": {"SECRET": "x"}}},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_update_autonomous_enabled(
+        self, client: AsyncClient, db_session
+    ):
+        """Member gets 403 when trying to change autonomous_enabled."""
+        project = await self._make_member_project(db_session)
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"autonomous_enabled": True},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_update_design_doc(
+        self, client: AsyncClient, db_session
+    ):
+        """Member gets 403 when trying to change design_doc."""
+        project = await self._make_member_project(db_session)
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"design_doc": {"summary": "hacked"}},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_update_vision(self, client: AsyncClient, db_session):
+        """Member gets 403 when trying to change vision."""
+        project = await self._make_member_project(db_session)
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"vision": {"text": "my vision"}},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_member_can_update_name(self, client: AsyncClient, db_session):
+        """Member may still update non-privileged fields like name."""
+        project = await self._make_member_project(db_session)
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"name": "Renamed by member"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["name"] == "Renamed by member"
+
+    @pytest.mark.asyncio
+    async def test_owner_can_update_build_config_env_vars(
+        self, client: AsyncClient, db_session
+    ):
+        """Project owner can update build_config including env_vars."""
+        project = await _make_project(db_session)
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"build_config": {"env_vars": {"TOKEN": "secret"}}},
+        )
+        assert resp.status_code == 200
+        bc = resp.json().get("build_config") or {}
+        assert bc.get("env_vars", {}).get("TOKEN") == "secret"
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_requires_owner_for_env_vars_persistence(
+        self, client: AsyncClient, db_session
+    ):
+        """Members cannot detect-and-write build_config; owners still can."""
+        member_project = await self._make_member_project(db_session)
+        member_project.github_owner = "acme"
+        member_project.github_repo = "member-repo"
+        db_session.add(member_project)
+
+        owner_project = await _make_project(db_session, name="Owner Detect Project")
+        owner_project.github_owner = "acme"
+        owner_project.github_repo = "owner-repo"
+        db_session.add(owner_project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"env_vars": {"TOKEN": "secret"}, "node_version": "20"},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            member_resp = await client.post(
+                f"/api/admin/projects/{member_project.id}/detect-build-config"
+            )
+            owner_resp = await client.post(
+                f"/api/admin/projects/{owner_project.id}/detect-build-config"
+            )
+
+        assert member_resp.status_code == 403
+        assert "owner" in member_resp.text
+
+        assert owner_resp.status_code == 200
+        owner_build_config = owner_resp.json().get("build_config") or {}
+        assert owner_build_config.get("env_vars", {}).get("TOKEN") == "secret"
+
+        await db_session.refresh(member_project)
+        await db_session.refresh(owner_project)
+        assert member_project.build_config is None
+        assert (owner_project.build_config or {}).get("env_vars", {}).get("TOKEN") == (
+            "secret"
+        )
+
+    @pytest.mark.asyncio
+    async def test_detect_build_config_preserves_existing_operator_settings(
+        self, client: AsyncClient, db_session
+    ):
+        """Detect should keep operator-managed secrets and reviewer toggles."""
+        project = await _make_project(db_session, name="Detect Preserve Config")
+        project.github_owner = "acme"
+        project.github_repo = "preserve-repo"
+        project.build_config = {
+            "env_vars": {"TOKEN": "secret"},
+            "enable_fresh_reviewer": True,
+            "enable_parallel_review": True,
+            "enable_parallel_fix": False,
+            "task_branch_namespace": "agents",
+            "task_branch_prefix": "bot/",
+            "pr_title_prefix": "[bot] ",
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"language": "typescript"},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/detect-build-config"
+            )
+
+        assert resp.status_code == 200
+        build_config = resp.json().get("build_config") or {}
+        assert build_config.get("language") == "typescript"
+        assert build_config.get("env_vars", {}).get("TOKEN") == "secret"
+        assert build_config.get("enable_fresh_reviewer") is True
+        assert build_config.get("enable_parallel_review") is True
+        assert build_config.get("enable_parallel_fix") is False
+        assert build_config.get("task_branch_namespace") == "agents"
+        assert build_config.get("task_branch_prefix") == "bot/"
+        assert build_config.get("pr_title_prefix") == "[bot] "
+
+        await db_session.refresh(project)
+        assert (project.build_config or {}).get("env_vars", {}).get("TOKEN") == (
+            "secret"
+        )
+        assert (project.build_config or {}).get("enable_fresh_reviewer") is True
+        assert (project.build_config or {}).get("enable_parallel_review") is True
+        assert (project.build_config or {}).get("enable_parallel_fix") is False
+        assert (project.build_config or {}).get("task_branch_namespace") == "agents"
+        assert (project.build_config or {}).get("task_branch_prefix") == "bot/"
+        assert (project.build_config or {}).get("pr_title_prefix") == "[bot] "
+
+
+class TestBuildConfigLintWarnings:
+    """Operator-visible warnings when build_config.directories[*].lint_cmd
+    is non-empty but is not a recognized linter prefix.
+
+    The agent's verbatim fallback is intentional — this surface only adds
+    visibility, it must not reject or rewrite the lint command.
+    """
+
+    @pytest.mark.asyncio
+    async def test_patch_returns_warning_for_unrecognized_lint_cmd(
+        self, client: AsyncClient, db_session
+    ):
+        """PATCH /projects/{id} attaches a warning when lint_cmd is unrecognized."""
+        project = await _make_project(db_session, name="warn-test")
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "build_config": {
+                    "directories": [
+                        {
+                            "path": "./backend",
+                            "type": "python",
+                            "lint_cmd": "make lint",
+                        },
+                        {
+                            "path": "./admin-ui",
+                            "type": "node",
+                            "lint_cmd": "npx eslint .",
+                        },
+                    ]
+                }
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        warnings = body.get("build_config_warnings")
+        assert isinstance(warnings, list)
+        assert len(warnings) == 1
+        assert "./backend" in warnings[0]
+        assert "make lint" in warnings[0]
+        # Existing response shape preserved — top-level build_config still present.
+        assert isinstance(body.get("build_config"), dict)
+        assert len(body["build_config"].get("directories", [])) == 2
+
+    @pytest.mark.asyncio
+    async def test_patch_returns_empty_warnings_when_all_recognized(
+        self, client: AsyncClient, db_session
+    ):
+        """All recognized lint_cmd values produce no warnings."""
+        project = await _make_project(db_session, name="warn-test-empty")
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "build_config": {
+                    "directories": [
+                        {
+                            "path": "./backend",
+                            "type": "python",
+                            "lint_cmd": "ruff check .",
+                        },
+                        {
+                            "path": "./admin-ui",
+                            "type": "node",
+                            "lint_cmd": "npx eslint .",
+                        },
+                    ]
+                }
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json().get("build_config_warnings") == []
+
+    @pytest.mark.asyncio
+    async def test_get_project_returns_warnings_from_stored_config(
+        self, client: AsyncClient, db_session
+    ):
+        """GET /projects/{id} surfaces warnings from the persisted build_config."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="warn-get")
+        project.build_config = {
+            "directories": [
+                {"path": "./svc", "type": "python", "lint_cmd": "./lint.sh"}
+            ]
+        }
+        flag_modified(project, "build_config")
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}")
+        assert resp.status_code == 200
+        warnings = resp.json().get("build_config_warnings")
+        assert isinstance(warnings, list)
+        assert len(warnings) == 1
+        assert "./svc" in warnings[0]
+        assert "./lint.sh" in warnings[0]
+
+    @pytest.mark.asyncio
+    async def test_list_projects_returns_warnings_per_item(
+        self, client: AsyncClient, db_session
+    ):
+        """GET /projects (list) attaches warnings on each item."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="warn-list")
+        project.build_config = {
+            "directories": [{"path": "./a", "type": "other", "lint_cmd": "make a-lint"}]
+        }
+        flag_modified(project, "build_config")
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/projects")
+        assert resp.status_code == 200
+        items = resp.json().get("items", [])
+        target = next((p for p in items if p["name"] == "warn-list"), None)
+        assert target is not None
+        warnings = target.get("build_config_warnings")
+        assert isinstance(warnings, list)
+        assert len(warnings) == 1
+        assert "./a" in warnings[0]
 
 
 class TestDeleteProject:
@@ -526,6 +1219,33 @@ class TestDeleteProject:
         resp = await client.delete(f"/api/admin/projects/{project.id}?force=true")
         assert resp.status_code == 200
         assert resp.json()["active_tasks_cancelled"] == 1
+
+    @pytest.mark.asyncio
+    async def test_delete_project_force_populates_deny_list(
+        self, client: AsyncClient, db_session, mocker
+    ):
+        """Force-delete fires terminal callbacks so cancelled task IDs enter the deny-list."""
+        mocker.patch("app.main._ensure_vm_deleted", return_value=None)
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "smoketest"}],
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        task_id = str(task.id)
+
+        fired_ids: list = []
+        sentinel = lambda tid: fired_ids.append(tid)  # noqa: E731
+        _on_task_terminal_callbacks.append(sentinel)
+        try:
+            resp = await client.delete(f"/api/admin/projects/{project.id}?force=true")
+            assert resp.status_code == 200
+            assert task_id in fired_ids
+        finally:
+            _on_task_terminal_callbacks.remove(sentinel)
 
     @pytest.mark.asyncio
     async def test_delete_project_non_owner_returns_403(
@@ -1948,20 +2668,20 @@ class TestNotificationConfigSettings:
 
     @pytest.mark.asyncio
     async def test_release_flags_round_trip_on_get(self, client: AsyncClient):
-        """The automain/LTS release-control flags — integration_branch,
-        promotion_enabled, smoketest_enabled — are settable via PATCH and
-        visible on GET (regression: GET previously omitted them)."""
+        """The automain/LTS release-control flags — promotion_enabled,
+        smoketest_enabled — are settable via PATCH and visible on GET
+        (regression: GET previously omitted them). integration_branch is
+        per-project only; see TestIntegrationBranchConfig in
+        test_admin_project_config.py."""
         resp = await client.patch(
             "/api/admin/settings",
             json={
-                "integration_branch": "automain",
                 "promotion_enabled": True,
                 "smoketest_enabled": False,
             },
         )
         assert resp.status_code == 200
         body = (await client.get("/api/admin/settings")).json()
-        assert body["integration_branch"] == "automain"
         assert body["promotion_enabled"] is True
         assert body["smoketest_enabled"] is False
         # Restore the default so promotion_enabled does not leak to other tests.
@@ -3173,7 +3893,7 @@ class TestViewportDebt:
             "untested_components": [],
         }
         with patch(
-            "app.routers.admin_digest._scan_viewport_debt_rows",
+            "app.viewport_debt._scan_viewport_debt_rows",
             return_value=(fake_rows, [], fake_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
@@ -3226,7 +3946,7 @@ class TestViewportDebt:
             "untested_components": [],
         }
         with patch(
-            "app.routers.admin_digest._scan_viewport_debt_rows",
+            "app.viewport_debt._scan_viewport_debt_rows",
             return_value=(fake_rows, [], fake_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
@@ -3249,7 +3969,7 @@ class TestViewportDebt:
             "untested_components": [],
         }
         with patch(
-            "app.routers.admin_digest._scan_viewport_debt_rows",
+            "app.viewport_debt._scan_viewport_debt_rows",
             return_value=([], [], empty_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
@@ -3305,7 +4025,7 @@ class TestViewportDebt:
             "untested_components": [],
         }
         with patch(
-            "app.routers.admin_digest._scan_viewport_debt_rows",
+            "app.viewport_debt._scan_viewport_debt_rows",
             return_value=(cached_rows, [], cached_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
@@ -3357,7 +4077,7 @@ class TestViewportDebt:
             ],
         }
         with patch(
-            "app.routers.admin_digest._scan_viewport_debt_rows",
+            "app.viewport_debt._scan_viewport_debt_rows",
             return_value=([], fake_untested, fake_summary),
         ):
             resp = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
@@ -3375,64 +4095,6 @@ class TestViewportDebt:
         assert ut["source_url"] == (
             "https://github.com/acme/repo/blob/main/"
             "admin-ui/src/components/QuickFilterPresets.tsx"
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# admin_settings.py — integration_branch validation
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-class TestIntegrationBranchValidation:
-    """PATCH /api/admin/settings integration_branch must reject shell metacharacters."""
-
-    @pytest.mark.asyncio
-    async def test_integration_branch_rejects_shell_injection(
-        self, client: AsyncClient
-    ):
-        """integration_branch=main\";id;\" must be rejected with HTTP 400."""
-        resp = await client.patch(
-            "/api/admin/settings", json={"integration_branch": 'main";id;"'}
-        )
-        assert resp.status_code == 400
-
-    @pytest.mark.asyncio
-    async def test_integration_branch_accepts_valid(self, client: AsyncClient):
-        """Valid branch names (e.g. main, feature/foo-bar) must be accepted."""
-        resp = await client.patch(
-            "/api/admin/settings", json={"integration_branch": "main"}
-        )
-        assert resp.status_code == 200
-
-        resp2 = await client.patch(
-            "/api/admin/settings", json={"integration_branch": "feature/foo-bar"}
-        )
-        assert resp2.status_code == 200
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "bad_branch",
-        [
-            'main";id;"',  # double-quote + semicolon
-            "main;id",  # semicolon
-            "branch$HOME",  # dollar
-            "branch`id`",  # backtick
-            "branch|cat",  # pipe
-            "branch&id",  # ampersand
-            "branch(id)",  # parentheses
-            ".hidden",  # leading dot
-            "a/..b",  # dotdot
-            "a/.git/b",  # reserved component
-        ],
-    )
-    async def test_integration_branch_rejects_bad_names(
-        self, client: AsyncClient, bad_branch: str
-    ):
-        resp = await client.patch(
-            "/api/admin/settings", json={"integration_branch": bad_branch}
-        )
-        assert resp.status_code == 400, (
-            f"Expected 400 for branch {bad_branch!r}, got {resp.status_code}"
         )
 
 
@@ -3547,6 +4209,248 @@ class TestSetVersionPhase:
         assert "dry-run calibration" in reasoning
 
 
+class TestVersionLifecycleInfraFailureFields:
+    """GET /api/admin/projects/{id}/version-lifecycle exposes infra-failure fields."""
+
+    @pytest.mark.asyncio
+    async def test_infra_failure_fields_exposed_in_last_qualification(
+        self, client: AsyncClient, db_session
+    ):
+        """error, consecutive_infra_errors, and audit_missing_reason from an
+        infra_failure last_qualification record are surfaced in the response."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={
+                "status": "infra_failure",
+                "error": "audit_report_missing",
+                "consecutive_infra_errors": 2,
+                "audit_missing_reason": None,
+                "candidate_sha": "abc1234",
+                "finalized_at": "2026-05-27T00:00:00",
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.get_latest_release_audit_report",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        lq = resp.json()["current_version"]["last_qualification"]
+        assert lq["status"] == "infra_failure"
+        assert lq["error"] == "audit_report_missing"
+        assert lq["consecutive_infra_errors"] == 2
+        assert lq["audit_missing_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_infra_failure_fields_absent_for_successful_qualification(
+        self, client: AsyncClient, db_session
+    ):
+        """For a non-infra-failure qualification, error/consecutive_infra_errors
+        are null and audit_missing_reason is null."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=2,
+            phase="stabilize",
+            status="open",
+            last_qualification={
+                "status": "dry_run",
+                "confidence": 0.95,
+                "threshold": 0.90,
+                "sub_scores": {"audit": 1.0, "test_erosion": 0.9, "smoketest": 0.95},
+                "blocker": None,
+                "finalized_at": "2026-05-27T00:00:00",
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": True, "reason": "ok"}),
+            ),
+            patch(
+                "app.release_qualifier.get_latest_release_audit_report",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        lq = resp.json()["current_version"]["last_qualification"]
+        assert lq["status"] == "dry_run"
+        assert lq["error"] is None
+        assert lq["consecutive_infra_errors"] is None
+        assert lq["audit_missing_reason"] is None
+
+
+class TestQualificationVerdictsAuditMissingReason:
+    """GET /api/admin/projects/{id}/qualification-verdicts exposes audit_missing_reason."""
+
+    @pytest.mark.asyncio
+    async def test_audit_missing_reason_exposed_on_verdict_row(
+        self, client: AsyncClient, db_session
+    ):
+        """audit_missing_reason populated on a verdict row is returned by the endpoint."""
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="deadbeef",
+            confidence=0.0,
+            blocker="audit_missing",
+            audit_missing_reason="parseable_but_unscoreable",
+            would_promote=False,
+            promotion_enabled=False,
+            terminal_status="not_promoted",
+            threshold=0.90,
+        )
+        db_session.add(verdict)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/qualification-verdicts"
+        )
+        assert resp.status_code == 200, resp.text
+        verdicts = resp.json()["verdicts"]
+        assert len(verdicts) == 1
+        assert verdicts[0]["audit_missing_reason"] == "parseable_but_unscoreable"
+        assert verdicts[0]["blocker"] == "audit_missing"
+
+    @pytest.mark.asyncio
+    async def test_audit_missing_reason_null_for_clean_verdict(
+        self, client: AsyncClient, db_session
+    ):
+        """audit_missing_reason is null on a clean (promoted) verdict."""
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="goodsha123",
+            confidence=0.95,
+            blocker=None,
+            audit_missing_reason=None,
+            would_promote=True,
+            promotion_enabled=True,
+            terminal_status="promoted",
+            threshold=0.90,
+        )
+        db_session.add(verdict)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/qualification-verdicts"
+        )
+        assert resp.status_code == 200, resp.text
+        verdicts = resp.json()["verdicts"]
+        assert len(verdicts) == 1
+        assert verdicts[0]["audit_missing_reason"] is None
+
+
+class TestQualificationVerdictsInfraContext:
+    """GET /api/admin/projects/{id}/qualification-verdicts includes infra_context."""
+
+    @pytest.mark.asyncio
+    async def test_infra_context_zero_when_no_infra_failures(
+        self, client: AsyncClient, db_session
+    ):
+        """infra_context counts are 0 when no ReleaseVersion has an infra_failure."""
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="abc123",
+            confidence=0.95,
+            blocker=None,
+            audit_missing_reason=None,
+            would_promote=True,
+            promotion_enabled=False,
+            terminal_status="dry_run",
+            threshold=0.90,
+        )
+        db_session.add(verdict)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/qualification-verdicts"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "infra_context" in data
+        assert data["infra_context"]["infra_failure_count"] == 0
+        assert data["infra_context"]["consecutive_infra_errors"] == 0
+
+    @pytest.mark.asyncio
+    async def test_infra_context_counts_infra_failures(
+        self, client: AsyncClient, db_session
+    ):
+        """infra_context surfaces infra_failure_count when ReleaseVersion has
+        infra_failure last_qualification entries, distinguishing 'never ran'
+        from 'infrastructure failing'."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="stabilize",
+            status="open",
+            last_qualification={
+                "status": "infra_failure",
+                "error": "audit_report_missing",
+                "consecutive_infra_errors": 3,
+            },
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/qualification-verdicts"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["verdicts"] == []
+        assert data["infra_context"]["infra_failure_count"] >= 1
+        assert data["infra_context"]["consecutive_infra_errors"] >= 1
+
+
 class TestResetIterationCap:
     """POST /api/admin/tasks/{task_id}/reset-iteration-cap — archives FAILED
     review/fix tasks for the PR. The archive filter pushes pr_number into SQL;
@@ -3627,3 +4531,595 @@ class TestResetIterationCap:
 
         resp = await client.post(f"/api/admin/tasks/{parking.id}/reset-iteration-cap")
         assert resp.status_code == 400
+
+
+class TestGetAllTasksHistory:
+    """GET /api/admin/tasks fetches each task's 10 most-recent TaskHistory
+    entries. The fetch uses a per-task ROW_NUMBER() window, so a single
+    high-activity task cannot exhaust a global LIMIT budget and starve other
+    tasks in the same page of their history."""
+
+    @pytest.mark.asyncio
+    async def test_per_task_history_not_starved_by_high_activity_task(
+        self, client: AsyncClient, db_session
+    ):
+        from datetime import datetime, timedelta
+        from app.models import TaskHistory
+
+        project = await _make_project(db_session)
+
+        busy = Task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create"}],
+        )
+        quiet = Task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create"}],
+        )
+        db_session.add(busy)
+        db_session.add(quiet)
+        await db_session.commit()
+        await db_session.refresh(busy)
+        await db_session.refresh(quiet)
+
+        base = datetime(2026, 5, 1, 0, 0, 0)
+        # The busy task has 25 entries, all NEWER than the quiet task's. Under a
+        # global LIMIT of len(task_ids)*10 == 20, every retained row would belong
+        # to the busy task and the quiet task would receive 0 history entries.
+        for i in range(25):
+            db_session.add(
+                TaskHistory(
+                    task_id=busy.id,
+                    action="STATUS_CHANGE",
+                    details={"i": i},
+                    timestamp=base + timedelta(hours=100 + i),
+                )
+            )
+        for i in range(8):
+            db_session.add(
+                TaskHistory(
+                    task_id=quiet.id,
+                    action="STATUS_CHANGE",
+                    details={"i": i},
+                    timestamp=base + timedelta(hours=i),
+                )
+            )
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/tasks")
+        assert resp.status_code == 200, resp.text
+        by_id = {t["id"]: t for t in resp.json()["tasks"]}
+
+        # Busy task is capped at its 10 most-recent entries.
+        busy_hist = by_id[str(busy.id)]["history"]
+        assert len(busy_hist) == 10
+        assert [h["details"]["i"] for h in busy_hist] == list(range(24, 14, -1))
+
+        # Quiet task still receives all 8 of its entries — not starved.
+        quiet_hist = by_id[str(quiet.id)]["history"]
+        assert len(quiet_hist) == 8
+        assert [h["details"]["i"] for h in quiet_hist] == list(range(7, -1, -1))
+
+
+class TestSrCatchRateHealth:
+    """GET /api/admin/projects/{project_id}/sr_catch_rate/health status matrix."""
+
+    async def _setup(self, db_session, trends):
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.design_doc = (
+            {"sr_catch_rate_trends": trends} if trends is not None else {}
+        )
+        flag_modified(project, "design_doc")
+        db_session.add(project)
+        await db_session.commit()
+        return project
+
+    @staticmethod
+    def _iso(hours_ago):
+        from datetime import datetime, timedelta
+
+        return (datetime.utcnow() - timedelta(hours=hours_ago)).isoformat()
+
+    @pytest.mark.asyncio
+    async def test_healthy(self, client: AsyncClient, db_session):
+        project = await self._setup(
+            db_session,
+            {
+                "signal_last_computed_at": self._iso(1),
+                "last_sufficient_computed_at": self._iso(1),
+                "data_sufficient": True,
+                "bucket_mode": "cycle",
+                "overall_hit_rate": 0.75,
+                "previous_overall_hit_rate": 0.7,
+                "overall_trend_verdict": "stable",
+                "overall_trend_significant": None,
+                "categories": {
+                    "correctness": {"current_hit_rate": 0.8},
+                    "security": {"current_hit_rate": None},
+                },
+            },
+        )
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/sr_catch_rate/health"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "healthy"
+        assert data["data_sufficient"] is True
+        assert data["bucket_mode"] == "cycle"
+        assert data["overall_hit_rate"] == 0.75
+        assert data["category_count"] == 2
+        assert data["categories_with_hit_rate"] == 1
+        assert 0.9 <= data["last_sufficient_age_hours"] <= 1.2
+        assert 0.9 <= data["signal_age_hours"] <= 1.2
+
+    @pytest.mark.asyncio
+    async def test_never_sufficient(self, client: AsyncClient, db_session):
+        project = await self._setup(
+            db_session,
+            {
+                "signal_last_computed_at": self._iso(1),
+                "data_sufficient": False,
+            },
+        )
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/sr_catch_rate/health"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "never_sufficient"
+        assert data["data_sufficient"] is False
+        assert data["last_sufficient_computed_at"] is None
+        assert data["last_sufficient_age_hours"] is None
+        assert 0.9 <= data["signal_age_hours"] <= 1.2
+
+    @pytest.mark.asyncio
+    async def test_frozen(self, client: AsyncClient, db_session):
+        # Signal fresh (< 6h) but real data stale (> 24h) => frozen-but-fresh.
+        project = await self._setup(
+            db_session,
+            {
+                "signal_last_computed_at": self._iso(2),
+                "last_sufficient_computed_at": self._iso(30),
+                "data_sufficient": False,
+            },
+        )
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/sr_catch_rate/health"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "frozen"
+        assert data["signal_age_hours"] < 6
+        assert data["last_sufficient_age_hours"] > 24
+
+    @pytest.mark.asyncio
+    async def test_stale(self, client: AsyncClient, db_session):
+        # Both timestamps older than the 48h general window; signal not fresh
+        # so the frozen branch does not apply.
+        project = await self._setup(
+            db_session,
+            {
+                "signal_last_computed_at": self._iso(50),
+                "last_sufficient_computed_at": self._iso(50),
+                "data_sufficient": True,
+            },
+        )
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/sr_catch_rate/health"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "stale"
+        assert data["last_sufficient_age_hours"] > 48
+
+    @pytest.mark.asyncio
+    async def test_low_data(self, client: AsyncClient, db_session):
+        # Recent on both clocks but not data-sufficient and not frozen/stale.
+        project = await self._setup(
+            db_session,
+            {
+                "signal_last_computed_at": self._iso(1),
+                "last_sufficient_computed_at": self._iso(2),
+                "data_sufficient": False,
+            },
+        )
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/sr_catch_rate/health"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "low_data"
+        assert data["data_sufficient"] is False
+
+    @pytest.mark.asyncio
+    async def test_missing(self, client: AsyncClient, db_session):
+        project = await self._setup(db_session, None)
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/sr_catch_rate/health"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "missing"
+        assert data["data_sufficient"] is False
+        assert data["category_count"] == 0
+        assert data["last_sufficient_age_hours"] is None
+        assert data["signal_age_hours"] is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# deploy.py — Deployment State & Rollback
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestDeployRollback:
+    @pytest.mark.asyncio
+    async def test_rollback_uses_orchestrator_service_name_env_var(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """trigger_rollback uses ORCHESTRATOR_SERVICE_NAME env var for gcloud invocation."""
+        from app.models import DeploymentState, DeploymentStatus
+
+        state = DeploymentState(
+            current_revision="rev-bad",
+            current_sha="sha123bad",
+            last_known_good_revision="rev-good",
+            last_known_good_sha="sha123good",
+            status=DeploymentStatus.STABLE,
+        )
+        db_session.add(state)
+        await db_session.commit()
+
+        monkeypatch.setenv("ORCHESTRATOR_SERVICE_NAME", "custom-service")
+        monkeypatch.setenv("GCP_PROJECT_ID", "test-project")
+        monkeypatch.setenv("GCP_REGION", "us-west1")
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stderr = ""
+
+            resp = await client.post("/api/admin/deploy-state/rollback")
+
+            assert resp.status_code == 200
+            assert mock_run.called
+            call_args = mock_run.call_args[0][0]
+            assert "custom-service" in call_args
+            assert "rev-good=100" in call_args
+            assert "us-west1" in call_args
+            assert "test-project" in call_args
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GET /api/admin/tasks/{task_id}/pr-files
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestGetTaskPrFiles:
+    @pytest.mark.asyncio
+    async def test_task_with_pr_returns_files(self, client: AsyncClient, db_session):
+        """Returns file list when task has a PR artifact."""
+        from app.models import Artifact, ArtifactType
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="test task",
+            status=TaskStatus.EVALUATING,
+            payloads=[{"type": "create", "prompt": "do something"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        artifact = Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/42",
+        )
+        db_session.add(artifact)
+        await db_session.commit()
+
+        mock_files = [
+            {
+                "filename": "foo.py",
+                "status": "modified",
+                "additions": 5,
+                "deletions": 2,
+                "changes": 7,
+            }
+        ]
+        with (
+            patch(
+                "app.routers.agent.get_github_token_for_task",
+                new_callable=AsyncMock,
+                return_value=("tok", "owner", "repo"),
+            ),
+            patch(
+                "app.github.get_pr_files",
+                new_callable=AsyncMock,
+                return_value=mock_files,
+            ),
+        ):
+            resp = await client.get(f"/api/admin/tasks/{task.id}/pr-files")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["pr_number"] == 42
+        assert len(data["files"]) == 1
+        assert data["files"][0]["filename"] == "foo.py"
+        assert data["files"][0]["additions"] == 5
+
+    @pytest.mark.asyncio
+    async def test_task_without_pr_returns_no_pr_reason(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns reason='no_pr' when task has no PR artifact."""
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="test task",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create", "prompt": "do something"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}/pr-files")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["files"] is None
+        assert data["reason"] == "no_pr"
+
+    @pytest.mark.asyncio
+    async def test_unknown_task_returns_404(self, client: AsyncClient, db_session):
+        """Returns 404 for a task that does not exist."""
+        resp = await client.get(f"/api/admin/tasks/{uuid.uuid4()}/pr-files")
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_invalid_task_id_returns_404(self, client: AsyncClient, db_session):
+        """Returns 404 for a malformed task ID."""
+        resp = await client.get("/api/admin/tasks/not-a-uuid/pr-files")
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_viewer_is_denied_basic_file_list(
+        self, override_get_session, db_session
+    ):
+        """Viewer role gets 403 for the basic file list."""
+        from app.auth import get_current_user as _gcu
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="test task",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create", "prompt": "do something"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        viewer_id = "viewer-user-999"
+        db_session.add(
+            ProjectMember(project_id=project.id, user_id=viewer_id, role="viewer")
+        )
+        await db_session.commit()
+
+        async def _viewer():
+            return {"user_id": viewer_id, "email": "viewer@example.com", "role": "user"}
+
+        app.dependency_overrides[_gcu] = _viewer
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get(f"/api/admin/tasks/{task.id}/pr-files")
+        finally:
+            app.dependency_overrides.pop(_gcu, None)
+
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_member_can_access_basic_file_list(
+        self, override_get_session, db_session
+    ):
+        """Member role succeeds for the basic file list."""
+        from app.models import Artifact, ArtifactType
+        from app.auth import get_current_user as _gcu
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="test task",
+            status=TaskStatus.EVALUATING,
+            payloads=[{"type": "create", "prompt": "do something"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        artifact = Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/99",
+        )
+        db_session.add(artifact)
+
+        member_id = "member-user-999"
+        db_session.add(
+            ProjectMember(project_id=project.id, user_id=member_id, role="member")
+        )
+        await db_session.commit()
+
+        async def _member():
+            return {"user_id": member_id, "email": "member@example.com", "role": "user"}
+
+        app.dependency_overrides[_gcu] = _member
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                with (
+                    patch(
+                        "app.routers.agent.get_github_token_for_task",
+                        new_callable=AsyncMock,
+                        return_value=("tok", "owner", "repo"),
+                    ),
+                    patch(
+                        "app.github.get_pr_files",
+                        new_callable=AsyncMock,
+                        return_value=[],
+                    ),
+                ):
+                    resp = await ac.get(f"/api/admin/tasks/{task.id}/pr-files")
+        finally:
+            app.dependency_overrides.pop(_gcu, None)
+
+        assert resp.status_code == 200
+        assert resp.json()["pr_number"] == 99
+
+    @pytest.mark.asyncio
+    async def test_member_cannot_access_patch(self, override_get_session, db_session):
+        """Member role gets 403 for include_patch=true."""
+        from app.auth import get_current_user as _gcu
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="test task",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create", "prompt": "do something"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        member_id = "member-user-888"
+        db_session.add(
+            ProjectMember(project_id=project.id, user_id=member_id, role="member")
+        )
+        await db_session.commit()
+
+        async def _member():
+            return {"user_id": member_id, "email": "member@example.com", "role": "user"}
+
+        app.dependency_overrides[_gcu] = _member
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                resp = await ac.get(
+                    f"/api/admin/tasks/{task.id}/pr-files?include_patch=true"
+                )
+        finally:
+            app.dependency_overrides.pop(_gcu, None)
+
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_owner_can_access_patch(self, client: AsyncClient, db_session):
+        """Owner role can access include_patch=true."""
+        from app.models import Artifact, ArtifactType
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="test task",
+            status=TaskStatus.EVALUATING,
+            payloads=[{"type": "create", "prompt": "do something"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        artifact = Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/repo/pull/77",
+        )
+        db_session.add(artifact)
+        await db_session.commit()
+
+        mock_files = [{"filename": "x.py", "patch": "diff..."}]
+        with (
+            patch(
+                "app.routers.agent.get_github_token_for_task",
+                new_callable=AsyncMock,
+                return_value=("tok", "owner", "repo"),
+            ),
+            patch(
+                "app.github.get_pr_files",
+                new_callable=AsyncMock,
+                return_value=mock_files,
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/tasks/{task.id}/pr-files?include_patch=true"
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["pr_number"] == 77
+        assert resp.json()["files"][0]["filename"] == "x.py"
+
+
+class TestGetAuditFindings:
+    """GET /api/admin/projects/{id}/audit-findings — read-only audit findings endpoint."""
+
+    @pytest.mark.asyncio
+    async def test_returns_findings_from_last_qualification(
+        self, client: AsyncClient, db_session
+    ):
+        """audit_findings stored in last_qualification are returned by the endpoint."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+        version.last_qualification = {
+            "audit_findings": [
+                {"severity": "high", "summary": "Token baked into image."},
+                {"severity": "low", "summary": "Unused import."},
+            ],
+            "audit_missing_reason": None,
+            "finalized_at": "2026-01-01T00:00:00",
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/audit-findings")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["source"] == "last_qualification"
+        assert len(data["findings"]) == 2
+        assert data["findings"][0]["severity"] == "high"
+        assert data["findings"][1]["severity"] == "low"
+        assert data["finalized_at"] == "2026-01-01T00:00:00"
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_no_open_version(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns empty findings list and 'no_open_version' source when no open version."""
+        project = await _make_project(db_session)
+        resp = await client.get(f"/api/admin/projects/{project.id}/audit-findings")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["findings"] == []
+        assert data["source"] == "no_open_version"
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_no_qualification_yet(
+        self, client: AsyncClient, db_session
+    ):
+        """Returns empty findings when an open version exists but no qualification ran."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+        resp = await client.get(f"/api/admin/projects/{project.id}/audit-findings")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["findings"] == []
+        assert data["source"] == "last_qualification"

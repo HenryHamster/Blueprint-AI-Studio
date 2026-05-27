@@ -24,6 +24,7 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.url_security import _resolve_safe_external_url
+from app.shared_state import get_project_promotion_target
 
 from app.models import (
     MessageType,
@@ -695,15 +696,25 @@ async def post_auto_fix_result_message(
         task_id=task_id,
     )
 
-    # Update per-branch failure tracking in the project's auto_remediation config
+    # Update per-branch failure tracking in the project's auto_remediation config.
+    # Pre-read the Task row outside the lock (pure read, no mutation).
     if result in ("failed", "merged"):
         try:
-            from sqlalchemy.orm.attributes import flag_modified
+            from app.task_locking import with_design_doc_locked
 
-            project = await session.get(Project, project_id)
-            if project is not None:
-                design_doc = dict(project.design_doc or {})
-                ar_config = dict(design_doc.get("_auto_remediation", {}))
+            threshold = _AUTO_REMEDIATION_ESCALATION_THRESHOLD
+            if result == "failed" and task_id is not None:
+                triggering = await session.get(Task, task_id)
+                if triggering is not None and (triggering.context or {}).get(
+                    "regression_of_task_id"
+                ):
+                    threshold = _AUTO_REMEDIATION_REGRESSION_ESCALATION_THRESHOLD
+
+            # Mutable cell to capture side-effects from inside the lock closure.
+            _escalation: dict = {}
+
+            def _mutate(doc: dict) -> None:
+                ar_config = dict(doc.get("_auto_remediation", {}))
                 failure_counts: dict[str, int] = dict(
                     ar_config.get("branch_failure_counts", {})
                 )
@@ -729,18 +740,6 @@ async def post_auto_fix_result_message(
                     # Increment consecutive failure counter
                     failure_counts[branch] = failure_counts.get(branch, 0) + 1
                     count = failure_counts[branch]
-                    # If the triggering task was flagged as a regression of a
-                    # recently-merged fix, suspend earlier — a straightforward
-                    # fix has already been tried and didn't hold.
-                    threshold = _AUTO_REMEDIATION_ESCALATION_THRESHOLD
-                    if task_id is not None:
-                        triggering = await session.get(Task, task_id)
-                        if triggering is not None and (triggering.context or {}).get(
-                            "regression_of_task_id"
-                        ):
-                            threshold = (
-                                _AUTO_REMEDIATION_REGRESSION_ESCALATION_THRESHOLD
-                            )
                     if count >= threshold and branch not in suspended:
                         suspended.append(branch)
                         # Preserve recovery_attempts across re-suspensions so
@@ -752,49 +751,50 @@ async def post_auto_fix_result_message(
                                 prior.get("recovery_attempts", 0) or 0
                             ),
                         }
-                        ar_config["branch_failure_counts"] = failure_counts
-                        ar_config["suspended_branches"] = suspended
-                        ar_config["suspension_metadata"] = suspension_meta
-                        design_doc["_auto_remediation"] = ar_config
-                        project.design_doc = design_doc
-                        flag_modified(project, "design_doc")
-                        session.add(project)
-                        # Fire escalation message + webhook
-                        await post_auto_fix_escalation_message(
-                            session,
-                            project_id,
-                            branch=branch,
-                            failure_count=count,
-                        )
-                        asyncio.ensure_future(
-                            dispatch_external_notification(
-                                project_id,
-                                "AUTO_FIX_ESCALATED",
-                                {
-                                    "branch": branch,
-                                    "consecutive_failures": count,
-                                    "threshold": threshold,
-                                    "suspended_at": suspension_meta[branch][
-                                        "suspended_at"
-                                    ],
-                                    "recovery_attempts": suspension_meta[branch][
-                                        "recovery_attempts"
-                                    ],
-                                    "severity": "blocker",
-                                    "manual_intervention_required": True,
-                                    "summary": summary,
-                                },
-                            )
-                        )
-                        return msg
+                        _escalation["count"] = count
+                        _escalation["meta"] = suspension_meta[branch]
 
                 ar_config["branch_failure_counts"] = failure_counts
                 ar_config["suspended_branches"] = suspended
                 ar_config["suspension_metadata"] = suspension_meta
-                design_doc["_auto_remediation"] = ar_config
-                project.design_doc = design_doc
-                flag_modified(project, "design_doc")
-                session.add(project)
+                doc["_auto_remediation"] = ar_config
+
+            # expire_on_commit=False means an already-identity-mapped Project
+            # carries a stale design_doc; expire it so the lock's SELECT FOR
+            # UPDATE re-reads the freshly-committed row (matches the canonical
+            # pattern in direction_outcomes.py / research_direction_state.py).
+            _proj = await session.get(Project, project_id)
+            if _proj is not None:
+                session.expire(_proj, ["design_doc"])
+            await with_design_doc_locked(session, project_id, _mutate)
+
+            if _escalation:
+                count = _escalation["count"]
+                meta = _escalation["meta"]
+                # Fire escalation message + webhook outside the lock
+                await post_auto_fix_escalation_message(
+                    session,
+                    project_id,
+                    branch=branch,
+                    failure_count=count,
+                )
+                asyncio.ensure_future(
+                    dispatch_external_notification(
+                        project_id,
+                        "AUTO_FIX_ESCALATED",
+                        {
+                            "branch": branch,
+                            "consecutive_failures": count,
+                            "threshold": threshold,
+                            "suspended_at": meta["suspended_at"],
+                            "recovery_attempts": meta["recovery_attempts"],
+                            "severity": "blocker",
+                            "manual_intervention_required": True,
+                            "summary": summary,
+                        },
+                    )
+                )
+                return msg
         except Exception as exc:
             logger.warning(
                 "[AUTO-REMEDIATION] Failed to update failure tracking for %s: %s",
@@ -1065,7 +1065,24 @@ async def post_remediation_result_message(
             pr_number=pr_number,
             task_id=task.id,
         )
-    branch = (task.context or {}).get("ci_failure_branch", "main")
+    _project = await session.get(Project, task.project_id) if task.project_id else None
+    _ci_failure_branch = (task.context or {}).get("ci_failure_branch")
+    if _ci_failure_branch:
+        branch = _ci_failure_branch
+    elif _project:
+        branch = get_project_promotion_target(_project)
+    else:
+        logger.warning(
+            "[AUTO-REMEDIATION] post_remediation_result_message: "
+            "project not found for task %s (project_id=%s) and no ci_failure_branch "
+            "in context — aborting",
+            task.id,
+            task.project_id,
+        )
+        raise ValueError(
+            f"post_remediation_result_message: project not found for task {task.id} "
+            f"and no ci_failure_branch in context"
+        )
     return await post_auto_fix_result_message(
         session,
         task.project_id,
@@ -1501,6 +1518,72 @@ async def post_direction_outcome_stalled_message(
         context=context,
         task_id=task_id,
     )
+
+
+async def post_direction_outcome_scaffolding_escalation_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_text: str,
+    flagged_cycles: int,
+    evidence: Optional[dict[str, Any]] = None,
+    direction_id: Optional[str] = None,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a BLOCKER-severity message when outcome-less scaffolding persists past the escalation threshold.
+
+    Fires once when outcome_scaffolding_flagged_cycles crosses escalation_cycles,
+    signalling that the agent/operator has had multiple cycles to act and hasn't.
+    Mirrored after post_direction_burn_pause_message — BLOCKER so it surfaces in
+    the operator alert feed.
+    """
+    ev = evidence or {}
+    parts: list[str] = []
+    if "total_cycles" in ev:
+        parts.append(f"cycles={ev['total_cycles']}")
+    if "lifetime_merged" in ev:
+        parts.append(f"merged={ev['lifetime_merged']}")
+    if "stall_run_cycles" in ev:
+        parts.append(f"no_progress_for={ev['stall_run_cycles']} cycles")
+    parts.append(f"flagged_for={flagged_cycles} cycles")
+    ev_str = f" ({', '.join(parts)})" if parts else ""
+    summary = (
+        f"Direction outcome-scaffolding flag unresolved after {flagged_cycles} cycles: "
+        f"'{direction_text[:80]}'{ev_str} — manual retirement or success_evidence update required."
+    )
+    ctx: dict[str, Any] = {
+        "event_type": "direction_outcome_scaffolding_escalation",
+        "direction_text": direction_text[:120],
+        "direction_id": direction_id,
+        "flagged_cycles": flagged_cycles,
+        "manual_intervention_required": True,
+    }
+    if evidence:
+        ctx["evidence"] = evidence
+    msg = ProjectMessage(
+        project_id=project_id,
+        message_type=MessageType.BLOCKER,
+        from_type="system",
+        from_task_id=task_id,
+        content=summary,
+        context=ctx,
+    )
+    session.add(msg)
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "DIRECTION_OUTCOME_SCAFFOLDING_ESCALATION",
+            {
+                "direction_text": direction_text[:120],
+                "direction_id": direction_id,
+                "flagged_cycles": flagged_cycles,
+                "evidence": evidence or {},
+                "severity": "blocker",
+                "manual_intervention_required": True,
+                "summary": summary,
+            },
+        )
+    )
+    return msg
 
 
 async def post_issue_implementation_spawned_message(

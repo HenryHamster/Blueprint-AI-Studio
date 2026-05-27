@@ -24,6 +24,9 @@ export interface ScopeBaselinesResponse {
   lookback_days: number;
 }
 
+const SCOPE_TOOLTIP_CONTENT_STYLE = { background: '#171717', border: '1px solid #404040', fontSize: 11 };
+const scopeTooltipFormatter = (v: unknown): string => (v == null ? '—' : `${v}%`);
+
 const SCOPE_LINE_COLORS: Record<string, string> = {
   small: '#34d399',
   medium: '#fbbf24',
@@ -103,8 +106,8 @@ export function ScopeTrendsSection({
                 <XAxis dataKey="week" tick={{ fontSize: 10, fill: '#737373' }} />
                 <YAxis domain={[0, 100]} tick={{ fontSize: 10, fill: '#737373' }} unit="%" />
                 <Tooltip
-                  contentStyle={{ background: '#171717', border: '1px solid #404040', fontSize: 11 }}
-                  formatter={(v) => (v == null ? '—' : `${v}%`)}
+                  contentStyle={SCOPE_TOOLTIP_CONTENT_STYLE}
+                  formatter={scopeTooltipFormatter}
                 />
                 <Legend wrapperStyle={{ fontSize: 10 }} />
                 {scopes.map(s => (

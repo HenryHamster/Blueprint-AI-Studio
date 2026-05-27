@@ -1,4 +1,4 @@
-import { afterEach, describe, test, vi } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { HeaderBar } from './HeaderBar';
@@ -269,5 +269,19 @@ describe('HeaderBar — viewport regression', () => {
       root = r;
       await act(async () => { r.render(<HeaderBar {...makeProps()} />); });
     });
+  });
+
+  test('desktop activity stream launcher calls its opener', async () => {
+    const onOpenActivityFeed = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<HeaderBar {...makeProps()} onOpenActivityFeed={onOpenActivityFeed} />); });
+    const activityButton = host.querySelector<HTMLButtonElement>('button[title="Chronological activity stream"]');
+    expect(activityButton).toBeTruthy();
+    await act(async () => { activityButton?.click(); });
+    expect(onOpenActivityFeed).toHaveBeenCalledOnce();
   });
 });

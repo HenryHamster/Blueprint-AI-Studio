@@ -8,6 +8,7 @@ import type { BuildConfig } from './index.js';
 import { formatProjectContext } from './prompts/project-context.js';
 import { isReadOnlyTaskType } from './taskCapabilities.js';
 import { parseBackendTimestamp } from './utils/time.js';
+import { SHELL_CMD_RE } from './shell-safety.js';
 
 // ── Re-exports from sub-modules (facade) ────────────────────────────────────
 // The bulky helpers have been split out into prompts/* modules so that small
@@ -98,7 +99,7 @@ export const TASK_TYPE_HINTS: Record<string, string> = {
   'migrate': 'This is a database migration task. Check existing Alembic migrations in backend/alembic/versions/ for naming conventions. Use `alembic revision --autogenerate` as a starting point only — always review and clean up generated migrations.',
   'security_audit': 'Focus on identifying security vulnerabilities. Do not implement fixes — create a detailed findings report as your output.',
   'self_audit': 'Score system maturity on four signals: test_coverage, friction_density, claim_consistency, failure_mix. Each component is 0-100. Pick recommended_mode (audit|fundamentals|ship|pause) from the worst component. Do not modify any files — output is a JSON findings report only.',
-  'release_audit': 'You are running on the LTS branch (main) and reviewing the incoming diff against main\'s standards. Run `git diff <diff_range>` to obtain the diff. Check for test erosion (deleted test files, net assertion/test-count delta). Score findings into audit_score [0,1]. Do not modify any files — output is a JSON release audit report only.',
+  'release_audit': 'You are running on the LTS / promotion branch and reviewing the incoming diff against that branch\'s standards. Run `git diff <diff_range>` to obtain the diff. Check for test erosion (deleted test files, net assertion/test-count delta). Score findings into audit_score [0,1]. Do not modify any files — output is a JSON release audit report only.',
   'perf': 'Profile before optimizing. Identify the specific bottleneck with measurements before writing any fix.',
   'create': 'Before finishing: edit the files you need to change, run `./check` to validate lint/build, fix any failures, then `./pr open --title "feat/fix/etc: ..." --body "Summary of changes"` to ship and `./done` to mark complete. The `./pr` helper gates on `./check` so broken code can\'t reach a PR. If admin-ui viewport bootstrapping only fails because Chromium deps are missing, `./check` will retry in the Playwright container when Docker is available and otherwise warn without blocking the task. If a library is unfamiliar, fetch its docs first. If you determine the task can\'t be completed (scope wrong, conflicting requirements, blocker found), call `./fail "<reason>"` instead of leaving silently.',
   'fix': 'You are fixing issues from a code review or a pipeline failure. Read ALL feedback carefully and address every point. IMPORTANT: the spawn prompt can be stale — between when this task was queued and when you run, a concurrent rollup may have resolved conflicts, or a new commit may have broken something new. If the prompt includes a "stale-premise notice", trust the latest state. After fixing, run `./check` to verify, then `./pr open --title "fix: ..." --body "..."` to push (it will update the existing PR if there is one), then `./done`. Use `./fail "<reason>"` only if you can\'t reasonably resolve the feedback.',
@@ -124,9 +125,9 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
 ]);
 
 // ── Dynamic Task Type Hints (based on project build configuration) ───────────
-export function getTaskTypeHints(buildConfig?: BuildConfig): Record<string, string> {
+export function getTaskTypeHints(buildConfig?: BuildConfig, promotionTarget?: string): Record<string, string> {
   const dirs = buildConfig?.directories ?? [];
-  if (dirs.length === 0) return TASK_TYPE_HINTS;
+  if (dirs.length === 0 && !promotionTarget) return TASK_TYPE_HINTS;
 
   const pythonDirs = dirs.filter(d => d.type === 'python');
   const nodeDirs = dirs.filter(d => d.type === 'node');
@@ -165,10 +166,88 @@ export function getTaskTypeHints(buildConfig?: BuildConfig): Record<string, stri
     hints['deps'] = `Check for breaking changes in major version bumps. This project uses ${pkgManagers.join(', ')}. Run the full test suite after updating to verify compatibility.`;
   }
 
+  if (promotionTarget) {
+    const lts = promotionTarget;
+    hints['release_audit'] = `You are running on the LTS branch (${lts}) and reviewing the incoming diff against ${lts}'s standards. Run \`git diff <diff_range>\` to obtain the diff. Check for test erosion (deleted test files, net assertion/test-count delta). Score findings into audit_score [0,1]. Do not modify any files — output is a JSON release audit report only.`;
+  }
+
   return hints;
 }
 
 export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. Use WebFetch to look up API documentation, library references, or framework guides when working with unfamiliar code. Use WebSearch to find solutions for specific error messages or unusual patterns. If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg". If you hit a barrier, have a question for the project owner, or want to flag something important, use ./messages send \'your message\' (types: NOTE, QUESTION, FEEDBACK, BUG_REPORT, BLOCKER).';
+
+// Adaptive parallel-subagent guidance for rollup PRs touching multiple
+// modules. Only inject when shouldFanOutReview() AND the per-project
+// enable_parallel_review flag both allow it — the fingerprint moves when
+// present so review telemetry can A/B by fingerprint. Trivial diffs MUST
+// skip fan-out: the block itself reminds the agent of that even when present.
+export const PARALLEL_REVIEW_GUIDANCE = `
+## Parallel review fan-out (rollup PRs touching multiple modules)
+
+This PR touches multiple module groups (build_config directories). To keep wall-clock close to the slowest module review instead of the sum, fan out the per-file checklist work (Correctness, Security, Code Quality, Test Coverage) using parallel investigation subagents. Self-check before fanning out: if the diff is actually trivial (a few files in one module) skip fan-out and review serially — subagent overhead dominates on small diffs.
+
+Fan-out plan:
+1. Group the changed files by build_config directory (one group per module).
+2. Spawn one investigation subagent per module group with the Task/Agent tool. Each subagent's prompt: read the diff for its assigned files only, apply the per-file checklist (Correctness, Security, Code Quality, Test Coverage), and return a short structured list of findings (severity, file, line, description). Keep each subagent prompt small — pass only the file list and the checklist, not the whole PR context.
+3. After all subagents return, summarize each finding to a single line before recompositing into your working set. This protects context budget.
+4. Run your OWN cross-module coherence pass over the recomposited findings AND the diff: shared types, interface contracts, naming consistency, layering, cross-file invariants. Subagents cannot see across module boundaries — this pass is mandatory and is yours alone.
+5. Emit the SINGLE verdict JSON yourself. Subagents are investigation-only — no subagent writes /tmp/review_verdict_*, makes edits, or emits a verdict.
+
+Fail-soft: if context is tight after recompositing subagent output, drop fan-out and finish serially. A complete serial review beats an incomplete parallel one.
+`;
+
+// Adaptive parallel-subagent guidance for fix iterations on rollups touching
+// multiple modules or carrying many reviewer issues. Only inject when
+// shouldFanOutFix() AND the per-project enable_parallel_fix flag both allow
+// it. Atomicity contract: ONLY the parent agent may Write/Edit/commit —
+// subagents return investigation reports only.
+export const PARALLEL_FIX_GUIDANCE = `
+## Parallel fix investigation (rollup PRs with multi-module diffs or many reviewer issues)
+
+This fix iteration has enough scope that parallel investigation subagents can reduce wall-clock. Use the Task/Agent tool to fan out root-cause investigation. **Read the atomicity contract below before delegating anything.**
+
+**ATOMICITY CONTRACT — non-negotiable:**
+Only the parent agent (you) may Write, Edit, NotebookEdit, or run Bash (git/check/pr) commands that change files. Subagents return investigation reports ONLY. A subagent that writes or edits files is a bug — remind yourself of this before spawning each one.
+
+**Slicing axes — choose the one that fits:**
+- **Module axis**: one subagent per build_config directory group. Each subagent reads the diff for its assigned files, identifies root causes for the reviewer's cited issues in those files, and returns: file, line, proposed fix location, estimated risk, suggested verify steps.
+- **Issue-cluster axis**: when reviewer issues are high (≥6) and span ≥2 files, group related issues into clusters and assign one subagent per cluster. Each subagent returns the same investigation report shape.
+Pick the axis that maps more naturally onto the actual issues — you may use a mix.
+
+**Fan-out plan:**
+1. Before spawning, summarize the review feedback to a compact form — fix prompts are large. Pass only the relevant issue subset and file list to each subagent, not the whole review history.
+2. Spawn subagents in parallel using the Task/Agent tool. Each subagent prompt: "You are an investigation-only subagent. Read these files and these reviewer issues. Return a structured report: {file, line, root_cause, proposed_fix_location, risk, verify_steps}. Do NOT write or edit any files."
+3. After all reports return, summarize each finding to a single line before merging. This protects your context budget.
+4. Merge and deduplicate: if two subagents propose overlapping fixes, resolve the conflict yourself (pick the more conservative one or ask yourself which is correct). Do NOT apply conflicting fixes from two subagents — that is when serial fallback is safer.
+5. Batch-read all affected files ONCE before applying any edits. Then apply changes sequentially yourself.
+6. Run your own cross-module coherence pass after edits: shared types, interface contracts, naming consistency. Subagents cannot see across module boundaries — this is yours alone.
+
+**Fail-soft:** If subagents disagree on root cause or their reports conflict, fall back to serial investigation for the conflicting files rather than guessing. Incomplete parallel fix is worse than complete serial fix.
+
+**Self-check before delegating each slice:** "Am I asking this subagent to apply the fix?" If yes, revise the prompt to ask for investigation only.
+`;
+
+// Adaptive parallel-subagent guidance for read-only audit/investigation
+// handlers. Inject when the per-project enable_parallel_review flag is set.
+// Output schema is unchanged — only investigation strategy changes.
+export const PARALLEL_AUDIT_GUIDANCE = `
+## Parallel audit fan-out (investigation-only handlers)
+
+These handlers never Edit or Write source files — atomicity is automatic. Fan out investigation work using parallel subagents when the scope spans multiple concern axes (e.g. one subagent per OWASP category for security audits, one per system for self-audits, one per file-cluster for investigate/debug/perf/release_audit).
+
+**Fan-out plan:**
+1. Identify 2-4 natural concern axes for the current task (OWASP category, system boundary, file cluster, failure mode, etc.).
+2. Spawn one investigation subagent per axis using the Task/Agent tool. Each subagent's prompt: read its assigned files/scope only, return a short structured findings list (severity, location, description). Keep each prompt small — pass only the relevant scope, not the full task context.
+3. After all subagents return, summarize each finding to a single line before merging. This protects context budget.
+4. Run your OWN coherence pass over the recomposited findings: deduplication, consistent severity assignment, cross-axis invariants that individual subagents cannot see.
+5. Emit the SINGLE output JSON yourself (the file written to /tmp/...). Subagents are investigation-only — no subagent writes the output file or emits a findings list as the final result.
+
+**Output schema unchanged:** only HOW the investigation is done changes, not WHAT is emitted. The final /tmp/ output file must match the handler's documented schema exactly.
+
+**Self-check:** if the task scope is narrow (one file, one system, one failure), skip fan-out — subagent overhead dominates on small scopes. Fan out only when parallelism meaningfully reduces wall-clock.
+
+Fail-soft: if context is tight after recompositing subagent output, drop fan-out and finish serially. A complete serial audit beats an incomplete parallel one.
+`;
 
 // Generalized override of the trained "lint failed → refactor source"
 // reflex for project-specific assertion messages that encode policy. The
@@ -342,15 +421,16 @@ export function assembleFailureGuidanceBlocks(): string {
 // a given task type. Used to correlate production task outcomes back to prompt
 // revisions cycle-over-cycle. Only hashes static/deterministic content —
 // task IDs, file paths, and payload-specific text are intentionally excluded.
-export function computePromptFingerprint(taskType: string, buildConfig?: BuildConfig): string {
-  const hints = getTaskTypeHints(buildConfig);
+export function computePromptFingerprint(
+  taskType: string,
+  buildConfig?: BuildConfig,
+  options?: { includeParallelFixGuidance?: boolean; promotionTarget?: string },
+): string {
+  const hints = getTaskTypeHints(buildConfig, options?.promotionTarget);
   const taskHint = hints[taskType] ?? '';
-  const content = [
-    taskHint,
-    DEFAULT_TOOL_GUIDANCE,
-    assembleFailureGuidanceBlocks(),
-  ].join('\n\n');
-  return createHash('sha256').update(content).digest('hex').slice(0, 12);
+  const sections = [taskHint, DEFAULT_TOOL_GUIDANCE, assembleFailureGuidanceBlocks()];
+  if (options?.includeParallelFixGuidance) sections.push(PARALLEL_FIX_GUIDANCE);
+  return createHash('sha256').update(sections.join('\n\n')).digest('hex').slice(0, 12);
 }
 
 // Within-task fix-iteration history. Each retry attempt of the within-VM
@@ -415,7 +495,7 @@ export function excludeAgentHelpers(): void {
 
 export function writePlaybookHelper(taskId: string): void {
   const helperScript = `#!/bin/bash
-OP="\${1:?Usage: playbook get|set|list|delete <key> [content]}"
+OP="\${1:?Usage: playbook get|set|list [key] [content]}"
 KEY="$2"
 VALUE="$3"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
@@ -432,15 +512,13 @@ elif [ "$OP" = "set" ]; then
     '{task_id: $tid, op: "set", key: $k, value: $v}' | \\
     curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
       -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
-elif [ "$OP" = "delete" ]; then
-  jq -n --arg tid "$TASK" --arg k "$KEY" \\
-    '{task_id: $tid, op: "delete", key: $k}' | \\
-    curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
 elif [ "$OP" = "list" ]; then
   printf '{"task_id":"%s","op":"list"}' "$TASK" | \\
     curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
       -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+else
+  echo "Error: unsupported playbook operation: $OP" >&2
+  exit 1
 fi
 echo ""
 `;
@@ -509,12 +587,23 @@ interface CodeChangeHelperConfig {
    *  to the existing PR instead of creating a new one. */
   existingPrNumber?: number;
   /** When true, ./check test runs the Docker backend test suite for any
-   *  task whose changes touch ``backend/``. Set when base_branch === 'main'. */
+   *  task whose changes touch ``backend/``. Set when baseBranch === promotionTarget
+   *  (or === 'main' when no promotionTarget is known). */
   testsOnMainBranch: boolean;
+  /** Per-project promotion target branch (e.g. 'automain', 'production', 'release/v2').
+   *  When set, the test gate fires when baseBranch === promotionTarget, overriding
+   *  the testsOnMainBranch boolean. Handlers that read promotion_target from the
+   *  task payload should pass it here. */
+  promotionTarget?: string;
   /** SR categories whose miss-rate is regressing for this task type.
    *  When set, ./done validates that each has a non-trivial `reasoning` field
    *  in check_results before posting COMPLETED. */
   regressingCategories?: string[];
+  /** Resolved project build configuration. When it carries per-directory
+   *  commands, the generated ./check runs those instead of the hardcoded
+   *  Blueprint admin-ui/agent/backend blocks (the self-repo fallback used
+   *  only when no build_config is present). */
+  buildConfig?: BuildConfig;
 }
 
 /** Write ./check, ./pr, ./done, ./fail, ./blocked to WORKSPACE. Idempotent. */
@@ -534,7 +623,7 @@ function writeCheckHelper(cfg: CodeChangeHelperConfig): void {
   // Runs the corresponding lint/build commands plus the admin-ui browser-mode
   // viewport suite. Optional `./check test` also runs the Docker backend test
   // suite when backend/ was touched and tests-on-main is enabled.
-  const script = `#!/bin/bash
+  const header = `#!/bin/bash
 # ./check — run lint/build (and optionally tests) for changed paths.
 # Usage:
 #   ./check         # lint+build only — fast, run before each iteration
@@ -605,7 +694,8 @@ run() {
     FAILED+=("$label")
   fi
 }
-
+`;
+  const blueprintStackBlocks = `
 if admin_ui_runtime_touched; then
   ( cd admin-ui && [ -d node_modules ] || npm ci ) >/tmp/check_npm_ci.log 2>&1 || {
     echo "[check] admin-ui npm ci FAILED — see /tmp/check_npm_ci.log"
@@ -661,6 +751,7 @@ if admin_ui_runtime_touched; then
       MISSING_VIEWPORT_TESTS=()
       while IFS= read -r comp; do
         [ -z "$comp" ] && continue
+        [ ! -f "$comp" ] && continue
         [ -f "\${comp%.tsx}.viewport.test.tsx" ] && continue
         basename "$comp" .tsx | grep -qE '^[a-z]' && continue
         grep -q '@viewport-test-exempt' "$comp" 2>/dev/null && continue
@@ -835,7 +926,7 @@ if touches backend/; then
   else
     echo "[check] ruff not installed, skipping backend lint"
   fi
-  if [ "$WITH_TESTS" = "1" ] && [ "${cfg.testsOnMainBranch ? '1' : '0'}" = "1" ]; then
+  if [ "$WITH_TESTS" = "1" ] && [ "${(cfg.promotionTarget !== undefined ? cfg.baseBranch === cfg.promotionTarget : cfg.testsOnMainBranch) ? '1' : '0'}" = "1" ]; then
     # --standalone --no-postgres: agent VM is e2-standard-2 (8 GB) and
     # cannot fit Docker build + Postgres sidecar + full pytest suite +
     # agent + Claude subprocess in memory. The full suite OOMs (exit
@@ -846,8 +937,20 @@ if touches backend/; then
     # the rest is CI's job.
     run "backend pytest" bash -c 'bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200'
   fi
+  # Fast migration-chain guard: no DB, no Docker, sub-second. Runs only
+  # when at least one alembic/versions/ file was added or changed.
+  if printf '%s\\n' "$CHANGED" | grep -q '^backend/alembic/versions/.*\\.py$'; then
+    run "backend migration chain" bash -c 'python3 backend/app/migration_chain.py 2>&1'
+  fi
 fi
-
+`;
+  // When the project supplies a build_config with directories, generate
+  // per-directory check blocks from it. Otherwise fall back to the hardcoded
+  // Blueprint blocks above (self-repo behavior is byte-for-byte unchanged).
+  const stackBlocks = cfg.buildConfig?.directories?.length
+    ? buildConfigDrivenStackBlocks(cfg.buildConfig)
+    : blueprintStackBlocks;
+  const footer = `
 if [ \${#FAILED[@]} -eq 0 ]; then
   echo ""
   echo "[check] PASS — all checks green"
@@ -858,7 +961,133 @@ else
   exit 1
 fi
 `;
+  const script = header + stackBlocks + footer;
   fs.writeFileSync(`${WORKSPACE}/check`, script, { mode: 0o755 });
+}
+
+// Detects the canonical linter kind from a lint_cmd string.
+// Returns null for unrecognized commands — those run verbatim (never silently
+// rewrite something we don't understand).
+export function detectLinterKind(lintCmd: string): 'ruff' | 'eslint' | 'mypy' | 'flake8' | 'pyright' | null {
+  const base = lintCmd.replace(/^(python3?\s+-m\s+|npx\s+|pnpm\s+exec\s+)/, '');
+  if (/^ruff\b/.test(base)) return 'ruff';
+  if (/^eslint\b/.test(base)) return 'eslint';
+  if (/^mypy\b/.test(base)) return 'mypy';
+  if (/^flake8\b/.test(base)) return 'flake8';
+  if (/^pyright\b/.test(base)) return 'pyright';
+  return null;
+}
+
+/**
+ * Builds the scoped lint bash one-liner for a recognized linter.
+ *
+ * source='check-tmpfile': returns the xargs invocation that reads null-delimited
+ *   paths from /tmp/check_<slug>_lint.txt (populated upstream by grep over
+ *   $CHANGED). Used inside the ./check generator (buildLintInner).
+ *
+ * source='git-diff': returns a git diff pipeline that filters changed files in
+ *   dirPath and strips the directory prefix before passing to the linter.
+ *   Used inside review prompt instruction strings (buildTypeCheckInstructions).
+ *
+ * Canonical behaviors shared across both call sites:
+ * - Strips trailing '.' / './' token (replaced by the scoped file list)
+ * - Recognizes python3 -m / npx / pnpm exec prefixes
+ * - Hardcodes ruff to --select E,F,W --ignore E501 with python3 -m
+ * - Returns null for unrecognized linters — callers must fall back to verbatim
+ */
+export function buildScopedLintOneliner(
+  lintCmd: string,
+  dirPath: string,
+  baseBranch: string,
+  source: 'check-tmpfile' | 'git-diff',
+): string | null {
+  const kind = detectLinterKind(lintCmd);
+  if (!kind) return null;
+
+  const toks = lintCmd.trim().split(/\s+/);
+  while (toks.length > 1 && (toks[toks.length - 1] === '.' || toks[toks.length - 1] === './')) toks.pop();
+  const execCmd = kind === 'ruff'
+    ? 'python3 -m ruff check --select E,F,W --ignore E501'
+    : toks.join(' ');
+
+  const dir = dirPath.replace(/\/$/, '');
+  const isPy = kind !== 'eslint';
+  const extPat = isPy ? '\\.py' : '\\.(ts|tsx|js|jsx|cjs|mjs)';
+
+  if (source === 'check-tmpfile') {
+    const slug = dir.replace(/\//g, '_');
+    return `xargs -0 -a /tmp/check_${slug}_lint.txt ${execCmd} 2>&1`;
+  }
+  return `git diff origin/${baseBranch}...HEAD --name-only | grep -E '${extPat}$' | sed 's|${dir}/||' | xargs -r ${execCmd}`;
+}
+
+// Returns the inner bash block for a directory's lint step. Recognized linters
+// are scoped to changed files (FULL_SCOPE=1 runs verbatim for the full tree).
+// Unrecognized commands keep the current verbatim behavior.
+function buildLintInner(dirPrefix: string, lintCmd: string): string {
+  const kind = detectLinterKind(lintCmd);
+  if (!kind) return `  run "${dirPrefix} lint" bash -c 'cd "${dirPrefix}" && ${lintCmd}'`;
+  const slug = dirPrefix.replace(/\//g, '_');
+  const tmpFile = `/tmp/check_${slug}_lint.txt`;
+  const isPy = kind !== 'eslint';
+  const extPat = isPy ? `\\.py` : `\\.(ts|tsx|js|jsx|cjs|mjs)`;
+  const extDesc = isPy ? 'Python' : 'JS/TS';
+  // kind !== null is already confirmed above; buildScopedLintOneliner returns null
+  // only for unrecognized linters, so the fallback here is unreachable.
+  const scopedExec = buildScopedLintOneliner(lintCmd, dirPrefix, '', 'check-tmpfile') ?? '';
+  return `  if [ "$FULL_SCOPE" = "1" ]; then
+    run "${dirPrefix} lint" bash -c 'cd "${dirPrefix}" && ${lintCmd}'
+  else
+    : > ${tmpFile}
+    printf '%s\\n' "$CHANGED" | grep -E '^${dirPrefix}/.*${extPat}$' | while IFS= read -r f; do
+      [ -f "$f" ] && printf '%s\\0' "\${f#${dirPrefix}/}" >> ${tmpFile}
+    done
+    if [ -s ${tmpFile} ]; then
+      run "${dirPrefix} lint (changed)" bash -c 'cd "${dirPrefix}" && ${scopedExec}'
+    else
+      echo "[check] no changed ${extDesc} files in ${dirPrefix}, skipping lint"
+    fi
+  fi`;
+}
+
+/** Generate config-driven per-directory ./check blocks from a project's
+ *  build_config. Mirrors the per-directory loop in runProjectLintChecks
+ *  (index.ts): for each configured directory whose files changed, run its
+ *  install/lint/build commands; test_cmd runs only under `./check test`
+ *  (WITH_TESTS). env_vars are exported so all commands inherit them.
+ *
+ *  All interpolated values (paths, commands, env names/values) are validated
+ *  by validateCfgShellSafety against a conservative allowlist that rejects
+ *  shell metacharacters (including single quotes), so emitting them as
+ *  single-quoted bash literals here is injection-safe — see CLAUDE.md on
+ *  generating one language from another. */
+function buildConfigDrivenStackBlocks(buildConfig: BuildConfig): string {
+  const dirs = buildConfig.directories ?? [];
+  const envLines = Object.entries(buildConfig.env_vars ?? {}).map(
+    ([k, v]) => `export ${k}='${v}'`,
+  );
+  const sections: string[] = [];
+  for (const dir of dirs) {
+    const dirPrefix = dir.path.replace(/\/$/, '');
+    const inner: string[] = [];
+    if (dir.install_cmd) inner.push(`  run "${dirPrefix} install" bash -c 'cd "${dirPrefix}" && ${dir.install_cmd}'`);
+    if (dir.lint_cmd) inner.push(buildLintInner(dirPrefix, dir.lint_cmd));
+    if (dir.build_cmd) inner.push(`  run "${dirPrefix} build" bash -c 'cd "${dirPrefix}" && ${dir.build_cmd}'`);
+    if (dir.test_cmd) {
+      inner.push(`  if [ "$WITH_TESTS" = "1" ]; then`);
+      inner.push(`    run "${dirPrefix} test" bash -c 'cd "${dirPrefix}" && ${dir.test_cmd}'`);
+      inner.push(`  fi`);
+    }
+    if (inner.length === 0) continue;
+    sections.push(`if touches "${dirPrefix}/"; then\n${inner.join('\n')}\nfi`);
+  }
+  const comment = `
+# Config-driven checks: project supplied a build_config, so run its
+# per-directory install/lint/build commands (tests under \`./check test\`)
+# for changed directories. Mirrors runProjectLintChecks in index.ts.`;
+  const envBlock = envLines.length ? `\n${envLines.join('\n')}` : '';
+  const body = sections.length ? `\n${sections.join('\n\n')}` : '';
+  return `${comment}${envBlock}${body}\n`;
 }
 
 // Load the canonical sr-pr-section.js renderer from disk and base64-encode
@@ -885,6 +1114,7 @@ function loadSrSectionScriptB64(): string {
 const BRANCH_RE = /^[A-Za-z0-9._/-]+$/;
 const OWNER_REPO_RE = /^[A-Za-z0-9._-]+$/;
 const TASK_ID_RE = /^[A-Za-z0-9-]+$/;
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 function validateCfgShellSafety(cfg: CodeChangeHelperConfig): void {
   if (!TASK_ID_RE.test(cfg.taskId)) {
@@ -901,6 +1131,38 @@ function validateCfgShellSafety(cfg: CodeChangeHelperConfig): void {
   }
   if (!OWNER_REPO_RE.test(cfg.repo)) {
     throw new Error(`repo contains unsafe characters for shell interpolation: ${cfg.repo}`);
+  }
+  validateBuildConfigShellSafety(cfg.buildConfig);
+}
+
+/** Validate every build_config value that gets interpolated into the generated
+ *  ./check bash. Throws on any shell metacharacter so the config-driven blocks
+ *  stay injection-safe (see CLAUDE.md on generating one language from another). */
+function validateBuildConfigShellSafety(buildConfig: BuildConfig | undefined): void {
+  if (!buildConfig) return;
+  for (const dir of buildConfig.directories ?? []) {
+    if (!SHELL_CMD_RE.test(dir.path)) {
+      throw new Error(`build_config directory path contains unsafe characters for shell interpolation: ${dir.path}`);
+    }
+    const cmds: Array<[string, string | undefined]> = [
+      ['install_cmd', dir.install_cmd],
+      ['lint_cmd', dir.lint_cmd],
+      ['build_cmd', dir.build_cmd],
+      ['test_cmd', dir.test_cmd],
+    ];
+    for (const [field, val] of cmds) {
+      if (val !== undefined && val !== '' && !SHELL_CMD_RE.test(val)) {
+        throw new Error(`build_config ${field} for ${dir.path} contains unsafe characters for shell interpolation: ${val}`);
+      }
+    }
+  }
+  for (const [k, v] of Object.entries(buildConfig.env_vars ?? {})) {
+    if (!ENV_NAME_RE.test(k)) {
+      throw new Error(`build_config env_var name contains unsafe characters for shell interpolation: ${k}`);
+    }
+    if (!SHELL_CMD_RE.test(v)) {
+      throw new Error(`build_config env_var value for ${k} contains unsafe characters for shell interpolation: ${v}`);
+    }
   }
 }
 
@@ -1038,8 +1300,8 @@ if [ -n "$SR_SECTION" ]; then
   BODY=$(printf '%s\\n\\n%s' "$BODY" "$SR_SECTION")
 fi
 
-${cfg.testsOnMainBranch ? `# Mandatory test gate: force WITH_TESTS=1 when the diff touches backend/.
-# The agent must not be able to skip backend tests on main-branch tasks.
+${(cfg.promotionTarget !== undefined ? cfg.baseBranch === cfg.promotionTarget : cfg.testsOnMainBranch) ? `# Mandatory test gate: force WITH_TESTS=1 when the diff touches backend/.
+# The agent must not be able to skip backend tests on LTS-branch tasks.
 _BASE_GATE="${cfg.baseBranch}"
 _CMT_GATE=""
 if git rev-parse --verify "origin/$_BASE_GATE" >/dev/null 2>&1; then
@@ -1050,7 +1312,7 @@ fi
 _UNC_GATE=$(git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null)
 _CHG_GATE=$(printf '%s\\n%s\\n' "$_CMT_GATE" "$_UNC_GATE" | sort -u | grep -v '^$' || true)
 if printf '%s\\n' "$_CHG_GATE" | grep -q '^backend/'; then
-  echo "[pr] backend/ touched on main — forcing WITH_TESTS=1 (mandatory test gate)"
+  echo "[pr] backend/ touched on LTS branch — forcing WITH_TESTS=1 (mandatory test gate)"
   WITH_TESTS=1
 fi
 ` : ''}
@@ -1357,6 +1619,15 @@ if [ ! -s "$PR_FILE" ]; then
   exit 2
 fi
 PR_URL=$(cat "$PR_FILE")
+# Validate shape — must be a canonical GitHub pull URL.
+# Aligned with agent/src/handlers/code-change.ts:337 (same regex).
+PR_URL_RE='^https://github\\.com/[^/[:space:]]+/[^/[:space:]]+/pull/[0-9]+$'
+if ! printf '%s' "$PR_URL" | grep -qE "$PR_URL_RE"; then
+  echo "[done] Error: $PR_FILE contains an invalid PR URL: $PR_URL" >&2
+  echo "[done]   Expected: https://github.com/<owner>/<repo>/pull/<number>" >&2
+  echo "[done]   ./pr open must produce a canonical pull URL (not /commit/, /compare/, etc.)." >&2
+  exit 2
+fi
 
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
@@ -1772,7 +2043,7 @@ export function formatPlaybook(
       return `### ${key}\n${caveat}${content}`;
     })
     .join('\n\n');
-  return `## Operational Playbook (active collective memory)\n\nThese notes are the project's living shared memory — every agent reads and writes them. Treat them as a useful starting point, not gospel: if an entry contradicts what you actually observe in the code, update or delete it (\`./playbook set\` to overwrite, \`./playbook delete <key>\` to remove). The playbook is only as accurate as the latest agent who looked.\n\n${lines}\n\n`;
+  return `## Operational Playbook (active collective memory)\n\nThese notes are the project's living shared memory — every agent reads and writes them. Treat them as a useful starting point, not gospel: if an entry contradicts what you actually observe in the code, overwrite it with \`./playbook set\`. The playbook is only as accurate as the latest agent who looked.\n\n${lines}\n\n`;
 }
 
 // 2026-05-04: appended to every code-change task prompt (create, refactor,
@@ -2106,7 +2377,8 @@ metrics, and reviewer-iteration priming.
 
 Use these canonical category IDs in \`check_results\` (drawn from the
 backend review vocabulary — must match exactly):
-<!-- vocabulary mirrored in backend/testing/test_invariants.py (TestPromptVocabularyParity) — keep parity -->
+<!-- vocabulary mirrored in backend/testing/test_invariants.py as AGENT_SELF_REVIEW_CATEGORIES frozenset — keep parity with both the frozenset and backend/app/playbook_learning.py (_REVIEW_CATEGORIES) -->
+<!-- SR_CATEGORIES_START -->
 - \`correctness\` — logic bugs, off-by-one errors, edge cases, race conditions
 - \`error-handling\` — unhandled exceptions, missing null checks, async errors
 - \`security\` — injection, XSS, CSRF, exposed secrets, unvalidated inputs
@@ -2119,6 +2391,7 @@ backend review vocabulary — must match exactly):
 - \`scope-drift\` — diff materially exceeds the declared task scope (see thresholds below)
 - \`regression_risk\` — previously-passing test now fails after changes (omit if no baseline available)
 - \`cross-system-contract\` — URL path, DTO field, or shared type referenced on one side has no matching definition on the other (see check below)
+<!-- SR_CATEGORIES_END -->
 
 **Scope-drift check (required for code-change tasks):**
 The \`scope-drift\` category has TWO triggers that both feed the SAME \`scope-drift\` entry
@@ -2308,7 +2581,7 @@ before \`./done\`, triage them: fix what's valid, record false positives in
 
 export const PLAYBOOK_GUIDANCE = `
 ## Operational Playbook — Active Collective Memory
-The playbook is shared, mutable knowledge across all agents in this project — more like a forum than an append-only log. Use \`./playbook set <key> <value>\` to save reusable knowledge OR overwrite an existing entry, \`./playbook get\` to review, and \`./playbook delete <key>\` to remove an entry that turned out to be wrong, stale, or contradicted by the code you just read. If an existing entry led you astray, fixing or removing it helps the next agent more than adding a new one alongside it.
+The playbook is shared, mutable knowledge across all agents in this project — more like a forum than an append-only log. Use \`./playbook set <key> <value>\` to save reusable knowledge OR overwrite an existing entry, and \`./playbook get\` to review. If an existing entry led you astray, overwrite it with corrected guidance so the next agent benefits from the latest version.
 
 **When to save (trigger conditions):**
 - After fixing a lint, build, or test error: save the root cause pattern and fix

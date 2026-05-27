@@ -71,10 +71,9 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
           )}
         </button>
         {userRole === 'admin' && onNewProject && (
-          // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
           <button
             onClick={onNewProject}
-            className="flex items-center gap-1 text-[11px] text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50 rounded px-1.5 py-0.5 transition-colors"
+            className="flex items-center justify-center gap-1 text-[11px] text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50 rounded min-h-[44px] min-w-[44px] px-2 transition-colors"
             title="Add new project"
           >
             <Plus className="w-3 h-3" />
@@ -156,10 +155,9 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                   </button>
                   <div className="flex items-center gap-1.5 shrink-0">
                     {isSelected && onToggleMembers && (
-                      // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                       <button
                         onClick={(e) => { e.stopPropagation(); onToggleMembers(); }}
-                        className={`p-1 rounded transition-colors ${
+                        className={`min-h-[44px] min-w-[44px] flex items-center justify-center rounded transition-colors ${
                           showMembers
                             ? 'bg-cyan-500/15 text-cyan-400'
                             : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50'
@@ -170,10 +168,9 @@ export function ProjectDashboard({ projects, tasks, selectedProjectId, onSelectP
                       </button>
                     )}
                     {showSetupNudge && onOpenSetupGuide && (
-                      // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
                       <button
                         onClick={(e) => { e.stopPropagation(); onOpenSetupGuide(project.id); }}
-                        className="p-1 rounded text-amber-400 hover:text-amber-300 hover:bg-amber-500/10 transition-colors"
+                        className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded text-amber-400 hover:text-amber-300 hover:bg-amber-500/10 transition-colors"
                         title="Complete project setup"
                       >
                         <Settings className="w-3.5 h-3.5" />

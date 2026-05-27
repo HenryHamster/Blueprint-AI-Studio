@@ -4,6 +4,7 @@ import {
   sanitize, sendLog, runClaudeCode, persistAndPostStatus, git,
   rotateOAuthCredentialsIfChanged,
 } from '../index.js';
+import type { BuildConfig } from '../index.js';
 import { writeCodeChangeHelpers, SELF_REVIEW_PROMPT_VERSION } from '../prompt.js';
 
 // ── Code-change task runner ─────────────────────────────────────────────────
@@ -46,8 +47,13 @@ export interface CodeChangeTaskOpts {
    *  self-review to THIS iteration's diff, not the cumulative PR diff. */
   fixIteration?: number;
   /** When true, ./check test runs the Docker backend test suite when changes
-   *  touch backend/. Set when baseBranch === 'main'. */
+   *  touch backend/. Set when baseBranch === promotionTarget (or 'main' when
+   *  no promotionTarget is known). */
   testsOnMainBranch: boolean;
+  /** Per-project promotion target branch (e.g. 'automain', 'production', 'release/v2').
+   *  When set, forwarded to writeCodeChangeHelpers so the generated ./check and ./pr
+   *  scripts can name the actual LTS branch rather than assuming 'main'. */
+  promotionTarget?: string;
   /** Diff summary captured pre-Claude — used as fallback if Claude exits
    *  without ./done|./fail. */
   baseCommit: string;
@@ -66,6 +72,10 @@ export interface CodeChangeTaskOpts {
    *  Forwarded to writeCodeChangeHelpers so ./done enforces a non-trivial
    *  `reasoning` field in check_results for each regressing category. */
   regressingCategories?: string[];
+  /** Resolved project build configuration. Forwarded to writeCodeChangeHelpers
+   *  so the generated ./check runs the project's configured per-directory
+   *  commands instead of the hardcoded Blueprint blocks. */
+  buildConfig?: BuildConfig;
   /** When true, this task was auto-decomposed from a larger finding into a
    *  cluster sibling. Combined with relatedFiles + siblingTasks, enables the
    *  SCOPE_EMPTY pre-flight guard (see runCodeChangeTask). */
@@ -271,7 +281,9 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     repo: opts.repo,
     existingPrNumber: opts.existingPrNumber,
     testsOnMainBranch: opts.testsOnMainBranch,
+    promotionTarget: opts.promotionTarget,
     regressingCategories: opts.regressingCategories,
+    buildConfig: opts.buildConfig,
   });
 
   // 2. Run Claude with the full task prompt. Claude is responsible for

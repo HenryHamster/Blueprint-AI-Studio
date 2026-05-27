@@ -2300,6 +2300,46 @@ async def test_pr_opened_auto_review_enabled_triggers_review(
 
 
 @pytest.mark.asyncio
+async def test_pr_opened_auto_review_base_branch_fallback_uses_integration_branch(
+    client, db_session, mocker
+):
+    """
+    When the PR payload has an empty base.ref, the auto-review handler should
+    receive base_branch from the project's configured integration_branch, not 'main'.
+    """
+    from app.models import Project
+
+    mocker.patch("app.routers.github.GITHUB_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    auto_review_mock = mocker.patch(
+        "app.auto_review._handle_auto_review",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="Custom Branch Auto Review",
+        user_id="user1",
+        github_owner="customorg",
+        github_repo="customrepo",
+        integration_branch="automain",
+        design_doc={"_auto_review": {"enabled": True}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    # Pass an empty string for base_branch to simulate a missing/empty base.ref
+    payload_bytes = _make_pr_event_payload(
+        "customorg", "customrepo", 99, "opened", base_branch=""
+    )
+    resp = await _post_webhook(client, payload_bytes, "pull_request")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "auto_review_triggered"
+    auto_review_mock.assert_called_once()
+    call_kwargs = auto_review_mock.call_args[1]
+    assert call_kwargs["base_branch"] == "automain"
+
+
+@pytest.mark.asyncio
 async def test_pr_synchronize_auto_review_enabled_triggers_review(
     client, db_session, mocker
 ):
@@ -2509,6 +2549,116 @@ async def test_update_branch_with_sha_retry_retry_also_fails(mocker):
 
     assert result == {"updated": False, "message": "retry failure"}
     assert update_branch_mock.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "There are no new commits on the base branch.",
+        "there are no new commits on the base branch",
+        "  There are no new commits on the base branch.  ",
+        "There are no new commits on the base branch",
+    ],
+)
+async def test_update_branch_with_sha_retry_no_new_commits_tags_not_behind(mocker, msg):
+    """GitHub's canonical 422 'no new commits on the base branch' must be tagged
+    with not_behind=True so callers can short-circuit instead of treating it as
+    a transient failure. Match is case/whitespace/period-tolerant."""
+    from app import github as gh
+
+    update_branch_mock = mocker.patch.object(
+        gh,
+        "update_branch",
+        new_callable=AsyncMock,
+        return_value={"updated": False, "message": msg},
+    )
+    get_pr_mock = mocker.patch.object(gh, "get_pull_request", new_callable=AsyncMock)
+
+    result = await gh.update_branch_with_sha_retry(
+        "t",
+        "o",
+        "r",
+        1,
+        expected_head_sha="abc",
+    )
+
+    assert result.get("not_behind") is True
+    assert result.get("updated") is False
+    # No retry — the not-behind tag should suppress the refetch+retry path.
+    assert update_branch_mock.await_count == 1
+    get_pr_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_branch_with_sha_retry_unrelated_422_does_not_tag(mocker):
+    """Regression guard: an unrelated 422 message (e.g. 'Merge conflict') must
+    NOT be tagged with not_behind. Only the canonical phrase triggers it."""
+    from app import github as gh
+
+    mocker.patch.object(
+        gh,
+        "update_branch",
+        new_callable=AsyncMock,
+        return_value={"updated": False, "message": "Merge conflict"},
+    )
+    mocker.patch.object(
+        gh,
+        "get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"head": {"sha": "sameSha"}},
+    )
+
+    result = await gh.update_branch_with_sha_retry(
+        "t",
+        "o",
+        "r",
+        1,
+        expected_head_sha="sameSha",
+    )
+
+    assert "not_behind" not in result
+    assert result.get("updated") is False
+
+
+@pytest.mark.asyncio
+async def test_update_branch_with_sha_retry_no_new_commits_on_retry_tags_not_behind(
+    mocker,
+):
+    """When the initial call fails with a generic message but the SHA-retry hits
+    the canonical 'no new commits on base' 422, the retry result must still be
+    tagged with not_behind=True."""
+    from app import github as gh
+
+    mocker.patch.object(
+        gh,
+        "update_branch",
+        new_callable=AsyncMock,
+        side_effect=[
+            {"updated": False, "message": "stale SHA"},
+            {
+                "updated": False,
+                "message": "There are no new commits on the base branch.",
+            },
+        ],
+    )
+    mocker.patch.object(
+        gh,
+        "get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"head": {"sha": "fresh999"}},
+    )
+
+    result = await gh.update_branch_with_sha_retry(
+        "t",
+        "o",
+        "r",
+        1,
+        expected_head_sha="stale",
+    )
+
+    assert result.get("not_behind") is True
+    assert result.get("updated") is False
 
 
 # ---------------------------------------------------------------------------
@@ -2833,3 +2983,268 @@ async def test_get_files_changed_between_refs_returns_none_on_api_error(mocker):
         "tok", "owner", "repo", "missing-ref", "head"
     )
     assert result is None
+
+
+@pytest.mark.asyncio
+async def test_is_ancestor_of_returns_true_when_ahead(mocker):
+    """Returns True when the compare API reports descendant_ref is ahead of ancestor_sha."""
+    from app.github import is_ancestor_of
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, {"status": "ahead"}),
+    )
+
+    result = await is_ancestor_of("tok", "owner", "repo", "abc123", "automain")
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_is_ancestor_of_returns_true_when_identical(mocker):
+    """Returns True when ancestor_sha and descendant_ref point at the same commit."""
+    from app.github import is_ancestor_of
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, {"status": "identical"}),
+    )
+
+    result = await is_ancestor_of("tok", "owner", "repo", "abc123", "automain")
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_is_ancestor_of_returns_false_when_not_merged_to_integration_branch(
+    mocker,
+):
+    """Returns False when fix PR merged only to a staging branch (not the integration branch).
+
+    A rollup child PR that merged to a staging branch has status 'behind' or 'diverged'
+    relative to the integration branch — the fix has NOT landed and recovery must NOT fire.
+    """
+    from app.github import is_ancestor_of
+
+    for not_ancestor_status in ("behind", "diverged"):
+        mocker.patch(
+            "httpx.AsyncClient.request",
+            return_value=MockResponse(200, {"status": not_ancestor_status}),
+        )
+        result = await is_ancestor_of("tok", "owner", "repo", "abc123", "automain")
+        assert result is False, f"expected False for status={not_ancestor_status!r}"
+
+
+@pytest.mark.asyncio
+async def test_is_ancestor_of_returns_none_on_api_error(mocker):
+    """Returns None (not False) on a non-200 API response — indeterminate result degrades safely.
+
+    An indeterminate result must NOT be treated as 'landed'; the regression case stays
+    eligible for re-spawn rather than being silently confirmed as fixed.
+    """
+    from app.github import is_ancestor_of
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(500, {}),
+    )
+
+    result = await is_ancestor_of("tok", "owner", "repo", "abc123", "automain")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_is_ancestor_of_returns_none_on_unparseable_response(mocker):
+    """Returns None when the compare API body cannot be parsed — degrades safely, not False."""
+    from app.github import is_ancestor_of
+
+    bad_response = MockResponse(200, None)
+    bad_response._json_data = None  # simulate json() returning None
+
+    def _raise():
+        raise ValueError("no JSON")
+
+    bad_response.json = _raise
+    mocker.patch("httpx.AsyncClient.request", return_value=bad_response)
+
+    result = await is_ancestor_of("tok", "owner", "repo", "abc123", "automain")
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# pr_is_not_behind — GitHub-clean / ancestor-of-base detector
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pr_is_not_behind_clean_mergeable_state_returns_true():
+    """mergeable_state='clean' is the authoritative GitHub signal — returns True
+    immediately without any API call, even when head and base SHAs differ."""
+    from app.github import pr_is_not_behind
+
+    result = await pr_is_not_behind(
+        "tok",
+        "owner",
+        "repo",
+        head_sha="head_sha_abc",
+        base_tip_sha="base_tip_xyz",
+        mergeable_state="clean",
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_pr_is_not_behind_clean_state_no_sha_still_returns_true():
+    """mergeable_state='clean' short-circuits even with no SHAs provided."""
+    from app.github import pr_is_not_behind
+
+    result = await pr_is_not_behind("tok", "owner", "repo", mergeable_state="clean")
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_pr_is_not_behind_ancestor_check_true_returns_true(mocker):
+    """base_tip_sha is already reachable from head_sha (status=ahead) → not behind."""
+    from app.github import pr_is_not_behind
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, {"status": "ahead"}),
+    )
+
+    result = await pr_is_not_behind(
+        "tok",
+        "owner",
+        "repo",
+        head_sha="head_abc",
+        base_tip_sha="base_xyz",
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_pr_is_not_behind_ancestor_check_false_returns_false(mocker):
+    """base_tip_sha is NOT reachable from head_sha (status=behind) → PR is behind."""
+    from app.github import pr_is_not_behind
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(200, {"status": "behind"}),
+    )
+
+    result = await pr_is_not_behind(
+        "tok",
+        "owner",
+        "repo",
+        head_sha="head_abc",
+        base_tip_sha="base_xyz",
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_pr_is_not_behind_api_error_falls_through_to_behind_state(mocker):
+    """When is_ancestor_of returns None (API error) and mergeable_state='behind',
+    falls through to mergeable_state signal and returns False."""
+    from app.github import pr_is_not_behind
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(500, {}),
+    )
+
+    result = await pr_is_not_behind(
+        "tok",
+        "owner",
+        "repo",
+        head_sha="head_abc",
+        base_tip_sha="base_xyz",
+        mergeable_state="behind",
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_pr_is_not_behind_api_error_no_fallback_returns_none(mocker):
+    """When is_ancestor_of returns None (API error) and no other signal is available,
+    returns None (indeterminate) — does not default to False."""
+    from app.github import pr_is_not_behind
+
+    mocker.patch(
+        "httpx.AsyncClient.request",
+        return_value=MockResponse(500, {}),
+    )
+
+    result = await pr_is_not_behind(
+        "tok",
+        "owner",
+        "repo",
+        head_sha="head_abc",
+        base_tip_sha="base_xyz",
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_pr_is_not_behind_no_shas_behind_state_returns_false():
+    """No SHAs provided, mergeable_state='behind' → returns False."""
+    from app.github import pr_is_not_behind
+
+    result = await pr_is_not_behind("tok", "owner", "repo", mergeable_state="behind")
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_pr_is_not_behind_no_shas_no_state_returns_none():
+    """No SHAs, no mergeable_state → indeterminate (None)."""
+    from app.github import pr_is_not_behind
+
+    result = await pr_is_not_behind("tok", "owner", "repo")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_repo_default_branch_returns_branch_on_200(mocker):
+    """200 with default_branch in JSON returns the branch name."""
+    from app.github import get_repo_default_branch
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(200, {"default_branch": "trunk"}),
+    )
+
+    result = await get_repo_default_branch("tok", "acme", "repo")
+    assert result == "trunk"
+
+
+@pytest.mark.asyncio
+async def test_get_repo_default_branch_non200_raises_502(mocker):
+    """Non-200 GitHub API response raises HTTPException(502) instead of silently returning 'main'."""
+    from app.github import get_repo_default_branch
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(403, text="Forbidden"),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_repo_default_branch("tok", "acme", "repo")
+    assert exc_info.value.status_code == 502
+    assert "HTTP 403" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_get_repo_default_branch_missing_key_raises_502(mocker):
+    """200 response missing default_branch field raises HTTPException(502) instead of substituting 'main'."""
+    from app.github import get_repo_default_branch
+
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(200, {"name": "repo", "owner": {"login": "acme"}}),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_repo_default_branch("tok", "acme", "repo")
+    assert exc_info.value.status_code == 502
+    assert "default_branch" in exc_info.value.detail

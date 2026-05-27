@@ -164,16 +164,24 @@ def _patch_spawning_deps(mocker):
 
 
 @pytest.fixture
-def _lts_split_active():
+def _lts_split_active(monkeypatch):
     """Activate the LTS split for version-lifecycle tests.
 
     The strategic version-phase block is gated on the integration branch being
-    a real trunk distinct from "main"; set it for the test and restore after.
+    a real trunk distinct from the promotion target. Override the per-project
+    resolvers (the global runtime_config bridge was removed) so tests using
+    `_make_project()` without an explicit `integration_branch` column see a
+    distinct trunk/target pair.
     """
-    _prev = _shared_state.runtime_config.get("integration_branch", "main")
-    _shared_state.runtime_config["integration_branch"] = "automain"
+    monkeypatch.setattr(
+        "app.strategic_spawning.get_project_integration_branch",
+        lambda _p: "automain",
+    )
+    monkeypatch.setattr(
+        "app.strategic_spawning.get_project_promotion_target",
+        lambda _p: "main",
+    )
     yield
-    _shared_state.runtime_config["integration_branch"] = _prev
 
 
 # ── Type selection: arch_frequency / strategic_cycle_count ────────────────────
@@ -555,6 +563,240 @@ async def test_success_evidence_absent_when_not_in_context(db_session):
 
 
 @pytest.mark.asyncio
+async def test_cumulative_confirmed_finding_count_and_trend_in_direction_stats(
+    db_session,
+):
+    """confirmed_finding_count and confirmed_finding_trend from outcome_progress_history reach direction stats."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-cf01",
+                "status": "active",
+                "text": "Direction with findings trend",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+                "outcome_progress_history": [
+                    {"progress": 1},
+                    {"progress": 2},
+                    {"progress": 3},
+                    {"progress": 5},
+                    {"progress": 8},
+                ],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-cf01")
+
+    assert "confirmed_finding_count" in d_stat
+    assert d_stat["confirmed_finding_count"] == 8
+    assert "confirmed_finding_trend" in d_stat
+    assert d_stat["confirmed_finding_trend"] == "improving"
+
+
+@pytest.mark.asyncio
+async def test_outcome_scaffolding_flag_surfaces_in_direction_stats(db_session):
+    """outcome_scaffolding_flagged and _evidence appear in stat_entry for flagged direction, absent for unflagged."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-scaff-flagged",
+                "status": "active",
+                "text": "Flagged scaffolding direction",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+                "outcome_scaffolding_flagged": True,
+                "outcome_scaffolding_evidence": {"reason": "no progress", "cycles": 5},
+            },
+            {
+                "id": "d-scaff-clean",
+                "status": "active",
+                "text": "Clean direction",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            },
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    by_id = {s["id"]: s for s in payload["directions_summary"]}
+
+    flagged = by_id["d-scaff-flagged"]
+    assert flagged.get("outcome_scaffolding_flagged") is True
+    assert flagged.get("outcome_scaffolding_evidence") == {
+        "reason": "no progress",
+        "cycles": 5,
+    }
+
+    clean = by_id["d-scaff-clean"]
+    assert "outcome_scaffolding_flagged" not in clean
+    assert "outcome_scaffolding_evidence" not in clean
+
+
+@pytest.mark.asyncio
+async def test_confirmed_finding_trend_declining_in_direction_stats(db_session):
+    """confirmed_finding_trend is declining when second half avg < first half avg * 0.7."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-cf02",
+                "status": "active",
+                "text": "Direction with declining findings",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+                "outcome_progress_history": [
+                    {"progress": 10},
+                    {"progress": 9},
+                    {"progress": 2},
+                    {"progress": 1},
+                ],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-cf02")
+
+    assert d_stat["confirmed_finding_count"] == 1
+    assert d_stat["confirmed_finding_trend"] == "declining"
+
+
+@pytest.mark.asyncio
+async def test_confirmed_finding_trend_stable_in_direction_stats(db_session):
+    """confirmed_finding_trend is stable when within the 0.7-1.3 range."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-cf03",
+                "status": "active",
+                "text": "Direction with stable findings",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+                "outcome_progress_history": [
+                    {"progress": 5},
+                    {"progress": 5},
+                    {"progress": 6},
+                    {"progress": 5},
+                ],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-cf03")
+
+    assert d_stat["confirmed_finding_count"] == 5
+    assert d_stat["confirmed_finding_trend"] == "stable"
+
+
+@pytest.mark.asyncio
+async def test_confirmed_finding_count_no_history_in_direction_stats(db_session):
+    """confirmed_finding_count is omitted when outcome_progress_history is empty."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-cf04",
+                "status": "active",
+                "text": "Direction without findings history",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-cf04")
+
+    assert "confirmed_finding_count" not in d_stat
+    assert "confirmed_finding_trend" not in d_stat
+
+
+@pytest.mark.asyncio
+async def test_confirmed_finding_trend_single_snapshot_in_direction_stats(db_session):
+    """confirmed_finding_count is present but trend is omitted with only one snapshot."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-cf05",
+                "status": "active",
+                "text": "Direction with single findings snapshot",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+                "outcome_progress_history": [{"progress": 5}],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-cf05")
+
+    assert "confirmed_finding_count" in d_stat
+    assert d_stat["confirmed_finding_count"] == 5
+    assert "confirmed_finding_trend" not in d_stat
+
+
+@pytest.mark.asyncio
 async def test_operator_rejection_rate_uses_history_aggregate(db_session):
     """operator_rejection_rate aggregates from both research_history and history_aggregate."""
     project = _make_project(
@@ -928,6 +1170,54 @@ async def test_spawn_strategic_review_proceeds_when_no_active_strategic(db_sessi
     assert len(tasks) == 1
     assert tasks[0].payloads[0]["type"] == "strategic_review"
     assert tasks[0].status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_enable_self_improvement_decoupled_from_is_self_repo(
+    db_session,
+):
+    """enable_self_improvement in the strategic payload is driven by build_config, not is_self_repo.
+
+    is_self_repo=True without the explicit flag → False.
+    build_config={"enable_self_improvement": True} regardless of is_self_repo → True.
+    """
+    # Self-repo without explicit flag → False
+    project_self_no_flag = _make_project(
+        is_self_repo=True,
+        build_config={"some_other_key": "value"},
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project_self_no_flag)
+    await db_session.commit()
+    await db_session.refresh(project_self_no_flag)
+    await _seed_legacy_cycles(db_session, project_self_no_flag)
+
+    spawned = await _spawn_strategic_review(project_self_no_flag, db_session)
+    assert spawned is True
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project_self_no_flag.id)
+    )
+    task_self = result.scalars().one()
+    assert task_self.payloads[0]["enable_self_improvement"] is False
+
+    # Non-self-repo with explicit flag → True
+    project_flag = _make_project(
+        is_self_repo=False,
+        build_config={"enable_self_improvement": True},
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project_flag)
+    await db_session.commit()
+    await db_session.refresh(project_flag)
+    await _seed_legacy_cycles(db_session, project_flag)
+
+    spawned2 = await _spawn_strategic_review(project_flag, db_session)
+    assert spawned2 is True
+    result2 = await db_session.execute(
+        select(Task).where(Task.project_id == project_flag.id)
+    )
+    task_flag = result2.scalars().one()
+    assert task_flag.payloads[0]["enable_self_improvement"] is True
 
 
 # ── Additional _spawn_design_doc_update tests ─────────────────────────────────
@@ -1806,6 +2096,57 @@ async def test_build_shipped_manifest_cutoff_from_cycle_history(db_session):
 
     manifest = await _build_shipped_changes_manifest(project, db_session)
     assert manifest == []
+
+
+@pytest.mark.asyncio
+async def test_build_shipped_manifest_excludes_rollup_children(db_session):
+    """Rollup child tasks (parent_task_id set) are excluded from the manifest.
+
+    A rollup child's PR merges to the rollup staging branch, not the integration
+    branch. Only the rollup parent (root task, parent_task_id=None) should appear
+    in the manifest once its own PR lands on the integration branch.
+    """
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Rollup parent — its PR landed on the integration branch
+    parent = Task(
+        project_id=project.id,
+        title="Rollup: ship feature X",
+        description="rollup",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "direction_id": "d-001"},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    # Rollup child — its PR merged to the staging branch only
+    child = Task(
+        project_id=project.id,
+        title="child: add helper",
+        description="child",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        parent_task_id=parent.id,
+        context={"pr_merged": True, "direction_id": "d-001"},
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    manifest = await _build_shipped_changes_manifest(project, db_session)
+
+    # Only the root task should appear; the child should be excluded
+    assert len(manifest) == 1
+    assert manifest[0]["direction_id"] == "d-001"
+    assert len(manifest[0]["tasks"]) == 1
+    assert manifest[0]["tasks"][0]["title"] == "Rollup: ship feature X"
 
 
 # ── predict_spawn_success: quality-score and momentum signals ─────────────────
@@ -3382,6 +3723,84 @@ async def test_version_phase_includes_recent_versions(
         assert "status" in entry
 
 
+@pytest.mark.asyncio
+async def test_version_phase_uses_promotion_target_gate(db_session, mocker):
+    """Version-phase LTS context follows integration_branch != promotion_target."""
+    await _ensure_releaseversion_table(db_session)
+
+    _patch_spawning_deps(mocker)
+    current_open_version = mocker.patch(
+        "app.release_version.current_open_version",
+        new=AsyncMock(return_value=None),
+    )
+    ensure_initial_release_version = mocker.patch(
+        "app.release_version.ensure_initial_release_version",
+        new=AsyncMock(return_value=None),
+    )
+
+    skipped_project = _make_project(
+        integration_branch="trunk",
+        promotion_target="trunk",
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(skipped_project)
+    await db_session.commit()
+    await db_session.refresh(skipped_project)
+
+    assert await _spawn_strategic_review(skipped_project, db_session) is True
+    assert current_open_version.call_count == 0
+    assert ensure_initial_release_version.call_count == 0
+
+    current_open_version.reset_mock()
+    ensure_initial_release_version.reset_mock()
+
+    active_project = _make_project(
+        integration_branch="automain",
+        promotion_target="main",
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(active_project)
+    await db_session.commit()
+    await db_session.refresh(active_project)
+
+    assert await _spawn_strategic_review(active_project, db_session) is True
+    assert current_open_version.call_count == 1
+    assert ensure_initial_release_version.call_args.kwargs["promotion_target"] == "main"
+
+
+@pytest.mark.asyncio
+async def test_version_phase_bootstrap_passes_custom_promotion_target(
+    db_session, mocker
+):
+    """Bootstrap uses the project promotion target even when integration_branch is main."""
+    await _ensure_releaseversion_table(db_session)
+
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.release_version.current_open_version",
+        new=AsyncMock(return_value=None),
+    )
+    ensure_initial_release_version = mocker.patch(
+        "app.release_version.ensure_initial_release_version",
+        new=AsyncMock(return_value=None),
+    )
+
+    project = _make_project(
+        integration_branch="main",
+        promotion_target="deploy",
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    assert await _spawn_strategic_review(project, db_session) is True
+    assert ensure_initial_release_version.call_count == 1
+    assert (
+        ensure_initial_release_version.call_args.kwargs["promotion_target"] == "deploy"
+    )
+
+
 # ── stabilize-stall strategic nudge ──────────────────────────────────────────
 
 
@@ -4222,6 +4641,58 @@ async def test_on_automain_false_when_rollup_not_merged(db_session):
     assert merges[0]["on_automain"] is False
 
 
+@pytest.mark.asyncio
+async def test_rolling_rates_exclude_rollup_children(db_session):
+    """Rollup children (parent_task_id set) are not counted as merged in rolling_rates.
+
+    A rollup child's pr_merged=True means its PR landed on the rollup staging branch,
+    not the integration branch. Only the rollup parent (root task) should count
+    toward the merged counter in rolling_rates when it lands on integration.
+    """
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Rollup parent — merged to integration branch
+    parent = Task(
+        project_id=project.id,
+        title="Rollup parent",
+        description="rollup",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    # Two rollup children — each merged to staging only
+    for i in range(2):
+        child = Task(
+            project_id=project.id,
+            title=f"Child fix {i}",
+            description="child",
+            payloads=[{"type": "create"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            parent_task_id=parent.id,
+            context={"pr_merged": True},
+        )
+        db_session.add(child)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    rates = result["rolling_rates"]
+    # Only the root parent counts as a merged task; the two children are staging-only
+    assert rates["last_7d"]["merged"] == 1, (
+        f"Expected 1 integration-landed merge (root task only), "
+        f"got {rates['last_7d']['merged']}"
+    )
+
+
 # ── git-ancestry landing verification in _build_recent_interventions ──────────
 
 
@@ -4595,3 +5066,50 @@ async def test_on_automain_false_for_root_task_ancestry_api_exception(
     assert merges[0]["pr_title"] == "API-error root fix"
     # API exception → task absent from _automain_verified → fail-closed = False
     assert merges[0]["on_automain"] is False
+
+
+# ── Per-project integration_branch resolution (column-based) ─────────────────
+
+
+class TestGetProjectIntegrationBranch:
+    """get_project_integration_branch() — the canonical column-based resolver.
+
+    Per-project value lives on the project.integration_branch column; when the
+    column is unset, the helper falls back to the literal default 'main'.
+    """
+
+    def test_unset_column_returns_global_default(self):
+        """Project with integration_branch=None resolves to the literal default."""
+        project = _make_project(integration_branch=None)
+        assert _shared_state.get_project_integration_branch(project) == "main"
+
+    def test_unset_column_ignores_global_state(self):
+        """A missing column no longer consults global runtime_config state."""
+        project = _make_project(integration_branch=None)
+        assert _shared_state.get_project_integration_branch(project) == "main"
+
+    def test_column_override_used(self):
+        """Project with integration_branch column set uses that value."""
+        project = _make_project(integration_branch="feature-trunk")
+        assert _shared_state.get_project_integration_branch(project) == "feature-trunk"
+
+    def test_column_override_ignores_global(self):
+        """Column value wins regardless of global state."""
+        project = _make_project(integration_branch="my-branch")
+        assert _shared_state.get_project_integration_branch(project) == "my-branch"
+
+    def test_two_projects_resolve_independently(self):
+        """Two projects with different column values each get their own value."""
+        project_a = _make_project(integration_branch="trunk-a")
+        project_b = _make_project(integration_branch="trunk-b")
+        assert _shared_state.get_project_integration_branch(project_a) == "trunk-a"
+        assert _shared_state.get_project_integration_branch(project_b) == "trunk-b"
+
+    def test_project_with_override_and_project_without_are_independent(self):
+        """A project with a column value and one without resolve independently."""
+        project_with = _make_project(integration_branch="custom-trunk")
+        project_without = _make_project(integration_branch=None)
+        assert (
+            _shared_state.get_project_integration_branch(project_with) == "custom-trunk"
+        )
+        assert _shared_state.get_project_integration_branch(project_without) == "main"

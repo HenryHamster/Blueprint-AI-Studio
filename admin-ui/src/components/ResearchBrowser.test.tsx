@@ -1,12 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ResearchBrowser } from './ResearchBrowser';
 import type { Task, ResearchFinding } from '../types/task';
+import { fetchRecentFindings } from '../api';
 
 vi.mock('../api', () => ({
   API_BASE_URL: '',
   authHeaders: vi.fn(() => Promise.resolve({})),
+  fetchRecentFindings: vi.fn(() => Promise.reject(new Error('no data'))),
 }));
 
 beforeEach(() => {
@@ -209,5 +211,80 @@ describe('ResearchBrowser findings_documented filter', () => {
     // Only implementation findings without a child task appear under Proposed.
     expect(screen.getByText('Impl proposed')).toBeInTheDocument();
     expect(screen.queryByText('Meta only')).not.toBeInTheDocument();
+  });
+});
+
+describe('ResearchBrowser research quality card', () => {
+  it('renders grade distribution when API returns findings', async () => {
+    vi.mocked(fetchRecentFindings).mockResolvedValueOnce({
+      findings: [
+        { task_id: 't1', title: 'Fix auth bypass', type: 'bug', scope: 'small', priority: 'high', actionability_grade: 'HIGH', direction_id: null, researched_at: '2026-05-27T10:00:00Z' },
+        { task_id: 't2', title: 'Update docs', type: 'improvement', scope: 'small', priority: 'low', actionability_grade: 'LOW', direction_id: null, researched_at: '2026-05-27T09:00:00Z' },
+      ],
+      grade_distribution: { HIGH: 1, MEDIUM: 0, LOW: 1 },
+      grade_distribution_pct: { HIGH: 50, MEDIUM: 0, LOW: 50 },
+      total: 2,
+    });
+    render(
+      <ResearchBrowser
+        tasks={[]}
+        selectedProjectId="proj-1"
+        onClose={() => {}}
+      />,
+    );
+    await waitFor(() => {
+      expect(screen.getByText('Research quality')).toBeInTheDocument();
+    });
+    expect(screen.getByText(/1 HIGH/)).toBeInTheDocument();
+    expect(screen.getByText(/1 LOW/)).toBeInTheDocument();
+    expect(screen.getByText('Fix auth bypass')).toBeInTheDocument();
+  });
+
+  it('does not render quality card when API returns no findings', async () => {
+    vi.mocked(fetchRecentFindings).mockResolvedValueOnce({
+      findings: [],
+      grade_distribution: { HIGH: 0, MEDIUM: 0, LOW: 0 },
+      grade_distribution_pct: { HIGH: 0, MEDIUM: 0, LOW: 0 },
+      total: 0,
+    });
+    render(
+      <ResearchBrowser
+        tasks={[]}
+        selectedProjectId="proj-1"
+        onClose={() => {}}
+      />,
+    );
+    // Wait a tick for the effect to settle, then confirm the card isn't rendered.
+    await new Promise<void>(resolve => setTimeout(resolve, 20));
+    expect(screen.queryByText('Research quality')).not.toBeInTheDocument();
+  });
+
+  it('shows HIGH/MEDIUM/LOW grade chips on recent findings rows', async () => {
+    vi.mocked(fetchRecentFindings).mockResolvedValueOnce({
+      findings: [
+        { task_id: 't1', title: 'High-value finding', type: 'bug', scope: 'medium', priority: 'high', actionability_grade: 'HIGH', direction_id: null, researched_at: null },
+        { task_id: 't2', title: 'Medium-value finding', type: 'improvement', scope: 'small', priority: 'medium', actionability_grade: 'MEDIUM', direction_id: null, researched_at: null },
+        { task_id: 't3', title: 'Low-value finding', type: 'observation', scope: 'small', priority: 'low', actionability_grade: 'LOW', direction_id: null, researched_at: null },
+      ],
+      grade_distribution: { HIGH: 1, MEDIUM: 1, LOW: 1 },
+      grade_distribution_pct: { HIGH: 33.3, MEDIUM: 33.3, LOW: 33.3 },
+      total: 3,
+    });
+    render(
+      <ResearchBrowser
+        tasks={[]}
+        selectedProjectId="proj-1"
+        onClose={() => {}}
+      />,
+    );
+    await waitFor(() => {
+      expect(screen.getByText('Research quality')).toBeInTheDocument();
+    });
+    expect(screen.getByText('HIGH')).toBeInTheDocument();
+    expect(screen.getByText('MEDIUM')).toBeInTheDocument();
+    expect(screen.getByText('LOW')).toBeInTheDocument();
+    expect(screen.getByText('High-value finding')).toBeInTheDocument();
+    expect(screen.getByText('Medium-value finding')).toBeInTheDocument();
+    expect(screen.getByText('Low-value finding')).toBeInTheDocument();
   });
 });

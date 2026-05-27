@@ -7,6 +7,7 @@ from app.models import (
     CYCLE_META_MEMOS_AVAILABLE,
     CYCLE_META_MEMOS_CITED,
     MaxPlanAccount,
+    Project,
     RegressionRemediationCase,
     StrategicCycle,
 )
@@ -184,6 +185,52 @@ def test_is_in_rate_limit_cooldown_malformed_at_field():
     assert acct.is_in_rate_limit_cooldown() is False
 
 
+def test_is_in_rate_limit_cooldown_at_time_parameter():
+    """at_time shifts the reference point: same entry, different at_time → different result."""
+    disabled_at = datetime(2026, 1, 1, 12, 0, 0)  # noon
+    at_str = disabled_at.isoformat()
+    acct = _make_account(
+        rate_limit_state={
+            "disabled_models": {
+                "claude-sonnet-4-6": {"at": at_str, "hits": 1, "kind": "rate_limit"}
+            }
+        }
+    )
+    # hits=1 → exponential = 30 minutes cooldown
+    # reference 10 minutes after disable → still in cooldown
+    inside_window = disabled_at + timedelta(minutes=10)
+    assert acct.is_in_rate_limit_cooldown(at_time=inside_window) is True
+    # reference 31 minutes after disable → cooldown expired
+    after_window = disabled_at + timedelta(minutes=31)
+    assert acct.is_in_rate_limit_cooldown(at_time=after_window) is False
+
+
+def test_is_in_rate_limit_cooldown_quota_exhausted_uses_24h():
+    """quota_exhausted kind uses 24-hour flat window, not exponential."""
+    disabled_at = datetime(2026, 1, 1, 12, 0, 0)
+    at_str = disabled_at.isoformat()
+    acct = _make_account(
+        rate_limit_state={
+            "disabled_models": {
+                "claude-opus-4-7": {
+                    "at": at_str,
+                    "hits": 1,
+                    "kind": "quota_exhausted",
+                }
+            }
+        }
+    )
+    # 5 hours after — still in 24-hour window
+    assert (
+        acct.is_in_rate_limit_cooldown(at_time=disabled_at + timedelta(hours=5)) is True
+    )
+    # 25 hours after — window expired
+    assert (
+        acct.is_in_rate_limit_cooldown(at_time=disabled_at + timedelta(hours=25))
+        is False
+    )
+
+
 def test_mark_merged_records_episode_investigate_started_at_re_armed():
     inv = _T0 + timedelta(minutes=5)
     recovered = _T0 + timedelta(hours=2)
@@ -206,3 +253,120 @@ def test_mark_merged_records_episode_investigate_started_at_re_armed():
     entry = case.fingerprint_to_fix_log[-1]
     # Second episode should anchor on recovered_at, not the original investigate_spawned_at
     assert datetime.fromisoformat(entry["episode_investigate_started_at"]) == recovered
+
+
+# ---------------------------------------------------------------------------
+# RegressionRemediationCase.mark_merged — merge_sha ancestry audit trail
+# ---------------------------------------------------------------------------
+
+
+def test_mark_merged_stores_fix_merge_sha_when_provided():
+    """fix_merge_sha is recorded in the fix-log entry when a merge commit SHA is given."""
+    case = _make_regression_case(investigate_spawned_at=_T0)
+    case.mark_merged(
+        pr_number=42, signal_snapshot={"value": 0.9}, merge_sha="abc123def456"
+    )
+    entry = case.fingerprint_to_fix_log[-1]
+    assert entry.get("fix_merge_sha") == "abc123def456"
+
+
+def test_mark_merged_omits_fix_merge_sha_when_not_provided():
+    """fix_merge_sha key is absent from the fix-log entry when no SHA is passed (backward compat)."""
+    case = _make_regression_case(investigate_spawned_at=_T0)
+    case.mark_merged(pr_number=42, signal_snapshot={"value": 0.9})
+    entry = case.fingerprint_to_fix_log[-1]
+    assert "fix_merge_sha" not in entry
+
+
+def test_mark_merged_fix_merge_sha_coexists_with_other_fields():
+    """fix_merge_sha is stored alongside layers_targeted and episode anchor without conflict."""
+    case = _make_regression_case(investigate_spawned_at=_T0)
+    case.mark_merged(
+        pr_number=55,
+        signal_snapshot={"value": 0.7},
+        layers_targeted=["PROMPTS", "TESTS"],
+        merge_sha="deadbeef1234",
+    )
+    entry = case.fingerprint_to_fix_log[-1]
+    assert entry.get("fix_merge_sha") == "deadbeef1234"
+    assert entry.get("layers_targeted") == ["PROMPTS", "TESTS"]
+    assert "episode_investigate_started_at" in entry
+
+
+# task_branch_prefix (project-level branch namespace)
+
+
+def _make_project(build_config=None):
+    return Project(name="Test", user_id="user1", build_config=build_config)
+
+
+def test_task_branch_prefix_defaults_to_blueprint():
+    assert _make_project().task_branch_prefix == "blueprint/"
+
+
+def test_task_branch_prefix_reads_from_build_config():
+    project = _make_project(build_config={"task_branch_prefix": "acme/"})
+    assert project.task_branch_prefix == "acme/"
+
+
+def test_task_branch_prefix_falls_back_when_build_config_is_none():
+    assert _make_project(build_config=None).task_branch_prefix == "blueprint/"
+
+
+def test_task_branch_prefix_falls_back_when_key_absent_in_build_config():
+    project = _make_project(build_config={"other_key": "value"})
+    assert project.task_branch_prefix == "blueprint/"
+
+
+def test_task_branch_prefix_derives_from_task_branch_namespace():
+    project = _make_project(build_config={"task_branch_namespace": "autoproj"})
+    assert project.task_branch_prefix == "autoproj/"
+
+
+def test_task_branch_prefix_explicit_override_wins_over_namespace_derivation():
+    project = _make_project(
+        build_config={
+            "task_branch_namespace": "autoproj",
+            "task_branch_prefix": "legacy/",
+        }
+    )
+    assert project.task_branch_prefix == "legacy/"
+
+
+# is_staging_branch (per-project intermediate staging branch predicate)
+
+
+def test_is_staging_branch_default_prefixes_research():
+    assert _make_project().is_staging_branch("research/cycle-1") is True
+
+
+def test_is_staging_branch_default_prefixes_plan():
+    assert _make_project().is_staging_branch("plan/cycle-1") is True
+
+
+def test_is_staging_branch_default_prefixes_non_staging():
+    assert _make_project().is_staging_branch("blueprint/task-abc123") is False
+    assert _make_project().is_staging_branch("main") is False
+
+
+def test_is_staging_branch_custom_prefixes_recognized():
+    project = _make_project(
+        build_config={"staging_branch_prefixes": ["feature/", "wip/"]}
+    )
+    assert project.is_staging_branch("feature/foo") is True
+    assert project.is_staging_branch("wip/bar") is True
+
+
+def test_is_staging_branch_custom_prefixes_reject_default_research():
+    project = _make_project(
+        build_config={"staging_branch_prefixes": ["feature/", "wip/"]}
+    )
+    # With custom prefixes configured, the Blueprint default 'research/' is no
+    # longer a staging branch for this project.
+    assert project.is_staging_branch("research/cycle-1") is False
+
+
+def test_is_staging_branch_empty_or_none_branch():
+    project = _make_project()
+    assert project.is_staging_branch("") is False
+    assert project.is_staging_branch(None) is False

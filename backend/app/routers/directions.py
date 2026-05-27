@@ -8,7 +8,6 @@ from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import get_session
@@ -24,7 +23,8 @@ from app.models import (
 from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role
 from app.payload_schemas import validate_internal_payload
-from app.task_locking import lock_project_or_429
+from app.task_locking import lock_project_or_429, with_directions_locked
+from app.direction_lifecycle import _reset_outcome_detection_state
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +160,7 @@ async def get_directions(
         ),
         "self_reflection_log": project.self_reflection_log or [],
         "is_self_repo": bool(project.is_self_repo),
+        "enable_self_improvement": project.enable_self_improvement,
     }
 
 
@@ -183,14 +184,6 @@ async def add_direction(
     from app.shared_state import runtime_config as _runtime_config
 
     max_active = _runtime_config.get("max_active_directions", 5)
-    active_count = sum(
-        1 for d in (project.directions or []) if d.get("status") == "active"
-    )
-    if active_count >= max_active:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Direction cap reached: max {max_active} active directions allowed",
-        )
 
     direction = {
         "id": f"d-{uuid.uuid4().hex[:8]}",
@@ -210,21 +203,34 @@ async def add_direction(
         )
     if payload.cost_budget_usd is not None:
         direction["cost_budget_usd"] = float(payload.cost_budget_usd)
-    if payload.conflicts_with:
-        # Validate referenced IDs exist
-        existing_ids = {d.get("id") for d in (project.directions or [])}
-        invalid = [cid for cid in payload.conflicts_with if cid not in existing_ids]
-        if invalid:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown direction IDs in conflicts_with: {invalid}",
-            )
-        direction["conflicts_with"] = payload.conflicts_with
 
-    directions = list(project.directions or [])
-    directions.append(direction)
-    project.directions = directions
-    session.add(project)
+    def _mutate_add(directions: list) -> None:
+        active_count = sum(1 for d in directions if d.get("status") == "active")
+        if active_count >= max_active:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Direction cap reached: max {max_active} active directions allowed",
+            )
+        if payload.conflicts_with:
+            existing_ids = {d.get("id") for d in directions}
+            invalid = [cid for cid in payload.conflicts_with if cid not in existing_ids]
+            if invalid:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown direction IDs in conflicts_with: {invalid}",
+                )
+            direction["conflicts_with"] = payload.conflicts_with
+        directions.append(direction)
+
+    applied = await with_directions_locked(
+        session, project.id, _mutate_add, skip_locked=True
+    )
+    if not applied:
+        raise HTTPException(
+            status_code=429,
+            detail="Project row locked by concurrent write, retry",
+            headers={"Retry-After": "2"},
+        )
     await session.commit()
 
     return {"direction": direction}
@@ -298,9 +304,15 @@ async def replace_directions(
             entry["status"] = "active"
         normalized.append(entry)
 
-    project.directions = normalized
-    flag_modified(project, "directions")
-    session.add(project)
+    applied = await with_directions_locked(
+        session, project.id, lambda _: normalized, skip_locked=True
+    )
+    if not applied:
+        raise HTTPException(
+            status_code=429,
+            detail="Project row locked by concurrent write, retry",
+            headers={"Retry-After": "2"},
+        )
     await session.commit()
     return {"directions": normalized}
 
@@ -316,34 +328,44 @@ async def remove_direction(
         project_id, current_user["user_id"], session, "member"
     )
 
-    original_directions = list(project.directions or [])
-    removed = [d for d in original_directions if d.get("id") == direction_id]
-    directions = [d for d in original_directions if d.get("id") != direction_id]
-    if len(directions) == len(original_directions):
-        raise HTTPException(status_code=404, detail="Direction not found")
+    def _mutate_remove(directions: list) -> list:
+        removed = [d for d in directions if d.get("id") == direction_id]
+        remaining = [d for d in directions if d.get("id") != direction_id]
+        if len(remaining) == len(directions):
+            raise HTTPException(status_code=404, detail="Direction not found")
 
-    # If this was a proposed direction, keep a tombstone (status='rejected') to prevent re-proposal
-    if removed and removed[0].get("status") == "proposed":
-        from datetime import datetime, timezone
+        # If this was a proposed direction, keep a tombstone to prevent re-proposal
+        if removed and removed[0].get("status") == "proposed":
+            from datetime import datetime, timezone
 
-        rejected_text = (removed[0].get("text") or "")[:200]
-        if rejected_text.strip():
-            tombstone = {
-                "id": removed[0]["id"],
-                "text": rejected_text,
-                "status": "rejected",
-                "rejected_at": datetime.now(timezone.utc)
-                .replace(tzinfo=None)
-                .isoformat(),
-            }
-            # Append tombstone and cap to 20 most-recent rejected entries
-            rejected = [d for d in directions if d.get("status") == "rejected"]
-            non_rejected = [d for d in directions if d.get("status") != "rejected"]
-            rejected.append(tombstone)
-            rejected = rejected[-20:]
-            directions = non_rejected + rejected
+            rejected_text = (removed[0].get("text") or "")[:200]
+            if rejected_text.strip():
+                tombstone = {
+                    "id": removed[0]["id"],
+                    "text": rejected_text,
+                    "status": "rejected",
+                    "rejected_at": datetime.now(timezone.utc)
+                    .replace(tzinfo=None)
+                    .isoformat(),
+                }
+                rejected = [d for d in remaining if d.get("status") == "rejected"]
+                non_rejected = [d for d in remaining if d.get("status") != "rejected"]
+                rejected.append(tombstone)
+                rejected = rejected[-20:]
+                remaining = non_rejected + rejected
+        return remaining
 
-    # Cancel QUEUED tasks spawned for this direction
+    applied = await with_directions_locked(
+        session, project.id, _mutate_remove, skip_locked=True
+    )
+    if not applied:
+        raise HTTPException(
+            status_code=429,
+            detail="Project row locked by concurrent write, retry",
+            headers={"Retry-After": "2"},
+        )
+
+    # Cancel QUEUED tasks spawned for this direction (same transaction, lock held)
     cancelled_result = await session.execute(
         select(Task).where(
             Task.project_id == project_id,
@@ -360,8 +382,6 @@ async def remove_direction(
         if t.vm_instance_id:
             vm_ids_to_delete.append(t.vm_instance_id)
 
-    project.directions = directions
-    session.add(project)
     await session.commit()
 
     # Delete VMs for cancelled tasks (after commit)
@@ -388,20 +408,30 @@ async def reorder_directions(
     if not isinstance(direction_ids, list):
         raise HTTPException(status_code=400, detail="direction_ids must be a list")
 
-    existing_ids = {d.get("id") for d in (project.directions or [])}
-    provided_ids = set(direction_ids)
-    if existing_ids != provided_ids:
+    reordered: list = []
+
+    def _mutate_reorder(directions: list) -> list:
+        existing_ids = {d.get("id") for d in directions}
+        provided_ids = set(direction_ids)
+        if existing_ids != provided_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="direction_ids must match existing direction IDs exactly",
+            )
+        directions_by_id = {d.get("id"): d for d in directions}
+        ordered = [directions_by_id[did] for did in direction_ids]
+        reordered[:] = ordered
+        return ordered
+
+    applied = await with_directions_locked(
+        session, project.id, _mutate_reorder, skip_locked=True
+    )
+    if not applied:
         raise HTTPException(
-            status_code=400,
-            detail="direction_ids must match existing direction IDs exactly",
+            status_code=429,
+            detail="Project row locked by concurrent write, retry",
+            headers={"Retry-After": "2"},
         )
-
-    directions_by_id = {d.get("id"): d for d in (project.directions or [])}
-    reordered = [directions_by_id[id] for id in direction_ids]
-
-    project.directions = reordered
-    flag_modified(project, "directions")
-    session.add(project)
     await session.commit()
     return {"directions": reordered}
 
@@ -418,7 +448,7 @@ async def update_direction(
         project_id, current_user["user_id"], session, "member"
     )
 
-    # Validate inputs
+    # Validate inputs (pure payload checks that don't need locked state)
     if "priority" in payload and payload["priority"] not in ("high", "medium", "low"):
         raise HTTPException(
             status_code=400, detail="priority must be high, medium, or low"
@@ -463,17 +493,6 @@ async def update_direction(
             raise HTTPException(
                 status_code=400,
                 detail="conflicts_with must be a list of direction ID strings",
-            )
-        existing_ids = {
-            d.get("id")
-            for d in (project.directions or [])
-            if d.get("id") != direction_id
-        }
-        invalid = [cid for cid in payload["conflicts_with"] if cid not in existing_ids]
-        if invalid:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown direction IDs in conflicts_with: {invalid}",
             )
     if (
         "category" in payload
@@ -522,6 +541,7 @@ async def update_direction(
     from app.strategic_completion import (  # noqa: PLC0415
         _VALID_RECOMMENDED_MODES,
         _normalize_recommended_mode,
+        _reset_scaffolding_state_on_outcome_change,
     )
 
     if "recommended_mode" in payload and payload["recommended_mode"] is not None:
@@ -537,141 +557,186 @@ async def update_direction(
                 detail="system_id must be a string of at most 100 characters",
             )
 
-    # Direction cap check: if reactivating, ensure we won't exceed the cap
-    if payload.get("status") == "active":
-        from app.shared_state import runtime_config as _runtime_config
+    updated_direction: list = []  # [d] populated by mutate_fn
 
-        max_active = _runtime_config.get("max_active_directions", 5)
-        # Count active directions, excluding the one being updated (it may already be active)
-        active_count = sum(
-            1
-            for d in (project.directions or [])
-            if d.get("status") == "active" and d.get("id") != direction_id
-        )
-        if active_count >= max_active:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Direction cap reached: max {max_active} active directions allowed",
+    def _mutate_update(directions: list) -> None:
+        # Cap check (needs locked data): if reactivating, ensure cap won't be exceeded
+        if payload.get("status") == "active":
+            from app.shared_state import runtime_config as _runtime_config  # noqa: PLC0415
+
+            max_active = _runtime_config.get("max_active_directions", 5)
+            active_count = sum(
+                1
+                for d in directions
+                if d.get("status") == "active" and d.get("id") != direction_id
             )
+            if active_count >= max_active:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Direction cap reached: max {max_active} active directions allowed",
+                )
 
-    directions = list(project.directions or [])
-    updated = False
-    for d in directions:
-        if d.get("id") == direction_id:
-            if "priority" in payload:
-                d["priority"] = payload["priority"]
-            if "status" in payload:
-                d["status"] = payload["status"]
-                # When reactivating from paused, clear auto-pause fields
-                if payload["status"] == "active":
-                    d.pop("paused_reason", None)
-                    d.pop("paused_at", None)
-                    d.pop("auto_paused", None)
-                    d.pop("expired_at", None)
-                    # Operator reactivation acknowledges any escalation — clear
-                    # manual-intervention flag, pending notification state, and
-                    # reset remediation attempts so spawn calibration no longer
-                    # penalizes the direction.
-                    d.pop("needs_manual_intervention", None)
-                    d.pop("needs_manual_intervention_at", None)
-                    d.pop("escalation_notification_pending", None)
-                    d.pop("escalation_notification_retries", None)
-                    d.pop("last_researched_at", None)
-                    d["remediation_attempts"] = 0
-                # When reviving from expired back to proposed, clear expired_at
-                if payload["status"] == "proposed":
-                    d.pop("expired_at", None)
-            if "text" in payload:
-                d["text"] = payload["text"]
-            if "paths" in payload:
-                d["paths"] = payload["paths"]
-            if "pending_update" in payload:
-                d["pending_update"] = payload["pending_update"]
-            if "research_context" in payload:
-                if payload["research_context"] is None:
-                    d.pop("research_context", None)
-                elif isinstance(payload["research_context"], str):
-                    d["research_context"] = payload["research_context"]
-                    # Re-evaluation of research context indicates the direction was reviewed —
-                    # clear any existing hold so new tasks can dispatch again.
-                    import app.shared_state as _ss  # noqa: PLC0415
+        # conflicts_with existence check (needs locked data)
+        if "conflicts_with" in payload and payload["conflicts_with"] is not None:
+            existing_ids = {
+                d.get("id") for d in directions if d.get("id") != direction_id
+            }
+            invalid = [
+                cid for cid in payload["conflicts_with"] if cid not in existing_ids
+            ]
+            if invalid:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown direction IDs in conflicts_with: {invalid}",
+                )
 
-                    _ss.clear_direction_hold(direction_id)
-            if "research_history" in payload:
-                if payload["research_history"] is None or (
-                    isinstance(payload["research_history"], list)
-                    and len(payload["research_history"]) == 0
-                ):
-                    d["research_history"] = []
-            if "notes" in payload:
-                if isinstance(payload["notes"], list):
-                    d["notes"] = payload["notes"]
-            if "completion_criteria" in payload:
-                if payload["completion_criteria"] is None:
-                    d.pop("completion_criteria", None)
-                elif isinstance(payload["completion_criteria"], str):
-                    d["completion_criteria"] = payload["completion_criteria"]
-            if "conflicts_with" in payload:
-                if payload["conflicts_with"] is None or (
-                    isinstance(payload["conflicts_with"], list)
-                    and len(payload["conflicts_with"]) == 0
-                ):
-                    d.pop("conflicts_with", None)
-                elif isinstance(payload["conflicts_with"], list):
-                    d["conflicts_with"] = payload["conflicts_with"]
-            if "category" in payload:
-                if payload["category"] is None:
-                    d.pop("category", None)
-                elif payload["category"] in VALID_CATEGORIES:
-                    d["category"] = payload["category"]
-            if "cost_budget_usd" in payload:
-                if payload["cost_budget_usd"] is None:
-                    d.pop("cost_budget_usd", None)
-                else:
-                    d["cost_budget_usd"] = float(payload["cost_budget_usd"])
-            if "success_evidence" in payload or "retirement_condition" in payload:
-                context = d.get("context") or {}
-                if "success_evidence" in payload:
-                    if payload["success_evidence"] is None:
-                        context.pop("success_evidence", None)
+        for d in directions:
+            if d.get("id") == direction_id:
+                # Snapshot contract fields before mutation to detect real changes.
+                _pre_text = d.get("text")
+                _pre_paths = list(d.get("paths") or [])
+                _pre_cc = d.get("completion_criteria")
+                _pre_ctx = d.get("context") or {}
+                _pre_se = _pre_ctx.get("success_evidence")
+                _pre_rc = _pre_ctx.get("retirement_condition")
+
+                if "priority" in payload:
+                    d["priority"] = payload["priority"]
+                if "status" in payload:
+                    d["status"] = payload["status"]
+                    # When reactivating from paused, clear auto-pause fields
+                    if payload["status"] == "active":
+                        d.pop("paused_reason", None)
+                        d.pop("paused_at", None)
+                        d.pop("auto_paused", None)
+                        d.pop("expired_at", None)
+                        # Operator reactivation acknowledges any escalation — clear
+                        # manual-intervention flag, pending notification state, and
+                        # reset remediation attempts so spawn calibration no longer
+                        # penalizes the direction.
+                        d.pop("needs_manual_intervention", None)
+                        d.pop("needs_manual_intervention_at", None)
+                        d.pop("escalation_notification_pending", None)
+                        d.pop("escalation_notification_retries", None)
+                        d.pop("last_researched_at", None)
+                        d["remediation_attempts"] = 0
+                    # When reviving from expired back to proposed, clear expired_at
+                    if payload["status"] == "proposed":
+                        d.pop("expired_at", None)
+                if "text" in payload:
+                    d["text"] = payload["text"]
+                if "paths" in payload:
+                    d["paths"] = payload["paths"]
+                if "pending_update" in payload:
+                    d["pending_update"] = payload["pending_update"]
+                if "research_context" in payload:
+                    if payload["research_context"] is None:
+                        d.pop("research_context", None)
+                    elif isinstance(payload["research_context"], str):
+                        d["research_context"] = payload["research_context"]
+                        # Re-evaluation of research context indicates the direction was reviewed —
+                        # clear any existing hold so new tasks can dispatch again.
+                        import app.shared_state as _ss  # noqa: PLC0415
+
+                        _ss.clear_direction_hold(direction_id)
+                if "research_history" in payload:
+                    if payload["research_history"] is None or (
+                        isinstance(payload["research_history"], list)
+                        and len(payload["research_history"]) == 0
+                    ):
+                        d["research_history"] = []
+                if "notes" in payload:
+                    if isinstance(payload["notes"], list):
+                        d["notes"] = payload["notes"]
+                if "completion_criteria" in payload:
+                    if payload["completion_criteria"] is None:
+                        d.pop("completion_criteria", None)
+                    elif isinstance(payload["completion_criteria"], str):
+                        d["completion_criteria"] = payload["completion_criteria"]
+                if "conflicts_with" in payload:
+                    if payload["conflicts_with"] is None or (
+                        isinstance(payload["conflicts_with"], list)
+                        and len(payload["conflicts_with"]) == 0
+                    ):
+                        d.pop("conflicts_with", None)
+                    elif isinstance(payload["conflicts_with"], list):
+                        d["conflicts_with"] = payload["conflicts_with"]
+                if "category" in payload:
+                    if payload["category"] is None:
+                        d.pop("category", None)
+                    elif payload["category"] in VALID_CATEGORIES:
+                        d["category"] = payload["category"]
+                if "cost_budget_usd" in payload:
+                    if payload["cost_budget_usd"] is None:
+                        d.pop("cost_budget_usd", None)
                     else:
-                        context["success_evidence"] = payload["success_evidence"]
-                if "retirement_condition" in payload:
-                    if payload["retirement_condition"] is None:
-                        context.pop("retirement_condition", None)
+                        d["cost_budget_usd"] = float(payload["cost_budget_usd"])
+                if "success_evidence" in payload or "retirement_condition" in payload:
+                    context = d.get("context") or {}
+                    _old_se = context.get("success_evidence")
+                    _old_rc = context.get("retirement_condition")
+                    if "success_evidence" in payload:
+                        if payload["success_evidence"] is None:
+                            context.pop("success_evidence", None)
+                        else:
+                            context["success_evidence"] = payload["success_evidence"]
+                    if "retirement_condition" in payload:
+                        if payload["retirement_condition"] is None:
+                            context.pop("retirement_condition", None)
+                        else:
+                            context["retirement_condition"] = payload[
+                                "retirement_condition"
+                            ]
+                    if (
+                        context.get("success_evidence") != _old_se
+                        or context.get("retirement_condition") != _old_rc
+                    ):
+                        _reset_scaffolding_state_on_outcome_change(d)
+                    d["context"] = context
+                if "recommended_mode" in payload:
+                    if payload["recommended_mode"] is None:
+                        d.pop("recommended_mode", None)
+                        d.pop(RECOMMENDED_MODE_META_KEY, None)
                     else:
-                        context["retirement_condition"] = payload[
-                            "retirement_condition"
-                        ]
-                d["context"] = context
-            if "recommended_mode" in payload:
-                if payload["recommended_mode"] is None:
-                    d.pop("recommended_mode", None)
-                    d.pop(RECOMMENDED_MODE_META_KEY, None)
-                else:
-                    mode = _normalize_recommended_mode(payload["recommended_mode"])
-                    d["recommended_mode"] = mode
-                    d[RECOMMENDED_MODE_META_KEY] = {
-                        "mode": mode,
-                        "source": "operator",
-                        "set_at": _utcnow().isoformat(),
-                    }
-            if "system_id" in payload:
-                if payload["system_id"] is None:
-                    d.pop("system_id", None)
-                else:
-                    d["system_id"] = payload["system_id"][:100]
-            updated = True
-            break
+                        mode = _normalize_recommended_mode(payload["recommended_mode"])
+                        d["recommended_mode"] = mode
+                        d[RECOMMENDED_MODE_META_KEY] = {
+                            "mode": mode,
+                            "source": "operator",
+                            "set_at": _utcnow().isoformat(),
+                        }
+                if "system_id" in payload:
+                    if payload["system_id"] is None:
+                        d.pop("system_id", None)
+                    else:
+                        d["system_id"] = payload["system_id"][:100]
 
-    if not updated:
+                # Reset outcome-detection state when any contract field actually changed.
+                _new_ctx = d.get("context") or {}
+                if (
+                    d.get("text") != _pre_text
+                    or list(d.get("paths") or []) != _pre_paths
+                    or d.get("completion_criteria") != _pre_cc
+                    or _new_ctx.get("success_evidence") != _pre_se
+                    or _new_ctx.get("retirement_condition") != _pre_rc
+                ):
+                    _reset_outcome_detection_state(d)
+
+                updated_direction.append(d)
+                return
         raise HTTPException(status_code=404, detail="Direction not found")
 
-    project.directions = directions
-    flag_modified(project, "directions")
-    session.add(project)
+    applied = await with_directions_locked(
+        session, project.id, _mutate_update, skip_locked=True
+    )
+    if not applied:
+        raise HTTPException(
+            status_code=429,
+            detail="Project row locked by concurrent write, retry",
+            headers={"Retry-After": "2"},
+        )
     await session.commit()
-    return {"direction": next(d for d in directions if d.get("id") == direction_id)}
+    return {"direction": updated_direction[0]}
 
 
 @router.post("/projects/{project_id}/directions/{direction_id}/research")
@@ -692,6 +757,9 @@ async def create_direction_research_task(
     if not direction:
         raise HTTPException(status_code=404, detail="Direction not found")
 
+    from app.shared_state import (
+        get_project_integration_branch as _get_project_integration_branch,
+    )
     from app.shared_state import runtime_config as _runtime_config
 
     if not bypass_cooldown:
@@ -720,7 +788,9 @@ async def create_direction_research_task(
         {
             "type": "research",
             "directions": [direction],
-            "base_branch": _runtime_config.get("integration_branch", "main"),
+            "base_branch": _get_project_integration_branch(project),
+            "is_self_repo": bool(project.is_self_repo),
+            "enable_self_improvement": project.enable_self_improvement,
         },
         "directions:research",
     )

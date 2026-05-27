@@ -25,6 +25,18 @@ router = APIRouter(
     dependencies=[Depends(get_current_user)],
 )
 
+# These endpoints aggregate over the FULL lookback window — every terminal task
+# contributes to the computed baselines/rates, so a row LIMIT used as a page size
+# would silently change the answer (and offset paging over an un-ordered aggregate
+# skips/duplicates rows). Instead of paginating we apply a single deterministic
+# safety cap that bounds worst-case memory without altering results in normal
+# operation: realistic windows (≤730d at ~20-40 tasks/day ≈ 30k rows) stay well
+# under the cap. Rows are ordered most-recent-first so that, in the pathological
+# case where the cap is exceeded, the scan is deterministic across identical calls
+# and the response advertises `truncated: true` rather than lying about a partial
+# aggregate.
+_MAX_AGGREGATION_SCAN = 50000
+
 
 def _compute_scope_baselines(tasks: list, lookback_days: int) -> dict:
     """Compute per-scope merge rate baselines from a pre-fetched list of terminal tasks.
@@ -652,10 +664,18 @@ async def get_scope_baselines(
                 Task.id, Task.status, Task.context, Task.created_at, Task.project_id
             )
         )
+        .order_by(Task.created_at.desc(), Task.id.desc())
+        .limit(_MAX_AGGREGATION_SCAN + 1)
     )
-    tasks = result.scalars().all()
+    tasks = list(result.scalars().all())
+    truncated = len(tasks) > _MAX_AGGREGATION_SCAN
+    if truncated:
+        tasks = tasks[:_MAX_AGGREGATION_SCAN]
 
-    return _compute_scope_baselines(list(tasks), lookback_days)
+    data = _compute_scope_baselines(tasks, lookback_days)
+    data["scanned"] = len(tasks)
+    data["truncated"] = truncated
+    return data
 
 
 @router.get("/medium-scope-measurement")
@@ -692,15 +712,23 @@ async def get_medium_scope_measurement(
                 Task.title,
             )
         )
+        .order_by(Task.created_at.desc(), Task.id.desc())
+        .limit(_MAX_AGGREGATION_SCAN + 1)
     )
-    all_tasks = result.scalars().all()
+    all_tasks = list(result.scalars().all())
+    truncated = len(all_tasks) > _MAX_AGGREGATION_SCAN
+    if truncated:
+        all_tasks = all_tasks[:_MAX_AGGREGATION_SCAN]
     medium_tasks = [t for t in all_tasks if (t.context or {}).get("scope") == "medium"]
 
     project = await session.get(Project, project_id)
 
-    return _compute_medium_scope_measurement(
+    data = _compute_medium_scope_measurement(
         medium_tasks, project, direction_id, lookback_days
     )
+    data["scanned"] = len(all_tasks)
+    data["truncated"] = truncated
+    return data
 
 
 @router.get("/first-attempt-measurement")
@@ -719,15 +747,21 @@ async def get_first_attempt_measurement(
     """
     cutoff = _utcnow() - timedelta(days=lookback_days)
     result = await session.execute(
-        select(Task).where(
+        select(Task)
+        .where(
             Task.status.in_(
                 [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
             ),
             Task.created_at >= cutoff,
             Task.project_id == project_id,
         )
+        .order_by(Task.created_at.desc(), Task.id.desc())
+        .limit(_MAX_AGGREGATION_SCAN + 1)
     )
-    all_tasks = result.scalars().all()
+    all_tasks = list(result.scalars().all())
+    truncated = len(all_tasks) > _MAX_AGGREGATION_SCAN
+    if truncated:
+        all_tasks = all_tasks[:_MAX_AGGREGATION_SCAN]
 
     parsed_split_date: Optional[datetime] = None
     if split_date:
@@ -736,6 +770,9 @@ async def get_first_attempt_measurement(
         except (ValueError, TypeError):
             pass
 
-    return _compute_first_attempt_measurement(
-        list(all_tasks), parsed_split_date, lookback_days
+    data = _compute_first_attempt_measurement(
+        all_tasks, parsed_split_date, lookback_days
     )
+    data["scanned"] = len(all_tasks)
+    data["truncated"] = truncated
+    return data

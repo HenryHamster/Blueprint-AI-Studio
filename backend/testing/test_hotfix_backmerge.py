@@ -42,13 +42,27 @@ pytestmark = pytest.mark.asyncio
 # ===========================================================================
 
 
-async def _make_project(db_session) -> Project:
-    """Create a project with an authorized GitHub repo."""
+async def _make_project(
+    db_session,
+    *,
+    integration_branch: str | None = "automain",
+    promotion_target: str | None = "main",
+) -> Project:
+    """Create a project with an authorized GitHub repo.
+
+    The runtime_config branch fallbacks were removed; tests now configure
+    integration_branch / promotion_target directly on the project. Defaults
+    activate the back-merge model (LTS split active) since most cases in this
+    file exercise that path; tests that need an inactive LTS pass
+    ``integration_branch="main"`` (or matching promotion_target).
+    """
     project = Project(
         name="Backmerge-Test",
         user_id="bm-user",
         github_owner="acme",
         github_repo="widget",
+        integration_branch=integration_branch,
+        promotion_target=promotion_target,
     )
     db_session.add(project)
     await db_session.commit()
@@ -135,10 +149,7 @@ async def test_open_backmerge_pr_success(db_session, mocker):
     # PR opened main -> automain (the inverse of promote's automain -> main).
     assert create_mock.call_args.kwargs["head"] == "main"
     assert create_mock.call_args.kwargs["base"] == "automain"
-    assert (
-        create_mock.call_args.kwargs["title"]
-        == "Back-merge: main -> automain"
-    )
+    assert create_mock.call_args.kwargs["title"] == "Back-merge: main -> automain"
 
     # Merge uses merge_method="merge" to preserve the hotfix history.
     assert merge_mock.call_args.kwargs["merge_method"] == "merge"
@@ -234,6 +245,11 @@ async def test_open_backmerge_pr_conflict_raises_alert_and_spawns_plan(
     tasks = await _tasks_for(db_session, project.id)
     assert len(tasks) == 1
     resolution = tasks[0]
+    assert resolution.title == "Resolve back-merge conflict: main -> automain"
+    assert (
+        resolution.description
+        == "The automated main -> automain back-merge PR #55 hit a merge conflict; resolve it on automain so the next promotion does not conflict."
+    )
     payload = resolution.first_payload
     # ``create`` (not ``plan``): single direct task so resolver guardrails
     # reach the executing agent verbatim, no planner-decomposer indirection.
@@ -302,9 +318,7 @@ async def test_open_backmerge_pr_dirty_pr_detected_as_conflict_spawns_resolver(
 
     # A resolution task was spawned (the whole point — not a silent "blocked").
     tasks = await _tasks_for(db_session, project.id)
-    resolvers = [
-        t for t in tasks if (t.first_payload or {}).get("type") == "create"
-    ]
+    resolvers = [t for t in tasks if (t.first_payload or {}).get("type") == "create"]
     assert len(resolvers) == 1
     assert resolvers[0].context["backmerge_conflict"] is True
     assert resolvers[0].first_payload["base_branch"] == "automain"
@@ -331,9 +345,7 @@ async def test_open_backmerge_pr_blocked_when_not_dirty(db_session, mocker):
 
     assert result["status"] == "blocked"
     tasks = await _tasks_for(db_session, project.id)
-    resolvers = [
-        t for t in tasks if (t.first_payload or {}).get("type") == "create"
-    ]
+    resolvers = [t for t in tasks if (t.first_payload or {}).get("type") == "create"]
     assert len(resolvers) == 0
 
 
@@ -354,16 +366,12 @@ async def test_open_backmerge_pr_conflict_no_duplicate_resolver(db_session, mock
     )
 
     # First attempt — spawns the resolution task.
-    r1 = await hb.open_backmerge_pr(
-        db_session, project.id, hotfix_task_id=hotfix_id
-    )
+    r1 = await hb.open_backmerge_pr(db_session, project.id, hotfix_task_id=hotfix_id)
     await db_session.commit()
     assert r1["status"] == "conflict"
 
     # Second attempt for the same hotfix — the resolution task is still open.
-    r2 = await hb.open_backmerge_pr(
-        db_session, project.id, hotfix_task_id=hotfix_id
-    )
+    r2 = await hb.open_backmerge_pr(db_session, project.id, hotfix_task_id=hotfix_id)
     await db_session.commit()
     assert r2["status"] == "conflict"
 
@@ -376,6 +384,102 @@ async def test_open_backmerge_pr_conflict_no_duplicate_resolver(db_session, mock
     assert len(alerts) == 2
 
 
+async def test_open_backmerge_pr_conflict_uses_custom_branch_names_for_resolver(
+    db_session, mocker
+):
+    """The spawned resolver task should mirror the configured branch names in
+    its user-facing title and description."""
+    project = await _make_project(
+        db_session, integration_branch="trunk", promotion_target="stable"
+    )
+    _patch_github(
+        mocker,
+        create_return={"number": 88, "html_url": "http://pr/88"},
+        merge_return={"merged": False, "conflict": True, "message": "conflict"},
+    )
+
+    await hb.open_backmerge_pr(db_session, project.id, hotfix_task_id=uuid.uuid4())
+    await db_session.commit()
+
+    task = (await _tasks_for(db_session, project.id))[0]
+    assert task.title == "Resolve back-merge conflict: stable -> trunk"
+    assert (
+        task.description
+        == "The automated stable -> trunk back-merge PR #88 hit a merge conflict; resolve it on trunk so the next promotion does not conflict."
+    )
+
+
+@pytest.mark.asyncio
+async def test_advisory_lock_prevents_concurrent_duplicate_resolver(db_session, mocker):
+    """Advisory lock prevents a duplicate resolver when two concurrent callers
+    both pass the _resolution_task_already_open check before either commits.
+
+    Simulates the production race: promotion-conflict hook + periodic reconciler
+    fire in the same instant, both see no open resolver, but the advisory lock
+    serializes them — exactly one resolver task is spawned.
+    """
+    project = await _make_project(db_session)
+
+    # Both callers "see" no open resolver — simulates the race where neither has committed yet.
+    mocker.patch(
+        "app.hotfix_backmerge._resolution_task_already_open",
+        new=AsyncMock(return_value=False),
+    )
+
+    # Lock mock: first call acquires it, second does not.
+    lock_call_count = {"n": 0}
+    real_execute = db_session.execute
+
+    async def mock_execute(stmt, params=None, **kwargs):
+        if "pg_try_advisory_xact_lock" in str(stmt):
+            lock_call_count["n"] += 1
+            from unittest.mock import MagicMock
+
+            result = MagicMock()
+            result.scalar.return_value = lock_call_count["n"] == 1
+            return result
+        if params is not None:
+            return await real_execute(stmt, params, **kwargs)
+        return await real_execute(stmt, **kwargs)
+
+    mocker.patch.object(db_session, "execute", side_effect=mock_execute)
+
+    # First call (e.g. promotion-conflict hook) — acquires lock, spawns resolver.
+    await hb._handle_conflict(
+        db_session,
+        project.id,
+        55,
+        "http://pr/55",
+        None,
+        "hook",
+        project=project,
+        message="conflict",
+        periodic=False,
+    )
+    await db_session.flush()
+
+    # Second call (e.g. periodic reconciler) — lock fails, returns immediately.
+    await hb._handle_conflict(
+        db_session,
+        project.id,
+        55,
+        "http://pr/55",
+        None,
+        "reconciler",
+        project=project,
+        message="conflict",
+        periodic=False,
+    )
+    await db_session.commit()
+
+    tasks = await _tasks_for(db_session, project.id)
+    resolvers = [t for t in tasks if (t.first_payload or {}).get("type") == "create"]
+    assert len(resolvers) == 1, (
+        f"Advisory lock must prevent duplicate resolver spawn — got {len(resolvers)} resolvers"
+    )
+
+
+@pytest.mark.asyncio
 async def test_open_backmerge_pr_conflict_respawns_after_resolver_terminal(
     db_session, mocker
 ):
@@ -390,9 +494,7 @@ async def test_open_backmerge_pr_conflict_respawns_after_resolver_terminal(
         merge_return={"merged": False, "conflict": True, "message": "conflict"},
     )
 
-    r1 = await hb.open_backmerge_pr(
-        db_session, project.id, hotfix_task_id=hotfix_id
-    )
+    r1 = await hb.open_backmerge_pr(db_session, project.id, hotfix_task_id=hotfix_id)
     await db_session.commit()
     assert r1["status"] == "conflict"
 
@@ -404,9 +506,7 @@ async def test_open_backmerge_pr_conflict_respawns_after_resolver_terminal(
     await db_session.commit()
 
     # A fresh conflict for the same hotfix now spawns a NEW resolver.
-    r2 = await hb.open_backmerge_pr(
-        db_session, project.id, hotfix_task_id=hotfix_id
-    )
+    r2 = await hb.open_backmerge_pr(db_session, project.id, hotfix_task_id=hotfix_id)
     await db_session.commit()
     assert r2["status"] == "conflict"
 
@@ -474,9 +574,7 @@ async def test_open_backmerge_pr_merge_exception_raises_alert(db_session, mocker
     assert await _tasks_for(db_session, project.id) == []
 
 
-async def test_open_backmerge_pr_pr_creation_failure_raises_alert(
-    db_session, mocker
-):
+async def test_open_backmerge_pr_pr_creation_failure_raises_alert(db_session, mocker):
     """An exception from create_pull_request raises an ERROR Alert and returns
     blocked — the back-merge could not even be opened."""
     from fastapi import HTTPException
@@ -504,7 +602,15 @@ async def test_open_backmerge_pr_no_credentials_raises_alert(db_session, mocker)
     """With no resolvable GitHub token the back-merge is blocked and an ERROR
     Alert is raised — a missed back-merge must never pass silently."""
     # Project with no github_owner/repo -> _resolve_github_with_session fails.
-    project = Project(name="Backmerge-NoCreds", user_id="bm-user")
+    # integration_branch/promotion_target set so the branch resolver in
+    # shared_state doesn't stage its own "Missing integration_branch" Alert
+    # alongside the no_credentials alert we're asserting on.
+    project = Project(
+        name="Backmerge-NoCreds",
+        user_id="bm-user",
+        integration_branch="automain",
+        promotion_target="main",
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -538,10 +644,7 @@ async def test_reconcile_skipped_when_integration_branch_not_automain(
     """The reconciler is a no-op when the LTS branch model is not active —
     integration_branch != "automain" means there is no separate trunk to
     reconcile, so GitHub is never touched."""
-    project = await _make_project(db_session)
-    mocker.patch.dict(
-        "app.shared_state.runtime_config", {"integration_branch": "main"}
-    )
+    project = await _make_project(db_session, integration_branch="main")
     create_mock, merge_mock = _patch_github(
         mocker,
         create_return={"number": 1, "html_url": "http://pr/1"},
@@ -555,15 +658,10 @@ async def test_reconcile_skipped_when_integration_branch_not_automain(
     merge_mock.assert_not_called()
 
 
-async def test_reconcile_delegates_to_backmerge_when_lts_active(
-    db_session, mocker
-):
+async def test_reconcile_delegates_to_backmerge_when_lts_active(db_session, mocker):
     """With integration_branch == "automain" the reconciler delegates to
     open_backmerge_pr and back-merges main -> automain."""
     project = await _make_project(db_session)
-    mocker.patch.dict(
-        "app.shared_state.runtime_config", {"integration_branch": "automain"}
-    )
     create_mock, _merge_mock = _patch_github(
         mocker,
         create_return={"number": 9, "html_url": "http://pr/9"},
@@ -581,9 +679,6 @@ async def test_reconcile_delegates_to_backmerge_when_lts_active(
 async def test_reconcile_empty_diff_is_noop(db_session, mocker):
     """When main == automain the reconciler is a clean no-op."""
     project = await _make_project(db_session)
-    mocker.patch.dict(
-        "app.shared_state.runtime_config", {"integration_branch": "automain"}
-    )
     _patch_github(
         mocker,
         create_return={"empty_diff": True, "merged": True, "html_url": ""},
@@ -618,9 +713,7 @@ async def test_periodic_block_raises_one_deduped_alert(db_session, mocker):
 
     # Three reconciler cycles, all hitting the same non-conflict block.
     for _ in range(3):
-        result = await hb.open_backmerge_pr(
-            db_session, project.id, periodic=True
-        )
+        result = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
         await db_session.commit()
         assert result["status"] == "blocked"
         assert result["error"] == "merge_blocked"
@@ -650,9 +743,7 @@ async def test_periodic_conflict_dedupes_alert_and_plan(db_session, mocker):
 
     # Three reconciler cycles, all hitting the same conflict.
     for _ in range(3):
-        result = await hb.open_backmerge_pr(
-            db_session, project.id, periodic=True
-        )
+        result = await hb.open_backmerge_pr(db_session, project.id, periodic=True)
         await db_session.commit()
         assert result["status"] == "conflict"
 
@@ -661,3 +752,120 @@ async def test_periodic_conflict_dedupes_alert_and_plan(db_session, mocker):
     tasks = await _tasks_for(db_session, project.id)
     assert len(tasks) == 1
     assert tasks[0].context["backmerge_conflict"] is True
+
+
+# ===========================================================================
+# Config-driven branch names — arbitrary integration trunk and promotion target
+# ===========================================================================
+
+
+async def test_open_backmerge_pr_uses_configured_branch_names(db_session, mocker):
+    """With arbitrary integration_branch / promotion_target, open_backmerge_pr
+    creates the PR from promotion_target INTO integration_branch — the back-merge
+    path is config-driven, not hardcoded to 'main'/'automain'."""
+    project = await _make_project(
+        db_session, integration_branch="mytrunk", promotion_target="mylts"
+    )
+    create_mock, _merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 99, "html_url": "http://pr/99"},
+        merge_return={"merged": True},
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "merged"
+    # PR head is the promotion target; base is the integration trunk.
+    assert create_mock.call_args.kwargs["head"] == "mylts"
+    assert create_mock.call_args.kwargs["base"] == "mytrunk"
+    assert create_mock.call_args.kwargs["title"] == "Back-merge: mylts -> mytrunk"
+
+
+async def test_reconcile_activates_for_custom_branch_names(db_session, mocker):
+    """The reconciler is active whenever integration_branch != promotion_target,
+    regardless of the specific names — not only when integration_branch is
+    literally 'automain'."""
+    project = await _make_project(
+        db_session, integration_branch="mytrunk", promotion_target="mylts"
+    )
+    create_mock, _merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 100, "html_url": "http://pr/100"},
+        merge_return={"merged": True},
+    )
+
+    result = await hb.reconcile_main_into_automain(db_session, project.id)
+    await db_session.commit()
+
+    # Should NOT skip — integration != promotion means LTS model is active.
+    assert result["status"] == "merged"
+    assert create_mock.call_args.kwargs["head"] == "mylts"
+    assert create_mock.call_args.kwargs["base"] == "mytrunk"
+
+
+async def test_reconcile_skipped_when_integration_equals_promotion(db_session, mocker):
+    """The reconciler skips when integration_branch == promotion_target — that
+    means there is no separate trunk to reconcile (LTS model inactive)."""
+    project = await _make_project(
+        db_session, integration_branch="main", promotion_target="main"
+    )
+    create_mock, merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 1, "html_url": "http://pr/1"},
+        merge_return={"merged": True},
+    )
+
+    result = await hb.reconcile_main_into_automain(db_session, project.id)
+
+    assert result == {"status": "skipped", "reason": "lts_inactive"}
+    create_mock.assert_not_called()
+    merge_mock.assert_not_called()
+
+
+# ===========================================================================
+# Per-project promotion_target resolution
+# ===========================================================================
+
+
+async def test_open_backmerge_pr_uses_per_project_promotion_target(db_session, mocker):
+    """When project.promotion_target is set, the back-merge goes to the
+    project-specific LTS branch."""
+    project = await _make_project(
+        db_session, integration_branch="proj-trunk", promotion_target="proj-lts"
+    )
+    create_mock, _merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 42, "html_url": "http://pr/42"},
+        merge_return={"merged": True},
+    )
+
+    result = await hb.open_backmerge_pr(db_session, project.id)
+    await db_session.commit()
+
+    assert result["status"] == "merged"
+    # PR must use the per-project branch names, not the global config values.
+    assert create_mock.call_args.kwargs["head"] == "proj-lts"
+    assert create_mock.call_args.kwargs["base"] == "proj-trunk"
+    assert create_mock.call_args.kwargs["title"] == "Back-merge: proj-lts -> proj-trunk"
+
+
+async def test_reconcile_uses_per_project_branch_names(db_session, mocker):
+    """reconcile_main_into_automain uses per-project branch names for both the
+    LTS-active check and the back-merge PR."""
+    project = await _make_project(
+        db_session, integration_branch="proj-trunk", promotion_target="proj-lts"
+    )
+    create_mock, _merge_mock = _patch_github(
+        mocker,
+        create_return={"number": 43, "html_url": "http://pr/43"},
+        merge_return={"merged": True},
+    )
+
+    result = await hb.reconcile_main_into_automain(db_session, project.id)
+    await db_session.commit()
+
+    # Per-project branches differ, so LTS is active and reconciler runs.
+    assert result["status"] == "merged"
+    assert create_mock.call_args.kwargs["head"] == "proj-lts"
+    assert create_mock.call_args.kwargs["base"] == "proj-trunk"

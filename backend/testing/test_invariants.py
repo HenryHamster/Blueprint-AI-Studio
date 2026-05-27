@@ -211,61 +211,63 @@ class TestSchemaRevisionSync:
         so a mismatch means the filename is misleading about ordering.
         """
         import glob as globmod
-        import re
+
+        from app.migration_chain import find_filename_revision_mismatches
 
         migrations_dir = os.path.join(
             os.path.dirname(__file__), "..", "alembic", "versions"
         )
         files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
-        rev_re = re.compile(r"^revision\s*=\s*['\"](\w+)['\"]", re.MULTILINE)
-        mismatches: list[str] = []
+        sources: dict[str, str] = {}
         for path in files:
-            filename_rev = os.path.basename(path).split("_")[0]
             with open(path) as f:
-                content = f.read()
-            match = rev_re.search(content)
-            if not match:
-                mismatches.append(f"{os.path.basename(path)}: no revision field found")
-                continue
-            internal_rev = match.group(1)
-            if internal_rev != filename_rev:
-                mismatches.append(
-                    f"{os.path.basename(path)}: filename says {filename_rev}, "
-                    f"internal revision says {internal_rev}"
-                )
+                sources[os.path.basename(path)] = f.read()
+        # Consume the shared helper the rollup auto-merge guard also uses, so
+        # the CI invariant and the runtime guard reason about filename-vs-
+        # revision desync with identical parsing.
+        mismatches = find_filename_revision_mismatches(sources)
         assert not mismatches, "Migration revision mismatches:\n  " + "\n  ".join(
             mismatches
         )
 
     def test_migration_chain_is_linear(self):
         """The alembic migration chain must be a single linear sequence —
-        no gaps, no branches, no dangling down_revision references.
+        no gaps, no branches, no dangling down_revision references, and no
+        duplicate revision identifiers across files.
+
+        Uses the same DB-free parser (``app.migration_chain``) that the
+        rollup auto-merge guard consumes, so the invariant test and the
+        runtime guard assert against identical revision/down_revision
+        resolution.
         """
         import glob as globmod
-        import re
+
+        from app.migration_chain import build_migration_chain, find_heads
 
         migrations_dir = os.path.join(
             os.path.dirname(__file__), "..", "alembic", "versions"
         )
         files = globmod.glob(os.path.join(migrations_dir, "[0-9]*.py"))
-        rev_re = re.compile(r"^revision\s*=\s*['\"](\w+)['\"]", re.MULTILINE)
-        # Match either down_revision = '0033' or down_revision = None
-        down_re = re.compile(
-            r"^down_revision\s*=\s*(?:['\"](\w+)['\"]|None)", re.MULTILINE
-        )
 
-        chain: dict[str, str | None] = {}  # revision -> down_revision
+        sources: dict[str, str] = {}
         for path in files:
             with open(path) as f:
-                content = f.read()
-            rev_match = rev_re.search(content)
-            down_match = down_re.search(content)
-            if rev_match:
-                # group(1) is the quoted revision string or None if matched 'None' literal
-                down = (
-                    down_match.group(1) if down_match and down_match.group(1) else None
-                )
-                chain[rev_match.group(1)] = down
+                sources[os.path.basename(path)] = f.read()
+
+        chain, duplicates, unparseable = build_migration_chain(sources)
+
+        # No unparseable migration files (every file must declare a revision).
+        assert not unparseable, (
+            "Migration files with no parseable revision identifier:\n  "
+            + "\n  ".join(sorted(unparseable))
+        )
+
+        # No two files may declare the same Alembic revision id — that is the
+        # rollup-collision regression this invariant exists to catch.
+        assert not duplicates, (
+            "Duplicate Alembic revision identifier(s) across migration files: "
+            + ", ".join(sorted(set(duplicates)))
+        )
 
         # Every down_revision must point to a revision that exists (or None for the root)
         missing_parents = [
@@ -283,8 +285,7 @@ class TestSchemaRevisionSync:
             f"Expected exactly 1 root migration, found {len(roots)}: {roots}"
         )
 
-        pointed_to = {d for d in chain.values() if d is not None}
-        heads = [r for r in chain if r not in pointed_to]
+        heads = find_heads(chain)
         assert len(heads) == 1, (
             f"Expected exactly 1 head migration, found {len(heads)}: {heads}"
         )
@@ -731,6 +732,147 @@ class TestSecurityIntegrity:
         )
 
 
+# ── Base-branch fallback hardening ─────────────────────────────────────────
+
+
+class TestBaseBranchFallback:
+    """Guard against hardcoded 'main' fallbacks across backend/app."""
+
+    def test_no_hardcoded_main_branch_fallbacks(self):
+        """No production module under backend/app/ may use defensive 'main' fallbacks."""
+        import os
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        allow_list = {"payload_schemas.py", "admin.py"}
+        patterns = [
+            re.compile(r'else\s+["\']main["\']'),
+            re.compile(r'else\s+["\']master["\']'),
+            re.compile(
+                r'runtime_config\.get\(["\'](?:integration_branch|promotion_target)["\'],\s*["\']main["\']\)'
+            ),
+            re.compile(r'\bbranch\s*=\s*["\']main["\']'),
+        ]
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in files:
+                if not fname.endswith(".py"):
+                    continue
+                if fname in allow_list:
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    for lineno, line in enumerate(f, start=1):
+                        if line.lstrip().startswith("#") or "# noqa" in line:
+                            continue
+                        if any(pattern.search(line) for pattern in patterns):
+                            rel = os.path.relpath(fpath, app_dir)
+                            offenders.append(f"  {rel}:{lineno}: {line.rstrip()}")
+        assert not offenders, (
+            "Found hardcoded branch fallbacks in backend/app/.\n"
+            "Replace defensive 'main' defaults with project-aware resolution.\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
+    def test_no_hardcoded_branch_in_task_display_strings(self):
+        """No production module under backend/app/ may embed a literal 'main...'
+        or 'main -> automain' inside a task title= or description= field.
+
+        These display strings are shown to operators for every project, including
+        non-Blueprint repos whose branches are not main/automain, so they would
+        mislabel what is actually being audited. Branch values must be interpolated
+        from the per-task resolved base_branch/diff_range variables instead.
+
+        Scope: only task/alert display fields (title=, description=, message=).
+        Log format strings are intentionally excluded — they are internal and
+        not shown to operators in the UI.
+        """
+        import os
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        # Match literal 'main...' or 'main -> automain' in task display field assignments.
+        patterns = [
+            re.compile(
+                r"""(?:title|description|message)\s*=\s*f?['""][^'"]*\bmain\.\.\."""
+            ),
+            re.compile(
+                r"""(?:title|description|message)\s*=\s*f?['""][^'"]*\bmain\s*->\s*automain"""
+            ),
+        ]
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in files:
+                if not fname.endswith(".py"):
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    for lineno, line in enumerate(f, start=1):
+                        if line.lstrip().startswith("#") or "# noqa" in line:
+                            continue
+                        if any(pattern.search(line) for pattern in patterns):
+                            rel = os.path.relpath(fpath, app_dir)
+                            offenders.append(f"  {rel}:{lineno}: {line.rstrip()}")
+        assert not offenders, (
+            "Found hardcoded branch names in task display fields (title=/description=/message=) "
+            "in backend/app/.\n"
+            "Interpolate branch values from the resolved per-task variable (e.g. base_branch)\n"
+            "instead of embedding literal 'main...' or 'main -> automain'.\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
+
+# ── Staging-branch prefix classification guard ────────────────────────────
+
+
+class TestStagingBranchClassification:
+    """Guard against hardcoded staging-prefix startswith calls in backend/app/.
+
+    Per-project branch classification must route through Project.is_staging_branch()
+    or Project.staging_branch_prefixes, not via bare .startswith("research/") /
+    .startswith("plan/") calls that silently break non-Blueprint installs.
+
+    Allowlisted files (they legitimately define or default these literals):
+      - models.py  — defines the staging_branch_prefixes property and fallback
+      - services.py — defines _DEFAULT_STAGING_PREFIXES constant
+    """
+
+    _ALLOWLIST = {"models.py", "services.py"}
+    _PATTERN = re.compile(r'\.startswith\(["\'](?:research|plan)/')
+
+    def test_no_hardcoded_staging_prefix_startswith(self):
+        """No production module under backend/app/ may call
+        .startswith("research/") or .startswith("plan/") directly.
+
+        If this fails, replace the hardcoded classification with:
+          - project.is_staging_branch(branch)   for boolean checks
+          - project.staging_branch_prefixes       for prefix iteration
+          - get_project_integration_branch(...)   for integration-branch decisions
+        The allowlisted files (models.py, services.py) define these values and
+        may legitimately contain the literals.
+        """
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        offenders: list[str] = []
+        for root, _dirs, files in os.walk(app_dir):
+            for fname in files:
+                if not fname.endswith(".py"):
+                    continue
+                if fname in self._ALLOWLIST:
+                    continue
+                fpath = os.path.join(root, fname)
+                with open(fpath, encoding="utf-8") as f:
+                    for lineno, line in enumerate(f, start=1):
+                        if line.lstrip().startswith("#") or "# noqa" in line:
+                            continue
+                        if self._PATTERN.search(line):
+                            rel = os.path.relpath(fpath, app_dir)
+                            offenders.append(f"  {rel}:{lineno}: {line.rstrip()}")
+        assert not offenders, (
+            "Found hardcoded staging-prefix startswith calls in backend/app/.\n"
+            "Replace with project.is_staging_branch(branch) or\n"
+            "project.staging_branch_prefixes for per-project prefix resolution.\n"
+            "Offenders:\n" + "\n".join(offenders)
+        )
+
+
 # ── Deployment State Model ──────────────────────────────────────────────────
 
 
@@ -806,6 +948,63 @@ class TestAgentRestrictions:
             content = f.read()
         assert "alembic" in content.lower(), (
             "CLAUDE.md must mention alembic as a restricted path"
+        )
+
+
+# ── Agent Router Task-State Cache Invariants ───────────────────────────
+
+
+class TestAgentRouterInvariants:
+    def test_agent_router_only_has_deny_list_task_cache(self):
+        """Enforce that agent.py only keeps _terminated_task_ids as a task-state cache.
+
+        Regression guard for PR #6038 which removed _agent_active_cache. That cache
+        was dead (no longer consulted by verify_agent_token), but its presence as
+        module-level state was a latent footgun: a future agent could mistakenly
+        believe it was load-bearing and gate the DB recheck on it again, silently
+        re-creating the auth bug (deleted/terminal task authorized via stale cache hit).
+
+        This tripwire enforces: the only task-ID-keyed module-level mutable mapping
+        in agent.py is _terminated_task_ids (the deny-list). Any attempt to add back
+        a 'known active tasks' cache will fail this test.
+
+        Suspicious patterns (names hinting at task auth/active state):
+        - _task_*_cache, _*active*, _authorized_*, _agent_*_cache
+        """
+        from app.routers import agent
+
+        # Task-auth-state suspicious name patterns.
+        # These patterns catch attempts to cache active/authorized task state by ID.
+        SUSPICIOUS_PATTERNS = [
+            r"_.*task.*cache",  # _task_cache, _task_auth_cache, etc.
+            r"_.*active.*",  # _active_*, _agent_active_*, etc.
+            r"_authorized.*",  # _authorized_task_ids, etc.
+            r"_agent.*cache",  # _agent_*_cache, etc.
+        ]
+
+        # The only allowed task-state dict
+        ALLOWED = {"_terminated_task_ids"}
+
+        offenders = []
+        for name, obj in agent.__dict__.items():
+            # Only inspect dicts that start with underscore (module-level private state)
+            if not isinstance(obj, dict) or not name.startswith("_"):
+                continue
+
+            # Check if name matches any suspicious pattern (case-insensitive)
+            if any(
+                re.match(pattern, name, re.IGNORECASE)
+                for pattern in SUSPICIOUS_PATTERNS
+            ):
+                if name not in ALLOWED:
+                    offenders.append(name)
+
+        assert not offenders, (
+            f"Task-auth-state cache(s) found in agent.py: {', '.join(offenders)}. "
+            "Only _terminated_task_ids is permitted as a task-ID-keyed dict. "
+            "See PR #6038: dead caches are latent footguns. The DB recheck is the "
+            "authoritative gate — caching 'known active' tasks risks stale "
+            "authorization of deleted/terminal tasks."
         )
 
 
@@ -1030,6 +1229,18 @@ class TestBackendModuleSizeGuardrails:
     def test_pipeline_regression_dispatcher(self):
         self._check_module("pipeline_regression_dispatcher.py")
 
+    def test_review_learning(self):
+        self._check_module("review_learning.py")
+
+    def test_playbook_lifecycle(self):
+        self._check_module("playbook_lifecycle.py")
+
+    def test_playbook_storage(self):
+        self._check_module("playbook_storage.py")
+
+    def test_playbook_auto(self):
+        self._check_module("playbook_auto.py")
+
 
 # ── Frontend File Size Guardrails ─────────────────────────────────────────────
 
@@ -1221,6 +1432,52 @@ class TestFrontendSizeGuardrails:
         self._check_frontend("components/TaskDurationWidget.tsx")
 
 
+# ── LLM Token Pricing Coverage ──────────────────────────────────────────────
+
+
+class TestLLMTokenPricingCoverage:
+    """Verify that every selectable LLM model has a pricing entry.
+
+    Selectable models are those advertised in each provider's settings_schema
+    model enum plus the values returned by tier_to_model() for each tier
+    (opus, sonnet, haiku with empty runtime_config).
+
+    This test guards against silent drift: when a provider adds/rotates a model,
+    operators can select it immediately, but if it's missing from LLM_TOKEN_PRICING,
+    tasks run on it contribute $0 to LLM cost and are flagged `priced: false` in
+    the cost breakdown — drifting the efficiency axes silently until the pricing
+    table is updated.
+    """
+
+    def test_all_selectable_models_have_pricing(self):
+        """Every model in get_all_selectable_models() must have an entry in
+        LLM_TOKEN_PRICING, keyed by (provider_name_lower, model_lower).
+        """
+        from app.efficiency_snapshot import LLM_TOKEN_PRICING
+        from app.providers.registry import get_all_selectable_models
+
+        selectable = get_all_selectable_models()
+        # selectable is {provider_name_str: frozenset[model_str]}
+
+        priced_keys = set(LLM_TOKEN_PRICING.keys())
+        missing = []
+
+        for provider_name, models in selectable.items():
+            for model in models:
+                key = (provider_name.lower(), model.lower())
+                if key not in priced_keys:
+                    missing.append(f"{provider_name}:{model}")
+
+        assert not missing, (
+            "Selectable models missing from LLM_TOKEN_PRICING:\n  "
+            + "\n  ".join(sorted(missing))
+            + "\n\nAdd entries to LLM_TOKEN_PRICING in backend/app/efficiency_snapshot.py "
+            "for each missing (provider, model) combo. Source rates from official "
+            "provider pricing pages; preview/beta models without published rates "
+            "should be priced at the closest GA-tier equivalent with a clarifying comment."
+        )
+
+
 # ── Failure Classification Taxonomy ────────────────────────────────────────
 
 
@@ -1293,9 +1550,12 @@ class TestFailureClassificationInvariants:
 
 # ── Prompt Vocabulary Parity ───────────────────────────────────────────────
 
-# MUST stay in sync with the bullet list under '## Required: self-review before `./done`'
-# in agent/src/prompt.ts (CODE_CHANGE_HELPER_GUIDANCE). Mirrored in backend for
-# invariant testing.
+# Always-on CI mirror of the SR category bullet list in agent/src/prompt.ts
+# (between SR_CATEGORIES_START / SR_CATEGORIES_END sentinels). This frozenset
+# is the source of truth used by CI (where prompt.ts is not in the Docker build
+# context). Keep it in sync with both:
+#   - the bullet list in agent/src/prompt.ts (SR_CATEGORIES_START/END region)
+#   - _REVIEW_CATEGORIES in backend/app/playbook_learning.py (excluding "other")
 AGENT_SELF_REVIEW_CATEGORIES = frozenset(
     {
         "correctness",
@@ -1314,29 +1574,356 @@ AGENT_SELF_REVIEW_CATEGORIES = frozenset(
 )
 
 
+def _resolve_prompt_ts_path() -> "str | None":
+    """Locate ``agent/src/prompt.ts`` across local + Docker test environments.
+
+    Search order:
+      1. ``AGENT_PROMPT_TS`` env override (caller-supplied path).
+      2. ``/agent/src/prompt.ts`` (Docker volume-mount target used by
+         ``scripts/test-backend.sh``).
+      3. Host filesystem at ``../../agent/src/prompt.ts`` from this test file
+         (``backend/testing/`` → repo root).
+
+    Returns the first existing path or ``None`` if none resolve.
+    """
+    env_override = os.getenv("AGENT_PROMPT_TS")
+    candidates = []
+    if env_override:
+        candidates.append(env_override)
+    candidates.append("/agent/src/prompt.ts")
+    candidates.append(
+        os.path.normpath(
+            os.path.join(
+                os.path.dirname(__file__), "..", "..", "agent", "src", "prompt.ts"
+            )
+        )
+    )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _parse_sr_categories_from_prompt(prompt_text: str) -> "frozenset[str]":
+    """Extract SR category IDs from the SR_CATEGORIES_START/END sentinel region.
+
+    The category bullet list in prompt.ts lives inside a TypeScript template
+    literal so backticks are escaped as \\` in the raw file. The regex matches
+    ``- \\`<id>\\``` to extract each ID.
+    """
+    start = prompt_text.find("SR_CATEGORIES_START")
+    end = prompt_text.find("SR_CATEGORIES_END", start + 1 if start != -1 else 0)
+    if start == -1 or end == -1:
+        raise ValueError(
+            "SR_CATEGORIES_START/END sentinels not found in prompt.ts. "
+            "Ensure the sentinel comments wrap the SR category bullet list."
+        )
+    region = prompt_text[start:end]
+    # Matches both escaped-backtick form (\`id\`, inside TS template literals)
+    # and plain-backtick form (`id`, for fixture strings in tests).
+    return frozenset(re.findall(r"- \\?`([^\\`]+)\\?`", region))
+
+
+def _check_sr_category_parity(
+    agent_cats: "frozenset[str]", backend_cats: "frozenset[str]"
+) -> "list[str]":
+    """Return directional mismatch messages; empty list means exact equality."""
+    messages = []
+    missing_from_backend = agent_cats - backend_cats
+    if missing_from_backend:
+        messages.append(
+            f"Categories in agent prompt but missing from backend _REVIEW_CATEGORIES: "
+            f"{sorted(missing_from_backend)}. "
+            f"Add them to _REVIEW_CATEGORIES in backend/app/playbook_learning.py."
+        )
+    missing_from_agent = backend_cats - agent_cats
+    if missing_from_agent:
+        messages.append(
+            f"Categories in backend _REVIEW_CATEGORIES but missing from agent prompt: "
+            f"{sorted(missing_from_agent)}. "
+            f"Add them to the SR category bullet list in agent/src/prompt.ts "
+            f"(between SR_CATEGORIES_START / SR_CATEGORIES_END sentinels) "
+            f"and to AGENT_SELF_REVIEW_CATEGORIES in backend/testing/test_invariants.py."
+        )
+    return messages
+
+
 class TestPromptVocabularyParity:
     """Cross-check that agent self-review categories and backend categorizer
-    stay in sync. A PR that adds a new category to the agent prompt but forgets
-    to teach the backend categorizer about it will fail this test.
+    stay in sync. A PR that adds or removes a category on one side without
+    updating the other will fail these tests.
     """
 
     def test_agent_categories_in_backend_vocabulary(self):
-        """Agent self-review categories must be a subset of backend review vocabulary.
+        """Agent self-review categories must exactly equal the backend review vocabulary.
 
-        If this fails: a category was added to agent/src/prompt.ts (in CODE_CHANGE_HELPER_GUIDANCE,
-        under the '## Required: self-review' bullet list) but not to backend/app/playbook_learning.py
-        (_REVIEW_CATEGORIES dict). Add the missing category to _REVIEW_CATEGORIES with its keyword list.
+        AGENT_SELF_REVIEW_CATEGORIES (this file) is the always-on CI mirror.
+        It must bidirectionally equal set(_REVIEW_CATEGORIES.keys()) — 'other' is
+        a backend-only residual catch-all and is exempt from parity.
+
+        If this fails: a category was added or removed on one side without updating
+        the other. Edit AGENT_SELF_REVIEW_CATEGORIES here AND either:
+          - backend/app/playbook_learning.py (_REVIEW_CATEGORIES) for backend-side changes
+          - agent/src/prompt.ts (SR_CATEGORIES_START/END region) for agent-side changes
         """
         from app.playbook_learning import _REVIEW_CATEGORIES
 
-        _valid_categories = set(_REVIEW_CATEGORIES.keys()) | {"other"}
+        backend_cats = frozenset(_REVIEW_CATEGORIES.keys()) - {"other"}
+        issues = _check_sr_category_parity(AGENT_SELF_REVIEW_CATEGORIES, backend_cats)
+        assert not issues, "\n".join(issues)
 
-        missing = AGENT_SELF_REVIEW_CATEGORIES - _valid_categories
-        assert not missing, (
-            f"Agent self-review categories missing from backend categorizer: {sorted(missing)}. "
-            f"Add them to _REVIEW_CATEGORIES in backend/app/playbook_learning.py "
-            f"and to the agent bullet list in agent/src/prompt.ts (CODE_CHANGE_HELPER_GUIDANCE)."
+    def test_agent_categories_match_prompt_source(self):
+        """Parsed prompt.ts categories must exactly match AGENT_SELF_REVIEW_CATEGORIES.
+
+        Skipped when agent/src/prompt.ts is not available (e.g. CI Docker context
+        which builds from ./backend only). Locally and with the agent/src mount from
+        scripts/test-backend.sh this check fires and prevents the mirror from drifting.
+
+        If this fails: the SR category bullet list in agent/src/prompt.ts differs from
+        AGENT_SELF_REVIEW_CATEGORIES in this file. Update AGENT_SELF_REVIEW_CATEGORIES
+        to match the authoritative prompt source (or vice versa).
+        """
+        prompt_path = _resolve_prompt_ts_path()
+        if prompt_path is None:
+            pytest.skip(
+                "agent/src/prompt.ts not available in this test environment "
+                "(CI docker context is ./backend; run locally or via "
+                "scripts/test-backend.sh from a checkout for enforcement)"
+            )
+        with open(prompt_path) as f:
+            prompt_text = f.read()
+        parsed_cats = _parse_sr_categories_from_prompt(prompt_text)
+        issues = _check_sr_category_parity(AGENT_SELF_REVIEW_CATEGORIES, parsed_cats)
+        assert not issues, (
+            "AGENT_SELF_REVIEW_CATEGORIES mirror has drifted from agent/src/prompt.ts:\n"
+            + "\n".join(issues)
         )
+
+
+class TestSrCategoryParityHelper:
+    """Unit tests demonstrating both failure directions of the parity helper.
+
+    These tests drive synthetic mismatched sets — they do NOT mutate the real
+    prompt.ts or backend _REVIEW_CATEGORIES dict.
+    """
+
+    def test_catches_category_in_backend_not_in_agent(self):
+        """A category present in the backend vocab but absent from the agent set is flagged."""
+        agent_cats = frozenset({"correctness", "security"})
+        backend_cats = frozenset({"correctness", "security", "extra-backend-only"})
+        issues = _check_sr_category_parity(agent_cats, backend_cats)
+        assert len(issues) == 1
+        assert "extra-backend-only" in issues[0]
+        assert "missing from agent prompt" in issues[0]
+
+    def test_catches_category_in_agent_not_in_backend(self):
+        """A category present in the agent set but absent from the backend vocab is flagged."""
+        agent_cats = frozenset({"correctness", "security", "extra-agent-only"})
+        backend_cats = frozenset({"correctness", "security"})
+        issues = _check_sr_category_parity(agent_cats, backend_cats)
+        assert len(issues) == 1
+        assert "extra-agent-only" in issues[0]
+        assert "missing from backend" in issues[0]
+
+    def test_passes_on_exact_match(self):
+        """Exact match between agent and backend category sets returns no issues."""
+        cats = frozenset({"correctness", "security", "error-handling"})
+        assert _check_sr_category_parity(cats, cats) == []
+
+    def test_parse_from_prompt_pinning_drift(self):
+        """When parsed-from-prompt set differs from mirror, the pinning check fails."""
+        fake_prompt = (
+            "<!-- SR_CATEGORIES_START -->\n"
+            "- `correctness` — logic bugs\n"
+            "- `not-in-mirror` — a fabricated category\n"
+            "<!-- SR_CATEGORIES_END -->\n"
+        )
+        parsed = _parse_sr_categories_from_prompt(fake_prompt)
+        assert parsed == frozenset({"correctness", "not-in-mirror"})
+        real_mirror = frozenset({"correctness", "security"})
+        issues = _check_sr_category_parity(real_mirror, parsed)
+        assert any("not-in-mirror" in msg for msg in issues)
+        assert any("security" in msg for msg in issues)
+
+
+# ── Reviewer-origin set parity (cross-language) ───────────────────────────────
+# The agent (agent/src/handlers/standard.ts) stamps an `origin` on every
+# self-review check_results entry. The author's own entries use origin "sr" (and
+# edges use "author"); every OTHER origin is a fresh-reviewer/recovery save. The
+# backend's canonical set of non-author origins is _REVIEWER_ORIGINS in
+# backend/app/sr_blind_spots.py — catch-rate attribution buckets these as
+# reviewer saves, never author SR hits. If a future agent-side origin is added
+# without updating _REVIEWER_ORIGINS, catches would silently be miscounted as
+# author self-review hits; this test fails to prevent that drift.
+
+# Author-side origins emitted by standard.ts that must be EXCLUDED from the
+# reviewer-origin set.
+AGENT_AUTHOR_ORIGINS = frozenset({"sr", "author"})
+
+
+def _resolve_standard_ts_path() -> "str | None":
+    """Locate ``agent/src/handlers/standard.ts`` across test environments.
+
+    Search order mirrors _resolve_prompt_ts_path: env override, the Docker
+    volume-mount target, then the host filesystem relative to this test file.
+    Returns the first existing path or ``None`` if none resolve.
+    """
+    env_override = os.getenv("AGENT_STANDARD_TS")
+    candidates = []
+    if env_override:
+        candidates.append(env_override)
+    candidates.append("/agent/src/handlers/standard.ts")
+    candidates.append(
+        os.path.normpath(
+            os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "..",
+                "agent",
+                "src",
+                "handlers",
+                "standard.ts",
+            )
+        )
+    )
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _parse_origin_literals_from_standard(source_text: str) -> "frozenset[str]":
+    """Extract every ``origin`` string literal assigned in standard.ts.
+
+    Matches both ``entry.origin = 'x'`` / ``sr.reviewer_recovery_origin = 'x'``
+    and object-literal ``origin: 'x'`` forms. Comment lines reuse the same
+    literals so including them does not change the resulting set.
+    """
+    return frozenset(re.findall(r"origin\s*[:=]\s*'([^']+)'", source_text))
+
+
+class TestReviewerOriginParity:
+    """Pin the backend canonical reviewer-origin set to the exact set of
+    non-author origins the agent stamps in standard.ts. Guards against silent
+    drift back into miscounting recovery catches as author self-review hits.
+    """
+
+    def test_reviewer_origins_is_single_canonical_set(self):
+        """playbook_learning must reference the same frozenset as sr_blind_spots.
+
+        The two membership sets used to diverge (one omitted lone_checker_recovery,
+        the other operator_requested_recovery). They are now one canonical object.
+        """
+        from app.sr_blind_spots import _REVIEWER_ORIGINS as canonical
+        from app.playbook_learning import _REVIEWER_ORIGINS as via_playbook
+
+        assert via_playbook is canonical
+
+    def test_reviewer_origins_matches_expected_five(self):
+        """The canonical set is exactly the five non-author origins."""
+        from app.sr_blind_spots import _REVIEWER_ORIGINS
+
+        assert _REVIEWER_ORIGINS == frozenset(
+            {
+                "reviewer",
+                "reviewer_disagreement",
+                "reviewer_recovery_after_incomplete_sr",
+                "lone_checker_recovery",
+                "operator_requested_recovery",
+            }
+        )
+
+    def test_reviewer_origins_match_agent_source(self):
+        """Parsed standard.ts origins minus author origins must equal _REVIEWER_ORIGINS.
+
+        Skipped when agent/src/handlers/standard.ts is not available (CI Docker
+        context builds from ./backend only). Locally and via scripts/test-backend.sh
+        (which mounts agent/src) this fires and prevents drift.
+
+        If this fails: standard.ts emits a non-author origin that is not in
+        _REVIEWER_ORIGINS (backend/app/sr_blind_spots.py), or vice versa. Catches
+        with the missing origin would be misattributed to the author's self-review.
+        """
+        standard_path = _resolve_standard_ts_path()
+        if standard_path is None:
+            pytest.skip(
+                "agent/src/handlers/standard.ts not available in this test "
+                "environment (CI docker context is ./backend; run locally or via "
+                "scripts/test-backend.sh from a checkout for enforcement)"
+            )
+        from app.sr_blind_spots import _REVIEWER_ORIGINS
+
+        with open(standard_path) as f:
+            source_text = f.read()
+        all_origins = _parse_origin_literals_from_standard(source_text)
+        # Sanity: the author origins we subtract must actually appear in the source.
+        assert AGENT_AUTHOR_ORIGINS <= all_origins, (
+            "Expected author origins {sr, author} not found in standard.ts — "
+            "the origin-tagging block may have moved or been renamed."
+        )
+        agent_reviewer_origins = all_origins - AGENT_AUTHOR_ORIGINS
+        assert agent_reviewer_origins == _REVIEWER_ORIGINS, (
+            "Reviewer-origin set drift between agent and backend:\n"
+            f"  in standard.ts but not _REVIEWER_ORIGINS: "
+            f"{sorted(agent_reviewer_origins - _REVIEWER_ORIGINS)}\n"
+            f"  in _REVIEWER_ORIGINS but not standard.ts: "
+            f"{sorted(_REVIEWER_ORIGINS - agent_reviewer_origins)}\n"
+            "Update _REVIEWER_ORIGINS in backend/app/sr_blind_spots.py to match "
+            "the non-author origins emitted by standard.ts."
+        )
+
+
+# ── Playbook-Learning Facade Compatibility ────────────────────────────────────
+# After the playbook-learning split, key symbols moved to sub-modules
+# (review_learning, playbook_lifecycle, playbook_storage, playbook_auto).
+# playbook_learning re-exports them so existing callers keep working.
+# These tests lock the re-export surface so future agents cannot drop
+# compatibility symbols without a CI failure.
+
+
+class TestPlaybookLearningFacadeCompat:
+    def test_review_categories_is_canonical_object(self):
+        """playbook_learning._REVIEW_CATEGORIES must be the same object as
+        review_learning._REVIEW_CATEGORIES — not a local copy.
+
+        Guards against the facade shadowing the canonical dict, which would
+        cause category-taxonomy drift between the SR categorizer and parity checks.
+        """
+        from app.playbook_learning import _REVIEW_CATEGORIES as via_facade
+        from app.review_learning import _REVIEW_CATEGORIES as canonical
+
+        assert via_facade is canonical, (
+            "playbook_learning._REVIEW_CATEGORIES is not the same object as "
+            "review_learning._REVIEW_CATEGORIES. The facade must re-export the "
+            "canonical dict (not shadow it) to keep taxonomy in sync."
+        )
+
+    def test_compat_lifecycle_and_storage_symbols_accessible(self):
+        """Key lifecycle and storage symbols extracted from the playbook-learning
+        monolith must remain importable through app.playbook_learning.
+
+        If this fails: a backward-compat re-export was dropped. Either restore
+        the import in playbook_learning.py or update every caller that used it.
+        """
+        from app.playbook_learning import (
+            _AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS,
+            _IDLE_RETIRE_DAYS,
+            _PLAYBOOK_CAPACITY_BYTES,
+            _STALE_AGE_DAYS,
+            check_and_flag_stale_refs,
+            finalize_pending_playbook_entries,
+            retire_idle_auto_entries,
+            retire_ineffective_patterns,
+        )
+
+        assert _AUTO_PLAYBOOK_RESURRECTION_COOLDOWN_DAYS > 0
+        assert _IDLE_RETIRE_DAYS > 0
+        assert _STALE_AGE_DAYS > 0
+        assert _PLAYBOOK_CAPACITY_BYTES > 0
+        assert callable(check_and_flag_stale_refs)
+        assert callable(finalize_pending_playbook_entries)
+        assert callable(retire_idle_auto_entries)
+        assert callable(retire_ineffective_patterns)
 
 
 # ── edges_considered Schema Invariants ────────────────────────────────────────
@@ -1752,3 +2339,832 @@ class TestReviewerDisagreementSeverityInvariants:
         )
         assert isinstance(item["severity_breakdown"], dict)
         assert item["max_severity"] == "CRITICAL"
+
+
+# ── Design-Doc Lock Invariant ─────────────────────────────────────────────────
+
+_LOCK_BASELINE_JSON = os.path.join(
+    os.path.dirname(__file__), "lock_assignment_baseline.json"
+)
+
+
+def _load_lock_baseline() -> dict:
+    import json
+
+    with open(_LOCK_BASELINE_JSON) as f:
+        return json.load(f)
+
+
+_LOCK_BASELINE = _load_lock_baseline()
+
+
+def _ast_count_attr_assignments(app_dir: str, attr_name: str) -> dict[str, int]:
+    """Return per-file counts of AST-level attribute assignments for attr_name.
+
+    Parses each backend/app/**/*.py file with ast.parse and counts ast.Assign /
+    ast.AugAssign nodes whose target (or any element of a tuple target) is an
+    ast.Attribute with .attr == attr_name.  Receiver name is ignored so aliases
+    like proj / p / _proj are all caught.  Assignments inside docstrings,
+    comments, or string literals are naturally excluded by the AST.
+    """
+    import ast
+    import glob as globmod
+
+    counts: dict[str, int] = {}
+    for py_file in globmod.glob(os.path.join(app_dir, "**", "*.py"), recursive=True):
+        with open(py_file) as fh:
+            source = fh.read()
+        try:
+            tree = ast.parse(source, filename=py_file)
+        except SyntaxError:
+            continue
+        count = 0
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AugAssign)):
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                for target in targets:
+                    for t in ast.walk(target):
+                        if isinstance(t, ast.Attribute) and t.attr == attr_name:
+                            count += 1
+        if count > 0:
+            rel = os.path.relpath(py_file, app_dir)
+            counts[rel] = count
+    return counts
+
+
+def _file_contains_lock_pattern(file_path: str, patterns: list[str]) -> bool:
+    """Check if a file contains at least one of the given lock-acquisition patterns.
+
+    Uses simple substring matching (not AST) to keep checks conservative and fast.
+    Returns True if any pattern is found, False otherwise.
+    """
+    try:
+        with open(file_path) as f:
+            source = f.read()
+    except (IOError, OSError):
+        return False
+
+    return any(pattern in source for pattern in patterns)
+
+
+def _check_lock_invariant(attr_name: str, baseline_key: str, helper_name: str) -> None:
+    """Shared implementation for all three column-lock invariant tests."""
+    app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+    baseline: dict[str, int] = _LOCK_BASELINE[baseline_key]
+    file_counts = _ast_count_attr_assignments(app_dir, attr_name)
+
+    violations: list[str] = []
+    for rel, count in sorted(file_counts.items()):
+        allowed = baseline.get(rel, 0)
+        if count > allowed:
+            violations.append(f"  {rel}: {count} assignments (baseline: {allowed})")
+
+    assert not violations, (
+        f"project.{attr_name} assignment counts exceed their per-file baseline:\n"
+        + "\n".join(violations)
+        + f"\n\nRoute new {attr_name} writes through {helper_name}() "
+        "(task_locking.py). Counts may only be lowered (after migrating a site "
+        "to the canonical helper), never raised. To record a legitimate decrease, "
+        "lower the count in backend/testing/lock_assignment_baseline.json. "
+        "Do NOT increase counts — that widens the tripwire hole."
+    )
+
+
+class TestDesignDocLockInvariant:
+    """Tripwire: direct <var>.design_doc attribute assignments must not increase
+    above their per-file baseline recorded in lock_assignment_baseline.json.
+
+    Uses AST-based scanning so docstrings, comments, and string literals are
+    excluded from the count (unlike a regex scan which would match them).
+
+    The baseline is a ratchet — counts may only decrease as write sites are
+    migrated to with_design_doc_locked() (task_locking.py). Adding a new
+    assignment to any file (even an already-allowlisted one) raises the count
+    above its baseline and fails this test.
+
+    To migrate a site: route it through with_design_doc_locked() and lower
+    the count in lock_assignment_baseline.json. Remove the entry when count
+    reaches 0.
+    """
+
+    def test_no_new_unlocked_design_doc_writes(self):
+        _check_lock_invariant("design_doc", "design_doc", "with_design_doc_locked")
+
+
+# ── Directions Lock Invariant ─────────────────────────────────────────────────
+
+
+class TestDirectionsLockInvariant:
+    """Tripwire: direct <var>.directions attribute assignments must not increase
+    above their per-file baseline recorded in lock_assignment_baseline.json.
+
+    Uses AST-based scanning (receiver-name-agnostic: matches any receiver so
+    aliases like proj / p / _proj are all caught).  Assignments inside
+    docstrings, comments, or string literals are naturally excluded.
+
+    The baseline is a ratchet — counts may only decrease as write sites are
+    migrated to with_directions_locked() (task_locking.py). Adding a new
+    assignment to any file (even an already-baselined one) raises the count
+    above its baseline and fails this test.
+
+    To migrate a site: route it through with_directions_locked() and lower
+    the count in lock_assignment_baseline.json. Remove the entry when count
+    reaches 0.
+    """
+
+    def test_no_new_unlocked_directions_writes(self):
+        _check_lock_invariant("directions", "directions", "with_directions_locked")
+
+
+class TestDirectionsLockAssignmentGuard:
+    """Positive ratchet: files with non-zero .directions assignments must be
+    wrapped in a project-row-lock acquisition site.
+
+    Complements TestDirectionsLockInvariant (negative ratchet). That test catches
+    NEW direct assignments. This test ensures EXISTING assignments have a surrounding
+    lock — if the lock is removed without migrating the write to with_directions_locked(),
+    this test fails.
+
+    Recognized lock acquisition sites:
+      - with_for_update(...) on Project (or alias)
+      - project_lock(...)
+      - lock_project_or_429(...) or _lock_project_or_429(...)
+      - with_directions_locked(...)
+
+    Failure message suggests either migrating to with_directions_locked or
+    restoring the surrounding lock call.
+    """
+
+    # Recognized patterns that indicate a file has a project-row lock.
+    # Substring matching is sufficient (conservative approach).
+    _LOCK_PATTERNS = [
+        "with_for_update(",
+        "project_lock(",
+        "lock_project_or_429(",
+        "with_directions_locked(",
+    ]
+
+    def test_directions_writes_guarded_by_locks(self):
+        """Every file with .directions writes must contain at least one lock acquisition."""
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        baseline: dict[str, int] = _LOCK_BASELINE.get("directions", {})
+
+        violations: list[str] = []
+        for rel_path, count in sorted(baseline.items()):
+            if count <= 0:
+                continue
+
+            file_path = os.path.join(app_dir, rel_path)
+            if not _file_contains_lock_pattern(file_path, self._LOCK_PATTERNS):
+                violations.append(
+                    f"  {rel_path}: {count} direct assignment(s), no lock guard found"
+                )
+
+        assert not violations, (
+            "Files with .directions assignments lack lock acquisition guards:\n"
+            + "\n".join(violations)
+            + "\n\nEach file must contain at least one of these lock-acquisition patterns:\n"
+            + "\n".join(f"  - {p}" for p in self._LOCK_PATTERNS)
+            + "\n\nEither:\n"
+            "  (a) Migrate the write to with_directions_locked() (in task_locking.py) and "
+            "lower the count in lock_assignment_baseline.json, or\n"
+            "  (b) Restore the surrounding project_lock / with_for_update / "
+            "lock_project_or_429 call that was accidentally removed."
+        )
+
+
+class TestResearchCompletionDirectionsLocked:
+    """Positive ratchet: research_completion.py must keep its direction writes routed
+    through with_directions_locked.
+
+    Complements TestDirectionsLockInvariant (which is a *negative* ratchet — catches
+    new direct .directions = assignments).  This positive ratchet catches the mirror
+    failure: a with_directions_locked call site is removed without being replaced by
+    another locked call, so the operation silently disappears rather than blowing up.
+
+    _EXPECTED_MIN_CALLS is set to 5 (the five sites migrated in PR #5704).  It must
+    not decrease.  If a call site is removed, either add a replacement locked call or
+    lower this constant in the same PR with an explanation.
+    """
+
+    _EXPECTED_MIN_CALLS = 5
+
+    def test_research_completion_locked_call_count(self):
+        """research_completion.py must have at least 5 with_directions_locked call sites."""
+        import ast
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        rc_path = os.path.join(app_dir, "research_completion.py")
+        with open(rc_path) as f:
+            source = f.read()
+        tree = ast.parse(source, filename=rc_path)
+        call_count = sum(
+            1
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "with_directions_locked"
+        )
+        assert call_count >= self._EXPECTED_MIN_CALLS, (
+            f"research_completion.py has only {call_count} call(s) to "
+            f"with_directions_locked (expected >= {self._EXPECTED_MIN_CALLS}). "
+            "All five migrated direction-write sites must remain routed through the "
+            "canonical locked helper — do not remove calls without replacing them "
+            "or lowering _EXPECTED_MIN_CALLS with an explanation."
+        )
+
+
+class TestRuntimeConfigProjectBranchBypasses:
+    _ALLOWED_FILES = frozenset(
+        {"shared_state.py", "routers/admin_settings.py", "routers/agent_status.py"}
+    )
+    _KEYS = ("integration_branch", "promotion_target", "task_branch_namespace")
+
+    def test_no_new_direct_project_branch_runtime_config_reads(self):
+        import ast
+        import glob as globmod
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        violations: list[str] = []
+
+        for py_file in globmod.glob(
+            os.path.join(app_dir, "**", "*.py"), recursive=True
+        ):
+            rel = os.path.relpath(py_file, app_dir)
+            if rel in self._ALLOWED_FILES:
+                continue
+            with open(py_file) as fh:
+                source = fh.read()
+            try:
+                tree = ast.parse(source, filename=py_file)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if not (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "get"
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "_runtime_config"
+                ):
+                    continue
+                if (
+                    node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value in self._KEYS
+                ):
+                    violations.append(f"  {rel}:{node.lineno}:{node.args[0].value}")
+
+        assert not violations, (
+            "Direct _runtime_config.get(...) project-branch reads found outside the allowlist:\n"
+            + "\n".join(violations)
+        )
+
+
+# ── Vision Lock Invariant ─────────────────────────────────────────────────────
+
+
+class TestBasebranchMainFallbackInvariant:
+    """Tripwire: spawn/recovery paths must not hardcode 'main' as the base_branch
+    fallback. Use shared_state.get_project_integration_branch(project) instead.
+
+    Scans the specific spawn/recovery modules whose hardcoded 'main' fallbacks were
+    routed through get_project_integration_branch() in clusters 1–12 of the
+    per-project base_branch fix.  If this test fails, the regression-prone pattern
+    payload.get("base_branch", "main") was reintroduced in one of these files.
+
+    To guard a newly-fixed file, add its relative path to _SPAWN_RECOVERY_MODULES.
+    To register a site that is legitimately global-config (not per-project), add it
+    to _ALLOWED_FILES instead — but only for true global-config defaults, not for
+    unfixed bugs.
+    """
+
+    # Files fixed by clusters 1-12; scanned for the regression-prone pattern.
+    _SPAWN_RECOVERY_MODULES = frozenset(
+        {
+            "anomaly_detection.py",
+            "lifecycle.py",
+            "services.py",
+            "rollup_management.py",
+            "task_lifecycle.py",
+            "task_completion.py",
+            "research_completion.py",
+            "plan_completion.py",
+            "issue_implementation.py",
+            "routers/agent_status.py",
+            "reaper.py",
+        }
+    )
+
+    # Files exempted because they use a global-config default that is intentional
+    # (not a per-project bypass).  Do not add unfixed-bug files here.
+    _ALLOWED_FILES: frozenset[str] = frozenset()
+
+    def test_no_hardcoded_main_base_branch_fallback(self):
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        violations: list[str] = []
+
+        for rel in sorted(self._SPAWN_RECOVERY_MODULES - self._ALLOWED_FILES):
+            py_file = os.path.join(app_dir, rel)
+            if not os.path.exists(py_file):
+                continue
+            with open(py_file) as fh:
+                for lineno, line in enumerate(fh, 1):
+                    stripped = line.strip()
+                    if stripped.startswith("#"):
+                        continue
+                    if (
+                        '"base_branch", "main"' in line
+                        or "'base_branch', 'main'" in line
+                    ):
+                        violations.append(f"  {rel}:{lineno}: {stripped}")
+
+        assert not violations, (
+            "Hardcoded 'main' fallback for base_branch found in fixed spawn/recovery modules:\n"
+            + "\n".join(violations)
+            + "\n\nReplace payload.get('base_branch', 'main') with per-project resolution:\n"
+            "  from app.shared_state import get_project_integration_branch\n"
+            "  base_branch = (payload.get('base_branch')\n"
+            "      or get_project_integration_branch(project))\n"
+            "See shared_state.get_project_integration_branch for the fallback ordering."
+        )
+
+
+class TestVisionLockInvariant:
+    """Tripwire: direct <var>.vision attribute assignments must not increase
+    above their per-file baseline recorded in lock_assignment_baseline.json.
+
+    Uses AST-based scanning (receiver-name-agnostic: matches any receiver so
+    aliases like proj / p / _proj are all caught).  Assignments inside
+    docstrings, comments, or string literals are naturally excluded.
+
+    The baseline is a ratchet — counts may only decrease as write sites are
+    migrated to with_vision_locked() (task_locking.py). Adding a new
+    assignment to any file (even an already-baselined one) raises the count
+    above its baseline and fails this test.
+
+    To migrate a site: route it through with_vision_locked() and lower
+    the count in lock_assignment_baseline.json. Remove the entry when count
+    reaches 0.
+    """
+
+    def test_no_new_unlocked_vision_writes(self):
+        _check_lock_invariant("vision", "vision", "with_vision_locked")
+
+
+# ── Behind-Recovery update_branch Guard ──────────────────────────────────────
+
+
+class TestBehindRecoveryUpdateBranchGuard:
+    """Tripwire: every behind-recovery caller of ``update_branch`` /
+    ``update_branch_with_sha_retry`` (from ``app.github``) must consult the
+    behind-base detector ``pr_is_not_behind`` first.
+
+    Motivation
+    ----------
+    ``pr_is_not_behind`` (defined in ``backend/app/github.py``) lets callers
+    skip an unnecessary GitHub ``update_branch`` write when the PR head is
+    already an ancestor of base, or when ``mergeable_state`` is ``"clean"``.
+    Those writes are not free — they round-trip GitHub, trigger fresh CI, and
+    burn behind-retry budget on PRs that don't need rebasing.
+
+    The pattern was wired into three sites already (one in
+    ``ci_completion.py``, two in ``rollup_management.py``) and is being added
+    to the orchestrator's CI polling site (``backend/app/orchestrator.py``)
+    in a parallel task. This ratchet exists so a future contributor cannot
+    add a new ``update_branch_with_sha_retry`` caller in a behind-recovery
+    context without also wiring the ``pr_is_not_behind`` short-circuit.
+
+    How it works
+    ------------
+    The test walks every ``.py`` file under ``backend/app/`` with ``ast.parse``
+    (skipping ``app/github.py`` itself, which defines both the helper and the
+    short-circuit), finds every ``ast.Call`` whose callee resolves to
+    ``update_branch`` or ``update_branch_with_sha_retry`` (matched by name as
+    ``ast.Name`` or as the attribute of an ``ast.Attribute``, so
+    ``github.update_branch(...)`` is also caught), identifies the smallest
+    enclosing function via a parent map, and asserts that ``pr_is_not_behind``
+    appears as a ``Name`` or ``Attribute`` somewhere in that function's body
+    (excluding nested function scopes). For module-scope calls with no
+    enclosing function, the test falls back to a ±50-line window scan of the
+    source file.
+
+    Allowlisting a non-behind-recovery caller
+    -----------------------------------------
+    If a caller of ``update_branch`` / ``update_branch_with_sha_retry`` is
+    genuinely NOT in a behind-recovery context (e.g. a maintenance script
+    that always wants to rebase regardless of ancestor state, or a test
+    scaffold that mocks the helper), add a ``"<relative_path>:<function>"``
+    entry to ``_ALLOWLIST`` with a comment explaining why the call is not a
+    behind-recovery write. Default behavior is "every call must be guarded";
+    use the allowlist sparingly.
+
+    Pending-fix entries
+    -------------------
+    ``_PENDING_GUARDS`` is a *temporary* allowlist for known unguarded sites
+    that are being fixed in a parallel PR. Each entry MUST carry a TODO
+    referencing the parallel work. A companion test
+    (``test_pending_guards_are_eventually_resolved``) is marked
+    ``pytest.mark.xfail(strict=True)`` so that once the parallel fix lands —
+    making the pending site actually guarded — the test xpasses, strict
+    failure fires, and the maintainer is forced to remove the corresponding
+    ``_PENDING_GUARDS`` entry in the same change.
+    """
+
+    # callee identifier (final segment, whether ``ast.Name`` or
+    # ``ast.Attribute``) → all of these are GitHub writes that should be
+    # gated by ``pr_is_not_behind`` in any behind-recovery context.
+    _TARGET_CALLEES = frozenset({"update_branch", "update_branch_with_sha_retry"})
+
+    # Explicit guard symbols — referencing ANY of these in the enclosing
+    # function body satisfies the tripwire. ``pr_is_not_behind`` is the
+    # underlying detector; ``pr_is_not_behind_for`` is the convenience
+    # wrapper in ``app/github.py`` that bundles the head_sha extraction +
+    # get_branch_sha fetch boilerplate around it. Either reference is
+    # sufficient evidence that the caller consulted the detector.
+    _GUARD_NAMES = frozenset({"pr_is_not_behind", "pr_is_not_behind_for"})
+
+    # ``app/github.py`` defines both ``update_branch`` and ``pr_is_not_behind``,
+    # and the internal ``update_branch_with_sha_retry -> update_branch`` call
+    # inside that file's helper is by definition not a behind-recovery
+    # caller.  Skip the whole file.
+    _SKIP_FILES = frozenset({"github.py"})
+
+    # ``"<relative_path>:<function_name>"`` entries for callers that are
+    # legitimately NOT behind-recovery writes.  Empty by default — every
+    # entry needs a comment justifying why the caller skips the guard.
+    _ALLOWLIST: frozenset[str] = frozenset()
+
+    # ``"<relative_path>:<function_name>"`` entries for sites currently
+    # being fixed in a parallel PR. Each MUST carry a TODO. The companion
+    # ``test_pending_guards_are_eventually_resolved`` will xpass once the
+    # parallel fix lands, forcing removal of the entry.
+    _PENDING_GUARDS: frozenset[str] = frozenset()
+
+    @staticmethod
+    def _callee_final_name(func):
+        """Return the final identifier of a Call's func, or None if untyped."""
+        import ast
+
+        if isinstance(func, ast.Name):
+            return func.id
+        if isinstance(func, ast.Attribute):
+            return func.attr
+        return None
+
+    @staticmethod
+    def _build_parent_map(tree):
+        """Return id(child) → parent for every node reachable from tree."""
+        import ast
+
+        parents: dict = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[id(child)] = parent
+        return parents
+
+    @classmethod
+    def _enclosing_function(cls, node, parents):
+        """Walk parent chain to find smallest enclosing FunctionDef, or None."""
+        import ast
+
+        cur = parents.get(id(node))
+        while cur is not None:
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return cur
+            cur = parents.get(id(cur))
+        return None
+
+    @classmethod
+    def _function_references_guard(cls, fn) -> bool:
+        """True if the guard symbol is referenced anywhere in fn's body,
+        excluding nested function scopes (each nested function is its own
+        scope and must have its own guard reference)."""
+        import ast
+
+        stack = list(getattr(fn, "body", []) or [])
+        while stack:
+            node = stack.pop()
+            # Skip nested function scopes — they're checked independently if
+            # they contain their own Call to a target.
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if isinstance(node, ast.Name) and node.id in cls._GUARD_NAMES:
+                return True
+            if isinstance(node, ast.Attribute) and node.attr in cls._GUARD_NAMES:
+                return True
+            stack.extend(ast.iter_child_nodes(node))
+        return False
+
+    @classmethod
+    def _module_window_references_guard(
+        cls, source_lines: list[str], lineno: int, window: int = 50
+    ) -> bool:
+        """Fallback for module-scope calls: scan ±window lines for guard."""
+        lo = max(0, lineno - 1 - window)
+        hi = min(len(source_lines), lineno + window)
+        for line in source_lines[lo:hi]:
+            # Strip-and-skip leading comments to mirror the AST's exclusion of
+            # comments (string literals also won't trip this since the guard
+            # name is unambiguous).
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            if any(name in line for name in cls._GUARD_NAMES):
+                return True
+        return False
+
+    @classmethod
+    def _scan_app_tree(cls) -> tuple[list[str], list[tuple[str, str]]]:
+        """Walk ``backend/app/`` and collect (violations, guarded_sites).
+
+        Returns
+        -------
+        violations
+            Human-readable lines describing unguarded callers, suitable for
+            inclusion in an assertion message.
+        guarded_sites
+            ``[(relative_path, function_name), ...]`` for every call site that
+            IS guarded.  Used by the positive-sanity assertion to confirm the
+            known good sites are still detected as guarded.
+        """
+        import ast
+        import glob as globmod
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        violations: list[str] = []
+        guarded_sites: list[tuple[str, str]] = []
+
+        py_files = sorted(
+            globmod.glob(os.path.join(app_dir, "**", "*.py"), recursive=True)
+        )
+        for py_file in py_files:
+            rel = os.path.relpath(py_file, app_dir)
+            if rel in cls._SKIP_FILES:
+                continue
+            try:
+                with open(py_file) as fh:
+                    source = fh.read()
+            except (IOError, OSError):
+                continue
+            try:
+                tree = ast.parse(source, filename=py_file)
+            except SyntaxError:
+                # Skip unparseable files — same conservative posture as
+                # _ast_count_attr_assignments above.
+                print(f"[behind-recovery guard] skipping unparseable: {rel}")
+                continue
+
+            source_lines = source.splitlines()
+            parents = cls._build_parent_map(tree)
+
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                callee = cls._callee_final_name(node.func)
+                if callee not in cls._TARGET_CALLEES:
+                    continue
+
+                fn = cls._enclosing_function(node, parents)
+                fn_name = fn.name if fn is not None else "<module>"
+                allow_key = f"{rel}:{fn_name}"
+
+                if allow_key in cls._ALLOWLIST:
+                    continue
+                if allow_key in cls._PENDING_GUARDS:
+                    # Pending fix — the companion xfail test guards us
+                    # against forgetting to remove this entry.
+                    continue
+
+                if fn is not None:
+                    is_guarded = cls._function_references_guard(fn)
+                else:
+                    is_guarded = cls._module_window_references_guard(
+                        source_lines, node.lineno
+                    )
+
+                if is_guarded:
+                    guarded_sites.append((rel, fn_name))
+                else:
+                    violations.append(
+                        f"New unguarded {callee} call in {rel}:{node.lineno}. "
+                        "Wire pr_is_not_behind first; see "
+                        "backend/app/ci_completion.py:438-468 for the "
+                        "canonical pattern."
+                    )
+
+        return violations, guarded_sites
+
+    def test_no_unguarded_update_branch_callers(self):
+        """Every caller of update_branch / update_branch_with_sha_retry must
+        reference pr_is_not_behind in its enclosing function body."""
+        violations, _guarded = self._scan_app_tree()
+        assert not violations, (
+            "Unguarded behind-recovery update_branch caller(s) detected:\n"
+            + "\n".join(f"  {v}" for v in violations)
+            + "\n\nEach call to update_branch / update_branch_with_sha_retry "
+            "in a behind-recovery context must be preceded by a "
+            "pr_is_not_behind short-circuit. See the docstring on "
+            "TestBehindRecoveryUpdateBranchGuard for how to add an "
+            "_ALLOWLIST entry if the caller is genuinely not behind-recovery."
+        )
+
+    def test_known_guarded_sites_are_detected(self):
+        """Positive sanity: the three currently-wired guarded sites must be
+        detected as guarded. If this assertion fails, the AST walk is broken
+        and the negative ratchet above would silently pass on regressions.
+
+        Once the parallel orchestrator fix lands and
+        ``orchestrator.py:orchestrator_worker`` is removed from
+        ``_PENDING_GUARDS``, it must also appear in this guarded set —
+        update the expected list at that time (the existing ratchet
+        ``test_pending_guards_are_eventually_resolved`` will fire to remind
+        the maintainer).
+        """
+        _violations, guarded = self._scan_app_tree()
+        guarded_keys = {f"{rel}:{fn}" for rel, fn in guarded}
+
+        # We expect at minimum these three currently-wired sites. Each
+        # appears once per Call site, so we use a containment check rather
+        # than equality (the same enclosing function may host multiple
+        # update_branch calls, all of which collapse to the same key).
+        expected_subset = {
+            # Single guarded call in ci_completion.py inside the CI merge
+            # finalization function.
+            "ci_completion.py",
+            # Single guarded call in rollup_management.py (post-merge ancestor
+            # check). The pre-merge SHA-mismatch check was removed in PR #6188
+            # as part of dropping the redundant pre-merge behind path.
+            "rollup_management.py",
+            # Guarded call in orchestrator.py inside orchestrator_worker for
+            # the CI polling behind path.
+            "orchestrator.py",
+        }
+        guarded_files = {rel for rel, _fn in guarded}
+        missing = expected_subset - guarded_files
+        assert not missing, (
+            "Positive-sanity check failed — the AST walk did not detect "
+            "known-guarded sites in: " + ", ".join(sorted(missing)) + ".\n"
+            "guarded_keys=" + ", ".join(sorted(guarded_keys))
+        )
+
+        # At least three guarded call sites must be present (1 in
+        # ci_completion + 1 in rollup_management + 1 in orchestrator).
+        assert len(guarded) >= 3, (
+            f"Expected at least 3 guarded update_branch sites, "
+            f"detected {len(guarded)}: {guarded}"
+        )
+
+    def test_pending_guards_are_eventually_resolved(self):
+        """Strict-xfail tripwire that flips once every site in
+        ``_PENDING_GUARDS`` becomes actually guarded in source.
+
+        For each ``"<rel>:<fn>"`` pending entry, this test parses the file,
+        finds the named function, and asserts that ``pr_is_not_behind`` is
+        referenced inside it. While the parallel fix is in flight, the
+        assertion fails (expected). The instant the fix lands the assertion
+        passes — strict xfail then fails the build, forcing the maintainer
+        to remove both the xfail mark and the corresponding
+        ``_PENDING_GUARDS`` entry in the same change.
+        """
+        import ast
+
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        unresolved: list[str] = []
+        for entry in sorted(self._PENDING_GUARDS):
+            rel, _, fn_name = entry.partition(":")
+            py_file = os.path.join(app_dir, rel)
+            with open(py_file) as fh:
+                source = fh.read()
+            tree = ast.parse(source, filename=py_file)
+            target_fn = None
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == fn_name
+                ):
+                    target_fn = node
+                    break
+            assert target_fn is not None, (
+                f"_PENDING_GUARDS references unknown function {entry}; "
+                "update the entry or remove it."
+            )
+            if not self._function_references_guard(target_fn):
+                unresolved.append(entry)
+
+        assert not unresolved, (
+            "Pending behind-recovery guard fix(es) not yet applied: "
+            + ", ".join(unresolved)
+        )
+
+
+# ── BuildConfig Schema Coverage ───────────────────────────────────────────────
+
+
+class TestBuildConfigSchemaCoverage:
+    """Guard: every build_config key read by a Project property must be declared
+    in BuildConfig so schema-validated saves do not silently strip the key.
+
+    Scans models.py for `(self.build_config or {}).get("key")` patterns inside
+    Project property methods and asserts each extracted key name appears as a
+    field in BuildConfig.model_fields. A CI failure here means a new property
+    was added to Project without a corresponding schema field — the round-trip
+    through the admin PATCH endpoint would silently drop the key on save.
+    """
+
+    def test_build_config_model_properties_declared_in_schema(self) -> None:
+        models_path = os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "app", "models.py")
+        )
+        with open(models_path) as f:
+            source = f.read()
+
+        consumed_keys = set(
+            re.findall(
+                r"\(self\.build_config\s+or\s+\{\}\)\.get\(\s*['\"]([^'\"]+)['\"]",
+                source,
+            )
+        )
+        assert consumed_keys, (
+            "No build_config .get() calls found in models.py — "
+            "the regex may need updating if the access pattern changed."
+        )
+
+        from app.schemas import BuildConfig
+
+        declared_keys = set(BuildConfig.model_fields.keys())
+        undeclared = consumed_keys - declared_keys
+        assert not undeclared, (
+            "build_config keys read by Project properties but not declared in "
+            "BuildConfig schema (they will be silently stripped on save):\n"
+            + "\n".join(f"  - {k}" for k in sorted(undeclared))
+            + "\n\nAdd each missing key to BuildConfig in backend/app/schemas.py."
+        )
+
+
+class TestVmCostRateConsolidation:
+    """Verify that VM cost rates are centralized and used consistently across consumers."""
+
+    def test_all_consumers_resolve_same_rate(self) -> None:
+        """All modules derive ON_DEMAND_RATE and SPOT_RATE from the same source."""
+        from app.vm_cost_rates import VM_COST_RATES, get_vm_rate_per_second
+        from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+
+        expected_on_demand = VM_COST_RATES["e2-standard-2"][0] / 3600
+        expected_spot = VM_COST_RATES["e2-standard-2"][1] / 3600
+
+        assert ON_DEMAND_RATE == expected_on_demand, (
+            f"admin_analytics ON_DEMAND_RATE ({ON_DEMAND_RATE}) does not match "
+            f"vm_cost_rates source ({expected_on_demand})"
+        )
+        assert SPOT_RATE == expected_spot, (
+            f"admin_analytics SPOT_RATE ({SPOT_RATE}) does not match "
+            f"vm_cost_rates source ({expected_spot})"
+        )
+
+        on_demand_from_func = get_vm_rate_per_second(spot=False)
+        spot_from_func = get_vm_rate_per_second(spot=True)
+
+        assert on_demand_from_func == expected_on_demand, (
+            f"get_vm_rate_per_second(spot=False) ({on_demand_from_func}) does not match "
+            f"expected rate ({expected_on_demand})"
+        )
+        assert spot_from_func == expected_spot, (
+            f"get_vm_rate_per_second(spot=True) ({spot_from_func}) does not match "
+            f"expected rate ({expected_spot})"
+        )
+
+    def test_default_machine_type_has_rate_entry(self) -> None:
+        """The configured default machine type must have a rate entry."""
+        from app.compute import MACHINE_TYPE
+        from app.vm_cost_rates import VM_COST_RATES
+
+        assert MACHINE_TYPE in VM_COST_RATES, (
+            f"Default MACHINE_TYPE '{MACHINE_TYPE}' is not in VM_COST_RATES. "
+            "Configured machine type must have an associated cost rate. "
+            "Add the rate to VM_COST_RATES in backend/app/vm_cost_rates.py."
+        )
+
+    def test_unknown_machine_type_falls_back_to_default(self) -> None:
+        """Unknown machine types should fall back to e2-standard-2, not silently yield zero cost."""
+        from app.vm_cost_rates import get_vm_rate_per_second, VM_COST_RATES
+
+        unknown_type = "unknown-machine-type"
+        expected_rate = VM_COST_RATES["e2-standard-2"][0] / 3600
+
+        rate = get_vm_rate_per_second(machine_type=unknown_type, spot=False)
+        assert rate == expected_rate, (
+            f"Unknown machine type '{unknown_type}' should fall back to "
+            f"e2-standard-2 rate ({expected_rate}), got {rate}"
+        )
+
+        unknown_spot = get_vm_rate_per_second(machine_type=unknown_type, spot=True)
+        expected_spot = VM_COST_RATES["e2-standard-2"][1] / 3600
+        assert unknown_spot == expected_spot, (
+            f"Unknown machine type '{unknown_type}' spot rate should fall back to "
+            f"e2-standard-2 spot rate ({expected_spot}), got {unknown_spot}"
+        )

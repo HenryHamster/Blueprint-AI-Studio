@@ -177,6 +177,31 @@ class TestComputeCompositeHardBlockers:
         # audit_missing — NOT test_file_deleted.
         assert result["blocker"] == "audit_missing"
 
+    def test_parseable_but_unscoreable_audit_forces_zero(self):
+        """Malformed findings are blocked the same way as an unusable audit."""
+        audit_score, test_erosion = rq._score_audit(
+            {
+                "audit_score": 0.95,
+                "findings": [{"description": "missing severity"}],
+                "test_erosion": {
+                    "deleted_test_files": [],
+                    "assertion_delta": 0,
+                    "test_count_delta": 0,
+                },
+            }
+        )
+        assert audit_score is None
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=audit_score,
+            test_erosion=test_erosion,
+            smoketest_score=1.0,
+            policy=_POLICY,
+        )
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+        assert result["blocker"] == "audit_missing"
+
     def test_blocker_precedence_ci_first(self):
         """When multiple blockers fire, ci_not_green is reported first."""
         result = rq.compute_composite(
@@ -682,7 +707,7 @@ class TestLoadPolicy:
 
 class TestScoreAudit:
     def test_clean_audit_report(self):
-        """A clean report yields the audit_score and a 1.0 erosion score."""
+        """An empty findings list yields derived audit_score=1.0 and 1.0 erosion."""
         report = {
             "audit_score": 0.85,
             "test_erosion": {
@@ -693,7 +718,87 @@ class TestScoreAudit:
             "findings": [],
         }
         audit, erosion = rq._score_audit(report)
-        assert audit == pytest.approx(0.85)
+        # derived from findings (empty) → 1.0; reported 0.85 is observability only
+        assert audit == pytest.approx(1.0)
+        assert erosion == pytest.approx(1.0)
+
+    def test_parseable_but_unscoreable_returns_none_audit_score(self):
+        """Findings with no severity/level are treated as an unusable audit signal."""
+        report = {
+            "audit_score": 0.95,
+            "findings": [
+                {"description": "Some issue without severity."},
+                "plain-text finding with no structured severity",
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        }
+        audit, erosion = rq._score_audit(report)
+        assert audit is None
+        assert erosion == pytest.approx(1.0)
+
+    def test_findings_deducted_correctly(self):
+        """1 high + 1 medium finding → 1.0 - 0.15 - 0.07 = 0.78."""
+        report = {
+            "audit_score": 0.78,
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Token in source.",
+                    "file": "app/auth.py",
+                    "verification_note": "Read app/auth.py lines 10-30: secret hardcoded in plaintext, reaches external HTTP call.",
+                },
+                {
+                    "severity": "medium",
+                    "summary": "Missing null check.",
+                    "file": "app/api.py",
+                    "verification_note": "Read app/api.py lines 55-70: payload.user may be None, dereferenced without guard.",
+                },
+            ],
+        }
+        audit, erosion = rq._score_audit(report)
+        assert audit == pytest.approx(0.78)
+        assert erosion == pytest.approx(1.0)
+
+    def test_critical_finding_deducted(self):
+        """A critical finding deducts 0.30 → 1.0 - 0.30 = 0.70."""
+        report = {
+            "findings": [
+                {
+                    "severity": "critical",
+                    "summary": "SQL injection.",
+                    "file": "app/db.py",
+                    "verification_note": "Read app/db.py lines 88-95: user_id from request headers reaches cursor.execute f-string with no parameterisation.",
+                },
+            ],
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(0.70)
+
+    def test_clamped_below_zero(self):
+        """Many critical findings clamp to 0.0."""
+        report = {
+            "findings": [
+                {
+                    "severity": "critical",
+                    "summary": f"Issue {i}",
+                    "file": "",
+                    "verification_note": f"Read src/module.py line {i * 10 + 1}: confirmed real defect in the diff with no mitigation.",
+                }
+                for i in range(10)
+            ],
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(0.0)
+
+    def test_missing_findings_key_scores_1_0(self):
+        """A report with no findings key derives score 1.0 (no deductions)."""
+        report = {"audit_score": 0.5, "test_erosion": {"deleted_test_files": []}}
+        audit, erosion = rq._score_audit(report)
+        assert audit == pytest.approx(1.0)
         assert erosion == pytest.approx(1.0)
 
     def test_deleted_test_file_returns_none_erosion(self):
@@ -705,9 +810,11 @@ class TestScoreAudit:
                 "assertion_delta": 0,
                 "test_count_delta": -5,
             },
+            "findings": [],
         }
         audit, erosion = rq._score_audit(report)
-        assert audit == pytest.approx(0.9)
+        # No findings → derived audit = 1.0
+        assert audit == pytest.approx(1.0)
         assert erosion is None
 
     def test_net_test_count_reduction_penalized(self):
@@ -724,11 +831,11 @@ class TestScoreAudit:
         assert erosion is not None
         assert erosion < 1.0
 
-    def test_missing_audit_score_returns_none(self):
-        """An absent audit_score yields None (a hard blocker downstream)."""
+    def test_missing_audit_score_no_findings_scores_1_0(self):
+        """An absent self-reported audit_score still yields derived 1.0 (no findings)."""
         report = {"test_erosion": {"deleted_test_files": []}}
         audit, erosion = rq._score_audit(report)
-        assert audit is None
+        assert audit == pytest.approx(1.0)
         assert erosion == pytest.approx(1.0)
 
     def test_none_report_returns_none_none(self):
@@ -737,9 +844,456 @@ class TestScoreAudit:
 
     def test_no_erosion_block_assumes_neutral(self):
         """A report with no test_erosion block assumes neutral (1.0)."""
-        audit, erosion = rq._score_audit({"audit_score": 0.7})
-        assert audit == pytest.approx(0.7)
+        audit, erosion = rq._score_audit({"audit_score": 0.7, "findings": []})
+        assert audit == pytest.approx(1.0)
         assert erosion == pytest.approx(1.0)
+
+    def test_divergence_log_emitted(self, caplog):
+        """When derived and reported scores diverge by >0.10 a warning is logged."""
+        import logging
+
+        _NOTE = (
+            "Read src/module.py lines 5-20: confirmed real defect with no mitigation."
+        )
+        report = {
+            "audit_score": 0.90,  # reported
+            # derived = 1.0 - 0.30 - 0.30 = 0.40 → delta 0.50
+            "findings": [
+                {
+                    "severity": "critical",
+                    "summary": "Issue A",
+                    "file": "",
+                    "verification_note": _NOTE,
+                },
+                {
+                    "severity": "critical",
+                    "summary": "Issue B",
+                    "file": "",
+                    "verification_note": _NOTE,
+                },
+            ],
+        }
+        with caplog.at_level(logging.WARNING, logger="backend.app.release_qualifier"):
+            audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(0.40)
+        assert any("audit_score drift" in r.message for r in caplog.records)
+
+    def test_moderate_severity_treated_as_medium(self):
+        """'moderate' is an alias for 'medium' (same 0.07 deduction)."""
+        report = {
+            "findings": [
+                {
+                    "severity": "moderate",
+                    "summary": "Style issue",
+                    "file": "",
+                    "verification_note": "Read app/utils.py lines 12-20: pattern inconsistent with rest of module, confirmed present in diff.",
+                }
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0 - 0.07)
+
+    def test_findings_under_issues_key_applies_deductions(self):
+        """When 'findings' is absent, fall back to 'issues' and apply deductions."""
+        report = {
+            "issues": [
+                {
+                    "severity": "high",
+                    "summary": "Token in source.",
+                    "file": "app/auth.py",
+                    "verification_note": "Read app/auth.py lines 10-30: API key hardcoded in source, reaches outbound request.",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        # Should deduct 0.15 for high, not produce 1.0 (fail-open)
+        assert audit == pytest.approx(1.0 - 0.15)
+
+    def test_severity_via_level_field_applies_deductions(self):
+        """Finding with 'level' instead of 'severity' must apply the correct deduction."""
+        report = {
+            "findings": [
+                {
+                    "level": "critical",
+                    "summary": "SQL injection",
+                    "file": "app/db.py",
+                    "verification_note": "Read app/db.py lines 88-95: user input reaches cursor.execute without parameterisation.",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0 - 0.30)
+
+    def test_unrecognized_severity_applies_nonzero_deduction(self):
+        """Off-list severity labels ('blocker', 'warning', 'info', 'unknown') must not score 0."""
+        _NOTE = "Read src/module.py lines 5-20: confirmed real defect with no mitigation in the diff."
+        for sev, expected_deduction, needs_note in [
+            ("blocker", 0.30, True),  # in _SEVERITIES_REQUIRING_VERIFICATION
+            ("warning", 0.07, True),  # in _SEVERITIES_REQUIRING_VERIFICATION
+            ("info", 0.02, False),  # not in set; no verification required
+            (
+                "custom_label",
+                rq._AUDIT_DEDUCTION_UNKNOWN,
+                False,
+            ),  # unknown; no verification required
+        ]:
+            finding: dict = {"severity": sev, "summary": "Issue", "file": ""}
+            if needs_note:
+                finding["verification_note"] = _NOTE
+            report = {"findings": [finding]}
+            audit, _ = rq._score_audit(report)
+            assert audit == pytest.approx(1.0 - expected_deduction), (
+                f"severity={sev!r} should deduct {expected_deduction} but got {1.0 - audit:.4f}"
+            )
+
+    def test_score_audit_and_extract_findings_agree_on_source(self):
+        """Both _score_audit and _extract_audit_findings must read from the same key/field.
+
+        Regression guard: a report whose findings live under 'issues' with 'level'
+        severity must produce a sub-1.0 score AND non-empty findings — not 1.0 / [].
+        """
+        report = {
+            "issues": [
+                {
+                    "level": "high",
+                    "summary": "Token baked into source.",
+                    "file": "app/secret.py",
+                    "verification_note": "Read app/secret.py lines 5-15: API key hardcoded in module-level constant, reaches outbound HTTP call.",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        findings = rq._extract_audit_findings(report)
+        # Gate must not pass 1.0 while findings are surfaced
+        assert audit < 1.0, "score should reflect the finding, not fail open to 1.0"
+        assert len(findings) > 0, "findings should be surfaced for the same report"
+        assert findings[0]["severity"] == "high"
+
+
+class TestScoreAuditVerification:
+    """_score_audit must skip deductions for high/medium/critical findings
+    that lack a substantive verification_note (≥ 20 non-whitespace chars)."""
+
+    def test_unverified_high_finding_not_deducted(self):
+        """A high finding without verification_note is excluded → score stays 1.0."""
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Potential issue.",
+                    "file": "app/foo.py",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0)
+
+    def test_unverified_medium_finding_not_deducted(self):
+        """A medium finding without verification_note is excluded → score stays 1.0."""
+        report = {
+            "findings": [
+                {
+                    "severity": "medium",
+                    "summary": "Missing guard.",
+                    "file": "app/bar.py",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0)
+
+    def test_low_finding_always_deducted_without_verification_note(self):
+        """Low findings do not require verification_note — deduction applies."""
+        report = {
+            "findings": [
+                {"severity": "low", "summary": "Nit: inconsistent style.", "file": ""},
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0 - 0.02)
+
+    def test_short_verification_note_not_counted(self):
+        """A verification_note with fewer than 20 non-whitespace chars is treated as absent."""
+        report = {
+            "findings": [
+                {
+                    "severity": "critical",
+                    "summary": "SQL injection.",
+                    "file": "app/db.py",
+                    "verification_note": "too short",  # only 9 non-whitespace chars
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0)
+
+    def test_verified_critical_finding_deducted(self):
+        """A critical finding WITH a substantive verification_note is deducted normally."""
+        report = {
+            "findings": [
+                {
+                    "severity": "critical",
+                    "summary": "SQL injection.",
+                    "file": "app/db.py",
+                    "verification_note": "Read app/db.py lines 88-95: user input from request body reaches cursor.execute without parameterisation.",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0 - 0.30)
+
+    def test_mixed_verified_and_unverified_findings(self):
+        """Only verified findings count — one verified high + one unverified critical."""
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Real issue.",
+                    "file": "app/auth.py",
+                    "verification_note": "Read app/auth.py lines 10-30: API key hardcoded in source, reaches outbound request.",
+                },
+                {
+                    "severity": "critical",
+                    "summary": "Speculative injection.",
+                    "file": "app/db.py",
+                    # no verification_note — should be excluded
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        # Only the verified high finding deducts: 1.0 - 0.15 = 0.85
+        assert audit == pytest.approx(1.0 - 0.15)
+
+    def test_empty_string_verification_note_not_counted(self):
+        """An empty verification_note is treated the same as absent."""
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Missing guard.",
+                    "file": "app/api.py",
+                    "verification_note": "",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0)
+
+    def test_all_findings_unverified_audit_missing_reason_fires(self):
+        """When _score_audit returns 1.0 due to all-unverified findings,
+        _audit_missing_reason must return 'all_findings_unverified'."""
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Potential issue.",
+                    "file": "app/foo.py",
+                },
+            ]
+        }
+        audit, _ = rq._score_audit(report)
+        assert audit == pytest.approx(1.0), "unverified high must not be deducted"
+        assert rq._audit_missing_reason(report) == "all_findings_unverified"
+
+
+class TestScoreAuditComputedErosion:
+    """_score_audit prefers computed_test_erosion (authoritative, deterministic
+    from git diff) over the LLM's self-reported test_erosion when the key is present."""
+
+    def test_computed_erosion_authoritative_over_llm(self):
+        """computed_test_erosion with a deleted file → None even when LLM omits it."""
+        report = {
+            "audit_score": 0.9,
+            "computed_test_erosion": {
+                "deleted_test_files": ["testing/test_gone.py"],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "test_erosion": {
+                "deleted_test_files": [],  # LLM missed the deletion
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "findings": [],
+        }
+        _, erosion = rq._score_audit(report)
+        assert erosion is None
+
+    def test_llm_reports_deletion_but_computed_does_not(self):
+        """computed wins: no deletions → score=1.0 even when LLM hallucinates one."""
+        report = {
+            "computed_test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "test_erosion": {
+                "deleted_test_files": ["testing/test_hallucinated.py"],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "findings": [],
+        }
+        _, erosion = rq._score_audit(report)
+        assert erosion == pytest.approx(1.0)
+
+    def test_computed_assertion_delta_penalizes(self):
+        """Negative assertion_delta in computed_test_erosion yields a penalty."""
+        report = {
+            "computed_test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": -10,
+                "test_count_delta": 0,
+            },
+            "findings": [],
+        }
+        _, erosion = rq._score_audit(report)
+        assert erosion is not None
+        assert erosion < 1.0
+
+    def test_fallback_to_llm_when_no_computed_key(self):
+        """When computed_test_erosion is absent, existing test_erosion logic is unchanged."""
+        report = {
+            "test_erosion": {
+                "deleted_test_files": ["testing/test_gone.py"],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "findings": [],
+        }
+        _, erosion = rq._score_audit(report)
+        assert erosion is None
+
+    def test_divergence_warning_logged(self, caplog):
+        """When computed and LLM deleted_test_files disagree, a warning is logged."""
+        import logging
+
+        report = {
+            "computed_test_erosion": {
+                "deleted_test_files": ["testing/test_gone.py"],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "test_erosion": {
+                "deleted_test_files": [],  # LLM missed it
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+            "findings": [],
+        }
+        with caplog.at_level(logging.WARNING, logger="backend.app.release_qualifier"):
+            rq._score_audit(report)
+        assert any("test_erosion divergence" in r.message for r in caplog.records)
+
+
+class TestAuditMissingReason:
+    """_audit_missing_reason returns a structured sub-status string for parseable
+    reports that yield no scoring signal, and None when the report is scoreable."""
+
+    def test_none_report_returns_none(self):
+        assert rq._audit_missing_reason(None) is None
+
+    def test_non_dict_returns_none(self):
+        assert rq._audit_missing_reason("not-a-dict") is None  # type: ignore[arg-type]
+
+    def test_no_findings_key(self):
+        """A report with neither 'findings' nor 'issues' key → 'no_findings_key'."""
+        report: dict = {"audit_score": 0.8}
+        assert rq._audit_missing_reason(report) == "no_findings_key"
+
+    def test_empty_findings_list_with_score(self):
+        """findings=[], audit_score present → 'empty_findings_list'."""
+        report = {"findings": [], "audit_score": 0.9}
+        assert rq._audit_missing_reason(report) == "empty_findings_list"
+
+    def test_audit_score_null_no_findings(self):
+        """findings=[], no self-reported audit_score → 'audit_score_null_no_findings'."""
+        report: dict = {"findings": []}
+        assert rq._audit_missing_reason(report) == "audit_score_null_no_findings"
+
+    def test_parseable_but_unscoreable(self):
+        """findings list with entries that have no severity/level → 'parseable_but_unscoreable'."""
+        report = {"findings": [{"description": "some issue"}, {"title": "another"}]}
+        assert rq._audit_missing_reason(report) == "parseable_but_unscoreable"
+
+    def test_scoreable_report_returns_none(self):
+        """A report with a verified high finding → None (genuinely scoreable)."""
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Token baked into image.",
+                    "verification_note": "Read infra/packer/agent.pkr.hcl lines 20-35: API token hardcoded in provisioner.",
+                }
+            ],
+            "audit_score": 0.85,
+        }
+        assert rq._audit_missing_reason(report) is None
+
+    def test_issues_key_fallback_empty(self):
+        """'issues' key with empty list and no audit_score → 'audit_score_null_no_findings'."""
+        report: dict = {"issues": []}
+        assert rq._audit_missing_reason(report) == "audit_score_null_no_findings"
+
+    def test_issues_key_with_severity_returns_none(self):
+        """Scoreable findings under 'issues' key with verified finding → None."""
+        report = {
+            "issues": [
+                {
+                    "severity": "medium",
+                    "summary": "dep pinning risk",
+                    "verification_note": "Read requirements.txt and pyproject.toml: unpinned transitive deps confirmed.",
+                }
+            ]
+        }
+        assert rq._audit_missing_reason(report) is None
+
+    def test_all_findings_unverified_single_high(self):
+        """Single unverified high finding → 'all_findings_unverified'."""
+        report = {
+            "findings": [{"severity": "high", "summary": "Potential issue."}],
+        }
+        assert rq._audit_missing_reason(report) == "all_findings_unverified"
+
+    def test_all_findings_unverified_multiple_mixed_severity(self):
+        """Multiple unverified high/medium/critical findings → 'all_findings_unverified'."""
+        report = {
+            "findings": [
+                {"severity": "critical", "summary": "SQL injection."},
+                {"severity": "high", "summary": "Leaked secret."},
+                {"severity": "medium", "summary": "Weak cipher."},
+            ]
+        }
+        assert rq._audit_missing_reason(report) == "all_findings_unverified"
+
+    def test_one_verified_one_unverified_returns_none(self):
+        """One verified high + one unverified medium → None (scoreable)."""
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Hardcoded credential.",
+                    "verification_note": "Read app/config.py lines 10-25: API key hardcoded in module-level constant.",
+                },
+                {
+                    "severity": "medium",
+                    "summary": "Missing rate limit.",
+                    "file": "app/api.py",
+                },
+            ]
+        }
+        assert rq._audit_missing_reason(report) is None
+
+    def test_all_findings_unverified_only_low_findings_returns_none(self):
+        """Only low/info findings (not in _SEVERITIES_REQUIRING_VERIFICATION) → None."""
+        report = {
+            "findings": [
+                {"severity": "low", "summary": "Minor style nit."},
+                {"severity": "info", "summary": "Informational note."},
+            ]
+        }
+        # No higher-severity findings to check → does not fire the new reason
+        assert rq._audit_missing_reason(report) is None
 
 
 class TestExtractAuditFindings:
@@ -757,13 +1311,14 @@ class TestExtractAuditFindings:
         report = {
             "audit_score": 0.74,
             "findings": [
+                # High without verification_note: excluded by the scoring gate.
                 {"severity": "high", "summary": "Token baked into VM image."},
+                # Low never requires verification.
                 {"severity": "low", "description": "Private import."},
             ],
         }
         out = rq._extract_audit_findings(report)
         assert out == [
-            {"severity": "high", "summary": "Token baked into VM image."},
             {"severity": "low", "summary": "Private import."},
         ]
 
@@ -771,18 +1326,79 @@ class TestExtractAuditFindings:
         report = {
             "findings": [
                 {"severity": "low", "summary": "low one"},
+                # High and medium lack verification_note → excluded by gate.
                 {"severity": "high", "summary": "high one"},
                 {"severity": "medium", "summary": "medium one"},
             ]
         }
         out = rq._extract_audit_findings(report)
-        assert [f["severity"] for f in out] == ["high", "medium", "low"]
+        # Only the low finding survives the verification gate.
+        assert [f["severity"] for f in out] == ["low"]
 
     def test_issues_key_fallback(self):
-        """Some audits key the list as 'issues' rather than 'findings'."""
+        """Some audits key the list as 'issues' rather than 'findings'.
+        Medium without verification_note → excluded by the scoring gate."""
         report = {"issues": [{"level": "medium", "title": "an issue"}]}
         out = rq._extract_audit_findings(report)
-        assert out == [{"severity": "medium", "summary": "an issue"}]
+        assert out == []
+
+    def test_unverified_high_finding_excluded(self):
+        """An unsubstantiated high finding must NOT appear in the carried list.
+
+        Regression guard: the scoring gate (_finding_is_verified) must be
+        applied inside _extract_audit_findings so unverified findings that
+        do not affect the audit sub-score are not surfaced as actionable blockers.
+        """
+        report = {
+            "findings": [
+                {"severity": "high", "summary": "Speculative SQL injection."},
+            ]
+        }
+        out = rq._extract_audit_findings(report)
+        assert out == [], (
+            "unverified high finding must be excluded from carried findings"
+        )
+
+    def test_verified_high_finding_included(self):
+        """A high finding with a substantive verification_note IS carried."""
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Token baked into image.",
+                    "verification_note": (
+                        "Read infra/packer/agent.pkr.hcl lines 20-35: "
+                        "API token hardcoded in provisioner shell command."
+                    ),
+                }
+            ]
+        }
+        out = rq._extract_audit_findings(report)
+        assert out == [{"severity": "high", "summary": "Token baked into image."}]
+
+    def test_gate_agrees_with_score_audit_for_unverified(self):
+        """When _score_audit treats a finding as undeducted (unverified),
+        _extract_audit_findings must also exclude it."""
+        report = {
+            "findings": [
+                # Medium without verification_note: _score_audit skips deduction.
+                {"severity": "medium", "summary": "Row-vs-ORM false positive."},
+                # Low always counted by both functions.
+                {"severity": "low", "summary": "Minor style issue."},
+            ]
+        }
+        # _score_audit should NOT deduct for the medium finding → score stays 1.0.
+        audit_score, _ = rq._score_audit(report)
+        assert audit_score == pytest.approx(1.0 - rq._AUDIT_DEDUCTIONS["low"]), (
+            "_score_audit should only deduct for the verified low finding"
+        )
+        # _extract_audit_findings must agree: medium excluded, low present.
+        out = rq._extract_audit_findings(report)
+        severities = [f["severity"] for f in out]
+        assert "medium" not in severities, (
+            "unverified medium finding must not appear in carried findings"
+        )
+        assert "low" in severities, "low finding must be carried"
 
     def test_caps_count_and_truncates_summary(self):
         report = {
@@ -800,6 +1416,94 @@ class TestExtractAuditFindings:
         out = rq._extract_audit_findings(report)
         # The blank-summary finding is dropped; the string one is kept.
         assert out == [{"severity": "unknown", "summary": "a plain string"}]
+
+
+class TestComputeAuditReconciliation:
+    """_compute_audit_reconciliation surfaces divergence between the model's
+    self-reported audit_score and the deterministic findings-derived score,
+    and counts findings excluded for lacking a substantive verification_note."""
+
+    def test_none_report_returns_empty_structure(self):
+        out = rq._compute_audit_reconciliation(None)
+        assert out == {
+            "model_reported_score": None,
+            "findings_derived_score": None,
+            "score_delta": None,
+            "excluded_findings_count": 0,
+        }
+
+    def test_model_score_only_no_findings(self):
+        """When findings key is absent, findings_derived_score and delta are None."""
+        out = rq._compute_audit_reconciliation({"audit_score": 0.8})
+        assert out["model_reported_score"] == pytest.approx(0.8)
+        assert out["findings_derived_score"] is None
+        assert out["score_delta"] is None
+        assert out["excluded_findings_count"] == 0
+
+    def test_agreement_yields_small_delta(self):
+        """No findings → derived=1.0; model-reported=1.0 → delta=0."""
+        out = rq._compute_audit_reconciliation({"audit_score": 1.0, "findings": []})
+        assert out["model_reported_score"] == pytest.approx(1.0)
+        assert out["findings_derived_score"] == pytest.approx(1.0)
+        assert out["score_delta"] == pytest.approx(0.0)
+
+    def test_divergence_delta_populated(self):
+        """A high finding (verified) reduces derived score; delta reflects gap."""
+        report = {
+            "audit_score": 1.0,
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "leaked secret",
+                    "verification_note": "confirmed in full repo scan with evidence",
+                }
+            ],
+        }
+        out = rq._compute_audit_reconciliation(report)
+        # findings-derived = 1.0 - 0.15 = 0.85; model_reported = 1.0
+        assert out["findings_derived_score"] == pytest.approx(0.85)
+        assert out["score_delta"] == pytest.approx(0.15)
+        assert out["excluded_findings_count"] == 0
+
+    def test_excluded_findings_counted_for_missing_note(self):
+        """High finding without a substantive note is excluded and counted."""
+        report = {
+            "audit_score": 0.9,
+            "findings": [
+                {"severity": "high", "summary": "risk", "verification_note": ""}
+            ],
+        }
+        out = rq._compute_audit_reconciliation(report)
+        assert out["excluded_findings_count"] == 1
+        # Not deducted, so derived stays 1.0
+        assert out["findings_derived_score"] == pytest.approx(1.0)
+
+    def test_low_finding_never_excluded(self):
+        """Low-severity findings are always counted without needing a note."""
+        report = {
+            "findings": [{"severity": "low", "summary": "minor"}],
+        }
+        out = rq._compute_audit_reconciliation(report)
+        assert out["excluded_findings_count"] == 0
+        assert out["findings_derived_score"] == pytest.approx(0.98)  # 1.0 - 0.02
+
+    def test_excluded_findings_count_coincides_with_all_findings_unverified(self):
+        """When all higher-severity findings are unverified, excluded_findings_count > 0
+        and _audit_missing_reason returns 'all_findings_unverified'."""
+        report = {
+            "audit_score": 0.9,
+            "findings": [
+                {"severity": "high", "summary": "Leaked token.", "file": "app/auth.py"},
+                {
+                    "severity": "medium",
+                    "summary": "Weak cipher.",
+                    "file": "app/crypto.py",
+                },
+            ],
+        }
+        out = rq._compute_audit_reconciliation(report)
+        assert out["excluded_findings_count"] == 2
+        assert rq._audit_missing_reason(report) == "all_findings_unverified"
 
 
 class TestScoreSmoketest:
@@ -1355,6 +2059,18 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
     # candidate_sha, the full 40-char SHA.
     assert audit_task.first_payload["candidate_sha"] == candidate
     assert audit_task.context["release_version_id"] == str(version.id)
+    assert audit_task.context["scope"] == "medium"
+
+    from datetime import datetime, timezone
+
+    from app import reaper
+
+    hb_cutoff = reaper._heartbeat_stale_cutoff(
+        audit_task, datetime(2026, 1, 1, tzinfo=timezone.utc)
+    )
+    assert (
+        datetime(2026, 1, 1, tzinfo=timezone.utc) - hb_cutoff
+    ).total_seconds() == 420
 
     # The qualifier smoketest carries candidate_sha in its payload too and is
     # flagged so its failure does not spawn a fix task.
@@ -2027,8 +2743,9 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
         db_session,
         project,
         version,
-        # audit 0.35 + erosion 1.0 + smoketest 1.0 → composite 0.74 < 0.75:
-        # not_promoted with no hard blocker, exercising the soft-miss path.
+        # Three findings derive audit 0.68; with erosion 1.0 and smoketest 0.5
+        # (half-passing), the composite lands at 0.722, just under the 0.75
+        # bar and on the soft-miss path.
         audit_logs={
             "audit_score": 0.35,
             "test_erosion": {
@@ -2038,12 +2755,24 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
             },
             "findings": [
                 {"severity": "low", "summary": "Private cross-module import."},
-                {"severity": "high", "summary": "Token baked into VM image."},
+                {
+                    "severity": "high",
+                    "summary": "Token baked into VM image.",
+                    "verification_note": "Read infra/packer/agent.pkr.hcl lines 20-35: API token hardcoded in provisioner shell command, present in diff with no mitigation.",
+                },
+                {
+                    "severity": "high",
+                    "summary": "Unsafe dependency pinning.",
+                    "verification_note": "Read agent/package.json: dependency version unpinned (uses ^), confirmed change in diff allows semver drift.",
+                },
             ],
         },
         smoke_logs={
             "passed": True,
-            "tests": [{"name": "a", "status": "pass"}],
+            "tests": [
+                {"name": "a", "status": "pass"},
+                {"name": "b", "status": "fail"},
+            ],
             "suites": {"startup": {"passed": True}},
         },
     )
@@ -2056,9 +2785,10 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
 
     await db_session.refresh(version)
     findings = version.last_qualification["audit_findings"]
-    # Most-severe first, both findings carried with severity + summary.
+    # Most-severe first, all three findings carried with severity + summary.
     assert findings == [
         {"severity": "high", "summary": "Token baked into VM image."},
+        {"severity": "high", "summary": "Unsafe dependency pinning."},
         {"severity": "low", "summary": "Private cross-module import."},
     ]
 
@@ -2985,20 +3715,17 @@ class TestFinalizeInfraFailure:
         assert readiness["verdicts_evaluated"] == 0
 
     @pytest.mark.asyncio
-    async def test_audit_completed_no_report_still_records_verdict(self, db_session):
-        """A COMPLETED audit task whose report is absent or unparseable routes
-        through the normal compute_composite path (audit_missing quality blocker)
-        — the existing 'quality verdict' code, NOT the new infra-failure path.
-        Preserves existing behaviour: a COMPLETED child with a missing artifact
-        is still a real quality blocker (the agent ran but produced no output)."""
-        from app import shared_state
-
-        shared_state.runtime_config["promotion_enabled"] = True
-
+    async def test_audit_completed_no_report_reclassified_as_infra_failure(
+        self, db_session
+    ):
+        """A COMPLETED audit task whose RELEASE_AUDIT_REPORT artifact is absent
+        is now reclassified as infra_failure — the agent ran but emitted no
+        usable output.  No QualificationVerdict row is written; the operator
+        notification is 'release_infra_failure', not 'release_blocked'."""
         project, version = await _make_project_and_version(db_session)
-        # Both children COMPLETED but NO artifacts seeded — the audit produced
-        # no report, which is a quality blocker, not an infra failure.
-        await _seed_infra_failure_children(
+        # Both children COMPLETED but NO artifacts seeded — audit produced
+        # no report, which is an infra failure (defense-in-depth path).
+        audit_task, _ = await _seed_infra_failure_children(
             db_session,
             project,
             version,
@@ -3010,11 +3737,11 @@ class TestFinalizeInfraFailure:
         result = await rq._finalize_qualification(db_session, version)
         await db_session.commit()
 
-        # Routes to the quality path: audit_missing (or smoketest_startup_failed
-        # since smoketest also has no artifact).  Either way, a verdict IS recorded.
-        assert result["status"] in ("not_promoted", "dry_run")
+        # Reclassified as infra_failure, not a quality verdict.
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_report_missing"
 
-        # A QualificationVerdict row was written — quality verdict, not infra error.
+        # NO QualificationVerdict row written — infra failure, not quality blocker.
         count = (
             await db_session.execute(
                 select(sa_func.count()).where(
@@ -3022,7 +3749,301 @@ class TestFinalizeInfraFailure:
                 )
             )
         ).scalar()
-        assert count == 1
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_audit_completed_empty_artifact_reclassified_as_infra_failure(
+        self, db_session
+    ):
+        """A COMPLETED audit task with an empty JSON artifact is infra_failure."""
+        project, version = await _make_project_and_version(db_session)
+        audit_task, _ = await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.COMPLETED,
+            smoke_status=TaskStatus.COMPLETED,
+            smoketest_enabled=True,
+        )
+        db_session.add(
+            Artifact(
+                task_id=audit_task.id,
+                artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+                logs="{}",
+            )
+        )
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_report_empty_dict"
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_audit_completed_unparseable_artifact_reclassified_as_infra_failure(
+        self, db_session
+    ):
+        """A COMPLETED audit task whose RELEASE_AUDIT_REPORT artifact contains
+        non-JSON logs (unparseable) is reclassified as infra_failure — distinct
+        regression test from the 'no artifact row' sub-case above."""
+        project, version = await _make_project_and_version(db_session)
+        audit_task, _ = await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.COMPLETED,
+            smoke_status=TaskStatus.COMPLETED,
+            smoketest_enabled=True,
+        )
+        # Seed a RELEASE_AUDIT_REPORT artifact with non-JSON content.
+        db_session.add(
+            Artifact(
+                task_id=audit_task.id,
+                artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+                logs="this is not valid json {{{{",
+            )
+        )
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_report_missing"
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_audit_completed_parseable_but_unscoreable_reclassified_as_infra_failure(
+        self, db_session
+    ):
+        """Structured but unscorable audit findings are infra_failure, not a verdict."""
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={
+                "audit_score": 0.95,
+                "findings": [
+                    {"description": "missing severity"},
+                    "plain-text finding with no structured severity",
+                ],
+                "test_erosion": {
+                    "deleted_test_files": [],
+                    "assertion_delta": 0,
+                    "test_count_delta": 0,
+                },
+            },
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "smoke-c", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_report_parseable_but_unscoreable"
+
+        await db_session.refresh(version)
+        assert version.last_qualification["status"] == "infra_failure"
+        assert (
+            version.last_qualification["error"]
+            == "audit_report_parseable_but_unscoreable"
+        )
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_legitimate_empty_findings_audit_reaches_verdict_not_infra_failure(
+        self, db_session
+    ):
+        """An audit report with findings=[] and a valid audit_score reaches a real verdict.
+
+        Regression guard: if _audit_missing_reason() were changed to return
+        'parseable_but_unscoreable' for empty-findings-with-score reports, the
+        finalize path would silently mis-route a clean audit as infra_failure.
+        This test ensures that path stays open — a QualificationVerdict row is
+        written and the audit sub-score reflects the clean signal (1.0).
+        """
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={
+                "audit_score": 1.0,
+                "findings": [],
+                "test_erosion": {
+                    "deleted_test_files": [],
+                    "assertion_delta": 0,
+                    "test_count_delta": 0,
+                },
+            },
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "smoke-ok", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # Primary guard: legitimate empty findings must NOT route to infra_failure.
+        assert result["status"] != "infra_failure", (
+            f"empty-findings clean audit mis-routed as infra_failure: {result}"
+        )
+        # A real QualificationVerdict row should be written.
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 1, f"expected 1 QualificationVerdict, got {count}"
+
+        # Audit sub-score must reflect the clean 1.0 signal, not collapse.
+        await db_session.refresh(version)
+        qual = version.last_qualification
+        assert qual["sub_scores"]["audit"] == 1.0, (
+            f"audit sub-score collapsed: {qual['sub_scores']['audit']}, expected 1.0"
+        )
+        # A clean audit is not a hard-blocking dimension.
+        assert result["would_promote"] is True, (
+            f"would_promote should be True for a clean audit, got {result}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_smoketest_completed_no_report_reclassified_as_infra_failure(
+        self, db_session
+    ):
+        """A COMPLETED smoketest with no SMOKETEST_RESULT is infra_failure,
+        not a smoketest_startup_failed verdict."""
+        project, version = await _make_project_and_version(db_session)
+        await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.COMPLETED,
+            smoke_status=TaskStatus.COMPLETED,
+            smoketest_enabled=True,
+        )
+
+        db_session.add(
+            Artifact(
+                task_id=version.last_qualification["audit_task_id"],
+                artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+                logs=json.dumps(
+                    {
+                        "audit_score": 1.0,
+                        "test_erosion": {"deleted_test_files": []},
+                    }
+                ),
+            )
+        )
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "smoketest_report_missing"
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_smoketest_completed_unparseable_artifact_reclassified_as_infra_failure(
+        self, db_session
+    ):
+        """A COMPLETED smoketest with an unparseable SMOKETEST_RESULT is infra_failure."""
+        project, version = await _make_project_and_version(db_session)
+        audit_task, smoke_task = await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.COMPLETED,
+            smoke_status=TaskStatus.COMPLETED,
+            smoketest_enabled=True,
+        )
+        db_session.add(
+            Artifact(
+                task_id=audit_task.id,
+                artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+                logs=json.dumps(
+                    {
+                        "audit_score": 1.0,
+                        "test_erosion": {"deleted_test_files": []},
+                    }
+                ),
+            )
+        )
+        db_session.add(
+            Artifact(
+                task_id=smoke_task.id,
+                artifact_type=ArtifactType.SMOKETEST_RESULT,
+                logs="not json {{{",
+            )
+        )
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "smoketest_report_missing"
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
 
     @pytest.mark.asyncio
     async def test_consecutive_infra_errors_backstop_fires_alert(self, db_session):
@@ -3163,6 +4184,840 @@ class TestFinalizeInfraFailure:
         # Took the normal quality-verdict path (dry_run since promotion disabled).
         assert result["status"] == "dry_run"
         assert result["status"] != "infra_failure"
+
+    @pytest.mark.asyncio
+    async def test_audit_task_failed_enriches_error_with_failure_category(
+        self, db_session
+    ):
+        """FAILED audit with agent_failure_category_raw → enriched error label.
+
+        Ensures operators can distinguish audit infra failures by the specific
+        agent failure category (e.g. rate_limited vs. claude_code_failed) when
+        inspecting consecutive infra-failure alerts.
+        """
+        project, version = await _make_project_and_version(db_session)
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[{"type": "release_audit", "base_branch": "main"}],
+            vm_instance_id="vm-audit-enriched",
+            status=TaskStatus.FAILED,
+            context={
+                "release_version_id": str(version.id),
+                "agent_failure_category_raw": "release_audit_report_unparseable",
+            },
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "cafe" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_task_id": None,
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_task_failed_release_audit_report_unparseable"
+
+        await db_session.refresh(version)
+        assert version.last_qualification["status"] == "infra_failure"
+        assert (
+            version.last_qualification["error"]
+            == "audit_task_failed_release_audit_report_unparseable"
+        )
+
+    @pytest.mark.asyncio
+    async def test_audit_task_failed_no_failure_category_falls_back_to_generic(
+        self, db_session
+    ):
+        """FAILED audit with no agent_failure_category_raw → generic label.
+
+        Ensures backward compatibility when older agents didn't record the
+        failure category — the label stays 'audit_task_failed'.
+        """
+        project, version = await _make_project_and_version(db_session)
+        await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.FAILED,
+            smoke_status=TaskStatus.COMPLETED,
+            smoketest_enabled=False,
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_task_failed"
+
+        await db_session.refresh(version)
+        assert version.last_qualification["error"] == "audit_task_failed"
+
+    @pytest.mark.asyncio
+    async def test_smoketest_task_failed_enriches_error_with_failure_category(
+        self, db_session
+    ):
+        """FAILED smoketest with agent_failure_category_raw → enriched error label."""
+        project, version = await _make_project_and_version(db_session)
+        audit_task, smoke_task = await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.COMPLETED,
+            smoke_status=TaskStatus.FAILED,
+            smoketest_enabled=True,
+        )
+        # Patch the smoketest task's context to include a failure category.
+        smoke_task.context = {
+            **dict(smoke_task.context or {}),
+            "agent_failure_category_raw": "rate_limited",
+        }
+        db_session.add(smoke_task)
+        await db_session.commit()
+        await db_session.refresh(smoke_task)
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "smoketest_task_failed_rate_limited"
+
+        await db_session.refresh(version)
+        assert (
+            version.last_qualification["error"] == "smoketest_task_failed_rate_limited"
+        )
+
+    @pytest.mark.asyncio
+    async def test_infra_failure_dispatches_external_webhook(self, db_session, mocker):
+        """_handle_infra_failure fires an external webhook with RELEASE_INFRA_FAILURE."""
+        import asyncio
+
+        dispatch_mock = AsyncMock()
+        mocker.patch(
+            "app.release_qualifier_infra.dispatch_external_notification",
+            dispatch_mock,
+        )
+
+        project, version = await _make_project_and_version(db_session)
+        await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.FAILED,
+            smoke_status=TaskStatus.COMPLETED,
+        )
+
+        await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+        # Drain ensure_future'd coroutine.
+        await asyncio.sleep(0)
+
+        dispatch_mock.assert_called_once()
+        call_args = dispatch_mock.call_args
+        assert call_args[0][1] == "RELEASE_INFRA_FAILURE"
+        payload = call_args[0][2]
+        assert payload["consecutive_infra_errors"] >= 1
+        assert "version_number" in payload
+        assert "infra_error" in payload
+
+    @pytest.mark.asyncio
+    async def test_infra_failure_streak_in_webhook_payload(self, db_session, mocker):
+        """Webhook payload carries the correct consecutive_infra_errors streak count."""
+        import asyncio
+
+        dispatch_mock = AsyncMock()
+        mocker.patch(
+            "app.release_qualifier_infra.dispatch_external_notification",
+            dispatch_mock,
+        )
+
+        project, version = await _make_project_and_version(db_session)
+        await _seed_infra_failure_children(
+            db_session,
+            project,
+            version,
+            audit_status=TaskStatus.FAILED,
+            smoke_status=TaskStatus.COMPLETED,
+            prior_infra_streak=1,
+        )
+
+        await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+        await asyncio.sleep(0)
+
+        dispatch_mock.assert_called_once()
+        payload = dispatch_mock.call_args[0][2]
+        assert payload["consecutive_infra_errors"] == 2
+
+    @pytest.mark.asyncio
+    async def test_audit_rate_limited_respawns_new_task(self, db_session):
+        """FAILED audit classified RATE_LIMIT → respawn, not infra_failure.
+
+        A transient rate-limit failure must not pollute the consecutive_infra_errors
+        streak or waste the candidate_sha snapshot.  The qualifier re-spawns a new
+        audit task carrying the same candidate_sha and returns
+        status='audit_rate_limit_respawned' instead of routing to _handle_infra_failure.
+        """
+        from app.failure_classification import RATE_LIMIT, persist_failure_category
+
+        project, version = await _make_project_and_version(db_session)
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[
+                {
+                    "type": "release_audit",
+                    "base_branch": "main",
+                    "diff_range": "main...abcd1234",
+                    "candidate_sha": "abcd1234" * 5,
+                }
+            ],
+            vm_instance_id="vm-audit-rate-limited",
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        persist_failure_category(audit_task, RATE_LIMIT)
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        original_audit_id = str(audit_task.id)
+        candidate = "abcd1234" * 5
+
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": original_audit_id,
+            "smoketest_task_id": None,
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # Returns the respawn status, not infra_failure.
+        assert result["status"] == "audit_rate_limit_respawned"
+        assert result["respawn_count"] == 1
+
+        # last_qualification carries the new audit_task_id and the counter.
+        await db_session.refresh(version)
+        new_qual = version.last_qualification
+        assert new_qual["audit_rl_respawn_count"] == 1
+        assert new_qual["audit_task_id"] != original_audit_id
+
+        # No QualificationVerdict row — verdict was not rendered.
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+        # No infra_failure ProjectMessage — this is a transient respawn, not a
+        # hard pipeline failure.
+        infra_msg_count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.context["event_type"].as_string()
+                    == "release_infra_failure",
+                )
+            )
+        ).scalar()
+        assert infra_msg_count == 0
+
+    @pytest.mark.asyncio
+    async def test_audit_rate_limited_cap_exceeded_routes_to_infra_failure(
+        self, db_session
+    ):
+        """When audit_rl_respawn_count hits _MAX_AUDIT_RL_RESPAWNS, fall through to
+        infra_failure with label 'audit_rate_limit_respawn_cap_exceeded'."""
+        from app.failure_classification import RATE_LIMIT, persist_failure_category
+        from app.release_qualifier_finalize import _MAX_AUDIT_RL_RESPAWNS
+
+        project, version = await _make_project_and_version(db_session)
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[
+                {
+                    "type": "release_audit",
+                    "base_branch": "main",
+                    "diff_range": "main...cafe5678",
+                    "candidate_sha": "cafe5678" * 5,
+                }
+            ],
+            vm_instance_id="vm-audit-rl-cap",
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        persist_failure_category(audit_task, RATE_LIMIT)
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "cafe5678" * 5,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_task_id": None,
+            "prior_infra_streak": 0,
+            # At the cap — next failure must route to infra_failure.
+            "audit_rl_respawn_count": _MAX_AUDIT_RL_RESPAWNS,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_rate_limit_respawn_cap_exceeded"
+
+        await db_session.refresh(version)
+        assert version.phase == "stabilize"
+        assert version.last_qualification["status"] == "infra_failure"
+        assert (
+            version.last_qualification["error"]
+            == "audit_rate_limit_respawn_cap_exceeded"
+        )
+
+    # -----------------------------------------------------------------------
+    # Malformed audit artifact shapes — each must produce either a real verdict
+    # OR an infra_failure; never both, never neither, never a silent clean score.
+    # -----------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_empty_dict_audit_report_routes_to_infra_failure(self, db_session):
+        """audit_report = {} (empty dict) must route to infra_failure.
+
+        Without the empty-dict guard _score_audit() returns (1.0, 1.0) with no
+        deductions applied — a silent clean score.  Verify infra_failure is
+        returned and no QualificationVerdict row is written."""
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={},
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "smoke-ok", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_report_empty_dict"
+
+        await db_session.refresh(version)
+        assert version.last_qualification["status"] == "infra_failure"
+        assert version.last_qualification["error"] == "audit_report_empty_dict"
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_findings_list_no_audit_score_field_reaches_verdict(self, db_session):
+        """audit_report = {"findings": []} with no audit_score field reaches a verdict.
+
+        An empty findings list with no self-reported score is a legitimately
+        clean audit — _audit_missing_reason returns "audit_score_null_no_findings"
+        which does NOT trigger infra_failure.  A QualificationVerdict row is
+        written and the audit sub-score is 1.0 (no deductions applied)."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={
+                # Deliberately omit "audit_score" — this is the variant under test.
+                "findings": [],
+                "test_erosion": {
+                    "deleted_test_files": [],
+                    "assertion_delta": 0,
+                    "test_count_delta": 0,
+                },
+            },
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "smoke-ok", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] != "infra_failure", (
+            f"empty-findings-no-score mis-routed as infra_failure: {result}"
+        )
+
+        await db_session.refresh(version)
+        qual = version.last_qualification
+        assert qual.get("audit_missing_reason") == "audit_score_null_no_findings"
+        assert qual["sub_scores"]["audit"] == 1.0
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 1, f"expected 1 QualificationVerdict row, got {count}"
+
+    @pytest.mark.asyncio
+    async def test_findings_entries_no_severity_routes_to_infra_failure(
+        self, db_session
+    ):
+        """audit_report with findings that have no severity/level field → infra_failure.
+
+        A single finding dict missing severity/level is "parseable_but_unscoreable" —
+        the agent produced structured output but _score_audit() cannot apply any
+        deduction.  No QualificationVerdict row is written."""
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={
+                "findings": [{"description": "finding with no severity field"}],
+                "test_erosion": {"deleted_test_files": [], "assertion_delta": 0},
+            },
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "smoke-ok", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_report_parseable_but_unscoreable"
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_issues_key_equivalent_to_findings_reaches_verdict(self, db_session):
+        """audit_report with "issues" key (not "findings") reaches a real verdict.
+
+        The "issues" fallback is recognized by _score_audit and _audit_missing_reason.
+        A low-severity finding applies a deduction so audit_score < 1.0 (not a
+        silent clean score).  A QualificationVerdict row is written."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={
+                "issues": [{"severity": "low", "description": "minor style nit"}],
+                "test_erosion": {
+                    "deleted_test_files": [],
+                    "assertion_delta": 0,
+                    "test_count_delta": 0,
+                },
+            },
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "smoke-ok", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] != "infra_failure", (
+            f"issues-key audit incorrectly routed as infra_failure: {result}"
+        )
+
+        await db_session.refresh(version)
+        qual = version.last_qualification
+        # Low-severity finding deducts 0.02 → audit score 0.98 < 1.0.
+        assert qual["sub_scores"]["audit"] < 1.0, (
+            f"expected deduction from low-severity finding, "
+            f"got {qual['sub_scores']['audit']}"
+        )
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 1, f"expected 1 QualificationVerdict row, got {count}"
+
+    @pytest.mark.asyncio
+    async def test_findings_wrong_type_routes_to_infra_failure(self, db_session):
+        """audit_report = {"findings": "not-a-list"} routes to infra_failure.
+
+        A "findings" key whose value is not a list causes _score_audit() to fall
+        through to the "issues" fallback (also absent here), yielding a silent
+        clean 1.0 without the wrong-type guard.  Verify infra_failure is returned
+        and no QualificationVerdict row is written."""
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={
+                "findings": "not-a-list",
+                "test_erosion": {"deleted_test_files": [], "assertion_delta": 0},
+            },
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "smoke-ok", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_report_findings_wrong_type"
+
+        await db_session.refresh(version)
+        assert version.last_qualification["status"] == "infra_failure"
+        assert version.last_qualification["error"] == "audit_report_findings_wrong_type"
+
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0
+
+
+# ===========================================================================
+# _finalize_qualification — reaper-induced heartbeat timeout
+# ===========================================================================
+
+
+class TestReaperInducedAuditHeartbeatTimeout:
+    """Regression guard: reaper-reaped release_audit routes to infra_failure.
+
+    Exercises the full reaper → finalize pipeline to catch regressions where
+    a reaped audit task silently creates a QualificationVerdict with
+    sub_scores.audit=0 (the 0.00 collapse) or crashes during finalization.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reaper_heartbeat_timeout_routes_to_infra_failure(self, db_session):
+        """Heartbeat-stale audit reaped as FAILED → infra_failure, no verdict.
+
+        Five assertions (matching the task contract):
+          (a) status is infra_failure, not not_promoted / dry_run.
+          (b) No QualificationVerdict row is created.
+          (c) Version remains open with phase=stabilize.
+          (d) Error label carries the heartbeat_timeout enrichment so the
+              operator can distinguish a VM heartbeat death from a code-defect
+              failure.
+          (e) consecutive_infra_errors is incremented (0 prior → 1).
+        """
+        from datetime import timedelta
+
+        from app.failure_classification import persist_failure_category
+        from app.reaper import _heartbeat_stale_cutoff
+        from app.time_utils import _utcnow
+
+        project, version = await _make_project_and_version(
+            db_session, phase="stabilize"
+        )
+
+        now = _utcnow()
+        # 400 s exceeds the default small-scope heartbeat-stale cutoff (300 s).
+        stale_heartbeat = now - timedelta(seconds=400)
+
+        # Seed an IN_PROGRESS release_audit task with a stale last_heartbeat,
+        # simulating an agent VM that stopped heartbeating before the reaper swept.
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[
+                {"type": "release_audit", "base_branch": "main", "scope": "small"}
+            ],
+            vm_instance_id="vm-audit-heartbeat-timeout",
+            status=TaskStatus.IN_PROGRESS,
+            last_heartbeat=stale_heartbeat,
+            context={
+                "release_version_id": str(version.id),
+                # Simulates an agent that reported its failure category before dying
+                # (e.g. via the agent_status endpoint before the VM was killed).
+                "agent_failure_category_raw": "heartbeat_timeout",
+            },
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        # Confirm the seeded heartbeat is stale per the reaper's own cutoff logic.
+        cutoff = _heartbeat_stale_cutoff(audit_task, now)
+        assert stale_heartbeat < cutoff, (
+            f"test precondition: heartbeat {stale_heartbeat} must be before "
+            f"stale cutoff {cutoff} — adjust timedelta if thresholds changed"
+        )
+
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "dead" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_task_id": None,
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Simulate the reaper sweep: mark the task FAILED and record the
+        # failure category (AGENT_TIMEOUT is what the reaper classifies
+        # heartbeat_timeout_post_claim failures as).
+        audit_task.status = TaskStatus.FAILED
+        persist_failure_category(audit_task, "AGENT_TIMEOUT")
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # (a) status is infra_failure, not not_promoted / dry_run.
+        assert result["status"] == "infra_failure", (
+            f"expected infra_failure, got {result['status']}: {result}"
+        )
+
+        # (b) No QualificationVerdict row — the qualifier never rendered a verdict.
+        count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        ).scalar()
+        assert count == 0, f"expected 0 QualificationVerdict rows, got {count}"
+
+        # (c) Version remains open with phase=stabilize.
+        await db_session.refresh(version)
+        assert version.status == "open"
+        assert version.phase == "stabilize"
+
+        # (d) Error label carries the heartbeat_timeout enrichment from
+        #     agent_failure_category_raw — distinguishes VM heartbeat death
+        #     from code-defect failures in operator notifications.
+        assert "audit_task_failed" in result["error"], (
+            f"expected 'audit_task_failed' prefix, got {result['error']!r}"
+        )
+        assert "heartbeat_timeout" in result["error"], (
+            f"expected 'heartbeat_timeout' enrichment in error label, "
+            f"got {result['error']!r}"
+        )
+
+        # (e) consecutive_infra_errors is incremented (0 prior → 1).
+        assert result["consecutive_infra_errors"] == 1
+
+
+# ===========================================================================
+# _finalize_qualification — happy-path audit_score regression
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_finalize_happy_path_audit_score_high(db_session, mocker):
+    """Happy path: a COMPLETED audit with clean findings yields audit sub-score ≥ 0.7.
+
+    Regression guard for the 0.00-collapse finding: ensures that a real
+    COMPLETED audit task whose RELEASE_AUDIT_REPORT artifact carries a small
+    number of low-severity findings produces a high composite with no blocker.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.9,
+            "findings": [
+                {
+                    "severity": "low",
+                    "summary": "Minor style issue.",
+                    "file": "app/foo.py",
+                },
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 3,
+                "test_count_delta": 1,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "smoke-a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run", f"expected dry_run, got {result['status']}"
+    assert result["would_promote"] is True
+
+    # sub_scores are stored in the persisted last_qualification record.
+    await db_session.refresh(version)
+    qual = version.last_qualification
+    assert qual["sub_scores"]["audit"] >= 0.7, (
+        f"audit sub-score collapsed to {qual['sub_scores']['audit']}, expected ≥ 0.7"
+    )
+    assert qual.get("blocker") is None, f"unexpected blocker: {qual.get('blocker')}"
+
+
+@pytest.mark.asyncio
+async def test_finalize_quality_blocker_four_critical_findings(db_session, mocker):
+    """Quality blocker: 4 critical findings yield a quality verdict (not infra_failure).
+
+    Ensures that a COMPLETED audit task with a 0.00 audit_score from real
+    findings is recorded as a quality verdict and the strategic agent can target
+    the findings list — not mis-routed as infra_failure.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.0,
+            "findings": [
+                {
+                    "severity": "critical",
+                    "summary": f"SQL injection {i}.",
+                    "file": "app/db.py",
+                    "verification_note": f"Read app/db.py lines {i * 10 + 5}-{i * 10 + 15}: user input from request body reaches cursor.execute f-string at line {i * 10 + 12} without parameterisation.",
+                }
+                for i in range(4)
+            ],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "smoke-b", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Must be a quality verdict (not_promoted), NOT an infra_failure.
+    assert result["status"] == "not_promoted", (
+        f"expected not_promoted quality verdict, got {result['status']}"
+    )
+    assert result["status"] != "infra_failure"
+
+    # A QualificationVerdict row must be written (quality path, not infra path).
+    count = (
+        await db_session.execute(
+            select(sa_func.count()).where(
+                QualificationVerdict.release_version_id == version.id
+            )
+        )
+    ).scalar()
+    assert count == 1, f"expected 1 QualificationVerdict row, got {count}"
+
+    # sub_scores and findings are persisted in last_qualification.
+    await db_session.refresh(version)
+    qual = version.last_qualification
+    assert qual["sub_scores"]["audit"] == pytest.approx(0.0), (
+        f"expected audit sub-score 0.0 (4 critical findings), got {qual['sub_scores']['audit']}"
+    )
+    # Findings must be captured so the strategic agent can target them.
+    findings = qual.get("audit_findings", [])
+    assert len(findings) > 0, (
+        "expected audit_findings in last_qualification for strategic agent"
+    )
 
 
 # ===========================================================================
@@ -4213,6 +6068,110 @@ async def test_sweep_commits_each_version_independently(db_session, mocker):
     # Version B stays pending — its finalize failed and rolled back cleanly.
     await db_session.refresh(version_b)
     assert version_b.last_qualification["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_sweep_finalize_crash_increments_streak(db_session, mocker):
+    """A single finalize crash increments sweep_crash_streak by 1 but does NOT
+    force-finalize — self-recovery fires only after _MAX_SWEEP_CRASH_STREAK
+    consecutive crashes.  The version stays pending and will be retried."""
+    project, version = await _make_project_and_version(db_session)
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+
+    mocker.patch.object(
+        rq,
+        "_finalize_qualification",
+        new=AsyncMock(side_effect=RuntimeError("simulated finalize crash")),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert count == 0  # crash was caught; nothing finalized on this sweep
+
+    await db_session.refresh(version)
+    qual = version.last_qualification
+    assert qual is not None
+    assert qual.get("status") == "pending"  # NOT force-finalized yet
+    assert qual.get("sweep_crash_streak") == 1  # streak incremented once
+
+
+@pytest.mark.asyncio
+async def test_sweep_finalize_crash_loop_force_finalizes_and_alerts(db_session, mocker):
+    """After _MAX_SWEEP_CRASH_STREAK consecutive finalize crashes the sweep
+    force-finalizes the version as not_promoted/sweep_finalize_crash_loop, resets
+    it to the stabilize phase, posts a WARNING Alert, and sends an operator
+    notification — the crash-loop is never invisible to operators."""
+    project, version = await _make_project_and_version(db_session)
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+
+    # Simulate (MAX - 1) prior crashes already recorded.
+    await db_session.refresh(version)
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    version.last_qualification = {
+        **version.last_qualification,
+        "sweep_crash_streak": rq._MAX_SWEEP_CRASH_STREAK - 1,
+    }
+    _flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch.object(
+        rq,
+        "_finalize_qualification",
+        new=AsyncMock(side_effect=RuntimeError("persistent finalize crash")),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    # force-finalize path does not count as a normal finalization
+    assert count == 0
+
+    await db_session.refresh(version)
+    qual = version.last_qualification
+    assert qual is not None
+    assert qual["status"] == "not_promoted"
+    assert qual["blocker"] == "sweep_finalize_crash_loop"
+    assert qual.get("sweep_crash_streak") == 0  # reset after force-finalize
+    assert version.phase == "stabilize"  # returned to stabilize for re-qualification
+
+    # A WARNING Alert must be raised so the crash-loop is visible to operators.
+    alerts = (
+        (await db_session.execute(select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "crash" in alerts[0].title.lower()
+
+    # An operator ProjectMessage must be posted.
+    messages = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert any("crash" in (m.content or "").lower() for m in messages)
 
 
 # ===========================================================================
@@ -6431,8 +8390,9 @@ async def test_finalize_below_threshold_posts_operator_message(db_session):
     shared_state.runtime_config["promotion_enabled"] = True
 
     project, version = await _make_project_and_version(db_session)
-    # audit 0.5 + a half-passing smoketest → composite well under the 0.90 bar,
-    # but no hard blocker (audit present, no test deletion, CI green).
+    # 2 high + 1 low findings → derived audit 0.68, erosion 1.0, smoketest 0.5
+    # (half-passing) → composite 0.722, well under the 0.75 threshold, but no
+    # hard blocker (audit present, no test deletion, CI green).
     await _seed_qualification_children(
         db_session,
         project,
@@ -6444,6 +8404,19 @@ async def test_finalize_below_threshold_posts_operator_message(db_session):
                 "assertion_delta": 0,
                 "test_count_delta": 0,
             },
+            "findings": [
+                {"severity": "low", "summary": "Stale comment in release_scoring."},
+                {
+                    "severity": "high",
+                    "summary": "Unverified retry path.",
+                    "verification_note": "Read app/release_promotion.py lines 40-60: retry loop swallows transient errors with no telemetry, confirmed in diff.",
+                },
+                {
+                    "severity": "high",
+                    "summary": "Missing null check.",
+                    "verification_note": "Read app/release_scoring.py lines 120-135: payload.audit may be None and is dereferenced without guard, confirmed in diff.",
+                },
+            ],
         },
         smoke_logs={
             "passed": True,
@@ -6572,7 +8545,7 @@ async def test_notify_operator_swallows_failure(db_session, mocker):
     release verdict is already decided by the time it runs."""
     _project, version = await _make_project_and_version(db_session)
     mocker.patch(
-        "app.release_qualifier.post_event_message",
+        "app.release_promotion.post_event_message",
         new=AsyncMock(side_effect=RuntimeError("messaging is down")),
     )
     # Must return normally despite post_event_message raising.
@@ -7590,7 +9563,7 @@ async def test_verdict_recording_failure_does_not_propagate(db_session, mocker):
 
     # Make the verdict-row construction blow up — recording must swallow it.
     mocker.patch(
-        "app.release_qualifier.QualificationVerdict",
+        "app.release_promotion.QualificationVerdict",
         side_effect=RuntimeError("boom — cannot build verdict row"),
     )
 
@@ -7906,6 +9879,66 @@ async def test_readiness_excludes_promotion_enabled_verdicts(db_session):
 
     assert out["verdicts_evaluated"] == 5
     assert out["ready"] is True, out["reason"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_surfaces_infra_failure_count_and_reason(db_session):
+    """When the only recent qualification is an infra_failure, the readiness
+    summary surfaces infra_failure_count >= 1, consecutive_infra_errors >= 1,
+    and a reason that distinguishes 'broken pipeline' from 'never ran'.
+
+    This is the anti-silent-collapse guard: operators must be able to tell the
+    difference between 'qualifier has not run' and 'qualifier is thrashing on
+    infrastructure'."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+
+    # Stamp the version's last_qualification as an infra_failure with a streak.
+    from sqlalchemy.orm.attributes import flag_modified
+
+    version.last_qualification = {
+        "status": "infra_failure",
+        "consecutive_infra_errors": 3,
+        "reason": "audit_report_missing",
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    # No QualificationVerdict rows were written — infra failures don't write them.
+    assert out["verdicts_evaluated"] == 0
+    assert out["infra_failure_count"] == 1
+    assert out["consecutive_infra_errors"] == 3
+    assert "infrastructure failures" in out["reason"]
+    assert out["ready"] is False
+
+
+@pytest.mark.asyncio
+async def test_readiness_consecutive_infra_errors_from_pending_prior_streak(db_session):
+    """When the latest last_qualification is 'pending' (a new run just started
+    after a streak of infra failures), consecutive_infra_errors is sourced from
+    prior_infra_streak on the pending record rather than from the previous infra
+    failure record."""
+    project, version = await _make_project_and_version(db_session)
+    await _ensure_verdict_table(db_session)
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    version.last_qualification = {
+        "status": "pending",
+        "prior_infra_streak": 2,
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    out = await rq.compute_promotion_readiness(db_session, project.id)
+
+    assert out["consecutive_infra_errors"] == 2
+    # infra_failure_count counts only infra_failure status rows, not pending.
+    assert out["infra_failure_count"] == 0
 
 
 # ===========================================================================
@@ -9373,3 +11406,257 @@ async def test_pending_auto_merge_pr_ci_pending_not_reconciled(db_session, mocke
     assert version.status == "open"
     assert version.last_qualification["status"] == "pending"
     assert "promotion_pending" in version.last_qualification
+
+
+# ===========================================================================
+# Per-project branch resolution — _lts_branch_names must use project columns
+# ===========================================================================
+
+
+async def _make_project_and_version_custom_branches(
+    db_session,
+    *,
+    integration_branch: str,
+    promotion_target: str,
+    phase: str = "stabilize",
+):
+    """Create a project with non-default branch columns and an open version."""
+    project = Project(
+        name="custom-branch-project",
+        user_id="cb-user",
+        github_owner="acme",
+        github_repo="custom",
+        integration_branch=integration_branch,
+        promotion_target=promotion_target,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    from app import release_version as _rv
+
+    version = await _rv.open_version(db_session, project.id, version_number=1)
+    if phase != "build":
+        _rv.set_version_phase(version, phase, reasoning="test setup")
+        db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return project, version
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_uses_project_integration_branch(db_session, mocker):
+    """run_qualification must snapshot the candidate SHA from the project's
+    configured integration_branch, not the global runtime_config default.
+
+    A project with integration_branch='trunk' should call github.get_branch_sha
+    with 'trunk', never with 'main' (the global default).
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+
+    project, version = await _make_project_and_version_custom_branches(
+        db_session,
+        integration_branch="trunk",
+        promotion_target="release",
+        phase="stabilize",
+    )
+
+    candidate = "trunk1ca" * 5  # 40-char placeholder SHA
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+
+    branch_sha_calls: list[str] = []
+
+    async def _branch_sha(token, owner, repo, branch, **kwargs):
+        branch_sha_calls.append(branch)
+        return candidate
+
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(side_effect=_branch_sha))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    assert result["candidate_sha"] == candidate
+
+    # The integration_branch snapshot call must use 'trunk', not 'main'.
+    assert "trunk" in branch_sha_calls, (
+        f"Expected get_branch_sha call for 'trunk' but got calls: {branch_sha_calls}"
+    )
+    assert "main" not in branch_sha_calls, (
+        "Got unexpected call for 'main' — should use per-project integration_branch"
+    )
+
+
+@pytest.mark.asyncio
+async def test_smoketest_payload_uses_project_integration_branch(db_session, mocker):
+    """The qualifier-smoketest payload's base_branch must equal the project's
+    configured integration_branch, not the global runtime_config default.
+
+    A project with integration_branch='trunk' should produce a smoketest task
+    whose payload.base_branch == 'trunk'.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = True
+
+    project, version = await _make_project_and_version_custom_branches(
+        db_session,
+        integration_branch="trunk",
+        promotion_target="release",
+        phase="stabilize",
+    )
+
+    candidate = "smktrunk" * 5  # 40-char SHA
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    assert result["smoketest_enabled"] is True
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    by_type = {(t.first_payload or {}).get("type"): t for t in tasks}
+    smoke_task = by_type.get("smoketest")
+    assert smoke_task is not None, "Smoketest task was not spawned"
+
+    # base_branch must be the per-project integration_branch, not 'main'.
+    assert smoke_task.first_payload["base_branch"] == "trunk", (
+        f"Expected base_branch='trunk' but got {smoke_task.first_payload['base_branch']!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_candidate_already_on_main_uses_project_promotion_target(
+    db_session, mocker
+):
+    """_candidate_already_on_main must check ancestry against the project's
+    configured promotion_target, not the global runtime_config default.
+
+    A project with promotion_target='release' should call github.is_ancestor_of
+    with 'release' as the descendant branch, not 'main'.
+    """
+    project, version = await _make_project_and_version_custom_branches(
+        db_session,
+        integration_branch="trunk",
+        promotion_target="release",
+        phase="build",
+    )
+
+    candidate = "chkancst" * 5  # 40-char SHA
+
+    ancestor_calls: list[str] = []
+
+    async def _is_ancestor(token, owner, repo, sha, branch, **kwargs):
+        ancestor_calls.append(branch)
+        return True
+
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(side_effect=_is_ancestor))
+
+    result = await rq._candidate_already_on_main(
+        "gh-token",
+        "acme",
+        "custom",
+        candidate,
+        version,
+        project=project,
+    )
+
+    assert result is True
+    assert ancestor_calls == ["release"], (
+        f"Expected is_ancestor_of called with 'release' but got: {ancestor_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_promotion_failed_uses_project_promotion_target(
+    db_session, mocker
+):
+    """When a promotion_failed version is reconciled (candidate landed on main
+    out-of-band), promoted_sha is resolved from the project's promotion_target
+    branch, not the global runtime_config default.
+
+    A project with promotion_target='release' should call get_branch_sha with
+    'release' to resolve the promoted merge commit SHA.
+    """
+    project, version = await _make_project_and_version_custom_branches(
+        db_session,
+        integration_branch="trunk",
+        promotion_target="release",
+        phase="build",
+    )
+
+    candidate_sha = "rcnclfld" * 5  # 40 chars
+    release_head_sha = "rlsehead" * 5  # 40 chars
+
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": candidate_sha,
+        "error": "merge_blocked",
+        "confidence": 0.9,
+        "sub_scores": {},
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    # Candidate is now on the promotion_target branch (operator merged it).
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+
+    branch_sha_calls: list[str] = []
+
+    async def _branch_sha(token, owner, repo, branch, **kwargs):
+        branch_sha_calls.append(branch)
+        return release_head_sha
+
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(side_effect=_branch_sha))
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value=None))
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 1
+
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.promoted_sha == release_head_sha
+
+    # promoted_sha must be resolved from the per-project promotion_target.
+    assert "release" in branch_sha_calls, (
+        f"Expected get_branch_sha call for 'release' but got: {branch_sha_calls}"
+    )
+    assert "main" not in branch_sha_calls, (
+        "Got unexpected 'main' branch call — should use per-project promotion_target"
+    )

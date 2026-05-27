@@ -512,6 +512,7 @@ _ALL_GENERIC_CODE_ERROR_LABELS: frozenset[str] = frozenset(
         "fatal",
         "incomplete",
         "agent_self_failed",
+        "parse_failed",
     }
 )
 
@@ -548,6 +549,27 @@ def _persist_rate_limit_signal_context(task: "Task", signal) -> None:
         task.context = ctx
     except Exception:
         logger.exception("[FAILURE_CLASS] Failed to persist rate_limit_* keys")
+
+
+def _persist_correlation_reclassification_context(task: "Task") -> None:
+    """Persist a marker on task.context when RATE_LIMIT is inferred via account/pool
+    correlation with no text/keyword signal matched.
+
+    Writes rate_limit_kind="unknown" (if not already set) and
+    rate_limit_correlation_reclassified=True so operators and downstream digest
+    consumers can distinguish correlation-based reclassifications from text-matched ones,
+    and so the cooldown bookkeeping path has a rate_limit_kind value to act on.
+    """
+    try:
+        ctx = dict(task.context or {})
+        if "rate_limit_kind" not in ctx:
+            ctx["rate_limit_kind"] = "unknown"
+        ctx["rate_limit_correlation_reclassified"] = True
+        task.context = ctx
+    except Exception:
+        logger.exception(
+            "[FAILURE_CLASS] Failed to persist correlation reclassification marker"
+        )
 
 
 def _account_was_rate_limited(task: "Task", at_time: "datetime | None" = None) -> bool:
@@ -599,20 +621,37 @@ def _account_was_rate_limited(task: "Task", at_time: "datetime | None" = None) -
         return False
 
 
-def _pool_was_rate_limited(at_time: "datetime | None" = None) -> bool:
-    """Return True if the entire account pool was in rate-limit cooldown.
+def _pool_was_rate_limited(
+    task: "Task | None" = None, at_time: "datetime | None" = None
+) -> bool:
+    """Return True if the eligible account pool was in rate-limit cooldown.
 
-    Complements _account_was_rate_limited for the pre-assignment case (task died
-    before an account was assigned) and the healthy-account-but-blocked-pool case.
+    Scopes the check to the candidate set the task could actually dispatch to:
+    - providers: the task's routed provider (when resolvable from context)
+    - model: the task's routed model (when stored in context)
+    - user_id: the user who owns the task's assigned account (when assigned)
+
+    Prevents accounts for unrelated users or providers from changing the verdict.
+    Falls back to the global pool when task is None or context is missing.
     Never raises — returns False with a debug log on any error.
     """
     try:
-        from app.max_plan_pool import pool_wide_rate_limit_cooldown
+        from app.max_plan_pool import (
+            get_task_rate_limit_scope,
+            pool_wide_rate_limit_cooldown,
+        )
 
         norm_time = at_time
         if norm_time is not None and getattr(norm_time, "tzinfo", None) is not None:
             norm_time = norm_time.replace(tzinfo=None)
-        result = pool_wide_rate_limit_cooldown(at_time=norm_time)
+        scope = get_task_rate_limit_scope(task) if task is not None else {}
+
+        result = pool_wide_rate_limit_cooldown(
+            at_time=norm_time,
+            providers=scope.get("providers"),
+            model=scope.get("model"),
+            user_id=scope.get("user_id"),
+        )
         if not result:
             logger.debug(
                 "[FAILURE_CLASS] pool_wide_rate_limit_cooldown: pool not fully blocked"
@@ -732,21 +771,36 @@ def persist_failure_category(
         )
 
 
-def normalize_agent_failure_category(raw: str | None, task: "Task") -> str:
+def normalize_agent_failure_category(
+    raw: str | None,
+    task: "Task",
+    *,
+    at_time: "datetime | None" = None,
+    db_rl_override: bool = False,
+) -> str:
     """Canonicalize an agent-reported ``failure_category`` label to an uppercase class name.
 
     The agent posts lowercase short labels (``rate_limited``, ``claude_code_failed``, …)
     but every consumer (rollups, dedup, analytics) compares against the uppercase
     canonical names. Normalize at the write boundary so the rest of the system sees
     a single vocabulary.
+
+    at_time: reference timestamp for rate-limit cooldown checks. Pass
+    ``task.last_heartbeat`` (the failure instant) so a lag between failure and
+    report time cannot cause a now-elapsed cooldown to be missed.
+
+    db_rl_override: pre-computed result of a durable DB rate-limit check. Pass
+    True when the caller has already confirmed (via db_account_was_rate_limited)
+    that the account was in cooldown at at_time, even if the in-memory pool
+    shows no cooldown (cross-instance case). Defaults to False (no override).
     """
     if not raw:
-        return classify_failure(task)
+        return classify_failure(task, at_time=at_time, db_rl_override=db_rl_override)
     label = raw.strip()
     label_lower = label.lower()
     mapped = _AGENT_CATEGORY_TO_CLASS.get(label_lower)
     if mapped:
-        if mapped == CODE_ERROR and label_lower in _GENERIC_AGENT_CODE_LABELS:
+        if mapped == CODE_ERROR and label_lower in _ALL_GENERIC_CODE_ERROR_LABELS:
             combined = (task.latest_status_message or "").lower()
             override = _text_provider_failure_override(task, combined)
             if override:
@@ -756,8 +810,13 @@ def normalize_agent_failure_category(raw: str | None, task: "Task") -> str:
         if (
             mapped == CODE_ERROR
             and label_lower in _ALL_GENERIC_CODE_ERROR_LABELS
-            and (_account_was_rate_limited(task) or _pool_was_rate_limited())
+            and (
+                db_rl_override
+                or _account_was_rate_limited(task, at_time=at_time)
+                or _pool_was_rate_limited(task, at_time=at_time)
+            )
         ):
+            _persist_correlation_reclassification_context(task)
             return RATE_LIMIT
         return mapped
     if label in INFRA_CLASSES or label == CODE_ERROR:
@@ -767,7 +826,7 @@ def normalize_agent_failure_category(raw: str | None, task: "Task") -> str:
         raw,
         getattr(task, "id", "?"),
     )
-    return classify_failure(task)
+    return classify_failure(task, at_time=at_time, db_rl_override=db_rl_override)
 
 
 # AGENT_TIMEOUT sub-types — finer breakdown of the catch-all timeout class so
@@ -1057,6 +1116,7 @@ def _spawn_bg_task(coro) -> None:
     task = loop.create_task(coro)
     _residual_bg_tasks.add(task)
     task.add_done_callback(_residual_bg_tasks.discard)
+
 
 _RE_UUID = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
@@ -1501,10 +1561,15 @@ def get_account_failure_class_counts(
 
 
 def classify_failure_with_confidence(
-    task: "Task", logs: str | None = None, at_time: "datetime | None" = None
+    task: "Task",
+    logs: str | None = None,
+    at_time: "datetime | None" = None,
+    db_rl_override: bool = False,
 ) -> FailureClassification:
     """Classify a failure and return a cheap rule-derived confidence score."""
-    failure_class = _classify_failure_class(task, logs, at_time=at_time)
+    failure_class = _classify_failure_class(
+        task, logs, at_time=at_time, db_rl_override=db_rl_override
+    )
     agent_category = (task.context or {}).get("failure_category")
     combined = (
         (task.latest_status_message or "").lower() + " " + (logs or "").lower()
@@ -1564,8 +1629,24 @@ def classify_failure_with_confidence(
     return FailureClassification(failure_class=failure_class, confidence=0.7)
 
 
+def persist_authoritative_verdict(task: "Task", failure_class: str) -> None:
+    """Persist the authoritative failure verdict to task.context['failure_class'].
+
+    Call this from authoritative classification sites (reaper, agent_status) at
+    the failure instant so analytics paths that invoke classify_failure() hours
+    later short-circuit to the same verdict without re-running rate-limit
+    correlation against post-cooldown account state.
+    """
+    ctx = dict(task.context or {})
+    ctx["failure_class"] = failure_class
+    task.context = ctx
+
+
 def _classify_failure_class(
-    task: "Task", logs: str | None = None, at_time: "datetime | None" = None
+    task: "Task",
+    logs: str | None = None,
+    at_time: "datetime | None" = None,
+    db_rl_override: bool = False,
 ) -> str:
     """Classify a task failure for deployment monitoring.
     Returns: CODE_ERROR, PROVISION_FAILURE, AGENT_TIMEOUT, EXTERNAL_API,
@@ -1583,13 +1664,15 @@ def _classify_failure_class(
 
     # Authoritative LLM rate-limit signal from the Claude Code CLI: the agent
     # emits a structured ``{"type":"rate_limit_event", ...}`` line in its output
-    # when the provider rate-limits the request. Preempts the agent_category
-    # fast path because a downstream task handler (memo, audit, investigate,
-    # …) can preempt-write its own CODE_ERROR label when the agent dies
-    # mid-stream — e.g. the memo handler reports
+    # when the provider rate-limits the request. Must run before both the
+    # persisted failure_class short-circuit and the agent_category fast path
+    # because a downstream task handler (memo, audit, investigate, …) can
+    # preempt-write its own CODE_ERROR verdict when the agent dies mid-stream
+    # — e.g. the memo handler reports
     # ``exitCode=1, "couldn't extract JSON"`` because the agent never produced
-    # the required output. Without this check, that CODE_ERROR label takes the
-    # fast path → no account blacklist → retry hits the same dead account →
+    # the required output. Without this check, that generic CODE_ERROR verdict
+    # takes the short-circuit / fast path → no account blacklist → retry hits
+    # the same dead account →
     # 3 strikes → terminal FAIL. Incident 2026-05-24: 5 tasks terminal-failed
     # this way when 3 Claude accounts weekly-burned at once.
     _classify_combined_lower = (
@@ -1597,6 +1680,35 @@ def _classify_failure_class(
     )
     if '"type":"rate_limit_event"' in _classify_combined_lower:
         return RATE_LIMIT
+
+    # Belt-and-suspenders for the Codex `exitCode=0` mid-turn silent-death
+    # failure mode (cause C, 2026-05-26). The Codex CLI (gpt-5.4-mini) emits
+    # `{"type":"thread.started"}` + `{"type":"turn.started"}` to stdout, then
+    # exits CLEAN before reaching `turn.completed`. This is an upstream
+    # OpenAI-side disconnect (token cap / silent refusal / 5xx) that the CLI
+    # swallows as success. The memo handler now reclassifies on its own
+    # (see agent/src/handlers/memo.ts), but mirror the override here so any
+    # other Codex consumer that forgets the agent-side fix still routes
+    # through EXTERNAL_API (proper backoff) instead of CODE_ERROR (burns
+    # retries). Bounded by len < 8KB because a real CLI death produces only
+    # the Claude/Codex init banner — anything larger means actual work output
+    # and the parse_failed/code_error label is probably correct.
+    if (
+        len(_classify_combined_lower) < 8192
+        and '"type":"thread.started"' in _classify_combined_lower
+        and '"type":"turn.completed"' not in _classify_combined_lower
+        and "exitcode=0" in _classify_combined_lower
+    ):
+        return EXTERNAL_API
+
+    # Short-circuit: if reaper/agent_status already persisted the authoritative
+    # verdict at the failure instant via persist_authoritative_verdict(), return
+    # it without re-running stateful rate-limit correlation. The structured
+    # rate_limit_event check above is still safe to run here because it is a
+    # deterministic signal embedded in the task output, not a cooldown lookup.
+    persisted_class = (task.context or {}).get("failure_class")
+    if isinstance(persisted_class, str) and persisted_class:
+        return persisted_class
 
     # Belt-and-suspenders for the Codex `exitCode=0` mid-turn silent-death
     # failure mode (cause C, 2026-05-26). The Codex CLI (gpt-5.4-mini) emits
@@ -1642,9 +1754,11 @@ def _classify_failure_class(
                 if any(kw in combined for kw in _VIEWPORT_PATTERNS):
                     return VIEWPORT_REGRESSION
                 if agent_lower in _ALL_GENERIC_CODE_ERROR_LABELS and (
-                    _account_was_rate_limited(task, at_time=at_time)
-                    or _pool_was_rate_limited(at_time)
+                    db_rl_override
+                    or _account_was_rate_limited(task, at_time=at_time)
+                    or _pool_was_rate_limited(task, at_time=at_time)
                 ):
+                    _persist_correlation_reclassification_context(task)
                     return RATE_LIMIT
             return mapped
         if agent_category in INFRA_CLASSES or agent_category == CODE_ERROR:
@@ -1661,8 +1775,15 @@ def _classify_failure_class(
     # Empty/whitespace-only combined log — agent crashed or never communicated.
     # Check account state FIRST: a silent death during a rate-limit cooldown
     # should classify as RATE_LIMIT, not AGENT_TIMEOUT, so no retry attempt is burned.
+    # Pool-wide check covers pre-assignment deaths (no account assigned yet) and
+    # cross-instance cases where db_rl_override carries the durable DB signal.
     if not combined.strip():
-        if _account_was_rate_limited(task, at_time=at_time):
+        if (
+            db_rl_override
+            or _account_was_rate_limited(task, at_time=at_time)
+            or _pool_was_rate_limited(task, at_time=at_time)
+        ):
+            _persist_correlation_reclassification_context(task)
             return RATE_LIMIT
         return AGENT_TIMEOUT
 
@@ -1929,9 +2050,12 @@ def _classify_failure_class(
     # are most likely throttling-induced; classifying as RATE_LIMIT avoids burning a
     # retry attempt. Pool-wide check fires even when no account was assigned (pre-
     # assignment death) or when the assigned account itself was not flagged.
-    if _account_was_rate_limited(task, at_time=at_time) or _pool_was_rate_limited(
-        at_time
+    if (
+        db_rl_override
+        or _account_was_rate_limited(task, at_time=at_time)
+        or _pool_was_rate_limited(task, at_time=at_time)
     ):
+        _persist_correlation_reclassification_context(task)
         return RATE_LIMIT
 
     # Default: code error — record fingerprint for residual-pattern analysis.
@@ -1943,10 +2067,15 @@ def _classify_failure_class(
 
 
 def classify_failure(
-    task: "Task", logs: str | None = None, at_time: "datetime | None" = None
+    task: "Task",
+    logs: str | None = None,
+    at_time: "datetime | None" = None,
+    db_rl_override: bool = False,
 ) -> str:
     """Backward-compatible shim that returns only the failure class string."""
-    return classify_failure_with_confidence(task, logs, at_time=at_time).failure_class
+    return classify_failure_with_confidence(
+        task, logs, at_time=at_time, db_rl_override=db_rl_override
+    ).failure_class
 
 
 # ---------------------------------------------------------------------------

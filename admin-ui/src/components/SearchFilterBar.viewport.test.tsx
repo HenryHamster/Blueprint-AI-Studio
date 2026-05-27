@@ -45,6 +45,7 @@ describe('SearchFilterBar — viewport regression', () => {
             onDateRangeChange={() => {}}
             blockedFilter={true}
             onBlockedFilterChange={() => {}}
+            onDownloadCsv={() => {}}
           />,
         );
       });
@@ -73,6 +74,7 @@ describe('SearchFilterBar — viewport regression', () => {
             onDateRangeChange={() => {}}
             blockedFilter={true}
             onBlockedFilterChange={() => {}}
+            onDownloadCsv={() => {}}
           />,
         );
       });
@@ -101,6 +103,7 @@ describe('SearchFilterBar — viewport regression', () => {
             onDateRangeChange={() => {}}
             blockedFilter={false}
             onBlockedFilterChange={() => {}}
+            onDownloadCsv={() => {}}
           />,
         );
       });
@@ -129,6 +132,7 @@ describe('SearchFilterBar — viewport regression', () => {
             onDateRangeChange={() => {}}
             blockedFilter={false}
             onBlockedFilterChange={() => {}}
+            onDownloadCsv={() => {}}
           />,
         );
       });
@@ -157,6 +161,7 @@ describe('SearchFilterBar — viewport regression', () => {
             onDateRangeChange={() => {}}
             blockedFilter={true}
             onBlockedFilterChange={() => {}}
+            onDownloadCsv={() => {}}
           />,
         );
       });
@@ -185,6 +190,7 @@ describe('SearchFilterBar — viewport regression', () => {
             onDateRangeChange={() => {}}
             blockedFilter={true}
             onBlockedFilterChange={() => {}}
+            onDownloadCsv={() => {}}
           />,
         );
       });

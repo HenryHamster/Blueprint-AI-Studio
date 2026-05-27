@@ -1656,6 +1656,10 @@ def _patch_common_rollup_mocks(mocker):
     mocker.patch(
         "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
     )
+    # The rollup auto-merge path now runs an Alembic combined-chain guard that
+    # lists the rollup PR's files before merging. Default to "no files touched"
+    # so the guard is a no-op; tests exercising the guard override this.
+    mocker.patch("app.github.get_pr_files", new_callable=AsyncMock, return_value=[])
     # Match callers' PR head_sha ("abc123") so the pre-merge tip-check is a
     # no-op. Tests exercising the behind-state path override this mock.
     mocker.patch(
@@ -2417,8 +2421,12 @@ async def test_rollup_merge_success_clears_transient_counter_state(rollup_db, mo
     await _check_and_trigger_rollup(child, rollup_db)
     await rollup_db.refresh(parent)
 
-    assert parent.status == TaskStatus.COMPLETED
-    assert (parent.context or {}).get("pr_merged") is True
+    # Auto-merge into a non-integration parent branch lands the rollup but is
+    # not the final landing into the integration branch, so the parent stays
+    # EVALUATING and pr_merged is intentionally NOT set (see #5585). The merge
+    # success path must still scrub all transient deferral/retry counters.
+    assert parent.status == TaskStatus.EVALUATING
+    assert (parent.context or {}).get("pr_merged") is None
     # All transient keys must be gone.
     for key in (
         "_merge_deferred_count",
@@ -2751,6 +2759,149 @@ async def test_rollup_behind_update_branch_success_clears_retry_counter(
     )
     assert mock_spawn.await_count == 0, "successful update_branch must skip fix spawn"
     assert "updated branch" in (parent.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_rollup_clean_pr_skips_update_branch_despite_sha_mismatch(
+    rollup_db, mocker
+):
+    """Regression: a rollup PR that GitHub reports as mergeable_state=clean must
+    NOT enter the update-branch recovery path even when head SHA differs from the
+    target-branch tip SHA.  Before the fix, any SHA mismatch unconditionally called
+    update_branch_with_sha_retry; rollup PRs whose heads already contain the base
+    tip (ahead-of-base, not behind) would be spuriously rebased on every sweep."""
+    _patch_common_rollup_mocks(mocker)
+    # Override get_branch_sha so head_sha ("abc123") != target_tip ("deadbeef").
+    # Without the fix this would trigger update_branch; with the fix, the
+    # mergeable_state=clean guard must short-circuit before that call.
+    mocker.patch(
+        "app.github.get_branch_sha", new_callable=AsyncMock, return_value="deadbeef"
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={
+            "additions": 5,
+            "deletions": 5,
+            "state": "open",
+            "merged": False,
+            "mergeable_state": "clean",
+            "head": {"sha": "abc123"},
+        },
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={"blocked": False, "findings": [], "summary": "ok", "report": ""},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "sha": "newsha"},
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock
+    )
+    mock_update = mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new_callable=AsyncMock,
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, None)),
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+
+    assert mock_update.await_count == 0, (
+        "update_branch_with_sha_retry must NOT be called for a clean rollup PR "
+        "even when head SHA differs from the target-branch tip"
+    )
+    assert mock_spawn.await_count == 0, (
+        "no fix task must be spawned for a GitHub-clean rollup PR"
+    )
+    assert "_behind_update_retries" not in (parent.context or {}), (
+        "behind-update retry counter must not be set for a clean-state PR"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rollup_premerge_no_new_commits_clears_counter(rollup_db, mocker):
+    """Pre-merge SHA-mismatch path: when update_branch reports the canonical
+    'no new commits on base' 422 (i.e. not_behind=True), the rollup must clear
+    any prior retry counter and defer to the next sweep without spawning a fix —
+    even when the counter is one short of the budget."""
+    _patch_behind_branch_mocks(
+        mocker,
+        {
+            "updated": False,
+            "not_behind": True,
+            "message": "There are no new commits on the base branch.",
+        },
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, None)),
+    )
+    mock_alert = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+    # Seed counter one short of default budget — even on the edge, a
+    # not_behind result must NOT trip fix-spawn.
+    parent.context = {**(parent.context or {}), "_behind_update_retries": 2}
+    rollup_db.add(parent)
+    await rollup_db.commit()
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+
+    assert "_behind_update_retries" not in (parent.context or {}), (
+        "not_behind result must clear the retry counter"
+    )
+    assert mock_spawn.await_count == 0, (
+        "not_behind result must NOT escalate to fix spawn"
+    )
+    assert mock_alert.await_count == 0
+    msg = (parent.latest_status_message or "").lower()
+    assert "not behind" in msg or "no new commits" in msg
+
+
+@pytest.mark.asyncio
+async def test_rollup_premerge_unrelated_422_still_increments_counter(
+    rollup_db, mocker
+):
+    """Regression guard: a 422 with an UNRELATED message ('Update is not possible')
+    must still increment _behind_update_retries — only the canonical 'no new
+    commits on base' phrase triggers the not_behind short-circuit."""
+    _patch_behind_branch_mocks(
+        mocker,
+        {"updated": False, "message": "Update is not possible"},
+    )
+    mock_spawn = mocker.patch(
+        "app.rollup_management._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, None)),
+    )
+
+    _, parent, child = await _make_rollup_parent_with_completed_child(
+        rollup_db, target_branch="research/parent-xyz"
+    )
+
+    await _check_and_trigger_rollup(child, rollup_db)
+    await rollup_db.refresh(parent)
+
+    assert (parent.context or {}).get("_behind_update_retries") == 1, (
+        "unrelated 422 must still bump the retry counter"
+    )
+    assert mock_spawn.await_count == 0
 
 
 # ── Strategic Completion Handler ─────────────────────────────────────────────

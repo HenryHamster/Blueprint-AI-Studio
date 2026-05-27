@@ -1,6 +1,7 @@
 """Integration tests for /api/admin/digest and /api/admin/activity endpoints."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
@@ -15,13 +16,26 @@ from app.models import (
     ResidualCaseStatus,
     RegressionRemediationCase,
     RegressionCaseStatus,
+    ReleaseVersion,
 )
 from app.routers.admin_analytics import _derive_completed_at
-from app.routers.admin_digest import (
+from app.digest_metrics import (
     _compute_layer_coverage_by_class,
     _compute_symptom_layers_by_class,
     _stash_projected_task_fields,
     _summarize_symptoms_by_layer,
+    compute_digest_cost_economics,
+    compute_digest_trend_history,
+    compute_failure_grouping,
+    compute_narrative_summary,
+    compute_recurring_error_clusters,
+    compute_release_qualifier_infra_metrics,
+    compute_remediation_and_patterns,
+    compute_remediation_funnel,
+    compute_retry_analytics,
+    compute_review_quality_metrics,
+    compute_scope_mismatch_summary,
+    compute_sr_prediction_accuracy,
 )
 from app.sr_blind_spots import aggregate_sr_reviewer_disagreements
 from testing.factories import make_project, make_task, make_membership, _utcnow
@@ -877,6 +891,43 @@ async def test_digest_project_filter(client: AsyncClient, db_session):
     titles = [c["title"] for c in data["recent_completions"]]
     assert "Task A" in titles
     assert "Task B" not in titles
+
+
+def test_compute_failure_grouping_respects_persisted_verdict():
+    """Persisted authoritative verdict is returned by compute_failure_grouping even
+    without at_time, preventing RATE_LIMIT→CODE_ERROR drift for analytics paths."""
+    from app.failure_classification import (
+        RATE_LIMIT,
+        persist_authoritative_verdict,
+    )
+
+    now = _utcnow()
+    heartbeat = now - timedelta(hours=2)
+    window_start = now - timedelta(hours=24)
+
+    task = make_task(
+        status=TaskStatus.FAILED,
+        latest_status_message="claude_code_failed",
+        context={"failure_category": "claude_code_failed"},
+        last_heartbeat=heartbeat,
+    )
+    # Simulate the reaper persisting RATE_LIMIT at the failure instant.
+    persist_authoritative_verdict(task, RATE_LIMIT)
+
+    result = compute_failure_grouping(
+        failed_tasks=[task],
+        error_log_map={},
+        dir_id_to_text={},
+        window_start=window_start,
+        now=now,
+    )
+    groups = {g["failure_class"]: g for g in result["failure_groups"]}
+    assert RATE_LIMIT in groups, (
+        f"Expected RATE_LIMIT group from persisted verdict, got: {list(groups)}"
+    )
+    assert "CODE_ERROR" not in groups, (
+        "classify_failure must not flip RATE_LIMIT→CODE_ERROR in analytics path"
+    )
 
 
 @pytest.mark.asyncio
@@ -2665,6 +2716,164 @@ async def test_narrative_taxonomy_insight_code_defect(client: AsyncClient, db_se
     assert "Code defects dominate failures" in data["narrative_summary"]
 
 
+def _build_narrative_summary(**overrides):
+    base = dict(
+        hours=24,
+        project_id=None,
+        completed_count=0,
+        failed_count=0,
+        pending_approval_count=0,
+        needs_attention=[],
+        failure_groups=[],
+        failure_taxonomy_distribution={
+            "categories": {},
+            "total_failures": 0,
+            "dominant_category": None,
+        },
+        trend=None,
+        completed_delta=0,
+        prev_completed_count=0,
+        sorted_completions=[],
+        sorted_failures=[],
+        direction_progress_list=[],
+        running_count=0,
+        queued_count=0,
+        pr_count=0,
+        error_log_map={},
+        failed_tasks=[],
+    )
+    base.update(overrides)
+    return compute_narrative_summary(**base)
+
+
+def test_compute_narrative_summary_all_clear():
+    completed = [make_task(title="Completed Alpha", status=TaskStatus.COMPLETED)]
+    assert (
+        _build_narrative_summary(
+            completed_count=1,
+            sorted_completions=completed,
+            pr_count=1,
+        )
+        == "All clear — 1 task completed with 1 PR merged, no action needed."
+    )
+
+
+def test_compute_narrative_summary_approval_only():
+    assert (
+        _build_narrative_summary(
+            pending_approval_count=1,
+            needs_attention=[{"reason": "approval_required", "waiting_hours": 2}],
+        )
+        == "1 task awaiting your approval (2h)."
+    )
+
+
+def test_compute_narrative_summary_dominant_code_error_refined():
+    failed_tasks = [
+        make_task(
+            title="Lint Fail 1",
+            status=TaskStatus.FAILED,
+            context={"failure_category": "test_failed"},
+            latest_status_message="pytest failed on test_foo",
+        ),
+        make_task(
+            title="Lint Fail 2",
+            status=TaskStatus.FAILED,
+            context={"failure_category": "test_failed"},
+            latest_status_message="pytest failed on test_bar",
+        ),
+        make_task(
+            title="Lint Fail 3",
+            status=TaskStatus.FAILED,
+            context={"failure_category": "test_failed"},
+            latest_status_message="pytest failed on test_baz",
+        ),
+    ]
+    assert (
+        _build_narrative_summary(
+            failed_count=5,
+            failure_groups=[{"failure_class": "CODE_ERROR", "count": 3}],
+            failure_taxonomy_distribution={
+                "categories": {"review_quality": {"count": 1}},
+                "total_failures": 1,
+                "dominant_category": "review_quality",
+            },
+            failed_tasks=failed_tasks,
+        )
+        == "Most failures (3/5) are code errors from test/lint failures — strengthen self-review before PR creation."
+    )
+
+
+def test_compute_narrative_summary_no_dominant_failure_class():
+    failed_tasks = [
+        make_task(title="Fail A", status=TaskStatus.FAILED),
+        make_task(title="Fail B", status=TaskStatus.FAILED),
+    ]
+    assert (
+        _build_narrative_summary(
+            failed_count=2,
+            failure_groups=[{"failure_class": "CODE_ERROR", "count": 1}],
+            failure_taxonomy_distribution={
+                "categories": {"code_defect": {"count": 1}},
+                "total_failures": 1,
+                "dominant_category": "code_defect",
+            },
+            sorted_failures=failed_tasks,
+            failed_tasks=failed_tasks,
+        )
+        == "2 tasks failed (Fail A, Fail B)."
+    )
+
+
+def test_compute_narrative_summary_completion_trend_prefix():
+    completed = [
+        make_task(title="Completed Alpha", status=TaskStatus.COMPLETED),
+        make_task(title="Completed Beta", status=TaskStatus.COMPLETED),
+    ]
+    failed_tasks = [make_task(title="Failed Task", status=TaskStatus.FAILED)]
+    assert _build_narrative_summary(
+        completed_count=2,
+        failed_count=1,
+        failure_groups=[{"failure_class": "CODE_ERROR", "count": 1}],
+        failure_taxonomy_distribution={
+            "categories": {"code_defect": {"count": 1}},
+            "total_failures": 1,
+            "dominant_category": "code_defect",
+        },
+        trend="improving",
+        completed_delta=1,
+        prev_completed_count=1,
+        sorted_completions=completed,
+        sorted_failures=failed_tasks,
+        failed_tasks=failed_tasks,
+    ) == (
+        "1 task failed (Failed Task). "
+        "Good progress — 2 tasks completed including Completed Alpha, Completed Beta (up from 1 last period)."
+    )
+
+
+def test_compute_narrative_summary_direction_taxonomy_hint():
+    assert (
+        _build_narrative_summary(
+            project_id=uuid4(),
+            direction_progress_list=[
+                {
+                    "direction_text": "Team Alpha",
+                    "prs_merged": 2,
+                    "possibly_saturated": False,
+                    "tasks_created": 0,
+                    "taxonomy_summary": {"review_quality": 2, "code_defect": 1},
+                }
+            ],
+        )
+        == "Research: Team Alpha: 2 PRs merged (mostly review-quality failures)."
+    )
+
+
+def test_compute_narrative_summary_empty_window_fallback():
+    assert _build_narrative_summary() == "All quiet — no activity in the last 24h."
+
+
 # ---------------------------------------------------------------------------
 # Trend boundary tests
 # ---------------------------------------------------------------------------
@@ -3914,7 +4123,7 @@ async def test_digest_direction_progress_cost_budget_fields(
 ):
     """direction_progress exposes budget utilization and fires alert when >=80%."""
     dispatch_mock = mocker.patch(
-        "app.routers.admin_digest.dispatch_external_notification",
+        "app.notification_dispatch.dispatch_external_notification",
         new_callable=mocker.AsyncMock,
     )
     now = _utcnow()
@@ -5298,6 +5507,136 @@ async def test_digest_remediation_funnel(client: AsyncClient, db_session):
         "CODE_ERROR": 1,
         "unknown": 2,
     }
+
+
+@pytest.mark.asyncio
+async def test_compute_remediation_funnel_helper_direct(db_session):
+    """compute_remediation_funnel computes the funnel directly off a session.
+
+    Exercises the extracted helper in isolation (no FastAPI layer) and confirms
+    the residual_remediation_funnel passed in lands verbatim in the returned dict
+    at its expected key.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+
+    inv_done = make_task(
+        project_id=project.id,
+        title="investigate A",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "investigate"}],
+        created_at=now - timedelta(hours=3),
+        plan_output={
+            "summary": "root cause X",
+            "root_cause": "null payload field",
+            "recommended_fix": "add a null guard before the access",
+            "confidence": "high",
+        },
+        context={"last_failure_class": "CODE_ERROR"},
+    )
+    inv_active = make_task(
+        project_id=project.id,
+        title="investigate B",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "investigate"}],
+        created_at=now - timedelta(hours=2),
+    )
+    db_session.add_all([inv_done, inv_active])
+    await db_session.commit()
+    await db_session.refresh(inv_done)
+
+    rem_merged = make_task(
+        project_id=project.id,
+        title="remediation A",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=2),
+        context={
+            "diagnosis_task_id": str(inv_done.id),
+            "direction_id": "d1",
+            "trigger_failure_class": "CODE_ERROR",
+        },
+        status_log=[
+            {"t": (now - timedelta(hours=1)).isoformat(), "status": "completed"}
+        ],
+    )
+    db_session.add(rem_merged)
+    await db_session.commit()
+
+    sentinel_residual = {"spawned": 7, "marker": "residual-stays-here"}
+    funnel, investigation_conversion = await compute_remediation_funnel(
+        db_session,
+        project_id=project.id,
+        window_start=window_start,
+        residual_remediation_funnel=sentinel_residual,
+    )
+
+    assert funnel["investigations_spawned"] == 2
+    assert funnel["investigations_completed"] == 1
+    assert funnel["investigations_with_diagnosis"] == 1
+    assert funnel["active_investigations"] == 1
+    assert funnel["remediations_spawned"] == 1
+    assert funnel["remediations_merged"] == 1
+    assert funnel["remediations_failed"] == 0
+    assert funnel["merged_remediations_by_trigger_class"] == {"CODE_ERROR": 1}
+    assert funnel["investigations_spawned_by_class"] == {
+        "CODE_ERROR": 1,
+        "unknown": 1,
+    }
+    # The caller-supplied residual funnel is spliced through unchanged.
+    assert funnel["residual_remediation_funnel"] is sentinel_residual
+    # Active-investigation detail surfaces the in-flight investigation only.
+    assert [d["task_id"] for d in funnel["active_investigations_detail"]] == [
+        str(inv_active.id)
+    ]
+    # investigation_conversion is returned separately as a top-level digest key.
+    assert investigation_conversion["total_completed"] == 1
+    assert investigation_conversion["parseable"] == 1
+    assert investigation_conversion["actionable"] == 1
+    assert investigation_conversion["remediation_spawned"] == 1
+
+
+@pytest.mark.asyncio
+async def test_compute_remediation_and_patterns_helper_direct(db_session):
+    """compute_remediation_and_patterns returns all four expected top-level keys.
+
+    Exercises the extracted helper in isolation (no FastAPI layer) and confirms
+    it returns a dict with remediation_funnel, investigation_conversion,
+    recurring_patterns, and early_warnings.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+
+    result = await compute_remediation_and_patterns(
+        session=db_session,
+        project_id=project.id,
+        window_start=window_start,
+        failed_tasks=[],
+        all_tasks=[],
+        active_tasks_all=[],
+        dir_id_to_text={},
+    )
+
+    assert set(result.keys()) == {
+        "remediation_funnel",
+        "investigation_conversion",
+        "recurring_patterns",
+        "early_warnings",
+    }
+    assert isinstance(result["recurring_patterns"], list)
+    assert isinstance(result["early_warnings"], list)
+    assert isinstance(result["remediation_funnel"], dict)
+    assert isinstance(result["investigation_conversion"], dict)
 
 
 @pytest.mark.asyncio
@@ -7858,6 +8197,59 @@ async def test_digest_direction_progress_zero_autonomous_with_operator_actions(
     assert dp["cost_per_merged_pr"] is None
 
 
+# ── Timezone-aware research_history timestamps ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_digest_direction_progress_tz_aware_timestamp_counted(
+    client: AsyncClient, db_session
+):
+    """research_history entries with tz-aware (UTC+Z) timestamps are counted, not dropped or raising TypeError."""
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-tz-aware",
+                "text": "Direction with tz-aware timestamp",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": (
+                            datetime.now(timezone.utc) - timedelta(hours=5)
+                        ).isoformat(),
+                        "prs_merged": 3,
+                        "tasks_created": 6,
+                    }
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-tz-aware"},
+        )
+    )
+    await db_session.commit()
+
+    # Must not raise TypeError for tz-aware vs naive comparison
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert len(data["direction_progress"]) == 1
+    dp = data["direction_progress"][0]
+    # prs_merged/tasks_created should be counted from the tz-aware entry
+    assert dp["prs_merged"] == 3
+    assert dp["conversion_rate"] == 0.5  # 3 merged / 6 created
+
+
 # ---------------------------------------------------------------------------
 # /api/admin/projects/{project_id}/retirement-critiques
 # ---------------------------------------------------------------------------
@@ -10364,10 +10756,6 @@ async def test_digest_sr_trends_full_fidelity_passthrough(
             "sr_skip_rate": 0.05,
             "sr_skip_reason_distribution": {"legacy_unknown": 2},
             "by_direction": {"dir-abc": {"correctness": {"hit_count": 2}}},
-            "execution_evidence_miss_rates": {
-                "test-coverage": {"miss_rate": 0.3, "miss_count": 3, "sample_count": 10}
-            },
-            "edges_considered_stats": {"total": 50, "with_sr": 40},
         }
     }
     db_session.add(project)
@@ -10385,13 +10773,90 @@ async def test_digest_sr_trends_full_fidelity_passthrough(
     assert trends["sr_skip_rate"] == 0.05
     assert trends["sr_skip_reason_distribution"] == {"legacy_unknown": 2}
     assert "dir-abc" in trends["by_direction"]
-    assert "test-coverage" in trends["execution_evidence_miss_rates"]
-    assert trends["edges_considered_stats"] == {"total": 50, "with_sr": 40}
+    assert "execution_evidence_miss_rates" not in trends
+    assert "edges_considered_stats" not in trends
     assert trends["by_severity"]["high"]["trend"] == "stable"
     assert trends["computed_at"] == "2026-05-01T00:00:00"
     assert trends["categories"]["correctness"]["fp_count"] == 1
     assert trends["by_scope"]["large"]["correctness"]["miss_rate"] == 0.6
     assert trends["by_scope"]["large"]["correctness"]["sample_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_digest_sr_trends_overall_verdict_passthrough(
+    client: AsyncClient, db_session
+):
+    """Digest explicitly promotes overall_trend_verdict/significant/data_sufficient."""
+    project = make_project()
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": "2026-05-01T00:00:00",
+            "categories": {},
+            "by_task_type": {},
+            "overall_hit_rate": 0.72,
+            "previous_overall_hit_rate": 0.65,
+            "overall_trend_verdict": "improving",
+            "overall_trend_significant": True,
+            "overall_trend_data_sufficient": True,
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    trends = response.json().get("self_review_prediction_accuracy_trends")
+    assert trends is not None
+    assert trends["overall_trend_verdict"] == "improving"
+    assert trends["overall_trend_significant"] is True
+    assert trends["overall_trend_data_sufficient"] is True
+
+    # Stable/not-significant case
+    project2 = make_project()
+    project2.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": "2026-05-01T00:00:00",
+            "categories": {},
+            "by_task_type": {},
+            "overall_hit_rate": 0.70,
+            "previous_overall_hit_rate": 0.71,
+            "overall_trend_verdict": "stable",
+            "overall_trend_significant": False,
+            "overall_trend_data_sufficient": True,
+        }
+    }
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project2)
+
+    response2 = await client.get(f"/api/admin/digest?project_id={project2.id}")
+    assert response2.status_code == 200
+    trends2 = response2.json().get("self_review_prediction_accuracy_trends")
+    assert trends2 is not None
+    assert trends2["overall_trend_verdict"] == "stable"
+    assert trends2["overall_trend_significant"] is False
+
+    # Absent (None) case — fields present but null
+    project3 = make_project()
+    project3.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": "2026-05-01T00:00:00",
+            "categories": {},
+            "by_task_type": {},
+        }
+    }
+    db_session.add(project3)
+    await db_session.commit()
+    await db_session.refresh(project3)
+
+    response3 = await client.get(f"/api/admin/digest?project_id={project3.id}")
+    assert response3.status_code == 200
+    trends3 = response3.json().get("self_review_prediction_accuracy_trends")
+    assert trends3 is not None
+    assert trends3["overall_trend_verdict"] is None
+    assert trends3["overall_trend_significant"] is None
+    assert trends3["overall_trend_data_sufficient"] is None
 
 
 @pytest.mark.asyncio
@@ -10462,8 +10927,6 @@ async def test_digest_sr_trends_empty_optional_fields_present(
             "sr_skip_rate": None,
             "sr_skip_reason_distribution": {},
             "by_direction": {},
-            "execution_evidence_miss_rates": {},
-            "edges_considered_stats": {},
         }
     }
     db_session.add(project)
@@ -10482,13 +10945,12 @@ async def test_digest_sr_trends_empty_optional_fields_present(
         "sr_skip_rate",
         "sr_skip_reason_distribution",
         "by_direction",
-        "execution_evidence_miss_rates",
-        "edges_considered_stats",
     ):
         assert key in trends, f"missing key: {key}"
     assert trends["sr_skip_rate"] is None
     assert trends["by_direction"] == {}
-    assert trends["execution_evidence_miss_rates"] == {}
+    assert "execution_evidence_miss_rates" not in trends
+    assert "edges_considered_stats" not in trends
 
 
 @pytest.mark.asyncio
@@ -10551,6 +11013,98 @@ async def test_serialize_sr_catch_rate_trends_is_stale(client: AsyncClient, db_s
     trends3 = response3.json().get("self_review_prediction_accuracy_trends")
     assert trends3 is not None
     assert trends3["is_stale"] is True
+
+
+@pytest.mark.asyncio
+async def test_serialize_sr_catch_rate_trends_handles_tz_aware_computed_at(
+    client: AsyncClient, db_session
+):
+    """A tz-aware computed_at is normalized before the stale check runs."""
+    project = make_project()
+    computed_at = datetime.now(timezone.utc) - timedelta(days=1)
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": computed_at.isoformat(),
+            "categories": {"correctness": {"miss_rate": 0.2, "trend": "stable"}},
+            "by_task_type": {},
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    trends = response.json().get("self_review_prediction_accuracy_trends")
+    assert trends is not None
+    assert trends["is_stale"] is False
+
+
+@pytest.mark.asyncio
+async def test_digest_sr_trends_overall_sr_alone_passthrough(
+    client: AsyncClient, db_session
+):
+    """Digest explicitly promotes overall_sr_alone_* fields from sr_catch_rate_trends."""
+    # Case 1: all catches are reviewer-origin → combined high, author-only low
+    project = make_project()
+    project.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": "2026-05-01T00:00:00",
+            "categories": {},
+            "by_task_type": {},
+            "overall_hit_rate": 0.80,
+            "overall_sr_alone_hit_rate": 0.10,
+            "previous_overall_sr_alone_hit_rate": 0.12,
+            "overall_sr_alone_trend_verdict": "stable",
+            "overall_sr_alone_trend_significant": False,
+            "overall_sr_alone_trend_data_sufficient": True,
+        }
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    trends = response.json().get("self_review_prediction_accuracy_trends")
+    assert trends is not None
+    assert trends["overall_hit_rate"] == 0.80
+    assert trends["overall_sr_alone_hit_rate"] == 0.10, (
+        "combined high but author-only should be low"
+    )
+    assert trends["overall_sr_alone_trend_verdict"] == "stable"
+    assert trends["overall_sr_alone_trend_significant"] is False
+    assert trends["overall_sr_alone_trend_data_sufficient"] is True
+
+    # Case 2: data insufficient → fields present but None / stable / data_sufficient=False
+    project2 = make_project()
+    project2.design_doc = {
+        "sr_catch_rate_trends": {
+            "computed_at": "2026-05-01T00:00:00",
+            "categories": {},
+            "by_task_type": {},
+        }
+    }
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project2)
+
+    response2 = await client.get(f"/api/admin/digest?project_id={project2.id}")
+    assert response2.status_code == 200
+    trends2 = response2.json().get("self_review_prediction_accuracy_trends")
+    assert trends2 is not None
+    # All five SR-alone fields must be present even when source lacks them
+    for field in (
+        "overall_sr_alone_hit_rate",
+        "previous_overall_sr_alone_hit_rate",
+        "overall_sr_alone_trend_verdict",
+        "overall_sr_alone_trend_significant",
+        "overall_sr_alone_trend_data_sufficient",
+    ):
+        assert field in trends2, f"missing promoted field: {field}"
+    assert trends2["overall_sr_alone_hit_rate"] is None
+    assert trends2["overall_sr_alone_trend_significant"] is None
+    assert trends2["overall_sr_alone_trend_data_sufficient"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -10763,6 +11317,80 @@ async def test_direction_sr_breakdown_categories_sorted_worst_first(
     assert entry["worst_category"] == "error-handling"
     assert cats["error-handling"]["miss_rate"] == 1.0
     assert cats["correctness"]["miss_rate"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_direction_sr_breakdown_uses_stored_snapshot(
+    client: AsyncClient, db_session
+):
+    """When sr_catch_rate_trends.by_direction is stored on the project, the endpoint
+    uses it as the primary source — not the narrow COMPLETED-only task query.
+
+    Proof: project has a stored snapshot for direction 'd-stored' but zero
+    qualifying tasks in the DB. The endpoint must return the stored entry.
+    """
+    stored_by_dir = {
+        "d-lower": {
+            "sample_count": 5,
+            "miss_rate": 0.2,
+            "overall_catch_rate": 0.8,
+            "categories": {
+                "style-conventions": {
+                    "hit_rate": 0.8,
+                    "miss_rate": 0.2,
+                    "sample_count": 5,
+                }
+            },
+        },
+        "d-stored": {
+            "sample_count": 7,
+            "miss_rate": 0.571,
+            "overall_catch_rate": 0.429,
+            "categories": {
+                "scope-drift": {
+                    "hit_rate": 0.8,
+                    "miss_rate": 0.2,
+                    "sample_count": 7,
+                },
+                "regression_risk": {
+                    "hit_rate": 0.429,
+                    "miss_rate": 0.571,
+                    "sample_count": 7,
+                },
+            },
+            "trend": "increasing",
+            "previous_miss_rate": 0.4,
+            "rate_history": [0.4, 0.571],
+        },
+    }
+    project = make_project(
+        directions=[{"id": "d-stored", "text": "Stored direction label"}],
+        design_doc={"sr_catch_rate_trends": {"by_direction": stored_by_dir}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/direction-sr-breakdown"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert [entry["direction_id"] for entry in body["directions"]] == [
+        "d-stored",
+        "d-lower",
+    ]
+    assert len(body["directions"]) == 2
+    entry = body["directions"][0]
+    assert entry["direction_id"] == "d-stored"
+    assert entry["direction_text"] == "Stored direction label"
+    assert entry["sample_size"] == 7
+    assert entry["overall_catch_rate"] == 0.429
+    assert entry["worst_category"] == "regression_risk"
+    assert list(entry["categories"]) == ["regression_risk", "scope-drift"]
+    assert entry["trend"] == "increasing"
+    assert entry["previous_miss_rate"] == 0.4
+    assert entry["rate_history"] == [0.4, 0.571]
 
 
 # ---------------------------------------------------------------------------
@@ -15040,7 +15668,7 @@ async def test_viewport_debt_coverage_summary_in_response(
     }
 
     with patch(
-        "app.routers.admin_digest._scan_viewport_debt_rows",
+        "app.viewport_debt._scan_viewport_debt_rows",
         return_value=(top_rows, [], expected_summary),
     ):
         response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
@@ -15096,7 +15724,7 @@ async def test_viewport_debt_coverage_summary_counts_full_set(
     }
 
     with patch(
-        "app.routers.admin_digest._scan_viewport_debt_rows",
+        "app.viewport_debt._scan_viewport_debt_rows",
         return_value=(top_rows, [], expected_summary),
     ):
         response = await client.get(f"/api/admin/projects/{project.id}/viewport-debt")
@@ -15153,7 +15781,7 @@ async def test_viewport_debt_counts_assertion_type_regressions(
     ]
 
     with patch(
-        "app.routers.admin_digest._scan_viewport_debt_rows",
+        "app.viewport_debt._scan_viewport_debt_rows",
         return_value=(
             fake_rows,
             [],
@@ -15233,7 +15861,7 @@ async def test_viewport_debt_returns_per_assertion_type_breakdown(
     ]
 
     with patch(
-        "app.routers.admin_digest._scan_viewport_debt_rows",
+        "app.viewport_debt._scan_viewport_debt_rows",
         return_value=(
             fake_rows,
             [],
@@ -16181,6 +16809,70 @@ async def test_digest_latest_cycle_includes_memo_stats(client: AsyncClient, db_s
     assert lc["memos_cited"] == 1
 
 
+@pytest.mark.asyncio
+async def test_digest_memo_ever_cited_false_when_no_citations(
+    client: AsyncClient, db_session
+):
+    """memo_ever_cited.ever_cited is False when no cycle has memos_cited > 0."""
+    from app import strategic_cycle as _sc
+
+    project = make_project()
+    db_session.add(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await _sc.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await _sc.mark_phase2_completed(
+        db_session, cycle.id, memos_available=3, memos_cited=0
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+    mec = data.get("memo_ever_cited")
+    assert mec is not None
+    assert mec["ever_cited"] is False
+    assert mec["first_cycle_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_digest_memo_ever_cited_true_with_oldest_cycle_cited(
+    client: AsyncClient, db_session
+):
+    """memo_ever_cited.ever_cited=True even when citation is outside the 20-cycle display window."""
+    from app import strategic_cycle as _sc
+
+    project = make_project()
+    db_session.add(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create 22 cycles; only the first one has a citation (outside recent 20-cycle window)
+    first_cycle_id = None
+    for i in range(22):
+        c = await _sc.create(db_session, project_id=project.id)
+        await db_session.commit()
+        cited = 1 if i == 0 else 0
+        await _sc.mark_phase2_completed(
+            db_session, c.id, memos_available=1, memos_cited=cited
+        )
+        await db_session.commit()
+        if i == 0:
+            first_cycle_id = c.id
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}")
+    assert response.status_code == 200
+    data = response.json()
+    mec = data.get("memo_ever_cited")
+    assert mec is not None
+    assert mec["ever_cited"] is True
+    assert mec["first_cycle_id"] == first_cycle_id
+
+
 # ---------------------------------------------------------------------------
 # /api/admin/projects/{project_id}/qualification-verdicts tests
 # ---------------------------------------------------------------------------
@@ -16426,3 +17118,1363 @@ async def test_list_qualification_verdicts_requires_auth(
         f"/api/admin/projects/{fake_id}/qualification-verdicts"
     )
     assert response.status_code in (401, 403)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for compute_failure_grouping (pure function, no DB required)
+# ---------------------------------------------------------------------------
+
+
+def _make_failed_task(**kwargs):
+    """Minimal failed Task object for compute_failure_grouping unit tests."""
+    return make_task(status=TaskStatus.FAILED, **kwargs)
+
+
+def test_compute_failure_grouping_empty():
+    """Empty failed-task list returns zeroed-out structure."""
+    now = _utcnow()
+    result = compute_failure_grouping(
+        failed_tasks=[],
+        error_log_map={},
+        dir_id_to_text={},
+        window_start=now - timedelta(hours=24),
+        now=now,
+    )
+    assert result["failure_groups"] == []
+    assert result["cost_by_failure_class"] == {}
+    assert result["total_failed_cost_usd"] == 0.0
+    assert result["provision_waste_cost_usd"] == 0.0
+    assert result["failure_stage_counts"] == {}
+    assert result["analysis_overflow_summary"]["total_count"] == 0
+    assert result["provision_waste_by_direction"] == []
+
+
+def test_compute_failure_grouping_rate_limit_class():
+    """Task with a rate-limit error message is placed in the RATE_LIMIT failure group."""
+    now = _utcnow()
+    task = _make_failed_task(
+        title="Rate Limited Task",
+        latest_status_message="API Error: Rate limit reached",
+    )
+    result = compute_failure_grouping(
+        failed_tasks=[task],
+        error_log_map={str(task.id): "API Error: Rate limit reached"},
+        dir_id_to_text={},
+        window_start=now - timedelta(hours=24),
+        now=now,
+    )
+    classes = {g["failure_class"] for g in result["failure_groups"]}
+    assert "RATE_LIMIT" in classes
+    rate_group = next(
+        g for g in result["failure_groups"] if g["failure_class"] == "RATE_LIMIT"
+    )
+    assert rate_group["count"] == 1
+    assert rate_group["tasks"][0]["title"] == "Rate Limited Task"
+    assert rate_group["label"] == "Rate Limit"
+
+
+def test_compute_failure_grouping_provision_failure_waste():
+    """PROVISION_FAILURE tasks contribute to provision_waste_cost_usd."""
+    now = _utcnow()
+    prov_at = now - timedelta(hours=1)
+    stop_at = now - timedelta(minutes=30)
+    task = _make_failed_task(
+        title="Quota Exceeded Task",
+        latest_status_message="CPUS_ALL_REGIONS quota exceeded for region us-central1",
+        vm_provisioned_at=prov_at,
+        vm_stopped_at=stop_at,
+        vm_spot=False,
+    )
+    result = compute_failure_grouping(
+        failed_tasks=[task],
+        error_log_map={},
+        dir_id_to_text={},
+        window_start=now - timedelta(hours=24),
+        now=now,
+    )
+    assert result["provision_waste_cost_usd"] > 0.0
+    assert "PROVISION_FAILURE" in result["cost_by_failure_class"]
+    assert result["provision_waste_cost_usd"] == pytest.approx(
+        result["cost_by_failure_class"]["PROVISION_FAILURE"]
+    )
+
+
+def test_compute_failure_grouping_sorted_by_count_descending():
+    """failure_groups are sorted by count descending."""
+    now = _utcnow()
+    tasks = [
+        _make_failed_task(
+            title=f"Code Error {i}",
+            latest_status_message="TypeError: something broke",
+        )
+        for i in range(3)
+    ] + [
+        _make_failed_task(
+            title="Rate Task",
+            latest_status_message="API Error: Rate limit reached",
+        )
+    ]
+    result = compute_failure_grouping(
+        failed_tasks=tasks,
+        error_log_map={str(t.id): t.latest_status_message for t in tasks},
+        dir_id_to_text={},
+        window_start=now - timedelta(hours=24),
+        now=now,
+    )
+    counts = [g["count"] for g in result["failure_groups"]]
+    assert counts == sorted(counts, reverse=True)
+    assert result["failure_groups"][0]["count"] >= 3
+
+
+def test_compute_failure_grouping_provision_waste_by_direction():
+    """provision_waste_by_direction groups PROVISION_FAILURE cost by direction_id."""
+    import uuid
+
+    now = _utcnow()
+    dir_id = str(uuid.uuid4())
+    prov_at = now - timedelta(hours=1)
+    stop_at = now - timedelta(minutes=30)
+    task = _make_failed_task(
+        title="Provision Fail",
+        latest_status_message="CPUS_ALL_REGIONS quota exceeded for region us-central1",
+        vm_provisioned_at=prov_at,
+        vm_stopped_at=stop_at,
+        vm_spot=False,
+        context={"direction_id": dir_id},
+    )
+    result = compute_failure_grouping(
+        failed_tasks=[task],
+        error_log_map={},
+        dir_id_to_text={dir_id: "My Direction"},
+        window_start=now - timedelta(hours=24),
+        now=now,
+    )
+    breakdown = result["provision_waste_by_direction"]
+    assert len(breakdown) == 1
+    assert breakdown[0]["direction_id"] == dir_id
+    assert breakdown[0]["direction_text"] == "My Direction"
+    assert breakdown[0]["provision_cost_usd"] > 0.0
+    assert breakdown[0]["provision_task_count"] == 1
+
+
+def test_compute_failure_grouping_analysis_overflow_summary():
+    """Tasks with scope_gate_triggered='analysis_overflow' appear in analysis_overflow_summary."""
+    now = _utcnow()
+    prov_at = now - timedelta(minutes=20)
+    stop_at = now - timedelta(minutes=10)
+    task = _make_failed_task(
+        title="Overflow Task",
+        context={"scope_gate_triggered": "analysis_overflow", "scope": "medium"},
+        vm_provisioned_at=prov_at,
+        vm_stopped_at=stop_at,
+        vm_spot=True,
+    )
+    result = compute_failure_grouping(
+        failed_tasks=[task],
+        error_log_map={},
+        dir_id_to_text={},
+        window_start=now - timedelta(hours=24),
+        now=now,
+    )
+    summary = result["analysis_overflow_summary"]
+    assert summary["total_count"] == 1
+    assert summary["by_scope"].get("medium") == 1
+    assert summary["cost_usd"] > 0.0
+
+
+def test_compute_failure_grouping_task_entry_fields():
+    """Each task entry in failure_groups contains the expected keys."""
+    now = _utcnow()
+    task = _make_failed_task(
+        title="Code Error Task",
+        latest_status_message="TypeError: cannot read property",
+        attempt_count=2,
+    )
+    result = compute_failure_grouping(
+        failed_tasks=[task],
+        error_log_map={str(task.id): "TypeError: cannot read property"},
+        dir_id_to_text={},
+        window_start=now - timedelta(hours=24),
+        now=now,
+    )
+    assert len(result["failure_groups"]) == 1
+    entry = result["failure_groups"][0]["tasks"][0]
+    assert entry["task_id"] == str(task.id)
+    assert entry["title"] == "Code Error Task"
+    assert entry["attempt_count"] == 2
+    assert entry["error_snippet"] == "TypeError: cannot read property"
+    assert "taxonomy" in entry
+    assert "timeout_subtype" in entry
+    assert entry["timeout_subtype"] is None  # not AGENT_TIMEOUT
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for compute_recurring_error_clusters (pure function, no DB required)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_recurring_error_clusters_empty():
+    """Empty failed-task list returns an empty cluster list."""
+    assert compute_recurring_error_clusters(failed_tasks=[], error_log_map={}) == []
+
+
+def test_compute_recurring_error_clusters_excludes_singletons():
+    """Clusters with count < 2 are excluded."""
+    tasks = [
+        _make_failed_task(latest_status_message="TypeError: foo is undefined"),
+        _make_failed_task(latest_status_message="Rate limit exceeded"),
+        _make_failed_task(latest_status_message="SyntaxError: unexpected token"),
+    ]
+    result = compute_recurring_error_clusters(
+        failed_tasks=tasks,
+        error_log_map={},
+    )
+    assert result == []
+
+
+def test_compute_recurring_error_clusters_groups_by_fingerprint():
+    """Failures sharing a normalized fingerprint group into one cluster, aggregating directions/task_types."""
+    tasks = [
+        _make_failed_task(
+            payloads=[{"type": "create"}],
+            context={"direction_id": "dir-a"},
+            latest_status_message="Merge conflict on PR #1234",
+        ),
+        _make_failed_task(
+            payloads=[{"type": "fix"}],
+            context={"direction_id": "dir-a"},
+            latest_status_message="Merge conflict on PR #5678",
+        ),
+    ]
+    result = compute_recurring_error_clusters(
+        failed_tasks=tasks,
+        error_log_map={},
+    )
+    assert len(result) == 1
+    cluster = result[0]
+    assert cluster["count"] == 2
+    assert len(cluster["fingerprint"]) == 12
+    assert "Merge conflict" in cluster["error_snippet"]
+    assert cluster["direction_ids"] == ["dir-a"]
+    assert sorted(cluster["task_types"]) == ["create", "fix"]
+    assert cluster["first_task_id"] == str(tasks[0].id)
+
+
+def test_compute_recurring_error_clusters_error_log_map_overrides_status_message():
+    """When error_log_map has an entry for the task id, it takes precedence over latest_status_message."""
+    task_a = _make_failed_task(latest_status_message="stale")
+    task_b = _make_failed_task(latest_status_message="stale")
+    result = compute_recurring_error_clusters(
+        failed_tasks=[task_a, task_b],
+        error_log_map={
+            str(task_a.id): "Merge conflict on PR #1",
+            str(task_b.id): "Merge conflict on PR #2",
+        },
+    )
+    assert len(result) == 1
+    assert "Merge conflict" in result[0]["error_snippet"]
+
+
+def test_compute_recurring_error_clusters_sorted_by_count_descending_and_capped():
+    """Returned clusters are sorted by count descending and capped at 5."""
+    tasks = []
+    # Build 6 distinct clusters with counts 7,6,5,4,3,2 — all should make it past the >=2 gate,
+    # but only the top 5 should be returned (sorted desc).
+    for cluster_idx, count in enumerate([7, 6, 5, 4, 3, 2]):
+        for _ in range(count):
+            tasks.append(
+                _make_failed_task(
+                    latest_status_message=f"Cluster {cluster_idx} unique-marker error",
+                )
+            )
+    result = compute_recurring_error_clusters(
+        failed_tasks=tasks,
+        error_log_map={},
+    )
+    assert len(result) == 5
+    counts = [c["count"] for c in result]
+    assert counts == sorted(counts, reverse=True)
+    assert counts == [7, 6, 5, 4, 3]
+
+
+def test_compute_recurring_error_clusters_skips_tasks_with_no_message():
+    """Tasks with neither error_log_map entry nor latest_status_message are skipped."""
+    tasks = [
+        _make_failed_task(latest_status_message=""),
+        _make_failed_task(latest_status_message=""),
+        _make_failed_task(latest_status_message="Merge conflict on PR #1"),
+        _make_failed_task(latest_status_message="Merge conflict on PR #2"),
+    ]
+    result = compute_recurring_error_clusters(
+        failed_tasks=tasks,
+        error_log_map={},
+    )
+    assert len(result) == 1
+    assert result[0]["count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for compute_digest_trend_history (pure function, no DB required)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_digest_trend_history_length():
+    """Returns exactly 7 entries regardless of task list."""
+    now = _utcnow()
+    result = compute_digest_trend_history(all_tasks=[], hours=24, now=now)
+    assert len(result) == 7
+
+
+def test_compute_digest_trend_history_entry_keys():
+    """Each entry contains the expected keys."""
+    now = _utcnow()
+    result = compute_digest_trend_history(all_tasks=[], hours=24, now=now)
+    for entry in result:
+        assert "period_end" in entry
+        assert "success_rate" in entry
+        assert "completed" in entry
+        assert "failed" in entry
+        assert "failed_by_class" in entry
+        assert "failed_by_taxonomy" in entry
+        assert "period_cost_usd" in entry
+        assert "first_attempt_success_rate" in entry
+        assert "first_attempt_sample_size" in entry
+
+
+def test_compute_digest_trend_history_empty_tasks():
+    """With no tasks all counts are 0 and rates are None."""
+    now = _utcnow()
+    result = compute_digest_trend_history(all_tasks=[], hours=24, now=now)
+    for entry in result:
+        assert entry["completed"] == 0
+        assert entry["failed"] == 0
+        assert entry["success_rate"] is None
+        assert entry["first_attempt_success_rate"] is None
+        assert entry["first_attempt_sample_size"] == 0
+
+
+def test_compute_digest_trend_history_completed_task_in_last_period():
+    """A COMPLETED task in the most recent period appears in the last entry."""
+    now = _utcnow()
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        created_at=now - timedelta(hours=1),
+    )
+    result = compute_digest_trend_history(all_tasks=[task], hours=24, now=now)
+    last = result[-1]
+    assert last["completed"] == 1
+    assert last["failed"] == 0
+    assert last["success_rate"] == 1.0
+
+
+def test_compute_digest_trend_history_failed_task_classified():
+    """A FAILED task is reflected in failed_by_class for the correct period."""
+    now = _utcnow()
+    task = make_task(
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        latest_status_message="API Error: Rate limit reached",
+        created_at=now - timedelta(hours=1),
+    )
+    result = compute_digest_trend_history(all_tasks=[task], hours=24, now=now)
+    last = result[-1]
+    assert last["failed"] == 1
+    assert last["success_rate"] == 0.0
+    assert isinstance(last["failed_by_class"], dict)
+    assert isinstance(last["failed_by_taxonomy"], dict)
+
+
+def test_compute_digest_trend_history_oldest_first():
+    """Entries are in ascending chronological order (period_end increases)."""
+    now = _utcnow()
+    result = compute_digest_trend_history(all_tasks=[], hours=24, now=now)
+    period_ends = [entry["period_end"] for entry in result]
+    assert period_ends == sorted(period_ends)
+
+
+def test_compute_digest_trend_history_first_attempt_rate():
+    """first_attempt_success_rate reflects _first_attempt_succeeded context flag."""
+    now = _utcnow()
+    t_pass = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        context={"_first_attempt_succeeded": True},
+        created_at=now - timedelta(hours=1),
+    )
+    t_fail = make_task(
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create"}],
+        context={"_first_attempt_succeeded": False},
+        created_at=now - timedelta(hours=1),
+    )
+    result = compute_digest_trend_history(all_tasks=[t_pass, t_fail], hours=24, now=now)
+    last = result[-1]
+    assert last["first_attempt_sample_size"] == 2
+    assert last["first_attempt_success_rate"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for compute_digest_cost_economics (pure function, no DB required)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_digest_cost_economics_empty():
+    """Empty tasks and directions return a zeroed-out cost structure."""
+    now = _utcnow()
+    result = compute_digest_cost_economics(
+        all_tasks=[],
+        direction_progress_list=[],
+        window_start=now - timedelta(hours=24),
+        now=now,
+        daily_cost_ceiling_usd=12.5,
+    )
+    assert result["total_estimated_cost_usd"] == 0.0
+    assert result["total_spot_cost_usd"] == 0.0
+    assert result["total_on_demand_cost_usd"] == 0.0
+    assert result["provisioning_overhead_usd"] == 0.0
+    assert result["provisioning_overhead_pct"] is None
+    assert result["daily_cost_usd"] == 0.0
+    assert result["daily_cost_ceiling_usd"] == 12.5
+    assert result["overall_product_ratio"] is None
+    assert result["median_cost_per_merged_pr"] is None
+    assert result["cost_per_merge_by_type"] == {}
+    assert result["median_cpm_by_type"] is None
+    assert result["pipeline_acceptance_rate"] is None
+    assert result["pipeline_conversion_rate"] is None
+    assert result["pipeline_autonomous_prs_merged"] == 0
+    assert result["pipeline_assisted_prs_merged"] == 0
+    assert result["pipeline_operator_action_count"] == 0
+    assert result["overall_type_distribution"] == {}
+    assert result["pipeline_filter_funnel"] == {}
+
+
+def test_compute_digest_cost_economics_spot_on_demand_split():
+    """Spot and on-demand task costs are split and totaled with known VM timing."""
+    from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
+
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    spot_task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now - timedelta(minutes=30),  # 1800s
+    )
+    od_task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix"}],
+        vm_spot=False,
+        vm_provisioned_at=now - timedelta(hours=2),
+        vm_stopped_at=now - timedelta(hours=1),  # 3600s
+    )
+    result = compute_digest_cost_economics(
+        all_tasks=[spot_task, od_task],
+        direction_progress_list=[],
+        window_start=window_start,
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    expected_spot = round(SPOT_RATE * 1800, 2)
+    expected_od = round(ON_DEMAND_RATE * 3600, 2)
+    assert result["total_spot_cost_usd"] == expected_spot
+    assert result["total_on_demand_cost_usd"] == expected_od
+    # Both tasks are undirected (no direction_id) and inside the window.
+    assert result["total_estimated_cost_usd"] == round(
+        SPOT_RATE * 1800 + ON_DEMAND_RATE * 3600, 2
+    )
+
+
+def test_compute_digest_cost_economics_provisioning_overhead():
+    """Time between provision and agent claim counts as provisioning overhead."""
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    # Provisioned 1h before now, claimed (started) 50m before → 600s overhead,
+    # stopped 30m before → 1800s total compute.
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        vm_spot=False,
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_started_at=now - timedelta(minutes=50),
+        vm_stopped_at=now - timedelta(minutes=30),
+    )
+    result = compute_digest_cost_economics(
+        all_tasks=[task],
+        direction_progress_list=[],
+        window_start=window_start,
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    # overhead_raw = ON_DEMAND_RATE * 600 = 0.0111…; rounds to 0.01.
+    assert result["provisioning_overhead_usd"] == 0.01
+    # pct = round(overhead_raw / rounded_total_compute, 3) = round(0.01117/0.03, 3).
+    assert result["provisioning_overhead_pct"] == 0.372
+
+
+def test_compute_digest_cost_economics_threshold_flag_in_place():
+    """cost_per_merge_exceeds_threshold is stamped onto direction dicts in place."""
+    now = _utcnow()
+    dirs = [
+        {"estimated_cost_usd": 0.0, "cost_per_merged_pr": 1.0},
+        {"estimated_cost_usd": 0.0, "cost_per_merged_pr": 2.0},
+        {"estimated_cost_usd": 0.0, "cost_per_merged_pr": 100.0},
+    ]
+    result = compute_digest_cost_economics(
+        all_tasks=[],
+        direction_progress_list=dirs,
+        window_start=now - timedelta(hours=24),
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    # median([1, 2, 100]) = 2.0; threshold = 2.0 * 3 = 6.0.
+    assert result["median_cost_per_merged_pr"] == 2.0
+    # In-place mutation on the same dict objects.
+    assert dirs[0]["cost_per_merge_exceeds_threshold"] is False
+    assert dirs[1]["cost_per_merge_exceeds_threshold"] is False
+    assert dirs[2]["cost_per_merge_exceeds_threshold"] is True
+
+
+def test_compute_digest_cost_economics_cost_per_merge_by_type():
+    """Per-task-type cost-per-merge counts merged tasks by payload type."""
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    merged = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now - timedelta(minutes=30),
+        context={"pr_merged": True},
+    )
+    unmerged = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        vm_spot=True,
+        vm_provisioned_at=now - timedelta(hours=1),
+        vm_stopped_at=now - timedelta(minutes=30),
+        context={},
+    )
+    result = compute_digest_cost_economics(
+        all_tasks=[merged, unmerged],
+        direction_progress_list=[],
+        window_start=window_start,
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    by_type = result["cost_per_merge_by_type"]
+    assert "create" in by_type
+    assert by_type["create"]["merged_count"] == 1
+    assert by_type["create"]["cost_per_merge"] is not None
+    assert by_type["create"]["total_cost_usd"] > 0.0
+
+
+def test_compute_digest_cost_economics_pipeline_aggregates():
+    """Pipeline-level rates and counts aggregate across all directions."""
+    now = _utcnow()
+    dirs = [
+        {
+            "estimated_cost_usd": 0.0,
+            "prs_merged": 3,
+            "prs_rejected": 1,
+            "tasks_created": 10,
+            "autonomous_prs_merged": 2,
+            "assisted_prs_merged": 1,
+            "operator_action_count": 4,
+            "type_distribution": {"create": 5},
+            "filter_funnel": {"a": 2},
+        },
+        {
+            "estimated_cost_usd": 0.0,
+            "prs_merged": 1,
+            "prs_rejected": 1,
+            "tasks_created": 5,
+            "autonomous_prs_merged": 1,
+            "assisted_prs_merged": 0,
+            "operator_action_count": 1,
+            "type_distribution": {"create": 2, "fix": 1},
+            "filter_funnel": {"a": 1, "b": 3},
+        },
+    ]
+    result = compute_digest_cost_economics(
+        all_tasks=[],
+        direction_progress_list=dirs,
+        window_start=now - timedelta(hours=24),
+        now=now,
+        daily_cost_ceiling_usd=0.0,
+    )
+    # merged=4, rejected=2 → 4/6 = 0.667; created=15 → 4/15 = 0.267.
+    assert result["pipeline_acceptance_rate"] == 0.667
+    assert result["pipeline_conversion_rate"] == 0.267
+    assert result["pipeline_autonomous_prs_merged"] == 3
+    assert result["pipeline_assisted_prs_merged"] == 1
+    assert result["pipeline_operator_action_count"] == 5
+    assert result["overall_type_distribution"] == {"create": 7, "fix": 1}
+    assert result["pipeline_filter_funnel"] == {"a": 3, "b": 3}
+
+
+def test_compute_scope_mismatch_summary_no_calibrated_tasks():
+    """Returns None when no terminal task carries scope_calibrated_from."""
+    completed = [make_task(status=TaskStatus.COMPLETED, context={})]
+    failed = [make_task(status=TaskStatus.FAILED, context={"direction_id": "d-1"})]
+    result = compute_scope_mismatch_summary(
+        completed_tasks=completed, failed_tasks=failed, dir_id_to_text={}
+    )
+    assert result is None
+
+
+def test_compute_scope_mismatch_summary_empty_inputs():
+    """Empty task lists yield None."""
+    result = compute_scope_mismatch_summary(
+        completed_tasks=[], failed_tasks=[], dir_id_to_text={}
+    )
+    assert result is None
+
+
+def test_compute_scope_mismatch_summary_success_rate_and_total():
+    """total_calibrated counts all calibrated tasks; success rate uses COMPLETED."""
+    completed = [
+        make_task(
+            status=TaskStatus.COMPLETED, context={"scope_calibrated_from": "medium"}
+        ),
+        make_task(
+            status=TaskStatus.COMPLETED, context={"scope_calibrated_from": "small"}
+        ),
+    ]
+    failed = [
+        make_task(status=TaskStatus.FAILED, context={"scope_calibrated_from": "large"}),
+    ]
+    result = compute_scope_mismatch_summary(
+        completed_tasks=completed, failed_tasks=failed, dir_id_to_text={}
+    )
+    assert result is not None
+    assert result["total_calibrated"] == 3
+    assert result["calibrated_success_rate"] == round(2 / 3, 3)
+
+
+def test_compute_scope_mismatch_summary_by_original_scope_breakdown():
+    """by_original_scope buckets by the prefix before ':' and tallies outcomes."""
+    completed = [
+        make_task(
+            status=TaskStatus.COMPLETED,
+            context={"scope_calibrated_from": "medium:reason-text"},
+        ),
+    ]
+    failed = [
+        make_task(
+            status=TaskStatus.FAILED,
+            context={"scope_calibrated_from": "medium:other-reason"},
+        ),
+    ]
+    result = compute_scope_mismatch_summary(
+        completed_tasks=completed, failed_tasks=failed, dir_id_to_text={}
+    )
+    assert result is not None
+    assert result["by_original_scope"] == {
+        "medium": {"total": 2, "completed": 1, "failed": 1}
+    }
+
+
+def test_compute_scope_mismatch_summary_blank_original_scope_is_unknown():
+    """An empty scope_calibrated_from value is not calibrated; a bare ':' → 'unknown'."""
+    # Empty string is falsy → excluded from calibrated set entirely.
+    excluded = make_task(
+        status=TaskStatus.COMPLETED, context={"scope_calibrated_from": ""}
+    )
+    # A value with no scope prefix before ':' falls back to "unknown".
+    bare = make_task(
+        status=TaskStatus.COMPLETED, context={"scope_calibrated_from": ":reason"}
+    )
+    result = compute_scope_mismatch_summary(
+        completed_tasks=[excluded, bare], failed_tasks=[], dir_id_to_text={}
+    )
+    assert result is not None
+    assert result["total_calibrated"] == 1
+    assert "unknown" in result["by_original_scope"]
+
+
+def test_compute_scope_mismatch_summary_top_directions_ranking():
+    """top_directions ranks by calibration_rate, attaches text, and caps at 3."""
+    completed = []
+    failed = []
+    # d-hi: 2/2 calibrated → rate 1.0
+    for _ in range(2):
+        completed.append(
+            make_task(
+                status=TaskStatus.COMPLETED,
+                context={"scope_calibrated_from": "small", "direction_id": "d-hi"},
+            )
+        )
+    # d-lo: 1/3 calibrated → rate ~0.333
+    completed.append(
+        make_task(
+            status=TaskStatus.COMPLETED,
+            context={"scope_calibrated_from": "small", "direction_id": "d-lo"},
+        )
+    )
+    for _ in range(2):
+        failed.append(
+            make_task(status=TaskStatus.FAILED, context={"direction_id": "d-lo"})
+        )
+    result = compute_scope_mismatch_summary(
+        completed_tasks=completed,
+        failed_tasks=failed,
+        dir_id_to_text={"d-hi": "High dir", "d-lo": "Low dir"},
+    )
+    assert result is not None
+    top = result["top_directions"]
+    assert [d["direction_id"] for d in top] == ["d-hi", "d-lo"]
+    assert top[0]["calibration_rate"] == 1.0
+    assert top[0]["total_tasks"] == 2
+    assert top[0]["direction_text"] == "High dir"
+    assert top[1]["calibration_rate"] == round(1 / 3, 3)
+
+
+def test_compute_scope_mismatch_summary_top_directions_capped_at_three():
+    """Only the top 3 directions are returned even when more are calibrated."""
+    completed = [
+        make_task(
+            status=TaskStatus.COMPLETED,
+            context={"scope_calibrated_from": "small", "direction_id": f"d-{i}"},
+        )
+        for i in range(5)
+    ]
+    result = compute_scope_mismatch_summary(
+        completed_tasks=completed, failed_tasks=[], dir_id_to_text={}
+    )
+    assert result is not None
+    assert len(result["top_directions"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for compute_sr_prediction_accuracy (pure function, no DB required)
+# ---------------------------------------------------------------------------
+
+
+def _make_sr_task(check_results=None, rejection_categories=None, **kwargs):
+    """Minimal terminal Task carrying _self_review_outcome.check_results and
+    _first_attempt_rejection_categories for SR-prediction unit tests."""
+    ctx = {
+        "_self_review_outcome": {"check_results": check_results or {}},
+        "_first_attempt_rejection_categories": rejection_categories or {},
+    }
+    ctx.update(kwargs.pop("context", {}))
+    return make_task(status=TaskStatus.COMPLETED, context=ctx, **kwargs)
+
+
+def test_compute_sr_prediction_accuracy_under_sample_size_returns_none():
+    """Sample size <5 short-circuits to None regardless of content."""
+    tasks = [
+        _make_sr_task(
+            check_results={"correctness": {"passed": False}},
+            rejection_categories={"correctness": 1},
+        )
+        for _ in range(4)
+    ]
+    assert compute_sr_prediction_accuracy(tasks) is None
+
+
+def test_compute_sr_prediction_accuracy_perfect_match():
+    """Every SR-failed category matches human rejection → hit rate 1.0, miss 0.0."""
+    tasks = [
+        _make_sr_task(
+            check_results={"correctness": {"passed": False}},
+            rejection_categories={"correctness": 1},
+        )
+        for _ in range(5)
+    ]
+    result = compute_sr_prediction_accuracy(tasks)
+    assert result is not None
+    assert result["prediction_hit_rate"] == 1.0
+    assert result["miss_rate"] == 0.0
+    assert result["false_alarm_rate"] == 0.0
+    assert result["sample_size"] == 5
+    # SR flagged AND human rejected => "self_flagged shipped unfixed"
+    assert result["self_flagged_shipped_unfixed_task_count"] == 5
+    assert result["self_flagged_shipped_unfixed_task_rate"] == 1.0
+
+
+def test_compute_sr_prediction_accuracy_all_miss():
+    """SR passed everything but humans rejected → miss_rate 1.0, hit_rate 0.0."""
+    tasks = [
+        _make_sr_task(
+            check_results={"correctness": {"passed": True}},
+            rejection_categories={"correctness": 1},
+        )
+        for _ in range(5)
+    ]
+    result = compute_sr_prediction_accuracy(tasks)
+    assert result is not None
+    assert result["prediction_hit_rate"] == 0.0
+    assert result["miss_rate"] == 1.0
+    # No SR failures recorded so false_alarm_rate is None (divide-by-zero guard).
+    assert result["false_alarm_rate"] is None
+    assert result["self_flagged_shipped_unfixed_task_count"] == 0
+    assert result["self_flagged_shipped_unfixed_task_rate"] == 0.0
+
+
+def test_compute_sr_prediction_accuracy_reviewer_origin_excluded():
+    """Reviewer-stamped check_results entries do not count as author SR failures."""
+    tasks = [
+        _make_sr_task(
+            check_results={
+                "correctness": {
+                    "passed": False,
+                    "origin": "reviewer_recovery_after_incomplete_sr",
+                }
+            },
+            rejection_categories={"correctness": 1},
+        )
+        for _ in range(5)
+    ]
+    result = compute_sr_prediction_accuracy(tasks)
+    assert result is not None
+    # The reviewer-origin failure should NOT count as an author catch.
+    assert result["prediction_hit_rate"] == 0.0
+    assert result["miss_rate"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for compute_review_quality_metrics
+# ---------------------------------------------------------------------------
+
+
+def test_compute_review_quality_metrics_empty_returns_nones():
+    """Empty input → every metric is None / empty-ish per sample-size guards."""
+    result = compute_review_quality_metrics([])
+    assert result["self_review_effectiveness"] is None
+    assert result["self_review_prediction_accuracy"] is None
+    assert result["review_accuracy"] is None
+    # _compute_fresh_reviewer_effectiveness always returns a dict; we just check shape.
+    assert isinstance(result["fresh_reviewer_effectiveness"], dict)
+
+
+def test_compute_review_quality_metrics_self_review_effectiveness_shape():
+    """≥3 tasks with _self_review_outcome populates self_review_effectiveness."""
+    with_sr_clean = [
+        make_task(
+            status=TaskStatus.COMPLETED,
+            context={
+                "_self_review_outcome": {"fixes_applied": False},
+                "_first_attempt_succeeded": True,
+            },
+        )
+        for _ in range(3)
+    ]
+    result = compute_review_quality_metrics(with_sr_clean)
+    eff = result["self_review_effectiveness"]
+    assert eff is not None
+    assert eff["sample_size"] == 3
+    assert eff["sr_clean_count"] == 3
+    assert eff["sr_fixed_count"] == 0
+    assert eff["with_self_review_approval_rate"] == 1.0
+    assert eff["clean_verdict_approval_rate"] == 1.0
+
+
+def test_compute_review_quality_metrics_review_accuracy_shape():
+    """≥5 review tasks with a verdict populates review_accuracy."""
+    review_tasks = []
+    for _ in range(5):
+        review_tasks.append(
+            make_task(
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "review"}],
+                context={
+                    "blueprint_review_verdict": "APPROVE",
+                    "user_caught_issues": False,
+                    "user_overrode_review": False,
+                    "review_dismissed": False,
+                },
+            )
+        )
+    result = compute_review_quality_metrics(review_tasks)
+    acc = result["review_accuracy"]
+    assert acc is not None
+    assert acc["total_reviews"] == 5
+    assert acc["total_approvals"] == 5
+    assert acc["overrides"] == 0
+    assert acc["precision"] == 1.0
+    assert acc["recall"] == 1.0
+
+
+def test_parallel_review_effectiveness_buckets_correctly():
+    """Tasks with review_was_parallelized=True/False bucket into parallel/serial."""
+
+    def _make_review(parallelized: bool, verdict: str = "APPROVE"):
+        return make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={
+                "blueprint_review_verdict": verdict,
+                "review_was_parallelized": parallelized,
+            },
+        )
+
+    parallel_tasks = [_make_review(True) for _ in range(3)]
+    serial_tasks = [_make_review(False) for _ in range(3)]
+    result = compute_review_quality_metrics(parallel_tasks + serial_tasks)
+    pre = result["parallel_review_effectiveness"]
+    assert pre is not None
+    assert pre["sample_sizes"]["parallel"] == 3
+    assert pre["sample_sizes"]["serial"] == 3
+    assert pre["parallel"]["count"] == 3
+    assert pre["serial"]["count"] == 3
+    assert pre["parallel"]["approval_rate"] == 1.0
+    assert pre["serial"]["approval_rate"] == 1.0
+
+
+def test_parallel_review_effectiveness_none_when_insufficient_sample():
+    """Returns None when either bucket has fewer than 3 tasks."""
+
+    def _make_review(parallelized: bool):
+        return make_task(
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "review"}],
+            context={
+                "blueprint_review_verdict": "APPROVE",
+                "review_was_parallelized": parallelized,
+            },
+        )
+
+    # Only 2 parallel tasks — below threshold
+    tasks = [_make_review(True) for _ in range(2)] + [
+        _make_review(False) for _ in range(5)
+    ]
+    result = compute_review_quality_metrics(tasks)
+    assert result["parallel_review_effectiveness"] is None
+
+
+# ---------------------------------------------------------------------------
+# /api/admin/projects/{id}/warm-reuse-funnel tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_warm_reuse_funnel_empty(client: AsyncClient, db_session):
+    """Endpoint returns all-zero counters when no funnel events have been recorded."""
+    import app.warm_backlog_reuse as wbr
+
+    # Reset counters so prior test runs don't bleed over.
+    wbr._vms_with_eligible_backlog_events.clear()
+    wbr._teardown_defers_events.clear()
+    wbr._next_role_polls_during_defer_events.clear()
+    wbr._warm_claims_succeeded_events.clear()
+    wbr._claim_skipped_events.clear()
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/projects/{project.id}/warm-reuse-funnel")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["completed_vms_with_eligible_backlog"] == 0
+    assert data["teardown_defers_scheduled"] == 0
+    assert data["next_role_polls_during_defer"] == 0
+    assert data["warm_claims_succeeded"] == 0
+    assert data["claim_skipped_total"] == 0
+    assert data["claim_skipped_by_reason"] == {}
+    assert data["window_hours"] == 24
+
+
+@pytest.mark.asyncio
+async def test_warm_reuse_funnel_counts_after_records(client: AsyncClient, db_session):
+    """Counter functions increment correctly and are reflected in the endpoint."""
+    import app.warm_backlog_reuse as wbr
+
+    wbr._vms_with_eligible_backlog_events.clear()
+    wbr._teardown_defers_events.clear()
+    wbr._next_role_polls_during_defer_events.clear()
+    wbr._warm_claims_succeeded_events.clear()
+    wbr._claim_skipped_events.clear()
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(make_membership(project.id))
+    await db_session.commit()
+
+    wbr.record_vm_with_eligible_backlog()
+    wbr.record_vm_with_eligible_backlog()
+    wbr.record_teardown_defer()
+    wbr.record_next_role_poll_during_defer()
+    wbr.record_warm_claim_succeeded()
+    wbr.record_claim_skipped("no_eligible")
+    wbr.record_claim_skipped("lost_claim_race")
+    wbr.record_claim_skipped("no_eligible")
+
+    response = await client.get(f"/api/admin/projects/{project.id}/warm-reuse-funnel")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["completed_vms_with_eligible_backlog"] == 2
+    assert data["teardown_defers_scheduled"] == 1
+    assert data["next_role_polls_during_defer"] == 1
+    assert data["warm_claims_succeeded"] == 1
+    assert data["claim_skipped_total"] == 3
+    assert data["claim_skipped_by_reason"]["no_eligible"] == 2
+    assert data["claim_skipped_by_reason"]["lost_claim_race"] == 1
+
+
+@pytest.mark.asyncio
+async def test_warm_reuse_funnel_requires_auth(unauthenticated_client: AsyncClient):
+    """Unauthenticated requests are rejected."""
+    import uuid
+
+    fake_id = uuid.uuid4()
+    response = await unauthenticated_client.get(
+        f"/api/admin/projects/{fake_id}/warm-reuse-funnel"
+    )
+    assert response.status_code in (401, 403)
+
+
+# ---------------------------------------------------------------------------
+# compute_retry_analytics unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestComputeRetryAnalytics:
+    """Unit tests for the extracted compute_retry_analytics helper."""
+
+    def _make_task(self, **kwargs):
+        """Minimal Task-like object for unit tests (no DB needed)."""
+        t = make_task(**kwargs)
+        return t
+
+    def test_no_retry_history(self):
+        """Tasks with _attempt_number <= 1 (or absent) produce zero/None counts."""
+        now = _utcnow()
+        window_start = now - timedelta(hours=24)
+        failed = [
+            make_task(status=TaskStatus.FAILED, context={}),
+            make_task(status=TaskStatus.FAILED, context={"_attempt_number": 1}),
+        ]
+        completed = [
+            make_task(status=TaskStatus.COMPLETED, context={}),
+        ]
+        result = compute_retry_analytics(
+            failed_tasks=failed,
+            completed_tasks=completed,
+            dir_id_to_text={},
+            window_start=window_start,
+        )
+        assert result["retry_task_count"] == 0
+        assert result["retry_success_count"] == 0
+        assert result["retry_overhead_cost_usd"] == 0.0
+        assert result["retry_recovery_cost_usd"] == 0.0
+        assert result["retry_waste_by_direction"] == []
+        assert result["avg_retries_before_failure"] is None
+        assert result["retry_success_rate_by_class"] == {}
+        assert result["retry_wasted_rate"] is None
+
+    def test_retried_and_succeeded(self):
+        """Completed tasks with _attempt_number > 1 count toward retry_success_count
+        and retry_recovery_cost_usd; retry_success_rate_by_class is populated."""
+        now = _utcnow()
+        window_start = now - timedelta(hours=24)
+        completed = [
+            make_task(
+                status=TaskStatus.COMPLETED,
+                context={
+                    "_attempt_number": 2,
+                    "_previous_failure_class": "CODE_ERROR",
+                    "_prior_attempts_cost": 1.5,
+                },
+            ),
+            make_task(
+                status=TaskStatus.COMPLETED,
+                context={
+                    "_attempt_number": 3,
+                    "_previous_failure_class": "CODE_ERROR",
+                    "_prior_attempts_cost": 0.75,
+                },
+            ),
+        ]
+        result = compute_retry_analytics(
+            failed_tasks=[],
+            completed_tasks=completed,
+            dir_id_to_text={},
+            window_start=window_start,
+        )
+        assert result["retry_success_count"] == 2
+        assert result["retry_recovery_cost_usd"] == round(1.5 + 0.75, 4)
+        assert "CODE_ERROR" in result["retry_success_rate_by_class"]
+        cls_entry = result["retry_success_rate_by_class"]["CODE_ERROR"]
+        assert cls_entry["merged"] == 2
+        assert cls_entry["failed"] == 0
+        assert cls_entry["success_rate"] == 1.0
+        # No failed retries → retry_wasted_rate denominator is 0+2=2, waste=0
+        assert result["retry_wasted_rate"] == 0.0
+
+    def test_retried_and_failed(self):
+        """Failed tasks with _attempt_number > 1 contribute to retry_overhead_cost_usd
+        and retry_waste_by_direction with top-5 truncation."""
+        now = _utcnow()
+        window_start = now - timedelta(hours=24)
+        # 6 directions — only top 5 by cost should appear
+        failed = []
+        dir_id_to_text = {}
+        for i in range(6):
+            did = f"dir-{i}"
+            dir_id_to_text[did] = f"Direction {i}"
+            duration_hours = i + 1  # dir-0=1h, dir-5=6h so dir-5 is most expensive
+            t = make_task(
+                status=TaskStatus.FAILED,
+                context={"_attempt_number": 2, "direction_id": did},
+                vm_provisioned_at=now - timedelta(hours=duration_hours + 1),
+                vm_stopped_at=now - timedelta(minutes=1),
+                vm_spot=False,
+            )
+            failed.append(t)
+
+        result = compute_retry_analytics(
+            failed_tasks=failed,
+            completed_tasks=[],
+            dir_id_to_text=dir_id_to_text,
+            window_start=window_start,
+        )
+        assert result["retry_task_count"] == 6
+        # Top-5 truncation: only 5 directions returned, sorted descending by cost
+        assert len(result["retry_waste_by_direction"]) == 5
+        costs = [e["retry_cost_usd"] for e in result["retry_waste_by_direction"]]
+        assert costs == sorted(costs, reverse=True)
+        # Overhead cost is positive
+        assert result["retry_overhead_cost_usd"] > 0
+
+    def test_retry_wasted_rate_denominator(self):
+        """retry_wasted_rate = failed_retries / (failed_retries + succeeded_retries)."""
+        now = _utcnow()
+        window_start = now - timedelta(hours=24)
+        failed = [
+            make_task(
+                status=TaskStatus.FAILED,
+                context={"_attempt_number": 2},
+            ),
+        ]
+        completed = [
+            make_task(
+                status=TaskStatus.COMPLETED,
+                context={"_attempt_number": 2, "_previous_failure_class": "CODE_ERROR"},
+            ),
+            make_task(
+                status=TaskStatus.COMPLETED,
+                context={"_attempt_number": 2, "_previous_failure_class": "CODE_ERROR"},
+            ),
+        ]
+        result = compute_retry_analytics(
+            failed_tasks=failed,
+            completed_tasks=completed,
+            dir_id_to_text={},
+            window_start=window_start,
+        )
+        # 1 failed retry, 2 succeeded retries → wasted_rate = 1/3
+        assert result["retry_task_count"] == 1
+        assert result["retry_success_count"] == 2
+        assert result["retry_wasted_rate"] == round(1 / 3, 4)
+
+
+# ---------------------------------------------------------------------------
+# compute_release_qualifier_infra_metrics tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_release_qualifier_infra_metrics_no_versions(db_session):
+    """Empty DB returns zero-valued counters."""
+    now = _utcnow()
+    result = await compute_release_qualifier_infra_metrics(
+        db_session,
+        project_id=None,
+        window_start=now - timedelta(hours=24),
+    )
+    assert result["qualifier_runs_total"] == 0
+    assert result["release_infra_failure_total"] == 0
+    assert result["audit_report_missing_count"] == 0
+    assert result["audit_report_parseable_but_unscoreable_count"] == 0
+    assert result["smoketest_report_missing_count"] == 0
+    assert result["release_infra_failure_streak_max"] == 0
+
+
+@pytest.mark.asyncio
+async def test_release_qualifier_infra_metrics_counts_by_error_category(db_session):
+    """Rows with distinct infra_failure error codes increment the correct buckets."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    finalized_at = (now - timedelta(hours=1)).isoformat()
+
+    error_cases = [
+        "audit_report_missing",
+        "audit_report_parseable_but_unscoreable",
+        "smoketest_report_missing",
+        "audit_task_failed_other",  # unknown bucket — counts in total only
+    ]
+    for i, error in enumerate(error_cases):
+        v = ReleaseVersion(
+            project_id=project.id,
+            version_number=i + 1,
+            phase="stabilize",
+            last_qualification={
+                "status": "infra_failure",
+                "error": error,
+                "consecutive_infra_errors": 1,
+                "finalized_at": finalized_at,
+            },
+        )
+        db_session.add(v)
+    await db_session.commit()
+
+    result = await compute_release_qualifier_infra_metrics(
+        db_session,
+        project_id=project.id,
+        window_start=window_start,
+    )
+    assert result["qualifier_runs_total"] == 4
+    assert result["release_infra_failure_total"] == 4
+    assert result["audit_report_missing_count"] == 1
+    assert result["audit_report_parseable_but_unscoreable_count"] == 1
+    assert result["smoketest_report_missing_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_release_qualifier_infra_metrics_streak_max(db_session):
+    """release_infra_failure_streak_max reflects the highest consecutive_infra_errors."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    finalized_at = (now - timedelta(hours=1)).isoformat()
+
+    for i, streak in enumerate([2, 4, 1]):
+        v = ReleaseVersion(
+            project_id=project.id,
+            version_number=i + 1,
+            phase="stabilize",
+            last_qualification={
+                "status": "infra_failure",
+                "error": "audit_report_missing",
+                "consecutive_infra_errors": streak,
+                "finalized_at": finalized_at,
+            },
+        )
+        db_session.add(v)
+    await db_session.commit()
+
+    result = await compute_release_qualifier_infra_metrics(
+        db_session,
+        project_id=project.id,
+        window_start=now - timedelta(hours=24),
+    )
+    assert result["release_infra_failure_streak_max"] == 4
+
+
+@pytest.mark.asyncio
+async def test_release_qualifier_infra_metrics_excludes_outside_window(db_session):
+    """Rows finalized before window_start are not counted."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    old_finalized_at = (now - timedelta(hours=48)).isoformat()
+    recent_finalized_at = (now - timedelta(hours=1)).isoformat()
+
+    old_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        last_qualification={
+            "status": "infra_failure",
+            "error": "audit_report_missing",
+            "consecutive_infra_errors": 3,
+            "finalized_at": old_finalized_at,
+        },
+    )
+    recent_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="stabilize",
+        last_qualification={
+            "status": "infra_failure",
+            "error": "smoketest_report_missing",
+            "consecutive_infra_errors": 1,
+            "finalized_at": recent_finalized_at,
+        },
+    )
+    db_session.add(old_version)
+    db_session.add(recent_version)
+    await db_session.commit()
+
+    result = await compute_release_qualifier_infra_metrics(
+        db_session,
+        project_id=project.id,
+        window_start=now - timedelta(hours=24),
+    )
+    assert result["qualifier_runs_total"] == 1
+    assert result["release_infra_failure_total"] == 1
+    assert result["smoketest_report_missing_count"] == 1
+    assert result["audit_report_missing_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_release_qualifier_infra_metrics_qualifier_runs_total(db_session):
+    """qualifier_runs_total counts all finalized quals, not just infra_failure ones."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    finalized_at = (now - timedelta(hours=1)).isoformat()
+
+    # One infra_failure and one successful promotion
+    infra_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        last_qualification={
+            "status": "infra_failure",
+            "error": "audit_report_missing",
+            "consecutive_infra_errors": 1,
+            "finalized_at": finalized_at,
+        },
+    )
+    promoted_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="promote",
+        last_qualification={
+            "status": "promoted",
+            "finalized_at": finalized_at,
+        },
+    )
+    # Version with no qualification at all — should not count
+    unqual_version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="build",
+        last_qualification=None,
+    )
+    db_session.add(infra_version)
+    db_session.add(promoted_version)
+    db_session.add(unqual_version)
+    await db_session.commit()
+
+    result = await compute_release_qualifier_infra_metrics(
+        db_session,
+        project_id=project.id,
+        window_start=now - timedelta(hours=24),
+    )
+    assert result["qualifier_runs_total"] == 2
+    assert result["release_infra_failure_total"] == 1

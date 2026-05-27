@@ -1348,7 +1348,7 @@ async def test_grace_period_expires_after_new_cycle_appended_triggers_pause(
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
         "auto_recovered_at": recovered_at.isoformat(),
-        "research_history": pre_history + [new_cycle],
+        "research_history": [*pre_history, new_cycle],
     }
     project = await _make_cost_project(db_session, direction)
 
@@ -1443,6 +1443,10 @@ async def test_grace_period_does_not_block_code_failure_pause(db_session, mocker
     )
 
 
+# sha256("")[:16] — fingerprint for directions without success_evidence
+_EMPTY_SE_FP = "e3b0c44298fc1c14"
+
+
 def _scaffolding_direction_for_lifecycle(progress_window):
     return {
         "id": "d-scaffold-lc",
@@ -1468,7 +1472,10 @@ def _scaffolding_direction_for_lifecycle(progress_window):
             "total_tasks_failed": 0,
             "total_tasks_failed_infra": 0,
         },
-        "outcome_progress_history": [{"progress": p} for p in progress_window],
+        "outcome_progress_history": [
+            {"progress": p, "success_evidence_fp": _EMPTY_SE_FP}
+            for p in progress_window
+        ],
     }
 
 
@@ -1515,7 +1522,7 @@ async def test_lifecycle_flags_outcome_scaffolding_and_notifies_once(
 async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
     db_session, mocker
 ):
-    """Once success-evidence advances across the window, the advisory flag is cleared."""
+    """Once the confirmed-finding count grows across the window, the advisory flag is cleared."""
     mocker.patch(
         "app.notification_dispatch.post_direction_outcome_stalled_message",
         new_callable=AsyncMock,
@@ -1532,10 +1539,10 @@ async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
     await db_session.refresh(project)
     assert project.directions[0].get("outcome_scaffolding_flagged") is True
 
-    # Progress resumes -> the success-evidence fingerprint now varies across the
-    # window, which the detector reads as advancement.
+    # Progress resumes -> the confirmed-finding count grows across the window,
+    # which the detector reads as advancement.
     project.directions[0]["outcome_progress_history"] = [
-        {"progress": 5, "success_evidence_fp": f"fp{i:015d}"} for i in range(6)
+        {"progress": p} for p in [5, 5, 6, 7, 8, 9]
     ]
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -1659,3 +1666,467 @@ async def test_scaffolding_memo_not_respawned_on_evidence_refresh(db_session, mo
     assert len(scaffolding_memos) == 1, (
         f"expected exactly 1 memo (no re-spawn), got {len(scaffolding_memos)}"
     )
+
+
+# ── Persistence-pressure ladder tests ─────────────────────────────────────────
+
+
+def _already_flagged_direction(flagged_cycles: int = 0, **extra) -> dict:
+    """Direction pre-flagged as outcome-less scaffolding with an existing cycle counter.
+
+    Uses the same scaffolding shape as _scaffolding_direction_for_lifecycle so
+    _check_outcome_scaffolding continues to return truthy on each pass (all fps
+    are None/identical → stalled success_evidence signal).
+    """
+    d = _scaffolding_direction_for_lifecycle([5, 5, 5, 5, 5, 5])
+    d["outcome_scaffolding_flagged"] = True
+    d["outcome_scaffolding_flagged_at"] = datetime.utcnow().isoformat()
+    d["outcome_scaffolding_evidence"] = {"total_cycles": 14}
+    d["outcome_scaffolding_flagged_cycles"] = flagged_cycles
+    # total_cycles = 4 (research_history) + 10 (history_aggregate) = 14.
+    # Set last_cycle_count to 13 so the lifecycle pass sees one new cycle (14>13)
+    # and advances the counter exactly once — simulating a real completed cycle.
+    d["outcome_scaffolding_last_cycle_count"] = 13
+    d.update(extra)
+    return d
+
+
+@pytest.mark.asyncio
+async def test_scaffolding_flag_counter_increments_on_new_cycle(db_session, mocker):
+    """outcome_scaffolding_flagged_cycles increments only when a new research cycle has completed."""
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_scaffolding_escalation_message",
+        new_callable=AsyncMock,
+    )
+
+    # last_cycle_count=13 < total_cycles=14 → one new cycle → counter advances
+    direction = _already_flagged_direction(flagged_cycles=1)
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d.get("outcome_scaffolding_flagged_cycles") == 2, (
+        f"counter should be 2 after one new cycle, got {d.get('outcome_scaffolding_flagged_cycles')}"
+    )
+    assert d["status"] == "active", (
+        "direction must remain active — only the counter increments"
+    )
+
+
+@pytest.mark.asyncio
+async def test_scaffolding_counter_does_not_increment_without_new_cycle(
+    db_session, mocker
+):
+    """outcome_scaffolding_flagged_cycles must NOT advance when no new research cycle completed."""
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_scaffolding_escalation_message",
+        new_callable=AsyncMock,
+    )
+
+    direction = _already_flagged_direction(flagged_cycles=1)
+    # Override last_cycle_count to equal current total_cycles (14) — no new cycle
+    direction["outcome_scaffolding_last_cycle_count"] = 14
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d.get("outcome_scaffolding_flagged_cycles") == 1, (
+        f"counter must not advance when no new cycle completed, got {d.get('outcome_scaffolding_flagged_cycles')}"
+    )
+    assert d["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_scaffolding_legacy_missing_watermark_backfills_without_increment(
+    db_session, mocker
+):
+    """Legacy flagged directions missing the watermark must backfill it without advancing."""
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    escalate_notify = mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_scaffolding_escalation_message",
+        new_callable=AsyncMock,
+    )
+
+    direction = _already_flagged_direction(flagged_cycles=2)
+    direction.pop("outcome_scaffolding_last_cycle_count", None)
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d.get("outcome_scaffolding_flagged_cycles") == 2, (
+        "legacy missing watermark must not miscount the current total_cycles as a new cycle"
+    )
+    assert d.get("outcome_scaffolding_last_cycle_count") == 14, (
+        "legacy missing watermark should be backfilled to the current completed-cycle count"
+    )
+    assert d["status"] == "active"
+    escalate_notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_scaffolding_escalation_fires_at_mid_threshold(db_session, mocker):
+    """Escalation notification fires when flagged_cycles reaches escalation_cycles (default 3)."""
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    escalate_notify = mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_scaffolding_escalation_message",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_direction_milestone_message",
+        new_callable=AsyncMock,
+    )
+
+    # escalation_cycles default = 3; preset counter to 2 so next pass hits 3
+    direction = _already_flagged_direction(flagged_cycles=2)
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d.get("outcome_scaffolding_flagged_cycles") == 3
+    assert d["status"] == "active", "escalation must not retire the direction"
+    escalate_notify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_scaffolding_escalation_does_not_refire_without_new_cycle(
+    db_session, mocker
+):
+    """Escalation notification must not repeat on later ticks without a new completed cycle."""
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    escalate_notify = mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_scaffolding_escalation_message",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_direction_milestone_message",
+        new_callable=AsyncMock,
+    )
+
+    direction = _already_flagged_direction(flagged_cycles=2)
+    project = await _make_cost_project(db_session, direction)
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    assert project.directions[0].get("outcome_scaffolding_flagged_cycles") == 3
+    escalate_notify.assert_awaited_once()
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d.get("outcome_scaffolding_flagged_cycles") == 3, (
+        "counter must stay pinned when no new cycle completed after escalation"
+    )
+    escalate_notify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_scaffolding_auto_retires_at_high_threshold(db_session, mocker):
+    """Direction is auto-retired when flagged_cycles reaches max_flagged_cycles (default 6)."""
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_scaffolding_escalation_message",
+        new_callable=AsyncMock,
+    )
+    milestone_notify = mocker.patch(
+        "app.notification_dispatch.post_direction_milestone_message",
+        new_callable=AsyncMock,
+    )
+
+    # max_flagged_cycles default = 6; preset counter to 5 so next pass hits 6
+    direction = _already_flagged_direction(flagged_cycles=5)
+    did = direction["id"]
+    project = await _make_cost_project(db_session, direction)
+
+    active_directions = await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "completed", (
+        "direction should be auto-retired (status=completed) after max_flagged_cycles"
+    )
+    assert d.get("auto_completed") is True
+    reason = d.get("auto_completed_reason", "")
+    assert "scaffolding" in reason.lower(), (
+        f"auto_completed_reason should mention scaffolding, got: {reason!r}"
+    )
+    milestone_notify.assert_awaited_once()
+    kwargs = milestone_notify.call_args.kwargs
+    assert kwargs.get("milestone") == "auto-retired-scaffolding"
+    # Retired direction must NOT be returned in active_directions — otherwise the
+    # downstream greedy selection could spawn a research cycle on a terminal
+    # direction in the same orchestrator tick.
+    assert did not in {ad.get("id") for ad in active_directions}, (
+        "auto-retired direction must be excluded from active_directions"
+    )
+
+
+@pytest.mark.asyncio
+async def test_scaffolding_flag_clear_resets_counter(db_session, mocker):
+    """When the scaffolding condition clears, counter is removed alongside the flag."""
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+
+    # Grow the confirmed-finding count so _check_outcome_scaffolding returns None
+    direction = _already_flagged_direction(flagged_cycles=2)
+    direction["outcome_progress_history"] = [
+        {"progress": p} for p in [5, 5, 6, 7, 8, 9]
+    ]
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d.get("outcome_scaffolding_flagged") is None, (
+        "flag should be cleared when scaffolding condition no longer holds"
+    )
+    assert "outcome_scaffolding_flagged_cycles" not in d, (
+        "counter should be removed when flag is cleared"
+    )
+    assert "outcome_scaffolding_last_cycle_count" not in d, (
+        "last_cycle_count watermark should be removed when flag is cleared"
+    )
+
+
+@pytest.mark.asyncio
+async def test_scaffolding_stale_verdict_does_not_freeze_counter(db_session, mocker):
+    """A stale advancing evidence_progress verdict must NOT freeze the ladder counter.
+
+    A stale advancing verdict (cycle_index far in the past) is old enough that
+    _check_outcome_scaffolding still fires (the suppression inside the detector
+    requires a RECENT verdict via _evidence_progress_suppresses_scaffolding). The
+    persistence-pressure ladder must use the SAME recency-aware helper rather than
+    a recency-blind status check, so a stale verdict grants no credit — the counter
+    advances, the direction eventually escalates and auto-retires.
+    """
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_scaffolding_escalation_message",
+        new_callable=AsyncMock,
+    )
+
+    # cycle_index=1 with total_cycles=14 → 13 cycles stale → exceeds stall_run(6)
+    # so _evidence_progress_suppresses_scaffolding returns False inside BOTH the
+    # detector AND the ladder, meaning the counter must increment.
+    direction = _already_flagged_direction(
+        flagged_cycles=1,
+        evidence_progress={"status": "advancing", "cycle_index": 1},
+    )
+    project = await _make_cost_project(db_session, direction)
+
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        cooldown_minutes=0.0,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d.get("outcome_scaffolding_flagged_cycles") == 2, (
+        "counter MUST increment when evidence_progress verdict is stale (recency check fails)"
+    )
+    assert d.get("outcome_scaffolding_flagged") is True, (
+        "flag must remain set (stale advancing does not clear the scaffolding flag)"
+    )
+
+
+# ── Contract-reset and fingerprint-filter unit tests ──────────────────────────
+
+
+def test_reset_outcome_detection_state_clears_all_keys():
+    """_reset_outcome_detection_state empties history and removes all outcome-detection fields."""
+    from app.direction_lifecycle import _reset_outcome_detection_state
+
+    d = {
+        "status": "active",
+        "outcome_progress_history": [{"progress": 5, "success_evidence_fp": "abc"}],
+        "outcome_progress_ever_met": True,
+        "evidence_progress": {"status": "advancing"},
+        "possibly_complete": True,
+        "completion_suggestion": "done",
+        "outcome_scaffolding_flagged": True,
+        "outcome_scaffolding_flagged_at": "2026-01-01T00:00:00",
+        "outcome_scaffolding_flagged_cycles": 3,
+    }
+    _reset_outcome_detection_state(d)
+
+    assert d["outcome_progress_history"] == [], "history must be emptied (not removed)"
+    for key in (
+        "outcome_progress_ever_met",
+        "evidence_progress",
+        "possibly_complete",
+        "completion_suggestion",
+        "outcome_scaffolding_flagged",
+        "outcome_scaffolding_flagged_at",
+        "outcome_scaffolding_flagged_cycles",
+    ):
+        assert key not in d, f"{key} should be removed by reset"
+    assert d["status"] == "active", "non-outcome keys must survive the reset"
+
+
+def test_check_outcome_scaffolding_filters_stale_contract_snapshots():
+    """Snapshots with an old success_evidence_fp are excluded from the stall window.
+
+    The detector must return None when all snapshots pre-date the current contract,
+    then fire once enough new-contract snapshots accumulate.
+    """
+    import hashlib
+    from app.strategic_completion import _check_outcome_scaffolding
+
+    old_fp = hashlib.sha256(b"old contract").hexdigest()[:16]
+    new_se = "new success evidence"
+    new_fp = hashlib.sha256(new_se.encode()).hexdigest()[:16]
+
+    direction = {
+        "id": "d-fp-filter",
+        "text": "test",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "context": {"success_evidence": new_se},
+        "research_history": [
+            {
+                "tasks_created": 3,
+                "tasks_completed": 3,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 3,
+            }
+            for _ in range(14)
+        ],
+        "history_aggregate": {
+            "total_cycles": 10,
+            "total_prs_merged": 8,
+            "total_tasks_completed": 8,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        },
+        # All snapshots carry the OLD fingerprint — none match new contract.
+        "outcome_progress_history": [
+            {"progress": 5, "success_evidence_fp": old_fp} for _ in range(6)
+        ],
+    }
+    assert _check_outcome_scaffolding(direction) is None, (
+        "old-contract snapshots must not fire the detector"
+    )
+
+    # Replace with new-contract snapshots — detector should now fire.
+    direction["outcome_progress_history"] = [
+        {"progress": 5, "success_evidence_fp": new_fp} for _ in range(6)
+    ]
+    assert _check_outcome_scaffolding(direction) is not None, (
+        "new-contract snapshots must fire the detector once stall window is full"
+    )
+
+
+# ── Additional contract-reset unit tests ──────────────────────────────────────
+
+
+def test_reset_outcome_detection_state_clears_completion_suggestion():
+    """_reset_outcome_detection_state specifically removes the completion_suggestion field.
+
+    completion_suggestion is the least-frequently-tested of the 8 outcome-detection
+    keys.  Verify it is removed (not left as an empty string or None) so a stale
+    advisory is never surfaced to operators after a contract rewrite.
+    """
+    from app.direction_lifecycle import _reset_outcome_detection_state
+
+    d = {
+        "status": "active",
+        "text": "Improve auth coverage",
+        "completion_suggestion": "All SAML tests green — direction may be done",
+        "outcome_progress_history": [{"progress": 4, "success_evidence_fp": "fp-old"}],
+        "outcome_progress_ever_met": True,
+    }
+    _reset_outcome_detection_state(d)
+
+    assert "completion_suggestion" not in d, (
+        "completion_suggestion must be removed, not left as empty value"
+    )
+    assert d["outcome_progress_history"] == [], "history must be emptied, not removed"
+    assert "outcome_progress_ever_met" not in d
+    assert d["status"] == "active", "non-outcome fields must survive the reset"
+    assert d["text"] == "Improve auth coverage", "text must survive the reset"

@@ -28,7 +28,11 @@ from app.models import (
 )
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 import app.shared_state as _shared_state
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import (
+    get_project_integration_branch,
+    get_project_promotion_target,
+    runtime_config as _runtime_config,
+)
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -436,7 +440,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "research_mode": {"priority": "critical"},
     "project_name": {"priority": "critical"},
     "base_branch": {"priority": "critical"},
-    "is_self_repo": {"priority": "critical"},
+    "enable_self_improvement": {"priority": "critical"},
     "model": {"priority": "critical"},
     "effort": {"priority": "critical"},
     "prompt_suffix": {"priority": "high"},
@@ -566,11 +570,15 @@ async def _build_shipped_changes_manifest(
     result = await session.execute(stmt)
     completed_tasks = result.scalars().all()
 
-    # Filter to merged tasks and collect manifest entries (cap at 50)
+    # Filter to merged tasks and collect manifest entries (cap at 50).
+    # Only include root tasks (parent_task_id is None): rollup children merge to a
+    # rollup staging branch, not the integration branch, so they have not "shipped"
+    # until the rollup parent itself merges. Including children would tell the design
+    # doc agent that work shipped when it only reached staging.
     manifest_entries: list[dict] = []
     for t in completed_tasks:
         ctx = t.context or {}
-        if not ctx.get("pr_merged"):
+        if not ctx.get("pr_merged") or t.parent_task_id is not None:
             continue
         entry: dict = {
             "title": t.title,
@@ -745,7 +753,15 @@ async def _build_recent_interventions(
             if not updated_at or (since_naive and updated_at < since_naive):
                 continue
             finished += 1
-            if t.status == TaskStatus.COMPLETED and (t.context or {}).get("pr_merged"):
+            # Count only integration-landed merges: root tasks (parent_task_id is None)
+            # whose PR merged directly to the integration branch. Child tasks (rollup
+            # members) have pr_merged=True when their PR lands on the rollup staging
+            # branch — not on the integration branch — so they must not be counted here.
+            if (
+                t.status == TaskStatus.COMPLETED
+                and (t.context or {}).get("pr_merged")
+                and t.parent_task_id is None
+            ):
                 merged += 1
         rate = round(merged / finished, 3) if finished > 0 else None
         return {
@@ -818,7 +834,7 @@ async def _build_recent_interventions(
     _gh_token_ss: str | None = None
     _gh_owner_ss: str | None = None
     _gh_repo_ss: str | None = None
-    _integration_branch_ss = _runtime_config.get("integration_branch", "main")
+    _integration_branch_ss = get_project_integration_branch(project)
     _automain_verified: dict[uuid.UUID, bool] = {}
 
     try:
@@ -1396,7 +1412,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
             "problem_model": _agent_view_problem_model(project.problem_model),
             "open_messages": open_msgs,
             "shipped_changes_manifest": shipped_changes_manifest,
-            "base_branch": _runtime_config.get("integration_branch", "main"),
+            "base_branch": get_project_integration_branch(project),
             **({"model": doc_model} if doc_model else {}),
             **({"effort": doc_effort} if doc_effort else {}),
         },
@@ -1593,6 +1609,12 @@ async def _spawn_strategic_review(
             stat_entry["recent_findings_grade_distribution"] = _agg_grade
         if recent_failures:
             stat_entry["recent_failures"] = recent_failures[:5]
+        # Surface cumulative confirmed-finding count and trend from
+        # outcome_progress_history (eviction-robust signal used by scaffolding
+        # detector). Shared helper keeps thresholds in sync with strategic_analysis.
+        from app.strategic_completion import outcome_progress_summary_fields
+
+        stat_entry.update(outcome_progress_summary_fields(d))
         if d.get("system_id"):
             stat_entry["system_id"] = d["system_id"]
         if d.get("status") == "paused":
@@ -1745,13 +1767,14 @@ async def _spawn_strategic_review(
     except Exception:
         logger.exception("[STRATEGIC] drift signal computation failed; continuing")
         drift_summary = {}
-    # LTS version/phase context — active whenever the integration branch is a
-    # real trunk distinct from "main" (i.e. the LTS split is on).  Project-generic:
-    # gated on integration_branch, not project.is_self_repo.  Best-effort.
+    # LTS version/phase context — active whenever the integration branch and
+    # promotion target differ (i.e. the LTS split is on). Project-generic:
+    # gated on the per-project branch pair, not project.is_self_repo. Best-effort.
     _open_version = None
     _version_phase_block: dict | None = None
-    _integration_branch = _runtime_config.get("integration_branch", "main")
-    if _integration_branch != "main":
+    _integration_branch = get_project_integration_branch(project)
+    _promotion_target = get_project_promotion_target(project)
+    if _integration_branch != _promotion_target:
         try:
             from app.release_version import (
                 count_merged_since,
@@ -1800,6 +1823,7 @@ async def _spawn_strategic_review(
                     integration_branch=_integration_branch,
                     base_sha=_bootstrap_sha,
                     goal=_bootstrap_goal,
+                    promotion_target=_promotion_target,
                 )
             if _open_version is not None:
                 _tasks_merged = await count_merged_since(
@@ -2111,7 +2135,7 @@ async def _spawn_strategic_review(
             ),
             "user_last_active_at": user_last_active_at,
             "self_reflection_log": (project.self_reflection_log or [])[-5:],
-            "is_self_repo": bool(project.is_self_repo),
+            "enable_self_improvement": project.enable_self_improvement,
             "directions_summary": direction_stats,
             "outcome_evaluation": _build_outcome_evaluation(project, cycle_history),
             "recent_interventions": recent_interventions,
@@ -2168,7 +2192,7 @@ async def _spawn_strategic_review(
                 if _efficiency_snapshot
                 else {}
             ),
-            "base_branch": _runtime_config.get("integration_branch", "main"),
+            "base_branch": get_project_integration_branch(project),
             **({"model": review_model} if review_model else {}),
             **({"effort": review_effort} if review_effort else {}),
         },

@@ -21,10 +21,15 @@ from app.models import (
     _utcnow,
 )
 from app.auth import get_current_user, require_admin
-from app.shared_state import external_health, circuit_breakers, get_circuit_breaker
+from app.shared_state import (
+    external_health,
+    circuit_breakers,
+    get_circuit_breaker,
+    snapshot_pr_is_not_behind_counts,
+)
 import app.shared_state as _shared_state
 from app.compute import get_zone_health_summary
-from app.routers.admin_digest import compute_pipeline_health_summary
+from app.pipeline_health import compute_pipeline_health_summary
 from app.routers.admin_debug import _build_stuck_tasks
 
 logger = logging.getLogger(__name__)
@@ -63,6 +68,49 @@ async def get_health_overview(
             session=session,
         ),
     )
+
+
+@router.get("/diagnostics/null-branch-config")
+async def get_null_branch_config_diagnostics(
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    rows = (
+        (
+            await session.execute(
+                select(Project)
+                .where(
+                    (Project.integration_branch.is_(None))
+                    | (Project.promotion_target.is_(None))
+                )
+                .order_by(Project.created_at.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    projects = []
+    self_repo_skipped = []
+    for project in rows:
+        item = {
+            "id": str(project.id),
+            "name": project.name,
+            "github_owner": project.github_owner,
+            "github_repo": project.github_repo,
+            "is_self_repo": project.is_self_repo,
+            "created_at": project.created_at.isoformat()
+            if project.created_at
+            else None,
+        }
+        if project.is_self_repo and project.integration_branch is None:
+            self_repo_skipped.append(item)
+        else:
+            projects.append(item)
+    return {
+        "projects": projects,
+        "self_repo_skipped": self_repo_skipped,
+        "total": len(projects) + len(self_repo_skipped),
+    }
 
 
 async def _compute_health_overview(
@@ -839,3 +887,18 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
             _shared_state.runtime_config.get("next_role_poll_timeout_secs", 180)
         ),
     }
+
+
+@router.get("/pr-behind-detector-stats")
+async def get_pr_behind_detector_stats(
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """In-process counts of pr_is_not_behind outcomes, keyed by call site.
+
+    Each call-site entry has integer buckets ``true`` / ``false`` / ``none``
+    plus ``total``. Counters are non-persistent (reset on process restart) and
+    track the four canonical call sites listed in
+    ``shared_state.PR_IS_NOT_BEHIND_CALL_SITES`` even when no hits have been
+    recorded yet, so the response shape is stable from process start.
+    """
+    return {"pr_is_not_behind": snapshot_pr_is_not_behind_counts()}

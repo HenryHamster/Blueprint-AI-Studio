@@ -3,6 +3,7 @@ import { useRef, useState, useEffect } from 'react';
 import type { RefObject } from 'react';
 import type { DateRange } from '../hooks/useSearchFilters';
 import { FILTER_TASK_TYPE_OPTIONS } from '../taskCapabilities';
+import { FAILURE_CLASS_CONFIG } from './TaskCard';
 
 interface SearchFilterBarProps {
   searchQuery: string;
@@ -11,10 +12,13 @@ interface SearchFilterBarProps {
   onTypeFilterChange: (filter: string[]) => void;
   statusFilter?: string[];
   onStatusFilterChange?: (filter: string[]) => void;
+  failureClassFilter?: string[];
+  onFailureClassFilterChange?: (filter: string[]) => void;
   dateRange: DateRange;
   onDateRangeChange: (range: DateRange) => void;
   blockedFilter: boolean;
   onBlockedFilterChange: (v: boolean) => void;
+  onDownloadCsv: () => void;
   inputRef?: RefObject<HTMLInputElement | null>;
 }
 
@@ -171,7 +175,10 @@ const DATE_RANGE_OPTIONS: { label: string; value: DateRange }[] = [
   { label: 'Last 7d', value: '7d' },
 ];
 
-export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, dateRange, onDateRangeChange, blockedFilter, onBlockedFilterChange, inputRef }: SearchFilterBarProps) {
+const DATE_RANGE_SELECT_OPTIONS: { label: string; value: string }[] = DATE_RANGE_OPTIONS.map(o => ({ label: o.label, value: o.value }));
+const FAILURE_CLASS_OPTIONS = Object.entries(FAILURE_CLASS_CONFIG).map(([value, config]) => ({ value, label: config.label }));
+
+export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, failureClassFilter = [], onFailureClassFilterChange, dateRange, onDateRangeChange, blockedFilter, onBlockedFilterChange, onDownloadCsv, inputRef }: SearchFilterBarProps) {
   const [inputValue, setInputValue] = useState(searchQuery);
   const typeOptions = FILTER_TASK_TYPE_OPTIONS;
   useEffect(() => {
@@ -188,6 +195,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
   const activeFilterCount = [
     searchQuery !== '',
     taskTypeFilter.length < typeOptions.length,
+    onFailureClassFilterChange != null && failureClassFilter.length > 0,
     dateRange !== 'all',
     blockedFilter,
   ].filter(Boolean).length;
@@ -197,6 +205,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
   function handleClear() {
     onSearchChange('');
     onTypeFilterChange(typeOptions.map(o => o.value));
+    onFailureClassFilterChange?.([]);
     onDateRangeChange('all');
     onBlockedFilterChange(false);
   }
@@ -222,8 +231,17 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
         onChange={onTypeFilterChange}
       />
 
+      {onFailureClassFilterChange && (
+        <MultiSelectDropdown
+          label="Failure class"
+          options={FAILURE_CLASS_OPTIONS}
+          selected={failureClassFilter}
+          onChange={onFailureClassFilterChange}
+        />
+      )}
+
       <SingleSelectDropdown
-        options={DATE_RANGE_OPTIONS.map(o => ({ label: o.label, value: o.value }))}
+        options={DATE_RANGE_SELECT_OPTIONS}
         value={dateRange}
         onChange={v => onDateRangeChange(v as DateRange)}
         isActive={v => v !== 'all'}
@@ -239,6 +257,14 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
       >
         <GitFork className="w-3 h-3" />
         <span>Blocked</span>
+      </button>
+
+      <button
+        onClick={onDownloadCsv}
+        title="Download CSV"
+        className="px-3 py-1.5 min-h-11 rounded-full text-xs font-medium border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300 transition-colors"
+      >
+        CSV
       </button>
 
       {hasActiveFilters && (

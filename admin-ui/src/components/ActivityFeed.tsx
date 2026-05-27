@@ -4,7 +4,6 @@ import { List, useDynamicRowHeight, type RowComponentProps } from 'react-window'
 import { apiFetch, API_BASE_URL } from '../api';
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { isSafeUrl, FAILURE_CLASS_CONFIG } from './TaskCard';
-import type { Task } from './TaskCard';
 import { TAXONOMY_LABELS, TAXONOMY_COLORS } from './taxonomyConstants';
 
 export type ActivityEventType = 'TASK_COMPLETED' | 'TASK_FAILED' | 'RESEARCH_FINDINGS' | 'DEPLOY_EVENT' | 'TASK_IN_PROGRESS';
@@ -38,7 +37,7 @@ export interface ActivityEvent {
 interface ActivityFeedProps {
   selectedProjectId: string | null;
   refreshInterval: number;
-  onSelectTask: (task: Task) => void;
+  onSelectTask: (task: { id: string }) => void;
   onClose: () => void;
   lastVisitTimestamp?: number | null;
   onEventsChange?: (events: ActivityEvent[]) => void;
@@ -341,6 +340,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
   const [expandedErrors, setExpandedErrors] = useState<Set<string>>(new Set());
   const [activeFilter, setActiveFilter] = useState<FilterOption>((initialFilter as FilterOption) ?? 'ALL');
   const [timeRange, setTimeRange] = useState<TimeRangeOption>(lastVisitTimestamp != null ? 'last_visit' : 'all');
+  const [searchQuery, setSearchQuery] = useState('');
   // Track whether the user has explicitly selected a time range so we don't
   // override their choice when lastVisitTimestamp arrives asynchronously after auth.
   const userChangedRangeRef = useRef(false);
@@ -386,11 +386,21 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
     return () => clearInterval(interval);
   }, [fetchEvents, refreshInterval]);
 
-  const filteredEvents = activeFilter === 'ALL' ? events : events.filter(e => e.type === activeFilter);
+  const filteredEvents = events.filter(e => {
+    const typeMatches = activeFilter === 'ALL' || e.type === activeFilter;
+    if (!typeMatches) return false;
+
+    if (!searchQuery) return true;
+
+    const queryLower = searchQuery.toLowerCase();
+    const titleMatches = e.title.toLowerCase().includes(queryLower);
+    const summaryMatches = e.error_summary?.toLowerCase().includes(queryLower) ?? false;
+    return titleMatches || summaryMatches;
+  });
 
   const handleRowClick = useCallback((event: ActivityEvent) => {
     if (!event.task_id) return;
-    onSelectTask({ id: event.task_id } as Task);
+    onSelectTask({ id: event.task_id });
   }, [onSelectTask]);
 
   const toggleExpanded = useCallback((id: string) => {
@@ -448,7 +458,9 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
   const rowHeight = useDynamicRowHeight({ defaultRowHeight: 68 });
 
   return (
-    <div className="flex-1 overflow-hidden flex flex-col min-h-0">
+    <div className="fixed inset-0 z-50 flex">
+      <div className="flex-1 bg-black/40" onClick={onClose} />
+      <div className="w-full max-w-[680px] bg-neutral-950 border-l border-neutral-800 flex flex-col shadow-2xl overflow-hidden">
       {/* Header */}
       <div className="px-6 py-4 border-b border-neutral-800 flex items-center justify-between shrink-0">
         <div className="flex items-center gap-2">
@@ -479,7 +491,14 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
       </div>
 
       {/* Filter pills */}
-      <div className="px-6 pt-2 pb-1.5 border-b border-neutral-800 flex flex-col gap-1.5 shrink-0">
+      <div className="px-6 pt-3 pb-1.5 border-b border-neutral-800 flex flex-col gap-2 shrink-0">
+        <input
+          type="text"
+          placeholder="Search events by title or error..."
+          value={searchQuery}
+          onChange={e => setSearchQuery(e.target.value)}
+          className="w-full bg-neutral-900 border border-neutral-700 rounded px-3 py-2 text-sm text-neutral-200 placeholder-neutral-600 focus:outline-none focus:border-neutral-500 focus:ring-1 focus:ring-neutral-500"
+        />
         <div className="flex items-center gap-1.5 flex-wrap">
           {FILTER_PILLS.map(pill => (
             <button
@@ -579,8 +598,20 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
       ) : filteredEvents.length === 0 ? (
         <div className="flex-1 overflow-y-auto px-6 py-4 flex flex-col items-center justify-center text-neutral-500">
           <Clock className="w-8 h-8 mb-3 opacity-40" />
-          <p className="text-sm">{activeFilter === 'ALL' ? 'No recent activity' : 'No matching events'}</p>
-          <p className="text-xs mt-1 opacity-70">{activeFilter === 'ALL' ? 'Events will appear here as tasks run' : 'Try a different filter'}</p>
+          <p className="text-sm">
+            {searchQuery
+              ? 'No events match your search'
+              : activeFilter === 'ALL'
+                ? 'No recent activity'
+                : 'No matching events'}
+          </p>
+          <p className="text-xs mt-1 opacity-70">
+            {searchQuery
+              ? 'Try different keywords'
+              : activeFilter === 'ALL'
+                ? 'Events will appear here as tasks run'
+                : 'Try a different filter'}
+          </p>
         </div>
       ) : (
         <List
@@ -605,6 +636,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
           Auto-refreshes every {Math.round(refreshInterval / 1000)}s
         </div>
       )}
+      </div>
     </div>
   );
 }

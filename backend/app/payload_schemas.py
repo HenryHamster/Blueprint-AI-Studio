@@ -87,7 +87,7 @@ class BasePayload(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    base_branch: str = Field(default="main")
+    base_branch: str | None = Field(default=None)
     model: str | None = None
     effort: str | None = Field(default=None, pattern=r"^(low|medium|high|max)$")
     prompt_suffix: str | None = None
@@ -95,8 +95,8 @@ class BasePayload(BaseModel):
 
     @field_validator("base_branch")
     @classmethod
-    def _check_base_branch(cls, v: str) -> str:
-        return _validate_branch_name(v)  # type: ignore[return-value]
+    def _check_base_branch(cls, v: str | None) -> str | None:
+        return _validate_branch_name(v)
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +206,6 @@ class StrategicReviewPayload(_SystemPopulated):
     running_update_acknowledged_at: str | None = None
     user_last_active_at: str | None = None
     self_reflection_log: list[dict[str, Any]] | None = None
-    is_self_repo: bool | None = None
     directions_summary: list[dict[str, Any]] | None = None
     outcome_evaluation: dict[str, Any] | None = None
     recent_interventions: dict[str, Any] | None = None

@@ -23,6 +23,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal
+from app.migration_path import is_migration_file
 from app.models import (
     Task,
     Artifact,
@@ -35,7 +36,12 @@ from app.rollup_state import (  # noqa: F401 — re-exported for legacy callers/
     _ROLLUP_TRANSIENT_CTX_KEYS,
     _clear_rollup_transient_state,
 )
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import (
+    runtime_config as _runtime_config,
+    get_project_integration_branch as _get_project_integration_branch,
+    get_project_pr_title_prefix as _get_project_pr_title_prefix,
+)
+from app.task_locking import with_directions_locked
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +69,79 @@ def _review_respawn_count(task: Task) -> int:
         return int((task.context or {}).get("_review_respawn_count", 0) or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _extract_rollup_migration_sources(diff: str) -> dict[str, str]:
+    """Reconstruct added/changed Alembic migration file contents from a PR diff.
+
+    Returns a mapping of ``alembic/versions`` file path -> reconstructed source
+    (the post-image, from the diff's ``+`` lines). Newly-added migration files
+    appear in full; this is enough to read their in-file revision/down_revision.
+    An empty result means the rollup diff does not touch the versions directory.
+    """
+    sources: dict[str, list[str]] = {}
+    current: list[str] | None = None
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            current = None
+        elif line.startswith("+++ "):
+            path = line[4:].strip()
+            if path.startswith("b/"):
+                path = path[2:]
+            if is_migration_file(path) and path.endswith(".py"):
+                current = sources.setdefault(path, [])
+            else:
+                current = None
+        elif current is not None and line.startswith("+") and not line.startswith("+++"):
+            current.append(line[1:])
+    return {path: "\n".join(lines) for path, lines in sources.items()}
+
+
+def _touches_alembic_versions(filename: str) -> bool:
+    return is_migration_file(filename) and filename.endswith(".py")
+
+
+async def _validate_rollup_migration_chain(
+    gh_token: str, owner: str, repo: str, pr_number: int
+) -> tuple[str, str | None]:
+    """Fail-safe Alembic-chain guard for rollup auto-merge.
+
+    Returns ``("ok", None)`` when the rollup does not touch ``alembic/versions``
+    or the combined migration set is valid (single head, unique revisions).
+    Returns ``("defer", reason)`` when GitHub metadata cannot be fetched (retry
+    next sweep) and ``("block", reason)`` when the combined chain is invalid or
+    a touched migration file is unparseable. Never waves a merge through on an
+    inability to fetch or parse the migration files.
+    """
+    from app.github import get_pr_files, get_pull_request_diff
+    from app.migration_chain import validate_added_migrations
+
+    try:
+        files = await get_pr_files(gh_token, owner, repo, pr_number)
+    except Exception as e:
+        return (
+            "defer",
+            f"could not list rollup files to check Alembic migrations: "
+            f"{type(e).__name__}: {e}",
+        )
+    if not any(_touches_alembic_versions(f.get("filename", "")) for f in files):
+        return ("ok", None)
+
+    try:
+        diff = await get_pull_request_diff(gh_token, owner, repo, pr_number)
+    except Exception as e:
+        return (
+            "defer",
+            f"could not fetch rollup diff to validate Alembic migrations: "
+            f"{type(e).__name__}: {e}",
+        )
+    if not diff:
+        return (
+            "defer",
+            "could not fetch rollup diff to validate Alembic migrations (empty response)",
+        )
+    reason = validate_added_migrations(_extract_rollup_migration_sources(diff))
+    return ("ok", None) if reason is None else ("block", reason)
 
 
 class _ParentMutatedDuringPRCreation(Exception):
@@ -653,10 +732,17 @@ async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
 
     # Feature branches after PR merge
     if ctx.get("pr_merged"):
-        for payload in task.payloads or []:
-            branch = payload.get("branch")
-            if branch and branch.startswith("blueprint/"):
-                branches_to_delete.append(branch)
+        project = await session.get(Project, task.project_id)
+        if not project:
+            # project should never be None in practice (loaded at task creation);
+            # a missing row signals a config bug. Log and skip to avoid silent
+            # cross-project branch mis-cleanup (would occur if using hardcoded 'blueprint/').
+            logger.warning(f"[CLEANUP] Missing project for task {task.id}; skipping branch cleanup")
+        else:
+            for payload in task.payloads or []:
+                branch = payload.get("branch")
+                if branch and branch.startswith(project.task_branch_prefix):
+                    branches_to_delete.append(branch)
 
     for branch in branches_to_delete:
         try:
@@ -741,9 +827,11 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
         create_pull_request,
         merge_pull_request,
         get_pull_request,
+        get_pull_request_diff,
         get_pr_files,
         get_branch_sha,
         close_pull_request,
+        pr_is_not_behind_for,
         update_branch_with_sha_retry,
     )
 
@@ -1011,9 +1099,16 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 try:
                     pr_number = int(pr_art.pr_url.rstrip("/").split("/")[-1])
                 except (ValueError, IndexError):
+                    # Malformed pr_url (e.g. /commit/<sha>) — cannot parse a PR number.
+                    # Force-set pr_merged so the next rollup cycle progresses instead of
+                    # hanging forever. ROOT CAUSE 2/3 fixes upstream make this rare.
                     logger.warning(
-                        f"[ROLLUP] Could not parse PR number from {pr_art.pr_url} for child {str(c.id)[:8]}"
+                        f"[ROLLUP] malformed pr_url {pr_art.pr_url!r} for child "
+                        f"{str(c.id)[:8]} — cannot parse PR number; "
+                        f"force-setting pr_merged=True so rollup progresses"
                     )
+                    c.context = {**(c.context or {}), "pr_merged": True}
+                    session.add(c)
                     continue
 
                 # Circuit-breaker: once a child's review has been respawned
@@ -1057,7 +1152,8 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                 # so respawned reviews would fail at `git clone --branch`.
                 from app.shared_state import resolve_task_branch
                 branch = resolve_task_branch(c)
-                base_branch = c_payload.get("base_branch", "main")
+                project = await session.get(Project, c.project_id)
+                base_branch = c_payload.get("base_branch") or _get_project_integration_branch(project)
                 original_prompt = c_payload.get("prompt", c.description or "")
                 review_task, was_spawned = await _spawn_pipeline_task(
                     c,
@@ -1273,6 +1369,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
 
         if staging_branch and target_branch and staging_branch != target_branch:
             gh_token = owner = repo = None
+            project = await session.get(Project, parent.project_id)
             # Track the rollup PR number/url across the try block so the
             # exception handler can rescue a newly-created PR whose marker
             # commit failed (see orphan-PR rescue below).
@@ -1439,9 +1536,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         research_payload = parent.first_payload
                         dir_id = research_payload.get("current_direction_id")
                         if dir_id:
-                            project = await session.get(Project, parent.project_id)
-                            if project and project.directions:
-                                directions = list(project.directions)
+                            def _append_empty_diff_note(directions: list) -> None:
                                 for d in directions:
                                     if d.get("id") == dir_id:
                                         notes = d.get("notes") or []
@@ -1454,9 +1549,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                         )
                                         d["notes"] = notes[-10:]  # Keep last 10
                                         break
-                                project.directions = directions
-                                flag_modified(project, "directions")
-                                session.add(project)
+                            await with_directions_locked(session, parent.project_id, _append_empty_diff_note, skip_locked=False)
                         session.add(parent)
                         await session.commit()
                         await _cleanup_branches(parent, session)
@@ -1471,9 +1564,9 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         f"{failed_count} child(ren) failed — cannot create rollup PR"
                     )
 
-                is_target_intermediate = target_branch.startswith(
-                    "research/"
-                ) or target_branch.startswith("plan/")
+                is_target_intermediate = (
+                    project is not None and project.is_staging_branch(target_branch)
+                )
 
                 # Resume from prior crash — skip PR creation if already done
                 existing_pr = parent_ctx.get("rollup_pr_number")
@@ -1513,10 +1606,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             logger.info(
                                 f"[ROLLUP] PR #{existing_pr} already merged — marking COMPLETED"
                             )
+                            _integration_br = _get_project_integration_branch(project)
+                            _landed = target_branch == _integration_br
                             parent.status = TaskStatus.COMPLETED
                             parent.context = {
                                 **_clear_rollup_transient_state(parent_ctx),
-                                "pr_merged": True,
+                                **({"pr_merged": True} if _landed else {}),
                             }
                             parent.latest_status_message = (
                                 f"Rollup PR #{existing_pr} already merged"
@@ -1554,7 +1649,8 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         f"[ROLLUP] Resuming with existing PR #{rollup_pr_number}"
                     )
                 else:
-                    pr_title = f"[Blueprint] Rollup: {parent.title}"
+                    _prefix = _get_project_pr_title_prefix(project)
+                    pr_title = f"{_prefix}Rollup: {parent.title}"
                     _dir_id = parent.first_payload.get(
                         "current_direction_id"
                     ) or parent_ctx.get("direction_id")
@@ -1864,6 +1960,18 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             exc_info=True,
                         )
 
+                    # Validate the combined Alembic migration chain on the rollup
+                    # branch before auto-merge. Two child PRs can each add a
+                    # migration with the same revision off the same head; each
+                    # passes its own CI in isolation but the merged rollup then
+                    # has duplicate revisions / multiple heads, breaking
+                    # `alembic upgrade head` on the integration branch for every
+                    # subsequent task. Fail-safe: fetch/parse failure does not
+                    # auto-merge. Runs in this unlocked window (GitHub I/O).
+                    alembic_status, alembic_reason = await _validate_rollup_migration_chain(
+                        gh_token, owner, repo, rollup_pr_number
+                    )
+
                     # Re-acquire to apply mutations / dispatch alerts.
                     parent = await _relock_parent(
                         session,
@@ -1947,6 +2055,65 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 f"[ROLLUP] Failed to post scan comment on PR #{rollup_pr_number}: {e}"
                             )
 
+                    # Alembic combined-chain guard (parent is locked here).
+                    if alembic_status == "defer":
+                        logger.info(
+                            f"[ROLLUP] Deferring auto-merge for PR #{rollup_pr_number} — "
+                            f"could not validate Alembic chain: {alembic_reason}"
+                        )
+                        parent.latest_status_message = (
+                            f"Rollup PR #{rollup_pr_number} — Alembic chain unverified, "
+                            f"retrying next cycle"
+                        )[:500]
+                        session.add(parent)
+                        await session.commit()
+                        return
+                    if alembic_status == "block":
+                        parent.requires_approval = True
+                        parent.latest_status_message = (
+                            f"Rollup PR #{rollup_pr_number} blocked — invalid Alembic "
+                            f"migration chain: {alembic_reason}"
+                        )[:500]
+                        parent.context = {
+                            **parent_ctx,
+                            "rollup_pr_url": rollup_pr_url,
+                            "rollup_pr_number": rollup_pr_number,
+                        }
+                        session.add(parent)
+                        await _dispatch_rollup_approval_alert(
+                            parent,
+                            session,
+                            f"Rollup PR #{rollup_pr_number} blocked — invalid Alembic "
+                            f"migration chain: {alembic_reason}",
+                            pr_number=rollup_pr_number,
+                        )
+                        await session.commit()
+                        _alembic_fix_prompt = (
+                            f"Rollup PR #{rollup_pr_number} merging {staging_branch} into "
+                            f"{target_branch} has an invalid combined Alembic migration "
+                            f"chain: {alembic_reason}. Two sibling PRs added migrations "
+                            f"that collide. Do NOT modify any already-landed migration "
+                            f"(applied history is immutable); instead rename and re-chain "
+                            f"your migration to the next free NNNN revision with "
+                            f"down_revision pointing at the current head, then bump "
+                            f"EXPECTED_SCHEMA_REVISION in backend/app/main.py to match."
+                        )
+                        await _spawn_pipeline_task(
+                            parent,
+                            "fix",
+                            session,
+                            rollup_pr_number,
+                            staging_branch,
+                            target_branch,
+                            fix_prompt=_alembic_fix_prompt,
+                            original_task_id=str(parent.id),
+                        )
+                        logger.warning(
+                            f"[ROLLUP] PR #{rollup_pr_number} blocked — invalid Alembic "
+                            f"chain ({alembic_reason}) — held for approval, spawned re-chain fix"
+                        )
+                        return
+
                     # Release lock around the actual merge call (slowest of all).
                     pre_actual_merge_snapshot = await _release_parent_lock(parent, session)
                     # NOTE: A pre-merge "is the PR behind base?" check used to live
@@ -1972,10 +2139,12 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         return
                     parent_ctx = parent.context or {}
                     if merge_result.get("merged"):
+                        _integration_br = _get_project_integration_branch(project)
+                        _landed = target_branch == _integration_br
                         parent.status = TaskStatus.COMPLETED
                         parent.context = {
                             **_clear_rollup_transient_state(parent_ctx),
-                            "pr_merged": True,
+                            **({"pr_merged": True} if _landed else {}),
                             "rollup_pr_url": rollup_pr_url,
                         }
                         parent.latest_status_message = f"All {completed_count} subtasks merged, rollup PR auto-merged"
@@ -2014,7 +2183,7 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                             )
                         try:
                             from app.github import get_pull_request_diff
-                            from app.pipeline_regression_dispatcher import (
+                            from app.viewport_coverage import (
                                 update_viewport_coverage_snapshot_from_diff,
                             )
 
@@ -2115,13 +2284,36 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 f"— skipping state-classification, falling through to fix-spawn"
                             )
                         elif _ms == "behind":
+                            # Before escalating to update_branch, check if the
+                            # ancestor test already considers this PR clean.
+                            # mergeable_state="behind" doesn't short-circuit
+                            # pr_is_not_behind so is_ancestor_of is consulted.
+                            _behind_head_sha = (
+                                _pr_detail.get("head", {}).get("sha") or None
+                            )
+                            _post_not_behind = await pr_is_not_behind_for(
+                                gh_token,
+                                owner,
+                                repo,
+                                pr_detail=_pr_detail,
+                                base_branch=target_branch,
+                                project_id=str(parent.project_id),
+                                call_site="rollup_post_merge",
+                            )
+                            if _post_not_behind is True:
+                                logger.info(
+                                    f"[ROLLUP] PR #{rollup_pr_number} "
+                                    f"mergeable_state=behind but "
+                                    f"pr_is_not_behind=True — skipping "
+                                    f"update_branch, deferring to next sweep"
+                                )
+                                return
                             _upd = await update_branch_with_sha_retry(
                                 gh_token,
                                 owner,
                                 repo,
                                 rollup_pr_number,
-                                expected_head_sha=_pr_detail.get("head", {}).get("sha")
-                                or None,
+                                expected_head_sha=_behind_head_sha,
                                 project_id=str(parent.project_id),
                             )
                             if _upd.get("updated"):
@@ -2142,6 +2334,30 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 await session.commit()
                                 logger.info(
                                     f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — update_branch succeeded, skipped fix spawn"
+                                )
+                                return
+                            if _upd.get("not_behind"):
+                                # GitHub's cached mergeable_state was stale — the PR
+                                # is not actually behind (no new commits on base).
+                                # Treat as a successful no-op: clear any prior retry
+                                # counter and defer to the next sweep.
+                                _new_ctx = {
+                                    **parent_ctx,
+                                    "rollup_pr_url": rollup_pr_url,
+                                    "rollup_pr_number": rollup_pr_number,
+                                }
+                                _new_ctx.pop("_behind_update_retries", None)
+                                parent.context = _new_ctx
+                                parent.latest_status_message = (
+                                    f"Rollup PR #{rollup_pr_number} not behind {target_branch} "
+                                    f"(no new commits on base) — cached mergeable_state was stale, "
+                                    f"deferring to next sweep"
+                                )
+                                session.add(parent)
+                                await session.commit()
+                                logger.info(
+                                    f"[ROLLUP] PR #{rollup_pr_number} behind {target_branch} — "
+                                    f"update_branch reports no new commits on base, deferring to next sweep"
                                 )
                                 return
                             # update_branch failed — this is a transient GitHub API error,
@@ -2499,20 +2715,37 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                                 "- Update `EXPECTED_SCHEMA_REVISION` in backend/app/main.py to match the final (highest) migration's revision."
                             )
                         parent_goal = (parent.description or parent.title or "")[:500]
-                        fix_prompt = (
-                            f"This rollup PR (#{rollup_pr_number}) merging {staging_branch} into {target_branch} has conflicts.\n"
-                            f"Error: {merge_msg}\n\n"
-                            f"Rollup goal: {parent_goal}\n\n"
-                            f"Files in this PR:\n{files_list}\n\n"
-                            f"Steps to resolve:\n"
-                            f"1. Run: git fetch origin {target_branch}\n"
-                            f"2. Run: git rebase origin/{target_branch}\n"
-                            f"3. Resolve any conflicts — {target_branch} is the source of truth. Keep its refactors and restructuring.\n"
-                            f"   Re-apply only the changes that serve the rollup goal (described above) on top of {target_branch}'s current state.\n"
-                            f"   If files were heavily rewritten on {target_branch}, adapt the rollup changes to the new structure.\n"
-                            f"4. Run: git rebase --continue after resolving each file"
-                            f"{migration_guidance}"
-                        )
+                        if _ms == "behind":
+                            # Budget-exhausted behind path: no real conflicts, just a stale
+                            # GitHub flag. The no-op guidance is critical — if the PR head is
+                            # already ancestor of base, git rebase will be a no-op and the
+                            # fix agent must not treat that as failure (PR #6153 incident).
+                            fix_prompt = (
+                                f"Rollup PR #{rollup_pr_number} merging {staging_branch} into {target_branch} "
+                                f"is behind the target branch and the GitHub update-branch API failed across "
+                                f"the retry budget ({_upd_msg}). Rebase manually onto origin/{target_branch}:\n\n"
+                                f"1. git fetch origin {target_branch}\n"
+                                f"2. git rebase origin/{target_branch}\n"
+                                f"3. If no conflicts and no commits were replayed, the PR is already "
+                                f"up-to-date — GitHub's mergeability flag is just stale. Report no "
+                                f"changes needed (don't force-push); retries will clear it.\n"
+                                f"4. Otherwise resolve conflicts and git push --force-with-lease."
+                            )
+                        else:
+                            fix_prompt = (
+                                f"This rollup PR (#{rollup_pr_number}) merging {staging_branch} into {target_branch} has conflicts.\n"
+                                f"Error: {merge_msg}\n\n"
+                                f"Rollup goal: {parent_goal}\n\n"
+                                f"Files in this PR:\n{files_list}\n\n"
+                                f"Steps to resolve:\n"
+                                f"1. Run: git fetch origin {target_branch}\n"
+                                f"2. Run: git rebase origin/{target_branch}\n"
+                                f"3. Resolve any conflicts — {target_branch} is the source of truth. Keep its refactors and restructuring.\n"
+                                f"   Re-apply only the changes that serve the rollup goal (described above) on top of {target_branch}'s current state.\n"
+                                f"   If files were heavily rewritten on {target_branch}, adapt the rollup changes to the new structure.\n"
+                                f"4. Run: git rebase --continue after resolving each file"
+                                f"{migration_guidance}"
+                            )
                         fix_task, _ = await _spawn_pipeline_task(
                             parent,
                             "fix",

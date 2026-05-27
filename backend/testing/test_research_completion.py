@@ -969,9 +969,8 @@ class TestRecordResearchTaskFailureScopeEmpty:
         task.first_payload = {"type": "research"}
         return task
 
-    def _make_session(self, project):
+    def _make_session(self):
         session = AsyncMock()
-        session.get.return_value = project
         session.add = MagicMock()
         return session
 
@@ -986,69 +985,84 @@ class TestRecordResearchTaskFailureScopeEmpty:
         ]
         return project
 
-    def test_scope_empty_marks_cycle_productive(self):
+    def _run(self, project, coro):
+        """Run coro with with_directions_locked patched to call mutate_fn on project.directions."""
         import asyncio
+        from unittest.mock import patch
+
+        async def _mock_wdl(session, project_id, mutate_fn):
+            mutate_fn(project.directions)
+
+        with patch("app.research_completion.with_directions_locked", _mock_wdl):
+            asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_scope_empty_marks_cycle_productive(self):
         from app.research_completion import _record_research_task_failure
 
         task = self._make_task("SCOPE_EMPTY")
         project = self._make_project()
-        session = self._make_session(project)
-
-        asyncio.get_event_loop().run_until_complete(
-            _record_research_task_failure(task, session)
-        )
+        self._run(project, _record_research_task_failure(task, self._make_session()))
 
         direction = project.directions[0]
         assert direction["last_cycle_productive"] is True
 
     def test_scope_empty_resets_unproductive_counter(self):
-        import asyncio
         from app.research_completion import _record_research_task_failure
 
         task = self._make_task("SCOPE_EMPTY")
         project = self._make_project(consecutive_unproductive=3)
-        session = self._make_session(project)
-
-        asyncio.get_event_loop().run_until_complete(
-            _record_research_task_failure(task, session)
-        )
+        self._run(project, _record_research_task_failure(task, self._make_session()))
 
         direction = project.directions[0]
         assert direction.get("consecutive_unproductive_cycles", 0) == 0
 
     def test_code_error_marks_cycle_unproductive(self):
-        import asyncio
         from app.research_completion import _record_research_task_failure
 
         task = self._make_task("CODE_ERROR")
         project = self._make_project(consecutive_unproductive=1)
-        session = self._make_session(project)
-
-        asyncio.get_event_loop().run_until_complete(
-            _record_research_task_failure(task, session)
-        )
+        self._run(project, _record_research_task_failure(task, self._make_session()))
 
         direction = project.directions[0]
         assert direction["last_cycle_productive"] is False
         assert direction.get("consecutive_unproductive_cycles", 0) == 2
 
     def test_scope_empty_history_entry_has_failure_category(self):
-        import asyncio
         from app.research_completion import _record_research_task_failure
 
         task = self._make_task("SCOPE_EMPTY")
         project = self._make_project()
-        session = self._make_session(project)
-
-        asyncio.get_event_loop().run_until_complete(
-            _record_research_task_failure(task, session)
-        )
+        self._run(project, _record_research_task_failure(task, self._make_session()))
 
         direction = project.directions[0]
         history = direction.get("research_history", [])
         assert len(history) == 1
         assert history[0]["research_task_failed"] is True
         assert history[0]["failure_category"] == "SCOPE_EMPTY"
+
+    def test_uses_with_directions_locked_not_session_get(self):
+        """Direction writes must go through with_directions_locked (no stale read-modify-write)."""
+        import asyncio
+        from unittest.mock import patch
+        from app.research_completion import _record_research_task_failure
+
+        task = self._make_task("CODE_ERROR")
+        project = self._make_project()
+        session = self._make_session()
+
+        called_with = []
+
+        async def mock_wdl(sess, project_id, mutate_fn):
+            called_with.append(project_id)
+            mutate_fn(project.directions)
+
+        with patch("app.research_completion.with_directions_locked", mock_wdl):
+            asyncio.get_event_loop().run_until_complete(
+                _record_research_task_failure(task, session)
+            )
+
+        assert called_with == [task.project_id]
+        session.get.assert_not_called()
 
 
 class TestTrimFindingForMemo:
@@ -1085,6 +1099,70 @@ class TestTrimFindingForMemo:
 
         out = _trim_finding_for_memo({"title": "Only title"})
         assert out == {"title": "Only title"}
+
+
+class TestSynthesizeDeferredFindingMemo:
+    """_synthesize_deferred_finding_memo: backend-side synthesis for deferred-finding memos."""
+
+    def _fn(self):
+        from app.research_completion import _synthesize_deferred_finding_memo
+
+        return _synthesize_deferred_finding_memo
+
+    def test_full_data_returns_memo(self):
+        result = self._fn()(
+            {
+                "title": "Fix auth edge case",
+                "description": "Token refresh fails on expiry",
+            },
+            "low_actionability",
+            "task-abc",
+        )
+        assert result is not None
+        assert result["summary"] == "Fix auth edge case"
+        assert "Fix auth edge case" in result["reasoning"]
+        assert "low_actionability" in result["reasoning"]
+        assert "Token refresh fails" in result["reasoning"]
+        assert "task:task-abc" in result["citations"]
+        assert "deferred-finding" in result["tags"]
+        assert "low_actionability" in result["tags"]
+
+    def test_degradation_gate_drop_reason(self):
+        result = self._fn()(
+            {"title": "Perf improvement", "description": "Cache miss rate high"},
+            "degradation_gate",
+            "task-xyz",
+        )
+        assert result is not None
+        assert "degradation_gate" in result["tags"]
+        assert "degradation_gate" in result["reasoning"]
+
+    def test_no_title_uses_description_as_summary(self):
+        result = self._fn()(
+            {"description": "Something useful"},
+            "low_actionability",
+            "task-1",
+        )
+        assert result is not None
+        assert result["summary"] == "Something useful"
+
+    def test_no_title_and_no_description_returns_none(self):
+        assert self._fn()({}, "low_actionability", "task-1") is None
+
+    def test_empty_strings_return_none(self):
+        assert (
+            self._fn()({"title": "", "description": ""}, "low_actionability", "t")
+            is None
+        )
+
+    def test_summary_truncated_to_200(self):
+        result = self._fn()(
+            {"title": "x" * 300},
+            "low_actionability",
+            "t",
+        )
+        assert result is not None
+        assert len(result["summary"]) == 200
 
 
 class TestFindingsTypeFilter:
@@ -1298,9 +1376,7 @@ class TestShelveFindingsForNextCycle:
     import pytest
 
     @pytest.mark.asyncio
-    async def test_writes_to_deferred_findings_key_for_propagation(
-        self, monkeypatch
-    ):
+    async def test_writes_to_deferred_findings_key_for_propagation(self, monkeypatch):
         import contextlib
         import uuid as _uuid
 

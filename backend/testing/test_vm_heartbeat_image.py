@@ -90,3 +90,107 @@ async def test_vm_heartbeat_without_image_fields_is_no_op_for_images(
     image_name, build_ts = _compute.get_vm_image("agent-vm-warm-noimg")
     assert image_name == "prebaked-image"
     assert build_ts == 1700000000
+
+
+@pytest.mark.asyncio
+async def test_vm_heartbeat_records_runtime_fingerprint_and_exposes_stale_vm(
+    client: AsyncClient, db_session
+):
+    """vm-heartbeat persists agent_runtime_fingerprint into stale-image diagnostics."""
+    import app.compute as _compute
+
+    vm_id = "agent-vm-runtime-vm-heartbeat"
+    runtime_fingerprint = "a" * 64
+
+    project = Project(name="VM-Heartbeat Runtime Fingerprint", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _compute._vm_images.pop(vm_id, None)
+    _compute._vm_runtime_fingerprints.pop(vm_id, None)
+
+    token = create_agent_token(str(task.id), vm_id)
+    resp = await client.post(
+        "/api/agent/vm-heartbeat",
+        json={
+            "vm_instance_id": vm_id,
+            "vm_image_name": "agent-vm-2026-05-07-abc123",
+            "vm_image_build_ts": 1,
+            "agent_runtime_fingerprint": runtime_fingerprint,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 204
+
+    assert _compute.get_vm_runtime_fingerprint(vm_id) == runtime_fingerprint
+    stale_vms = _compute.get_stale_image_vms(threshold_hours=0)
+    assert any(
+        vm["vm_id"] == vm_id
+        and vm["image_name"] == "agent-vm-2026-05-07-abc123"
+        and vm["agent_runtime_fingerprint"] == runtime_fingerprint
+        for vm in stale_vms
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_heartbeat_records_runtime_fingerprint_and_exposes_stale_vm(
+    client: AsyncClient, db_session
+):
+    """/api/agent/heartbeat persists agent_runtime_fingerprint into stale-image diagnostics."""
+    import app.compute as _compute
+
+    vm_id = "agent-vm-runtime-task-heartbeat"
+    runtime_fingerprint = "b" * 64
+
+    project = Project(
+        name="Task Heartbeat Runtime Fingerprint", user_id="test-user-123"
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    _compute._vm_images.pop(vm_id, None)
+    _compute._vm_runtime_fingerprints.pop(vm_id, None)
+
+    token = create_agent_token(str(task.id), vm_id)
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "vm_image_name": "agent-vm-2026-05-07-def456",
+            "vm_image_build_ts": 1,
+            "agent_runtime_fingerprint": runtime_fingerprint,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    assert _compute.get_vm_runtime_fingerprint(vm_id) == runtime_fingerprint
+    stale_vms = _compute.get_stale_image_vms(threshold_hours=0)
+    assert any(
+        vm["vm_id"] == vm_id
+        and vm["image_name"] == "agent-vm-2026-05-07-def456"
+        and vm["agent_runtime_fingerprint"] == runtime_fingerprint
+        for vm in stale_vms
+    )

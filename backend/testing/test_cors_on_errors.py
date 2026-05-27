@@ -7,7 +7,7 @@ allow_credentials=true).
 
 import pytest
 from fastapi import HTTPException
-from httpx import AsyncClient, ASGITransport
+from httpx import ASGITransport, AsyncClient
 
 from app.main import allowed_origins, app
 
@@ -90,3 +90,52 @@ async def test_no_origin_header_no_cors_header():
     # is explicitly in the allowlist (which the test fixture does not add).
     if "*" not in allowed_origins:
         assert "access-control-allow-origin" not in {k.lower() for k in r.headers}
+
+
+def test_wildcard_origin_startup_rejected():
+    """The production guard in main._resolve_allowed_origins must reject any
+    list containing '*'. Wildcard + allow_credentials=True lets any origin
+    authenticate on behalf of logged-in users."""
+    from app.main import _resolve_allowed_origins
+
+    # Plain '*'.
+    with pytest.raises(ValueError, match=r"ALLOWED_ORIGINS may not contain '\*'"):
+        _resolve_allowed_origins("*")
+
+    # '*' mixed with explicit origins — the same bypass applies because
+    # Starlette's CORSMiddleware will still echo arbitrary origins back when
+    # '*' is anywhere in allow_origins with allow_credentials=True.
+    with pytest.raises(ValueError, match=r"ALLOWED_ORIGINS may not contain '\*'"):
+        _resolve_allowed_origins("*,https://foo.com")
+    with pytest.raises(ValueError, match=r"ALLOWED_ORIGINS may not contain '\*'"):
+        _resolve_allowed_origins("https://foo.com,*")
+    # Whitespace around '*' must not let it slip past the check.
+    with pytest.raises(ValueError, match=r"ALLOWED_ORIGINS may not contain '\*'"):
+        _resolve_allowed_origins(" * ")
+
+    # Concrete origins should parse cleanly.
+    assert _resolve_allowed_origins("https://foo.com,https://bar.com") == [
+        "https://foo.com",
+        "https://bar.com",
+    ]
+    # Empty env falls back to the localhost defaults.
+    assert "http://localhost:3000" in _resolve_allowed_origins("")
+
+
+@pytest.mark.asyncio
+async def test_wildcard_allowlist_does_not_echo_specific_origin():
+    """When '*' is in the runtime allowlist, _apply_cors_headers must NOT echo
+    a specific unrecognised Origin back — that would let arbitrary sites send
+    credentialed requests on behalf of logged-in users."""
+    evil_origin = "https://attacker.example.com"
+    # Temporarily place '*' in the list (simulates misconfigured runtime state).
+    allowed_origins.append("*")
+    try:
+        async with _client() as c:
+            r = await c.get("/__test/raise-http-exc", headers={"Origin": evil_origin})
+        # _apply_cors_headers must NOT reflect the attacker's specific origin.
+        # A non-credentialed '*' from CORSMiddleware is acceptable; echoing the
+        # attacker's domain with credentials is the vulnerability we prevent.
+        assert r.headers.get("access-control-allow-origin") != evil_origin
+    finally:
+        allowed_origins.remove("*")

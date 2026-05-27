@@ -8,11 +8,14 @@ import { ProjectBuildConfigSection } from './ProjectBuildConfigSection';
 import { ProjectAutoRemediationSection } from './ProjectAutoRemediationSection';
 import { ProjectIssueImplementationSection } from './ProjectIssueImplementationSection';
 import { ProjectAutoReviewSection } from './ProjectAutoReviewSection';
-import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, AutoReviewConfig } from '../types/project';
+import { ProjectIntegrationBranchSection } from './ProjectIntegrationBranchSection';
+import { ProjectPromotionTargetSection } from './ProjectPromotionTargetSection';
+import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, IssueImplementationConfigUpdate, AutoReviewConfig } from '../types/project';
 import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks, Server, User, FileDown, LogOut, Users, Bell, Wrench, Tag, HelpCircle, Plus, ChevronDown, ChevronUp, RefreshCw } from 'lucide-react';
 import { timeAgo, parseTimestamp } from '../utils/time';
 import { USER_LAUNCHABLE_TASK_TYPE_OPTIONS } from '../taskCapabilities';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
+import type { ViewMode } from '../hooks/useViewPreferences';
 export type { MaxPlanAccount } from '../types/settings';
 import type { AuthMode, CategoryRoutingEntry, DeployState, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
 import { DeploySection } from './SettingsDeploySection';
@@ -28,8 +31,8 @@ interface SettingsDropdownProps {
   // Defaults
   defaultTaskType: UserLaunchableTaskType;
   onUpdateDefaultTaskType: (value: UserLaunchableTaskType) => void;
-  viewMode: 'kanban' | 'pipeline' | 'home';
-  onSetViewMode: (mode: 'kanban' | 'pipeline' | 'home') => void;
+  viewMode: ViewMode;
+  onSetViewMode: (mode: ViewMode) => void;
   // Notifications
   notifyOnComplete: boolean;
   onUpdateNotifyOnComplete: (value: boolean) => void;
@@ -39,6 +42,8 @@ interface SettingsDropdownProps {
   onUpdateNotifyOnApprovalNeeded: (value: boolean) => void;
   soundOnComplete: boolean;
   onUpdateSoundOnComplete: (value: boolean) => void;
+  notifyOnHighSignalMessage: boolean;
+  onUpdateNotifyOnHighSignalMessage: (value: boolean) => void;
   // Existing
   maxConcurrentVMs: number;
   onUpdateMaxVMs: (value: number) => void;
@@ -159,11 +164,17 @@ interface SettingsDropdownProps {
   onUpdateAutoRemediationConfig: (config: AutoRemediationConfig) => Promise<void>;
   // Issue implementation config (project-scoped)
   issueImplementationConfig: IssueImplementationConfig | null;
-  onUpdateIssueImplementationConfig: (config: IssueImplementationConfig) => Promise<void>;
+  onUpdateIssueImplementationConfig: (config: IssueImplementationConfigUpdate) => Promise<void>;
   // Auto-review config (project-scoped)
   selectedProjectRole?: 'owner' | 'member' | 'viewer' | null;
   autoReviewConfig: AutoReviewConfig | null;
   onUpdateAutoReviewConfig: (patch: Partial<AutoReviewConfig>) => Promise<void>;
+  // Integration branch config (project-scoped)
+  integrationBranchData: { integration_branch: string; is_default: boolean } | null;
+  onUpdateIntegrationBranch: (branch: string | null) => Promise<void>;
+  // Promotion target config (project-scoped)
+  promotionTargetData: { promotion_target: string; is_default: boolean } | null;
+  onUpdatePromotionTarget: (branch: string | null) => Promise<void>;
 }
 
 
@@ -242,7 +253,7 @@ const CREDENTIAL_GUIDES: Record<string, CredentialGuide> = {
   },
 };
 
-export type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation' | 'auto-review';
+export type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation' | 'auto-review' | 'integration-branch' | 'promotion-target';
 
 const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean; projectOnly?: boolean }[] = [
   { id: 'general', label: 'General', icon: Sliders },
@@ -256,6 +267,8 @@ const SECTIONS: { id: SectionId; label: string; icon: typeof Settings; adminOnly
   { id: 'auto-review', label: 'Auto-Review', icon: HelpCircle, projectOnly: true },
   { id: 'auto-remediation', label: 'Auto-Remediation', icon: Settings, projectOnly: true },
   { id: 'issue-implementation', label: 'Issue Implementation', icon: Tag, projectOnly: true },
+  { id: 'integration-branch', label: 'Integration Branch', icon: GitBranch, projectOnly: true },
+  { id: 'promotion-target', label: 'Promotion Target', icon: GitBranch, projectOnly: true },
   { id: 'advanced', label: 'Advanced', icon: FileDown },
 ];
 
@@ -288,6 +301,8 @@ export function SettingsDropdown({
   onUpdateNotifyOnApprovalNeeded,
   soundOnComplete,
   onUpdateSoundOnComplete,
+  notifyOnHighSignalMessage,
+  onUpdateNotifyOnHighSignalMessage,
   maxConcurrentVMs,
   onUpdateMaxVMs,
   maxRetries,
@@ -402,6 +417,10 @@ export function SettingsDropdown({
   selectedProjectRole,
   autoReviewConfig,
   onUpdateAutoReviewConfig,
+  integrationBranchData,
+  onUpdateIntegrationBranch,
+  promotionTargetData,
+  onUpdatePromotionTarget,
 }: SettingsDropdownProps) {
   const [, setTick] = useState(0);
   const [activeSection, setActiveSection] = useState<SectionId>('general');
@@ -528,11 +547,12 @@ export function SettingsDropdown({
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Default View Mode</label>
               <select
                 value={viewMode}
-                onChange={e => onSetViewMode(e.target.value as 'kanban' | 'pipeline')}
+                onChange={e => onSetViewMode(e.target.value as ViewMode)}
                 className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
               >
                 <option value="kanban">Kanban</option>
                 <option value="pipeline">Pipeline</option>
+                <option value="timeline">Timeline</option>
               </select>
             </div>
             <div>
@@ -691,6 +711,13 @@ export function SettingsDropdown({
             <div className="flex items-center justify-between">
               <span className="text-xs text-neutral-400">Play sound on task completion</span>
               <Toggle enabled={soundOnComplete} onChange={onUpdateSoundOnComplete} />
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-neutral-400">Browser notification on high-signal message</span>
+              <Toggle enabled={notifyOnHighSignalMessage} onChange={v => {
+                if (v && 'Notification' in window && Notification.permission === 'default') Notification.requestPermission();
+                onUpdateNotifyOnHighSignalMessage(v);
+              }} />
             </div>
             <p className="text-[11px] text-neutral-600 pt-1">
               These are browser-only notifications. For external webhooks (Slack, PagerDuty, etc.), see the{' '}
@@ -1204,7 +1231,7 @@ export function SettingsDropdown({
                       <div className="text-xs text-neutral-300">{guide.summary}</div>
                       <ol className="list-decimal list-inside mt-1.5 space-y-0.5 text-[11px] text-neutral-400">
                         {guide.steps.map((step, i) => (
-                          <li key={i}><span className="[&_code]:text-cyan-300 [&_code]:bg-neutral-900 [&_code]:px-1 [&_code]:rounded" dangerouslySetInnerHTML={{ __html: step.replace(/`([^`]+)`/g, '<code>$1</code>') }} /></li>
+                          <li key={i}>{step.split(/(`[^`]+`)/g).map((part, idx) => part.startsWith('`') && part.endsWith('`') ? <code key={idx} className="text-cyan-300 bg-neutral-900 px-1 rounded">{part.slice(1, -1)}</code> : <span key={idx}>{part}</span>)}</li>
                         ))}
                       </ol>
                     </div>
@@ -1442,6 +1469,8 @@ export function SettingsDropdown({
         config={autoRemediationConfig}
         stats={autoRemediationStats}
         onSave={onUpdateAutoRemediationConfig}
+        integrationBranch={integrationBranchData?.integration_branch}
+        promotionTarget={promotionTargetData?.promotion_target}
       />
     );
   }
@@ -1452,6 +1481,28 @@ export function SettingsDropdown({
         config={autoReviewConfig}
         canSave={selectedProjectRole === 'owner'}
         onSave={onUpdateAutoReviewConfig}
+      />
+    );
+  }
+
+  function renderIntegrationBranch() {
+    return (
+      <ProjectIntegrationBranchSection
+        data={integrationBranchData}
+        canSave={selectedProjectRole === 'owner'}
+        onSave={onUpdateIntegrationBranch}
+        relatedPromotionTarget={promotionTargetData?.promotion_target}
+      />
+    );
+  }
+
+  function renderPromotionTarget() {
+    return (
+      <ProjectPromotionTargetSection
+        data={promotionTargetData}
+        canSave={selectedProjectRole === 'owner'}
+        onSave={onUpdatePromotionTarget}
+        relatedIntegrationBranch={integrationBranchData?.integration_branch}
       />
     );
   }
@@ -1511,6 +1562,8 @@ export function SettingsDropdown({
       case 'auto-review': return renderAutoReview();
       case 'auto-remediation': return renderAutoRemediation();
       case 'issue-implementation': return renderIssueImplementation();
+      case 'integration-branch': return renderIntegrationBranch();
+      case 'promotion-target': return renderPromotionTarget();
       case 'advanced': return renderAdvanced();
     }
   }

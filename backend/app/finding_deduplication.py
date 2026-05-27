@@ -173,7 +173,9 @@ def build_dedup_state(
         ):
             continue
         if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED):
-            failure_class = classify_failure(t)
+            failure_class = classify_failure(
+                t, at_time=t.last_heartbeat or t.started_at
+            )
             # Exclude transient infra failures (task never ran, should be retried).
             if failure_class in INFRA_CLASSES:
                 continue
@@ -219,21 +221,27 @@ def build_dedup_state(
     return recent_finding_hashes, failed_hashes, prior_failure_by_hash
 
 
-def extract_retired_failed_approaches(retired_context: list[dict]) -> list[str]:
-    """Extract failed approach strings from retired direction context dicts.
+def extract_retired_failed_approaches(retired_context: list[dict]) -> list[dict]:
+    """Extract failed approach dicts from retired direction context dicts.
 
     Each dict may have 'failed_approaches' (list[str]) and/or
     'recently_completed_finding_titles' (list[str]). Both are used as
     suppression signals — the system already explored them.
+
+    Each input dict may carry a 'category' field ('product' | 'structural' | 'mixed').
+    Missing/None category defaults to 'mixed' (permissive: matches any finding category).
+
+    Returns a list of dicts with 'text' (str) and 'category' (str) keys.
     """
-    approaches: list[str] = []
+    approaches: list[dict] = []
     for ctx in retired_context or []:
+        category = ctx.get("category") or "mixed"
         for approach in ctx.get("failed_approaches", []):
             if isinstance(approach, str) and approach.strip():
-                approaches.append(approach)
+                approaches.append({"text": approach, "category": category})
         for title in ctx.get("recently_completed_finding_titles", []):
             if isinstance(title, str) and title.strip():
-                approaches.append(title)
+                approaches.append({"text": title, "category": category})
     return approaches
 
 
@@ -254,18 +262,29 @@ def extract_archived_diagnoses(design_doc: dict) -> list[str]:
 
 def _find_retired_approach_match(
     finding_title: str,
-    retired_failed_approaches: list[str],
+    retired_failed_approaches: list[dict],
+    finding_category: Optional[str] = None,
 ) -> Optional[str]:
     """Return the first retired approach whose words overlap finding_title.
 
     Uses a lower threshold (3 words) than active-task matching (4/6) because
     the system has already concluded these approaches don't work.
+
+    Category gating: a match is skipped when both the finding and the retired
+    approach have explicit non-mixed categories that differ. 'mixed' on either
+    side is permissive and always allows the match to block.
     """
     words = set(finding_title.lower().split()) - _STOPWORDS
-    for approach in retired_failed_approaches:
-        overlap = words & (set(approach.lower().split()) - _STOPWORDS)
+    fc = finding_category or "mixed"
+    for entry in retired_failed_approaches:
+        text = entry.get("text", "") if isinstance(entry, dict) else str(entry)
+        ac = (entry.get("category") or "mixed") if isinstance(entry, dict) else "mixed"
+        # Cross-category: both sides have explicit non-mixed categories that differ → skip
+        if fc != "mixed" and ac != "mixed" and fc != ac:
+            continue
+        overlap = words & (set(text.lower().split()) - _STOPWORDS)
         if len(overlap) >= 3:
-            return approach[:60]
+            return text[:60]
     return None
 
 
@@ -422,8 +441,9 @@ def deduplicate_findings(
     failed_hashes: dict[str, object],
     existing_tasks_with_dirs: list[tuple],
     open_pr_files: set[str],
-    retired_failed_approaches: Optional[list[str]] = None,
+    retired_failed_approaches: Optional[list[dict]] = None,
     archived_diagnoses: Optional[list[str]] = None,
+    direction_categories: Optional[dict[str, str]] = None,
 ) -> DedupOutcome:
     """Apply hash, word-overlap, file-overlap, and evidence-overlap dedup to ``findings``.
 
@@ -483,8 +503,13 @@ def deduplicate_findings(
             continue
 
         if retired_failed_approaches:
+            _finding_category = (
+                (direction_categories or {}).get(finding_dir_id or "") or "mixed"
+                if finding_dir_id
+                else "mixed"
+            )
             matched_approach = _find_retired_approach_match(
-                title, retired_failed_approaches
+                title, retired_failed_approaches, _finding_category
             )
             if matched_approach is not None:
                 logger.info(

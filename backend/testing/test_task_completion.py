@@ -1,5 +1,5 @@
 """
-Unit tests for app/task_completion.py pure functions.
+Unit tests for app/task_completion.py and app/task_completion_investigation.py.
 
 Covers:
 - _parse_plan_output: JSON extraction from agent logs
@@ -8,9 +8,14 @@ Covers:
 - _log_file_overlaps: overlapping file detection
 - _compute_first_attempt_succeeded: attempt_count threshold and status check
 - _ensure_branch: retry/backoff, token refresh, exists-verification, terminal failure
+- _handle_investigation_terminal_failure / _maybe_spawn_reinvestigation_after_failure
+- _record_regression_signal_if_matching / _maybe_spawn_followup_investigation
+- _maybe_escalate_exhausted_followups
 """
 
+import asyncio
 import json
+import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,6 +23,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import sessionmaker
 
 from app.task_completion import (
     _parse_plan_output,
@@ -31,26 +38,35 @@ from app.task_completion import (
     _record_remediation_outcome,
     _record_remediation_if_terminal,
     _record_project_remediation_outcome,
-    _maybe_spawn_followup_investigation,
     _handle_investigation_completion,
-    _extract_partial_diagnosis,
-    _handle_investigation_terminal_failure,
-    _maybe_spawn_reinvestigation_after_failure,
     _is_structural_diagnosis,
     _clear_direction_diagnosis_flag,
     _calculate_remediation_scope,
-    _record_regression_signal_if_matching,
-    _maybe_escalate_exhausted_followups,
+    _persist_direction_field_update,
     build_blueprint_pr_footer,
     build_blueprint_pr_merge_summary_comment,
     patch_pr_body_with_blueprint_meta,
     BLUEPRINT_PR_META_MARKER,
     BLUEPRINT_PR_MERGE_SUMMARY_MARKER,
+    _synthesize_memo_from_source_finding,
+)
+from app.task_completion_investigation import (
+    _maybe_spawn_followup_investigation,
+    _extract_partial_diagnosis,
+    _handle_investigation_terminal_failure,
+    _maybe_spawn_reinvestigation_after_failure,
+    _record_regression_signal_if_matching,
+    _maybe_escalate_exhausted_followups,
 )
 from app.strategic_constants import STRATEGIC_RATIONALE_MAX
-from app.models import Alert, AlertSeverity, Task, TaskStatus
+from app.models import Alert, AlertSeverity, Project, Task, TaskStatus
+from app.task_completion import confirm_applied_playbook_entries
 from sqlalchemy import select as _sa_select
 from testing.factories import make_project, make_task
+
+_USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
+    "DATABASE_URL", ""
+).startswith("postgresql")
 
 
 # ── _compute_first_attempt_succeeded ────────────────────────────────────────
@@ -3476,7 +3492,14 @@ class TestHandleInvestigationCompletion:
         result = await db_session.execute(
             _select(_Task).where(_Task.parent_task_id == task.id)
         )
-        assert result.scalars().all() == []
+        children = result.scalars().all()
+        # Memo task is spawned for the unactionable structural outcome
+        assert len(children) == 1
+        memo = children[0]
+        assert memo.first_payload["type"] == "memo"
+        assert memo.first_payload["reasoning_kind"] == "investigation_unactionable"
+        assert memo.context["investigation_outcome"] == "structural"
+        assert memo.context["memo_source_task_id"] == str(task.id)
 
         d = project.directions[0]
         notes = d.get("notes") or []
@@ -3602,7 +3625,11 @@ class TestHandleInvestigationCompletion:
             .scalars()
             .all()
         )
-        assert siblings == []
+        # Cap exceeded → no followup spawned → memo is spawned for low_confidence outcome
+        assert len(siblings) == 1
+        memo = siblings[0]
+        assert memo.first_payload["type"] == "memo"
+        assert memo.context["investigation_outcome"] == "low_confidence"
         d = project.directions[0]
         assert d["followup_investigation_attempts_by_fingerprint"] == {"fp-low": recent}
         assert "diagnosis_in_progress" not in d
@@ -3897,7 +3924,9 @@ class TestHandleInvestigationCompletion:
         assert case.false_positive_reason and "design_doc" in case.false_positive_reason
         assert task.status == TaskStatus.COMPLETED
 
-        # No remediation was spawned — only the original investigate task remains.
+        # No remediation was spawned. A reasoning memo documenting the
+        # false-positive determination is spawned alongside the original
+        # investigate task, so two tasks remain — the original plus the memo.
         all_tasks = (
             (
                 await db_session.execute(
@@ -3907,8 +3936,18 @@ class TestHandleInvestigationCompletion:
             .scalars()
             .all()
         )
-        assert len(all_tasks) == 1
-        assert all_tasks[0].id == task.id
+        assert {t.id for t in all_tasks} >= {task.id}
+        spawned = [t for t in all_tasks if t.id != task.id]
+        assert all((t.first_payload or {}).get("type") == "memo" for t in spawned), (
+            "non-investigate spawned tasks must be memos, not remediations"
+        )
+        assert [
+            t
+            for t in spawned
+            if (t.context or {}).get("memo_reasoning_kind")
+            == "regression_false_positive"
+        ], "a regression false-positive memo should be spawned"
+        assert len(all_tasks) == 2
 
     @pytest.mark.asyncio
     async def test_not_a_regression_verdict_ignored_for_direction_investigations(
@@ -3953,6 +3992,545 @@ class TestHandleInvestigationCompletion:
         # Verdict is recorded on the report payload regardless of spawn path.
         assert isinstance(task.plan_output, dict)
         assert task.plan_output.get("verdict") == "not_a_regression"
+
+    # ── memo spawn on terminal (unactionable) outcomes ───────────────────────
+
+    @pytest.mark.asyncio
+    async def test_memo_spawned_for_structural_outcome(self, db_session, mocker):
+        """Structural diagnosis → memo child with reasoning_kind=investigation_unactionable."""
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id, context={"direction_id": "dir-invest-1"}
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        structural_report = self._report(
+            root_cause="The direction scope is too broad — conflates two concerns.",
+            recommended_fix="Split into two narrower directions.",
+        )
+        await _handle_investigation_completion(
+            task, self._payload(structural_report), db_session
+        )
+        await db_session.commit()
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1
+        memo = children[0]
+        assert memo.first_payload["type"] == "memo"
+        assert memo.first_payload["reasoning_kind"] == "investigation_unactionable"
+        assert memo.context["investigation_outcome"] == "structural"
+        assert memo.context["memo_source_task_id"] == str(task.id)
+        assert memo.context["memo_reasoning_kind"] == "investigation_unactionable"
+        assert memo.context["direction_id"] == "dir-invest-1"
+        assert memo.status == TaskStatus.COMPLETED
+        assert memo.created_by == "ORCHESTRATOR"
+
+    @pytest.mark.asyncio
+    async def test_memo_spawned_for_no_actionable_fix_outcome(self, db_session, mocker):
+        """No recommended_fix → memo child, no remediation task."""
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id, context={"direction_id": "dir-invest-1"}
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_completion(
+            task,
+            self._payload(self._report(recommended_fix="", confidence="high")),
+            db_session,
+        )
+        await db_session.commit()
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1
+        memo = children[0]
+        assert memo.first_payload["reasoning_kind"] == "investigation_unactionable"
+        assert memo.context["investigation_outcome"] == "no_actionable_fix"
+        # No remediation create-child
+        assert memo.first_payload["type"] == "memo"
+
+    @pytest.mark.asyncio
+    async def test_memo_spawned_for_low_confidence_outcome(self, db_session, mocker):
+        """Low confidence with capped followup → memo child."""
+        from app.time_utils import _utcnow
+
+        recent = [_utcnow().isoformat(), _utcnow().isoformat()]
+        project = await self._setup(
+            db_session,
+            mocker,
+            direction_overrides={
+                "error_fingerprint": "fp-lc",
+                "followup_investigation_attempts_by_fingerprint": {
+                    "fp-lc": list(recent)
+                },
+            },
+        )
+        task = make_task(
+            project_id=project.id,
+            context={"direction_id": "dir-invest-1", "diagnosis_fingerprint": "fp-lc"},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_completion(
+            task, self._payload(self._report(confidence="low")), db_session
+        )
+        await db_session.commit()
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1
+        memo = children[0]
+        assert memo.first_payload["reasoning_kind"] == "investigation_unactionable"
+        assert memo.context["investigation_outcome"] == "low_confidence"
+
+    @pytest.mark.asyncio
+    async def test_no_memo_when_remediation_spawned(self, db_session, mocker):
+        """High-confidence actionable report → remediation only, no memo."""
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id, context={"direction_id": "dir-invest-1"}
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_completion(
+            task, self._payload(self._report()), db_session
+        )
+        await db_session.commit()
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1
+        assert children[0].first_payload["type"] == "create"
+
+    @pytest.mark.asyncio
+    async def test_memo_dedup_skips_duplicate_for_same_investigation(
+        self, db_session, mocker
+    ):
+        """Second call for the same investigation task does not spawn a second memo."""
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id, context={"direction_id": "dir-invest-1"}
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        structural_report = self._report(
+            root_cause="The direction scope is too broad.",
+            recommended_fix="Narrow the scope.",
+        )
+        # First call
+        await _handle_investigation_completion(
+            task, self._payload(structural_report), db_session
+        )
+        await db_session.commit()
+        # Second call (simulates accidental re-processing)
+        await _handle_investigation_completion(
+            task, self._payload(structural_report), db_session
+        )
+        await db_session.commit()
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+
+        memos = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(
+                        _Task.project_id == project.id,
+                        _Task.parent_task_id == task.id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        memo_tasks = [
+            m
+            for m in memos
+            if (m.context or {}).get("memo_reasoning_kind")
+            == "investigation_unactionable"
+        ]
+        assert len(memo_tasks) == 1, (
+            "dedup should prevent a second memo for the same investigation"
+        )
+
+    @pytest.mark.asyncio
+    async def test_memo_spawned_for_no_direction_outcome(self, db_session, mocker):
+        """High-confidence actionable report with no direction context → memo with no_direction outcome."""
+        mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # No direction_id in context → direction=None, spawn_remediation=True but
+        # no direction-anchored / crash / dispatcher path fires → spawned_child=None.
+        task = make_task(project_id=project.id, context={})
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _handle_investigation_completion(
+            task, self._payload(self._report()), db_session
+        )
+        await db_session.commit()
+
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1
+        memo = children[0]
+        assert memo.first_payload["type"] == "memo"
+        assert memo.first_payload["reasoning_kind"] == "investigation_unactionable"
+        assert memo.context["investigation_outcome"] == "no_direction"
+        assert memo.context["memo_source_task_id"] == str(task.id)
+        assert memo.status == TaskStatus.COMPLETED
+        assert memo.created_by == "ORCHESTRATOR"
+
+    @pytest.mark.asyncio
+    async def test_unactionable_writes_verdict_to_regression_case(
+        self, db_session, mocker
+    ):
+        """Unactionable investigation for a dispatcher-spawned task writes
+        last_unactionable_verdict and last_unactionable_summary to the case row."""
+        from app.models import RegressionCaseStatus, RegressionRemediationCase
+
+        mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        regression_class = "sr_catch_rate:correctness"
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class=regression_class,
+            status=RegressionCaseStatus.ACTIVE,
+            hit_count=1,
+        )
+        db_session.add(case)
+        await db_session.commit()
+        await db_session.refresh(case)
+
+        task = make_task(
+            project_id=project.id,
+            context={
+                "spawned_by": "pipeline_regression_dispatcher",
+                "regression_class": regression_class,
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        # No recommended_fix → outcome = no_actionable_fix
+        await _handle_investigation_completion(
+            task,
+            self._payload(
+                self._report(
+                    summary="signal is intentional design behavior",
+                    recommended_fix="",
+                    confidence="high",
+                )
+            ),
+            db_session,
+        )
+        await db_session.commit()
+        await db_session.refresh(case)
+
+        assert case.last_unactionable_verdict == "no_actionable_fix"
+        assert case.last_unactionable_summary == "signal is intentional design behavior"
+
+    @pytest.mark.asyncio
+    async def test_unactionable_noop_when_case_row_absent(self, db_session, mocker):
+        """When no matching RegressionRemediationCase exists, the unactionable path
+        completes without raising (case update is silently skipped)."""
+        mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        task = make_task(
+            project_id=project.id,
+            context={
+                "spawned_by": "pipeline_regression_dispatcher",
+                "regression_class": "nonexistent_class",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        # Should not raise even though there's no matching case row.
+        await _handle_investigation_completion(
+            task,
+            self._payload(self._report(recommended_fix="", confidence="high")),
+            db_session,
+        )
+        await db_session.commit()
+        assert task.status == TaskStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_false_positive_memo_source_finding_contains_verdict_reason(
+        self, db_session, mocker
+    ):
+        """False-positive memo payload source_finding carries the actual verdict_reason,
+        not just the generic topic — ensures memo agent writes real reasoning."""
+        from sqlmodel import select as _select
+
+        from app.models import (
+            RegressionCaseStatus,
+            RegressionRemediationCase,
+        )
+
+        mocker.patch("app.task_completion.broadcast_to_project", new_callable=AsyncMock)
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        regression_class = "sr_catch_rate:correctness"
+        case = RegressionRemediationCase(
+            project_id=project.id,
+            regression_class=regression_class,
+            status=RegressionCaseStatus.ACTIVE,
+            hit_count=1,
+        )
+        db_session.add(case)
+        await db_session.commit()
+        await db_session.refresh(case)
+
+        task = make_task(
+            project_id=project.id,
+            context={
+                "spawned_by": "pipeline_regression_dispatcher",
+                "regression_class": regression_class,
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        verdict_reason_text = (
+            "design_doc explicitly documents partial backend test coverage; "
+            "this is intentional, not a regression"
+        )
+        verdict_report = json.dumps(
+            {
+                "summary": "Step skipped per design doc",
+                "root_cause": "",
+                "affected_files": [],
+                "recommended_fix": "",
+                "severity": "low",
+                "confidence": "high",
+                "verdict": "not_a_regression",
+                "verdict_reason": verdict_reason_text,
+            }
+        )
+        await _handle_investigation_completion(
+            task, self._payload(verdict_report), db_session
+        )
+        await db_session.commit()
+
+        all_tasks = (
+            (
+                await db_session.execute(
+                    _select(Task).where(Task.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        memos = [
+            t
+            for t in all_tasks
+            if t.id != task.id
+            and (t.context or {}).get("memo_reasoning_kind")
+            == "regression_false_positive"
+        ]
+        assert len(memos) == 1
+        memo = memos[0]
+        source_finding = (memo.first_payload or {}).get("source_finding") or {}
+        assert "verdict_reason" in source_finding, (
+            "source_finding must carry verdict_reason so memo captures real reasoning"
+        )
+        assert "design_doc" in source_finding["verdict_reason"]
+        assert source_finding.get("regression_class") == regression_class
+
+    @pytest.mark.asyncio
+    async def test_unactionable_investigation_memo_source_finding_contains_root_cause(
+        self, db_session, mocker
+    ):
+        """Investigation-unactionable memo source_finding carries root_cause —
+        ensures memo captures real reasoning rather than a generic topic."""
+        from sqlmodel import select as _select
+        from app.models import Task as _Task
+
+        project = await self._setup(db_session, mocker)
+        task = make_task(
+            project_id=project.id, context={"direction_id": "dir-invest-1"}
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        root_cause_text = (
+            "Deadlock in the rollup coordinator: two workers acquire locks "
+            "in opposite order, creating a cycle"
+        )
+        await _handle_investigation_completion(
+            task,
+            self._payload(
+                self._report(
+                    root_cause=root_cause_text,
+                    recommended_fix="",
+                    confidence="high",
+                )
+            ),
+            db_session,
+        )
+        await db_session.commit()
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1
+        memo = children[0]
+        assert memo.first_payload["type"] == "memo"
+        source_finding = (memo.first_payload or {}).get("source_finding") or {}
+        assert "root_cause" in source_finding, (
+            "source_finding must carry root_cause so memo captures real reasoning"
+        )
+        assert "Deadlock" in source_finding["root_cause"]
+        assert source_finding.get("outcome") == "no_actionable_fix"
+
+
+# ── _synthesize_memo_from_source_finding ────────────────────────────────────
+
+
+class TestSynthesizeMemoFromSourceFinding:
+    """Pure-function tests for the backend-side memo synthesis helper."""
+
+    def test_regression_false_positive_full_data(self):
+        sf = {
+            "verdict_reason": "design_doc says this is intentional",
+            "investigation_summary": "trace confirms the behavior",
+            "regression_class": "sr_catch_rate:correctness",
+        }
+        result = _synthesize_memo_from_source_finding(
+            "regression_false_positive", sf, "task-1"
+        )
+        assert result is not None
+        assert "design_doc" in result["summary"]
+        assert "trace confirms" in result["reasoning"]
+        assert "task:task-1" in result["citations"]
+        assert "regression-false-positive" in result["tags"]
+        assert "sr_catch_rate:correctness" in result["tags"]
+
+    def test_regression_false_positive_missing_verdict_reason_returns_none(self):
+        assert (
+            _synthesize_memo_from_source_finding("regression_false_positive", {}, "t")
+            is None
+        )
+
+    def test_investigation_unactionable_with_root_cause(self):
+        sf = {
+            "root_cause": "workers acquire locks in opposite order",
+            "summary": "deadlock in rollup coordinator",
+            "recommended_fix": "fix lock order",
+            "outcome": "structural",
+        }
+        result = _synthesize_memo_from_source_finding(
+            "investigation_unactionable", sf, "task-2"
+        )
+        assert result is not None
+        assert "workers acquire locks" in result["reasoning"]
+        assert "fix lock order" in result["reasoning"]
+        assert "investigation-unactionable" in result["tags"]
+        assert "structural" in result["tags"]
+        assert "task:task-2" in result["citations"]
+
+    def test_investigation_unactionable_missing_root_cause_and_summary_returns_none(
+        self,
+    ):
+        assert (
+            _synthesize_memo_from_source_finding(
+                "investigation_unactionable", {"outcome": "x"}, "t"
+            )
+            is None
+        )
+
+    def test_unknown_reasoning_kind_returns_none(self):
+        assert (
+            _synthesize_memo_from_source_finding("deferred_finding", {"body": "x"}, "t")
+            is None
+        )
 
 
 # ── _clear_direction_diagnosis_flag ─────────────────────────────────────────
@@ -5506,7 +6084,6 @@ class TestEscalateExhaustedFollowupsAlert:
         await _maybe_escalate_exhausted_followups(
             project=project,
             direction=project.directions[0],
-            directions=list(project.directions),
             fp_key="fp-stuck",
             session=db_session,
         )
@@ -5557,7 +6134,6 @@ class TestEscalateExhaustedFollowupsAlert:
         await _maybe_escalate_exhausted_followups(
             project=project,
             direction=project.directions[0],
-            directions=list(project.directions),
             fp_key="fp-ok",
             session=db_session,
         )
@@ -6273,3 +6849,254 @@ class TestCrossLayerRemediationPrompt:
         prompt = task.first_payload["prompt"]
         assert "CROSS-LAYER REMEDIATION" not in prompt
         assert "recommended_unmodifiable_layers" not in prompt
+
+
+@pytest.mark.skipif(
+    not _USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL"
+)
+class TestCompletionHandlerDirectionsConcurrency:
+    """Regression for the lost-update class fixed by routing completion-handler
+    project.directions / project.design_doc writes through the canonical row
+    locks (with_directions_locked / with_design_doc_locked).
+
+    Two concurrent completions of the SAME project, each mutating a DIFFERENT
+    direction (or a different JSON column), must BOTH persist — before the fix,
+    each handler loaded the project unlocked and wrote back a stale whole-array
+    snapshot, silently dropping the peer's update.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_remediation_outcomes_on_different_directions_both_persist(
+        self, db_session
+    ):
+        project = make_project(
+            directions=[
+                {"id": "dir-a", "status": "active"},
+                {"id": "dir-b", "status": "active"},
+            ]
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        pid = project.id
+
+        Session = sessionmaker(
+            bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+        )
+
+        async def record(direction_id: str) -> None:
+            async with Session() as s:
+                task = make_task(
+                    project_id=pid,
+                    context={
+                        "diagnosis_task_id": f"diag-{direction_id}",
+                        "direction_id": direction_id,
+                    },
+                )
+                s.add(task)
+                await s.commit()
+                await s.refresh(task)
+                ok = await _record_remediation_outcome(task, merged=True, session=s)
+                assert ok is True
+                await s.commit()
+
+        await asyncio.gather(record("dir-a"), record("dir-b"))
+
+        async with Session() as v:
+            proj = (
+                await v.execute(_sa_select(Project).where(Project.id == pid))
+            ).scalar_one()
+            by = {d["id"]: d for d in proj.directions}
+        assert by["dir-a"].get("last_remediation_result") == "merged", (
+            f"dir-a lost update: {by}"
+        )
+        assert by["dir-b"].get("last_remediation_result") == "merged", (
+            f"dir-b lost update: {by}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_directions_and_design_doc_writes_both_persist(
+        self, db_session
+    ):
+        """A directions write (remediation outcome) and a design_doc write
+        (playbook confirmation) racing on the same project must both survive —
+        the two columns are serialized through separate canonical helpers."""
+        from app.task_locking import with_design_doc_locked
+
+        project = make_project(
+            directions=[{"id": "dir-a", "status": "active"}],
+        )
+        project.design_doc = {
+            "playbook/pb-1": {"value": "x", "confirmed_count": 0},
+        }
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        pid = project.id
+
+        Session = sessionmaker(
+            bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+        )
+
+        async def record_direction() -> None:
+            async with Session() as s:
+                task = make_task(
+                    project_id=pid,
+                    context={
+                        "diagnosis_task_id": "diag-a",
+                        "direction_id": "dir-a",
+                    },
+                )
+                s.add(task)
+                await s.commit()
+                await s.refresh(task)
+                await _record_remediation_outcome(task, merged=True, session=s)
+                await s.commit()
+
+        def _add_pb2(doc: dict) -> None:
+            doc["playbook/pb-2"] = {"value": "y", "confirmed_count": 7}
+
+        async def confirm_playbook() -> None:
+            async with Session() as s:
+                # Pre-load the Project so it is identity-mapped in this session
+                # with the current design_doc cached. Under expire_on_commit=False
+                # this mirrors the production completion flow, where the Project
+                # is already loaded before confirm_applied_playbook_entries runs.
+                await s.get(Project, pid)
+                task = make_task(
+                    project_id=pid,
+                    context={"playbook_applied_entry_ids": ["pb-1"]},
+                )
+                s.add(task)
+                await s.commit()
+                await s.refresh(task)
+                # A concurrent same-project design_doc write lands on a DIFFERENT
+                # key (pb-2) from a separate session, AFTER this session cached
+                # the doc. Without the session.expire(project, ['design_doc'])
+                # inside confirm_applied_playbook_entries, its SELECT FOR UPDATE
+                # returns this session's stale identity-mapped instance, so the
+                # confirmed_count bump writes back a doc that never saw pb-2 and
+                # clobbers it. The expire forces a fresh load under the lock.
+                async with Session() as other:
+                    await with_design_doc_locked(other, pid, _add_pb2)
+                    await other.commit()
+                await confirm_applied_playbook_entries(task, session=s)
+                await s.commit()
+
+        await asyncio.gather(record_direction(), confirm_playbook())
+
+        async with Session() as v:
+            proj = (
+                await v.execute(_sa_select(Project).where(Project.id == pid))
+            ).scalar_one()
+            assert proj.directions[0].get("last_remediation_result") == "merged", (
+                f"directions write lost: {proj.directions}"
+            )
+            assert proj.design_doc["playbook/pb-1"]["confirmed_count"] == 1, (
+                f"design_doc write lost: {proj.design_doc}"
+            )
+            # The concurrent pb-2 write must survive — its loss is the exact
+            # stale-identity-map clobber the expire guards against.
+            assert "playbook/pb-2" in proj.design_doc, (
+                f"concurrent design_doc key clobbered (missing expire): {proj.design_doc}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_diagnosis_flag_clears_on_different_directions_both_persist(
+        self, db_session
+    ):
+        """Two _clear_direction_diagnosis_flag calls on different directions of
+        the same project must both clear their own direction (no lost update)."""
+        project = make_project(
+            directions=[
+                {"id": "dir-a", "status": "active", "diagnosis_in_progress": True},
+                {"id": "dir-b", "status": "active", "diagnosis_in_progress": True},
+            ]
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        pid = project.id
+
+        Session = sessionmaker(
+            bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+        )
+
+        async def clear(direction_id: str) -> None:
+            async with Session() as s:
+                task = make_task(project_id=pid, context={"direction_id": direction_id})
+                s.add(task)
+                await s.commit()
+                await s.refresh(task)
+                await _clear_direction_diagnosis_flag(
+                    task, s, summary=None, outcome="done"
+                )
+                await s.commit()
+
+        await asyncio.gather(clear("dir-a"), clear("dir-b"))
+
+        async with Session() as v:
+            proj = (
+                await v.execute(_sa_select(Project).where(Project.id == pid))
+            ).scalar_one()
+            by = {d["id"]: d for d in proj.directions}
+        assert by["dir-a"].get("diagnosis_in_progress") is None, by
+        assert by["dir-b"].get("diagnosis_in_progress") is None, by
+        assert by["dir-a"].get("last_diagnosis_outcome") == "done", by
+        assert by["dir-b"].get("last_diagnosis_outcome") == "done", by
+
+    @pytest.mark.asyncio
+    async def test_concurrent_field_updates_on_same_direction_both_persist(
+        self, db_session
+    ):
+        """Two sessions each updating a DIFFERENT field on the SAME direction must
+        both survive — the delta-merge in _persist_direction_field_update must not
+        overwrite the peer's write with a stale whole-snapshot replacement.
+
+        Before the fix, _apply did target.clear(); target.update(direction) inside
+        the lock.  Even though each session re-read the fresh row, the second
+        committer's .clear() wiped out the first committer's field.  After the fix
+        the helper does target.update(direction) (no clear), so concurrent writes
+        to different keys are both preserved.
+        """
+        project = make_project(
+            directions=[{"id": "dir-shared", "status": "active", "existing": "keep"}]
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        pid = project.id
+
+        Session = sessionmaker(
+            bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+        )
+
+        async def write_field_a() -> None:
+            async with Session() as s:
+                proj = await s.get(Project, pid)
+                dirs = list(proj.directions or [])
+                target = next(d for d in dirs if d["id"] == "dir-shared")
+                target["field_a"] = "value_a"
+                await _persist_direction_field_update(s, proj, target)
+                await s.commit()
+
+        async def write_field_b() -> None:
+            async with Session() as s:
+                proj = await s.get(Project, pid)
+                dirs = list(proj.directions or [])
+                target = next(d for d in dirs if d["id"] == "dir-shared")
+                target["field_b"] = "value_b"
+                await _persist_direction_field_update(s, proj, target)
+                await s.commit()
+
+        await asyncio.gather(write_field_a(), write_field_b())
+
+        async with Session() as v:
+            proj = (
+                await v.execute(_sa_select(Project).where(Project.id == pid))
+            ).scalar_one()
+            d = next(x for x in proj.directions if x["id"] == "dir-shared")
+
+        assert d.get("field_a") == "value_a", f"field_a lost: {d}"
+        assert d.get("field_b") == "value_b", f"field_b lost: {d}"
+        assert d.get("existing") == "keep", f"pre-existing field clobbered: {d}"

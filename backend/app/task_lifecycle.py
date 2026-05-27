@@ -37,7 +37,11 @@ from app.models import (
 )
 from app.schemas import AgentStatusPayload
 from app.routers.agent import _has_local_cycle
-from app.shared_state import runtime_config as _runtime_config, DEFAULT_TASK_SCOPE
+from app.shared_state import (
+    runtime_config as _runtime_config,
+    DEFAULT_TASK_SCOPE,
+    derive_task_branch as _derive_task_branch,
+)
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project
 from app.payload_schemas import validate_internal_payload
@@ -51,17 +55,8 @@ from app.notification_dispatch import (
     is_residual_remediation_task,
     post_remediation_result_message,
 )
-from app.failure_classification import (
-    classify_failure,
-    _timeout_subtype_from_message,
-    TIMEOUT_OOM,
-    TIMEOUT_HEARTBEAT_LOST,
-    TIMEOUT_ITERATION_LIMIT,
-    TIMEOUT_CASCADE,
-    TIMEOUT_PROCESS_CRASH,
-)
+from app.failure_classification import classify_failure
 from app.retry_budget import (
-    CODE_ERROR_STAGE_GUIDANCE,
     append_failure_class_history,
     classify_override_reason,
     compute_effective_max_requeues,
@@ -84,179 +79,20 @@ from app.failure_stage import (  # noqa: E402, F401, RUF100
 )
 
 
-# Mirrors SCOPE_OVERFLOW_THRESHOLDS in agent/src/constants.ts — keep in sync.
-_SCOPE_OVERFLOW_THRESHOLDS = {"small": 6, "medium": 10, "large": 20}
-
-
-# Build/lint complaint patterns the reviewer's local VM might raise that
-# correspond to a CI gate. When CI is GREEN for the matching job and the
-# reviewer flags the gate as red, that's a reviewer-env issue, not a real
-# defect — the fix agent should dispute via /tmp/fix_responses rather than
-# edit config files to satisfy a phantom complaint.
-_BUILD_GATE_PATTERN = re.compile(
-    r"npm run build|npm ci|cannot resolve|"
-    r"vite/client|@tailwindcss|tsc\b|--noEmit|"
-    r"ruff(\s+(check|format))?|"
-    r"build (?:fail|gate|broken|red)|"
-    r"required verification gate|type definition|"
-    r"package\.json.*(?:not.?install|missing)",
-    re.IGNORECASE,
+from app.retry_prompt import (  # noqa: E402, F401, RUF100
+    _ANALYSIS_ARTIFACT_KEYS,
+    _BUILD_GATE_PATTERN,
+    _RETRY_SUFFIX_AUTO_PREFIXES,
+    _SCOPE_OVERFLOW_THRESHOLDS,
+    _append_approve_to_review_history,
+    _build_retry_prompt_suffix,
+    _build_scope_overflow_details,
+    _copy_analysis_artifacts_to_previous,
+    _detect_ci_review_disagreement,
+    _extract_error_files,
+    _extract_failing_tests,
+    merge_retry_prompt_suffix,
 )
-
-
-def _detect_ci_review_disagreement(
-    issues: list,
-    feedback: str,
-    ci_check: dict | None,
-    pr_number: int | None,
-) -> str:
-    """Return a fix-prompt preamble when reviewer claims a build/lint gate is
-    red but CI shows the matching job green.
-
-    Returns an empty string when there's no disagreement to surface; otherwise
-    a short instructional block ending with ``\\n\\n`` that prepends the
-    fix-prompt issue list. The agent is told to verify CI status via gh and,
-    if confirmed green, write a structured `disputed` response with mechanical
-    verify steps so the next reviewer is forced to re-run them.
-    """
-    if not ci_check or not ci_check.get("details"):
-        return ""
-    details = ci_check.get("details") or []
-    green_jobs = {
-        (d.get("name") or "").lower()
-        for d in details
-        if d.get("conclusion") == "success" and d.get("status") == "completed"
-    }
-    if not green_jobs:
-        return ""
-    haystack = (feedback or "").lower()
-    for i in issues or []:
-        desc = (i.get("description") or "").lower()
-        haystack += "\n" + desc
-    if not _BUILD_GATE_PATTERN.search(haystack):
-        return ""
-    # Map reviewer-complaint domains to CI job-name fragments. A green CI job
-    # that matches a complained-about domain is the disagreement signal.
-    flagged: list[str] = []
-    if any(
-        kw in haystack
-        for kw in (
-            "admin-ui",
-            "vite",
-            "tailwind",
-            "vite/client",
-            "frontend",
-            "npm run build",
-        )
-    ) and any("frontend" in n for n in green_jobs):
-        flagged.append("CI / Frontend")
-    if any(kw in haystack for kw in ("agent", "tsc", "noemit", "type def")) and any(
-        "agent" in n for n in green_jobs
-    ):
-        flagged.append("CI / Agent")
-    if any(kw in haystack for kw in ("ruff", "backend", "py_compile", "lint")) and any(
-        "backend" in n for n in green_jobs
-    ):
-        flagged.append("CI / Backend")
-    if not flagged:
-        return ""
-    pr_ref = f"#{pr_number}" if pr_number else "this PR"
-    job_list = ", ".join(sorted(set(flagged)))
-    return (
-        "## CI vs reviewer build-gate disagreement\n"
-        f"GitHub Actions CI is currently GREEN on {pr_ref} for: {job_list}. "
-        "However, the reviewer flagged build/lint gates as failing in their local environment.\n\n"
-        "This usually means the reviewer's workspace lacks installed dependencies, NOT a real defect. "
-        "Before re-fixing source code:\n"
-        f"  1. Run `gh pr checks {pr_number or '<pr>'}` to confirm CI status.\n"
-        "  2. If CI is green, write a `disputed` response to `/tmp/fix_responses_${TASK_ID}.json` "
-        "with mechanical verify steps that prove the build passes from a fresh install — for example:\n"
-        "     - `cd /tmp/workspace && npm ci && npm run build`\n"
-        "     - `cd /tmp/workspace/admin-ui && npm ci && npm run build`\n"
-        "     - reference the green CI run URL\n"
-        "  3. The next reviewer will re-run those steps. If they pass, the issue is dropped; if they fail, "
-        "the loop escalates to standoff and an operator is paged. Either way, you stop the thrash.\n"
-        "  4. ONLY modify source code if you can REPRODUCE the build failure from a clean install. "
-        "Do not edit config files just to satisfy a complaint you cannot reproduce locally.\n\n"
-    )
-
-
-def _build_scope_overflow_details(ctx: dict, task_scope: str) -> str:
-    """Render a decomposition-hint block from the previous attempt's scope overflow.
-
-    Uses ``_previous_changed_files`` (and optional ``_previous_diff_summary``) to
-    surface: module distribution (files per top-level path), the expansion ratio
-    vs. the scope threshold, and the specific files the agent touched. This lets
-    the plan agent split along the actual fault lines (e.g. backend/app vs.
-    agent/src) instead of re-analysing the whole scope. Returns "" if no signal.
-    """
-    changed_files = ctx.get("_previous_changed_files") or []
-    if not changed_files:
-        return ""
-
-    module_counts: dict[str, int] = {}
-    for f in changed_files:
-        parts = str(f).split("/")
-        key = "/".join(parts[:2]) if len(parts) >= 2 else parts[0]
-        module_counts[key] = module_counts.get(key, 0) + 1
-
-    lines = [
-        "OVERFLOW DETAILS FROM PREVIOUS ATTEMPT:",
-        f"- Files touched: {len(changed_files)}",
-    ]
-    threshold = _SCOPE_OVERFLOW_THRESHOLDS.get(task_scope)
-    if threshold:
-        lines.append(
-            f"- Scope budget: {task_scope}={threshold} files "
-            f"(over by {len(changed_files) - threshold}, "
-            f"{len(changed_files) / threshold:.1f}x budget)"
-        )
-    if module_counts:
-        dist = ", ".join(
-            f"{m}={n}" for m, n in sorted(module_counts.items(), key=lambda kv: -kv[1])
-        )
-        lines.append(f"- Module distribution: {dist}")
-        if len(module_counts) > 1:
-            lines.append(
-                "- Decomposition hint: split along the module boundaries above — "
-                "each module can likely become a separate subtask."
-            )
-    lines.append("- Changed files: " + ", ".join(str(f) for f in changed_files[:10]))
-    return "\n".join(lines) + "\n"
-
-
-def _append_approve_to_review_history(
-    review_loop: dict,
-    changed_files: "list[str] | None" = None,
-) -> list:
-    """Append an APPROVE entry to ``review_history`` so the trajectory section
-    shown to fix agents includes approved iterations alongside REQUEST_CHANGES
-    ones.  PR #3435's iter 1 was approved, then iter 2's rebase regressed it —
-    every later fix agent saw only the rejected iterations and could not see
-    that the PR had ever been correct.  Surfacing the APPROVE entry lets the
-    drift detector compute "files in current diff but absent from any approved
-    iteration" — the load-bearing signal.
-
-    Idempotent on (iteration, verdict) so re-entering the ci_waiting transition
-    (e.g. retry after merge failure) does not append duplicate entries.
-    """
-    history = list(review_loop.get("review_history") or [])
-    iteration = int(review_loop.get("iteration") or 0)
-    if (
-        history
-        and history[-1].get("iteration") == iteration
-        and history[-1].get("verdict") == "APPROVE"
-    ):
-        return history
-    history.append(
-        {
-            "iteration": iteration,
-            "feedback": "",
-            "verdict": "APPROVE",
-            "changed_files": list(changed_files or [])[:30],
-        }
-    )
-    return history
 
 
 def _record_parent_failure(parent: Task, failure_class: str) -> None:
@@ -277,354 +113,6 @@ def _record_parent_failure(parent: Task, failure_class: str) -> None:
             failure_class=failure_class,
             project_id=str(parent.project_id) if parent.project_id else "",
         )
-
-
-_RETRY_SUFFIX_AUTO_PREFIXES = re.compile(
-    r"^(?:RETRY GUIDANCE:"
-    r"|IMPORTANT: The previous attempt TIMED OUT"
-    r"|NOTE: The previous attempt was CANCELLED"
-    r"|WARNING: The same tests are failing).*?(?=\n\n|\Z)",
-    flags=re.MULTILINE | re.DOTALL,
-)
-
-
-def merge_retry_prompt_suffix(
-    extra_guidance: str, existing_suffix: str, ctx: dict
-) -> str:
-    """Combine fresh retry guidance with carry-forward spawn-time suffix.
-
-    Stamps ctx['_original_prompt_suffix'] on first use (with all known
-    auto-generated leading blocks stripped from existing_suffix), then
-    carries that snapshot forward verbatim across retries. Without this,
-    each retry stacks another auto-block (observed on 911b3ed3 / 547a700d:
-    two `IMPORTANT: The previous attempt TIMED OUT` blocks in the payload
-    after a single reaper-driven retry).
-
-    Used by both _requeue_parent_task (parent-level requeue) and the
-    in-place reaper retry in reaper.py — keeping the dedup centralized
-    so a third caller can't drift again.
-    """
-    if "_original_prompt_suffix" in ctx:
-        carry = ctx.get("_original_prompt_suffix") or ""
-    else:
-        carry = _RETRY_SUFFIX_AUTO_PREFIXES.sub("\n", existing_suffix or "").strip()
-        ctx["_original_prompt_suffix"] = carry
-    return extra_guidance + ("\n" + carry if carry else "")
-
-
-def _build_retry_prompt_suffix(
-    failure_class: "str | None",
-    original_status_message: "str | None",
-    attempt: int,
-    task_scope: str,
-    ctx: dict,
-) -> "tuple[str, str | None]":
-    """Build failure-class-specific retry guidance for the agent prompt_suffix.
-
-    Returns (extra_guidance, scope_override). scope_override is set to a
-    different scope string when the failure mode should route through a
-    different scope on retry:
-      - AGENT_TIMEOUT with attempt ≥ 2: downgrade large→medium or medium→small
-      - CODE_ERROR with attempt ≥ 2: downgrade large→medium or medium→small only
-        when the previous failure stage is unknown or ctx indicates the scope
-        itself overflowed (expansion_ratio > 1.5). Pure SCOPE_OVERFLOW is handled
-        by its own branch above.
-        Failures at identified code-defect stages (test/lint/build/review/merge)
-        preserve the original scope since a tighter budget won't fix bugs.
-      - SCOPE_OVERFLOW on a medium task: escalate medium→large so the plan
-        agent decomposes the work into multiple small subtasks
-      - SCOPE_OVERFLOW on a small task: escalate small→medium so the retry
-        gets a 10-file budget instead of 6
-    Otherwise None. Reads ``_previous_failing_tests`` and ``_previous_error_files``
-    from ctx for CODE_ERROR hints.
-    """
-    extra_guidance = ""
-    scope_override: str | None = None
-
-    diagnosis_prefix = ""
-    if ctx.get("diagnosis_task_id"):
-        root_cause = str(ctx.get("diagnosis_root_cause") or "").strip()
-        recommended_fix = str(ctx.get("diagnosis_recommended_fix") or "").strip()
-        lines = [
-            "DIAGNOSIS CONTEXT: This task was spawned from a diagnosed failure. "
-            "Your previous attempt to implement the recommended fix failed — "
-            "try a different approach to the same root cause rather than abandoning "
-            "the diagnosis."
-        ]
-        if root_cause:
-            lines.append(f"- Root cause identified: {root_cause[:800]}")
-        if recommended_fix:
-            lines.append(f"- Originally recommended fix: {recommended_fix[:800]}")
-        affected = ctx.get("related_files") or []
-        if affected:
-            lines.append(
-                "- Affected files: " + ", ".join(str(f) for f in affected[:10])
-            )
-        diagnosis_prefix = "\n".join(lines) + "\n"
-
-    if failure_class == "AGENT_TIMEOUT":
-        subtype = _timeout_subtype_from_message(original_status_message or "")
-        if subtype == TIMEOUT_OOM:
-            extra_guidance = (
-                "IMPORTANT: The previous attempt TIMED OUT due to an out-of-memory condition. You MUST reduce memory usage:\n"
-                "- Simplify data structures and avoid loading large files fully into memory\n"
-                "- Stream or paginate reads instead of materializing entire result sets\n"
-                "- Drop unused intermediate variables and large caches\n"
-                "- Reduce scope so fewer files/transforms are held in memory at once\n"
-            )
-        elif subtype == TIMEOUT_HEARTBEAT_LOST:
-            extra_guidance = (
-                "IMPORTANT: The previous attempt TIMED OUT — the agent stopped sending heartbeats. Keep operations smaller:\n"
-                "- Break long-running steps into shorter units that emit progress frequently\n"
-                "- Avoid single commands that block for minutes; prefer batched/iterative work\n"
-                "- Commit partial progress early so a later heartbeat loss doesn't erase it\n"
-                "- Reduce scope to fit comfortably within the heartbeat window\n"
-            )
-        elif subtype == TIMEOUT_ITERATION_LIMIT:
-            extra_guidance = (
-                "IMPORTANT: The previous attempt TIMED OUT — the review-fix/iteration cap was exhausted. You MUST narrow scope:\n"
-                "- Focus on the single most critical change; defer everything else\n"
-                "- Produce changes that pass review on the first pass — avoid churn that triggers more fix cycles\n"
-                "- Skip optional refactors, style tweaks, and speculative edits\n"
-            )
-        elif subtype == TIMEOUT_CASCADE:
-            extra_guidance = (
-                "NOTE: The previous attempt was CANCELLED by the orchestrator (cascade/supersession), not by a code defect.\n"
-                "- Proceed with the originally planned approach; no need to reduce scope defensively\n"
-                "- Check whether parent/sibling state has shifted before duplicating already-merged work\n"
-            )
-        elif subtype == TIMEOUT_PROCESS_CRASH:
-            extra_guidance = (
-                "IMPORTANT: The previous attempt TIMED OUT — the agent process crashed. Reduce scope and avoid risky operations:\n"
-                "- Skip commands known to be flaky or resource-intensive on this VM\n"
-                "- Keep changes small so a crash doesn't lose too much progress\n"
-                "- Commit working changes early and often\n"
-            )
-        else:
-            extra_guidance = (
-                "IMPORTANT: The previous attempt TIMED OUT. You MUST reduce scope:\n"
-                "- Focus on the single most critical change only\n"
-                "- Skip non-essential improvements, refactors, or cleanup\n"
-                "- Commit working changes early and often\n"
-                "- If the task requires changes across many files, pick the 2-3 most important\n"
-            )
-        if subtype not in (TIMEOUT_CASCADE, TIMEOUT_ITERATION_LIMIT):
-            if attempt >= 2 and task_scope == "large":
-                scope_override = "medium"
-            elif attempt >= 2 and task_scope == "medium":
-                scope_override = "small"
-
-    # Escalate medium→large when the previous attempt overflowed its scope budget.
-    # Routing through "large" invokes the plan agent, which decomposes the work
-    # into multiple small subtasks — turning a repeated same-scope failure into a
-    # productive decomposition pass. Matches both the canonical SCOPE_OVERFLOW class
-    # and the raw lowercase 'scope_overflow' label in case normalization didn't run.
-    elif (
-        failure_class == "SCOPE_OVERFLOW"
-        or (ctx.get("failure_category") or "").lower() == "scope_overflow"
-    ):
-        if ctx.get("scope_gate_triggered") == "analysis_overflow":
-            extra_guidance = (
-                "RETRY GUIDANCE: The previous attempt could not produce a valid analysis plan within the scope budget.\n"
-                "- Simplify the analysis approach; target the smallest coherent change that addresses the core issue\n"
-                "- Plan against fewer files up front rather than exploring broadly\n"
-                "- Avoid tangential code paths, speculative refactors, or unrelated cleanups\n"
-            )
-        else:
-            extra_guidance = (
-                "RETRY GUIDANCE: The previous attempt exceeded the scope's file-count budget.\n"
-                "- Focus on the single most critical change; limit production edits to 1-3 files\n"
-                "- Split unrelated concerns into follow-up work rather than bundling them here\n"
-            )
-        extra_guidance += _build_scope_overflow_details(ctx, task_scope)
-        if task_scope == "medium":
-            scope_override = "large"
-        elif task_scope == "small":
-            scope_override = "medium"
-
-    elif failure_class == "CODE_ERROR":
-        agent_raw = (ctx.get("agent_failure_category_raw") or "").lower()
-        # Wrapper-fallback "incomplete": the agent process exited without
-        # calling ./done|./fail|./pr — typically because the LLM printed a
-        # unified diff to stdout instead of using its editing tools. The
-        # status-message keyword detector frequently mis-matches "build" on
-        # diff bodies that mention BuildConfig/etc., producing irrelevant
-        # build-stage retry guidance. Short-circuit with a bespoke prompt
-        # before any keyword-based routing fires.
-        if agent_raw == "incomplete":
-            # Branch on the previous attempt's provider: each agent CLI has a
-            # different file-edit tool. Codex emitting a unified diff in its
-            # final assistant message instead of calling apply_patch is the
-            # primary observed failure mode here (3e1a042b incident).
-            prev_provider = (ctx.get("_previous_provider") or "").lower()
-            if prev_provider == "openai":
-                tool_guidance = (
-                    "  - Codex applies edits via the `apply_patch` tool. Your previous\n"
-                    "    attempt printed a unified diff to stdout instead of calling\n"
-                    "    apply_patch — printed text is NOT applied. Every file change\n"
-                    "    must go through apply_patch; do NOT emit a diff in your final\n"
-                    "    assistant message.\n"
-                )
-            elif prev_provider == "gemini":
-                tool_guidance = (
-                    "  - Gemini applies edits via its file-write tool calls. Your\n"
-                    "    previous attempt printed a diff to stdout instead of\n"
-                    "    invoking the edit tool — printed text is NOT applied.\n"
-                )
-            else:
-                tool_guidance = (
-                    "  - Use the file editing tools (Edit/Write/apply_patch) to\n"
-                    "    actually apply changes to the working tree — do not just\n"
-                    "    print a patch\n"
-                )
-            extra_guidance = (
-                "RETRY GUIDANCE: Your previous attempt printed a diff to stdout but never\n"
-                "applied any edits or shipped a PR. A unified diff printed as text does\n"
-                "NOT modify the repository. The wrapper observed zero file changes and\n"
-                "no ./done/./fail/./pr call, so it failed the task as 'incomplete'.\n"
-                "You MUST:\n"
-                + tool_guidance
-                + "  - Run the build/tests if the task requires verification\n"
-                "  - Open a PR via ./pr and call ./done to ship — OR call\n"
-                '    ./fail "<reason>" if the task fundamentally cannot be completed\n'
-                "Do NOT print a unified diff to stdout and exit.\n"
-            )
-            # Escape hatch: if this provider has now produced "incomplete" twice
-            # in a row, it's likely a tool-layer mismatch the prompt won't fix.
-            # Hint at ./fail so the orchestrator can surface the failure cleanly
-            # rather than burning the full retry budget on the same wall.
-            history = ctx.get("_failure_class_history") or []
-            recent = [h for h in history[-2:] if isinstance(h, dict)]
-            if (
-                len(recent) >= 2
-                and prev_provider
-                and ctx.get("_previous_failure_stage") in (None, "", "incomplete")
-            ):
-                extra_guidance += (
-                    "\nIf your tool layer is consistently failing to apply edits "
-                    "(third attempt with the same provider), exit with "
-                    '`./fail "tool-call layer not producing applied edits — needs '
-                    'provider switch"` so the orchestrator can escalate.\n'
-                )
-        else:
-            stage_guidance = CODE_ERROR_STAGE_GUIDANCE.get(
-                ctx.get("_previous_failure_stage") or ""
-            )
-            if stage_guidance:
-                extra_guidance = "RETRY GUIDANCE: " + stage_guidance + "\n"
-            else:
-                error_text = (original_status_message or "").lower()
-                hints = []
-                if any(
-                    kw in error_text
-                    for kw in ["test", "assert", "pytest", "jest", "vitest"]
-                ):
-                    hints.append(
-                        "Fix the specific failing tests shown in the error log before making other changes."
-                    )
-                if any(kw in error_text for kw in ["lint", "ruff", "eslint", "tsc"]):
-                    hints.append(
-                        "Fix lint/type errors first — run the linter before committing."
-                    )
-                if hints:
-                    extra_guidance = "RETRY GUIDANCE: " + " ".join(hints) + "\n"
-                else:
-                    extra_guidance = (
-                        "RETRY GUIDANCE: The previous attempt failed with an unclassified code error.\n"
-                        "- Verify changes compile and pass lint locally before committing\n"
-                        "- Check for import errors or missing dependencies\n"
-                        "- If the previous approach produced errors, try a simpler alternative\n"
-                    )
-        failing_tests = ctx.get("_previous_failing_tests", [])
-        error_files = ctx.get("_previous_error_files", [])
-        current_failing = _extract_failing_tests(original_status_message or "")
-        overlap = [t for t in current_failing if t in set(failing_tests)]
-        if overlap:
-            extra_guidance = (
-                "WARNING: The same tests are failing across attempts — try a fundamentally "
-                "different approach rather than iterating on the current one.\n"
-                "- Overlapping failures: " + ", ".join(overlap[:5]) + "\n"
-            ) + extra_guidance
-        if failing_tests:
-            extra_guidance += "Previously failing tests:\n" + "".join(
-                f"  {t}\n" for t in failing_tests
-            )
-        if error_files:
-            extra_guidance += "Error file locations:\n" + "".join(
-                f"  {f}\n" for f in error_files
-            )
-        prev_review_issues = ctx.get("_previous_review_issues") or []
-        if prev_review_issues:
-            extra_guidance += (
-                "Unresolved review issues from previous attempt (address these proactively):\n"
-                + "".join(f"  - {str(d)[:300]}\n" for d in prev_review_issues[:5])
-            )
-        if attempt >= 2 and task_scope in ("large", "medium"):
-            prev_stage = ctx.get("_previous_failure_stage")
-            prev_expansion = ctx.get("expansion_ratio")
-            scope_related = (
-                isinstance(prev_expansion, (int, float)) and prev_expansion > 1.5
-            )
-            # Downgrade only when the stage is unknown (no diagnostic signal that
-            # points at a code defect) or when context indicates the scope itself
-            # was the problem. Code-defect stages (test, lint, build, review, merge)
-            # are not remedied by a tighter file budget — preserve original scope
-            # and rely on stage-specific guidance instead.
-            if scope_related or not prev_stage:
-                scope_override = "medium" if task_scope == "large" else "small"
-
-    elif failure_class == "EXTERNAL_API":
-        error_text = original_status_message or ""
-        lower = error_text.lower()
-        if "github" in lower:
-            service = "GitHub API"
-        elif "anthropic" in lower or "claude" in lower:
-            service = "Claude API"
-        else:
-            service = "external API"
-        code_match = re.search(r"\b([45]\d{2})\b", error_text)
-        code_hint = f" (status {code_match.group(1)})" if code_match else ""
-        extra_guidance = (
-            f"RETRY GUIDANCE: The previous attempt failed due to an {service} error{code_hint}.\n"
-            "- Check the service's status page before making calls\n"
-            "- Implement exponential backoff with jitter on retries\n"
-            "- Handle transient 5xx and network errors gracefully\n"
-        )
-
-    elif failure_class == "RATE_LIMIT":
-        extra_guidance = (
-            "RETRY GUIDANCE: The previous attempt hit a rate limit.\n"
-            "- Respect Retry-After headers when present\n"
-            "- Use exponential backoff with jitter between retries\n"
-            "- Batch or reduce request volume where possible\n"
-        )
-
-    cross_attempt_lines: list[str] = []
-    if ctx.get("_previous_is_recurring"):
-        cross_attempt_lines.append(
-            "- This failure class has recurred 3+ times project-wide — it is a systemic "
-            "pattern, not a one-off. Consider a structurally different approach."
-        )
-    prev_stage = ctx.get("_previous_failure_stage")
-    if prev_stage:
-        cross_attempt_lines.append(
-            f"- Previous attempt failed at pipeline stage: {prev_stage}"
-        )
-    prev_self_review = ctx.get("_previous_self_review_outcome")
-    if prev_self_review:
-        summary = str(prev_self_review)[:300]
-        cross_attempt_lines.append(
-            f"- Previous attempt's self-review flagged: {summary}"
-        )
-    if cross_attempt_lines:
-        extra_guidance += (
-            "CROSS-ATTEMPT CONTEXT:\n" + "\n".join(cross_attempt_lines) + "\n"
-        )
-
-    if diagnosis_prefix:
-        extra_guidance = diagnosis_prefix + extra_guidance
-
-    return extra_guidance, scope_override
 
 
 async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
@@ -706,62 +194,24 @@ async def _increment_research_spawn_count(
     return new_count
 
 
-def _extract_failing_tests(text: str) -> list[str]:
-    """Extract up to 10 failing test identifiers from error output.
+def _get_approval_gate_file_lists(project: Project) -> tuple[set, set]:
+    """Get infra_files and critical_files for approval gate.
 
-    Recognizes pytest FAILED path::test, Jest/Vitest FAIL suite/test,
-    and generic Error: lines.
+    Returns (infra_files_set, critical_files_set).
+    Uses project.approval_gate_config when present; otherwise returns empty sets.
     """
-    results: list[str] = []
-    seen: set[str] = set()
+    config = (project.approval_gate_config or {}) if project else {}
 
-    def _add(ident: str) -> None:
-        if ident not in seen and len(results) < 10:
-            seen.add(ident)
-            results.append(ident)
-
-    # pytest: FAILED path/to/test_file.py::test_name[param]
-    for m in re.finditer(r"FAILED\s+(\S+::\S+)", text):
-        _add(m.group(1))
-
-    # Jest/Vitest: FAIL TestSuite/TestName or FAIL path/to/test.ts
-    for m in re.finditer(r"\bFAIL\b\s+(\S+/\S+)", text):
-        _add(m.group(1))
-
-    # Generic "Error: message" lines (capped at 120 chars each)
-    for m in re.finditer(r"^Error:\s+.+$", text, re.MULTILINE):
-        _add(m.group(0).strip()[:120])
-
-    return results
-
-
-def _extract_error_files(text: str) -> list[str]:
-    """Extract up to 5 file paths from error output.
-
-    Recognizes Python tracebacks (File "path", line N) and
-    TypeScript/ESLint errors (path/to/file.ts:line:col).
-    """
-    results: list[str] = []
-    seen: set[str] = set()
-
-    def _add(path: str) -> None:
-        if path not in seen and len(results) < 5:
-            seen.add(path)
-            results.append(path)
-
-    # Python tracebacks: File "path/to/file.py", line N
-    for m in re.finditer(r'File "([^"]+)", line \d+', text):
-        _add(m.group(1))
-
-    # TypeScript/ESLint: path/to/file.ts:line:col (require path separator)
-    for m in re.finditer(
-        r"([a-zA-Z0-9_.][a-zA-Z0-9_./\-]*\.[a-z]{2,4}):(\d+):(\d+)", text
-    ):
-        path = m.group(1)
-        if "/" in path:
-            _add(path)
-
-    return results
+    # Infer the missing half when only one of infra/critical is configured.
+    # If only infra_files is set, any infra change must require approval (critical = infra).
+    # If only critical_files is set, infra must include all critical files (infra = critical).
+    infra = set(config.get("infra_files", []))
+    critical = set(config.get("critical_files", []))
+    if infra and not critical:
+        critical = set(infra)
+    if critical and not infra:
+        infra = set(critical)
+    return infra, critical
 
 
 async def _requeue_parent_task(parent: Task, session: AsyncSession):
@@ -1445,7 +895,19 @@ async def _spawn_ci_auto_remediation_followup(
     from app.main import _utcnow
 
     ctx = task.context or {}
-    branch = ctx.get("ci_failure_branch") or "main"
+    _ci_project = (
+        await session.get(Project, task.project_id) if task.project_id else None
+    )
+    if not _ci_project:
+        logger.warning(
+            "[AUTO-REMEDIATION] _spawn_ci_auto_remediation_followup: "
+            "project not found for task %s (project_id=%s) — aborting follow-up spawn",
+            task.id,
+            task.project_id,
+        )
+        return False
+    _promotion_target = _shared_state.get_project_promotion_target(_ci_project)
+    branch = ctx.get("ci_failure_branch") or _promotion_target
     fingerprint = ctx.get("_previous_error_fingerprint") or ""
     failed_checks = ctx.get("ci_failure_checks") or []
     failure_type = ctx.get("ci_failure_type") or "(unknown)"
@@ -1502,7 +964,7 @@ async def _spawn_ci_auto_remediation_followup(
         {
             "type": "investigate",
             "prompt": "\n".join(prompt_lines)[:20000],
-            "base_branch": _runtime_config.get("integration_branch", "main"),
+            "base_branch": _shared_state.get_project_integration_branch(_ci_project),
         },
         "task_lifecycle:ci_auto_remediation_followup",
     )
@@ -1603,7 +1065,7 @@ async def _close_loop_regression_case_on_merge(
         try:
             from app.github import get_pr_files, get_repo_installation_token
             from app.models import Project
-            from app.pipeline_regression_dispatcher import _classify_layers_from_paths
+            from app.regression_layer_backfill import _classify_layers_from_paths
 
             project = await session.get(Project, task.project_id)
             if project and project.github_owner and project.github_repo:
@@ -1632,6 +1094,67 @@ async def _close_loop_regression_case_on_merge(
                 task.project_id,
                 exc,
             )
+
+    # Verify the PR's merge commit is reachable from the integration branch before
+    # advancing the case.  A PR merged only into a rollup staging branch has NOT
+    # landed on the integration branch — advancing the case would suppress re-spawning
+    # while the regression is still live.  Fail-safe (skip) on INDETERMINATE (None) as
+    # well as a definitive False; only a confirmed True (ancestor) proceeds.  Exception
+    # in the outer try/except is still fail-open (credentials unavailable, etc.) because
+    # the ancestry helper was unreachable, not because it returned a negative signal.
+    try:
+        from app.github import (
+            get_pull_request as _get_pull_request,
+            get_repo_installation_token as _get_installation_token,
+            is_ancestor_of as _is_ancestor_of,
+        )
+        from app.models import Project as _Project
+
+        _anc_project = await session.get(_Project, task.project_id)
+        if _anc_project and _anc_project.github_owner and _anc_project.github_repo:
+            _anc_token = await _get_installation_token(
+                _anc_project.github_owner, _anc_project.github_repo
+            )
+            if _anc_token:
+                _pr_data = await _get_pull_request(
+                    _anc_token,
+                    _anc_project.github_owner,
+                    _anc_project.github_repo,
+                    pr_number,
+                    project_id=str(task.project_id),
+                )
+                _merge_sha = (_pr_data or {}).get("merge_commit_sha")
+                if _merge_sha:
+                    _integration_branch = _shared_state.get_project_integration_branch(
+                        _anc_project
+                    )
+                    _is_anc = await _is_ancestor_of(
+                        _anc_token,
+                        _anc_project.github_owner,
+                        _anc_project.github_repo,
+                        _merge_sha,
+                        _integration_branch,
+                        project_id=str(task.project_id),
+                    )
+                    if _is_anc is not True:
+                        logger.info(
+                            "[REGRESSION-CASE] Skipping mark_merged for PR #%s "
+                            "project=%s: merge commit %s not confirmed ancestor of %s "
+                            "(result=%s — indeterminate treated as not landed)",
+                            pr_number,
+                            task.project_id,
+                            _merge_sha,
+                            _integration_branch,
+                            _is_anc,
+                        )
+                        return
+    except Exception as _exc_anc:
+        logger.warning(
+            "[REGRESSION-CASE] Ancestry check skipped for PR #%s project=%s: %s — proceeding",
+            pr_number,
+            task.project_id,
+            _exc_anc,
+        )
 
     case.mark_merged(
         pr_number,
@@ -1682,7 +1205,9 @@ async def _close_loop_regression_case_on_failure(
     if case is None:
         return
     try:
-        case.last_failure_class = classify_failure(task)
+        case.last_failure_class = classify_failure(
+            task, at_time=task.last_heartbeat or task.started_at
+        )
     except Exception as exc:
         logger.warning(
             "classify_failure raised while capturing last_failure_class for case %s: %s",
@@ -2074,23 +1599,19 @@ async def _process_post_commit(
                 and payload.artifact_type == ArtifactType.PULL_REQUEST
             ):
                 pr_number = int(payload.pr_url.rstrip("/").split("/")[-1])
-                short_id = str(task.id).replace("-", "")[:8]
-                branch = (
-                    f"blueprint/docs-{short_id}"
-                    if task_type == "docs"
-                    else f"blueprint/deps-{short_id}"
-                    if task_type == "deps"
-                    else f"blueprint/migrate-{short_id}"
-                    if task_type == "migrate"
-                    else f"blueprint/refactor-{short_id}"
-                    if task_type == "refactor"
-                    else f"blueprint/task-{short_id}"
+                _project = await session.get(Project, task.project_id)
+                branch = _derive_task_branch(
+                    task.id,
+                    task_type,
+                    _shared_state.get_project_task_branch_namespace(_project),
                 )
-                base_branch = task_payload.get("base_branch", "main")
+                base_branch = task_payload.get(
+                    "base_branch"
+                ) or _shared_state.get_project_integration_branch(_project)
                 original_prompt = task_payload.get("prompt", task.description or "")
-                is_intermediate = base_branch.startswith(
-                    "research/"
-                ) or base_branch.startswith("plan/")
+                is_intermediate = _project is not None and _project.is_staging_branch(
+                    base_branch
+                )
                 scope = (task.context or {}).get("scope", "unknown")
 
                 # Auto-approve trivially small main-branch diffs: skip review and route
@@ -2408,7 +1929,7 @@ async def _process_post_commit(
                                     project_id=str(task.project_id),
                                 )
                                 ms = (pr_detail.get("mergeable_state") or "").lower()
-                                if ms in ("blocked", "unstable"):
+                                if ms in ("blocked", "unstable", "clean"):
                                     am_result = await enable_auto_merge(
                                         gh_token,
                                         owner,
@@ -2424,6 +1945,11 @@ async def _process_post_commit(
                                         logger.info(
                                             f"[PIPELINE] Auto-merge enablement declined for PR #{pr_number}: {am_result.get('message')}"
                                         )
+                                    if ms == "clean":
+                                        # PR is clean/ready — transient API failure, not a real
+                                        # conflict. Skip recovery task spawn; let auto-merge
+                                        # fire when GitHub is ready.
+                                        recovery_type = None
                                 elif ms == "dirty":
                                     recovery_type = "fix"
                             except Exception as _am_exc:
@@ -2433,6 +1959,8 @@ async def _process_post_commit(
                             # Spawn the recovery task. For DIRTY conflicts on cluster
                             # sub-PRs we use `fix` (rebase + resolve); otherwise
                             # `review` (the existing default).
+                            # When recovery_type is None (clean state) no spawn fires —
+                            # auto-merge was re-enabled above and the task parks in CI-wait.
                             #
                             # Pass fix_reason="merge_conflict" so the fix-completion
                             # handler can route straight to security-scan + auto-merge
@@ -2442,49 +1970,24 @@ async def _process_post_commit(
                             # there's no review-worthy logic change to re-assess —
                             # rebase output is mechanical. This keeps the cost model
                             # symmetric with the no-conflict happy path.
-                            spawn_kwargs = {
-                                "original_prompt": original_prompt,
-                                "original_task_id": str(task.id),
-                            }
-                            if recovery_type == "fix":
-                                spawn_kwargs["fix_reason"] = "merge_conflict"
-                                spawn_kwargs["fix_prompt"] = (
-                                    f"PR #{pr_number} cannot merge into `{base_branch}` due to a merge conflict "
-                                    f"(GitHub mergeable_state='dirty'). The code review is already approved — "
-                                    f"focus only on resolving the conflict.\n\n"
-                                    f"After cloning:\n"
-                                    f"  1. Run `git fetch origin {base_branch} && git rebase origin/{base_branch}`.\n"
-                                    f"  2. Resolve every conflict marker — preserve the intent of both branches.\n"
-                                    f"  3. Re-run lint/type/test suites for the affected files.\n"
-                                    f"  4. Commit the resolution and force-push with `--force-with-lease`."
-                                )
-                            recovery_task, was_created = await _spawn_pipeline_task(
-                                task,
-                                recovery_type,
-                                session,
-                                pr_number,
-                                branch,
-                                base_branch,
-                                **spawn_kwargs,
-                            )
-                            if was_created:
+                            if recovery_type is None:
                                 logger.info(
-                                    f"[PIPELINE] Spawned {recovery_type} task {recovery_task.id} for PR #{pr_number} after auto-merge failure"
-                                )
-                            elif recovery_task is not None:
-                                logger.info(
-                                    f"[PIPELINE] Auto-merge failed for PR #{pr_number} — same-chain {recovery_task.first_payload.get('type')} task {recovery_task.id} ({recovery_task.status}) already handling it"
-                                )
-                            else:
-                                logger.warning(
-                                    f"[PIPELINE] Auto-merge failed and no {recovery_type} spawned for PR #{pr_number} (cap hit or guard) — parking in CI-wait"
+                                    f"[PIPELINE] Auto-merge failed for PR #{pr_number} (mergeable_state=clean) — re-enabled auto-merge, parking in CI-wait"
                                 )
                                 task.status = TaskStatus.EVALUATING
-                                task.latest_status_message = f"Auto-merge failed for PR #{pr_number} — parked for CI-wait retry"
+                                task.latest_status_message = f"Auto-merge failed for PR #{pr_number} (clean state) — parked for CI-wait retry"
+                                # Small/medium intermediate (and auto_approve_small) explicitly
+                                # skip review — no review task will ever set review_approved.
+                                # mergeable_state="clean" also implies CI is already green.
+                                # Pre-satisfy both gate flags so handle_ci_completion can merge
+                                # on the next signal instead of stranding the task on
+                                # _review_approved.
                                 task.context = {
                                     **(task.context or {}),
                                     "review_loop": {
                                         "ci_waiting": True,
+                                        "review_approved": True,
+                                        "ci_passed": True,
                                         "pr_number": pr_number,
                                         "branch": branch,
                                         "base_branch": base_branch,
@@ -2494,6 +1997,59 @@ async def _process_post_commit(
                                 }
                                 session.add(task)
                                 await session.commit()
+                            else:
+                                spawn_kwargs = {
+                                    "original_prompt": original_prompt,
+                                    "original_task_id": str(task.id),
+                                }
+                                if recovery_type == "fix":
+                                    spawn_kwargs["fix_reason"] = "merge_conflict"
+                                    spawn_kwargs["fix_prompt"] = (
+                                        f"PR #{pr_number} cannot merge into `{base_branch}` due to a merge conflict "
+                                        f"(GitHub mergeable_state='dirty'). The code review is already approved — "
+                                        f"focus only on resolving the conflict.\n\n"
+                                        f"After cloning:\n"
+                                        f"  1. Run `git fetch origin {base_branch} && git rebase origin/{base_branch}`.\n"
+                                        f"  2. Resolve every conflict marker — preserve the intent of both branches.\n"
+                                        f"  3. Re-run lint/type/test suites for the affected files.\n"
+                                        f"  4. Commit the resolution and force-push with `--force-with-lease`."
+                                    )
+                                recovery_task, was_created = await _spawn_pipeline_task(
+                                    task,
+                                    recovery_type,
+                                    session,
+                                    pr_number,
+                                    branch,
+                                    base_branch,
+                                    **spawn_kwargs,
+                                )
+                                if was_created:
+                                    logger.info(
+                                        f"[PIPELINE] Spawned {recovery_type} task {recovery_task.id} for PR #{pr_number} after auto-merge failure"
+                                    )
+                                elif recovery_task is not None:
+                                    logger.info(
+                                        f"[PIPELINE] Auto-merge failed for PR #{pr_number} — same-chain {recovery_task.first_payload.get('type')} task {recovery_task.id} ({recovery_task.status}) already handling it"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"[PIPELINE] Auto-merge failed and no {recovery_type} spawned for PR #{pr_number} (cap hit or guard) — parking in CI-wait"
+                                    )
+                                    task.status = TaskStatus.EVALUATING
+                                    task.latest_status_message = f"Auto-merge failed for PR #{pr_number} — parked for CI-wait retry"
+                                    task.context = {
+                                        **(task.context or {}),
+                                        "review_loop": {
+                                            "ci_waiting": True,
+                                            "pr_number": pr_number,
+                                            "branch": branch,
+                                            "base_branch": base_branch,
+                                            "original_task_id": str(task.id),
+                                            "ci_wait_started": _utcnow().isoformat(),
+                                        },
+                                    }
+                                    session.add(task)
+                                    await session.commit()
                     except Exception as e:
                         logger.error(
                             f"[PIPELINE] Auto-merge error for PR #{pr_number}: {e}",
@@ -2635,34 +2191,18 @@ async def _process_post_commit(
 
                     # PR file-path flagging: flag infrastructure/security-critical file changes
                     # Don't block here — let review run, block at merge time.
-                    # Gated by require_approval_gates — these paths are hardcoded for the
-                    # Blueprint repo and irrelevant for other projects.
+                    # Gated by require_approval_gates — uses project config if available,
+                    # falls back to Blueprint defaults for self-repo.
                     if _runtime_config.get("require_approval_gates", True):
                         try:
                             pr_files = await get_pr_files(
                                 gh_token, owner, repo, pr_number
                             )
-                            INFRA_FILES = {
-                                "backend/app/main.py",
-                                "backend/app/compute.py",
-                                "backend/app/models.py",
-                                "backend/app/database.py",
-                                "backend/app/security.py",
-                                "backend/app/auth.py",
-                                "agent/src/index.ts",
-                                "CLAUDE.md",
-                                # Phase 4 trusted core — also in CRITICAL_FILES.
-                                "backend/promotion_policy.yaml",
-                            }
-                            CRITICAL_FILES = {
-                                "backend/app/security.py",
-                                "backend/app/auth.py",
-                                "CLAUDE.md",
-                                # The release-qualifier promotion rubric — the
-                                # human-owned trusted core. Autonomous changes to
-                                # it must be human-approved before merge.
-                                "backend/promotion_policy.yaml",
-                            }
+                            # Fetch project to get approval gate config
+                            project = await session.get(Project, task.project_id)
+                            INFRA_FILES, CRITICAL_FILES = _get_approval_gate_file_lists(
+                                project
+                            )
                             touched_infra = [
                                 f["filename"]
                                 for f in pr_files
@@ -2729,8 +2269,11 @@ async def _process_post_commit(
                     "pr_number"
                 )
                 branch = review_loop.get("branch") or task_payload.get("branch")
-                base_branch = review_loop.get("base_branch") or task_payload.get(
-                    "base_branch", "main"
+                _review_project = await session.get(Project, task.project_id)
+                base_branch = (
+                    review_loop.get("base_branch")
+                    or task_payload.get("base_branch")
+                    or _shared_state.get_project_integration_branch(_review_project)
                 )
                 original_task_id = review_loop.get(
                     "original_task_id", ""
@@ -2788,6 +2331,7 @@ async def _process_post_commit(
 
                 verdict_parsed = False
                 verdict_unparseable = False
+                review_was_parallelized = False
 
                 # Method 1: verdict_json field (from /tmp/verdict.json on the agent)
                 if payload.verdict_json:
@@ -2808,6 +2352,9 @@ async def _process_post_commit(
                                     for p in raw_investigated
                                     if isinstance(p, str) and p
                                 ][:25]
+                            review_was_parallelized = bool(
+                                vj.get("review_was_parallelized", False)
+                            )
                             verdict_parsed = True
                             logger.info(
                                 f"[REVIEW PIPELINE] Verdict from verdict_json field: {verdict}"
@@ -3055,6 +2602,7 @@ async def _process_post_commit(
                 task.context = {
                     **(task.context or {}),
                     "blueprint_review_verdict": verdict,
+                    "review_was_parallelized": review_was_parallelized,
                 }
                 session.add(task)
 
@@ -3242,12 +2790,20 @@ async def _process_post_commit(
                         # post-cutover it is the promotion / hotfix-rollup
                         # target, and a merge to main must never bypass CI.
                         head_sha = pr_data.get("head", {}).get("sha", "")
-                        _integration_branch = _runtime_config.get(
-                            "integration_branch", "main"
+                        project = (
+                            await session.get(Project, task.project_id)
+                            if task.project_id
+                            else None
+                        )
+                        _integration_branch = (
+                            _shared_state.get_project_integration_branch(project)
+                        )
+                        _promotion_target = _shared_state.get_project_promotion_target(
+                            project
                         )
                         is_ci_gated_merge = base_branch in (
                             _integration_branch,
-                            "main",
+                            _promotion_target,
                         )
                         ci_status = (
                             await get_check_runs_cached(
@@ -3486,6 +3042,14 @@ async def _process_post_commit(
                                             **(orig.context or {}),
                                             "pr_merged": True,
                                         }
+                                        _orig_project = await session.get(
+                                            Project, orig.project_id
+                                        )
+                                        _orig_promotion_target = (
+                                            _shared_state.get_project_promotion_target(
+                                                _orig_project
+                                            )
+                                        )
                                         # If this was a rollup PR review, mark the parent as COMPLETED
                                         is_rollup_merge = (
                                             orig.status == TaskStatus.EVALUATING
@@ -3575,7 +3139,7 @@ async def _process_post_commit(
                                         # Extract review feedback as persistent playbook entries
                                         # on every merge (captures first-attempt data at any iteration)
                                         try:
-                                            from app.playbook_learning import (
+                                            from app.review_learning import (
                                                 extract_review_feedback_to_playbook,
                                             )
 
@@ -3606,18 +3170,19 @@ async def _process_post_commit(
                                         await session.commit()
                                         # Clean up branches (staging + feature)
                                         await _cleanup_branches(orig, session)
-                                        # Spawn a smoketest after rollup merges to main.
-                                        # After Phase 1 (automain/LTS), normal rollups target
-                                        # `automain`; only promotion PRs (automain → main) still
-                                        # merge to `main`. So base_branch == "main" here means a
-                                        # PROMOTION just landed — this smoketest acts as a
-                                        # post-promotion production health-check, not a routine
-                                        # integration check.
+                                        # Spawn a smoketest after rollup merges to the
+                                        # promotion target. After Phase 1 (automain/LTS),
+                                        # normal rollups target `automain`; only promotion
+                                        # PRs (automain → promotion_target) still merge to
+                                        # the promotion branch. So base_branch ==
+                                        # promotion_target here means a PROMOTION just
+                                        # landed — this smoketest acts as a post-promotion
+                                        # production health-check, not a routine check.
                                         # Supported runtime_config keys for smoketest:
                                         #   health_check_urls: list[str] — live URLs to probe with HTTP GET after local tests
                                         if (
                                             is_rollup_merge
-                                            and base_branch == "main"
+                                            and base_branch == _orig_promotion_target
                                             and _runtime_config.get("smoketest_enabled")
                                         ):
                                             try:
@@ -3703,15 +3268,16 @@ async def _process_post_commit(
                                                     f"[SMOKETEST] Failed to spawn smoketest after rollup merge: {e}",
                                                     exc_info=True,
                                                 )
-                                        # Back-merge: when a HOTFIX merges to main, open a
-                                        # main -> automain PR so the branches don't diverge.
-                                        # A hotfix is a `plan` task with base_branch="main" and
-                                        # hotfix:true in its payload.  A missed back-merge makes
-                                        # the next automain -> main promotion conflict.
-                                        # (automain/LTS plan Phase 5)
+                                        # Back-merge: when a HOTFIX merges to the
+                                        # promotion target, open a promotion_target ->
+                                        # integration_branch PR so branches don't diverge.
+                                        # A hotfix is a `plan` task with
+                                        # base_branch=promotion_target and hotfix:true.
+                                        # A missed back-merge makes the next promotion
+                                        # conflict. (automain/LTS plan Phase 5)
                                         if (
                                             is_rollup_merge
-                                            and base_branch == "main"
+                                            and base_branch == _orig_promotion_target
                                             and bool(orig.first_payload.get("hotfix"))
                                         ):
                                             try:
@@ -4362,7 +3928,7 @@ async def _process_post_commit(
                     # (accumulated superset used by all-iterations catch-rate metric).
                     if issues and original_task_id:
                         try:
-                            from app.playbook_learning import (
+                            from app.review_learning import (
                                 cache_first_attempt_classification,
                                 _keyword_from_flat,
                             )
@@ -4440,8 +4006,11 @@ async def _process_post_commit(
                     "pr_number"
                 )
                 branch = review_loop.get("branch") or task_payload.get("branch")
-                base_branch = review_loop.get("base_branch") or task_payload.get(
-                    "base_branch", "main"
+                _fix_project = await session.get(Project, task.project_id)
+                base_branch = (
+                    review_loop.get("base_branch")
+                    or task_payload.get("base_branch")
+                    or _shared_state.get_project_integration_branch(_fix_project)
                 )
                 original_task_id = review_loop.get(
                     "original_task_id", ""
@@ -4768,7 +4337,9 @@ async def _process_post_commit(
                     from app.failure_classification import persist_failure_category
                     from app.routers.agent_status import record_task_result
 
-                    _fc_handler = classify_failure(task)
+                    _fc_handler = classify_failure(
+                        task, at_time=task.last_heartbeat or task.started_at
+                    )
                     persist_failure_category(task, _fc_handler)
                     record_task_result(
                         success=False,

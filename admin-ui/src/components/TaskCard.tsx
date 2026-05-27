@@ -1,6 +1,6 @@
 /* eslint-disable react-refresh/only-export-components */
 import React, { useState, useEffect, useRef, memo, forwardRef } from 'react';
-import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers, Gauge, Compass, FileText } from 'lucide-react';
+import { CheckCircle, AlertTriangle, Clock, Hash, Activity, ExternalLink, Terminal, RotateCcw, Pencil, X, XCircle, RefreshCw, ChevronRight, ChevronDown, ChevronUp, Search, GitFork, Microscope, Shield, Archive, BookOpen, ShieldAlert, TestTube, Package, ArrowUpDown, Wrench, MoreHorizontal, Radio, Layers, Gauge, Compass, FileText, Copy, Check } from 'lucide-react';
 import { formatDurationMs, parseTimestamp } from '../utils/time';
 import { authGet, API_BASE_URL } from '../api';
 import { EXIT_REASON_COLORS } from '../utils/fixLoopColors';
@@ -429,6 +429,7 @@ interface TaskCardProps {
   onOpenSelfReview?: () => void;
   onTrack?: (task: Task) => void;
   isTracked?: boolean;
+  onDuplicate?: (task: Task) => void;
   blockingCount?: number;
   searchQuery?: string;
   onDirectionClick?: (directionId: string) => void;
@@ -573,6 +574,31 @@ export function StatusBadge({ status }: { status: TaskStatus }) {
   );
 }
 
+function ErrorLogsBlock({ errorLogs }: { errorLogs: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = () => {
+    navigator.clipboard.writeText(errorLogs);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
+
+  return (
+    <div className="bg-red-950/30 text-red-400 text-[11px] p-2 rounded mb-2 border border-red-900/30 font-mono max-h-20 overflow-y-auto relative group">
+      {/* eslint-disable-next-line viewport/min-touch-target -- dense toolbar */}
+      <button
+        onClick={(e) => { e.stopPropagation(); handleCopy(); }}
+        className="absolute top-2 right-2 p-1 rounded opacity-0 group-hover:opacity-100 transition-opacity bg-neutral-900/80 hover:bg-neutral-800 text-neutral-400 hover:text-emerald-400"
+        title="Copy full error logs"
+      >
+        {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+      </button>
+      <span className="font-semibold block mb-1 text-red-500 font-sans">Error:</span>
+      {errorLogs.slice(0, 500)}
+    </div>
+  );
+}
+
 function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   const subtasks = planOutput.subtasks as Record<string, unknown>[] | undefined;
   if (!subtasks) return null;
@@ -588,7 +614,7 @@ function PlanPreview({ planOutput }: { planOutput: Record<string, unknown> }) {
   );
 }
 
-export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, actionLoading, compact, blockingCount, selectionMode, onToggleTaskSelection, onCtrlClick, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onOpenSelfReview, onTrack, isTracked, searchQuery, onDirectionClick }, ref) {
+export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function TaskCard({ task, actionLoading, compact, blockingCount, selectionMode, onToggleTaskSelection, onCtrlClick, colIdx, cardIdx, onNavigate, onApprove, onRequestChanges, onCancel, onRetry, onEditPrompt, onDismiss, onArchive, onViewLogs, onOpenSelfReview, onTrack, isTracked, onDuplicate, searchQuery, onDirectionClick }, ref) {
   const [editing, setEditing] = useState(false);
   const [editPrompt, setEditPrompt] = useState(task.description || '');
   const [descExpanded, setDescExpanded] = useState(false);
@@ -748,6 +774,17 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
   const borderColor = task.task_type ? (taskTypeBorderColor[task.task_type] ?? 'border-l-neutral-700') : 'border-l-neutral-700';
 
   const directionId = (task.context as Record<string, unknown> | undefined)?.direction_id as string | undefined;
+  const directionTitle = (task.context as Record<string, unknown> | undefined)?.direction_title as string | undefined;
+
+  // Truncate direction_title to ~24 chars with ellipsis, fallback to direction_id
+  const directionLabel = directionTitle
+    ? (directionTitle.length > 24 ? `${directionTitle.slice(0, 24)}…` : directionTitle)
+    : ((directionId?.length ?? 0) > 10 ? `${directionId?.slice(0, 10)}…` : directionId);
+
+  // Tooltip: show full title and id when title exists, otherwise just id
+  const directionTooltip = directionTitle && directionId
+    ? `Direction: ${directionTitle}\n\nID: ${directionId}`
+    : `Direction: ${directionId}`;
 
   return (
     <div
@@ -811,6 +848,15 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 <Archive className="w-3.5 h-3.5" />
               </button>
             )}
+            {onDuplicate && (
+              <button
+                title="Duplicate task"
+                onClick={(e) => { e.stopPropagation(); onDuplicate(task); }}
+                className="sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100 transition-colors min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto"
+              >
+                <Copy className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
           <StatusBadge status={task.status} />
           {isActive && task.last_heartbeat && (
@@ -845,19 +891,19 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             <button
               type="button"
               onClick={(e) => { e.stopPropagation(); onDirectionClick(directionId); }}
-              className="inline-flex items-center gap-0.5 text-[10px] text-neutral-500 font-mono hover:text-neutral-200 hover:bg-neutral-800 rounded px-1 -mx-1 transition-colors cursor-pointer min-h-[44px] sm:min-h-auto"
-              title={`Filter by direction: ${directionId}`}
+              className="inline-flex items-center gap-0.5 text-[10px] text-neutral-500 hover:text-neutral-200 hover:bg-neutral-800 rounded px-1 -mx-1 transition-colors cursor-pointer min-h-[44px] sm:min-h-auto"
+              title={directionTooltip}
             >
               <Compass className="w-3 h-3" />
-              {directionId.length > 10 ? `${directionId.slice(0, 10)}…` : directionId}
+              {directionLabel}
             </button>
           ) : (
             <span
-              className="inline-flex items-center gap-0.5 text-[10px] text-neutral-500 font-mono"
-              title={`Direction: ${directionId}`}
+              className="inline-flex items-center gap-0.5 text-[10px] text-neutral-500"
+              title={directionTooltip}
             >
               <Compass className="w-3 h-3" />
-              {directionId.length > 10 ? `${directionId.slice(0, 10)}…` : directionId}
+              {directionLabel}
             </span>
           )
         )}
@@ -948,12 +994,15 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
 
       {task.status === 'FAILED' && task.failure_class && FAILURE_CLASS_CONFIG[task.failure_class] ? (
         <div className="mb-2">
-          <span
-            className={`inline-block text-[10px] px-1.5 py-0.5 rounded font-semibold ${FAILURE_CLASS_CONFIG[task.failure_class].color}`}
+          <button
+            type="button"
+            data-viewport-allow-small-target
+            onClick={(e) => { e.stopPropagation(); window.dispatchEvent(new CustomEvent('blueprint:failure-class-filter', { detail: task.failure_class })); }}
+            className={`inline-flex items-center text-[10px] px-1.5 py-0.5 rounded font-semibold hover:opacity-80 transition-opacity ${FAILURE_CLASS_CONFIG[task.failure_class].color}`}
             title={FAILURE_CLASS_CONFIG[task.failure_class].hint}
           >
             {FAILURE_CLASS_CONFIG[task.failure_class].label}
-          </span>
+          </button>
           <p className="text-[10px] text-neutral-500 mt-0.5">{FAILURE_CLASS_CONFIG[task.failure_class].suggestion}</p>
           {(() => {
             const retryAfter = task.context?.retry_after as string | undefined;
@@ -970,10 +1019,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
       ) : null}
 
       {task.status === 'FAILED' && task.error_logs ? (
-        <div className="bg-red-950/30 text-red-400 text-[11px] p-2 rounded mb-2 border border-red-900/30 font-mono max-h-20 overflow-y-auto">
-          <span className="font-semibold block mb-1 text-red-500 font-sans">Error:</span>
-          {task.error_logs.slice(0, 500)}
-        </div>
+        <ErrorLogsBlock errorLogs={task.error_logs} />
       ) : null}
 
       {task.research_findings ? (

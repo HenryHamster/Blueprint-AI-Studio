@@ -9,12 +9,21 @@ import json
 import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import func, update
+from sqlalchemy import func, update, case
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 
 from app.database import get_session
-from app.shared_state import limiter
+from app.shared_state import (
+    derive_task_branch as _derive_task_branch,
+    backfill_branch_columns,
+    get_project_integration_branch,
+    get_project_pr_title_prefix as _get_project_pr_title_prefix,
+    get_project_promotion_target as _get_project_promotion_target_for_task,
+    get_project_task_branch_namespace,
+    limiter,
+    resolve_task_branch as _resolve_task_branch,
+)
 from app.models import (
     Task,
     TaskStatus,
@@ -353,8 +362,21 @@ async def get_all_tasks(
     if task_ids:
         artifact_stmt = (
             select(Artifact)
+            .options(
+                load_only(
+                    Artifact.id,
+                    Artifact.task_id,
+                    Artifact.artifact_type,
+                    Artifact.pr_url,
+                    Artifact.commit_hash,
+                    Artifact.repo_url,
+                    Artifact.iteration,
+                    Artifact.created_at,
+                )
+            )
             .where(Artifact.task_id.in_(task_ids))
             .order_by(Artifact.created_at.asc())
+            .limit(len(task_ids) * 20)
         )
         artifacts = (await session.execute(artifact_stmt)).scalars().all()
         for a in artifacts:
@@ -373,43 +395,70 @@ async def get_all_tasks(
             )
             if a.artifact_type == ArtifactType.PULL_REQUEST and a.pr_url:
                 pr_map[tid] = a.pr_url
+            if a.artifact_type == ArtifactType.GIT_COMMIT and a.commit_hash:
+                commit_map[tid] = {"commit_hash": a.commit_hash, "repo_url": a.repo_url}
+
+        # Fetch logs columns separately to avoid loading large blobs in the main query
+        logs_stmt = (
+            select(Artifact)
+            .options(load_only(Artifact.task_id, Artifact.artifact_type, Artifact.logs))
+            .where(
+                Artifact.task_id.in_(task_ids),
+                Artifact.artifact_type.in_(
+                    [ArtifactType.ERROR_LOG, ArtifactType.RESEARCH_FINDINGS]
+                ),
+            )
+        )
+        logs_artifacts = (await session.execute(logs_stmt)).scalars().all()
+        for a in logs_artifacts:
+            tid = str(a.task_id)
             if a.artifact_type == ArtifactType.ERROR_LOG and a.logs:
                 logs_map[tid] = a.logs[:2000]
             if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
                 try:
-                    parsed = json.loads(a.logs[:100000])
+                    parsed = await asyncio.to_thread(json.loads, a.logs[:100000])
                     if isinstance(parsed, list):
-                        research_map[str(a.task_id)] = parsed
+                        research_map[tid] = parsed
                     elif isinstance(parsed, dict):
                         logs = parsed.get("logs", [])
                         if isinstance(logs, list):
-                            research_map[str(a.task_id)] = logs
+                            research_map[tid] = logs
                 except (json.JSONDecodeError, AttributeError):
                     pass
-            if a.artifact_type == ArtifactType.GIT_COMMIT and a.commit_hash:
-                commit_map[tid] = {"commit_hash": a.commit_hash, "repo_url": a.repo_url}
 
-    # Fetch task history (last 10 entries per task)
+    # Fetch task history (last 10 entries per task). A per-task ROW_NUMBER()
+    # window keeps each task's 10 most-recent rows, so a single high-activity
+    # task can't exhaust a global budget and starve other tasks of history.
     history_map: Dict[str, List[Dict[str, Any]]] = {}
     if task_ids:
-        history_stmt = (
-            select(TaskHistory)
-            .where(TaskHistory.task_id.in_(task_ids))
-            .order_by(TaskHistory.timestamp.desc())
+        row_number = (
+            func.row_number()
+            .over(
+                partition_by=TaskHistory.task_id,
+                order_by=TaskHistory.timestamp.desc(),
+            )
+            .label("rn")
         )
-        all_history = (await session.execute(history_stmt)).scalars().all()
+        ranked = (
+            select(TaskHistory, row_number)
+            .where(TaskHistory.task_id.in_(task_ids))
+            .subquery()
+        )
+        history_stmt = (
+            select(ranked).where(ranked.c.rn <= 10).order_by(ranked.c.timestamp.desc())
+        )
+        all_history = (await session.execute(history_stmt)).all()
         for h in all_history:
             tid = str(h.task_id)
             if tid not in history_map:
                 history_map[tid] = []
-            if len(history_map[tid]) < 10:
-                history_map[tid].append(
-                    {
-                        "timestamp": h.timestamp.isoformat() if h.timestamp else None,
-                        "action": h.action,
-                        "details": h.details,
-                    }
-                )
+            history_map[tid].append(
+                {
+                    "timestamp": h.timestamp.isoformat() if h.timestamp else None,
+                    "action": h.action,
+                    "details": h.details,
+                }
+            )
 
     # Build parent→children map from the fetched result set (no extra DB query)
     children_map: Dict[str, List[str]] = {}
@@ -477,28 +526,26 @@ async def get_all_tasks(
         }
         result_list.append(task_dict)
 
-    # Global counts (not affected by pagination/filters)
-    active_count = (
+    # Global counts (not affected by pagination/filters) — single query via CASE/WHEN
+    _counts_row = (
         await session.execute(
-            select(func.count())
-            .select_from(Task)
-            .where(Task.status.in_([TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]))
+            select(
+                func.count(
+                    case(
+                        (
+                            Task.status.in_(
+                                [TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING]
+                            ),
+                            1,
+                        )
+                    )
+                ),
+                func.count(case((Task.status == TaskStatus.EVALUATING, 1))),
+                func.count(case((Task.status == TaskStatus.QUEUED, 1))),
+            ).select_from(Task)
         )
-    ).scalar() or 0
-    evaluating_count = (
-        await session.execute(
-            select(func.count())
-            .select_from(Task)
-            .where(Task.status == TaskStatus.EVALUATING)
-        )
-    ).scalar() or 0
-    queued_count = (
-        await session.execute(
-            select(func.count())
-            .select_from(Task)
-            .where(Task.status == TaskStatus.QUEUED)
-        )
-    ).scalar() or 0
+    ).one()
+    active_count, evaluating_count, queued_count = _counts_row
 
     return {
         "tasks": result_list,
@@ -811,6 +858,7 @@ async def bulk_action_tasks(
                             from app.routers.agent import get_github_token_for_task
                             from app.shared_state import (
                                 runtime_config as _runtime_config,
+                                get_project_promotion_target as _get_project_promotion_target,
                             )
                             from app.rollup_management import _cleanup_branches
                             from app.github import merge_pull_request, create_pr_comment
@@ -838,11 +886,16 @@ async def bulk_action_tasks(
                                 session.add(task)
                                 await session.commit()
                                 await _cleanup_branches(task, session)
+                                _project = await session.get(Project, task.project_id)
                                 base_branch = (task.first_payload).get(
-                                    "base_branch", "main"
+                                    "base_branch"
+                                ) or get_project_integration_branch(_project)
+                                _promotion_target = _get_project_promotion_target(
+                                    _project
                                 )
-                                if base_branch == "main" and _runtime_config.get(
-                                    "smoketest_enabled"
+                                if (
+                                    base_branch == _promotion_target
+                                    and _runtime_config.get("smoketest_enabled")
                                 ):
                                     try:
                                         type_model = (
@@ -955,7 +1008,10 @@ async def bulk_action_tasks(
                             pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
                             task_payload = task.first_payload
                             branch = _resolve_task_branch(task)
-                            base_branch = task_payload.get("base_branch", "main")
+                            _project = await session.get(Project, task.project_id)
+                            base_branch = task_payload.get(
+                                "base_branch"
+                            ) or get_project_integration_branch(_project)
 
                             if ctx.get("touched_critical"):
                                 try:
@@ -1092,9 +1148,7 @@ async def bulk_action_tasks(
                 # c56fa118 / PR #5983 incident (2026-05-26).
                 from app.task_lifecycle import close_orphan_pr_if_any
 
-                await close_orphan_pr_if_any(
-                    task, session, reason="admin_bulk_cancel"
-                )
+                await close_orphan_pr_if_any(task, session, reason="admin_bulk_cancel")
 
                 # Suppress low-priority tasks with finding_hash for 180 days
                 if task.context and task.context.get("finding_hash"):
@@ -1218,7 +1272,9 @@ async def get_task(
     except ValueError:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    task = await _get_user_task(tid, current_user["user_id"], session)
+    task = await _get_user_task_with_role(
+        tid, current_user["user_id"], session, "member"
+    )
 
     # Fetch all artifacts for this task (all types, not just last per type)
     artifact_stmt = (
@@ -1322,6 +1378,7 @@ async def get_task(
         "history": history,
         "child_task_ids": child_task_ids,
         "estimated_cost_usd": _estimated_cost_usd(task),
+        "api_call_summary": task.api_call_summary,
     }
 
 
@@ -1352,7 +1409,9 @@ async def get_task_serial_console(
     except ValueError:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    task = await _get_user_task(tid, current_user["user_id"], session)
+    task = await _get_user_task_with_role(
+        tid, current_user["user_id"], session, "member"
+    )
 
     # 404 if task has no VM
     if not task.vm_instance_id:
@@ -1395,12 +1454,78 @@ async def get_task_serial_console(
     }
 
 
+@router.get("/tasks/{task_id}/pr-files")
+async def get_task_pr_files(
+    task_id: str,
+    include_patch: bool = Query(False),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return changed-file summary for a task's PR.
+
+    Fetches the PR's file list from GitHub on demand (not cached). Returns
+    {files, pr_number} on success, or {files: null, reason: "no_pr"} when the
+    task has no PR artifact. Set include_patch=true to include the unified diff
+    text for each file (subject to GitHub's 5 MB / 3000-line patch cap).
+    """
+    try:
+        tid = uuid.UUID(task_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # Require at least member role; non-members get 404, viewers get 403.
+    # include_patch exposes raw diff via the installation token — restrict to owners.
+    if include_patch:
+        task = await _get_user_task_with_role(
+            tid, current_user["user_id"], session, min_role="owner"
+        )
+    else:
+        task = await _get_user_task_with_role(
+            tid, current_user["user_id"], session, min_role="member"
+        )
+
+    # Find the PR artifact
+    artifact_result = await session.execute(
+        select(Artifact).where(
+            Artifact.task_id == task.id,
+            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+        )
+    )
+    artifact = artifact_result.scalars().first()
+
+    if not artifact or not artifact.pr_url:
+        return {"files": None, "pr_number": None, "reason": "no_pr"}
+
+    pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
+
+    from app.routers.agent import get_github_token_for_task
+    from app.github import get_pr_files
+
+    try:
+        gh_token, owner, repo = await get_github_token_for_task(task.id, session)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"[ADMIN] Failed to get GitHub token for task {task_id}: {exc}")
+        raise HTTPException(status_code=502, detail="Failed to obtain GitHub token")
+
+    files = await get_pr_files(
+        gh_token,
+        owner,
+        repo,
+        pr_number,
+        project_id=str(task.project_id),
+        include_patch=include_patch,
+    )
+    return {"files": files, "pr_number": pr_number}
+
+
 class CreateTaskPayload(BaseModel):
     github_repo: str = Field(..., pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
     title: str = Field(..., min_length=1, max_length=200)
     prompt: str = Field(..., min_length=1, max_length=50000)
-    base_branch: str = Field(
-        default="main", max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
+    base_branch: str | None = Field(
+        default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
     )
     task_type: TaskType = Field(default=TaskType.create)
     pr_number: int | None = None
@@ -1499,14 +1624,21 @@ async def create_task_manually(
         )
         await session.commit()
 
+    await backfill_branch_columns(session, project_id=project.id)
+
     # Auto-generate VM instance ID so orchestrator worker picks up the task
     vm_name = f"agent-vm-{uuid.uuid4().hex}"
+
+    # Resolve base_branch: explicit client value takes precedence; omitted → project promotion_target
+    resolved_base_branch = (
+        payload.base_branch or _get_project_promotion_target_for_task(project)
+    )
 
     # Build payload based on task type
     task_payload = {
         "type": payload.task_type,
         "prompt": payload.prompt,
-        "base_branch": payload.base_branch,
+        "base_branch": resolved_base_branch,
     }
     if payload.model is not None:
         task_payload["model"] = payload.model
@@ -1599,7 +1731,7 @@ async def create_task_manually(
             "created_by": "USER",
             "method": "admin_launcher",
             "github_repo": payload.github_repo,
-            "base_branch": payload.base_branch,
+            "base_branch": resolved_base_branch,
         },
     )
     session.add(history)
@@ -1652,7 +1784,10 @@ async def request_changes(
     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
     task_payload = task.first_payload
     branch = _resolve_task_branch(task)
-    base_branch = task_payload.get("base_branch", "main")
+    _project = await session.get(Project, task.project_id)
+    base_branch = task_payload.get("base_branch") or get_project_integration_branch(
+        _project
+    )
 
     from app.review_pipeline import REVIEW_FIX_GOAL_PREAMBLE, _spawn_pipeline_task
 
@@ -1701,8 +1836,6 @@ _FRESH_REVIEWER_COOLDOWN_SECS = 3600  # 1 hour
 # Branch derivation moved to app.shared_state.derive_task_branch so callers
 # outside admin (rollup_management, task_lifecycle) can share the same map
 # without circular imports.
-from app.shared_state import derive_task_branch as _derive_task_branch
-from app.shared_state import resolve_task_branch as _resolve_task_branch
 
 
 @router.post("/tasks/{task_id}/request-fresh-reviewer")
@@ -1748,12 +1881,19 @@ async def request_fresh_reviewer(
     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
     task_payload = task.first_payload
     review_loop = ctx.get("review_loop") or {}
+    _project = await session.get(Project, task.project_id)
     branch = (
         review_loop.get("branch")
         or task_payload.get("branch")
-        or _derive_task_branch(task_id, task_payload.get("type"))
+        or _derive_task_branch(
+            task_id,
+            task_payload.get("type"),
+            get_project_task_branch_namespace(_project),
+        )
     )
-    base_branch = task_payload.get("base_branch", "main")
+    base_branch = task_payload.get("base_branch") or get_project_integration_branch(
+        _project
+    )
     related_files = task_payload.get("related_files") or ctx.get("related_files") or []
 
     reviewer_task = Task(
@@ -2136,7 +2276,10 @@ async def modify_task(
                 # Rollup PR approval: merge the rollup PR directly
                 try:
                     from app.routers.agent import get_github_token_for_task
-                    from app.shared_state import runtime_config as _runtime_config
+                    from app.shared_state import (
+                        runtime_config as _runtime_config,
+                        get_project_promotion_target as _get_project_promotion_target,
+                    )
                     from app.rollup_management import _cleanup_branches
                     from app.github import merge_pull_request, create_pr_comment
 
@@ -2167,8 +2310,12 @@ async def modify_task(
                         await session.commit()
                         # Post-merge cleanup: branches + smoketest (mirrors webhook merge path)
                         await _cleanup_branches(task, session)
-                        base_branch = (task.first_payload).get("base_branch", "main")
-                        if base_branch == "main" and _runtime_config.get(
+                        _project = await session.get(Project, task.project_id)
+                        base_branch = (task.first_payload).get(
+                            "base_branch"
+                        ) or get_project_integration_branch(_project)
+                        _promotion_target = _get_project_promotion_target(_project)
+                        if base_branch == _promotion_target and _runtime_config.get(
                             "smoketest_enabled"
                         ):
                             try:
@@ -2281,7 +2428,10 @@ async def modify_task(
                     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
                     task_payload = task.first_payload
                     branch = _resolve_task_branch(task)
-                    base_branch = task_payload.get("base_branch", "main")
+                    _project = await session.get(Project, task.project_id)
+                    base_branch = task_payload.get(
+                        "base_branch"
+                    ) or get_project_integration_branch(_project)
 
                     if ctx.get("touched_critical"):
                         # Critical file approval: review already passed, merge the PR
@@ -2464,6 +2614,8 @@ async def modify_task(
             # Cycle detection: walk depends_on graph from each dep to see if we reach task.id
             task_id_str = str(task.id)
 
+            task_cache: dict[str, Task | None] = {}
+
             async def _has_path_to(
                 start_id: str, target_id: str, visited: set, depth: int = 0
             ) -> bool:
@@ -2474,7 +2626,9 @@ async def modify_task(
                 if start_id in visited:
                     return False
                 visited.add(start_id)
-                dep_task = await session.get(Task, uuid.UUID(start_id))
+                if start_id not in task_cache:
+                    task_cache[start_id] = await session.get(Task, uuid.UUID(start_id))
+                dep_task = task_cache[start_id]
                 if not dep_task:
                     return False
                 for d in dep_task.depends_on or []:
@@ -2575,11 +2729,9 @@ async def trigger_self_audit(
         project_id, current_user["user_id"], session, "member"
     )
 
-    from app.shared_state import runtime_config as _runtime_config
-
     payload_dict: dict = {
         "type": "self_audit",
-        "base_branch": _runtime_config.get("integration_branch", "main"),
+        "base_branch": get_project_integration_branch(project),
     }
     if body is not None:
         if body.focus_systems is not None:
@@ -2721,7 +2873,9 @@ async def trigger_rollup(
 
     from app.rollup_management import _build_rollup_pr_body
 
-    pr_title = f"[Blueprint] Rollup: {task.title}"
+    _project = await session.get(Project, task.project_id)
+    _prefix = _get_project_pr_title_prefix(_project)
+    pr_title = f"{_prefix}Rollup: {task.title}"
     _dir_id = task.first_payload.get("current_direction_id") or ctx.get("direction_id")
     _dir_title = ctx.get("direction_title") or task.title
     pr_body = _build_rollup_pr_body(
@@ -2744,9 +2898,9 @@ async def trigger_rollup(
     rollup_pr_url = pr_result.get("html_url", "")
     rollup_pr_number = pr_result.get("number")
 
-    is_target_intermediate = target_branch.startswith(
-        "research/"
-    ) or target_branch.startswith("plan/")
+    is_target_intermediate = _project is not None and _project.is_staging_branch(
+        target_branch
+    )
 
     if is_target_intermediate:
         merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)

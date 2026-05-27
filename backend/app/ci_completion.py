@@ -30,6 +30,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import Task, TaskStatus, _utcnow
+from app.vm_cost_rates import get_vm_rate_per_second
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +153,7 @@ async def _post_merge_summary(
     _prov_at = getattr(task, "vm_provisioned_at", None)
     _stop_at = getattr(task, "vm_stopped_at", None)
     if _prov_at and _stop_at:
-        _rate = (0.020 if getattr(task, "vm_spot", False) else 0.067) / 3600
+        _rate = get_vm_rate_per_second(spot=getattr(task, "vm_spot", False))
         cost_usd = (_stop_at - _prov_at).total_seconds() * _rate
 
     type_scope = f"{task_type} / {scope}" if scope else task_type
@@ -291,6 +292,8 @@ async def _attempt_merge_with_retry_and_escalation(
     """
     from app.github import merge_pull_request, create_pr_comment, get_pull_request
     from app.main import _maybe_create_failure_alert
+    from app.models import Project
+    from app.shared_state import get_project_integration_branch
 
     ci_loop = (task.context or {}).get("review_loop", {})
     ci_pr_number = ci_loop.get("pr_number")
@@ -299,7 +302,14 @@ async def _attempt_merge_with_retry_and_escalation(
         "original_task_id", ""
     )
     ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
-    ci_base = ci_loop.get("base_branch", "") or ci_payload.get("base_branch", "main")
+    _merge_project = (
+        await session.get(Project, task.project_id) if task.project_id else None
+    )
+    ci_base = (
+        ci_loop.get("base_branch", "")
+        or ci_payload.get("base_branch", "")
+        or get_project_integration_branch(_merge_project)
+    )
 
     # Round 4 W1: capture a content snapshot BEFORE releasing the lock.
     # ``parent_id_local`` mirrors the snapshot-stale convention from
@@ -426,13 +436,37 @@ async def _attempt_merge_with_retry_and_escalation(
         # 'behind' path: call update_branch (GitHub write) BEFORE re-acquiring
         # the lock. The result is consumed in the lock-held block below.
         if _recheck_err is None and _ms == "behind":
-            from app.github import update_branch
+            from app.github import pr_is_not_behind_for, update_branch
 
-            try:
-                _upd = await update_branch(gh_token, owner, repo, ci_pr_number)
-            except Exception as e:
-                _upd = {"updated": False, "message": str(e)[:200]}
-                logger.warning(f"[CI] PR #{ci_pr_number} update_branch raised: {e}")
+            _not_behind = await pr_is_not_behind_for(
+                gh_token,
+                owner,
+                repo,
+                pr_detail=_recheck_pr,
+                base_branch=ci_base,
+                call_site="ci_completion",
+            )
+            if _not_behind:
+                _upd = {"not_behind": True}
+                logger.info(
+                    f"[CI] PR #{ci_pr_number} mergeable_state='behind' but "
+                    f"pr_is_not_behind=True — skipping update_branch"
+                )
+            else:
+                try:
+                    _upd = await update_branch(gh_token, owner, repo, ci_pr_number)
+                except Exception as e:
+                    _upd = {"updated": False, "message": str(e)[:200]}
+                    logger.warning(f"[CI] PR #{ci_pr_number} update_branch raised: {e}")
+                else:
+                    # Tag the canonical "no new commits on the base branch" 422
+                    # so the existing `_upd.get("not_behind")` short-circuit in
+                    # the merge-failure branch below treats it as a stale-cache
+                    # signal rather than a transient failure that increments
+                    # update_branch_failures.
+                    from app.github import _tag_not_behind_if_no_new_commits
+
+                    _upd = _tag_not_behind_if_no_new_commits(_upd)
 
     # ── RE-ACQUIRE FOR UPDATE FOR FINAL DB MUTATIONS ──────────────────────
     # All GitHub I/O above ran with no row lock held. Now re-acquire briefly
@@ -610,6 +644,20 @@ async def _attempt_merge_with_retry_and_escalation(
             ci_loop["ci_wait_pause_baseline"] = await pause_clock.current_baseline(
                 session
             )
+            if _upd.get("not_behind"):
+                # pr_is_not_behind confirmed head already contains base tip —
+                # skip update_branch, re-enter CI polling for a fresh merge attempt.
+                ci_loop["update_branch_failures"] = 0
+                task.context = {**(task.context or {}), "review_loop": ci_loop}
+                flag_modified(task, "context")
+                task.latest_status_message = (
+                    f"PR #{ci_pr_number} reports 'behind' but head already contains"
+                    f" base tip — re-entering CI polling without update"
+                )
+                logger.info(
+                    f"[CI] PR #{ci_pr_number} not-behind — skipped update_branch ({source})"
+                )
+                return False
             if _upd.get("updated"):
                 ci_loop["update_branch_failures"] = 0
                 task.context = {**(task.context or {}), "review_loop": ci_loop}
@@ -975,9 +1023,14 @@ async def _attempt_merge_with_retry_and_escalation(
             # conditions below would FAIL the task anyway (deterministic error,
             # repeated-identical streak, or hard-cap reached) — a rebase can't
             # recover from those and the test suite verifies those paths exit
-            # cleanly without spawning.
+            # cleanly without spawning.  Also skip when GitHub reports the PR as
+            # 'clean' — the merge failure is a transient API hiccup, not a real
+            # conflict; spawning a rebase fix against a clean PR is always wrong.
             if not (
-                _deterministic or _repeated_identical or _merge_failures >= _hard_cap
+                _deterministic
+                or _repeated_identical
+                or _merge_failures >= _hard_cap
+                or _ms == "clean"
             ):
                 from app.review_pipeline import _spawn_pipeline_task
 
@@ -1217,6 +1270,8 @@ async def handle_ci_completion(
     from app.github import create_pr_comment
     from app.main import _maybe_create_failure_alert
     from app.broadcast import broadcast_to_project
+    from app.models import Project
+    from app.shared_state import get_project_integration_branch
 
     # Serialize concurrent callers (webhook + poller) by locking the task row.
     # skip_locked: if another handler already holds the lock, exit — it will
@@ -1255,7 +1310,14 @@ async def handle_ci_completion(
     ci_pr_number = ci_loop.get("pr_number")
     ci_payload = task.first_payload
     ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
-    ci_base = ci_loop.get("base_branch", "") or ci_payload.get("base_branch", "main")
+    _ci_project = (
+        await session.get(Project, task.project_id) if task.project_id else None
+    )
+    ci_base = (
+        ci_loop.get("base_branch", "")
+        or ci_payload.get("base_branch", "")
+        or get_project_integration_branch(_ci_project)
+    )
     ci_orig_id = ci_loop.get("original_task_id", "") or ci_payload.get(
         "original_task_id", ""
     )

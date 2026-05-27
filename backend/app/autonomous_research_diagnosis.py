@@ -24,7 +24,10 @@ from app.models import (
     TaskStatus,
 )
 from app.payload_schemas import validate_internal_payload
-from app.shared_state import runtime_config as _runtime_config
+from app.shared_state import (
+    get_project_integration_branch,
+    runtime_config as _runtime_config,
+)
 from app.strategic_completion import _is_code_failure_pause_reason
 from app.time_utils import _utcnow
 
@@ -284,7 +287,7 @@ async def _spawn_direction_diagnosis(
         "directions": [direction_summary],
         "current_direction_id": did,
         "design_doc": design_doc_summary,
-        "base_branch": _runtime_config.get("integration_branch", "main"),
+        "base_branch": get_project_integration_branch(project),
         "pause_reason": pause_reason,
         "failed_task_signatures": failed_signatures,
         "failure_taxonomy_counts": taxonomy_counts,
@@ -449,7 +452,7 @@ async def _spawn_unproductive_diagnosis(
         {
             "type": "investigate",
             "prompt": prompt,
-            "base_branch": _runtime_config.get("integration_branch", "main"),
+            "base_branch": get_project_integration_branch(project),
             "effort": "low",
             "recent_changes": recent_changes,
         },
@@ -560,7 +563,7 @@ async def _spawn_remediation_stall_diagnosis(
         {
             "type": "investigate",
             "prompt": prompt,
-            "base_branch": _runtime_config.get("integration_branch", "main"),
+            "base_branch": get_project_integration_branch(project),
             "effort": "low",
             "recent_changes": recent_changes,
         },

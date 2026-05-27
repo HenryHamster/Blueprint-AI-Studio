@@ -114,7 +114,9 @@ async def rollup_db():
     await engine.dispose()
 
 
-async def _make_respawn_scenario(session, *, child_respawn_count, payload_type="create"):
+async def _make_respawn_scenario(
+    session, *, child_respawn_count, payload_type="create"
+):
     """Build an EVALUATING parent with one stale, unmerged COMPLETED child.
 
     The child has a PR artifact and an ``updated_at`` 30 min in the past so it
@@ -231,9 +233,7 @@ async def test_below_cap_increments_counter_by_one_on_real_spawn(rollup_db, mock
 
     from app.rollup_management import _check_and_trigger_rollup
 
-    parent, child = await _make_respawn_scenario(
-        rollup_db, child_respawn_count=start
-    )
+    parent, child = await _make_respawn_scenario(rollup_db, child_respawn_count=start)
 
     await _check_and_trigger_rollup(child, rollup_db)
 
@@ -297,9 +297,7 @@ async def test_respawn_uses_task_type_branch_prefix(rollup_db, mocker):
 
 
 @pytest.mark.asyncio
-async def test_respawn_prefers_review_loop_branch_over_synthesized(
-    rollup_db, mocker
-):
+async def test_respawn_prefers_review_loop_branch_over_synthesized(rollup_db, mocker):
     """The respawn now goes through ``resolve_task_branch``, which prefers
     ``context.review_loop.branch`` over ``context.branch`` and the synthesized
     fallback. Regression for the 2026-05-26 fix-task respawn bug where the
@@ -403,9 +401,7 @@ async def test_dedup_hit_does_not_increment_counter(rollup_db, mocker):
 
     from app.rollup_management import _check_and_trigger_rollup
 
-    parent, child = await _make_respawn_scenario(
-        rollup_db, child_respawn_count=start
-    )
+    parent, child = await _make_respawn_scenario(rollup_db, child_respawn_count=start)
 
     await _check_and_trigger_rollup(child, rollup_db)
 

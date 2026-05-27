@@ -37,8 +37,15 @@ from app.reaper import (
     reaper_service,
     _copy_analysis_artifacts_to_previous,
     _reaper_skip_counts,
+    _orphan_reap_crash_streaks,
+    _ORPHAN_REAP_CRASH_STREAK_LIMIT,
     _heartbeat_stale_cutoff,
     _progress_stale_cutoff,
+    _reaper_halt_state,
+    _REAPER_CYCLE_HALT_THRESHOLD,
+    _REAPER_HALF_OPEN_PROBE_LIMIT,
+    get_reaper_stats,
+    is_reaper_halted,
 )
 from app.shared_state import runtime_config as _runtime_config
 
@@ -1059,6 +1066,326 @@ async def test_reaper_account_cooldown_uses_failure_instant_not_sweep_time(
     )
     assert account_id in (ctx.get("blacklisted_accounts") or [])
     disable_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reaper_db_rl_cross_instance_silent_death_free_requeue(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Silent death + DB-recorded cooldown (in-memory cache missed) → RATE_LIMIT free requeue.
+
+    Regression guard for the durable DB rate-limit correlation path in the REAPER.
+    Scenario: a pool-wide rate-limit block was recorded on a different Cloud Run instance
+    (or before a restart), so _account_was_rate_limited returns False (cache miss).
+    db_account_was_rate_limited queries durable DB state and returns True.
+    Expected: RATE_LIMIT free-requeue (attempt not burned), account blacklisted, verdict persisted.
+    This exercises the durable DB fallback at reaper.py:1398-1413.
+    """
+    disable_mock = mocker.patch(
+        "app.max_plan_pool.disable_account_model", new_callable=AsyncMock
+    )
+    mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
+    # In-memory cache returns False (cross-instance miss); no RL keyword in last_error either.
+    mocker.patch(
+        "app.failure_classification._account_was_rate_limited", return_value=False
+    )
+    mocker.patch(
+        "app.failure_classification._pool_was_rate_limited", return_value=False
+    )
+    # Durable DB state records the cooldown — this is the path under test.
+    mocker.patch(
+        "app.max_plan_pool.db_account_was_rate_limited",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    account_id = "acct-db-rl-cross-instance"
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "model": "sonnet"}],
+        vm_instance_id="vm-db-rl-silent",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={
+            "max_plan_account_id": account_id,
+            # No rate-limit keywords — correlation driven purely by DB state.
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    ctx = t.context or {}
+    assert t.status == TaskStatus.QUEUED, "DB-correlated RL must requeue"
+    assert t.attempt_count == 1, "DB-correlated RL must not burn attempt budget"
+    assert account_id in (ctx.get("blacklisted_accounts") or [])
+    assert "max_plan_account_id" not in ctx
+    disable_mock.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_reaper_db_rl_pool_wide_accountless_silent_death_free_requeue(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Pool-wide cooldown (no account ID) → RATE_LIMIT free requeue without burning budget.
+
+    Regression guard for the accountless pool-wide branch in reaper.py (the `elif`
+    after db_account_was_rate_limited). Scenario: a task has no max_plan_account_id
+    (either never assigned or cleared), and the provider pool was fully blocked at
+    failure time. The reaper must classify it as RATE_LIMIT and requeue without
+    incrementing attempt_count, since the task had no actionable account to blacklist.
+    """
+    mocker.patch("app.max_plan_pool.disable_account_model", new_callable=AsyncMock)
+    mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
+    # In-memory caches both return False — pool-wide cooldown only in DB.
+    mocker.patch(
+        "app.failure_classification._account_was_rate_limited", return_value=False
+    )
+    mocker.patch(
+        "app.failure_classification._pool_was_rate_limited", return_value=False
+    )
+    # DB account check not called / returns False (no account ID on task).
+    mocker.patch(
+        "app.max_plan_pool.db_account_was_rate_limited",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+    # Pool-wide DB check returns True — this is the branch under test.
+    pool_wide_mock = mocker.patch(
+        "app.max_plan_pool.db_pool_wide_rate_limit_cooldown",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    project = await _make_project(reaper_db)
+    failure_time = datetime.utcnow() - timedelta(minutes=10)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "model": "sonnet"}],
+        vm_instance_id="vm-pool-rl-accountless",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=failure_time,
+        context={
+            # No max_plan_account_id — accountless task.
+            "llm_provider": "anthropic",
+            "llm_model": "claude-sonnet-4-6",
+            # No rate-limit keywords in last_error — purely pool-wide DB signal.
+        },
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    ctx = t.context or {}
+    assert t.status == TaskStatus.QUEUED, (
+        "pool-wide DB-correlated RL must requeue (not FAILED)"
+    )
+    assert t.attempt_count == 1, (
+        "pool-wide DB-correlated RL must not burn attempt budget"
+    )
+    # No account to blacklist — blacklisted_accounts should be absent or empty.
+    assert not ctx.get("blacklisted_accounts"), (
+        "accountless RL requeue must not create a spurious blacklisted_accounts entry"
+    )
+    pool_wide_mock.assert_awaited_once_with(
+        at_time=failure_time,
+        providers=["anthropic"],
+        model="claude-sonnet-4-6",
+        user_id=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaper_db_rl_verdict_persisted_stable_under_analytics(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """DB-correlated rate-limit reap persists the verdict so analytics cannot flip it.
+
+    After the reaper classifies a silent death as RATE_LIMIT via durable DB state,
+    persist_authoritative_verdict writes 'RATE_LIMIT' to task.context['failure_class'].
+    Analytics paths that call classify_failure() hours later (after the cooldown lifts,
+    with _account_was_rate_limited returning False) must short-circuit to the persisted
+    verdict rather than re-running correlation and returning CODE_ERROR/AGENT_TIMEOUT.
+    """
+    mocker.patch("app.max_plan_pool.disable_account_model", new_callable=AsyncMock)
+    mocker.patch("app.max_plan_pool.release_max_plan_account", new_callable=AsyncMock)
+    # Simulate cooldown lifted by sweep time — in-memory check returns False.
+    mocker.patch(
+        "app.failure_classification._account_was_rate_limited", return_value=False
+    )
+    mocker.patch(
+        "app.failure_classification._pool_was_rate_limited", return_value=False
+    )
+    # DB check returns True at the failure instant.
+    mocker.patch(
+        "app.max_plan_pool.db_account_was_rate_limited",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    account_id = "acct-db-rl-persist"
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "model": "sonnet"}],
+        vm_instance_id="vm-db-rl-persist",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=1,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"max_plan_account_id": account_id},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    # The reaper must persist the verdict via persist_authoritative_verdict.
+    ctx = t.context or {}
+    assert ctx.get("failure_class") == "RATE_LIMIT", (
+        "reaper must persist RATE_LIMIT verdict so analytics cannot flip it to CODE_ERROR"
+    )
+
+    # Analytics path: classify_failure called later with in-memory checks both False
+    # (simulating a healthy pool after the cooldown lifted). The persisted verdict
+    # short-circuits the classifier before rate-limit correlation runs.
+    from app.failure_classification import classify_failure
+
+    analytics_class = classify_failure(t)
+    assert analytics_class == "RATE_LIMIT", (
+        "analytics re-classification must return persisted RATE_LIMIT, "
+        "not CODE_ERROR/AGENT_TIMEOUT after cooldown lifts"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaper_terminal_persist_uses_failure_instant_not_sweep_time(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """The terminal-persist path must classify at the failure instant, not sweep time.
+
+    Regression guard for reaper.py:2184 — the terminal-fail branch calls
+    ``classify_failure_with_confidence`` with ``at_time=task.last_heartbeat or
+    task.started_at`` (the failure instant). The default ``at_time=None`` would make
+    the classifier resolve the cooldown check against ``_utcnow()`` (the later sweep
+    instant), so a rate-limited death whose cooldown lapsed between failure and sweep
+    gets mislabeled CODE_ERROR/AGENT_TIMEOUT instead of RATE_LIMIT.
+
+    A purely behavioural RATE_LIMIT assertion is infeasible here: every reaper-rewritten
+    terminal status message embeds the reap_reason ("No heartbeat for Ns ..."), and
+    "no heartbeat" matches the AGENT_TIMEOUT keyword bank, short-circuiting the terminal
+    classification *before* the account-state correlation that ``at_time`` feeds
+    (failure_classification.py:1867 vs :1929). So we assert the wiring contract directly:
+    the terminal classify call receives the failure instant. The spy still delegates to
+    the real classifier, and is the LAST ``classify_failure_with_confidence`` call in the
+    cycle, so its captured ``at_time`` reflects the terminal-persist invocation. If the
+    ``at_time`` argument at :2184 is dropped, the captured value becomes ``None`` and this
+    test fails.
+    """
+    import app.failure_classification as fc
+
+    real_cwc = fc.classify_failure_with_confidence
+    captured: dict = {}
+
+    def _spy(task, logs=None, at_time=None, db_rl_override=False):
+        captured["at_time"] = at_time
+        return real_cwc(task, logs=logs, at_time=at_time, db_rl_override=db_rl_override)
+
+    mocker.patch.object(fc, "classify_failure_with_confidence", side_effect=_spy)
+
+    failure_instant = datetime.utcnow() - timedelta(minutes=10)
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-terminal-at-time",
+        status=TaskStatus.IN_PROGRESS,
+        # attempt_count=2 == CODE_ERROR budget → can_retry False → terminal-persist path.
+        attempt_count=2,
+        last_heartbeat=failure_instant,
+        # Plain code-style error → CODE_ERROR (budget=2) at the budget-decision call.
+        context={"last_error": "NameError: foo is not defined"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED, "task must reach the terminal-persist path"
+    assert "at_time" in captured, (
+        "classify_failure_with_confidence must run on the terminal-persist path"
+    )
+    # The fix: at_time is the failure instant, NOT None (which the classifier would
+    # resolve to the later sweep time _utcnow()).
+    assert captured["at_time"] is not None, (
+        "terminal-persist must pass the failure instant, not None (reaper.py:2184)"
+    )
+    assert captured["at_time"] == failure_instant, (
+        "terminal-persist at_time must equal the failure instant (last_heartbeat)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaper_terminal_persist_falls_back_to_started_at_when_no_heartbeat(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Terminal-persist falls back to started_at when last_heartbeat is None.
+
+    Regression guard for reaper.py:2187 — a never-claimed provision death has
+    last_heartbeat=None, so passing a bare ``task.last_heartbeat`` would hand the
+    classifier ``at_time=None`` (→ sweep time), the exact bug being fixed. The
+    ``or task.started_at`` fallback keeps the cooldown correlation anchored at the
+    failure instant, consistent with the agent_status.py call sites.
+    """
+    import app.failure_classification as fc
+
+    # Empty provision error + any_zone_available (fixture) keep is_infra False, so the
+    # task takes the task-specific provision path and terminal-fails on exhausted budget
+    # rather than being requeued as an infra-wide wait.
+    mocker.patch("app.reaper.get_provision_error", return_value="")
+    mocker.patch("app.reaper.get_vm_zone", return_value=None)
+
+    real_cwc = fc.classify_failure_with_confidence
+    captured: dict = {}
+
+    def _spy(task, logs=None, at_time=None, db_rl_override=False):
+        captured["at_time"] = at_time
+        return real_cwc(task, logs=logs, at_time=at_time, db_rl_override=db_rl_override)
+
+    mocker.patch.object(fc, "classify_failure_with_confidence", side_effect=_spy)
+
+    started_at = datetime.utcnow() - timedelta(minutes=30)
+    project = await _make_project(reaper_db)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-terminal-no-hb",
+        status=TaskStatus.PROVISIONING,
+        # Past the 15-min absolute provision ceiling → reaped as absolute_timeout.
+        started_at=started_at,
+        last_heartbeat=None,
+        # Exhaust the provision retry budget so the task terminal-fails this cycle.
+        context={"provision_failures": 99, "provision_zone": "us-central1-a"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.FAILED, "task must reach the terminal-persist path"
+    assert captured.get("at_time") == started_at, (
+        "with last_heartbeat=None, terminal-persist must fall back to started_at "
+        "(reaper.py:2187), not pass None which resolves to sweep time"
+    )
 
 
 @pytest.mark.asyncio
@@ -4201,6 +4528,35 @@ async def test_step9_calcification_alert_not_fired_for_dry_run_hold(
     assert len(alerts) == 0
 
 
+@pytest.mark.asyncio
+async def test_step9_sweep_scan_error_blocks_liveness_counter(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """A scan-level failure in the Step 9 qualification sweep (e.g. DB error
+    on the initial open-versions query) must NOT advance the reaper liveness
+    counter.  The sweep re-raises scan-level errors so the outer
+    consecutive_errors handler engages — unlike per-version finalize crashes,
+    which are swallowed inside sweep_stuck_qualifications."""
+    import app.reaper as _reaper_mod
+    from app import release_qualifier as _rq
+
+    _reaper_mod._reaper_cycles_completed_count = 0
+    _reaper_mod._reaper_last_cycle_completed_at = None
+
+    mocker.patch.object(
+        _rq,
+        "sweep_stuck_qualifications",
+        new=AsyncMock(side_effect=RuntimeError("simulated scan-level DB failure")),
+    )
+
+    await _run_reaper_once()
+
+    # Cycle FAILED — liveness counter must NOT have advanced.
+    stats = _reaper_mod.get_reaper_stats()
+    assert stats["cycles_completed_total"] == 0
+    assert stats["last_cycle_age_seconds"] == -1
+
+
 # ── Step 7: stalled-cycle reaper + linked task reconciliation ────────────────
 
 
@@ -4370,3 +4726,512 @@ async def test_step7_stalled_cycle_already_terminal_task_untouched(
         "task message must not be overwritten"
     )
     assert cycle.outcome == "stalled_phase1", "cycle must be declared stalled"
+
+
+# ── Orphan reap crash isolation & quarantine ─────────────────────────────
+
+
+@pytest.fixture()
+def clean_crash_streaks():
+    """Reset the per-task reap-crash streak tracker before and after each test."""
+    _orphan_reap_crash_streaks.clear()
+    yield _orphan_reap_crash_streaks
+    _orphan_reap_crash_streaks.clear()
+
+
+@pytest.mark.asyncio
+async def test_orphan_crash_sibling_reaped_when_poison_throws(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, clean_crash_streaks, mocker
+):
+    """A poison task that raises mid-reap is skipped; a sibling orphan in the same
+    batch is still reaped normally — per-task isolation prevents cascade failure."""
+    project = await _make_project(reaper_db)
+    poison = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-poison",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    healthy = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-healthy-sibling",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(poison)
+    reaper_db.add(healthy)
+    await reaper_db.commit()
+    poison_id = poison.id
+
+    # Inject a crash on the first session.get(Task, poison_id) call only.
+    # Subsequent calls (e.g. from the quarantine path's _qsession) succeed normally.
+    call_count: dict = {}
+    real_get = AsyncSession.get
+
+    async def patched_get(self, model, pk, **kwargs):
+        key = (model, pk)
+        call_count[key] = call_count.get(key, 0) + 1
+        if pk == poison_id and call_count[key] == 1:
+            raise RuntimeError("injected-poison-pill")
+        return await real_get(self, model, pk, **kwargs)
+
+    mocker.patch.object(AsyncSession, "get", patched_get)
+
+    import app.reaper as _reaper_mod
+
+    _cycles_before = _reaper_mod._reaper_cycles_completed_count
+    await _run_reaper_once()
+    await reaper_db.refresh(poison)
+    await reaper_db.refresh(healthy)
+
+    # The cycle must complete cleanly: the per-task crash + rollback expires the
+    # batch's ORM objects, and the post-commit loops (rollup/dependent-unblock)
+    # must not touch expired attributes (would raise MissingGreenlet and bubble
+    # to the cycle handler, stalling the liveness counter). A bumped counter
+    # proves the success path ran end-to-end, not the cycle-level except.
+    assert _reaper_mod._reaper_cycles_completed_count == _cycles_before + 1, (
+        "reaper cycle must complete cleanly despite the poison-task crash — "
+        "a stalled counter means the post-loop hit MissingGreenlet on an "
+        "expired ORM object and the cycle handler swallowed it"
+    )
+
+    assert poison.status == TaskStatus.IN_PROGRESS, (
+        "poison task must not be reaped this cycle (crash was caught and skipped)"
+    )
+    assert healthy.status == TaskStatus.QUEUED, (
+        "sibling healthy task must be reaped normally despite poison task crash"
+    )
+    assert healthy.attempt_count == 1
+    assert clean_crash_streaks.get(str(poison_id)) == 1, (
+        "crash streak must be incremented for the poison task"
+    )
+
+
+@pytest.mark.asyncio
+async def test_orphan_crash_quarantines_task_after_streak_threshold(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, clean_crash_streaks, mocker
+):
+    """A task that causes a reap crash on every cycle is quarantined (FAILED) after
+    _ORPHAN_REAP_CRASH_STREAK_LIMIT consecutive crashes, with an operator-visible Alert.
+    The streak counter is cleared on quarantine so it stops being re-selected."""
+    project = await _make_project(reaper_db)
+    poison = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-to-quarantine",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(poison)
+    await reaper_db.commit()
+    poison_id = poison.id
+
+    # Pre-seed streak to one below the threshold so this cycle triggers quarantine.
+    clean_crash_streaks[str(poison_id)] = _ORPHAN_REAP_CRASH_STREAK_LIMIT - 1
+
+    # Raise on the first session.get call per task id (main loop body); subsequent
+    # calls from the quarantine path's _qsession succeed so the FAILED write lands.
+    call_count: dict = {}
+    real_get = AsyncSession.get
+
+    async def patched_get(self, model, pk, **kwargs):
+        key = (model, pk)
+        call_count[key] = call_count.get(key, 0) + 1
+        if pk == poison_id and call_count[key] == 1:
+            raise RuntimeError("injected-poison-quarantine")
+        return await real_get(self, model, pk, **kwargs)
+
+    mocker.patch.object(AsyncSession, "get", patched_get)
+
+    import app.reaper as _reaper_mod
+
+    _cycles_before = _reaper_mod._reaper_cycles_completed_count
+    await _run_reaper_once()
+    await reaper_db.refresh(poison)
+
+    # Quarantine path also rolls back + expires the batch; the cycle must still
+    # complete cleanly (counter advances), proving the post-loop never reads an
+    # expired ORM attribute.
+    assert _reaper_mod._reaper_cycles_completed_count == _cycles_before + 1, (
+        "reaper cycle must complete cleanly through the quarantine path"
+    )
+
+    assert poison.status == TaskStatus.FAILED, (
+        "task must be quarantined (FAILED) after reaching the streak threshold"
+    )
+    assert "Quarantined" in (poison.latest_status_message or ""), (
+        "status message must mention 'Quarantined'"
+    )
+    assert "injected-poison-quarantine" in (poison.latest_status_message or ""), (
+        "status message must include the last error for operator triage"
+    )
+
+    alerts = (
+        (await reaper_db.execute(_select(Alert).where(Alert.task_id == poison_id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) >= 1, "quarantine must emit an operator-visible Alert"
+    assert (
+        "quarantine" in (alerts[0].title or "").lower()
+        or "quarantine" in (alerts[0].message or "").lower()
+    )
+
+    assert str(poison_id) not in clean_crash_streaks, (
+        "streak entry must be cleared after quarantine so the task stops being re-selected"
+    )
+
+
+# ── Cycle-level halt circuit breaker ─────────────────────────────────────────
+
+
+class _FailingSessionCM:
+    """Async context manager whose __aenter__ always raises (simulates cycle crash)."""
+
+    def __call__(self):
+        return self
+
+    async def __aenter__(self):
+        raise RuntimeError("injected-cycle-crash")
+
+    async def __aexit__(self, *_):
+        pass
+
+
+_HALT_STATE_CLEAN = {
+    "halted": False,
+    "halt_timestamp": None,
+    "last_error": None,
+    "crash_count": 0,
+    "hard_halted": False,
+    "half_open_failures": 0,
+    "_in_probe": False,
+}
+
+
+@pytest.fixture()
+def clean_halt_state():
+    """Reset _reaper_halt_state to the clean baseline before and after each test."""
+    import app.reaper as _reaper_mod
+
+    _reaper_mod._reaper_halt_state.update(_HALT_STATE_CLEAN)
+    yield _reaper_mod._reaper_halt_state
+    _reaper_mod._reaper_halt_state.update(_HALT_STATE_CLEAN)
+
+
+@pytest.mark.asyncio
+async def test_cycle_halt_state_recorded_after_n_consecutive_crashes(
+    reaper_side_effects, clean_halt_state, mocker
+):
+    """After _REAPER_CYCLE_HALT_THRESHOLD consecutive whole-cycle exceptions the
+    reaper records HALTED state and get_reaper_stats()/is_reaper_halted() reflect it."""
+    mocker.patch("app.reaper.AsyncSessionLocal", _FailingSessionCM())
+    mocker.patch("app.reaper._post_reaper_halt_alert", new_callable=AsyncMock)
+
+    async def _sleep_until_halted(secs):
+        if _reaper_halt_state["halted"]:
+            raise _StopLoop()
+
+    mocker.patch("asyncio.sleep", side_effect=_sleep_until_halted)
+
+    await _run_reaper_once()
+
+    assert _reaper_halt_state["halted"] is True, (
+        "halt state must be set after N crashes"
+    )
+    assert _reaper_halt_state["crash_count"] == _REAPER_CYCLE_HALT_THRESHOLD
+    assert "injected-cycle-crash" in (_reaper_halt_state["last_error"] or "")
+    assert _reaper_halt_state["halt_timestamp"] is not None
+
+    stats = get_reaper_stats()
+    assert stats["halted"] is True, "get_reaper_stats must surface halt flag"
+    assert stats["halt_crash_count"] == _REAPER_CYCLE_HALT_THRESHOLD
+    assert is_reaper_halted() is True
+
+
+@pytest.mark.asyncio
+async def test_cycle_halt_skips_further_cycle_attempts(
+    reaper_side_effects, clean_halt_state, mocker
+):
+    """Once the reaper is halted, subsequent loop iterations skip the cycle body
+    entirely (the halt branch sleeps 300s and continues)."""
+    import app.reaper as _reaper_mod
+
+    _reaper_mod._reaper_halt_state.update(
+        {
+            "halted": True,
+            "halt_timestamp": datetime.utcnow(),
+            "last_error": "pre-halted",
+            "crash_count": _REAPER_CYCLE_HALT_THRESHOLD,
+        }
+    )
+
+    session_factory_mock = mocker.patch("app.reaper.AsyncSessionLocal")
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop())
+
+    await _run_reaper_once()
+
+    assert session_factory_mock.call_count == 0, (
+        "halted reaper must not enter the cycle body (AsyncSessionLocal not called)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cycle_halt_alert_posted_exactly_once(
+    reaper_side_effects, clean_halt_state, mocker
+):
+    """_post_reaper_halt_alert is called exactly once — right when the threshold is crossed."""
+    mocker.patch("app.reaper.AsyncSessionLocal", _FailingSessionCM())
+    halt_alert = mocker.patch(
+        "app.reaper._post_reaper_halt_alert", new_callable=AsyncMock
+    )
+
+    # Allow error-backoff sleeps; stop once halted (halt-branch sleep fires)
+    async def _sleep_until_halted(secs):
+        if _reaper_halt_state["halted"]:
+            raise _StopLoop()
+
+    mocker.patch("asyncio.sleep", side_effect=_sleep_until_halted)
+
+    await _run_reaper_once()
+
+    # The alert task is created via asyncio.get_running_loop().create_task(...) so
+    # it may not have awaited yet; we check the mock was called once.
+    assert halt_alert.call_count == 1, (
+        "_post_reaper_halt_alert must be called exactly once when halt is triggered"
+    )
+    call_args = halt_alert.call_args
+    assert call_args[0][0] == _REAPER_CYCLE_HALT_THRESHOLD  # crash_count
+    assert "injected-cycle-crash" in call_args[0][1]  # last_error
+
+
+@pytest.mark.asyncio
+async def test_per_task_crash_does_not_trigger_cycle_halt(
+    reaper_db,
+    stop_after_one_cycle,
+    reaper_side_effects,
+    clean_halt_state,
+    clean_crash_streaks,
+    mocker,
+):
+    """A crash inside the per-task isolation block completes the cycle cleanly
+    (consecutive_errors stays 0) so the cycle-level halt is never triggered."""
+    project = await _make_project(reaper_db)
+    orphan = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-per-task-crash",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+    )
+    reaper_db.add(orphan)
+    await reaper_db.commit()
+    orphan_id = orphan.id
+
+    call_count: dict = {}
+    real_get = AsyncSession.get
+
+    async def _crash_on_first_get(self, model, pk, **kwargs):
+        key = (model, pk)
+        call_count[key] = call_count.get(key, 0) + 1
+        if pk == orphan_id and call_count[key] == 1:
+            raise RuntimeError("per-task-isolated-crash")
+        return await real_get(self, model, pk, **kwargs)
+
+    mocker.patch.object(AsyncSession, "get", _crash_on_first_get)
+
+    import app.reaper as _reaper_mod
+
+    cycles_before = _reaper_mod._reaper_cycles_completed_count
+    await _run_reaper_once()
+
+    assert _reaper_halt_state["halted"] is False, (
+        "per-task crash must not trigger the cycle-level halt circuit breaker"
+    )
+    assert _reaper_mod._reaper_cycles_completed_count == cycles_before + 1, (
+        "cycle must complete cleanly: per-task crash is isolated, not a cycle-level error"
+    )
+
+
+# ── Half-open circuit breaker (auto-recovery) ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_half_open_probe_recovers_after_cooldown(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, clean_halt_state, mocker
+):
+    """When the halt cooldown elapses the reaper runs a probe cycle; on success
+    it clears halt state and posts a recovery alert."""
+    import app.reaper as _reaper_mod
+
+    recovery_alert = mocker.patch(
+        "app.reaper._post_reaper_recovery_alert", new_callable=AsyncMock
+    )
+    # Pre-set soft halt with an expired cooldown (10 min ago).
+    _reaper_mod._reaper_halt_state.update(
+        {
+            "halted": True,
+            "hard_halted": False,
+            "halt_timestamp": datetime.utcnow() - timedelta(seconds=600),
+            "last_error": "transient-error",
+            "crash_count": 5,
+            "half_open_failures": 0,
+        }
+    )
+
+    await _run_reaper_once()
+
+    assert _reaper_halt_state["halted"] is False, (
+        "halt must be cleared after a successful probe cycle"
+    )
+    assert _reaper_halt_state.get("hard_halted") is False
+    assert _reaper_halt_state.get("half_open_failures") == 0
+    assert is_reaper_halted() is False
+    stats = get_reaper_stats()
+    assert stats["halted"] is False
+    assert stats.get("hard_halted") is False
+    assert recovery_alert.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_half_open_probe_failure_rehalts_with_incremented_counter(
+    reaper_side_effects, clean_halt_state, mocker
+):
+    """A half-open probe that crashes re-halts (soft) with half_open_failures incremented."""
+    import app.reaper as _reaper_mod
+
+    mocker.patch("app.reaper.AsyncSessionLocal", _FailingSessionCM())
+    mocker.patch("app.reaper._post_reaper_halt_alert", new_callable=AsyncMock)
+
+    _reaper_mod._reaper_halt_state.update(
+        {
+            "halted": True,
+            "hard_halted": False,
+            "halt_timestamp": datetime.utcnow() - timedelta(seconds=600),
+            "last_error": "initial-error",
+            "crash_count": 5,
+            "half_open_failures": 0,
+        }
+    )
+
+    async def _stop_after_rehalt(secs):
+        # Stop once the probe has finished and re-halted (not during cooldown sleep).
+        if _reaper_halt_state["halted"] and not _reaper_halt_state.get("_in_probe"):
+            raise _StopLoop()
+
+    mocker.patch("asyncio.sleep", side_effect=_stop_after_rehalt)
+
+    await _run_reaper_once()
+
+    assert _reaper_halt_state["halted"] is True, (
+        "reaper must re-halt after probe failure"
+    )
+    assert _reaper_halt_state.get("hard_halted") is False, "must remain a soft halt"
+    assert _reaper_halt_state.get("half_open_failures") == 1
+
+
+@pytest.mark.asyncio
+async def test_half_open_hard_halt_after_probe_limit(
+    reaper_side_effects, clean_halt_state, mocker
+):
+    """After _REAPER_HALF_OPEN_PROBE_LIMIT consecutive failed probes the reaper
+    escalates to a hard halt that requires operator reset."""
+    import app.reaper as _reaper_mod
+
+    mocker.patch("app.reaper.AsyncSessionLocal", _FailingSessionCM())
+    mocker.patch("app.reaper._post_reaper_halt_alert", new_callable=AsyncMock)
+
+    probe_limit = _REAPER_HALF_OPEN_PROBE_LIMIT
+    # Use a timestamp far enough in the past that even the extended cooldown
+    # (base * 2^(probe_limit-1)) has definitely elapsed.
+    _reaper_mod._reaper_halt_state.update(
+        {
+            "halted": True,
+            "hard_halted": False,
+            "halt_timestamp": datetime.utcnow() - timedelta(hours=2),
+            "last_error": "recurring-error",
+            "crash_count": 5,
+            "half_open_failures": probe_limit - 1,
+        }
+    )
+
+    async def _stop_on_hard_halt(secs):
+        if _reaper_halt_state.get("hard_halted"):
+            raise _StopLoop()
+
+    mocker.patch("asyncio.sleep", side_effect=_stop_on_hard_halt)
+
+    await _run_reaper_once()
+
+    assert _reaper_halt_state.get("hard_halted") is True, (
+        "must escalate to hard halt after probe_limit consecutive failures"
+    )
+    assert _reaper_halt_state["halted"] is True
+    assert _reaper_halt_state.get("half_open_failures") == probe_limit
+    assert is_reaper_halted() is True
+
+
+# ── reaper review-respawn uses per-project task_branch_namespace ───────────
+
+
+@pytest.mark.asyncio
+async def test_reap_with_open_pr_uses_project_namespace(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Reaper review-respawn derives branches under the project's task_branch_namespace.
+
+    A project with namespace='autoproj' must produce 'autoproj/*' branch names
+    instead of the Blueprint-hardcoded 'blueprint/*'.
+    """
+    mock_spawn = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new_callable=AsyncMock,
+        return_value=(None, True),
+    )
+
+    project = Project(
+        name="AutoProj",
+        user_id="user1",
+        build_config={"task_branch_namespace": "autoproj"},
+    )
+    reaper_db.add(project)
+    await reaper_db.commit()
+    await reaper_db.refresh(project)
+
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="vm-with-pr-ns",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        context={"scope": "small"},
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+    await reaper_db.refresh(t)
+
+    reaper_db.add(
+        Artifact(
+            task_id=t.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/owner/autoproj/pull/99",
+        )
+    )
+    await reaper_db.commit()
+
+    await _run_reaper_once()
+    await reaper_db.refresh(t)
+
+    assert t.status == TaskStatus.EVALUATING
+    mock_spawn.assert_called_once()
+    _spawned_branch = mock_spawn.call_args[0][4]
+    assert _spawned_branch.startswith("autoproj/"), (
+        f"expected autoproj/* branch, got {_spawned_branch!r}"
+    )

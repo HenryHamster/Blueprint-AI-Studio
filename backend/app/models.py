@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Mapping
 from sqlmodel import SQLModel, Field, Relationship
 from sqlmodel.sql.sqltypes import GUID
 from sqlalchemy import (
@@ -20,11 +20,13 @@ from sqlalchemy import (
     Enum as SAEnum,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Session as _OrmSession
 from sqlalchemy.types import TypeDecorator
 import logging
 import uuid
 from datetime import datetime, timezone
 from app.time_utils import _utcnow
+from app.vm_cost_rates import get_vm_rate_per_second
 
 
 class NaiveUTCDateTime(TypeDecorator):
@@ -61,6 +63,13 @@ class NaiveUTCDateTime(TypeDecorator):
 
 
 logger = logging.getLogger(__name__)
+_UNLOADED = object()
+
+_TASK_BANKED_VM_RUNTIME_COST_KEY = "vm_runtime_cost_banked"
+_TASK_BANKED_LLM_INPUT_TOKENS_KEY = "llm_input_tokens_banked"
+_TASK_BANKED_LLM_OUTPUT_TOKENS_KEY = "llm_output_tokens_banked"
+_TASK_BANKED_LLM_CALL_COUNT_KEY = "llm_call_count_banked"
+_TASK_ATTEMPT_HISTORY_KEY = "attempt_history"
 
 
 class ProjectStatus(str, Enum):
@@ -298,6 +307,159 @@ class Project(SQLModel, table=True):
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
+    # Approval gate configuration for PR file-path flagging.
+    # Shape: {"infra_files": [...], "critical_files": [...]}.
+    # When unset, defaults to Blueprint's hardcoded sensitive paths.
+    approval_gate_config: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    # Per-project trunk branch for autonomous task spawning.
+    # NULL means "fall back to 'main'".
+    # Blueprint's own repo uses 'automain'; most other projects use 'main'.
+    # See shared_state.get_project_integration_branch.
+    integration_branch: str | None = Field(
+        default=None,
+        sa_column=Column(String, nullable=True),
+    )
+    # Per-project promotion (LTS) branch. NULL means fall back to 'main' —
+    # identical semantics to integration_branch.
+    # See shared_state.get_project_promotion_target.
+    promotion_target: str | None = Field(
+        default=None,
+        sa_column=Column(String, nullable=True),
+    )
+
+    @property
+    def enable_self_improvement(self) -> bool:
+        return bool((self.build_config or {}).get("enable_self_improvement", False))
+
+    @property
+    def task_branch_namespace(self) -> str:
+        """Namespace prefix for agent task branches (``{namespace}/{prefix}-{8hex}``).
+
+        Reads from ``build_config.task_branch_namespace`` if set; otherwise
+        returns Blueprint's default (``"blueprint"``). A non-Blueprint install
+        can ship its own namespace (e.g. ``"autoproj"``) by setting this in
+        build_config, and the canonical resolver lives in
+        ``shared_state.get_project_task_branch_namespace``.
+        """
+        configured = (self.build_config or {}).get("task_branch_namespace")
+        if configured:
+            return str(configured)
+        return "blueprint"
+
+    @property
+    def staging_branch_prefixes(self) -> tuple[str, ...]:
+        """Ordered staging branch prefixes for research/plan rollups.
+
+        Reads from ``build_config.staging_branch_prefixes`` if set; otherwise
+        returns Blueprint's conventional pair (``research/``, ``plan/``).
+        """
+        configured = (self.build_config or {}).get("staging_branch_prefixes")
+        if configured is not None:
+            prefixes = tuple(str(prefix) for prefix in configured if prefix)
+            if prefixes:
+                return prefixes
+        return ("research/", "plan/")
+
+    def is_staging_branch(self, branch: str | None) -> bool:
+        """True when ``branch`` is one of this project's intermediate staging
+        branches (research/plan rollup targets).
+
+        Routes all "is this an intermediate staging branch?" decisions through
+        the per-project ``staging_branch_prefixes`` so non-Blueprint installs
+        with custom prefixes are classified correctly. Guards against
+        ``None``/empty branch names.
+        """
+        if not branch:
+            return False
+        return branch.startswith(tuple(self.staging_branch_prefixes))
+
+    @property
+    def research_branch_prefix(self) -> str:
+        """Prefix for research staging branches."""
+        return self.staging_branch_prefixes[0]
+
+    @property
+    def plan_branch_prefix(self) -> str:
+        """Prefix for plan staging branches."""
+        return (
+            self.staging_branch_prefixes[1]
+            if len(self.staging_branch_prefixes) > 1
+            else "plan/"
+        )
+
+    @property
+    def stale_branch_prefixes(self) -> tuple[str, ...]:
+        """Branch name prefixes eligible for stale cleanup.
+
+        Reads from build_config.stale_branch_prefixes if set; otherwise returns
+        the project's task-branch namespace alongside the project's staging
+        branch prefixes. An empty list in build_config disables cleanup for this
+        project.
+        """
+        configured = (self.build_config or {}).get("stale_branch_prefixes")
+        if configured is not None:
+            return tuple(configured)
+        return (f"{self.task_branch_namespace}/", *self.staging_branch_prefixes)
+
+    @property
+    def protected_branches(self) -> frozenset[str]:
+        """Branch names that must never be deleted by stale-branch cleanup.
+
+        Reads from build_config.protected_branches if set; otherwise returns
+        the default set (main, master, develop, dev). Always includes the
+        project's integration_branch and promotion_target so misconfiguration
+        cannot delete trunk branches.
+        """
+        from app.services import _DEFAULT_PROTECTED_BRANCHES
+        from app.shared_state import (
+            get_project_integration_branch,
+            get_project_promotion_target,
+        )
+
+        configured = (self.build_config or {}).get("protected_branches")
+        if configured is not None:
+            base: frozenset[str] = frozenset(configured)
+        else:
+            base = frozenset(_DEFAULT_PROTECTED_BRANCHES)
+        return base | {
+            get_project_integration_branch(self),
+            get_project_promotion_target(self),
+        }
+
+    @property
+    def task_branch_prefix(self) -> str:
+        """Namespace prefix for task branch names (e.g. 'blueprint/').
+
+        By default this tracks ``task_branch_namespace`` so a project that
+        overrides only the namespace (e.g. ``'autoproj'``) gets the matching
+        prefix (``'autoproj/'``) automatically — keeping cleanup loops in
+        sync with the project's actual branch naming.
+
+        Precedence: an explicit ``build_config.task_branch_prefix`` wins
+        (legacy escape hatch so any project pinned to the older key keeps
+        working byte-for-byte); otherwise the prefix is derived as
+        ``f"{task_branch_namespace}/"``.
+        """
+        explicit = (self.build_config or {}).get("task_branch_prefix")
+        if explicit:
+            return str(explicit)
+        return f"{self.task_branch_namespace}/"
+
+    @property
+    def alembic_versions_path(self) -> str:
+        """Directory prefix for Alembic migration files in this project.
+
+        Reads from build_config.alembic_versions_path if set; otherwise returns
+        Blueprint's conventional path ('backend/alembic/versions/').
+        """
+        from app.migration_path import _DEFAULT_ALEMBIC_VERSIONS_PATH
+
+        return (self.build_config or {}).get(
+            "alembic_versions_path", _DEFAULT_ALEMBIC_VERSIONS_PATH
+        )
 
     def append_routine_digest(self, event_type: str, summary: str) -> None:
         """Append a one-line digest entry for a routine event to running_update.
@@ -623,6 +785,29 @@ class Task(SQLModel, table=True):
     api_call_summary: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
+    # Retry-attribution banking now has dedicated nullable columns. The
+    # accessors below still fall back to legacy context keys so in-flight rows
+    # written before the migration keep their banked totals during rollout.
+    vm_runtime_cost_banked_db: float | None = Field(
+        default=None,
+        sa_column=Column("vm_runtime_cost_banked", Float, nullable=True),
+    )
+    llm_input_tokens_banked_db: int | None = Field(
+        default=None,
+        sa_column=Column("llm_input_tokens_banked", Integer, nullable=True),
+    )
+    llm_output_tokens_banked_db: int | None = Field(
+        default=None,
+        sa_column=Column("llm_output_tokens_banked", Integer, nullable=True),
+    )
+    llm_call_count_banked_db: int | None = Field(
+        default=None,
+        sa_column=Column("llm_call_count_banked", Integer, nullable=True),
+    )
+    attempt_history_db: List[Dict[str, Any]] | None = Field(
+        default=None,
+        sa_column=Column("attempt_history", JSONB, nullable=True),
+    )
 
     # Lifecycle flags promoted from JSONB context (audit 2026-04-25 W1).
     # Reading these via SELECT FOR UPDATE returns DB-fresh values without
@@ -732,6 +917,27 @@ class Task(SQLModel, table=True):
         Index("ix_task_depends_on_gin", "depends_on", postgresql_using="gin"),
         Index("ix_task_provider_created_at", "provider", "created_at"),
         Index("ix_task_account_id_created_at", "account_id", "created_at"),
+        Index(
+            "ix_task_account_model_provider_created",
+            "account_id",
+            "provider",
+            "model",
+            "created_at",
+        ),
+        # Partial index for the orchestrator dispatch hot path
+        # (.where(Task.status == QUEUED, Task.requires_approval.is_(False))).
+        # Covers status, priority, created_at so the planner can satisfy the
+        # ORDER BY priority / created_at sort without a full QUEUED-queue scan.
+        # Postgres-only via alembic 0116 CONCURRENTLY DDL; the metadata Index
+        # registers the name + columns for test_model_indexes_covered_by_migrations.
+        Index(
+            "ix_task_queued_no_approval",
+            "status",
+            "priority",
+            "created_at",
+            postgresql_where=text("requires_approval = false"),
+            sqlite_where=text("requires_approval = 0"),
+        ),
         # Partial expression index on the leading payload's pr_number so the
         # review-pipeline per-PR iteration-cap query (review_pipeline.py) can
         # filter in SQL rather than loading every terminal Task row in the
@@ -802,6 +1008,26 @@ class Task(SQLModel, table=True):
         # ``octet_length(payloads::text) < 200000`` is Postgres-specific syntax
         # that breaks SQLite-fixture tests using metadata.create_all.
         # See alembic 0063 / memory ``reference_strategic_payload_bloat.md``.
+        # Partial index for auto_remediation.py queries that filter
+        # Task.auto_remediation.is_(True) — keeps the scan tight to the small
+        # fraction of tasks with auto_remediation enabled.
+        Index(
+            "ix_task_auto_remediation_active",
+            "project_id",
+            "created_at",
+            postgresql_where=text("auto_remediation = true"),
+            sqlite_where=text("auto_remediation = 1"),
+        ),
+        # Partial index for services.py post_commit_pending queries (lines 2233,
+        # 2252) that filter Task.post_commit_pending.is_(True) — avoids a full
+        # table scan since only a small subset of tasks have this flag set.
+        Index(
+            "ix_task_post_commit_pending",
+            "project_id",
+            "status",
+            postgresql_where=text("post_commit_pending = true"),
+            sqlite_where=text("post_commit_pending = 1"),
+        ),
     )
 
     # Optimistic concurrency: ``version_id_col`` mapper arg was dropped in
@@ -818,6 +1044,238 @@ class Task(SQLModel, table=True):
     history: List["TaskHistory"] = Relationship(
         back_populates="task", sa_relationship_kwargs={"cascade": "all, delete-orphan"}
     )
+
+    def _get_context_backed_value(self, key: str) -> Any:
+        return (self.context or {}).get(key)
+
+    def _set_context_backed_value(self, key: str, value: Any) -> None:
+        ctx = dict(self.context or {})
+        if value is None:
+            ctx.pop(key, None)
+        else:
+            ctx[key] = value
+        self.context = ctx
+
+    @property
+    def vm_runtime_cost_banked(self) -> float | None:
+        db_value = self.__dict__.get("vm_runtime_cost_banked_db", _UNLOADED)
+        if isinstance(db_value, (int, float)):
+            return float(db_value)
+        value = self._get_context_backed_value(_TASK_BANKED_VM_RUNTIME_COST_KEY)
+        return float(value) if isinstance(value, (int, float)) else None
+
+    @vm_runtime_cost_banked.setter
+    def vm_runtime_cost_banked(self, value: float | None) -> None:
+        self.vm_runtime_cost_banked_db = None if value is None else float(value)
+        self._set_context_backed_value(_TASK_BANKED_VM_RUNTIME_COST_KEY, None)
+
+    @property
+    def llm_input_tokens_banked(self) -> int | None:
+        db_value = self.__dict__.get("llm_input_tokens_banked_db", _UNLOADED)
+        if isinstance(db_value, (int, float)) and db_value >= 0:
+            return int(db_value)
+        value = self._get_context_backed_value(_TASK_BANKED_LLM_INPUT_TOKENS_KEY)
+        return int(value) if isinstance(value, (int, float)) and value >= 0 else None
+
+    @llm_input_tokens_banked.setter
+    def llm_input_tokens_banked(self, value: int | None) -> None:
+        self.llm_input_tokens_banked_db = None if value is None else int(value)
+        self._set_context_backed_value(_TASK_BANKED_LLM_INPUT_TOKENS_KEY, None)
+
+    @property
+    def llm_output_tokens_banked(self) -> int | None:
+        db_value = self.__dict__.get("llm_output_tokens_banked_db", _UNLOADED)
+        if isinstance(db_value, (int, float)) and db_value >= 0:
+            return int(db_value)
+        value = self._get_context_backed_value(_TASK_BANKED_LLM_OUTPUT_TOKENS_KEY)
+        return int(value) if isinstance(value, (int, float)) and value >= 0 else None
+
+    @llm_output_tokens_banked.setter
+    def llm_output_tokens_banked(self, value: int | None) -> None:
+        self.llm_output_tokens_banked_db = None if value is None else int(value)
+        self._set_context_backed_value(_TASK_BANKED_LLM_OUTPUT_TOKENS_KEY, None)
+
+    @property
+    def llm_call_count_banked(self) -> int | None:
+        db_value = self.__dict__.get("llm_call_count_banked_db", _UNLOADED)
+        if isinstance(db_value, (int, float)) and db_value >= 0:
+            return int(db_value)
+        value = self._get_context_backed_value(_TASK_BANKED_LLM_CALL_COUNT_KEY)
+        return int(value) if isinstance(value, (int, float)) and value >= 0 else None
+
+    @llm_call_count_banked.setter
+    def llm_call_count_banked(self, value: int | None) -> None:
+        self.llm_call_count_banked_db = None if value is None else int(value)
+        self._set_context_backed_value(_TASK_BANKED_LLM_CALL_COUNT_KEY, None)
+
+    @property
+    def attempt_history(self) -> List[Dict[str, Any]] | None:
+        db_value = self.__dict__.get("attempt_history_db", _UNLOADED)
+        if isinstance(db_value, list):
+            return list(db_value)
+        value = self._get_context_backed_value(_TASK_ATTEMPT_HISTORY_KEY)
+        return list(value) if isinstance(value, list) else None
+
+    @attempt_history.setter
+    def attempt_history(self, value: List[Dict[str, Any]] | None) -> None:
+        self.attempt_history_db = None if value is None else list(value)
+        self._set_context_backed_value(_TASK_ATTEMPT_HISTORY_KEY, None)
+
+
+def _coerce_nonnegative_int(value: Any) -> int:
+    if isinstance(value, (int, float)) and value >= 0:
+        return int(value)
+    return 0
+
+
+def get_task_current_attempt_llm_totals(task: Task) -> tuple[int, int, int]:
+    summary = task.api_call_summary or {}
+    return (
+        _coerce_nonnegative_int(summary.get("total_input_tokens")),
+        _coerce_nonnegative_int(summary.get("total_output_tokens")),
+        _coerce_nonnegative_int(summary.get("llm_call_count")),
+    )
+
+
+def get_task_total_llm_totals(task: Task) -> tuple[int, int, int]:
+    input_tokens, output_tokens, call_count = get_task_current_attempt_llm_totals(task)
+    return (
+        input_tokens + int(task.llm_input_tokens_banked or 0),
+        output_tokens + int(task.llm_output_tokens_banked or 0),
+        call_count + int(task.llm_call_count_banked or 0),
+    )
+
+
+def get_task_current_attempt_vm_cost_usd(
+    task: Task, *, stopped_at: datetime | None = None
+) -> float:
+    if task.vm_provisioned_at is None:
+        return 0.0
+    effective_stop = stopped_at or task.vm_stopped_at
+    if effective_stop is None:
+        return 0.0
+    runtime_seconds = max(
+        0.0, (effective_stop - task.vm_provisioned_at).total_seconds()
+    )
+    if runtime_seconds <= 0:
+        return 0.0
+    return runtime_seconds * get_vm_rate_per_second(spot=task.vm_spot)
+
+
+def get_task_total_vm_cost_usd(
+    task: Task, *, stopped_at: datetime | None = None
+) -> float:
+    return float(
+        task.vm_runtime_cost_banked or 0.0
+    ) + get_task_current_attempt_vm_cost_usd(task, stopped_at=stopped_at)
+
+
+def with_task_attempt_banking(
+    task: Task, context: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Return context plus the task's banked retry-attribution fields.
+
+    Requeue paths sometimes keep mutating a stale pre-banking context copy
+    after ``bank_task_current_attempt()`` runs. Copying only the banked
+    attribution fields back into that context preserves retry costs without
+    resurrecting runtime keys that the caller intentionally removed.
+    """
+
+    merged = dict(context or {})
+
+    banked_vm_cost = task.vm_runtime_cost_banked
+    if banked_vm_cost is None:
+        merged.pop(_TASK_BANKED_VM_RUNTIME_COST_KEY, None)
+    else:
+        merged[_TASK_BANKED_VM_RUNTIME_COST_KEY] = float(banked_vm_cost)
+
+    banked_input_tokens = task.llm_input_tokens_banked
+    if banked_input_tokens is None:
+        merged.pop(_TASK_BANKED_LLM_INPUT_TOKENS_KEY, None)
+    else:
+        merged[_TASK_BANKED_LLM_INPUT_TOKENS_KEY] = int(banked_input_tokens)
+
+    banked_output_tokens = task.llm_output_tokens_banked
+    if banked_output_tokens is None:
+        merged.pop(_TASK_BANKED_LLM_OUTPUT_TOKENS_KEY, None)
+    else:
+        merged[_TASK_BANKED_LLM_OUTPUT_TOKENS_KEY] = int(banked_output_tokens)
+
+    banked_call_count = task.llm_call_count_banked
+    if banked_call_count is None:
+        merged.pop(_TASK_BANKED_LLM_CALL_COUNT_KEY, None)
+    else:
+        merged[_TASK_BANKED_LLM_CALL_COUNT_KEY] = int(banked_call_count)
+
+    attempt_history = task.attempt_history
+    if attempt_history is None:
+        merged.pop(_TASK_ATTEMPT_HISTORY_KEY, None)
+    else:
+        merged[_TASK_ATTEMPT_HISTORY_KEY] = list(attempt_history)
+
+    return merged
+
+
+def bank_task_current_attempt(
+    task: Task,
+    *,
+    stopped_at: datetime | None = None,
+    clear_current_attempt: bool = True,
+) -> Dict[str, Any] | None:
+    effective_stop = stopped_at or task.vm_stopped_at
+    vm_cost = get_task_current_attempt_vm_cost_usd(task, stopped_at=effective_stop)
+    input_tokens, output_tokens, call_count = get_task_current_attempt_llm_totals(task)
+    has_attempt_data = (
+        task.vm_provisioned_at is not None
+        or task.api_call_summary is not None
+        or vm_cost > 0
+        or input_tokens > 0
+        or output_tokens > 0
+        or call_count > 0
+    )
+    if not has_attempt_data:
+        return None
+
+    if vm_cost > 0:
+        task.vm_runtime_cost_banked = (
+            float(task.vm_runtime_cost_banked or 0.0) + vm_cost
+        )
+    if input_tokens > 0:
+        task.llm_input_tokens_banked = (
+            int(task.llm_input_tokens_banked or 0) + input_tokens
+        )
+    if output_tokens > 0:
+        task.llm_output_tokens_banked = (
+            int(task.llm_output_tokens_banked or 0) + output_tokens
+        )
+    if call_count > 0:
+        task.llm_call_count_banked = int(task.llm_call_count_banked or 0) + call_count
+
+    snapshot: Dict[str, Any] = {
+        "vm_provisioned_at": task.vm_provisioned_at.isoformat()
+        if task.vm_provisioned_at
+        else None,
+        "vm_stopped_at": effective_stop.isoformat() if effective_stop else None,
+        "vm_spot": bool(task.vm_spot),
+        "vm_runtime_cost_usd": round(vm_cost, 6),
+        "llm_input_tokens": input_tokens,
+        "llm_output_tokens": output_tokens,
+        "llm_call_count": call_count,
+    }
+    history = list(task.attempt_history or [])
+    history.append(snapshot)
+    task.attempt_history = history
+
+    total_vm_cost = float(task.vm_runtime_cost_banked or 0.0)
+    task.estimated_cost_usd = round(total_vm_cost, 4) if total_vm_cost > 0 else None
+
+    if clear_current_attempt:
+        task.vm_provisioned_at = None
+        task.vm_started_at = None
+        task.vm_stopped_at = None
+        task.api_call_summary = None
+
+    return snapshot
 
 
 class TaskHistory(SQLModel, table=True):
@@ -886,6 +1344,55 @@ _on_task_terminal_callbacks: list = []
 # Firing revive callbacks on every non-terminal status set restores the
 # cache invariant so the agent can claim cleanly.
 _on_task_revive_callbacks: list = []
+
+
+def notify_tasks_terminated(task_ids: list) -> None:
+    """Fire terminal callbacks for a list of task IDs.
+
+    Used by bulk UPDATE sites (e.g. force-delete) that bypass the ORM event
+    listener, ensuring the in-memory deny-list is populated for all cancelled
+    tasks exactly as if each transition had gone through the ORM setter.
+    """
+    for task_id in task_ids:
+        tid = str(task_id)
+        for cb in _on_task_terminal_callbacks:
+            try:
+                cb(tid)
+            except Exception as e:  # noqa: PERF203
+                logger.error(
+                    f"[MODELS] Terminal callback failed for task {tid}: {e}",
+                    exc_info=True,
+                )
+
+
+@event.listens_for(_OrmSession, "before_flush")
+def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
+    """Emit pg_notify for Task rows transitioning to a terminal status.
+
+    Runs inside the before_flush hook (sync context, greenlet-driven by
+    AsyncSession.flush) so the NOTIFY lands in the same transaction as the
+    status mutation.  Postgres only delivers the notification to listeners
+    after commit — so receivers see the change as durable.
+
+    Uses a late import to break the circular dependency:
+      agent.py → models.py → jwt_revocation.py → agent.py
+    Exceptions are fully swallowed so a NOTIFY failure never aborts the flush.
+    """
+    try:
+        from sqlalchemy import inspect as _sa_inspect
+        from app.jwt_revocation import emit_task_terminated_notify  # noqa: PLC0415
+
+        terminal = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+        for instance in session.dirty:
+            if not isinstance(instance, Task):
+                continue
+            history = _sa_inspect(instance).attrs.status.history
+            if not history.added:
+                continue
+            if history.added[0] in terminal:
+                emit_task_terminated_notify(session, str(instance.id))
+    except Exception as exc:  # noqa: BLE001 — never block the flush
+        logger.warning("[MODELS] before_flush NOTIFY failed: %s", exc)
 
 
 @event.listens_for(Task.status, "set")
@@ -1065,6 +1572,10 @@ class StrategicCycle(SQLModel, table=True):
     updated_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
+    )
+
+    __table_args__ = (
+        Index("ix_strategiccycle_project_created", "project_id", "created_at"),
     )
 
     @property
@@ -1338,23 +1849,27 @@ class MaxPlanAccount(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=False, onupdate=_utcnow),
     )
 
-    def is_in_rate_limit_cooldown(self) -> bool:
+    def is_in_rate_limit_cooldown(self, at_time: "datetime | None" = None) -> bool:
         """Return True if any model is still in rate-limit cooldown from persisted state.
 
         Reads self.rate_limit_state (JSONB, populated by _persist_rate_limit_state
-        in max_plan_pool). Uses a conservative 4-hour upper-bound window — the
-        maximum quarantine cooldown — to avoid a circular import of the precise
-        _cooldown_seconds_for_info helper (max_plan_pool imports models).
-        The in-memory pool check (max_plan_pool.account_in_rate_limit_cooldown)
-        is authoritative when the pool is loaded; this method is a fallback for
-        callers that have an ORM-loaded account but no live pool (e.g. tests,
-        admin tooling). Returns False on any parse failure.
+        in max_plan_pool). Inlines the same cooldown-window math as
+        max_plan_pool._cooldown_seconds_for_info to avoid a circular import
+        (max_plan_pool imports models).
+
+        at_time: reference timestamp for the check. Pass the failure instant so
+        reaper lag between failure and classification cannot cause a missed
+        correlation. Defaults to now.
+
+        Returns False on any parse failure.
         """
         try:
             dm = (self.rate_limit_state or {}).get("disabled_models") or {}
             if not dm:
                 return False
-            now = _utcnow()
+            now = at_time if at_time is not None else _utcnow()
+            if getattr(now, "tzinfo", None) is not None:
+                now = now.replace(tzinfo=None)
             for info in dm.values():
                 at_str = info.get("at")
                 if not at_str:
@@ -1365,7 +1880,21 @@ class MaxPlanAccount(SQLModel, table=True):
                         at_dt = at_dt.replace(tzinfo=None)
                 except (ValueError, TypeError):
                     continue
-                if (now - at_dt).total_seconds() < 4 * 3600:
+                # Mirror max_plan_pool._cooldown_seconds_for_info inline.
+                kind = info.get("kind")
+                if kind == "quota_exhausted":
+                    cooldown = 24 * 3600
+                elif kind == "quarantine":
+                    cooldown = 15 * 60
+                elif kind == "regression":
+                    cooldown = 6 * 3600
+                else:
+                    hits = info.get("hits", 1)
+                    cooldown = min(30 * (2 ** (hits - 1)), 240) * 60
+                    hint = info.get("retry_after_seconds")
+                    if isinstance(hint, (int, float)) and hint > cooldown:
+                        cooldown = int(hint)
+                if (now - at_dt).total_seconds() < cooldown:
                     return True
             return False
         except Exception:
@@ -1522,6 +2051,12 @@ class Artifact(SQLModel, table=True):
             "task_id",
             unique=True,
             postgresql_where=text("artifact_type = 'PULL_REQUEST'"),
+        ),
+        Index(
+            "ix_artifact_pr_url_trgm",
+            "pr_url",
+            postgresql_using="gin",
+            postgresql_ops={"pr_url": "gin_trgm_ops"},
         ),
     )
 
@@ -1893,6 +2428,22 @@ class RegressionRemediationCase(SQLModel, table=True):
         default=None,
         sa_column=Column(String(40), nullable=True),
     )
+    # Outcome label from the most recent unactionable investigation
+    # (structural / no_actionable_fix / low_confidence / no_direction).
+    # Written by task_completion when investigation_unactionable memo fires.
+    # Persists as historical context: a later FALSE_POSITIVE verdict does
+    # NOT clear this field, so _format_prior_verdict_context may emit both
+    # the false-positive block and this unactionable block for the same case.
+    last_unactionable_verdict: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+    # Brief summary (≤500 chars) from the most recent unactionable investigation.
+    # Fed back to the next investigation prompt so it can skip already-ruled-out paths.
+    last_unactionable_summary: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False),
@@ -1979,6 +2530,7 @@ class RegressionRemediationCase(SQLModel, table=True):
         *,
         spawn_was_cross_layer: bool = False,
         spawn_layers_enumerated: List[str] | None = None,
+        merge_sha: str | None = None,
     ) -> None:
         """Transition ACTIVE → MERGED after remediation PR merges.
 
@@ -2004,6 +2556,10 @@ class RegressionRemediationCase(SQLModel, table=True):
         dispatcher's cross-layer escalation context at spawn time so the
         compliance metric can compare layers observed vs layers touched.
         Only written when truthy; absence means non-cross-layer or legacy entry.
+
+        ``merge_sha`` (optional) stores the git commit SHA for the merged PR so
+        the recovery scan can re-verify ancestry against the integration branch
+        without a redundant GitHub API call to re-fetch the PR.
         """
         if not signal_snapshot:
             signal_snapshot = dict(self.signal_snapshot_at_spawn or {})
@@ -2018,6 +2574,8 @@ class RegressionRemediationCase(SQLModel, table=True):
         }
         if ep_start is not None:
             log_entry["episode_investigate_started_at"] = ep_start.isoformat()
+        if merge_sha:
+            log_entry["fix_merge_sha"] = merge_sha
         if layers_targeted:
             log_entry["layers_targeted"] = list(layers_targeted)
         if recommended_unmodifiable_layers:
@@ -2543,6 +3101,12 @@ class QualificationVerdict(SQLModel, table=True):
 
     # Hard-blocker code (compute_composite), or NULL when none fired.
     blocker: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
+    # Reason the audit sub-score was missing/unscoreable (from release_scoring).
+    audit_missing_reason: str | None = Field(
         default=None,
         sa_column=Column(String(64), nullable=True),
     )

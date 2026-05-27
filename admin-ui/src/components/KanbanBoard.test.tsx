@@ -146,7 +146,7 @@ describe('KanbanBoard', () => {
     expect(checkboxes.length).toBeGreaterThan(0);
   });
 
-  it('archive button appears for terminal columns with tasks and fires handler', async () => {
+  it('archive button appears for terminal columns with tasks and fires handler on second click', async () => {
     const user = userEvent.setup();
     const onArchiveColumn = vi.fn();
     const task = makeTask({ id: '1', title: 'Done Task', status: 'COMPLETED' });
@@ -154,7 +154,13 @@ describe('KanbanBoard', () => {
 
     const archiveBtns = screen.getAllByTitle('Archive all Completed tasks');
     expect(archiveBtns.length).toBeGreaterThan(0);
+    // First click enters confirm state — must NOT fire yet
     await user.click(archiveBtns[0]);
+    expect(onArchiveColumn).not.toHaveBeenCalled();
+    // Second click fires the handler
+    const confirmBtns = screen.getAllByTitle('Archive 1 tasks? (4s)');
+    expect(confirmBtns.length).toBeGreaterThan(0);
+    await user.click(confirmBtns[0]);
     expect(onArchiveColumn).toHaveBeenCalledWith(['1'], 'Completed');
   });
 });

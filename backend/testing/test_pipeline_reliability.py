@@ -1274,7 +1274,7 @@ async def test_ci_polling_unrecognized_state_uses_lower_threshold(orch_db, mocke
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "mergeable_state",
-    ["blocked", "unknown", "unstable", "weird_new_state"],
+    ["blocked", "unknown", "unstable", "clean", "weird_new_state"],
 )
 async def test_ci_polling_non_dirty_state_continues_without_fix_spawn(
     orch_db,
@@ -1339,6 +1339,9 @@ async def test_ci_polling_non_dirty_state_continues_without_fix_spawn(
             "head": {"sha": "abc123"},
         },
     )
+    update_mock = mocker.patch(
+        "app.github.update_branch_with_sha_retry", new=AsyncMock()
+    )
     # The orchestrator imports _spawn_pipeline_task from app.review_pipeline at
     # call time; patching the source module catches any invocation.
     spawn_mock = mocker.patch(
@@ -1369,6 +1372,9 @@ async def test_ci_polling_non_dirty_state_continues_without_fix_spawn(
     assert "conflict_fix_spawned" not in rl, (
         f"conflict_fix_spawned must NOT be set for non-dirty state "
         f"{mergeable_state!r}, got rl={rl!r}"
+    )
+    assert update_mock.await_count == 0, (
+        f"mergeable_state={mergeable_state!r} must not escalate to update_branch"
     )
     spawn_mock.assert_not_called()
     assert len(all_tasks) == 1, (
@@ -1410,6 +1416,15 @@ async def test_ci_polling_behind_update_branch_failure_defers_without_fix_spawn(
             "mergeable_state": "behind",
             "head": {"sha": "sha-behind"},
         },
+    )
+    # pr_is_not_behind probe must fall through to update_branch_with_sha_retry.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="sha-base"),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=False),
     )
     update_mock = mocker.patch(
         "app.github.update_branch_with_sha_retry",
@@ -1477,6 +1492,15 @@ async def test_ci_polling_behind_update_branch_exhausted_spawns_fix_with_alert(
             "head": {"sha": "sha-behind-2"},
         },
     )
+    # pr_is_not_behind probe must fall through to update_branch_with_sha_retry.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="sha-base"),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=False),
+    )
     mocker.patch(
         "app.github.update_branch_with_sha_retry",
         new=AsyncMock(return_value={"updated": False, "message": "GitHub 500 temp"}),
@@ -1531,6 +1555,14 @@ async def test_ci_polling_behind_update_branch_exhausted_spawns_fix_with_alert(
     assert "BEHIND" in fix_prompt, fix_prompt
     assert "UNMERGEABLE" not in fix_prompt
     assert "merge conflicts against" not in fix_prompt
+    assert "gh-token" not in fix_prompt
+    assert "/api/agent/github/check-runs" in fix_prompt
+    assert "$AGENT_API_TOKEN" in fix_prompt
+    # No-op rebase must be recognised as success so a stale mergeability flag
+    # does not cause the fix agent to report BLOCKED_PRECONDITION (PR #6153).
+    assert "up-to-date" in fix_prompt, fix_prompt
+    assert "don't force-push" in fix_prompt, fix_prompt
+    assert "changes needed" in fix_prompt, fix_prompt
 
 
 @pytest.mark.asyncio
@@ -1567,6 +1599,15 @@ async def test_ci_polling_behind_update_branch_success_clears_retry_counter(
             "head": {"sha": "sha-behind-3"},
         },
     )
+    # pr_is_not_behind probe must fall through to update_branch_with_sha_retry.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="sha-base"),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=False),
+    )
     mocker.patch(
         "app.github.update_branch_with_sha_retry",
         new=AsyncMock(return_value={"updated": True, "message": "branch updated"}),
@@ -1591,6 +1632,159 @@ async def test_ci_polling_behind_update_branch_success_clears_retry_counter(
     )
     assert rl.get("ci_waiting") is True
     spawn_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_behind_skips_update_when_pr_is_not_behind(
+    orch_db,
+    mocker,
+):
+    """When CI polling sees mergeable_state='behind' but the base tip is already
+    an ancestor of the PR head, pr_is_not_behind returns True and the orchestrator
+    must skip update_branch_with_sha_retry entirely. No retry counter bump, no
+    fix spawn — defer to the next CI sweep so GitHub can refresh mergeable_state.
+    """
+    session, _Session = orch_db
+    task = await _make_ci_waiting_task(
+        session, pr_number=604, project_name="CI Behind Stale State"
+    )
+    task_id = task.id
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "open",
+            "merged": False,
+            "mergeable": False,
+            "mergeable_state": "behind",
+            "head": {"sha": "sha-head"},
+        },
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="sha-base-tip"),
+    )
+    # is_ancestor_of=True → base tip is already in PR head → not behind
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+    update_mock = mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new=AsyncMock(return_value={"updated": True}),
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock
+    )
+    alert_mock = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    await _run_one_cycle(mocker)
+
+    from sqlmodel import select as _select
+
+    async with _Session() as verify:
+        t = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
+
+    assert t.status == TaskStatus.EVALUATING
+    assert update_mock.await_count == 0, (
+        "update_branch_with_sha_retry must NOT be called when pr_is_not_behind=True"
+    )
+    spawn_mock.assert_not_called()
+    alert_mock.assert_not_called()
+    rl = (t.context or {}).get("review_loop", {})
+    assert "_behind_update_retries" not in rl, (
+        f"pr_is_not_behind short-circuit must NOT bump retry counter; got rl={rl!r}"
+    )
+    assert rl.get("ci_waiting") is True
+    msg = (t.latest_status_message or "").lower()
+    assert "updated branch via github api" not in msg
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_behind_no_new_commits_clears_counter(orch_db, mocker):
+    """When the orchestrator's CI polling sees mergeable_state='behind' and
+    update_branch_with_sha_retry returns the canonical not_behind=True (no new
+    commits on base), the orchestrator must clear any prior retry counter and
+    defer to the next sweep without escalating to fix-spawn — even when the
+    counter is already at budget-1."""
+    session, _Session = orch_db
+    task = await _make_ci_waiting_task(
+        session, pr_number=605, project_name="CI Behind NoNewCommits"
+    )
+    rl = dict((task.context or {}).get("review_loop", {}))
+    rl["_behind_update_retries"] = 2  # one short of default budget (3)
+    task.context = {**(task.context or {}), "review_loop": rl}
+    session.add(task)
+    await session.commit()
+    task_id = task.id
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "state": "open",
+            "merged": False,
+            "mergeable": False,
+            "mergeable_state": "behind",
+            "head": {"sha": "sha-behind-5"},
+        },
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="sha-base"),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=False),
+    )
+    update_mock = mocker.patch(
+        "app.github.update_branch_with_sha_retry",
+        new=AsyncMock(
+            return_value={
+                "updated": False,
+                "not_behind": True,
+                "message": "There are no new commits on the base branch.",
+            }
+        ),
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task", new_callable=AsyncMock
+    )
+    alert_mock = mocker.patch(
+        "app.main._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    await _run_one_cycle(mocker)
+
+    from sqlmodel import select as _select
+
+    async with _Session() as verify:
+        t = (
+            (await verify.execute(_select(Task).where(Task.id == task_id)))
+            .scalars()
+            .first()
+        )
+    rl = (t.context or {}).get("review_loop", {})
+    assert "_behind_update_retries" not in rl, (
+        f"not_behind result must clear retry counter; got rl={rl!r}"
+    )
+    assert rl.get("ci_waiting") is True
+    assert update_mock.await_count == 1
+    spawn_mock.assert_not_called()
+    alert_mock.assert_not_called()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1802,7 +1996,7 @@ async def test_ci_polling_non_rollup_task_completes_on_conflict_fix(
     session.add(fake_fix)
     await session.commit()
     await session.refresh(fake_fix)
-    mocker.patch(
+    spawn_mock = mocker.patch(
         "app.review_pipeline._spawn_pipeline_task",
         new=AsyncMock(return_value=(fake_fix, True)),
     )
@@ -1824,6 +2018,11 @@ async def test_ci_polling_non_rollup_task_completes_on_conflict_fix(
         f"conflict resolution to a fix task — the review iteration itself is done. "
         f"Got {updated.status}."
     )
+    fix_prompt = spawn_mock.await_args.kwargs.get("fix_prompt", "")
+    assert "UNMERGEABLE" in fix_prompt, fix_prompt
+    assert "gh-token" not in fix_prompt
+    assert "/api/agent/github/check-runs" in fix_prompt
+    assert "$AGENT_API_TOKEN" in fix_prompt
 
 
 # ══════════════════════════════════════════════════════════════════════════════

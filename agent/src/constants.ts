@@ -51,6 +51,14 @@ export const LOG_TAIL_BYTES = 5_000;
 // Heartbeat
 export const HEARTBEAT_INTERVAL = 30_000;
 
+// Proactive agent-JWT refresh timing.
+// The agent decodes the token's real exp claim and schedules refresh at
+// FRACTION of remaining lifetime, clamped to [FLOOR, CEILING]. This removes
+// the hardcoded TTL mirror and makes refresh robust to any future TTL change.
+export const TOKEN_REFRESH_FRACTION = 0.75;
+export const TOKEN_REFRESH_FLOOR_MS = 3 * 60_000;    // 3 min minimum
+export const TOKEN_REFRESH_CEILING_MS = 55 * 60_000; // 55 min maximum
+
 // WebSocket log buffer
 export const MAX_LOG_BUFFER = 1_000;
 
@@ -135,6 +143,101 @@ export const SCOPE_OVERFLOW_THRESHOLDS: Record<string, number> = {
   medium: 10, // medium expects 2-5 files; warn at >10
   large: 20,  // large expects 5+ files; warn at >20
 };
+
+// Parallel review fan-out thresholds. False positive (extra fan-out) costs a
+// little extra subagent overhead; false negative (no fan-out on a big rollup)
+// costs review wall-clock. Keep defaults conservative — easier to widen later.
+export const PARALLEL_REVIEW_THRESHOLDS = {
+  minNonTestFiles: 4,
+  minDistinctModules: 2,
+} as const;
+
+// Shared test-path classifier used by both fan-out helpers.
+function isTestPath(p: string): boolean {
+  return (
+    /(^|\/)testing\//.test(p) ||
+    /\.test\.[tj]sx?$/.test(p) ||
+    /\.spec\.[tj]sx?$/.test(p) ||
+    /(^|\/)tests?\//.test(p) ||
+    /(^|\/)__tests__\//.test(p) ||
+    /_test\.py$/.test(p) ||
+    /(^|\/)test_[^/]+\.py$/.test(p)
+  );
+}
+
+// Returns true when a review should fan out per-module investigation subagents.
+// Trivial diffs and single-module changes always return false — subagent
+// overhead dominates there. buildConfig is required to identify "module
+// boundaries"; without it we default to false (conservative).
+export function shouldFanOutReview(
+  changedFilePaths: string[],
+  buildConfig?: { directories?: { path: string }[] },
+): boolean {
+  const dirs = buildConfig?.directories;
+  if (!dirs || dirs.length === 0) return false;
+  const nonTest = changedFilePaths.filter(p => !isTestPath(p));
+  if (nonTest.length < PARALLEL_REVIEW_THRESHOLDS.minNonTestFiles) return false;
+  const matched = new Set<string>();
+  for (const p of nonTest) {
+    for (const d of dirs) {
+      const prefix = d.path.endsWith('/') ? d.path : d.path + '/';
+      if (p === d.path || p.startsWith(prefix)) {
+        matched.add(d.path);
+        break;
+      }
+    }
+  }
+  return matched.size >= PARALLEL_REVIEW_THRESHOLDS.minDistinctModules;
+}
+
+// Parallel fix fan-out thresholds. Conservative defaults: fan-out only when
+// the diff is genuinely multi-module OR the reviewer raised many issues across
+// multiple files. Small diffs and single-module fixes always stay serial.
+export const PARALLEL_FIX_THRESHOLDS = {
+  minNonTestFiles: 4,
+  minDistinctModules: 2,
+  minReviewerIssues: 6,
+  minIssueFiles: 2,
+} as const;
+
+// Returns true when a fix iteration should fan out per-slice investigation
+// subagents. Two independent axes can trigger fan-out:
+//   (a) multi-module diff: >=minNonTestFiles non-test files across >=minDistinctModules
+//       build_config directories
+//   (b) many reviewer issues: >=minReviewerIssues issues spanning >=minIssueFiles
+//       distinct files
+// buildConfig is optional — without it only the issue-count axis can trigger.
+export function shouldFanOutFix(
+  changedFilePaths: string[],
+  reviewIssueCount?: number,
+  reviewIssueFiles?: string[],
+  buildConfig?: { directories?: { path: string }[] },
+): boolean {
+  // Issue-cluster axis: many reviewer issues across multiple files
+  if (
+    reviewIssueCount !== undefined &&
+    reviewIssueCount >= PARALLEL_FIX_THRESHOLDS.minReviewerIssues &&
+    (reviewIssueFiles?.length ?? 0) >= PARALLEL_FIX_THRESHOLDS.minIssueFiles
+  ) {
+    return true;
+  }
+  // Module axis: large multi-module diff
+  const dirs = buildConfig?.directories;
+  if (!dirs || dirs.length === 0) return false;
+  const nonTest = changedFilePaths.filter(p => !isTestPath(p));
+  if (nonTest.length < PARALLEL_FIX_THRESHOLDS.minNonTestFiles) return false;
+  const matched = new Set<string>();
+  for (const p of nonTest) {
+    for (const d of dirs) {
+      const prefix = d.path.endsWith('/') ? d.path : d.path + '/';
+      if (p === d.path || p.startsWith(prefix)) {
+        matched.add(d.path);
+        break;
+      }
+    }
+  }
+  return matched.size >= PARALLEL_FIX_THRESHOLDS.minDistinctModules;
+}
 
 // Pre-implementation analysis plan gate. If a medium-scope analysis plan
 // proposes more files than this, the handler retries the analysis with a

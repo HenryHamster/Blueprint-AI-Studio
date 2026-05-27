@@ -69,18 +69,18 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, runProjectLintChecks, testFixLoop, lintFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, isViewportBootstrapFailure, isInfrastructureFailure, runViewportSuiteWithFallback, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, codexStreamHasTurnCompleted, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
   _resetFixLoopEventStateForTesting,
 } from './fix-loop-events.js';
 import {
-  MAX_LINT_FIX_ATTEMPTS,
   MAX_TEST_FIX_ATTEMPTS,
   TOOL_USE_STALL_TIMEOUT_MS,
   CLAUDE_STREAM_STALL_MS,
-  FRONTEND_PLAYWRIGHT_INSTALL_TIMEOUT,
+  TOKEN_REFRESH_FLOOR_MS,
+  TOKEN_REFRESH_CEILING_MS,
 } from './constants.js';
 import { execFileSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
@@ -91,6 +91,59 @@ function defined<T>(v: T | undefined | null, msg = 'expected value to be defined
   if (v === undefined || v === null) throw new Error(msg);
   return v;
 }
+
+// ── computeRefreshDelayMs ─────────────────────────────────────────────────────
+/** Build a minimal JWT with a given exp claim (no real signature needed). */
+function mockJwtWithExp(expUnixSec: number): string {
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ exp: expUnixSec, sub: 'test-task' })).toString('base64url');
+  return `${header}.${payload}.fakesig`;
+}
+
+describe('computeRefreshDelayMs', () => {
+  it('schedules at 75% of remaining lifetime for a 1h token', () => {
+    const now = 1_000_000_000_000; // arbitrary fixed ms
+    const expSec = Math.floor(now / 1000) + 3600; // 1 hour remaining
+    const delay = computeRefreshDelayMs(mockJwtWithExp(expSec), now);
+    expect(delay).toBe(3600 * 1000 * 0.75); // 2700000ms
+  });
+
+  it('clamps to floor when remaining lifetime is very short', () => {
+    const now = 1_000_000_000_000;
+    const expSec = Math.floor(now / 1000) + 30; // 30 seconds remaining
+    const delay = computeRefreshDelayMs(mockJwtWithExp(expSec), now);
+    expect(delay).toBe(TOKEN_REFRESH_FLOOR_MS);
+  });
+
+  it('clamps to ceiling when remaining lifetime is very long', () => {
+    const now = 1_000_000_000_000;
+    const expSec = Math.floor(now / 1000) + 7200; // 2 hours remaining
+    const delay = computeRefreshDelayMs(mockJwtWithExp(expSec), now);
+    expect(delay).toBe(TOKEN_REFRESH_CEILING_MS);
+  });
+
+  it('falls back to floor for an unparseable token', () => {
+    const delay = computeRefreshDelayMs('not-a-jwt');
+    expect(delay).toBe(TOKEN_REFRESH_FLOOR_MS);
+  });
+
+  it('falls back to floor when token has no exp claim', () => {
+    const now = 1_000_000_000_000;
+    const header = Buffer.from(JSON.stringify({ alg: 'HS256' })).toString('base64url');
+    const payload = Buffer.from(JSON.stringify({ sub: 'test' })).toString('base64url');
+    const token = `${header}.${payload}.sig`;
+    expect(computeRefreshDelayMs(token, now)).toBe(TOKEN_REFRESH_FLOOR_MS);
+  });
+
+  it('is at ceiling for a fresh standard 1h token', () => {
+    // 75% of 3600s = 2700s which is 45 min — within [3 min, 55 min]
+    const now = 1_000_000_000_000;
+    const expSec = Math.floor(now / 1000) + 3600;
+    const delay = computeRefreshDelayMs(mockJwtWithExp(expSec), now);
+    expect(delay).toBeGreaterThanOrEqual(TOKEN_REFRESH_FLOOR_MS);
+    expect(delay).toBeLessThanOrEqual(TOKEN_REFRESH_CEILING_MS);
+  });
+});
 
 // ── strVal ───────────────────────────────────────────────────────────────────
 describe('strVal', () => {
@@ -254,6 +307,61 @@ describe('validateBranchName', () => {
   });
 });
 
+// ── deriveTaskBranch ─────────────────────────────────────────────────────────
+// Pins the task-type → branch-prefix mapping so drift between the agent and
+// backend/app/services.py _TASK_TYPE_BRANCH_PREFIX is caught immediately.
+describe('deriveTaskBranch', () => {
+  const taskId = 'abcdef12-3456-7890-abcd-ef1234567890';
+  const shortId = 'abcdef12'; // taskId.replace(/-/g,'').slice(0,8)
+
+  it('maps refactor → refactor prefix', () => {
+    expect(deriveTaskBranch('refactor', taskId)).toBe(`blueprint/refactor-${shortId}`);
+  });
+
+  it('maps docs → docs prefix', () => {
+    expect(deriveTaskBranch('docs', taskId)).toBe(`blueprint/docs-${shortId}`);
+  });
+
+  it('maps deps → deps prefix', () => {
+    expect(deriveTaskBranch('deps', taskId)).toBe(`blueprint/deps-${shortId}`);
+  });
+
+  it('maps migrate → migrate prefix', () => {
+    expect(deriveTaskBranch('migrate', taskId)).toBe(`blueprint/migrate-${shortId}`);
+  });
+
+  it('defaults unknown types to task prefix', () => {
+    expect(deriveTaskBranch('create', taskId)).toBe(`blueprint/task-${shortId}`);
+    expect(deriveTaskBranch('qa', taskId)).toBe(`blueprint/task-${shortId}`);
+    expect(deriveTaskBranch('fix', taskId)).toBe(`blueprint/task-${shortId}`);
+    expect(deriveTaskBranch('review', taskId)).toBe(`blueprint/task-${shortId}`);
+    expect(deriveTaskBranch('', taskId)).toBe(`blueprint/task-${shortId}`);
+  });
+
+  it('TASK_TYPE_BRANCH_PREFIX covers all explicitly-mapped types', () => {
+    // Keep in sync with backend/app/shared_state.py TASK_TYPE_BRANCH_PREFIX
+    expect(TASK_TYPE_BRANCH_PREFIX).toEqual({
+      refactor: 'refactor',
+      docs: 'docs',
+      deps: 'deps',
+      migrate: 'migrate',
+    });
+  });
+
+  it('uses first 8 hex chars of task UUID with dashes removed', () => {
+    const id = '11223344-aaaa-bbbb-cccc-ddddeeee0000';
+    expect(deriveTaskBranch('refactor', id)).toBe('blueprint/refactor-11223344');
+  });
+
+  it('accepts a per-project namespace argument', () => {
+    const id = '11223344-aaaa-bbbb-cccc-ddddeeee0000';
+    expect(deriveTaskBranch('refactor', id, 'autoproj')).toBe('autoproj/refactor-11223344');
+    expect(deriveTaskBranch('docs', id, 'bot')).toBe('bot/docs-11223344');
+    // Default still matches the Blueprint self-repo namespace byte-for-byte.
+    expect(deriveTaskBranch('refactor', id)).toBe('blueprint/refactor-11223344');
+  });
+});
+
 // ── FailureCategory ──────────────────────────────────────────────────────────
 describe('FailureCategory', () => {
   const expectedCategories: FailureCategory[] = [
@@ -349,245 +457,6 @@ describe('readHandlerOutput', () => {
     expect(mockReadFileSync).toHaveBeenCalledWith('/tmp/review_verdict_myTask.json', 'utf-8');
   });
 });
-
-// ── runProjectLintChecks ──────────────────────────────────────────────────────
-describe('runProjectLintChecks', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    // Return empty string (not Buffer) so sendLog/sanitize don't receive a Buffer
-    (vi.mocked(execFileSync) as unknown as { mockReturnValue: (v: string) => void }).mockReturnValue('');
-    vi.mocked(execSync).mockReturnValue('');
-  });
-
-  it('uses dynamic lint_cmd when buildConfig is provided with a touched directory', () => {
-    runProjectLintChecks(['frontend/src/App.tsx'], null, {
-      directories: [{ path: 'frontend', type: 'node', lint_cmd: 'npm run lint' }],
-    });
-    expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
-      'npm', ['run', 'lint'], expect.objectContaining({ cwd: expect.stringContaining('frontend') as unknown as string }),
-    );
-  });
-
-  it('uses dynamic build_cmd when buildConfig is provided with a touched directory', () => {
-    runProjectLintChecks(['myapp/src/index.ts'], null, {
-      directories: [{ path: 'myapp', type: 'node', build_cmd: 'npm run build' }],
-    });
-    expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
-      'npm', ['run', 'build'], expect.objectContaining({ cwd: expect.stringContaining('myapp') as unknown as string }),
-    );
-  });
-
-  it('skips directories not touched by changedPaths when buildConfig is provided', () => {
-    // Clear the execFileSync call count specifically for this assertion
-    vi.mocked(execFileSync).mockClear();
-    runProjectLintChecks(['unrelated/file.ts'], null, {
-      directories: [{ path: 'backend', type: 'python', lint_cmd: 'ruff check .' }],
-    });
-    // execFileSync should not be called for lint/build since the directory wasn't touched
-    const lintBuildCalls = vi.mocked(execFileSync).mock.calls.filter(
-      args => args[0] !== 'rm',
-    );
-    expect(lintBuildCalls.length).toBe(0);
-  });
-
-  it('falls back to hardcoded admin-ui checks when buildConfig is undefined and admin-ui touched', () => {
-    runProjectLintChecks(['admin-ui/src/App.tsx'], null, undefined);
-    const adminUiCalls = vi.mocked(execFileSync).mock.calls
-      .filter(([, , options]) => ((options as { cwd?: string } | undefined)?.cwd?.includes('/admin-ui')) ?? false)
-      .map(([cmd, args]) => `${cmd} ${(args as string[]).join(' ')}`);
-    expect(adminUiCalls).toEqual([
-      'npm ci',
-      'npx eslint .',
-      'npx playwright install chromium',
-      'npm run test:viewport',
-      'npm run build',
-    ]);
-  });
-
-  it('uses the Playwright install timeout for hardcoded admin-ui browser provisioning', () => {
-    runProjectLintChecks(['admin-ui/src/App.tsx'], null, undefined);
-    const installCall = vi.mocked(execFileSync).mock.calls.find(
-      ([cmd, args]) => cmd === 'npx' && Array.isArray(args) && args.join(' ') === 'playwright install chromium',
-    );
-    expect(defined(installCall)[2]).toEqual(expect.objectContaining({
-      timeout: FRONTEND_PLAYWRIGHT_INSTALL_TIMEOUT,
-    }));
-  });
-
-  it('skips Playwright install when Chromium is already cached', () => {
-    vi.clearAllMocks();
-    vi.mocked(fs.existsSync).mockImplementation((path: unknown) => {
-      const pathStr = typeof path === 'string' ? path : '';
-      return pathStr.includes('.cache/ms-playwright');
-    });
-    (vi.mocked(fs.readdirSync) as ReturnType<typeof vi.fn>).mockReturnValue(['chromium-1234']);
-
-    runProjectLintChecks(['admin-ui/src/App.tsx'], null, undefined);
-    const installCalls = vi.mocked(execFileSync).mock.calls.filter(
-      ([cmd, args]) => cmd === 'npx' && Array.isArray(args) && (args as string[])[0] === 'playwright',
-    );
-    expect(installCalls).toHaveLength(0);
-  });
-
-  it('falls back to --with-deps when plain Playwright install fails', () => {
-    vi.clearAllMocks();
-    // Mock that chromium is not cached
-    vi.mocked(fs.existsSync).mockReturnValue(false);
-    vi.mocked(fs.readdirSync).mockReturnValue([]);
-
-    let callCount = 0;
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown, args: unknown) => {
-      // First call to 'npx playwright install chromium' fails
-      if (cmd === 'npx' && Array.isArray(args) && args.join(' ') === 'playwright install chromium') {
-        if (callCount === 0) {
-          callCount++;
-          throw new Error('install failed');
-        }
-      }
-      return '';
-    });
-
-    runProjectLintChecks(['admin-ui/src/App.tsx'], null, undefined);
-    // Should call both plain and --with-deps versions
-    const installCalls = vi.mocked(execFileSync).mock.calls.filter(
-      ([cmd, args]) => cmd === 'npx' && Array.isArray(args) && (args as string[])[0] === 'playwright',
-    );
-    expect(installCalls.length).toBeGreaterThanOrEqual(1);
-    // Should have tried the --with-deps fallback
-    const withDepsCall = installCalls.find(
-      ([, args]) => Array.isArray(args) && args.includes('--with-deps'),
-    );
-    expect(withDepsCall).toBeDefined();
-  });
-
-  it('runProjectLintChecks wires runViewportSuiteWithFallback into the admin-ui path', () => {
-    // Verify that the admin-ui branch uses runViewportSuiteWithFallback (calls npm run test:viewport)
-    // and that the call exists at all — this test will break loudly if a future merge removes it.
-    runProjectLintChecks(['admin-ui/src/App.tsx'], null, undefined);
-    const viewportCall = vi.mocked(execFileSync).mock.calls.find(
-      ([cmd, args]) => cmd === 'npm' && Array.isArray(args) && args.join(' ') === 'run test:viewport',
-    );
-    expect(viewportCall).toBeDefined();
-  });
-
-  it('falls back to hardcoded agent checks when buildConfig is undefined and agent/ touched', () => {
-    runProjectLintChecks(['agent/src/index.ts'], null, undefined);
-    expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
-      'npx', ['tsc', '--noEmit'], expect.any(Object),
-    );
-  });
-
-  it('is_self_repo triggers fallback: resolveBuildConfig returns undefined for is_self_repo=true', () => {
-    // When is_self_repo=true, resolveBuildConfig returns undefined, so the
-    // hardcoded fallback runs even if build_config data is present.
-    // Simulate: call runProjectLintChecks with undefined (what resolveBuildConfig returns)
-    runProjectLintChecks(['backend/app/main.py'], null, undefined);
-    // Should use hardcoded ruff check (via execFileSync for the try/catch ruff path)
-    // We just verify it doesn't throw and execFileSync was called for something
-    expect(typeof runProjectLintChecks).toBe('function');
-  });
-});
-
-describe('isViewportBootstrapFailure', () => {
-  it('matches missing-library signatures', () => {
-    expect(isViewportBootstrapFailure('error: libatk-1.0.so.0: cannot open shared object file')).toBe(true);
-    expect(isViewportBootstrapFailure('error loading libnss3.so')).toBe(true);
-    expect(isViewportBootstrapFailure('libgbm.so.1 not found')).toBe(true);
-    expect(isViewportBootstrapFailure('cannot find libxkbcommon')).toBe(true);
-    expect(isViewportBootstrapFailure('libxcomposite.so missing')).toBe(true);
-    expect(isViewportBootstrapFailure('libasound.so.2 not present')).toBe(true);
-    expect(isViewportBootstrapFailure('cannot open shared object file: no such file')).toBe(true);
-    expect(isViewportBootstrapFailure('host system is missing dependencies')).toBe(true);
-    expect(isViewportBootstrapFailure("executable doesn't exist at /usr/bin/chromium")).toBe(true);
-  });
-
-  it('does not match generic launch failures or real test failures', () => {
-    expect(isViewportBootstrapFailure('browserType.launch: Target page, context or browser has been closed')).toBe(false);
-    expect(isViewportBootstrapFailure('failed to launch browser: error while loading')).toBe(false);
-    expect(isViewportBootstrapFailure('AssertionError: expected 375 to equal 1280')).toBe(false);
-    expect(isViewportBootstrapFailure('Error: expect(received).toBe(expected)')).toBe(false);
-  });
-});
-
-describe('runViewportSuiteWithFallback', () => {
-  beforeEach(() => {
-    vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
-  });
-
-  it('runs npm run test:viewport and returns on success', () => {
-    runViewportSuiteWithFallback('/workspace/admin-ui', {}, 60000);
-    expect(vi.mocked(execFileSync)).toHaveBeenCalledWith(
-      'npm', ['run', 'test:viewport'], expect.objectContaining({ cwd: '/workspace/admin-ui' }),
-    );
-  });
-
-  it('rethrows non-bootstrap failures without Docker retry', () => {
-    vi.mocked(execFileSync).mockImplementationOnce(() => {
-      throw new Error('AssertionError: expected true to be false');
-    });
-    expect(() => { runViewportSuiteWithFallback('/workspace/admin-ui', {}, 60000); }).toThrow('AssertionError');
-    const dockerCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'docker');
-    expect(dockerCall).toBeUndefined();
-  });
-
-  it('retries via Docker on bootstrap failure and passes VITE_ env vars', () => {
-    vi.mocked(execFileSync).mockImplementationOnce(() => {
-      throw new Error('libatk-1.0.so.0: cannot open shared object file');
-    });
-    vi.mocked(execFileSync).mockReturnValueOnce(Buffer.from(''));
-    const env = { VITE_API_URL: 'http://localhost:8080', VITE_FIREBASE_PROJECT_ID: 'ci', HOME: '/root' };
-    runViewportSuiteWithFallback('/workspace/admin-ui', env, 60000);
-    const dockerCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'docker');
-    expect(dockerCall).toBeDefined();
-    const dockerArgs = defined(dockerCall)[1] as string[];
-    expect(dockerArgs).toContain('mcr.microsoft.com/playwright:v1.59.1-jammy');
-    expect(dockerArgs).toContain('--env');
-    expect(dockerArgs).toContain('VITE_API_URL=http://localhost:8080');
-    // Non-VITE_ vars should not be passed
-    const homeEnvIdx = dockerArgs.findIndex(a => a.startsWith('HOME='));
-    expect(homeEnvIdx).toBe(-1);
-  });
-
-  it('gracefully skips when docker is unavailable', () => {
-    const sendMock = vi.fn();
-    const mockWs = { send: sendMock, readyState: 1 } as unknown as WebSocket;
-    vi.mocked(execFileSync).mockImplementationOnce(() => {
-      throw new Error('libatk-1.0.so.0: cannot open shared object file');
-    });
-    vi.mocked(execFileSync).mockImplementationOnce(() => {
-      throw new Error('command not found: docker');
-    });
-    runViewportSuiteWithFallback('/workspace/admin-ui', {}, 60000, mockWs);
-    expect(sendMock).toHaveBeenCalledWith(
-      expect.stringContaining('viewport suite skipped'),
-    );
-  });
-
-  it('gracefully skips on Docker file-import errors', () => {
-    const sendMock = vi.fn();
-    const mockWs = { send: sendMock, readyState: 1 } as unknown as WebSocket;
-    vi.mocked(execFileSync).mockImplementationOnce(() => {
-      throw new Error('libatk-1.0.so.0: cannot open shared object file');
-    });
-    vi.mocked(execFileSync).mockImplementationOnce(() => {
-      throw new Error('Error: Cannot find module "@vite/something"');
-    });
-    runViewportSuiteWithFallback('/workspace/admin-ui', {}, 60000, mockWs);
-    expect(sendMock).toHaveBeenCalled();
-  });
-
-  it('rethrows Docker test assertion failures', () => {
-    vi.mocked(execFileSync).mockImplementationOnce(() => {
-      throw new Error('libatk-1.0.so.0: cannot open shared object file');
-    });
-    vi.mocked(execFileSync).mockImplementationOnce(() => {
-      throw new Error('Tests 1 failed');
-    });
-    expect(() => { runViewportSuiteWithFallback('/workspace/admin-ui', {}, 60000); }).toThrow('Tests 1 failed');
-  });
-});
-
 // Helper: spawn mock that emits close(code) immediately for each spawn call.
 // `failCmds` maps command names to (exitCode, stderr) for failing runners.
 // `npm ci` (dep install) is never failed even when `npm` is in failCmds —
@@ -774,164 +643,6 @@ describe('errorFingerprint', () => {
   });
 });
 
-// ── isInfrastructureFailure ──────────────────────────────────────────────────
-describe('isInfrastructureFailure', () => {
-  it('detects "command not found"', () => {
-    expect(isInfrastructureFailure('command not found: ruff')).toBe(true);
-  });
-
-  it('detects ENOENT', () => {
-    expect(isInfrastructureFailure('spawn ruff ENOENT')).toBe(true);
-  });
-
-  it('detects Cannot connect to Docker daemon', () => {
-    expect(isInfrastructureFailure('Cannot connect to Docker daemon')).toBe(true);
-  });
-
-  it('detects exit 137 (OOM)', () => {
-    expect(isInfrastructureFailure('Command failed with exit 137')).toBe(true);
-  });
-
-  it('detects EOOM (OOM code)', () => {
-    expect(isInfrastructureFailure('Error code: EOOM')).toBe(true);
-  });
-
-  it('detects out of memory', () => {
-    expect(isInfrastructureFailure('Process killed: out of memory')).toBe(true);
-  });
-
-  it('detects SIGKILL + OOM pattern', () => {
-    expect(isInfrastructureFailure('Killed signal: SIGKILL, reason: OOM')).toBe(true);
-  });
-
-  it('detects ETIMEDOUT', () => {
-    expect(isInfrastructureFailure('Error: ETIMEDOUT process timeout')).toBe(true);
-  });
-
-  it('detects spawn timeout', () => {
-    expect(isInfrastructureFailure('spawn timeout: process did not start')).toBe(true);
-  });
-
-  it('detects ECONNREFUSED (DNS/network)', () => {
-    expect(isInfrastructureFailure('ECONNREFUSED localhost:5432')).toBe(true);
-  });
-
-  it('detects ENOTFOUND (DNS)', () => {
-    expect(isInfrastructureFailure('getaddrinfo ENOTFOUND example.com')).toBe(true);
-  });
-
-  it('detects ENETUNREACH (network)', () => {
-    expect(isInfrastructureFailure('Network is unreachable ENETUNREACH')).toBe(true);
-  });
-
-  it('detects chromium + sudo issue', () => {
-    expect(isInfrastructureFailure('Chromium installation requires sudo: sudo apt-get install')).toBe(true);
-  });
-
-  it('detects chromium + permission denied', () => {
-    expect(isInfrastructureFailure('Chromium: permission denied when installing')).toBe(true);
-  });
-
-  it('detects docker daemon unavailable', () => {
-    expect(isInfrastructureFailure('Docker daemon is unavailable')).toBe(true);
-  });
-
-  it('returns false for genuine lint/code errors', () => {
-    expect(isInfrastructureFailure('error: unexpected semicolon on line 42')).toBe(false);
-  });
-
-  it('returns false for test assertion failures', () => {
-    expect(isInfrastructureFailure('AssertionError: expected foo to equal bar')).toBe(false);
-  });
-
-  it('returns false for type errors', () => {
-    expect(isInfrastructureFailure('TS2339: Property "foo" does not exist on type "Bar"')).toBe(false);
-  });
-
-  it('is case-insensitive', () => {
-    expect(isInfrastructureFailure('CANNOT CONNECT TO DOCKER DAEMON')).toBe(true);
-    expect(isInfrastructureFailure('Command NOT Found')).toBe(true);
-  });
-});
-
-describe('lintFixLoop early exit on identical errors', () => {
-  beforeEach(() => {
-    _resetFixLoopEventStateForTesting();
-    vi.mocked(execFileSync).mockReset();
-    vi.mocked(spawn).mockImplementation(() => {
-      const proc = {
-        pid: 123, stderr: { on: vi.fn() }, stdout: { on: vi.fn() },
-        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
-          if (event === 'close') setImmediate(() => { cb(0); });
-        }),
-        kill: vi.fn(),
-      };
-      return proc as unknown as ReturnType<typeof spawn>;
-    });
-  });
-
-  it('exits early when consecutive lint errors are identical', async () => {
-    const buildConfig = { directories: [{ path: 'agent', type: 'node', lint_cmd: 'npm run lint' }] };
-    const errorMessage = 'eslint: no-unused-vars at foo.ts:1:1';
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'npm') throw new Error(errorMessage);
-      return '' as unknown as ReturnType<typeof execFileSync>;
-    });
-
-    const result = await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
-    expect(result.passed).toBe(false);
-    expect(result.exitReason).toBe('early_unchanged');
-    expect(result.lastErrorTail).toContain('eslint');
-    const npmCalls = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'npm').length;
-    expect(npmCalls).toBeLessThanOrEqual(2);
-  });
-
-  it('continues when lint errors differ between attempts', async () => {
-    const buildConfig = { directories: [{ path: 'agent', type: 'node', lint_cmd: 'npm run lint' }] };
-    let callCount = 0;
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'npm') {
-        callCount++;
-        throw new Error(`eslint error variant ${callCount}`);
-      }
-      return '' as unknown as ReturnType<typeof execFileSync>;
-    });
-
-    await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
-    const npmCalls = vi.mocked(execFileSync).mock.calls.filter(c => c[0] === 'npm').length;
-    expect(npmCalls).toBe(MAX_LINT_FIX_ATTEMPTS);  // tracks the constant rather than hardcoding 3
-  });
-
-  it('emits one fix-loop telemetry event per iteration with terminal exit_reason on the final attempt', async () => {
-    const buildConfig = { directories: [{ path: 'agent', type: 'node', lint_cmd: 'npm run lint' }] };
-    let callCount = 0;
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'npm') {
-        callCount++;
-        throw new Error(`eslint error variant ${callCount}`);
-      }
-      return '' as unknown as ReturnType<typeof execFileSync>;
-    });
-
-    await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
-    const events = drainFixLoopEventBuffer();
-    expect(events.length).toBe(MAX_LINT_FIX_ATTEMPTS);
-    expect(events.map(e => e.iteration)).toEqual(
-      Array.from({ length: MAX_LINT_FIX_ATTEMPTS }, (_, i) => i + 1),
-    );
-    expect(events.every(e => e.loop === 'lint')).toBe(true);
-    expect(events.every(e => e.source === 'agent_emitted')).toBe(true);
-    // All but the last are mid-loop (in_progress); the last is terminal.
-    for (let i = 0; i < events.length - 1; i++) {
-      expect(events[i].exit_reason).toBe('in_progress');
-    }
-    expect(events[events.length - 1].exit_reason).toBe('max_attempts');
-    // Each event carries an error_tail and a fingerprint hash.
-    expect(events[0].error_tail).toContain('eslint');
-    expect(events[0].fingerprint_hash).toMatch(/^[0-9a-f]{16}$/);
-  });
-});
-
 // ── jaccardSimilarity unit tests ─────────────────────────────────────────────
 describe('jaccardSimilarity', () => {
   it('returns 1 for identical strings', () => {
@@ -993,217 +704,6 @@ describe('detectLoopDivergence', () => {
     const fps = ['fp1', 'fp2', 'fp3'];
     const errs = ['error 1', 'error 2', 'error 3'];
     expect(detectLoopDivergence(fps, errs, prevDiff, currDiff)).toBeNull();
-  });
-});
-
-// ── lintFixLoop divergence detection ─────────────────────────────────────────
-describe('lintFixLoop divergence detection', () => {
-  const buildConfig = { directories: [{ path: 'agent', type: 'node', lint_cmd: 'npm run lint' }] };
-
-  beforeEach(() => {
-    _resetFixLoopEventStateForTesting();
-    vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
-    vi.mocked(execSync).mockReset();
-    vi.mocked(execSync).mockReturnValue('');
-    vi.mocked(spawn).mockImplementation(() => {
-      const proc = {
-        pid: 123, stderr: { on: vi.fn() }, stdout: { on: vi.fn() },
-        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
-          if (event === 'close') setImmediate(() => { cb(0); });
-        }),
-        kill: vi.fn(),
-      };
-      return proc as unknown as ReturnType<typeof spawn>;
-    });
-  });
-
-  it('exits with divergence_oscillation when errors oscillate A→B→A', async () => {
-    const errors = ['eslint: no-unused-vars unique_A', 'eslint: missing-semicolon unique_B', 'eslint: no-unused-vars unique_A'];
-    let callCount = 0;
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'npm') throw new Error(errors[Math.min(callCount++, errors.length - 1)]);
-      return '' as unknown as ReturnType<typeof execFileSync>;
-    });
-
-    const result = await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
-    expect(result.passed).toBe(false);
-    expect(result.exitReason).toBe('divergence_oscillation');
-    const events = drainFixLoopEventBuffer();
-    expect(events.some(e => e.exit_reason === 'divergence_oscillation')).toBe(true);
-  });
-
-  it('exits with divergence_similar_error when errors are Jaccard-similar across 3 iterations', async () => {
-    // Each error differs by 1 token out of 10 — Jaccard ≈ 9/11 ≈ 0.82 > 0.8 threshold.
-    // The unique suffixes ensure fingerprints differ (no early_unchanged trigger).
-    const base = 'TypeError property foo undefined at baz module context error';
-    const errors = [`${base} alpha`, `${base} bravo`, `${base} charlie`];
-    let callCount = 0;
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'npm') throw new Error(errors[Math.min(callCount++, errors.length - 1)]);
-      return '' as unknown as ReturnType<typeof execFileSync>;
-    });
-
-    const result = await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
-    expect(result.passed).toBe(false);
-    expect(result.exitReason).toBe('divergence_similar_error');
-    const events = drainFixLoopEventBuffer();
-    expect(events.some(e => e.exit_reason === 'divergence_similar_error')).toBe(true);
-  });
-
-  it('exits with divergence_diff_revert when second Claude iteration reverts first', async () => {
-    const errors = ['Error alpha unique_one', 'Error beta unique_two', 'Error gamma unique_three'];
-    let callCount = 0;
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'npm') throw new Error(errors[Math.min(callCount++, errors.length - 1)]);
-      return '' as unknown as ReturnType<typeof execFileSync>;
-    });
-    // First diff capture: prevDiff has 5 added lines
-    // Second diff capture: currDiff has none of those lines (full revert)
-    let diffCallCount = 0;
-    vi.mocked(execSync).mockImplementation((cmd: unknown) => {
-      if (typeof cmd === 'string' && cmd.includes('git diff HEAD --no-color')) {
-        diffCallCount++;
-        if (diffCallCount === 1) return '+line_a\n+line_b\n+line_c\n+line_d\n+line_e\n';
-        return '+line_x\n+line_y\n';  // all 5 prev lines gone — 100% revert
-      }
-      return '';
-    });
-
-    const result = await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
-    expect(result.passed).toBe(false);
-    expect(result.exitReason).toBe('divergence_diff_revert');
-    const events = drainFixLoopEventBuffer();
-    expect(events.some(e => e.exit_reason === 'divergence_diff_revert')).toBe(true);
-  });
-
-  it('does not fire divergence on first 2 iterations — needs 3 entries in history', async () => {
-    // With only 2 distinct errors (A then B then B again), early_unchanged fires at attempt 2
-    // because B==B; divergence never gets to check (history has only 2 entries when B first appears).
-    const errors = ['Error alpha unique_A', 'Error bravo unique_B'];
-    let callCount = 0;
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'npm') throw new Error(errors[Math.min(callCount++, errors.length - 1)]);
-      return '' as unknown as ReturnType<typeof execFileSync>;
-    });
-
-    const result = await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
-    expect(result.passed).toBe(false);
-    // early_unchanged fires at attempt 2 (B == B); divergence never triggered
-    expect(result.exitReason).toBe('early_unchanged');
-  });
-});
-
-// ── lintFixLoop infrastructure failure detection ────────────────────────────────
-describe('lintFixLoop infrastructure failure detection', () => {
-  beforeEach(() => {
-    _resetFixLoopEventStateForTesting();
-    vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
-    vi.mocked(spawn).mockReset();
-  });
-
-  it('detects docker unavailable and abandons without invoking Claude', async () => {
-    const infraError = 'Command failed: docker run -v /workspace:/workspace ... Cannot connect to Docker daemon';
-    const buildConfig = { directories: [{ path: 'admin-ui', type: 'node', lint_cmd: 'npm run lint' }] };
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'npm') throw new Error(infraError);
-      return '' as unknown as ReturnType<typeof execFileSync>;
-    });
-
-    const result = await lintFixLoop(['admin-ui/src/foo.tsx'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
-    expect(result.passed).toBe(false);
-    expect(result.setupFailed).toBe(true);
-    expect(result.infraFailureSummary).toContain('Cannot connect to Docker daemon');
-    // Claude MUST NOT be invoked for infra failures.
-    const claudeCalls = vi.mocked(spawn).mock.calls.filter(c => c[0].includes('claude')).length;
-    expect(claudeCalls).toBe(0);
-    // An infra abandon is NOT a lint outcome — it must emit no fix-loop event,
-    // matching the testFixLoop setup-failure precedent. Emitting one with
-    // exit_reason 'passed' (a backend _FIX_LOOP_SUCCESS_REASONS member) would
-    // misclassify the failure as a successful loop and hide it from operators.
-    expect(drainFixLoopEventBuffer()).toHaveLength(0);
-  });
-
-  it('detects chromium/sudo permission issue and abandons without invoking Claude', async () => {
-    const infraError = 'Error: Chromium installation requires sudo: sudo apt-get install ...';
-    const buildConfig = { directories: [{ path: 'admin-ui', type: 'node', lint_cmd: 'npm run lint' }] };
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'npm') throw new Error(infraError);
-      return '' as unknown as ReturnType<typeof execFileSync>;
-    });
-
-    const result = await lintFixLoop(['admin-ui/src/foo.tsx'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
-    expect(result.passed).toBe(false);
-    expect(result.setupFailed).toBe(true);
-    expect(result.infraFailureSummary).toContain('Chromium');
-    const claudeCalls = vi.mocked(spawn).mock.calls.filter(c => c[0].includes('claude')).length;
-    expect(claudeCalls).toBe(0);
-  });
-
-  it('detects ENOENT (command not found) and abandons without invoking Claude', async () => {
-    const infraError = 'Command failed: ruff\nError: spawn ruff ENOENT';
-    const buildConfig = { directories: [{ path: 'backend', type: 'python', lint_cmd: 'python3 -m ruff check' }] };
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'python3') throw new Error(infraError);
-      return '' as unknown as ReturnType<typeof execFileSync>;
-    });
-
-    const result = await lintFixLoop(['backend/app/foo.py'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
-    expect(result.passed).toBe(false);
-    expect(result.setupFailed).toBe(true);
-    const claudeCalls = vi.mocked(spawn).mock.calls.filter(c => c[0].includes('claude')).length;
-    expect(claudeCalls).toBe(0);
-  });
-
-  it('detects exit 137 (OOM) and abandons without invoking Claude', async () => {
-    const infraError = 'Command failed: npm run build\nexit 137 — out of memory';
-    const buildConfig = { directories: [{ path: 'admin-ui', type: 'node', build_cmd: 'npm run build' }] };
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      if (cmd === 'npm') throw new Error(infraError);
-      return '' as unknown as ReturnType<typeof execFileSync>;
-    });
-
-    const result = await lintFixLoop(['admin-ui/src/foo.tsx'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
-    expect(result.passed).toBe(false);
-    expect(result.setupFailed).toBe(true);
-    const claudeCalls = vi.mocked(spawn).mock.calls.filter(c => c[0].includes('claude')).length;
-    expect(claudeCalls).toBe(0);
-  });
-
-  it('still invokes Claude for genuine lint/build code errors (not infra)', async () => {
-    const lintError = 'error: unexpected semicolon on line 42';
-    const buildConfig = { directories: [{ path: 'agent', type: 'node', lint_cmd: 'npm run lint' }] };
-    let callCount = 0;
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      // First run: throw lint error. On retry after Claude, pass.
-      if (cmd === 'npm' && callCount === 0) {
-        callCount++;
-        throw new Error(lintError);
-      }
-      return '' as unknown as ReturnType<typeof execFileSync>;
-    });
-    vi.mocked(spawn).mockImplementation((_cmd: unknown) => {
-      // Claude (spawn, not execFileSync) succeeds on first call
-      const proc = {
-        stdin: { on: vi.fn(), end: vi.fn() },
-        stderr: { on: vi.fn() },
-        stdout: { on: vi.fn() },
-        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
-          if (event === 'close') {
-            setImmediate(() => { cb(0); });
-          }
-        }),
-        kill: vi.fn(),
-      };
-      return proc as unknown as ReturnType<typeof spawn>;
-    });
-
-    const result = await lintFixLoop(['agent/src/foo.ts'], null, { value: '' }, 'ctx', undefined, undefined, buildConfig);
-    expect(result.passed).toBe(true);
-    // Claude was invoked for the genuine lint error
-    const claudeCalls = vi.mocked(spawn).mock.calls.filter(c => c[0].includes('claude')).length;
-    expect(claudeCalls).toBeGreaterThan(0);
   });
 });
 
@@ -1452,6 +952,14 @@ describe('matchesRateLimit', () => {
 
   it('detects "you\'ve hit your session limit" for default provider (anthropic/oauth)', () => {
     expect(matchesRateLimit("you've hit your session limit · resets 7:10am (UTC)")).toBe(true);
+  });
+
+  it('detects "you\'ve hit your weekly limit" for anthropic/oauth', () => {
+    expect(matchesRateLimit("You've hit your weekly limit · resets 9pm (UTC)", 'anthropic', 'oauth')).toBe(true);
+  });
+
+  it('detects "you\'ve hit your weekly limit" for default provider (anthropic/oauth)', () => {
+    expect(matchesRateLimit("You've hit your weekly limit · resets 9pm (UTC)")).toBe(true);
   });
 
   it('detects structured api_error_status:429 in transcript regardless of provider', () => {
@@ -3775,6 +3283,82 @@ describe('fetchVmImageIdentity', () => {
   });
 });
 
+describe('agent runtime fingerprint heartbeats', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+  const runtimeFingerprint = 'a'.repeat(64);
+
+  beforeEach(() => {
+    fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    _setAgentRuntimeFingerprintForTesting(runtimeFingerprint);
+  });
+
+  afterEach(() => {
+    _stopHeartbeatForTesting();
+    _setAgentRuntimeFingerprintForTesting(null);
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('includes agent_runtime_fingerprint in /api/agent/vm-heartbeat payloads', async () => {
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/vm-heartbeat')) {
+        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
+      }
+      return Promise.resolve({
+        status: 200,
+        json: () => Promise.resolve({ action: 'exit', reason: 'done' }),
+      });
+    });
+
+    const result = await pollForNextRole({
+      vmInstanceId: 'vm-runtime-fp',
+      priorTaskId: 'task-runtime-fp',
+      priorPrNumber: null,
+      apiBase: 'http://api.test',
+      agentJwt: 'jwt-runtime-fp',
+      pollIntervalMs: 10,
+      timeoutMs: 1000,
+      heartbeatIntervalMs: 60_000,
+    });
+
+    expect(result).toEqual({ action: 'exit', reason: 'done' });
+    const vmHeartbeatCall = fetchMock.mock.calls.find(
+      ([url]) => String(url).endsWith('/api/agent/vm-heartbeat'),
+    );
+    expect(vmHeartbeatCall).toBeDefined();
+    const vmHeartbeatBody = (vmHeartbeatCall?.[1] as RequestInit | undefined)?.body;
+    expect(typeof vmHeartbeatBody).toBe('string');
+    const body = JSON.parse(
+      defined(typeof vmHeartbeatBody === 'string' ? vmHeartbeatBody : undefined),
+    ) as { agent_runtime_fingerprint?: string };
+    expect(body.agent_runtime_fingerprint).toBe(runtimeFingerprint);
+  });
+
+  it('includes agent_runtime_fingerprint in /api/agent/heartbeat payloads', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({}),
+    });
+
+    _startHeartbeatForTesting('task-runtime-fp', () => 'heartbeat-ok');
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const heartbeatCall = fetchMock.mock.calls.find(
+      ([url]) => String(url).endsWith('/api/agent/heartbeat'),
+    );
+    expect(heartbeatCall).toBeDefined();
+    const heartbeatBody = (heartbeatCall?.[1] as RequestInit | undefined)?.body;
+    expect(typeof heartbeatBody).toBe('string');
+    const body = JSON.parse(
+      defined(typeof heartbeatBody === 'string' ? heartbeatBody : undefined),
+    ) as { task_id?: string; agent_runtime_fingerprint?: string };
+    expect(body.task_id).toBe('task-runtime-fp');
+    expect(body.agent_runtime_fingerprint).toBe(runtimeFingerprint);
+  });
+});
+
 // ── Per-task LLM telemetry (efficiency direction d-91d8dede) ────────────────
 describe('LLM telemetry counters', () => {
   beforeEach(() => {
@@ -3821,6 +3405,47 @@ describe('LLM telemetry counters', () => {
       total_input_tokens: 0,
       total_output_tokens: 0,
     });
+  });
+});
+
+// ── Gemini text-mode token estimation ────────────────────────────────────────
+describe('Gemini text-mode token estimation', () => {
+  beforeEach(() => {
+    resetLlmTelemetry();
+  });
+
+  it('estimateTokensFromChars returns ceil(chars/4)', () => {
+    expect(estimateTokensFromChars(0)).toBe(0);
+    expect(estimateTokensFromChars(1)).toBe(1);
+    expect(estimateTokensFromChars(4)).toBe(1);
+    expect(estimateTokensFromChars(5)).toBe(2);
+    expect(estimateTokensFromChars(400)).toBe(100);
+    expect(estimateTokensFromChars(1000)).toBe(250);
+  });
+
+  it('lands estimated tokens in the same getLlmTelemetry() fields Claude uses', () => {
+    // Simulate what runProviderAgent does for outputMode='text': estimate from
+    // prompt.length and lastResultText.length, then call recordLlmTokens.
+    const promptChars = 2000;  // → 500 estimated input tokens
+    const resultChars = 800;   // → 200 estimated output tokens
+    recordLlmCallStart();
+    recordLlmTokens(estimateTokensFromChars(promptChars), estimateTokensFromChars(resultChars));
+    const telemetry = getLlmTelemetry();
+    expect(telemetry.total_input_tokens).toBe(500);
+    expect(telemetry.total_output_tokens).toBe(200);
+    expect(telemetry.llm_call_count).toBe(1);
+  });
+
+  it('records non-zero tokens on partial output (timeout/kill scenario)', () => {
+    // Even when the Gemini CLI is killed mid-run, lastResultText has partial
+    // output. Verify estimation still produces non-zero values.
+    const fullPromptChars = 5000;
+    const partialResultChars = 100;
+    recordLlmCallStart();
+    recordLlmTokens(estimateTokensFromChars(fullPromptChars), estimateTokensFromChars(partialResultChars));
+    const telemetry = getLlmTelemetry();
+    expect(telemetry.total_input_tokens).toBeGreaterThan(0);
+    expect(telemetry.total_output_tokens).toBeGreaterThan(0);
   });
 });
 

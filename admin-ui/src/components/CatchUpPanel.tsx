@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { RefObject } from 'react';
 import { Clock, ChevronDown, ChevronUp, AlertTriangle, CheckCircle, XCircle, Loader2, Check, RotateCcw, DollarSign, Compass } from 'lucide-react';
 import { apiFetch, API_BASE_URL } from '../api';
@@ -294,6 +294,7 @@ interface DigestData {
     memos_cited?: number | null;
   } | null;
   memo_pathway_exits?: number | null;
+  memo_ever_cited?: { ever_cited: boolean; first_cycle_id: string | null; first_cited_at: string | null } | null;
   recent_cycle_memo_stats?: Array<{ cycle_id: string | null; started_at: string | null; memos_available: number; memos_cited: number }> | null;
   remediation_funnel?: {
     investigations_spawned: number;
@@ -376,7 +377,11 @@ export interface CatchUpPanelProps {
   userEmail?: string | null;
 }
 
-export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: _lastVisitTimestamp, refreshInterval, onSelectTask, needsAttentionCount = 0, onApprove, onRetry, onBulkApprove, onBulkRetry, wsRef, userEmail }: CatchUpPanelProps) {
+function sortDesc<T>(entries: [string, T][], key: (v: T) => number): [string, T][] {
+  return entries.sort((a, b) => key(b[1]) - key(a[1]));
+}
+
+export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: _lastVisitTimestamp, refreshInterval, onSelectTask, onOpenActivityFeed, needsAttentionCount = 0, onApprove, onRetry, onBulkApprove, onBulkRetry, wsRef, userEmail }: CatchUpPanelProps) {
   // Per-operator localStorage key for catch-up viewed timestamp.
   // Falls back to the legacy global key when unauthenticated or email unknown.
   const catchUpViewedKey = userEmail
@@ -612,13 +617,13 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
     setOpenDropdown(null);
   };
 
-  const restoreItem = (taskId: string) => {
+  const restoreItem = useCallback((taskId: string) => {
     const next = Object.fromEntries(
       Object.entries(dismissed).filter(([k]) => k !== taskId)
     ) as DismissedState;
     setDismissed(next);
     saveDismissed(next);
-  };
+  }, [dismissed]);
 
   const isHidden = useCallback((taskId: string): boolean => {
     const entry = dismissed[taskId];
@@ -641,6 +646,14 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
     [visibleItems]
   );
 
+  const handleBulkApproveAll = useCallback(() => {
+    handleBulkApprove(approvalItems.map(i => i.task_id));
+  }, [handleBulkApprove, approvalItems]);
+
+  const handleBulkRetryAll = useCallback(() => {
+    handleBulkRetry(failedItems.map(i => i.task_id));
+  }, [handleBulkRetry, failedItems]);
+
   const toggle = () => {
     const next = !collapsed;
     if (next) {
@@ -654,14 +667,21 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
     localStorage.setItem('blueprint-admin:catchUpPanelCollapsed', String(next));
   };
 
-  const toggleSnippet = (id: string) => {
+  const toggleSnippet = useCallback((id: string) => {
     setExpandedSnippets(prev => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
-  };
+  }, []);
+
+  const handleToggleShowDismissed = useCallback(() => setShowDismissed(v => !v), []);
+  const handleToggleActiveExpanded = useCallback(() => setActiveExpanded(v => !v), []);
+
+  const handleWindowChange = useCallback((e: React.MouseEvent<HTMLButtonElement>) => {
+    setActiveWindow(e.currentTarget.dataset.key as TimeWindow);
+  }, []);
 
   const hasActivity = digest && (
     digest.completed_count > 0 ||
@@ -673,10 +693,8 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
   );
 
   // Failures not already in needs_attention
-  const attentionIds = new Set((digest?.needs_attention ?? []).map(i => i.task_id));
-  const extraFailureGroups = (digest?.failure_groups ?? [])
-    .map(g => ({ ...g, tasks: g.tasks.filter(t => !attentionIds.has(t.task_id)) }))
-    .filter(g => g.tasks.length > 0);
+  const attentionIds = useMemo(() => new Set((digest?.needs_attention ?? []).map(i => i.task_id)), [digest?.needs_attention]);
+  const extraFailureGroups = useMemo(() => (digest?.failure_groups ?? []).map(g => ({ ...g, tasks: g.tasks.filter(t => !attentionIds.has(t.task_id)) })).filter(g => g.tasks.length > 0), [digest?.failure_groups, attentionIds]);
 
   const windowLabels: { key: TimeWindow; label: string }[] = [
     { key: 'last_visit', label: lastCatchUpViewed ? 'Since last visit' : 'Since last visit (24h)' },
@@ -723,6 +741,22 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
   }, [digest?.pipeline_filter_funnel]);
 
   const history = useMemo(() => digest?.trend_history ?? [], [digest?.trend_history]);
+
+  const { frbcEntries, mrbcEntries, cmbcEntries, carTypeEntries, dropOffEntries } = useMemo(() => {
+    const rf = digest?.remediation_funnel;
+    const frbc = rf?.failed_remediations_by_class ?? {};
+    const mrbc = rf?.merged_remediations_by_trigger_class ?? {};
+    const cmbc = rf?.cumulative_merged_by_trigger_class ?? {};
+    const car = rf?.ci_auto_remediation;
+    const dropOff = rf?.diagnosis_drop_off_by_reason ?? {};
+    return {
+      frbcEntries: sortDesc(Object.entries(frbc).filter(([, v]) => v > 0), v => v),
+      mrbcEntries: sortDesc(Object.entries(mrbc).filter(([, v]) => v > 0), v => v),
+      cmbcEntries: sortDesc(Object.entries(cmbc).filter(([, v]) => v > 0), v => v),
+      carTypeEntries: sortDesc(Object.entries(car?.by_ci_failure_type ?? {}).filter(([, v]) => (v.spawned + v.merged + v.failed) > 0), v => v.spawned),
+      dropOffEntries: sortDesc(Object.entries(dropOff).filter(([, v]) => v > 0), v => v),
+    };
+  }, [digest?.remediation_funnel]);
 
   const trendFor = useCallback((cat: string): { arrow: string; color: string } => {
     if (history.length < 4) return { arrow: '–', color: 'text-neutral-500' };
@@ -781,7 +815,8 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
             {windowLabels.map(({ key, label }) => (
               <button
                 key={key}
-                onClick={() => setActiveWindow(key)}
+                onClick={handleWindowChange}
+                data-key={key}
                 aria-pressed={activeWindow === key}
                 className={`px-2 min-h-[44px] flex items-center rounded-full text-[10px] font-medium transition-colors ${
                   activeWindow === key
@@ -792,6 +827,16 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                 {label}
               </button>
             ))}
+            {onOpenActivityFeed && (
+              <button
+                onClick={() => onOpenActivityFeed()}
+                className="px-2 min-h-[44px] flex items-center gap-1 rounded-full text-[10px] font-medium text-neutral-500 hover:text-neutral-300 border border-transparent transition-colors sm:ml-auto"
+                title="Open chronological activity timeline"
+              >
+                <Compass className="w-3 h-3" />
+                Activity
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -892,6 +937,18 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                   <span className="text-[10px] font-semibold text-violet-400 px-1.5 py-0.5 rounded border border-violet-500/30 bg-violet-500/10">
                     {digest.memo_pathway_exits} exit{digest.memo_pathway_exits !== 1 ? 's' : ''}
                   </span>
+                  {digest.memo_ever_cited?.ever_cited ? (
+                    <span
+                      className="text-[10px] font-semibold text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/30 bg-emerald-500/10"
+                      title={digest.memo_ever_cited.first_cited_at ? `first cited ${timeAgo(digest.memo_ever_cited.first_cited_at)}` : undefined}
+                    >
+                      ever cited ✓
+                    </span>
+                  ) : digest.memo_ever_cited != null ? (
+                    <span className="text-[10px] text-neutral-500 px-1.5 py-0.5 rounded border border-neutral-700/50">
+                      not yet cited
+                    </span>
+                  ) : null}
                   {(digest.recent_cycle_memo_stats ?? []).length > 0 && (
                     <div className="flex flex-wrap gap-1">
                       {(digest.recent_cycle_memo_stats ?? []).slice(0, 5).map((s, i) => (
@@ -1278,7 +1335,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                       {onBulkApprove && approvalItems.length >= 2 && (
                         <button
                           className="text-[10px] font-semibold px-2 py-4 rounded border flex items-center gap-1 bg-emerald-500/10 text-emerald-500 hover:bg-emerald-500/20 border-emerald-500/20 normal-case tracking-normal"
-                          onClick={() => handleBulkApprove(approvalItems.map(i => i.task_id))}
+                          onClick={handleBulkApproveAll}
                         >
                           <Check className="w-3 h-3" />
                           Approve all ({approvalItems.length})
@@ -1287,7 +1344,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                       {onBulkRetry && failedItems.length >= 2 && (
                         <button
                           className="text-[10px] font-semibold px-2 py-4 rounded border flex items-center gap-1 bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 border-blue-500/20 normal-case tracking-normal"
-                          onClick={() => handleBulkRetry(failedItems.map(i => i.task_id))}
+                          onClick={handleBulkRetryAll}
                         >
                           <RotateCcw className="w-3 h-3" />
                           Retry all ({failedItems.length})
@@ -1447,7 +1504,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                       <div className="mt-1">
                         <button
                           className="text-[10px] text-neutral-600 hover:text-neutral-400 transition-colors"
-                          onClick={() => setShowDismissed(v => !v)}
+                          onClick={handleToggleShowDismissed}
                         >
                           {showDismissed ? 'Hide dismissed' : `Show ${hiddenItems.length} dismissed`}
                         </button>
@@ -1485,7 +1542,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
               {digest.active_count > 0 && (
                 <div>
                   <button
-                    onClick={() => setActiveExpanded(v => !v)}
+                    onClick={handleToggleActiveExpanded}
                     aria-expanded={activeExpanded}
                     className="flex items-center gap-1.5 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors mb-1.5"
                   >
@@ -2648,19 +2705,9 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                           const confColor: Record<string, string> = { high: 'text-emerald-400', medium: 'text-amber-400', low: 'text-neutral-400' };
                           const ibc = rf.investigations_by_confidence ?? {};
                           const rsbc = rf.remediation_success_by_confidence ?? {};
-                          const frbc = rf.failed_remediations_by_class ?? {};
-                          const mrbc = rf.merged_remediations_by_trigger_class ?? {};
-                          const cmbc = rf.cumulative_merged_by_trigger_class ?? {};
                           const car = rf.ci_auto_remediation;
-                          const dropOff = rf.diagnosis_drop_off_by_reason ?? {};
                           const ibcEntries = confOrder.filter(k => (ibc[k] ?? 0) > 0);
                           const rsbcEntries = confOrder.filter(k => { const v = rsbc[k]; return !!v && (v.merged + v.failed) > 0; });
-                          const sortDesc = <T,>(entries: [string, T][], key: (v: T) => number) => entries.sort((a, b) => key(b[1]) - key(a[1]));
-                          const frbcEntries = sortDesc(Object.entries(frbc).filter(([, v]) => v > 0), v => v);
-                          const mrbcEntries = sortDesc(Object.entries(mrbc).filter(([, v]) => v > 0), v => v);
-                          const cmbcEntries = sortDesc(Object.entries(cmbc).filter(([, v]) => v > 0), v => v);
-                          const carTypeEntries = sortDesc(Object.entries(car?.by_ci_failure_type ?? {}).filter(([, v]) => (v.spawned + v.merged + v.failed) > 0), v => v.spawned);
-                          const dropOffEntries = sortDesc(Object.entries(dropOff).filter(([, v]) => v > 0), v => v);
                           const hasCar = !!car && (car.spawned + car.merged + car.failed) > 0;
                           const dropOffTotal = dropOffEntries.reduce((acc, [, v]) => acc + v, 0);
                           const dropOffDominant = dropOffEntries[0]?.[0];

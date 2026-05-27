@@ -3,7 +3,8 @@ import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName, readHandlerOutput,
   persistAndPostStatus, git, runClaudeCode, sendHeartbeatSync,
-  setCurrentPromptFingerprint, listOpenPullRequestsForBranch,
+  setCurrentPromptFingerprint, listOpenPullRequestsForBranch, deriveTaskBranch, matchesRateLimit,
+  resolveBaseBranch,
 } from '../index.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
@@ -12,12 +13,22 @@ import { describeJsonExtractionResult, extractJsonArrayDetailed, extractJsonObje
 import {
   getTaskTypeHints, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
   READ_THE_FAILURE_MESSAGE, SIZE_GUARDRAIL_GUIDANCE, PRIOR_ATTEMPT_DIVERGENCE, BEYOND_SCOPE_REPORTING,
+  PARALLEL_AUDIT_GUIDANCE,
   getTaskTypeFocusBlock,
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper, formatPlaybook, buildRetryContext, computePromptFingerprint, type PlaybookEntry,
 } from '../prompt.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
+
+/** Returns true when the project has opted into parallel audit fan-out. */
+function isParallelAuditEnabled(task: Record<string, unknown>): boolean {
+  const meta = task.project_metadata;
+  if (meta && typeof meta === 'object' && !Array.isArray(meta)) {
+    return (meta as Record<string, unknown>).enable_parallel_review === true;
+  }
+  return false;
+}
 
 // ── Candidate-SHA helpers (release qualifier) ────────────────────────────────
 
@@ -61,7 +72,7 @@ export async function handleSecurityAudit(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawBaseBranch = resolveBaseBranch(payload, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   statusRef.value = `Cloning ${owner}/${repo} for security audit...`;
@@ -135,7 +146,8 @@ Rules:
   const secFingerprint = computePromptFingerprint('security_audit', secBuildConfig);
   setCurrentPromptFingerprint(secFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: secFingerprint });
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + secFirstTaskSection + securityPromptSuffix + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const secParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(securityPrompt + secTypeHint + secFirstTaskSection + securityPromptSuffix + secParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const findings = readHandlerOutput(taskId, 'security_findings', ws);
   let logs = findings !== null ? sanitize(JSON.stringify(findings)) : '';
@@ -166,7 +178,8 @@ export async function handleMigrate(
   model?: string, effort?: string
 ) {
   const rawPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawBaseBranch = resolveBaseBranch(payload, task);
+  const migratePromotionTarget = strVal(payload.promotion_target) || strVal((task.project_metadata as Record<string, unknown> | undefined)?.promotion_target) || undefined;
   const migrateTaskTitle = strVal(task.title);
   const prompt = migrateTaskTitle ? `Task: ${migrateTaskTitle}\n\n${rawPrompt}` : rawPrompt;
 
@@ -189,8 +202,7 @@ export async function handleMigrate(
   git(['config', 'user.email', migrateBuildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', migrateBuildConfig?.git_user_name || 'Blueprint Agent']);
 
-  const shortId = taskId.replace(/-/g, '').slice(0, 8);
-  const workBranch = `blueprint/migrate-${shortId}`;
+  const workBranch = deriveTaskBranch('migrate', taskId, migrateBuildConfig?.task_branch_namespace);
   let staleBranchExists = false;
   try {
     git(['ls-remote', '--exit-code', 'origin', workBranch]);
@@ -293,7 +305,7 @@ ${DEFAULT_TOOL_GUIDANCE}`;
     baseBranch,
     owner,
     repo,
-    testsOnMainBranch: baseBranch === 'main',
+    testsOnMainBranch: baseBranch === (migratePromotionTarget ?? resolveBaseBranch({} as Record<string, unknown>, task)),
     baseCommit: migrateBaseCommit,
     model,
     effort,
@@ -308,7 +320,7 @@ export async function handleSmoketest(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawBaseBranch = resolveBaseBranch(payload, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   // CRITICAL (C4): the qualifier-smoketest must run against ONE pinned
@@ -484,10 +496,11 @@ ${DEFAULT_TOOL_GUIDANCE}`;
       ...(!passed ? { failure_category: 'claude_code_failed' } : {}),
     });
   } else {
+    const smoketestUnparseable = exitCode === 0;
     await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
       logs: sanitize(allOutput.slice(-10_000)),
-      failure_category: 'claude_code_failed',
+      failure_category: matchesRateLimit(allOutput) ? 'rate_limited' : (smoketestUnparseable ? 'smoketest_result_unparseable' : 'claude_code_failed'),
     });
   }
 }
@@ -501,7 +514,7 @@ export async function handleDebug(
   const errorLogs = strVal(payload.error_logs) || strVal(payload.failure_context);
   const failedTaskId = strVal(payload.failed_task_id);
   const failedTaskTitle = strVal(payload.failed_task_title) || strVal(task.title);
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawBaseBranch = resolveBaseBranch(payload, task);
   validateBranchName(rawBaseBranch, 'base_branch');
 
   // Clone for read-only analysis (no work branch or push needed)
@@ -583,7 +596,8 @@ IMPORTANT: Always write /tmp/debug_report_${taskId}.json even if you cannot dete
   const debugFingerprint = computePromptFingerprint('debug');
   setCurrentPromptFingerprint(debugFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: debugFingerprint });
-  const { allOutput } = await runClaudeCode(debugPrompt + debugFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const debugParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
+  const { allOutput } = await runClaudeCode(debugPrompt + debugFirstTaskSection + debugParallelGuidance + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const debugResult = readHandlerOutput(taskId, 'debug_report', ws) as { root_cause: string; affected_files: string[]; fix_prompt: string; confidence: string } | null;
 
@@ -598,10 +612,11 @@ IMPORTANT: Always write /tmp/debug_report_${taskId}.json even if you cannot dete
       repo_url: `https://github.com/${owner}/${repo}`,
     });
   } else {
+    const debugLogs = sanitize(allOutput.slice(-10_000));
     await persistAndPostStatus(taskId, {
       task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-      logs: sanitize(allOutput.slice(-10_000)),
-      failure_category: 'claude_code_failed',
+      logs: debugLogs,
+      failure_category: matchesRateLimit(allOutput) ? 'rate_limited' : 'claude_code_failed',
     });
   }
 }
@@ -612,7 +627,7 @@ export async function handlePerf(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawBaseBranch = resolveBaseBranch(payload, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   statusRef.value = `Cloning ${owner}/${repo} for performance analysis...`;
@@ -682,7 +697,8 @@ Rules:
   const perfFingerprint = computePromptFingerprint('perf', perfBuildConfig);
   setCurrentPromptFingerprint(perfFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: perfFingerprint });
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfFirstTaskSection + perfPerfSuffix + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const perfParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(perfPrompt + perfTypeHint + perfFirstTaskSection + perfPerfSuffix + perfParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   const perfFindings = readHandlerOutput(taskId, 'perf_report', ws);
   let logs = perfFindings !== null ? sanitize(JSON.stringify(perfFindings)) : '';
@@ -718,7 +734,7 @@ export async function handleInvestigate(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawBaseBranch = resolveBaseBranch(payload, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
   const userPrompt = strVal(payload.prompt) || strVal(payload.description) || strVal(task.description);
   // Match handleMigrate (line 133): a missing prompt produces a malformed
@@ -798,7 +814,8 @@ IMPORTANT:
   const investigateFingerprint = computePromptFingerprint('investigate');
   setCurrentPromptFingerprint(investigateFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: investigateFingerprint });
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(investigatePrompt + investigateFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const investigateParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(investigatePrompt + investigateFirstTaskSection + investigateParallelGuidance + PLAYBOOK_GUIDANCE + '\nNote: If your investigation revealed a root cause pattern, diagnostic technique, or system behavior that would help future debugging, save it to the playbook.\n' + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   let investigationResult = readHandlerOutput(taskId, 'investigation_report', ws);
   if (investigationResult === null) {
@@ -841,18 +858,20 @@ IMPORTANT:
       // message previously hid both modes.
       const tail = (allOutput || '').slice(-2000);
       const lastResultTail = (lastResultText || '').slice(-500);
+      const logsBlob =
+        `Failed to read investigation report from /tmp/investigation_report_${taskId}.json; ` +
+        `no JSON object with root_cause found in transcript ` +
+        `(exitCode=${exitCode}, allOutput=${(allOutput || '').length}b, ` +
+        `lastResultText=${(lastResultText || '').length}b)\n` +
+        `--- lastResultText tail ---\n${lastResultTail}\n` +
+        `--- allOutput tail ---\n${tail}`;
+      const rateLimitDetected = matchesRateLimit((allOutput || '') + '\n' + (lastResultText || ''));
       await persistAndPostStatus(taskId, {
         task_id: taskId,
         status: 'FAILED',
         artifact_type: 'ERROR_LOG',
-        logs:
-          `Failed to read investigation report from /tmp/investigation_report_${taskId}.json; ` +
-          `no JSON object with root_cause found in transcript ` +
-          `(exitCode=${exitCode}, allOutput=${(allOutput || '').length}b, ` +
-          `lastResultText=${(lastResultText || '').length}b)\n` +
-          `--- lastResultText tail ---\n${lastResultTail}\n` +
-          `--- allOutput tail ---\n${tail}`,
-        failure_category: 'parse_failed',
+        logs: logsBlob,
+        failure_category: rateLimitDetected ? 'rate_limited' : 'parse_failed',
       });
       return;
     }
@@ -873,7 +892,7 @@ export async function handleSelfAudit(
   ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string
 ) {
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawBaseBranch = resolveBaseBranch(payload, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   statusRef.value = `Cloning ${owner}/${repo} for self audit...`;
@@ -983,7 +1002,8 @@ Rules:
   const selfAuditFingerprint = computePromptFingerprint('self_audit', buildConfig);
   setCurrentPromptFingerprint(selfAuditFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: selfAuditFingerprint });
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(selfAuditPrompt + typeHint + firstTaskSection + promptSuffix + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const selfAuditParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(selfAuditPrompt + typeHint + firstTaskSection + promptSuffix + selfAuditParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
 
   // Parse findings: prefer structured file output, then a {findings:[...]} object
   // anywhere in the output, then a bare array of findings (wrapped on our side).
@@ -1023,7 +1043,7 @@ export async function handleReleaseAudit(
 ) {
   // CRITICAL: always clone base_branch (main), never automain. The audit must
   // judge the incoming changes by main's standards, not the new code's standards.
-  const rawBaseBranch = strVal(payload.base_branch, 'main');
+  const rawBaseBranch = resolveBaseBranch(payload, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
 
   // CRITICAL (C2/C4): the qualifier must score one PINNED candidate commit, not
@@ -1146,6 +1166,57 @@ export async function handleReleaseAudit(
     return;
   }
 
+  // Deterministically compute test erosion from the actual diff so the
+  // hard-blocker (deleted test files) and sub-score deltas are not dependent
+  // on the LLM spotting every change in a potentially large diff.
+  type ComputedTestErosion = {
+    deleted_test_files: string[];
+    assertion_delta: number;
+    test_count_delta: number;
+  };
+  let computedTestErosion: ComputedTestErosion | null = null;
+  try {
+    const TEST_PATH_RE = /\/(testing|tests|__tests__)\/|\.test\.|\.spec\./;
+
+    const nameStatus = execFileSync('git', ['diff', '--name-status', diffRange], {
+      cwd: WORKSPACE, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const deletedTestFiles = nameStatus
+      .split('\n')
+      .filter((line: string) => line.startsWith('D\t'))
+      .map((line: string) => line.slice(2).trim())
+      .filter((p: string) => TEST_PATH_RE.test(p));
+
+    const diffText = execFileSync('git', ['diff', diffRange], {
+      cwd: WORKSPACE, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 50 * 1024 * 1024,
+    });
+
+    const ASSERTION_RE = /\b(assert[\s(]|expect\(|assertEqual|assertRaises|it\(|describe\()/;
+    const TEST_FN_RE = /\b(def test_|test\(|it\(|describe\()/;
+
+    let assertionDelta = 0;
+    let testCountDelta = 0;
+    for (const line of diffText.split('\n')) {
+      if (line.startsWith('+') && !line.startsWith('+++')) {
+        if (ASSERTION_RE.test(line)) assertionDelta++;
+        if (TEST_FN_RE.test(line)) testCountDelta++;
+      } else if (line.startsWith('-') && !line.startsWith('---')) {
+        if (ASSERTION_RE.test(line)) assertionDelta--;
+        if (TEST_FN_RE.test(line)) testCountDelta--;
+      }
+    }
+
+    computedTestErosion = {
+      deleted_test_files: deletedTestFiles,
+      assertion_delta: assertionDelta,
+      test_count_delta: testCountDelta,
+    };
+    sendLog(ws, `[AUDIT] Computed test erosion: ${deletedTestFiles.length} deleted test file(s), assertion_delta=${assertionDelta}, test_count_delta=${testCountDelta}\n`);
+  } catch (e) {
+    sendLog(ws, `[WARNING] Could not compute deterministic test erosion: ${e instanceof Error ? e.message : String(e)}\n`);
+  }
+
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const disallowedTools = configureAgentPermissions('release_audit');
@@ -1192,21 +1263,23 @@ IMPORTANT: You are running on \`${baseBranch}\` intentionally. You must judge th
     {
       "severity": "high",
       "summary": "One sentence describing the issue",
-      "file": "path/to/affected/file.py"
+      "file": "path/to/affected/file.py",
+      "verification_note": "Read app/auth.py lines 45-62 — req.user_id is user-controlled and reaches the SQL call at line 60 with no sanitisation."
     }
   ]
 }
 \`\`\`
 
 Field semantics:
-- \`audit_score\`: float [0, 1] — 1.0 means no issues found; deduct per finding by severity (critical: -0.30, high: -0.15, medium: -0.07, low: -0.02). Clamp to [0, 1].
+- \`audit_score\`: float [0, 1] — holistic cross-check of your overall assessment (1.0 = no issues found, 0.0 = critical problems). The backend derives the authoritative gating score from the \`findings\` list, so focus on producing accurate, well-categorised findings rather than computing this number precisely.
 - \`test_erosion.deleted_test_files\`: list of test file paths deleted in the diff. An empty list is good.
 - \`test_erosion.assertion_delta\`: integer — positive means more assertions added than removed (good), negative means erosion.
 - \`test_erosion.test_count_delta\`: integer — positive means more tests added than removed (good), negative means erosion.
-- \`findings\`: each entry has \`severity\` (critical|high|medium|low), \`summary\` (one sentence), and \`file\` (file path or empty string if cross-cutting).
+- \`findings\`: each entry has \`severity\` (critical|high|medium|low), \`summary\` (one sentence), \`file\` (file path or empty string if cross-cutting), and \`verification_note\` (required for high/medium/critical — cite the specific file and line you read and why the issue is real, ≥ 20 non-whitespace characters). Findings at severity high/medium/critical WITHOUT a substantive \`verification_note\` are silently excluded from the score — they do not deduct points. Drop or downgrade to low/info any finding you cannot substantiate.
 
 Rules:
 - Read the actual diff — do NOT speculate about code you haven't read.
+- IMPORTANT — substantiation required: Before recording any finding at severity high, medium, or critical, read the relevant unchanged files in the full repository (not just the diff) to check for existing mitigations (guards, exception handlers, per-request checks, hardcoded constants at the call site). Record what you read and why the issue is real in \`verification_note\`. A hardcoded constant reaching a sink is NOT injection. A per-request DB check is NOT a replay gap. A comparison that is exception-guarded is NOT a TypeError. Only record the finding if you can substantiate it after reading the whole-repo context.
 - If \`git diff ${diffRange}\` produces no output (empty diff), set \`audit_score: 1.0\`, \`findings: []\`, and note it in a single low-severity finding.
 - IMPORTANT: Write ONLY the JSON object to \`/tmp/release_audit_report_${taskId}.json\` — no markdown, no code fences, no extra text.
 - Also output the same JSON object as the final output in your logs.
@@ -1220,26 +1293,39 @@ Rules:
   const releaseAuditFingerprint = computePromptFingerprint('release_audit', buildConfig);
   setCurrentPromptFingerprint(releaseAuditFingerprint);
   sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: releaseAuditFingerprint });
+  const releaseAuditParallelGuidance = isParallelAuditEnabled(task) ? PARALLEL_AUDIT_GUIDANCE : '';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(
-    releaseAuditPrompt + typeHint + firstTaskSection + promptSuffix + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`,
+    releaseAuditPrompt + typeHint + firstTaskSection + promptSuffix + releaseAuditParallelGuidance + PLAYBOOK_GUIDANCE + `\n\n${DEFAULT_TOOL_GUIDANCE}`,
     ws, statusRef, model, effort, disallowedTools,
   );
 
   const handlerOutput = readHandlerOutput(taskId, 'release_audit_report', ws) as {
     audit_score?: number;
     test_erosion?: { deleted_test_files?: unknown[]; assertion_delta?: number; test_count_delta?: number };
+    computed_test_erosion?: { deleted_test_files: string[]; assertion_delta: number; test_count_delta: number };
     findings?: unknown[];
   } | null;
 
+  // Inject computed_test_erosion into the artifact so the backend can use it
+  // as the authoritative signal rather than the LLM's self-reported test_erosion.
+  const enrichedOutput = handlerOutput !== null && computedTestErosion !== null
+    ? { ...handlerOutput, computed_test_erosion: computedTestErosion }
+    : handlerOutput;
+
   let logs = '';
-  if (handlerOutput !== null) {
-    logs = sanitize(JSON.stringify(handlerOutput));
+  let releaseAuditUnparseable = false;
+  if (enrichedOutput !== null) {
+    logs = sanitize(JSON.stringify(enrichedOutput));
   } else {
     const haystack = (allOutput || '') + '\n' + (lastResultText || '');
     const objExtract = extractJsonObjectDetailed(haystack, 'audit_score', 'findings');
     if (objExtract.ok) {
-      logs = sanitize(JSON.stringify(objExtract.value));
+      const enrichedExtracted = computedTestErosion !== null
+        ? { ...objExtract.value, computed_test_erosion: computedTestErosion }
+        : objExtract.value;
+      logs = sanitize(JSON.stringify(enrichedExtracted));
     } else {
+      releaseAuditUnparseable = exitCode === 0;
       sendLog(ws, `[WARNING] Could not extract release audit JSON: ${describeJsonExtractionResult(objExtract)}\n`);
       logs = sanitize(lastResultText || allOutput.slice(-50_000));
     }
@@ -1247,8 +1333,12 @@ Rules:
 
   await persistAndPostStatus(taskId, {
     task_id: taskId,
-    status: exitCode === 0 ? 'COMPLETED' : 'FAILED',
-    ...(exitCode !== 0 ? { artifact_type: 'ERROR_LOG', failure_category: 'claude_code_failed' } : { artifact_type: 'RELEASE_AUDIT_REPORT' }),
+    status: releaseAuditUnparseable || exitCode !== 0 ? 'FAILED' : 'COMPLETED',
+    ...(releaseAuditUnparseable
+      ? { artifact_type: 'ERROR_LOG', failure_category: 'release_audit_report_unparseable' }
+      : exitCode !== 0
+        ? { artifact_type: 'ERROR_LOG', failure_category: 'claude_code_failed' }
+        : { artifact_type: 'RELEASE_AUDIT_REPORT' }),
     logs,
   });
 }

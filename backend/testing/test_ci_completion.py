@@ -1332,6 +1332,61 @@ async def test_mergeable_state_clean_does_not_escalate_on_keyword(db_session, mo
 
 
 @pytest.mark.asyncio
+async def test_mergeable_state_clean_no_existing_fix_does_not_spawn_rebase(
+    db_session, mocker
+):
+    """
+    When mergeable_state='clean' and there is NO pre-existing fix task, a
+    transient merge API failure must NOT spawn a rebase fix.  GitHub has
+    confirmed the PR is conflict-free, so there is nothing to rebase — the
+    only correct action is to retry the merge.
+
+    Regression guard for the clean-state short-circuit in the rebase-fix
+    spawn block (_ms == 'clean' condition).
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open", "mergeable_state": "clean"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "transient server error"},
+    )
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(None, False),
+    )
+
+    project = Project(name="clean no fix spawn", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # No existing fix task — without the clean-state guard, the rebase-fix
+    # spawn path would fire here.
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    spawn_mock.assert_not_called()
+    assert result is False
+    assert task.requires_approval is not True, "clean state must not escalate"
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("merge_failures") == 1, (
+        "clean-state transient failure must still tick the retry counter"
+    )
+
+
+@pytest.mark.asyncio
 async def test_mergeable_state_unknown_falls_back_to_keywords(db_session, mocker):
     """
     When mergeable_state is 'unknown' (GitHub still computing), fall back to
@@ -2043,7 +2098,9 @@ async def test_suppress_warm_handoff_merge_blocked_rebase(db_session, mocker):
     mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
     mocker.patch(
         "app.github.get_pull_request",
-        return_value={"merged": False, "state": "open", "mergeable_state": "clean"},
+        # Use 'unknown' so keyword-based rule-block detection runs and the
+        # transient path (no clean-state guard) reaches the rebase-fix spawn.
+        return_value={"merged": False, "state": "open", "mergeable_state": "unknown"},
     )
     mocker.patch(
         "app.github.merge_pull_request",
@@ -2193,9 +2250,7 @@ async def test_ci_failure_spawn_extracts_failing_test_names_into_prompt(
     spawn_mock.assert_called_once()
     fix_prompt = spawn_mock.call_args.kwargs.get("fix_prompt") or ""
     assert "Failing tests (extracted from CI summary" in fix_prompt
-    assert (
-        "testing/test_pack_under_budget.py::test_meta_preserved" in fix_prompt
-    )
+    assert "testing/test_pack_under_budget.py::test_meta_preserved" in fix_prompt
     assert (
         "testing/test_anomaly_detection.py::test_proactive_fingerprint_spawns"
         in fix_prompt
@@ -2208,6 +2263,194 @@ async def test_ci_failure_spawn_extracts_failing_test_names_into_prompt(
     )
     # And the broken-on-main fix-as-part-of-PR guidance should be there.
     assert "broken on `main`" in fix_prompt
+
+
+# ---------------------------------------------------------------------------
+# Per-project base_branch resolution
+# ---------------------------------------------------------------------------
+
+
+def _make_task_no_base(db_session, project, pr_number: int = 77):
+    """Create a minimal EVALUATING task whose payload and context omit base_branch."""
+    task = Task(
+        project_id=project.id,
+        title="CI base-branch test task",
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": pr_number,
+                "branch": "blueprint/feature-x",
+            }
+        ],
+        context={
+            "review_loop": {
+                "pr_number": pr_number,
+                "branch": "blueprint/feature-x",
+                "iteration": 1,
+                "review_approved": True,
+            }
+        },
+        vm_instance_id=f"agent-vm-base-{uuid.uuid4().hex[:8]}",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_handle_ci_completion_uses_project_integration_branch(db_session, mocker):
+    """handle_ci_completion resolves base_branch from project.integration_branch
+    when neither review_loop nor payload carry one.
+    """
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+    mocker.patch(
+        "app.review_pipeline.build_ci_failure_fix_prompt",
+        return_value="fix prompt",
+    )
+
+    project = Project(
+        name="automain-project",
+        user_id="test-user",
+        integration_branch="automain",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task_no_base(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "failure", "failed_logs": "error"}
+    await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    spawn_mock.assert_called_once()
+    # Third positional arg to _spawn_pipeline_task is ci_base
+    called_base = spawn_mock.call_args.args[5]
+    assert called_base == "automain", (
+        f"Expected ci_base='automain' from project.integration_branch, got {called_base!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_conflict_spawn_uses_project_integration_branch(db_session, mocker):
+    """_attempt_merge_with_retry_and_escalation resolves ci_base from
+    project.integration_branch when payload and review_loop both omit base_branch.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={"merged": False, "state": "open", "mergeable_state": "dirty"},
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "merge failed"},
+    )
+
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+
+    project = Project(
+        name="automain-merge-test",
+        user_id="test-user",
+        integration_branch="automain",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task_no_base(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    spawn_mock.assert_called_once()
+    called_base = spawn_mock.call_args.args[5]
+    assert called_base == "automain", (
+        f"Expected ci_base='automain' from project.integration_branch, got {called_base!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_behind_skipped_when_pr_is_not_behind(db_session, mocker):
+    """
+    When mergeable_state='behind' but pr_is_not_behind returns True (base tip is
+    already reachable from PR head), update_branch must NOT be called.
+    The task re-enters CI polling with ci_passed=False and no update_branch_failures
+    increment.
+    """
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "merged": False,
+            "state": "open",
+            "mergeable_state": "behind",
+            "head": {"sha": "abc123def456"},
+        },
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "message": "Base branch was modified"},
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        return_value="base456tip789",
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        return_value=True,
+    )
+    update_mock = mocker.patch("app.github.update_branch")
+
+    project = Project(name="Not-behind skip test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project, ci_loop_extra={"ci_passed": True})
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="webhook"
+    )
+
+    assert result is False
+    update_mock.assert_not_called()
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("ci_passed") is False, "ci_passed must be reset for re-poll"
+    assert review_loop.get("merge_failures", 0) == 0, (
+        "behind must not increment retry counter"
+    )
+    assert review_loop.get("update_branch_failures", 0) == 0
 
 
 # ---------------------------------------------------------------------------

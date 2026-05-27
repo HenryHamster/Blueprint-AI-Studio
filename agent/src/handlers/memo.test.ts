@@ -319,6 +319,68 @@ describe('handleMemo', () => {
     expect(prompt).not.toContain('Source finding (JSON):');
   });
 
+  // ── Direct synthesis for dispatcher-sourced memos ────────────────────────
+
+  it('regression_false_positive: synthesizes memo from verdict_reason without calling Claude', async () => {
+    const payload = {
+      reasoning_kind: 'regression_false_positive',
+      source_task_id: 'task-inv-1',
+      source_finding: {
+        verdict_reason: 'CPU spike is a deployment artifact, not a regression.',
+        investigation_summary: 'Checked the past 3 deploys; spike correlates with rollout.',
+        regression_class: 'cpu_p99_spike',
+      },
+    };
+    await handleMemo(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(runClaudeCode).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.logs).toContain('CPU spike is a deployment artifact, not a regression.');
+    expect(call.logs).toContain('Checked the past 3 deploys');
+  });
+
+  it('investigation_unactionable: synthesizes memo from root_cause and recommended_fix without calling Claude', async () => {
+    const payload = {
+      reasoning_kind: 'investigation_unactionable',
+      source_task_id: 'task-inv-2',
+      source_finding: {
+        root_cause: 'Missing index on user_events.created_at causes full table scans.',
+        recommended_fix: 'Add CREATE INDEX CONCURRENTLY on user_events(created_at).',
+        summary: 'Slow query traced to missing index.',
+        outcome: 'no_actionable_fix',
+      },
+    };
+    await handleMemo(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(runClaudeCode).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.logs).toContain('Missing index on user_events.created_at');
+    expect(call.logs).toContain('CREATE INDEX CONCURRENTLY');
+  });
+
+  it('falls through to Claude when reasoning_kind is not a dispatcher kind', async () => {
+    const payload = {
+      reasoning_kind: 'deferred_finding',
+      source_finding: { title: 'Some finding' },
+    };
+    await handleMemo(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(runClaudeCode).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls through to Claude when verdict_reason is absent for regression_false_positive', async () => {
+    const payload = {
+      reasoning_kind: 'regression_false_positive',
+      source_finding: { regression_class: 'cpu_p99_spike' },
+    };
+    await handleMemo(TASK_ID, payload, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(runClaudeCode).toHaveBeenCalledTimes(1);
+  });
+
+
   // ── Codex JSONL path regression tests ────────────────────────────────────
 
   it('succeeds when memo JSON in lastResultText exceeds 200 characters', async () => {

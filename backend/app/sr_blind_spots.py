@@ -250,17 +250,13 @@ async def compute_sr_blind_spot_themes(
     dispatcher can detect when this job stops running and spawn an
     investigation automatically.
     """
-    from app.models import Project
-    from sqlalchemy.orm.attributes import flag_modified
+    from app.shared_state import with_design_doc_locked
 
-    project = await session.get(Project, project_id)
-    if project is None:
-        return
-    doc = dict(project.design_doc or {})
-    stamp_sr_blind_spot_computed_at(doc, now=now)
-    project.design_doc = doc
-    flag_modified(project, "design_doc")
-    session.add(project)
+    await with_design_doc_locked(
+        session,
+        project_id,
+        lambda doc: stamp_sr_blind_spot_computed_at(doc, now=now),
+    )
 
 
 async def aggregate_sr_blind_spot_themes(
@@ -645,11 +641,19 @@ def aggregate_sr_scope_drift_vs_expansion(
     }
 
 
+# Canonical set of every NON-author origin the agent stamps on a fresh-reviewer
+# /recovery check_results entry (see agent/src/handlers/standard.ts). Findings
+# with these origins are reviewer SAVES, never author self-review hits, and must
+# be excluded from author SR false-positive attribution. The author's own
+# entries use origin "sr" (and edges use "author"). test_invariants.py pins this
+# set to the exact origins emitted by standard.ts to guard against silent drift.
 _REVIEWER_ORIGINS = frozenset(
     (
         "reviewer",
         "reviewer_disagreement",
         "reviewer_recovery_after_incomplete_sr",
+        "lone_checker_recovery",
+        "operator_requested_recovery",
     )
 )
 

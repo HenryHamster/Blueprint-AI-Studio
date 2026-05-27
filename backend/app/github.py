@@ -1339,8 +1339,17 @@ async def get_repo_default_branch(token: str, owner: str, repo: str) -> str:
         "GET", f"https://api.github.com/repos/{owner}/{repo}", headers
     )
     if response.status_code != 200:
-        return "main"  # Safe fallback
-    return response.json().get("default_branch", "main")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"GitHub API error detecting default branch (HTTP {response.status_code}).",
+        )
+    data = response.json()
+    if "default_branch" not in data:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="GitHub API response missing default_branch field.",
+        )
+    return data["default_branch"]
 
 
 async def delete_branch(token: str, owner: str, repo: str, branch: str) -> bool:
@@ -1563,6 +1572,117 @@ async def is_ancestor_of(
     # "identical" (same commit) or "ahead" (descendant strictly contains the
     # ancestor) both mean ancestor_sha is reachable from descendant_ref.
     return compare_status in ("identical", "ahead")
+
+
+async def pr_is_not_behind(
+    token: str,
+    owner: str,
+    repo: str,
+    *,
+    head_sha: str | None = None,
+    base_tip_sha: str | None = None,
+    mergeable_state: str | None = None,
+    project_id: str | None = None,
+    call_site: str | None = None,
+) -> bool | None:
+    """Return True iff a PR is NOT behind its base branch.
+
+    Two signals are checked in order (short-circuit on first conclusive result):
+
+    1. ``mergeable_state == "clean"`` — GitHub's authoritative signal.  A clean
+       PR is not behind regardless of SHA comparison.
+    2. Ancestry check — if ``base_tip_sha`` is already reachable from
+       ``head_sha`` the PR head already contains the base tip, so it is not
+       behind even when the two SHAs differ and GitHub has not yet recomputed
+       mergeable_state.
+
+    Returns ``True`` (not behind — safe to attempt merge without update-branch),
+    ``False`` (behind — base tip not yet in PR head), or ``None`` (indeterminate:
+    API error or insufficient information provided).
+
+    When ``call_site`` is provided, the outcome (True/False/None) is recorded
+    via ``shared_state.record_pr_is_not_behind`` so the admin diagnostics
+    endpoint can surface short-circuit hit rates. Call-site labels follow a
+    ``<subsystem>[_<sub-phase>]`` convention — see
+    ``shared_state.PR_IS_NOT_BEHIND_CALL_SITES`` for the canonical set.
+    """
+    from app.shared_state import record_pr_is_not_behind
+
+    if (mergeable_state or "").lower() == "clean":
+        if call_site:
+            record_pr_is_not_behind(call_site, True)
+        return True
+
+    if head_sha and base_tip_sha:
+        ancestor = await is_ancestor_of(
+            token, owner, repo, base_tip_sha, head_sha, project_id=project_id
+        )
+        if ancestor is True:
+            if call_site:
+                record_pr_is_not_behind(call_site, True)
+            return True
+        if ancestor is False:
+            if call_site:
+                record_pr_is_not_behind(call_site, False)
+            return False
+        # ancestor is None (API error) — fall through to mergeable_state signal
+
+    if (mergeable_state or "").lower() == "behind":
+        if call_site:
+            record_pr_is_not_behind(call_site, False)
+        return False
+
+    if call_site:
+        record_pr_is_not_behind(call_site, None)
+    return None
+
+
+async def pr_is_not_behind_for(
+    token: str,
+    owner: str,
+    repo: str,
+    *,
+    pr_detail: dict | None,
+    base_branch: str | None = None,
+    base_tip_sha: str | None = None,
+    project_id: str | None = None,
+    call_site: str | None = None,
+) -> bool | None:
+    """Convenience wrapper around :func:`pr_is_not_behind` that pulls
+    ``head_sha`` and ``mergeable_state`` from a PR-detail dict and (optionally)
+    fetches the base branch's tip SHA via :func:`get_branch_sha`.
+
+    Every behind-recovery caller of ``update_branch`` / ``update_branch_with_sha_retry``
+    needs to consult :func:`pr_is_not_behind` first. The orchestration boilerplate
+    around that consultation is identical across callers — extract head SHA from
+    the PR dict, fetch the base tip with a defensive try/except, then forward
+    the params. This helper collapses that boilerplate to a single ``await``.
+
+    Pass an already-fetched ``base_tip_sha`` to skip the GitHub round-trip when
+    the caller has it in hand (e.g. the rollup pre-merge site needs the tip SHA
+    independently for its own comparison).
+    """
+    detail = pr_detail or {}
+    head_sha = (detail.get("head") or {}).get("sha")
+    mergeable_state = detail.get("mergeable_state") or ""
+    if base_tip_sha is None and head_sha and base_branch:
+        try:
+            base_tip_sha = await get_branch_sha(token, owner, repo, base_branch)
+        except Exception as exc:  # noqa: BLE001 — mirrors caller-site behavior: any get_branch_sha failure (network, 404, auth) must fall through to pr_is_not_behind with base_tip_sha=None so it can decide based on mergeable_state alone.
+            logger.warning(
+                f"[PR_IS_NOT_BEHIND] get_branch_sha({base_branch}) failed for "
+                f"{owner}/{repo}: {exc}"
+            )
+    return await pr_is_not_behind(
+        token,
+        owner,
+        repo,
+        head_sha=head_sha,
+        base_tip_sha=base_tip_sha,
+        mergeable_state=mergeable_state,
+        project_id=project_id,
+        call_site=call_site,
+    )
 
 
 async def get_files_changed_between_refs(
@@ -2099,6 +2219,33 @@ async def update_branch(
     )
 
 
+# GitHub's canonical 422 reply when /update-branch is called but the PR's
+# base ref has no commits the head ref doesn't already contain. This is a
+# *positive* signal: the PR is not behind despite a stale cached
+# mergeable_state. We tag the response with `not_behind=True` so callers
+# can short-circuit just like the pr_is_not_behind=True path instead of
+# treating it as a transient update-branch failure that burns a retry.
+_UPDATE_BRANCH_NO_NEW_COMMITS_PHRASE = "no new commits on the base branch"
+
+
+def _is_no_new_commits_message(message: str | None) -> bool:
+    if not message:
+        return False
+    return _UPDATE_BRANCH_NO_NEW_COMMITS_PHRASE in message.strip().lower()
+
+
+def _tag_not_behind_if_no_new_commits(result: dict) -> dict:
+    """Annotate an update_branch result with `not_behind=True` when GitHub's
+    message indicates the PR has nothing on base to incorporate."""
+    if (
+        not result.get("updated")
+        and _is_no_new_commits_message(result.get("message"))
+        and not result.get("not_behind")
+    ):
+        return {**result, "not_behind": True}
+    return result
+
+
 async def update_branch_with_sha_retry(
     token: str,
     owner: str,
@@ -2116,6 +2263,11 @@ async def update_branch_with_sha_retry(
     mismatch and always attempt the refetch+retry path once. If the fresh SHA
     equals the original, no retry is made. The extra API call is trivial compared
     to spawning a fix VM. Returns the same {"updated": bool, "message": str} shape.
+
+    When GitHub responds with the canonical "no new commits on the base branch"
+    message, the PR is not actually behind (cached mergeable_state is stale);
+    the result is tagged with ``not_behind=True`` so callers can skip retry/fix
+    escalation, mirroring the existing ``pr_is_not_behind`` short-circuit.
     """
     try:
         result = await update_branch(
@@ -2132,6 +2284,13 @@ async def update_branch_with_sha_retry(
         return {"updated": False, "message": f"{type(exc).__name__}: {exc}"}
     if result.get("updated"):
         return result
+    result = _tag_not_behind_if_no_new_commits(result)
+    if result.get("not_behind"):
+        logger.info(
+            f"[UPDATE-BRANCH] PR #{pr_number} not-behind (no new commits on base) — "
+            f"skipping retry, deferring to next sweep"
+        )
+        return result
     try:
         fresh = await get_pull_request(
             token, owner, repo, pr_number, project_id=project_id
@@ -2147,7 +2306,7 @@ async def update_branch_with_sha_retry(
         f"(prior failure: {result.get('message')})"
     )
     try:
-        return await update_branch(
+        retry_result = await update_branch(
             token,
             owner,
             repo,
@@ -2159,6 +2318,7 @@ async def update_branch_with_sha_retry(
         return {"updated": False, "message": f"HTTP error on retry: {exc.detail}"}
     except Exception as exc:  # noqa: BLE001
         return {"updated": False, "message": f"{type(exc).__name__} on retry: {exc}"}
+    return _tag_not_behind_if_no_new_commits(retry_result)
 
 
 async def close_pull_request(
@@ -2225,6 +2385,7 @@ async def get_pr_files(
     repo: str,
     pr_number: int,
     project_id: str | None = None,
+    include_patch: bool = False,
 ) -> list[dict]:
     """Fetches the list of files changed in a PR with their status.
 
@@ -2232,6 +2393,9 @@ async def get_pr_files(
     genuinely empty PR (returns []) from a transient GitHub failure. The
     empty-rollup short-circuit in task_lifecycle relies on this distinction to
     avoid closing real PRs when the API is briefly unavailable.
+
+    When include_patch=True, the returned dicts also contain a 'patch' key with
+    the unified diff text for each file (may be absent for binary files).
     """
     headers = {
         "Authorization": f"Bearer {token}",
@@ -2256,7 +2420,19 @@ async def get_pr_files(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"GitHub API error fetching PR #{pr_number} files (HTTP {response.status_code})",
         )
-    return [{"filename": f["filename"], "status": f["status"]} for f in response.json()]
+    result = []
+    for f in response.json():
+        entry: dict = {
+            "filename": f["filename"],
+            "status": f["status"],
+            "additions": f.get("additions", 0),
+            "deletions": f.get("deletions", 0),
+            "changes": f.get("changes", 0),
+        }
+        if include_patch and "patch" in f:
+            entry["patch"] = f["patch"]
+        result.append(entry)
+    return result
 
 
 def _unique(*values: int | None) -> list[int]:

@@ -15,13 +15,14 @@ the escalation threshold.
 from app.cochange_decomposition import (
     cluster_files_by_cochange as _cluster_files_by_cochange,
 )
+from app.migration_path import is_migration_file
 
 
 def _is_auto_generated(path: str) -> bool:
     """Auto-generated files (e.g. alembic migrations) are mechanically
     derived from models.py changes, so they should not inflate complexity
     scoring dimensions."""
-    return path.startswith("backend/alembic/versions/")
+    return is_migration_file(path)
 
 
 def _composite_complexity_score(

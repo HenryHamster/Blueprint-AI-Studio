@@ -2020,3 +2020,86 @@ async def test_post_version_ci_unresolved_stall_message_creates_message(
     assert msg.context["age_days"] == 2
     assert "CI cannot be resolved" in msg.content
     assert "GitHub connectivity" in msg.content
+
+
+# ─── post_remediation_result_message — promotion_target fallback ──────────────
+
+
+@pytest.mark.asyncio
+async def test_remediation_result_message_branch_falls_back_to_promotion_target(
+    db_session,
+):
+    """When ci_failure_branch is absent from task context, post_remediation_result_message
+    must use the project's promotion_target as the branch, not the literal 'main'.
+    Verifies that the posted message carries the correct per-project branch value."""
+    from app.models import Task, TaskStatus  # noqa: PLC0415
+    from app.notification_dispatch import post_remediation_result_message  # noqa: PLC0415
+
+    project = Project(
+        name="Promo Branch Fallback", user_id="u1", promotion_target="release/v2"
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    fix_task = Task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "fix"}],
+        context={
+            "auto_remediation": True,
+            # deliberately NO ci_failure_branch — should fall back to promotion_target
+        },
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+
+    msg = await post_remediation_result_message(
+        db_session,
+        fix_task,
+        result="failed",
+    )
+    await db_session.commit()
+
+    assert msg.context["event_type"] == "auto_fix_result"
+    assert msg.context["branch"] == "release/v2", (
+        "branch must fall back to project.promotion_target ('release/v2'), not 'main'"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remediation_result_message_raises_when_project_missing_and_no_branch(
+    db_session,
+):
+    """When the project row is gone and ci_failure_branch is absent from context,
+    post_remediation_result_message must raise ValueError rather than silently
+    routing to the literal 'main' branch."""
+    from app.models import Project, Task, TaskStatus  # noqa: PLC0415
+    from app.notification_dispatch import post_remediation_result_message  # noqa: PLC0415
+
+    # Create project and task, then delete the project so the FK row is gone.
+    project = Project(name="Deleted Project", user_id="u-deleted")
+    db_session.add(project)
+    await db_session.commit()
+
+    fix_task = Task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "fix"}],
+        context={
+            "auto_remediation": True,
+            # deliberately no ci_failure_branch
+        },
+        auto_remediation=True,
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+
+    await db_session.delete(project)
+    await db_session.commit()
+
+    with pytest.raises(ValueError, match="project not found"):
+        await post_remediation_result_message(
+            db_session,
+            fix_task,
+            result="failed",
+        )

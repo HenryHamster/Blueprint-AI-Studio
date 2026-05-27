@@ -778,6 +778,58 @@ async def test_direction_stats_entry_shape_pinned():
     assert not missing, f"direction_stats entry missing keys: {missing}"
 
 
+# ── Timezone-aware research_history timestamps ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_research_history_tz_aware_timestamp_included_in_window():
+    """research_history entries with tz-aware (UTC-Z) timestamps are counted, not silently dropped."""
+    now = _utcnow()
+    project_id = uuid.uuid4()
+    direction_id = str(uuid.uuid4())
+
+    # Produce a tz-aware ISO timestamp (the 'Z' / '+00:00' form) that is
+    # inside the default 24-hour lookback window.
+    aware_ts = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": direction_id,
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": aware_ts,
+                        "prs_merged": 2,
+                        "tasks_created": 4,
+                        "prs_rejected": 1,
+                    }
+                ],
+            }
+        ]
+    )
+    tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": direction_id},
+            created_at=now - timedelta(hours=4),
+        ),
+    ]
+    session = _make_mock_session(tasks=tasks, project=project)
+
+    # Must not raise TypeError for tz-aware vs naive comparison
+    result = await compute_pipeline_health_summary(session, project_id)
+
+    stats = result["direction_stats"]
+    assert len(stats) == 1, "direction should appear in stats"
+    assert stats[0]["cycles"] == 1
+    # prs_merged/tasks_created should be counted from the tz-aware entry
+    assert stats[0]["conversion_rate"] == 0.5  # 2 merged / 4 created
+    assert stats[0]["acceptance_rate"] == pytest.approx(2 / 3, abs=0.001)
+
+
 # ── First-review approval rate ────────────────────────────────────────────────
 
 
@@ -3266,7 +3318,7 @@ async def test_lookback_hours_excludes_tasks_outside_window():
 
 def test_all_accounts_blocked_action_fires_once_per_episode():
     """Every eligible task blocked, nothing dispatched → fire, then debounce."""
-    from app.orchestrator import _compute_all_accounts_blocked_action as act
+    from app.stall_alert_diagnostics import _compute_all_accounts_blocked_action as act
 
     # Stall starts: fire a single alert.
     assert act(blocked_count=3, dispatched_count=0, already_alerted=False) == "fire"
@@ -3276,7 +3328,7 @@ def test_all_accounts_blocked_action_fires_once_per_episode():
 
 def test_all_accounts_blocked_action_resets_on_dispatch():
     """Any successful dispatch re-arms the debounce for the next stall."""
-    from app.orchestrator import _compute_all_accounts_blocked_action as act
+    from app.stall_alert_diagnostics import _compute_all_accounts_blocked_action as act
 
     assert act(blocked_count=0, dispatched_count=2, already_alerted=True) == "reset"
     # Mixed cycle (some dispatched, some blocked) is not a full stall.
@@ -3285,7 +3337,7 @@ def test_all_accounts_blocked_action_resets_on_dispatch():
 
 def test_all_accounts_blocked_action_noop_when_no_signal():
     """Empty cycle or no account-blocked skips should not trip the alert."""
-    from app.orchestrator import _compute_all_accounts_blocked_action as act
+    from app.stall_alert_diagnostics import _compute_all_accounts_blocked_action as act
 
     assert act(blocked_count=0, dispatched_count=0, already_alerted=False) == "noop"
     assert act(blocked_count=0, dispatched_count=0, already_alerted=True) == "noop"
@@ -3297,7 +3349,7 @@ def test_all_accounts_blocked_action_noop_when_no_signal():
 def test_format_stall_alert_falls_back_when_no_reasons():
     """No reasons captured → keep the original rate-limit copy. Preserves
     dedup keys and existing operator expectations for legacy callers."""
-    from app.orchestrator import _format_stall_alert
+    from app.stall_alert_diagnostics import _format_stall_alert
 
     title, body = _format_stall_alert(None, None)
     assert "rate-limited" in title.lower()
@@ -3311,7 +3363,7 @@ def test_format_stall_alert_rate_limit_only_includes_recovery():
     Title says "eligible" not "all" because describe_pool_blockage
     summarizes per-task-model state — accounts that don't serve this task's
     model can still be healthy. (2026-04-24 misleading-alert fix.)"""
-    from app.orchestrator import _format_stall_alert
+    from app.stall_alert_diagnostics import _format_stall_alert
 
     earliest = datetime(2026, 4, 25, 12, 30, tzinfo=timezone.utc)
     reasons = {
@@ -3325,7 +3377,7 @@ def test_format_stall_alert_rate_limit_only_includes_recovery():
 def test_format_stall_alert_capacity_only_no_cooldown_copy():
     """Slot/cap contention is NOT a rate-limit problem — the title and body
     must not claim cooldown or earliest recovery (none exists)."""
-    from app.orchestrator import _format_stall_alert
+    from app.stall_alert_diagnostics import _format_stall_alert
 
     title, body = _format_stall_alert({"no eligible accounts or slot contention"}, None)
     assert title == "Pipeline stalled — eligible Max plan accounts at capacity"
@@ -3338,7 +3390,7 @@ def test_format_stall_alert_mixed_rate_limit_and_capacity():
     """When both rate-limit and capacity pressure are present (e.g., one
     account cooling down and another at daily-cap), the title must reflect
     the mix instead of pretending it's pure rate-limit."""
-    from app.orchestrator import _format_stall_alert
+    from app.stall_alert_diagnostics import _format_stall_alert
 
     earliest = datetime(2026, 4, 25, 14, 0, tzinfo=timezone.utc)
     reasons = {
@@ -3360,7 +3412,7 @@ def test_format_stall_alert_mixed_rate_limit_and_capacity():
 def test_format_stall_alert_no_accounts_configured():
     """No-accounts case is its own diagnostic — different fix (add an
     account, not wait for cooldown), so the title must not say cooldown."""
-    from app.orchestrator import _format_stall_alert
+    from app.stall_alert_diagnostics import _format_stall_alert
 
     title, body = _format_stall_alert({"no accounts configured"}, None)
     assert title == "Pipeline stalled — no Max plan accounts configured"
@@ -3371,7 +3423,7 @@ def test_format_stall_alert_no_accounts_configured():
 def test_format_stall_alert_no_ready_accounts():
     """Disabled accounts or accounts missing credentials are not a cooldown
     problem; operators need to make an account ready."""
-    from app.orchestrator import _format_stall_alert
+    from app.stall_alert_diagnostics import _format_stall_alert
 
     title, body = _format_stall_alert({"no ready accounts for provider gemini"}, None)
     assert title == "Pipeline stalled — no Max plan accounts ready"
@@ -3386,7 +3438,9 @@ def test_format_stall_alert_no_ready_accounts():
 
 
 def test_missing_runtime_credentials_stall_reason_distinguishes_no_pool_and_no_ready():
-    from app.orchestrator import _missing_runtime_credentials_stall_reason as reason
+    from app.stall_alert_diagnostics import (
+        _missing_runtime_credentials_stall_reason as reason,
+    )
 
     assert (
         reason(
@@ -3421,7 +3475,7 @@ def test_format_stall_alert_partial_rate_limit_string_still_classifies():
     """The partial-mix string from describe_pool_blockage ("N of M
     accounts rate-limited, remaining accounts at capacity") triggers BOTH
     rate-limited AND capacity classification because it actually is both."""
-    from app.orchestrator import _format_stall_alert
+    from app.stall_alert_diagnostics import _format_stall_alert
 
     reasons = {"3 of 5 accounts rate-limited, remaining accounts at capacity"}
     title, _body = _format_stall_alert(reasons, None)
@@ -3436,7 +3490,7 @@ def test_format_stall_alert_title_never_claims_pool_wide_when_per_task():
     fires per-cycle when at least one task can't dispatch and zero tasks
     dispatched. The reasons describe per-task-model constraints, not the
     full pool state. Title must not assert "all" pool accounts are bad."""
-    from app.orchestrator import _format_stall_alert
+    from app.stall_alert_diagnostics import _format_stall_alert
 
     for reasons in (
         None,
@@ -3461,7 +3515,9 @@ def test_format_stall_alert_title_never_claims_pool_wide_when_per_task():
 
 def test_retry_after_escalation_below_alert_returns_none():
     """Resets below the alert threshold leave the task alone."""
-    from app.orchestrator import _compute_retry_after_escalation_action as act
+    from app.stall_alert_diagnostics import (
+        _compute_retry_after_escalation_action as act,
+    )
 
     assert act(resets=0, alert_threshold=8, fail_threshold=0) is None
     assert act(resets=7, alert_threshold=8, fail_threshold=0) is None
@@ -3469,7 +3525,9 @@ def test_retry_after_escalation_below_alert_returns_none():
 
 def test_retry_after_escalation_alert_at_threshold():
     """Reaching the alert threshold fires a WARNING."""
-    from app.orchestrator import _compute_retry_after_escalation_action as act
+    from app.stall_alert_diagnostics import (
+        _compute_retry_after_escalation_action as act,
+    )
 
     assert act(resets=8, alert_threshold=8, fail_threshold=0) == "alert"
     assert act(resets=15, alert_threshold=8, fail_threshold=0) == "alert"
@@ -3478,7 +3536,9 @@ def test_retry_after_escalation_alert_at_threshold():
 def test_retry_after_escalation_never_fails():
     """Pool exhaustion is a wait condition: escalation must never return 'fail',
     no matter how many resets accumulate or what fail_threshold is passed."""
-    from app.orchestrator import _compute_retry_after_escalation_action as act
+    from app.stall_alert_diagnostics import (
+        _compute_retry_after_escalation_action as act,
+    )
 
     for resets in (16, 99, 9999):
         for fail_threshold in (0, 1, 16, 9999):
@@ -3490,7 +3550,9 @@ def test_retry_after_escalation_never_fails():
 
 def test_retry_after_escalation_disabled_alert_threshold():
     """A non-positive alert threshold disables escalation entirely."""
-    from app.orchestrator import _compute_retry_after_escalation_action as act
+    from app.stall_alert_diagnostics import (
+        _compute_retry_after_escalation_action as act,
+    )
 
     assert act(resets=100, alert_threshold=0, fail_threshold=0) is None
 

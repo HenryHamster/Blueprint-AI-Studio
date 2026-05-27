@@ -36,6 +36,17 @@ export interface BuildConfig {
   env_vars?: Record<string, string>;
   detected_at?: string;
   enable_fresh_reviewer?: boolean;
+  enable_parallel_review?: boolean;
+  enable_parallel_fix?: boolean;
+  task_branch_namespace?: string;
+  task_branch_prefix?: string;
+  pr_title_prefix?: string;
+  staging_branch_prefixes?: string[] | null;
+}
+
+export interface StagingBranchPrefixesConfig {
+  staging_branch_prefixes: string[];
+  is_default: boolean;
 }
 
 export interface Project {
@@ -84,9 +95,13 @@ export interface IssueImplementationConfig {
   trigger_label: string;
   max_per_hour: number;
   max_concurrent: number;
-  base_branch: string;
+  /** Live-derived from project.integration_branch. Returned by GET; rejected by PATCH. */
+  readonly base_branch: string;
   default_effort: 'low' | 'medium' | 'high';
 }
+
+/** Fields admin-ui may PATCH on issue-implementation config — base_branch excluded (server-derived). */
+export type IssueImplementationConfigUpdate = Omit<IssueImplementationConfig, 'base_branch'>;
 
 export interface AutoReviewConfig {
   enabled: boolean;

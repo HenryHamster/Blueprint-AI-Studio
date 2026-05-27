@@ -1,10 +1,11 @@
 """Project onboarding endpoint with build config auto-detection."""
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Dict, Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -21,6 +22,18 @@ router = APIRouter(
     tags=["admin-onboard"],
     dependencies=[Depends(get_current_user)],
 )
+
+
+def _derive_task_branch_namespace(github_repo: str) -> str:
+    """Derive a branch-name-safe namespace from the GitHub repo name.
+
+    Lowercases, replaces non-alphanumeric characters with '-', strips
+    leading/trailing dashes, and caps at 40 characters.  The Blueprint
+    self-repo maps to 'blueprint' via the is_self_repo flag at the DB layer;
+    this function slugifies all repo names uniformly.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", github_repo.lower()).strip("-")
+    return slug[:40] if slug else "project"
 
 
 async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, Any]:
@@ -63,7 +76,7 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
             {
                 "path": "./",
                 "type": "python",
-                "lint_cmd": "ruff check ." if "pyproject.toml" in root_names else None,
+                "lint_cmd": "ruff check",
                 "test_cmd": "pytest",
             }
         )
@@ -76,7 +89,6 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
                 "path": "./",
                 "type": "node",
                 "install_cmd": "npm ci",
-                "lint_cmd": "npx eslint .",
                 "build_cmd": "npm run build",
                 "test_cmd": "npm test",
             }
@@ -89,7 +101,6 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
             {
                 "path": "./",
                 "type": "go",
-                "lint_cmd": "go vet ./...",
                 "test_cmd": "go test ./...",
             }
         )
@@ -101,7 +112,6 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
             {
                 "path": "./",
                 "type": "rust",
-                "lint_cmd": "cargo clippy",
                 "build_cmd": "cargo build",
                 "test_cmd": "cargo test",
             }
@@ -147,7 +157,7 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
                 {
                     "path": f"{subdir}/",
                     "type": "python",
-                    "lint_cmd": "ruff check .",
+                    "lint_cmd": "ruff check",
                     "test_cmd": "pytest",
                 }
             )
@@ -166,8 +176,6 @@ async def _detect_build_config(token: str, owner: str, repo: str) -> Dict[str, A
         "language": language,
         "directories": directories,
         "env_vars": {},
-        "git_user_name": "Blueprint Agent",
-        "git_user_email": "blueprint-agent@automated.dev",
         "detected_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -227,6 +235,12 @@ async def onboard_project(
             exc_info=True,
         )
 
+    # Seed per-project task-branch namespace (override may overwrite this below)
+    build_config.setdefault(
+        "task_branch_namespace",
+        _derive_task_branch_namespace(payload.github_repo),
+    )
+
     # Merge override on top of detected config (validate shape)
     if payload.build_config_override:
         build_config.update(payload.build_config_override)
@@ -247,20 +261,43 @@ async def onboard_project(
     session.add(project)
 
     # Detect default branch and initialize auto_remediation config
-    default_branch = "main"
-    try:
-        from app.github import get_repo_default_branch
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No installation token available — cannot detect default branch.",
+        )
+    from app.github import get_repo_default_branch
 
-        if token:
-            default_branch = await get_repo_default_branch(
-                token, payload.github_owner, payload.github_repo
-            )
+    try:
+        default_branch = await get_repo_default_branch(
+            token, payload.github_owner, payload.github_repo
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.warning(f"[ONBOARD] Default branch detection failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Default branch detection failed: {e}",
+        ) from e
 
-    branch_whitelist = ["main", "master"]
-    if default_branch and default_branch not in branch_whitelist:
-        branch_whitelist.insert(0, default_branch)
+    if default_branch:
+        project.integration_branch = default_branch
+        project.promotion_target = default_branch
+
+    if payload.promotion_target:
+        project.promotion_target = payload.promotion_target
+
+    branch_whitelist: list[str] = []
+    if default_branch:
+        branch_whitelist.append(default_branch)
+    if (
+        project.integration_branch
+        and project.integration_branch not in branch_whitelist
+    ):
+        branch_whitelist.append(project.integration_branch)
+    if project.promotion_target and project.promotion_target not in branch_whitelist:
+        branch_whitelist.append(project.promotion_target)
     design_doc = dict(project.design_doc or {})
     design_doc["_auto_remediation"] = {
         "enabled": False,
@@ -271,10 +308,9 @@ async def onboard_project(
     }
     design_doc["_issue_implementation"] = {
         "enabled": False,
-        "trigger_label": "blueprint:implement",
+        "trigger_label": "auto:implement",
         "max_per_hour": 3,
         "max_concurrent": 3,
-        "base_branch": default_branch or "main",
         "default_effort": "high",
     }
     design_doc["_auto_review"] = {

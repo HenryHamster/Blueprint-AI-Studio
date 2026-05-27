@@ -1,5 +1,3 @@
-import re
-
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -186,9 +184,6 @@ async def get_settings(
         "ci_backstop_timeout_minutes": _runtime_config.get(
             "ci_backstop_timeout_minutes", 60
         ),
-        # automain/LTS release-qualifier control flags — kept in sync with the
-        # _apply_settings write path and the runtime_config_json persistence.
-        "integration_branch": _runtime_config.get("integration_branch", "main"),
         "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
         "smoketest_enabled": bool(_runtime_config.get("smoketest_enabled", False)),
         "warm_continuity_enabled": bool(
@@ -429,33 +424,6 @@ async def _apply_settings(
                 detail="ci_backstop_timeout_minutes must be between 1 and 1440",
             )
         _runtime_config["ci_backstop_timeout_minutes"] = val
-    # automain/LTS — release-qualifier control flags (Phase 0/1). Persisted to
-    # runtime_config_json below and synced back into runtime_config every ~15s.
-    if "integration_branch" in payload:
-        val = str(payload["integration_branch"] or "").strip()
-        _branch_pattern = re.compile(r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$")
-        if not val or len(val) > 200 or not _branch_pattern.match(val):
-            raise HTTPException(
-                status_code=400,
-                detail="integration_branch must be a valid branch name",
-            )
-        for part in val.split("/"):
-            if part in (".git", ".lock"):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"integration_branch contains reserved component: {part}",
-                )
-            if part.startswith("."):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"integration_branch component cannot start with a dot: {part}",
-                )
-            if ".." in part:
-                raise HTTPException(
-                    status_code=400,
-                    detail="integration_branch component cannot contain '..'",
-                )
-        _runtime_config["integration_branch"] = val
     if "promotion_enabled" in payload:
         _runtime_config["promotion_enabled"] = bool(payload["promotion_enabled"])
     if "smoketest_enabled" in payload:
@@ -1516,9 +1484,6 @@ async def _apply_settings(
                             "throttle_seconds": 30,
                         },
                     ),
-                    "integration_branch": _runtime_config.get(
-                        "integration_branch", "main"
-                    ),
                     "promotion_enabled": bool(
                         _runtime_config.get("promotion_enabled", False)
                     ),
@@ -1744,15 +1709,17 @@ async def memory_snapshot(
     import tracemalloc
     import os
 
-    rss_mb = None
-    try:
-        with open(f"/proc/{os.getpid()}/status", "r") as _st:
-            for _line in _st:
-                if _line.startswith("VmRSS:"):
-                    rss_mb = int(_line.split()[1]) / 1024
-                    break
-    except Exception as _rss_exc:
-        logger.debug(f"[MEMORY] RSS read failed: {_rss_exc}")
+    def _read_rss_mb() -> float | None:
+        try:
+            with open(f"/proc/{os.getpid()}/status", "r") as _st:
+                for _line in _st:
+                    if _line.startswith("VmRSS:"):
+                        return int(_line.split()[1]) / 1024
+        except Exception as _rss_exc:
+            logger.debug(f"[MEMORY] RSS read failed: {_rss_exc}")
+        return None
+
+    rss_mb = await asyncio.to_thread(_read_rss_mb)
 
     if not tracemalloc.is_tracing():
         logger.warning(f"[MEMORY SNAPSHOT] rss_mb={rss_mb} tracemalloc=off")
@@ -1859,13 +1826,19 @@ async def repair_state(
 
     # 1. Tasks stuck in PROVISIONING/IN_PROGRESS with no heartbeat for 15+ min → FAILED
     fifteen_min_ago = _utcnow() - timedelta(minutes=15)
+    # Scope to tasks updated in the last 24 hours; active tasks older than that are
+    # extremely rare and would require manual intervention anyway.
+    recent_cutoff = _utcnow() - timedelta(hours=24)
     stuck_tasks = (
         (
             await session.execute(
-                select(Task).where(
+                select(Task)
+                .where(
                     Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
                     Task.vm_instance_id.isnot(None),
+                    Task.updated_at >= recent_cutoff,
                 )
+                .limit(500)
             )
         )
         .scalars()
@@ -1904,7 +1877,7 @@ async def repair_state(
     evaluating_tasks = (
         (
             await session.execute(
-                select(Task).where(Task.status == TaskStatus.EVALUATING)
+                select(Task).where(Task.status == TaskStatus.EVALUATING).limit(500)
             )
         )
         .scalars()
@@ -1949,13 +1922,15 @@ async def repair_state(
     orphan_children = (
         (
             await session.execute(
-                select(Task).where(
+                select(Task)
+                .where(
                     Task.parent_task_id.isnot(None),
                     ~select(ParentTask.id)
                     .where(ParentTask.id == Task.parent_task_id)
                     .correlate(Task)
                     .exists(),
                 )
+                .limit(500)
             )
         )
         .scalars()

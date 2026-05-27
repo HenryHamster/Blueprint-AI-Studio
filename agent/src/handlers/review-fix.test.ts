@@ -20,6 +20,12 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 vi.mock('../index.js', () => ({
   WORKSPACE: '/tmp/workspace',
   strVal: (v: unknown, fallback = '') => (typeof v === 'string' ? v : fallback),
+  resolveBaseBranch: (payload: Record<string, unknown>, task: Record<string, unknown>, fallback = 'main') => {
+    if (typeof payload.base_branch === 'string' && payload.base_branch) return payload.base_branch;
+    const meta = task.project_metadata as Record<string, unknown> | undefined;
+    if (typeof meta?.integration_branch === 'string' && meta.integration_branch) return meta.integration_branch;
+    return fallback;
+  },
   sanitize: (s: string) => s,
   sendLog: vi.fn(),
   log: vi.fn(),
@@ -108,8 +114,20 @@ import {
   annotateResolvedIssues, detectMediumScopeSubsystemHint, pushForceWithLeaseRetrying,
   detectMigrationConflict, buildMigrationConflictGuidance, buildBlueprintPrFooter,
   formatTrajectorySection, formatDriftSection, verifyStepsOk, computeReviewPromptFingerprint,
+  buildTypeCheckInstructions,
 } from './review-fix.js';
 import { runCodeChangeTask } from './code-change.js';
+import { resolveBuildConfig } from '../build-config.js';
+import { shouldFanOutReview, shouldFanOutFix } from '../constants.js';
+import { computePromptFingerprint, buildScopedLintOneliner } from '../prompt.js';
+
+const BLUEPRINT_CONFIG = {
+  directories: [
+    { path: 'agent', type: 'node' },
+    { path: 'admin-ui', type: 'node' },
+    { path: 'backend', type: 'python' },
+  ],
+};
 
 const statusRef = () => ({ value: '' });
 
@@ -138,7 +156,15 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(fs.existsSync).mockReturnValue(false);
   vi.mocked(fs.readFileSync).mockReturnValue('');
-  vi.mocked(execFileSync).mockReturnValue('');
+  // Default: ls-remote returns a ref line (branch exists) so handleReview tests
+  // that don't care about the deleted-branch path proceed normally. Tests that
+  // need the branch-missing or transport-error behavior override this per-test.
+  vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+    if (cmd === 'git' && Array.isArray(args) && args.includes('ls-remote')) {
+      return 'abc123\trefs/heads/feature\n';
+    }
+    return '';
+  }) as unknown as typeof execFileSync);
   vi.mocked(indexMod.git).mockReturnValue('');
   vi.mocked(indexMod.gitAsync).mockResolvedValue('');
   vi.mocked(indexMod.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
@@ -446,37 +472,37 @@ describe('handleReview — scope overflow replaces scope-narrowed preamble', () 
 // ── detectMediumScopeSubsystemHint: subsystem-aware priority guidance ───────
 describe('detectMediumScopeSubsystemHint — medium-scope subsystem hint', () => {
   it('returns agent-focused hint when all changed files are under agent/', () => {
-    const hint = detectMediumScopeSubsystemHint('M\tagent/src/handlers/standard.ts\nM\tagent/src/prompt.ts');
+    const hint = detectMediumScopeSubsystemHint('M\tagent/src/handlers/standard.ts\nM\tagent/src/prompt.ts', BLUEPRINT_CONFIG);
     expect(hint).toContain('agent/');
     expect(hint).toContain('deprioritize SQL injection');
   });
 
-  it('returns admin-ui-focused hint when all changed files are under admin-ui/', () => {
-    const hint = detectMediumScopeSubsystemHint('M\tadmin-ui/src/App.tsx\nA\tadmin-ui/src/components/Foo.tsx');
+  it('returns node-type hint when all changed files are under admin-ui/', () => {
+    const hint = detectMediumScopeSubsystemHint('M\tadmin-ui/src/App.tsx\nA\tadmin-ui/src/components/Foo.tsx', BLUEPRINT_CONFIG);
     expect(hint).toContain('admin-ui/');
-    expect(hint).toContain('Deprioritize backend-specific checks');
+    expect(hint).toContain('deprioritize SQL injection');
   });
 
   it('keeps full security scrutiny for backend-only changes', () => {
-    const hint = detectMediumScopeSubsystemHint('M\tbackend/app/orchestrator.py\nM\tbackend/app/main.py');
+    const hint = detectMediumScopeSubsystemHint('M\tbackend/app/orchestrator.py\nM\tbackend/app/main.py', BLUEPRINT_CONFIG);
     expect(hint).toContain('backend/');
     expect(hint).toContain('full security scrutiny');
   });
 
   it('deprioritizes security for backend/testing-only changes', () => {
-    const hint = detectMediumScopeSubsystemHint('M\tbackend/testing/test_foo.py\nA\tbackend/testing/test_bar.py');
+    const hint = detectMediumScopeSubsystemHint('M\tbackend/testing/test_foo.py\nA\tbackend/testing/test_bar.py', BLUEPRINT_CONFIG);
     expect(hint).toContain('test');
     expect(hint).toContain('Deprioritize');
     expect(hint).not.toContain('full security scrutiny');
   });
 
   it('keeps full security scrutiny when backend changes include a non-test file', () => {
-    const hint = detectMediumScopeSubsystemHint('M\tbackend/testing/test_foo.py\nM\tbackend/app/main.py');
+    const hint = detectMediumScopeSubsystemHint('M\tbackend/testing/test_foo.py\nM\tbackend/app/main.py', BLUEPRINT_CONFIG);
     expect(hint).toContain('full security scrutiny');
   });
 
   it('returns cross-system guidance when changes span 2+ subsystems', () => {
-    const hint = detectMediumScopeSubsystemHint('M\tagent/src/index.ts\nM\tbackend/app/main.py');
+    const hint = detectMediumScopeSubsystemHint('M\tagent/src/index.ts\nM\tbackend/app/main.py', BLUEPRINT_CONFIG);
     expect(hint).toContain('cross-system');
     expect(hint).toContain('agent');
     expect(hint).toContain('backend');
@@ -484,20 +510,47 @@ describe('detectMediumScopeSubsystemHint — medium-scope subsystem hint', () =>
   });
 
   it('returns cross-system guidance for backend + admin-ui changes', () => {
-    const hint = detectMediumScopeSubsystemHint('M\tbackend/app/main.py\nM\tadmin-ui/src/App.tsx');
+    const hint = detectMediumScopeSubsystemHint('M\tbackend/app/main.py\nM\tadmin-ui/src/App.tsx', BLUEPRINT_CONFIG);
     expect(hint).toContain('cross-system');
     expect(hint).toContain('admin-ui');
     expect(hint).toContain('backend');
   });
 
   it('returns empty string for changed files placeholder / no files', () => {
-    expect(detectMediumScopeSubsystemHint('')).toBe('');
-    expect(detectMediumScopeSubsystemHint('(could not generate file list)')).toBe('');
+    expect(detectMediumScopeSubsystemHint('', BLUEPRINT_CONFIG)).toBe('');
+    expect(detectMediumScopeSubsystemHint('(could not generate file list)', BLUEPRINT_CONFIG)).toBe('');
+  });
+
+  it('returns empty string when no buildConfig is provided', () => {
+    expect(detectMediumScopeSubsystemHint('M\tagent/src/index.ts')).toBe('');
+    expect(detectMediumScopeSubsystemHint('M\tbackend/app/main.py')).toBe('');
+  });
+
+  it('returns node hint for a custom single-directory node project', () => {
+    const config = { directories: [{ path: 'src', type: 'node' }] };
+    const hint = detectMediumScopeSubsystemHint('M\tsrc/index.ts\nM\tsrc/utils.ts', config);
+    expect(hint).toContain('src/');
+    expect(hint).toContain('deprioritize SQL injection');
+  });
+
+  it('returns empty string for paths outside any configured directory', () => {
+    const config = { directories: [{ path: 'src', type: 'node' }] };
+    expect(detectMediumScopeSubsystemHint('M\tdocs/readme.md', config)).toBe('');
+  });
+
+  it('returns cross-system hint for two node directories', () => {
+    const config = { directories: [{ path: 'app', type: 'node' }, { path: 'lib', type: 'node' }] };
+    const hint = detectMediumScopeSubsystemHint('M\tapp/index.ts\nM\tlib/utils.ts', config);
+    expect(hint).toContain('cross-system');
+    expect(hint).toContain('app');
+    expect(hint).toContain('lib');
+    expect(hint).toContain('interface consistency');
   });
 });
 
 describe('handleReview — medium-scope subsystem hint integration', () => {
   it('injects agent-focused hint into the review prompt for medium-scope agent-only PRs', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce(BLUEPRINT_CONFIG as ReturnType<typeof resolveBuildConfig>);
     vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\tagent/src/handlers/review-fix.ts';
@@ -516,7 +569,88 @@ describe('handleReview — medium-scope subsystem hint integration', () => {
     expect(prompt).toContain('deprioritize SQL injection');
   });
 
+  it('scopes build_config lint guidance to changed files in the review prompt', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce({
+      directories: [{ path: 'svc', type: 'python', lint_cmd: 'ruff check .' }],
+    } as ReturnType<typeof resolveBuildConfig>);
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return 'M\tsvc/a.py';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      'task-review-lint-scope',
+      { pr_number: 51, branch: 'feature/lint', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('svc/a.py');
+    expect(prompt).not.toContain('ruff check .');
+    expect(prompt).not.toContain('grep \'.py$\'');
+  });
+
+  it.each([
+    ['mypy', 'python3 -m mypy'],
+    ['flake8', 'flake8'],
+    ['pyright', 'pnpm exec pyright'],
+  ])('scopes %s build_config lint guidance to changed Python files with the configured binary', async (_label, lintCmd) => {
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce({
+      directories: [{ path: 'svc', type: 'python', lint_cmd: lintCmd }],
+    } as ReturnType<typeof resolveBuildConfig>);
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return 'M\tsvc/a.py';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      'task-review-py-lint-scope',
+      { pr_number: 52, branch: 'feature/lint-py', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('svc/a.py');
+    expect(prompt).toContain(`xargs -r ${lintCmd}`);
+    expect(prompt).not.toContain('python3 -m ruff check --select E,F,W --ignore E501');
+    expect(prompt).not.toContain('ruff check .');
+  });
+
+  it.each([
+    ['ruff check .'],
+    ['python3 -m mypy'],
+    ['flake8'],
+    ['npx eslint'],
+  ])('review prompt contains exact buildScopedLintOneliner output for %s (drift guard)', async (lintCmd) => {
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce({
+      directories: [{ path: 'svc', type: 'python', lint_cmd: lintCmd }],
+    } as ReturnType<typeof resolveBuildConfig>);
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) return 'M\tsvc/a.py';
+      return '';
+    }) as unknown as typeof indexMod.git);
+
+    await handleReview(
+      `task-lint-drift-${lintCmd.replace(/\W/g, '-')}`,
+      { pr_number: 98, branch: 'feat/drift', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = vi.mocked(indexMod.runClaudeCode).mock.calls[0][0];
+    const expected = buildScopedLintOneliner(lintCmd, 'svc', 'main', 'git-diff');
+    if (expected === null) throw new Error(`buildScopedLintOneliner returned null for ${lintCmd}`);
+    expect(prompt).toContain(expected);
+  });
+
   it('injects cross-system hint for multi-subsystem medium-scope PRs', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce(BLUEPRINT_CONFIG as ReturnType<typeof resolveBuildConfig>);
     vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\tagent/src/index.ts\nM\tbackend/app/main.py';
@@ -899,6 +1033,88 @@ describe('handleReview — verdict file parsing', () => {
   });
 });
 
+// ── handleReview: deleted-head-branch protection ─────────────────────────────
+describe('handleReview — deleted head branch short-circuit', () => {
+  const basePayload = {
+    pr_number: 999,
+    branch: 'feature/deleted',
+    base_branch: 'main',
+    original_prompt: '',
+  };
+
+  it('completes cleanly with PR_BRANCH_DELETED when branch no longer exists on remote', async () => {
+    // ls-remote returns empty string = branch does not exist
+    vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+      if (cmd === 'git' && Array.isArray(args) && args.includes('ls-remote')) {
+        return '';
+      }
+      return '';
+    }) as unknown as typeof execFileSync);
+
+    const { prepareWorkspaceForRole } = await import('../workspacePrep.js');
+
+    await handleReview(
+      'task-deleted-branch', basePayload, { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    // Must not have cloned or run Claude
+    expect(vi.mocked(prepareWorkspaceForRole)).not.toHaveBeenCalled();
+    expect(vi.mocked(indexMod.runClaudeCode)).not.toHaveBeenCalled();
+
+    const statusCalls = vi.mocked(indexMod.persistAndPostStatus).mock.calls;
+    expect(statusCalls.length).toBeGreaterThanOrEqual(1);
+    const status = statusCalls[0][1];
+    expect(status.status).toBe('COMPLETED');
+    expect(status.failure_category).toBe('PR_BRANCH_DELETED');
+    expect(String(status.logs)).toContain('feature/deleted');
+  });
+
+  it('proceeds to clone and review when branch exists on remote', async () => {
+    // ls-remote returns a ref line = branch exists
+    vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+      if (cmd === 'git' && Array.isArray(args) && args.includes('ls-remote')) {
+        return 'abc123\trefs/heads/feature/deleted\n';
+      }
+      return '';
+    }) as unknown as typeof execFileSync);
+
+    const { prepareWorkspaceForRole } = await import('../workspacePrep.js');
+
+    await handleReview(
+      'task-existing-branch',
+      { pr_number: 100, branch: 'feature/existing', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    expect(vi.mocked(prepareWorkspaceForRole)).toHaveBeenCalled();
+    expect(vi.mocked(indexMod.runClaudeCode)).toHaveBeenCalled();
+  });
+
+  it('falls through to clone when ls-remote throws (transport/auth failure)', async () => {
+    // ls-remote throws = network/auth error; clone should still be attempted
+    vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+      if (cmd === 'git' && Array.isArray(args) && args.includes('ls-remote')) {
+        throw new Error('fatal: unable to look up github.com');
+      }
+      return '';
+    }) as unknown as typeof execFileSync);
+
+    const { prepareWorkspaceForRole } = await import('../workspacePrep.js');
+
+    await handleReview(
+      'task-ls-remote-failure',
+      { pr_number: 200, branch: 'feature/transport-fail', base_branch: 'main', original_prompt: '' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    // Clone is still attempted despite ls-remote failure
+    expect(vi.mocked(prepareWorkspaceForRole)).toHaveBeenCalled();
+  });
+});
+
 // ── handleFix: prompt enrichment + runCodeChangeTask delegation ─────────────
 //
 // 2026-05-04: handleFix's wrapper-driven post-Claude pipeline (push, retry-
@@ -950,6 +1166,58 @@ describe('handleFix — runCodeChangeTask delegation', () => {
     expect(opts.testsOnMainBranch).toBe(false);
   });
 
+  it('sets testsOnMainBranch=true via integration_branch cascade when promotion_target absent and baseBranch=master', async () => {
+    await handleFix(
+      'task-fix-integration-branch-master',
+      { ...basePayload, base_branch: 'master' },
+      { context: { scope: 'small' }, project_metadata: { integration_branch: 'master' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const opts = capturedFixOpts();
+    expect(opts.baseBranch).toBe('master');
+    expect(opts.testsOnMainBranch).toBe(true);
+  });
+
+  it('sets testsOnMainBranch=false when baseBranch does not match integration_branch', async () => {
+    await handleFix(
+      'task-fix-integration-branch-mismatch',
+      { ...basePayload, base_branch: 'feature/x' },
+      { context: { scope: 'small' }, project_metadata: { integration_branch: 'master' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const opts = capturedFixOpts();
+    expect(opts.baseBranch).toBe('feature/x');
+    expect(opts.testsOnMainBranch).toBe(false);
+  });
+
+  it('sets testsOnMainBranch=true when base_branch matches promotion_target', async () => {
+    await handleFix(
+      'task-fix-promotion-target',
+      { ...basePayload, base_branch: 'automain', promotion_target: 'automain' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const opts = capturedFixOpts();
+    expect(opts.baseBranch).toBe('automain');
+    expect(opts.testsOnMainBranch).toBe(true);
+  });
+
+  it('sets testsOnMainBranch=false when base_branch does not match promotion_target', async () => {
+    await handleFix(
+      'task-fix-non-lts',
+      { ...basePayload, base_branch: 'feature/x', promotion_target: 'automain' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const opts = capturedFixOpts();
+    expect(opts.baseBranch).toBe('feature/x');
+    expect(opts.testsOnMainBranch).toBe(false);
+  });
+
   it('throws when prompt is missing — never calls runCodeChangeTask', async () => {
     await expect(
       handleFix(
@@ -962,7 +1230,7 @@ describe('handleFix — runCodeChangeTask delegation', () => {
     expect(vi.mocked(runCodeChangeTask)).not.toHaveBeenCalled();
   });
 
-  it('runs fresh-reviewer pass when project_metadata.is_self_repo is true and enable_fresh_reviewer is unset', async () => {
+  it('does NOT run fresh-reviewer pass when only is_self_repo is true and enable_fresh_reviewer is unset', async () => {
     vi.mocked(indexMod.git).mockReturnValue(Array.from({ length: 25 }, (_, i) => `+line ${i}`).join('\n'));
     vi.mocked(indexMod.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '{"reviewer_findings":[]}' });
 
@@ -979,7 +1247,7 @@ describe('handleFix — runCodeChangeTask delegation', () => {
     const reviewerCall = vi.mocked(indexMod.runClaudeCode).mock.calls.find(
       call => typeof call[0] === 'string' && call[0].includes('You are reviewing a PR'),
     );
-    expect(reviewerCall).toBeDefined();
+    expect(reviewerCall).toBeUndefined();
   });
 
   it('forwards project_context into the fresh-reviewer calibration block when enabled', async () => {
@@ -1037,6 +1305,56 @@ describe('handleFix — runCodeChangeTask delegation', () => {
     expect(rebaseCall).toBeDefined();
     // Implementation must follow.
     expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to project_metadata.integration_branch when payload.base_branch is absent', async () => {
+    await handleFix(
+      'task-fix-meta-branch',
+      { branch: 'feature/x', pr_number: 42, prompt: 'fix it' },
+      { context: { scope: 'small' }, project_metadata: { integration_branch: 'develop' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const opts = capturedFixOpts();
+    expect(opts.baseBranch).toBe('develop');
+  });
+
+  it('falls back to main when both payload.base_branch and project_metadata.integration_branch are absent', async () => {
+    await handleFix(
+      'task-fix-fallback-main',
+      { branch: 'feature/x', pr_number: 42, prompt: 'fix it' },
+      { context: { scope: 'small' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const opts = capturedFixOpts();
+    expect(opts.baseBranch).toBe('main');
+  });
+
+  it('picks up promotionTarget from project_metadata when payload omits it', async () => {
+    await handleFix(
+      'task-fix-meta-promotion',
+      { branch: 'feature/x', base_branch: 'trunk', pr_number: 42, prompt: 'fix it', promotion_target: 'trunk' },
+      { context: { scope: 'small' }, project_metadata: { promotion_target: 'trunk' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const opts = capturedFixOpts();
+    // base_branch matches promotion_target → testsOnMainBranch=true
+    expect(opts.testsOnMainBranch).toBe(true);
+  });
+
+  it('falls back to project_metadata.promotion_target when payload.promotion_target is absent', async () => {
+    await handleFix(
+      'task-fix-meta-promo-fallback',
+      { branch: 'feature/x', base_branch: 'trunk', pr_number: 42, prompt: 'fix it' },
+      { context: { scope: 'small' }, project_metadata: { promotion_target: 'trunk' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const opts = capturedFixOpts();
+    // base_branch 'trunk' matches project_metadata.promotion_target 'trunk' → testsOnMainBranch=true
+    expect(opts.testsOnMainBranch).toBe(true);
   });
 });
 
@@ -2120,6 +2438,76 @@ describe('handleReview prompt determinism', () => {
   });
 });
 
+// ── handleReview: rollup-PR guidance honors per-project staging prefixes ─────
+describe('handleReview — rollup-PR guidance staging prefixes', () => {
+  const ROLLUP_MARKER = 'Rollup-PR verification';
+  const REVIEW_TASK = { title: 'Review', description: '', context: {}, project_context: {} };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(resolveBuildConfig).mockReturnValue({});
+    vi.mocked(indexMod.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+
+  function lastReviewPrompt(): string {
+    const calls = vi.mocked(indexMod.runClaudeCode).mock.calls;
+    if (calls.length === 0) throw new Error('runClaudeCode was not invoked');
+    return calls[calls.length - 1][0];
+  }
+
+  it('injects rollup guidance when a custom staging prefix matches the head branch', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValue({ staging_branch_prefixes: ['stage/', 'integration/'] });
+    await handleReview(
+      'task-rollup-custom',
+      { pr_number: 10, branch: 'stage/abcd1234', base_branch: 'main' },
+      REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).toContain(ROLLUP_MARKER);
+  });
+
+  it('does NOT inject rollup guidance when the head branch matches no configured prefix', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValue({ staging_branch_prefixes: ['stage/', 'integration/'] });
+    await handleReview(
+      'task-rollup-nomatch',
+      { pr_number: 11, branch: 'feature/foo', base_branch: 'main' },
+      REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).not.toContain(ROLLUP_MARKER);
+  });
+
+  it('default Blueprint config still injects rollup guidance for research/* heads (regression guard)', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValue({});
+    await handleReview(
+      'task-rollup-default',
+      { pr_number: 12, branch: 'research/4da143e3', base_branch: 'main' },
+      REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).toContain(ROLLUP_MARKER);
+  });
+
+  it('default Blueprint config does NOT inject rollup guidance for a non-staging branch', async () => {
+    vi.mocked(resolveBuildConfig).mockReturnValue({});
+    await handleReview(
+      'task-rollup-default-nonstaging',
+      { pr_number: 13, branch: 'feat', base_branch: 'main' },
+      REVIEW_TASK, 'token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).not.toContain(ROLLUP_MARKER);
+  });
+
+  it('fingerprint stays invariant to per-project staging prefixes (stable default)', () => {
+    // The fingerprint must track template edits, not per-task config: a project
+    // configuring custom prefixes must not fragment reviewer telemetry, so the
+    // fingerprint always evaluates rollup detection against ['research/','plan/'].
+    const baseFp = computeReviewPromptFingerprint(BLUEPRINT_CONFIG, { branch: 'research/abc', baseBranch: 'main' });
+    const customFp = computeReviewPromptFingerprint(
+      { ...BLUEPRINT_CONFIG, staging_branch_prefixes: ['stage/', 'integration/'] },
+      { branch: 'research/abc', baseBranch: 'main' },
+    );
+    expect(customFp).toBe(baseFp);
+  });
+});
+
 // ── handleFix: fix-task self-review SR focus ─────────────────────────────────
 describe('handleFix — fix-task SR focus block', () => {
   it('includes FIX_TASK_FOCUS content (regression_risk, scope-drift) in the fix prompt', async () => {
@@ -2164,5 +2552,486 @@ describe('handleFix — fix-task SR focus block', () => {
     );
     const prompt = capturedFixPrompt();
     expect(prompt).not.toContain('Repeating-issues verification');
+  });
+});
+
+// ── shouldFanOutReview threshold helper ──────────────────────────────────────
+describe('shouldFanOutReview — fan-out gating helper', () => {
+  it('returns false for trivial diff (1 file, 1 dir)', () => {
+    expect(shouldFanOutReview(['backend/app/foo.py'], BLUEPRINT_CONFIG)).toBe(false);
+  });
+
+  it('returns false for single-module rollup (10 files, 1 dir)', () => {
+    const files = Array.from({ length: 10 }, (_, i) => `backend/app/m${i}.py`);
+    expect(shouldFanOutReview(files, BLUEPRINT_CONFIG)).toBe(false);
+  });
+
+  it('returns true for multi-module rollup (8 files, 3 dirs)', () => {
+    const files = [
+      'agent/src/a.ts', 'agent/src/b.ts', 'agent/src/c.ts',
+      'admin-ui/src/d.tsx', 'admin-ui/src/e.tsx',
+      'backend/app/f.py', 'backend/app/g.py', 'backend/app/h.py',
+    ];
+    expect(shouldFanOutReview(files, BLUEPRINT_CONFIG)).toBe(true);
+  });
+
+  it('returns false when buildConfig is missing (conservative default)', () => {
+    const files = Array.from({ length: 8 }, (_, i) => `pkg${i}/src/m.ts`);
+    expect(shouldFanOutReview(files, undefined)).toBe(false);
+  });
+
+  it('ignores test files when counting non-test threshold', () => {
+    // 3 non-test files (below threshold of 4) across 2 dirs → false even with test padding
+    const files = [
+      'agent/src/a.ts',
+      'agent/src/a.test.ts',
+      'admin-ui/src/b.tsx',
+      'admin-ui/src/b.test.tsx',
+      'backend/app/c.py',
+      'backend/testing/test_c.py',
+    ];
+    expect(shouldFanOutReview(files, BLUEPRINT_CONFIG)).toBe(false);
+  });
+});
+
+// ── handleReview: parallel-review fan-out injection ──────────────────────────
+describe('handleReview — parallel-review fan-out gating', () => {
+  const PARALLEL_PAYLOAD = { pr_number: 700, branch: 'feat/rollup', base_branch: 'main', original_prompt: '' };
+  const BIG_DIFF = (
+    'M\tagent/src/a.ts\n' +
+    'M\tagent/src/b.ts\n' +
+    'M\tadmin-ui/src/c.tsx\n' +
+    'M\tadmin-ui/src/d.tsx\n' +
+    'M\tbackend/app/e.py'
+  );
+
+  function mockBigCrossModuleDiff(): void {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) return BIG_DIFF;
+      return '';
+    }) as unknown as typeof indexMod.git);
+    vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
+  }
+
+  function lastReviewPrompt(): string {
+    const calls = vi.mocked(indexMod.runClaudeCode).mock.calls;
+    if (calls.length === 0) throw new Error('runClaudeCode was not invoked');
+    return calls[calls.length - 1][0];
+  }
+
+  it('injects PARALLEL_REVIEW_GUIDANCE when the project flag is on and threshold is met', async () => {
+    mockBigCrossModuleDiff();
+    await handleReview(
+      'task-parallel-on',
+      PARALLEL_PAYLOAD,
+      {
+        context: { scope: 'large' },
+        project_metadata: { enable_parallel_review: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).toContain('Parallel review fan-out');
+  });
+
+  it('does NOT inject parallel guidance when the project flag is off (even for big multi-module diffs)', async () => {
+    mockBigCrossModuleDiff();
+    await handleReview(
+      'task-parallel-off',
+      PARALLEL_PAYLOAD,
+      {
+        context: { scope: 'large' },
+        project_metadata: { enable_parallel_review: false },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).not.toContain('Parallel review fan-out');
+  });
+
+  it('does NOT inject parallel guidance when project_metadata is absent (backward compatibility)', async () => {
+    mockBigCrossModuleDiff();
+    await handleReview(
+      'task-parallel-absent',
+      PARALLEL_PAYLOAD,
+      { context: { scope: 'large' } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).not.toContain('Parallel review fan-out');
+  });
+
+  it('does NOT inject parallel guidance when the helper returns false (trivial diff) even with flag on', async () => {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return 'M\tbackend/app/only.py';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+    vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
+    await handleReview(
+      'task-parallel-trivial',
+      PARALLEL_PAYLOAD,
+      {
+        context: { scope: 'small' },
+        project_metadata: { enable_parallel_review: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(lastReviewPrompt()).not.toContain('Parallel review fan-out');
+  });
+
+  it('prompt fingerprint changes when parallel guidance is enabled', () => {
+    const baseFp = computeReviewPromptFingerprint(BLUEPRINT_CONFIG);
+    const parallelFp = computeReviewPromptFingerprint(BLUEPRINT_CONFIG, { includeParallelReviewGuidance: true });
+    expect(parallelFp).not.toBe(baseFp);
+  });
+
+  it('records review_was_parallelized=true in the verdict JSON when fan-out was injected', async () => {
+    mockBigCrossModuleDiff();
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue('{"verdict":"APPROVE","feedback":"ok"}');
+    await handleReview(
+      'task-parallel-telemetry',
+      PARALLEL_PAYLOAD,
+      {
+        context: { scope: 'large' },
+        project_metadata: { enable_parallel_review: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const lastCall = vi.mocked(indexMod.persistAndPostStatus).mock.calls.at(-1);
+    if (!lastCall) throw new Error('persistAndPostStatus was not invoked');
+    const payload = lastCall[1] as { verdict_json?: string };
+    expect(payload.verdict_json).toBeDefined();
+    const parsed = JSON.parse(defined(payload.verdict_json)) as Record<string, unknown>;
+    expect(parsed.review_was_parallelized).toBe(true);
+  });
+
+  it('does NOT add review_was_parallelized when fan-out was not injected', async () => {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-status')) {
+        return 'M\tbackend/app/only.py';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+    vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
+    vi.mocked(fs.existsSync).mockReturnValue(true);
+    vi.mocked(fs.readFileSync).mockReturnValue('{"verdict":"APPROVE","feedback":"ok"}');
+    await handleReview(
+      'task-parallel-no-telemetry',
+      PARALLEL_PAYLOAD,
+      {
+        context: { scope: 'small' },
+        project_metadata: { enable_parallel_review: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    const lastCall = vi.mocked(indexMod.persistAndPostStatus).mock.calls.at(-1);
+    if (!lastCall) throw new Error('persistAndPostStatus was not invoked');
+    const payload = lastCall[1] as { verdict_json?: string };
+    expect(payload.verdict_json).toBeDefined();
+    const parsed = JSON.parse(defined(payload.verdict_json)) as Record<string, unknown>;
+    expect(parsed.review_was_parallelized).toBeUndefined();
+  });
+});
+
+// ── shouldFanOutFix threshold helper ─────────────────────────────────────────
+describe('shouldFanOutFix — fan-out gating helper', () => {
+  it('returns false for trivial diff (1 file)', () => {
+    expect(shouldFanOutFix(['backend/app/foo.py'], 0, [], BLUEPRINT_CONFIG)).toBe(false);
+  });
+
+  it('returns false for single-module diff below file threshold', () => {
+    const files = ['backend/app/a.py', 'backend/app/b.py', 'backend/app/c.py'];
+    expect(shouldFanOutFix(files, 0, [], BLUEPRINT_CONFIG)).toBe(false);
+  });
+
+  it('returns true for multi-module diff (4+ non-test files, 2+ dirs)', () => {
+    const files = [
+      'agent/src/a.ts', 'agent/src/b.ts',
+      'backend/app/c.py', 'backend/app/d.py',
+    ];
+    expect(shouldFanOutFix(files, 0, [], BLUEPRINT_CONFIG)).toBe(true);
+  });
+
+  it('returns true when reviewer issues cross threshold (6 issues, 2 files)', () => {
+    expect(shouldFanOutFix([], 6, ['file_a.ts', 'file_b.ts'], BLUEPRINT_CONFIG)).toBe(true);
+  });
+
+  it('returns false when issue count meets threshold but only 1 file', () => {
+    expect(shouldFanOutFix([], 6, ['file_a.ts'], BLUEPRINT_CONFIG)).toBe(false);
+  });
+
+  it('returns false when issue file count meets threshold but issue count is below', () => {
+    expect(shouldFanOutFix([], 5, ['file_a.ts', 'file_b.ts'], BLUEPRINT_CONFIG)).toBe(false);
+  });
+
+  it('returns false when buildConfig is missing and diff is trivial', () => {
+    const files = ['agent/src/a.ts', 'backend/app/b.py'];
+    expect(shouldFanOutFix(files, 0, [], undefined)).toBe(false);
+  });
+
+  it('ignores test files when counting non-test threshold', () => {
+    // 3 non-test files across 2 dirs but below minNonTestFiles=4 → false
+    const files = [
+      'agent/src/a.ts',
+      'agent/src/a.test.ts',
+      'backend/app/b.py',
+      'backend/testing/test_b.py',
+      'admin-ui/src/c.tsx',
+    ];
+    expect(shouldFanOutFix(files, 0, [], BLUEPRINT_CONFIG)).toBe(false);
+  });
+});
+
+// ── handleFix: parallel-fix fan-out injection ─────────────────────────────────
+describe('handleFix — parallel-fix fan-out gating', () => {
+  const FIX_PAYLOAD = {
+    pr_number: 800,
+    branch: 'fix/rollup',
+    base_branch: 'main',
+    prompt: 'Fix the issues',
+    original_prompt: 'Original task',
+  };
+  const BIG_FIX_DIFF = [
+    'agent/src/a.ts',
+    'agent/src/b.ts',
+    'backend/app/c.py',
+    'backend/app/d.py',
+  ].join('\n');
+
+  function mockBigFixDiff(): void {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-only')) return BIG_FIX_DIFF;
+      return '';
+    }) as unknown as typeof indexMod.git);
+    vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
+  }
+
+  it('injects PARALLEL_FIX_GUIDANCE when flag is on and multi-module diff threshold is met', async () => {
+    mockBigFixDiff();
+    await handleFix(
+      'task-fix-parallel-on',
+      FIX_PAYLOAD,
+      {
+        context: { scope: 'large', review_loop: { review_history: [] } },
+        project_metadata: { enable_parallel_fix: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(capturedFixPrompt()).toContain('Parallel fix investigation');
+  });
+
+  it('injects PARALLEL_FIX_GUIDANCE when flag is on and reviewer issue count meets threshold', async () => {
+    vi.mocked(indexMod.git).mockReturnValue('');
+    vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
+    const issues = Array.from({ length: 6 }, (_, i) => ({
+      severity: 'major',
+      description: `Issue ${i}`,
+      file: i < 3 ? 'backend/app/foo.py' : 'agent/src/bar.ts',
+    }));
+    await handleFix(
+      'task-fix-parallel-issues',
+      FIX_PAYLOAD,
+      {
+        context: {
+          scope: 'large',
+          review_loop: { review_history: [{ iteration: 1, feedback: 'feedback', issues }] },
+        },
+        project_metadata: { enable_parallel_fix: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(capturedFixPrompt()).toContain('Parallel fix investigation');
+  });
+
+  it('does NOT inject PARALLEL_FIX_GUIDANCE when flag is off', async () => {
+    mockBigFixDiff();
+    await handleFix(
+      'task-fix-parallel-off',
+      FIX_PAYLOAD,
+      {
+        context: { scope: 'large', review_loop: { review_history: [] } },
+        project_metadata: { enable_parallel_fix: false },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(capturedFixPrompt()).not.toContain('Parallel fix investigation');
+  });
+
+  it('does NOT inject PARALLEL_FIX_GUIDANCE when project_metadata is absent (backward compat)', async () => {
+    mockBigFixDiff();
+    await handleFix(
+      'task-fix-parallel-absent',
+      FIX_PAYLOAD,
+      { context: { scope: 'large', review_loop: { review_history: [] } } },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(capturedFixPrompt()).not.toContain('Parallel fix investigation');
+  });
+
+  it('does NOT inject PARALLEL_FIX_GUIDANCE when diff is trivial (single-module)', async () => {
+    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+      if (args && args[0] === 'diff' && args.includes('--name-only')) {
+        return 'backend/app/only.py';
+      }
+      return '';
+    }) as unknown as typeof indexMod.git);
+    vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
+    await handleFix(
+      'task-fix-parallel-trivial',
+      FIX_PAYLOAD,
+      {
+        context: { scope: 'small', review_loop: { review_history: [] } },
+        project_metadata: { enable_parallel_fix: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(capturedFixPrompt()).not.toContain('Parallel fix investigation');
+  });
+
+  it('prompt fingerprint changes when parallel fix guidance is enabled', () => {
+    const baseFp = computePromptFingerprint('fix', BLUEPRINT_CONFIG);
+    const parallelFp = computePromptFingerprint('fix', BLUEPRINT_CONFIG, { includeParallelFixGuidance: true });
+    expect(parallelFp).not.toBe(baseFp);
+  });
+
+  it('writes fix_parallelized telemetry file when fan-out is injected', async () => {
+    mockBigFixDiff();
+    await handleFix(
+      'task-fix-telemetry',
+      FIX_PAYLOAD,
+      {
+        context: { scope: 'large', review_loop: { review_history: [] } },
+        project_metadata: { enable_parallel_fix: true },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+    expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(
+      '/tmp/fix_parallelized_task-fix-telemetry.json',
+      expect.stringContaining('"fix_was_parallelized":true'),
+      'utf-8',
+    );
+  });
+});
+
+describe('buildTypeCheckInstructions — lint scoping', () => {
+  // Reproduces the bug fixed alongside this test: lint_cmd like 'mypy .' was
+  // being passed verbatim as the xargs executable, so xargs appended the
+  // changed-files list AFTER the '.' and the linter scanned the full tree on
+  // top of the changed files. The fix strips trailing '.' / './' tokens.
+  const makeConfig = (lintCmd: string) => ({
+    directories: [{ path: 'backend', type: 'python', lint_cmd: lintCmd }],
+  });
+
+  const xargsTail = (s: string, linterInvocation: string) => {
+    // Whitespace-tolerant check for the trailing-dot tail that signals a
+    // full-tree scan: `xargs -r <linter-invocation> .` or `... ./`.
+    const re = new RegExp(`xargs\\s+-r\\s+${linterInvocation}\\s+\\.\\/?(?:\\s|\`|$)`);
+    return re.test(s);
+  };
+
+  it.each([
+    "svc$(whoami)`rm`;echo|cat&",
+    'svc;rm -rf /',
+    'svc|tee',
+    'svc&wait',
+    'svc`id`',
+  ])('rejects unsafe build_config path %s before emitting review instructions', async (maliciousPath) => {
+    const actualBuildConfig = await vi.importActual<typeof import('../build-config.js')>('../build-config.js');
+    const cfg = actualBuildConfig.resolveBuildConfig({
+      build_config: {
+        directories: [
+          {
+            path: maliciousPath,
+            type: 'python',
+            build_cmd: 'python -m build',
+          },
+        ],
+      },
+    });
+    expect(cfg).toBeUndefined();
+
+    const out = buildTypeCheckInstructions(cfg);
+    expect(out).not.toContain(maliciousPath);
+    expect(out).toContain('Build & Type Safety (MUST run these');
+  });
+
+  it('ruff: keeps hardcoded --select E,F,W --ignore E501 override and strips trailing dot', () => {
+    const out = buildTypeCheckInstructions(makeConfig('ruff check .'));
+    expect(out).toContain('xargs -r python3 -m ruff check --select E,F,W --ignore E501');
+    expect(xargsTail(out, 'python3 -m ruff check --select E,F,W --ignore E501')).toBe(false);
+  });
+
+  it('mypy: strips trailing dot so xargs gets only the changed-files list', () => {
+    const out = buildTypeCheckInstructions(makeConfig('mypy .'));
+    expect(out).toContain('xargs -r mypy`');
+    expect(xargsTail(out, 'mypy')).toBe(false);
+  });
+
+  it('flake8: strips trailing dot', () => {
+    const out = buildTypeCheckInstructions(makeConfig('flake8 .'));
+    expect(out).toContain('xargs -r flake8`');
+    expect(xargsTail(out, 'flake8')).toBe(false);
+  });
+
+  it('pyright: strips trailing dot', () => {
+    const out = buildTypeCheckInstructions(makeConfig('pyright .'));
+    expect(out).toContain('xargs -r pyright`');
+    expect(xargsTail(out, 'pyright')).toBe(false);
+  });
+
+  it('mypy: strips trailing ./', () => {
+    const out = buildTypeCheckInstructions(makeConfig('mypy ./'));
+    expect(out).toContain('xargs -r mypy`');
+    expect(xargsTail(out, 'mypy')).toBe(false);
+  });
+
+  it('eslint via npx: keeps hardcoded npx eslint invocation', () => {
+    const out = buildTypeCheckInstructions({
+      directories: [{ path: 'admin-ui', type: 'node', lint_cmd: 'npx eslint .' }],
+    });
+    expect(out).toContain('xargs -r npx eslint`');
+    expect(xargsTail(out, 'npx eslint')).toBe(false);
+  });
+
+  it('python3 -m mypy: preserves prefix through to the xargs invocation', () => {
+    const out = buildTypeCheckInstructions(makeConfig('python3 -m mypy .'));
+    expect(out).toContain('xargs -r python3 -m mypy`');
+    expect(xargsTail(out, 'python3 -m mypy')).toBe(false);
+  });
+
+  it('python3 -m flake8: preserves prefix through to the xargs invocation', () => {
+    const out = buildTypeCheckInstructions(makeConfig('python3 -m flake8 .'));
+    expect(out).toContain('xargs -r python3 -m flake8`');
+    expect(xargsTail(out, 'python3 -m flake8')).toBe(false);
+  });
+
+  it('pnpm exec eslint: preserves prefix through to the xargs invocation', () => {
+    const out = buildTypeCheckInstructions({
+      directories: [{ path: 'admin-ui', type: 'node', lint_cmd: 'pnpm exec eslint .' }],
+    });
+    expect(out).toContain('xargs -r pnpm exec eslint`');
+    expect(xargsTail(out, 'pnpm exec eslint')).toBe(false);
+  });
+
+  it('unrecognized lint_cmd (e.g. make lint): emitted verbatim, not rewritten into xargs form', () => {
+    const out = buildTypeCheckInstructions({
+      directories: [{ path: 'backend', type: 'python', lint_cmd: 'make lint' }],
+    });
+    expect(out).toContain('make lint');
+    expect(out).not.toContain('xargs -r make');
+  });
+
+  it('no buildConfig: emits the generic fallback wording', () => {
+    const out = buildTypeCheckInstructions(undefined);
+    expect(out).toContain('Build & Type Safety (MUST run these');
+    expect(out).toContain('For TypeScript/JavaScript changes');
+    expect(out).toContain('For Python changes');
+  });
+
+  it('buildConfig with no build_cmd or lint_cmd: emits "No build commands configured" notice', () => {
+    const out = buildTypeCheckInstructions({
+      directories: [{ path: 'backend', type: 'python' }],
+    });
+    expect(out).toContain('No build commands configured');
   });
 });
