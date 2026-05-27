@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.models import AlertSeverity
+import app.shared_state as _shared_state
 from app.shared_state import (
     TASK_TYPE_BRANCH_PREFIX,
     backfill_branch_columns,
@@ -339,6 +341,66 @@ class TestBackfillBranchColumns:
         assert project.integration_branch == original_integration
         assert project.promotion_target == "main"
         assert summary["filled"] == 1
+
+
+class TestProjectBranchResolvers:
+    @pytest.fixture(autouse=True)
+    def _reset_missing_branch_alerts(self):
+        import app.shared_state as shared_state
+
+        shared_state._missing_project_branch_alerts.clear()
+        yield
+        shared_state._missing_project_branch_alerts.clear()
+
+    def test_populated_branches_return_values_without_alerts(self):
+        project = _project(
+            integration_branch="develop",
+            promotion_target="release",
+        )
+        session = MagicMock()
+
+        with (
+            patch(
+                "app.shared_state.object_session", return_value=session
+            ) as mock_session,
+            patch("app.shared_state.logger.warning") as mock_warning,
+        ):
+            assert _shared_state.get_project_integration_branch(project) == "develop"
+            assert _shared_state.get_project_promotion_target(project) == "release"
+
+        mock_session.assert_not_called()
+        mock_warning.assert_not_called()
+        session.add.assert_not_called()
+
+    def test_null_branch_emits_alert_once_per_project_and_column(self):
+        project = _project(integration_branch=None, promotion_target=None)
+        session = MagicMock()
+
+        with (
+            patch("app.shared_state.object_session", return_value=session),
+            patch("app.shared_state.logger.warning") as mock_warning,
+        ):
+            assert _shared_state.get_project_integration_branch(project) == "main"
+            assert _shared_state.get_project_integration_branch(project) == "main"
+            assert _shared_state.get_project_promotion_target(project) == "main"
+            assert _shared_state.get_project_promotion_target(project) == "main"
+
+        assert session.add.call_count == 2
+        integration_alert = session.add.call_args_list[0].args[0]
+        promotion_alert = session.add.call_args_list[1].args[0]
+        assert integration_alert.severity == AlertSeverity.ERROR
+        assert integration_alert.title == "Missing integration_branch"
+        assert promotion_alert.severity == AlertSeverity.ERROR
+        assert promotion_alert.title == "Missing promotion_target"
+        assert mock_warning.call_count == 2
+        assert mock_warning.call_args_list[0].args[1:] == (
+            str(project.id),
+            "integration_branch",
+        )
+        assert mock_warning.call_args_list[1].args[1:] == (
+            str(project.id),
+            "promotion_target",
+        )
 
 
 if __name__ == "__main__":

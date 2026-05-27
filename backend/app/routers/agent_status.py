@@ -1347,186 +1347,197 @@ async def update_agent_status(
                         # The LTS model is active when the integration trunk and
                         # promotion target are distinct branches.
                         _smoketest_project = await session.get(Project, task.project_id)
-                        _promotion_target = (
-                            _get_project_promotion_target(_smoketest_project)
-                            if _smoketest_project is not None
-                            else str(_runtime_config.get("promotion_target", "main"))
-                        )
-                        _integration_branch = (
-                            _get_project_integration_branch(_smoketest_project)
-                            if _smoketest_project is not None
-                            else str(_runtime_config.get("integration_branch", "main"))
-                        )
-                        base_branch = (task.first_payload).get(
-                            "base_branch"
-                        ) or _integration_branch
-                        is_post_promotion = base_branch == _promotion_target and (
-                            _integration_branch != _promotion_target
-                        )
-                        failure_summary = "\n".join(
-                            f"- {t['name']}: {t.get('message', 'no details')}"
-                            for t in failed_tests
-                        )
-
-                        # Determine priority based on which suite failed (higher = dispatched first)
-                        suite_results = smoketest_data.get("suites", {})
-                        if suite_results.get("startup", {}).get("passed") is False:
-                            fix_priority = 90  # Startup failure — critical
-                        elif suite_results.get("curated", {}).get("passed") is False:
-                            fix_priority = 70  # Curated test failure — high
+                        if _smoketest_project is None:
+                            logger.warning(
+                                "[SMOKETEST] project not found for task %s "
+                                "(project_id=%s) — skipping fix spawn",
+                                task.id,
+                                task.project_id,
+                            )
                         else:
-                            fix_priority = 50  # Regression-only failure — normal
+                            _promotion_target = _get_project_promotion_target(
+                                _smoketest_project
+                            )
+                            _integration_branch = _get_project_integration_branch(
+                                _smoketest_project
+                            )
+                            base_branch = (task.first_payload).get(
+                                "base_branch"
+                            ) or _integration_branch
+                            is_post_promotion = base_branch == _promotion_target and (
+                                _integration_branch != _promotion_target
+                            )
+                            failure_summary = "\n".join(
+                                f"- {t['name']}: {t.get('message', 'no details')}"
+                                for t in failed_tests
+                            )
 
-                        # Post-promotion (production) smoketest failures are urgent:
-                        # override suite-based ladder so priority is always >= 90.
-                        if is_post_promotion:
-                            fix_priority = max(fix_priority, 90)
-
-                        type_model = (
-                            _runtime_config.get("task_type_models", {}).get("plan")
-                            or None
-                        )
-                        type_effort = (
-                            _runtime_config.get("task_type_efforts", {}).get("plan")
-                            or None
-                        )
-                        plan_task = Task(
-                            project_id=task.project_id,
-                            title=(
-                                f"[HOTFIX] Fix post-promotion smoketest failures on {base_branch}"
-                                if is_post_promotion
-                                else f"Fix smoketest failures on {base_branch}"
-                            ),
-                            description=f"{len(failed_tests)} smoke test(s) failed after merge to {base_branch}",
-                            parent_task_id=task.id,
-                            priority=fix_priority,
-                            payloads=[
-                                _validate_internal_payload(
-                                    {
-                                        "type": "plan",
-                                        "prompt": (
-                                            f"Smoke tests failed after a merge to {base_branch}. "
-                                            f"Investigate and plan fixes for these failures:\n\n"
-                                            f"{failure_summary}\n\n"
-                                            f"IMPORTANT GUARDRAILS:\n"
-                                            f"- Do NOT delete or skip tests just to make them pass\n"
-                                            f"- First diagnose: is the failure in the CODE or the TEST?\n"
-                                            f"- If the test is wrong, fix it to correctly test the intended behavior\n"
-                                            f"- If the code is wrong, fix the code\n"
-                                            f"- Tests may only be removed if the tested functionality was removed — explain why\n"
-                                            f"- Do NOT weaken assertions without justification\n"
-                                            f"Diagnose root causes, identify which recent changes caused each failure, "
-                                            f"and produce subtasks to fix them."
-                                        ),
-                                        "base_branch": base_branch,
-                                        **(
-                                            {"hotfix": True}
-                                            if is_post_promotion
-                                            else {}
-                                        ),
-                                        **({"model": type_model} if type_model else {}),
-                                        **(
-                                            {"effort": type_effort}
-                                            if type_effort
-                                            else {}
-                                        ),
-                                    },
-                                    "main:smoketest_fix_plan",
-                                )
-                            ],
-                            context={
-                                "smoketest_task_id": str(task.id),
-                                "failed_tests": [t["name"] for t in failed_tests],
-                                "suite_results": suite_results,
-                                "guardrail_violations": smoketest_data.get(
-                                    "guardrail_violations", []
-                                ),
-                                "total_tests": len(smoketest_data.get("tests", [])),
-                                "passed_count": len(
-                                    [
-                                        t
-                                        for t in smoketest_data.get("tests", [])
-                                        if t.get("status") == "pass"
-                                    ]
-                                ),
-                                "failed_count": len(failed_tests),
-                                **({"hotfix": True} if is_post_promotion else {}),
-                            },
-                            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-                            status=TaskStatus.QUEUED,
-                            created_by="ORCHESTRATOR",
-                        )
-                        session.add(plan_task)
-                        await session.flush()
-                        history = TaskHistory(
-                            task_id=plan_task.id,
-                            action="SPAWNED",
-                            details={
-                                "spawned_by": "SMOKETEST_FAILURE",
-                                "priority": fix_priority,
-                                "failed_tests": [t["name"] for t in failed_tests],
-                            },
-                        )
-                        session.add(history)
-
-                        # Build suite breakdown for alert message
-                        suite_detail = ""
-                        for suite_name, suite_data in suite_results.items():
-                            if (
-                                isinstance(suite_data, dict)
-                                and suite_data.get("passed") is False
+                            # Determine priority based on which suite failed (higher = dispatched first)
+                            suite_results = smoketest_data.get("suites", {})
+                            if suite_results.get("startup", {}).get("passed") is False:
+                                fix_priority = 90  # Startup failure — critical
+                            elif (
+                                suite_results.get("curated", {}).get("passed") is False
                             ):
-                                suite_fails = [
-                                    t
-                                    for t in suite_data.get("tests", [])
-                                    if t.get("status") == "fail"
-                                ]
-                                if suite_fails:
-                                    suite_detail += (
-                                        f" [{suite_name}: {len(suite_fails)} failed]"
+                                fix_priority = 70  # Curated test failure — high
+                            else:
+                                fix_priority = 50  # Regression-only failure — normal
+
+                            # Post-promotion (production) smoketest failures are urgent:
+                            # override suite-based ladder so priority is always >= 90.
+                            if is_post_promotion:
+                                fix_priority = max(fix_priority, 90)
+
+                            type_model = (
+                                _runtime_config.get("task_type_models", {}).get("plan")
+                                or None
+                            )
+                            type_effort = (
+                                _runtime_config.get("task_type_efforts", {}).get("plan")
+                                or None
+                            )
+                            plan_task = Task(
+                                project_id=task.project_id,
+                                title=(
+                                    f"[HOTFIX] Fix post-promotion smoketest failures on {base_branch}"
+                                    if is_post_promotion
+                                    else f"Fix smoketest failures on {base_branch}"
+                                ),
+                                description=f"{len(failed_tests)} smoke test(s) failed after merge to {base_branch}",
+                                parent_task_id=task.id,
+                                priority=fix_priority,
+                                payloads=[
+                                    _validate_internal_payload(
+                                        {
+                                            "type": "plan",
+                                            "prompt": (
+                                                f"Smoke tests failed after a merge to {base_branch}. "
+                                                f"Investigate and plan fixes for these failures:\n\n"
+                                                f"{failure_summary}\n\n"
+                                                f"IMPORTANT GUARDRAILS:\n"
+                                                f"- Do NOT delete or skip tests just to make them pass\n"
+                                                f"- First diagnose: is the failure in the CODE or the TEST?\n"
+                                                f"- If the test is wrong, fix it to correctly test the intended behavior\n"
+                                                f"- If the code is wrong, fix the code\n"
+                                                f"- Tests may only be removed if the tested functionality was removed — explain why\n"
+                                                f"- Do NOT weaken assertions without justification\n"
+                                                f"Diagnose root causes, identify which recent changes caused each failure, "
+                                                f"and produce subtasks to fix them."
+                                            ),
+                                            "base_branch": base_branch,
+                                            **(
+                                                {"hotfix": True}
+                                                if is_post_promotion
+                                                else {}
+                                            ),
+                                            **(
+                                                {"model": type_model}
+                                                if type_model
+                                                else {}
+                                            ),
+                                            **(
+                                                {"effort": type_effort}
+                                                if type_effort
+                                                else {}
+                                            ),
+                                        },
+                                        "main:smoketest_fix_plan",
                                     )
-
-                        alert = Alert(
-                            project_id=task.project_id,
-                            severity=AlertSeverity.ERROR,
-                            title=(
-                                f"[HOTFIX] Post-promotion smoke tests failed on {base_branch}"
-                                if is_post_promotion
-                                else f"Smoke tests failed on {base_branch}"
-                            ),
-                            message=(
-                                "[POST-PROMOTION PRODUCTION FAILURE] "
-                                if is_post_promotion
-                                else ""
+                                ],
+                                context={
+                                    "smoketest_task_id": str(task.id),
+                                    "failed_tests": [t["name"] for t in failed_tests],
+                                    "suite_results": suite_results,
+                                    "guardrail_violations": smoketest_data.get(
+                                        "guardrail_violations", []
+                                    ),
+                                    "total_tests": len(smoketest_data.get("tests", [])),
+                                    "passed_count": len(
+                                        [
+                                            t
+                                            for t in smoketest_data.get("tests", [])
+                                            if t.get("status") == "pass"
+                                        ]
+                                    ),
+                                    "failed_count": len(failed_tests),
+                                    **({"hotfix": True} if is_post_promotion else {}),
+                                },
+                                vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                                status=TaskStatus.QUEUED,
+                                created_by="ORCHESTRATOR",
                             )
-                            + f"{len(failed_tests)} test(s) failed: {', '.join(t['name'] for t in failed_tests[:5])}"
-                            + (
-                                f" (+{len(failed_tests) - 5} more)"
-                                if len(failed_tests) > 5
-                                else ""
+                            session.add(plan_task)
+                            await session.flush()
+                            history = TaskHistory(
+                                task_id=plan_task.id,
+                                action="SPAWNED",
+                                details={
+                                    "spawned_by": "SMOKETEST_FAILURE",
+                                    "priority": fix_priority,
+                                    "failed_tests": [t["name"] for t in failed_tests],
+                                },
                             )
-                            + (suite_detail if suite_detail else ""),
-                            task_id=task.id,
-                        )
-                        session.add(alert)
+                            session.add(history)
 
-                        await broadcast_to_project(
-                            str(task.project_id),
-                            "task_updated",
-                            {"task_id": str(plan_task.id), "status": TaskStatus.QUEUED},
-                        )
-                        await broadcast_to_project(
-                            str(task.project_id),
-                            "alert_created",
-                            {
-                                "alert_id": str(alert.id),
-                                "severity": alert.severity,
-                                "title": alert.title,
-                            },
-                        )
-                        logger.error(
-                            f"[SMOKETEST] Spawned {'hotfix ' if is_post_promotion else ''}plan task {plan_task.id} (priority={fix_priority}) + alert for {len(failed_tests)} failed smoke tests"
-                        )
+                            # Build suite breakdown for alert message
+                            suite_detail = ""
+                            for suite_name, suite_data in suite_results.items():
+                                if (
+                                    isinstance(suite_data, dict)
+                                    and suite_data.get("passed") is False
+                                ):
+                                    suite_fails = [
+                                        t
+                                        for t in suite_data.get("tests", [])
+                                        if t.get("status") == "fail"
+                                    ]
+                                    if suite_fails:
+                                        suite_detail += f" [{suite_name}: {len(suite_fails)} failed]"
+
+                            alert = Alert(
+                                project_id=task.project_id,
+                                severity=AlertSeverity.ERROR,
+                                title=(
+                                    f"[HOTFIX] Post-promotion smoke tests failed on {base_branch}"
+                                    if is_post_promotion
+                                    else f"Smoke tests failed on {base_branch}"
+                                ),
+                                message=(
+                                    "[POST-PROMOTION PRODUCTION FAILURE] "
+                                    if is_post_promotion
+                                    else ""
+                                )
+                                + f"{len(failed_tests)} test(s) failed: {', '.join(t['name'] for t in failed_tests[:5])}"
+                                + (
+                                    f" (+{len(failed_tests) - 5} more)"
+                                    if len(failed_tests) > 5
+                                    else ""
+                                )
+                                + (suite_detail if suite_detail else ""),
+                                task_id=task.id,
+                            )
+                            session.add(alert)
+
+                            await broadcast_to_project(
+                                str(task.project_id),
+                                "task_updated",
+                                {
+                                    "task_id": str(plan_task.id),
+                                    "status": TaskStatus.QUEUED,
+                                },
+                            )
+                            await broadcast_to_project(
+                                str(task.project_id),
+                                "alert_created",
+                                {
+                                    "alert_id": str(alert.id),
+                                    "severity": alert.severity,
+                                    "title": alert.title,
+                                },
+                            )
+                            logger.error(
+                                f"[SMOKETEST] Spawned {'hotfix ' if is_post_promotion else ''}plan task {plan_task.id} (priority={fix_priority}) + alert for {len(failed_tests)} failed smoke tests"
+                            )
         except Exception as e:
             # Audit W5/A6: smoketest plan-task spawn used to silently log-and-continue.
             # That hid genuine breakage of the smoketest → fix-spawn → CI loop. Now

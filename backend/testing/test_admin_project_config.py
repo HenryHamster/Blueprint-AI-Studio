@@ -1,5 +1,7 @@
 import pytest
 from httpx import AsyncClient
+from unittest.mock import AsyncMock, patch
+from fastapi import HTTPException
 
 from app.models import Project
 from app.shared_state import (
@@ -744,3 +746,219 @@ async def test_post_backfill_branches_owner_succeeds(
     await db_session.refresh(project)
     assert project.promotion_target == "main"
     assert project.integration_branch == "automain"
+
+
+# ---------------------------------------------------------------------------
+# Remote branch-existence validation tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def github_project(db_session):
+    """Project with GitHub integration configured (owner + repo set)."""
+    project = Project(
+        name="GitHub Project",
+        user_id="test-user-123",
+        github_owner="acme",
+        github_repo="myrepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    from testing.factories import make_membership
+
+    member = make_membership(project.id, user_id="test-user-123", role="owner")
+    db_session.add(member)
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_integration_branch_rejects_nonexistent_branch(
+    client: AsyncClient, db_session, github_project
+):
+    """PATCH integration-branch with a branch that does not exist returns 422."""
+    project = github_project
+    with (
+        patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="tok",
+        ),
+        patch(
+            "app.github.get_branch_sha",
+            new_callable=AsyncMock,
+            side_effect=HTTPException(status_code=404, detail="not found"),
+        ),
+    ):
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/integration-branch",
+            json={"integration_branch": "developmnet"},
+        )
+    assert resp.status_code == 422, resp.text
+    msg = resp.json()["error"]["message"]
+    assert "developmnet" in msg
+    assert "does not exist" in msg
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_integration_branch_accepts_existing_branch(
+    client: AsyncClient, db_session, github_project
+):
+    """PATCH integration-branch with a branch that exists on the remote returns 200."""
+    project = github_project
+    with (
+        patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="tok",
+        ),
+        patch(
+            "app.github.get_branch_sha",
+            new_callable=AsyncMock,
+            return_value="abc123",
+        ),
+    ):
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/integration-branch",
+            json={"integration_branch": "development"},
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["integration_branch"] == "development"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_integration_branch_502_when_no_token(
+    client: AsyncClient, db_session, github_project
+):
+    """PATCH integration-branch returns 502 when GitHub credential is unavailable."""
+    project = github_project
+    with patch(
+        "app.github.get_repo_installation_token",
+        new_callable=AsyncMock,
+        return_value=None,
+    ):
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/integration-branch",
+            json={"integration_branch": "development"},
+        )
+    assert resp.status_code == 502, resp.text
+    assert "credential unavailable" in resp.json()["error"]["message"]
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_integration_branch_null_skips_remote_check(
+    client: AsyncClient, db_session, github_project
+):
+    """PATCH integration-branch with null does not call GitHub at all."""
+    project = github_project
+    with patch(
+        "app.github.get_repo_installation_token",
+        new_callable=AsyncMock,
+    ) as mock_token:
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/integration-branch",
+            json={"integration_branch": None},
+        )
+    assert resp.status_code == 200, resp.text
+    mock_token.assert_not_called()
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_promotion_target_rejects_nonexistent_branch(
+    client: AsyncClient, db_session, github_project
+):
+    """PATCH promotion-target with a branch that does not exist returns 422."""
+    project = github_project
+    with (
+        patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="tok",
+        ),
+        patch(
+            "app.github.get_branch_sha",
+            new_callable=AsyncMock,
+            side_effect=HTTPException(status_code=404, detail="not found"),
+        ),
+    ):
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/promotion-target",
+            json={"promotion_target": "lts-typo"},
+        )
+    assert resp.status_code == 422, resp.text
+    msg = resp.json()["error"]["message"]
+    assert "lts-typo" in msg
+    assert "does not exist" in msg
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_promotion_target_accepts_existing_branch(
+    client: AsyncClient, db_session, github_project
+):
+    """PATCH promotion-target with a branch that exists on the remote returns 200."""
+    project = github_project
+    with (
+        patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="tok",
+        ),
+        patch(
+            "app.github.get_branch_sha",
+            new_callable=AsyncMock,
+            return_value="def456",
+        ),
+    ):
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/promotion-target",
+            json={"promotion_target": "lts"},
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["promotion_target"] == "lts"
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_promotion_target_502_when_no_token(
+    client: AsyncClient, db_session, github_project
+):
+    """PATCH promotion-target returns 502 when GitHub credential is unavailable."""
+    project = github_project
+    with patch(
+        "app.github.get_repo_installation_token",
+        new_callable=AsyncMock,
+        return_value=None,
+    ):
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/promotion-target",
+            json={"promotion_target": "lts"},
+        )
+    assert resp.status_code == 502, resp.text
+    assert "credential unavailable" in resp.json()["error"]["message"]
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_patch_promotion_target_null_skips_remote_check(
+    client: AsyncClient, db_session, github_project
+):
+    """PATCH promotion-target with null does not call GitHub at all."""
+    project = github_project
+    with patch(
+        "app.github.get_repo_installation_token",
+        new_callable=AsyncMock,
+    ) as mock_token:
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}/promotion-target",
+            json={"promotion_target": None},
+        )
+    assert resp.status_code == 200, resp.text
+    mock_token.assert_not_called()
