@@ -2035,11 +2035,12 @@ def _apply_cors_headers(resp: JSONResponse, request: Request) -> JSONResponse:
     deployment via ALLOWED_ORIGINS env; resolve at call time.
     """
     origin = request.headers.get("origin")
-    if origin and (origin in allowed_origins or "*" in allowed_origins):
+    if origin and origin in allowed_origins:
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Access-Control-Allow-Credentials"] = "true"
         resp.headers["Vary"] = "Origin"
     elif "*" in allowed_origins:
+        # Non-credentialed wildcard only — browsers forbid Allow-Credentials with *.
         resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
@@ -2106,20 +2107,36 @@ async def generic_exception_handler(request: Request, exc: Exception):
 # Add CORS Middleware so the frontend can call these APIs
 # In production, set ALLOWED_ORIGINS to the specific frontend domain (e.g., "https://my-app.com")
 # Multiple origins can be comma-separated.
+def _resolve_allowed_origins(env_value: str) -> list[str]:
+    """Parse ALLOWED_ORIGINS env value and reject any wildcard entry.
+
+    A '*' anywhere in the list (whether ALLOWED_ORIGINS='*' or
+    ALLOWED_ORIGINS='*,https://foo.com') combined with our
+    allow_credentials=True CORS config would let Starlette's CORSMiddleware
+    echo arbitrary origins back with credentials — the bypass this guard
+    prevents.
+    """
+    if not env_value:
+        return [
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:5173",
+        ]
+    parsed = [origin.strip() for origin in env_value.split(",") if origin.strip()]
+    if any(o == "*" for o in parsed):
+        raise ValueError(
+            "ALLOWED_ORIGINS may not contain '*' when Firebase auth is configured: "
+            "a wildcard origin with allow_credentials=True lets any site send "
+            "authenticated requests on behalf of logged-in users. "
+            "Set ALLOWED_ORIGINS to a comma-separated list of explicit origins "
+            f"(e.g. 'https://my-app.web.app,http://localhost:3000'). Got: {env_value!r}"
+        )
+    return parsed
+
+
 allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "")
-if allowed_origins_env == "*":
-    allowed_origins = ["*"]
-elif allowed_origins_env:
-    allowed_origins = [
-        origin.strip() for origin in allowed_origins_env.split(",") if origin.strip()
-    ]
-else:
-    allowed_origins = [
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173",
-    ]
+allowed_origins = _resolve_allowed_origins(allowed_origins_env)
 
 app.add_middleware(
     CORSMiddleware,

@@ -1,5 +1,12 @@
 substitutions:
-  _ALLOWED_ORIGINS: '*'
+  # _ALLOWED_ORIGINS: comma-separated list of explicit frontend origins for CORS.
+  # MUST NOT contain '*' — main.py rejects any wildcard list at startup because
+  # wildcard + allow_credentials=True lets any site authenticate on behalf of
+  # logged-in users (the CORS-credentials bypass). Override at deploy time with
+  # the actual frontend URL, e.g.
+  #   --substitutions=_ALLOWED_ORIGINS=https://my-app.web.app,http://localhost:3000
+  # The localhost default below is safe but useful only for local development.
+  _ALLOWED_ORIGINS: 'http://localhost:3000'
   _ORCHESTRATOR_URL: ''
   _IMAGE_TAG: 'latest'
   # Wave F4 M6: previously hardcoded `lihuanshen123@gmail.com`. Pass via
