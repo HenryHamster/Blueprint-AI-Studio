@@ -1006,3 +1006,33 @@ export async function updateStagingBranchPrefixes(
   if (!res.ok) throw new Error(`Failed to update staging branch prefixes: ${res.status}`);
   return res.json();
 }
+
+export interface NullBranchConfigEntry {
+  id: string;
+  name: string;
+  github_owner: string;
+  github_repo: string;
+  is_self_repo: boolean;
+  created_at: string | null;
+}
+
+export interface NullBranchConfigResponse {
+  projects: NullBranchConfigEntry[];
+  self_repo_skipped: NullBranchConfigEntry[];
+  total: number;
+}
+
+export async function fetchNullBranchConfig(): Promise<NullBranchConfigResponse> {
+  const res = await apiFetch('/api/admin/diagnostics/null-branch-config');
+  if (!res.ok) throw new Error(`Failed to fetch null branch config: ${res.status}`);
+  return res.json();
+}
+
+export async function backfillProjectBranches(projectId: string): Promise<unknown> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/backfill-branches`,
+    { method: 'POST' },
+  );
+  if (!res.ok) throw new Error(`Failed to backfill branches: ${res.status}`);
+  return res.json();
+}

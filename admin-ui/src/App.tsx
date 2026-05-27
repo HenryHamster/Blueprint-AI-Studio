@@ -41,6 +41,7 @@ import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
 import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { DiagnosticsPanel } from './components/DiagnosticsPanel';
+import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
 import { PlaybookPanel } from './components/PlaybookPanel';
 import { WarmVmPanel } from './components/WarmVmPanel';
 import { FILTER_TASK_TYPE_IDS } from './taskCapabilities';
@@ -713,6 +714,8 @@ export default function App() {
         diagnostics={s.diagnostics}
         onViewTask={handleViewTask}
       />
+
+      {s.userRole === 'admin' && <NullBranchDiagnosticsPanel />}
 
       <WarmVmPanel onViewTask={handleViewTask} />
 
