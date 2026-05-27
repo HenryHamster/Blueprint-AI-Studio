@@ -1234,13 +1234,14 @@ class TestExtractAuditFindings:
         report = {
             "audit_score": 0.74,
             "findings": [
+                # High without verification_note: excluded by the scoring gate.
                 {"severity": "high", "summary": "Token baked into VM image."},
+                # Low never requires verification.
                 {"severity": "low", "description": "Private import."},
             ],
         }
         out = rq._extract_audit_findings(report)
         assert out == [
-            {"severity": "high", "summary": "Token baked into VM image."},
             {"severity": "low", "summary": "Private import."},
         ]
 
@@ -1248,18 +1249,79 @@ class TestExtractAuditFindings:
         report = {
             "findings": [
                 {"severity": "low", "summary": "low one"},
+                # High and medium lack verification_note → excluded by gate.
                 {"severity": "high", "summary": "high one"},
                 {"severity": "medium", "summary": "medium one"},
             ]
         }
         out = rq._extract_audit_findings(report)
-        assert [f["severity"] for f in out] == ["high", "medium", "low"]
+        # Only the low finding survives the verification gate.
+        assert [f["severity"] for f in out] == ["low"]
 
     def test_issues_key_fallback(self):
-        """Some audits key the list as 'issues' rather than 'findings'."""
+        """Some audits key the list as 'issues' rather than 'findings'.
+        Medium without verification_note → excluded by the scoring gate."""
         report = {"issues": [{"level": "medium", "title": "an issue"}]}
         out = rq._extract_audit_findings(report)
-        assert out == [{"severity": "medium", "summary": "an issue"}]
+        assert out == []
+
+    def test_unverified_high_finding_excluded(self):
+        """An unsubstantiated high finding must NOT appear in the carried list.
+
+        Regression guard: the scoring gate (_finding_is_verified) must be
+        applied inside _extract_audit_findings so unverified findings that
+        do not affect the audit sub-score are not surfaced as actionable blockers.
+        """
+        report = {
+            "findings": [
+                {"severity": "high", "summary": "Speculative SQL injection."},
+            ]
+        }
+        out = rq._extract_audit_findings(report)
+        assert out == [], (
+            "unverified high finding must be excluded from carried findings"
+        )
+
+    def test_verified_high_finding_included(self):
+        """A high finding with a substantive verification_note IS carried."""
+        report = {
+            "findings": [
+                {
+                    "severity": "high",
+                    "summary": "Token baked into image.",
+                    "verification_note": (
+                        "Read infra/packer/agent.pkr.hcl lines 20-35: "
+                        "API token hardcoded in provisioner shell command."
+                    ),
+                }
+            ]
+        }
+        out = rq._extract_audit_findings(report)
+        assert out == [{"severity": "high", "summary": "Token baked into image."}]
+
+    def test_gate_agrees_with_score_audit_for_unverified(self):
+        """When _score_audit treats a finding as undeducted (unverified),
+        _extract_audit_findings must also exclude it."""
+        report = {
+            "findings": [
+                # Medium without verification_note: _score_audit skips deduction.
+                {"severity": "medium", "summary": "Row-vs-ORM false positive."},
+                # Low always counted by both functions.
+                {"severity": "low", "summary": "Minor style issue."},
+            ]
+        }
+        # _score_audit should NOT deduct for the medium finding → score stays 1.0.
+        audit_score, _ = rq._score_audit(report)
+        assert audit_score == pytest.approx(1.0 - rq._AUDIT_DEDUCTIONS["low"]), (
+            "_score_audit should only deduct for the verified low finding"
+        )
+        # _extract_audit_findings must agree: medium excluded, low present.
+        out = rq._extract_audit_findings(report)
+        severities = [f["severity"] for f in out]
+        assert "medium" not in severities, (
+            "unverified medium finding must not appear in carried findings"
+        )
+        assert "low" in severities, "low finding must be carried"
 
     def test_caps_count_and_truncates_summary(self):
         report = {

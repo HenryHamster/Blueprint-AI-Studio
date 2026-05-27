@@ -423,6 +423,11 @@ def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str
     for f in raw:
         if isinstance(f, dict):
             sev = str(f.get("severity") or f.get("level") or "unknown").lower()
+            if not _finding_is_verified(f, sev):
+                # Mirror the scoring gate: unsubstantiated medium/high/critical
+                # findings do not affect the audit sub-score and must not be
+                # carried as actionable blockers.
+                continue
             summary = (
                 f.get("summary")
                 or f.get("description")
