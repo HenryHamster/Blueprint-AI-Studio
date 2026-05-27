@@ -13,6 +13,7 @@ from typing import Any, Dict
 
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.failure_classification import INFRA_CLASSES as _DIRECTION_INFRA_CLASSES
 from app.time_utils import _utcnow
@@ -646,6 +647,128 @@ def get_project_promotion_target(project) -> str:
     column stabilized across the migration/backfill rollout.
     """
     return getattr(project, "promotion_target", None) or "main"
+
+
+async def backfill_branch_columns(session) -> dict:
+    """Populate NULL integration_branch / promotion_target from GitHub defaults.
+
+    Runs once at startup (called from main.py lifespan) after migrations finish.
+    Only writes to columns that are still NULL — skips rows already populated so
+    the function is safe to re-run.  Self-repo projects with NULL integration_branch
+    are left untouched (migration 0124 already set them to 'automain'; if still NULL
+    they are in a state the LTS workflow manages separately).  Self-repo projects
+    with NULL promotion_target get 'main' without a GitHub round-trip.
+
+    For non-self-repo projects, resolves GitHub credentials and calls
+    get_repo_default_branch().  When the GitHub API call fails, emits a per-project
+    Alert so an operator can fix credentials and re-run rather than silently falling
+    back to 'main'.
+
+    Returns a summary dict:
+      {
+        "filled": int,     # columns written
+        "skipped": int,    # projects already fully populated
+        "errored": int,    # projects where GitHub API call failed
+        "self_repo_skipped": int,  # self-repo integration_branch left as-is
+      }
+    """
+    from app.models import Alert, AlertSeverity, Project
+    from app.release_promotion import _resolve_github_with_session
+    from app import github as _github
+    from sqlmodel import select
+
+    summary = {"filled": 0, "skipped": 0, "errored": 0, "self_repo_skipped": 0}
+
+    try:
+        result = await session.execute(
+            select(Project).where(
+                (Project.integration_branch.is_(None))
+                | (Project.promotion_target.is_(None))
+            )
+        )
+        projects = result.scalars().all()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[BRANCH_BACKFILL] Could not query projects: %s", exc)
+        return summary
+
+    for project in projects:
+        need_integration = project.integration_branch is None
+        need_promotion = project.promotion_target is None
+
+        if not need_integration and not need_promotion:
+            summary["skipped"] += 1
+            continue
+
+        # Self-repo: integration_branch managed by the LTS workflow — leave NULL
+        # as-is (migration 0124 already backfilled is_self_repo rows to 'automain').
+        if project.is_self_repo and need_integration:
+            summary["self_repo_skipped"] += 1
+            need_integration = False
+
+        # Self-repo promotion_target: no GitHub round-trip needed.
+        if project.is_self_repo and need_promotion:
+            project.promotion_target = "main"
+            flag_modified(project, "promotion_target")
+            session.add(project)
+            summary["filled"] += 1
+            need_promotion = False
+
+        if not need_integration and not need_promotion:
+            continue
+
+        # Non-self-repo: resolve GitHub credentials and fetch the default branch.
+        try:
+            resolved = await _resolve_github_with_session(session, project)
+            if resolved is None:
+                raise ValueError("no GitHub credentials available")
+            token, owner, repo = resolved
+            default_branch = await _github.get_repo_default_branch(token, owner, repo)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[BRANCH_BACKFILL] project %s (%s/%s): GitHub call failed: %s",
+                project.id,
+                getattr(project, "github_owner", "?"),
+                getattr(project, "github_repo", "?"),
+                exc,
+            )
+            try:
+                alert = Alert(
+                    project_id=project.id,
+                    severity=AlertSeverity.WARNING,
+                    title="Branch backfill failed — integration_branch or promotion_target still NULL",
+                    message=(
+                        f"Could not populate integration_branch/promotion_target for project "
+                        f"{project.id} from GitHub: {str(exc)[:300]}. "
+                        "Fix GitHub credentials and re-run the backfill (restart the service or "
+                        "call POST /api/admin/projects/{id}/backfill-branches)."
+                    ),
+                )
+                session.add(alert)
+            except Exception:  # noqa: BLE001
+                pass
+            summary["errored"] += 1
+            continue
+
+        if need_integration:
+            project.integration_branch = default_branch
+            flag_modified(project, "integration_branch")
+            summary["filled"] += 1
+        if need_promotion:
+            project.promotion_target = default_branch
+            flag_modified(project, "promotion_target")
+            summary["filled"] += 1
+        session.add(project)
+
+    if summary["filled"] or summary["errored"]:
+        logger.info(
+            "[BRANCH_BACKFILL] complete: filled=%d skipped=%d errored=%d self_repo_skipped=%d",
+            summary["filled"],
+            summary["skipped"],
+            summary["errored"],
+            summary["self_repo_skipped"],
+        )
+
+    return summary
 
 
 def get_project_broadcast_limit(project) -> int:

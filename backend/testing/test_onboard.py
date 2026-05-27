@@ -592,6 +592,96 @@ class TestOnboardTaskBranchNamespace:
         assert (project.build_config or {}).get("task_branch_namespace") == "custom-ns"
 
 
+class TestOnboardBranchBackfillIntegration:
+    """Regression: branches are populated post-onboard; backfill skips populated rows."""
+
+    @pytest.mark.asyncio
+    async def test_onboard_leaves_no_null_branches(
+        self, client: AsyncClient, db_session
+    ):
+        """Neither integration_branch nor promotion_target may be NULL after onboarding."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="develop",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "backfill-reg1"},
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        project = await db_session.get(Project, data["project_id"])
+        assert project.integration_branch is not None, (
+            "integration_branch must not be NULL after onboard"
+        )
+        assert project.promotion_target is not None, (
+            "promotion_target must not be NULL after onboard"
+        )
+
+    @pytest.mark.asyncio
+    async def test_backfill_skips_rows_populated_by_onboard(
+        self, client: AsyncClient, db_session
+    ):
+        """backfill_branch_columns must not overwrite columns already set by onboarding."""
+        from app.shared_state import backfill_branch_columns
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github.get_repo_default_branch",
+                new_callable=AsyncMock,
+                return_value="develop",
+            ),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "backfill-reg2"},
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        project = await db_session.get(Project, data["project_id"])
+        assert project.integration_branch == "develop"
+        assert project.promotion_target == "develop"
+
+        # Run backfill — must not touch already-populated columns.
+        summary = await backfill_branch_columns(db_session)
+        assert summary["filled"] == 0, (
+            f"backfill must not write to already-populated columns; got filled={summary['filled']}"
+        )
+        assert summary["errored"] == 0, (
+            f"backfill must not error for already-populated project; got errored={summary['errored']}"
+        )
+
+        # Values must remain unchanged after the backfill pass.
+        await db_session.refresh(project)
+        assert project.integration_branch == "develop"
+        assert project.promotion_target == "develop"
+
+
 class TestBuildConfigDetection:
     @pytest.mark.asyncio
     async def test_detect_build_config_seeds_lint_cmd_for_root_python(self):
