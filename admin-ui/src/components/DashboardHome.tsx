@@ -10,7 +10,7 @@ import {
   Search,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { apiFetch, fetchQualificationVerdicts, fetchSrUnhandledEdgesRetrospectives, setVersionPhase, triggerQualify, type AuditFinding, type AuditReconciliation, type CiResolution, type LatestAudit, type PromptFingerprintAnalyticsResponse, type QualificationVerdictRecord, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
+import { apiFetch, fetchQualificationVerdicts, fetchSrUnhandledEdgesRetrospectives, setVersionPhase, triggerQualify, fetchTask, type AuditFinding, type AuditReconciliation, type CiResolution, type LatestAudit, type PromptFingerprintAnalyticsResponse, type QualificationVerdictRecord, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import { timeAgo, formatDurationSec } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
@@ -1107,6 +1107,17 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     onConfigureTargets?.();
   }, [onConfigureTargets]);
 
+  const handleViewTaskById = useCallback((taskId: string) => {
+    const task = tasks.find(t => t.id === taskId);
+    if (task) {
+      onViewTask(task);
+    } else {
+      fetchTask(taskId).then(onViewTask).catch(() => {
+        // Silently fail; user can retry or navigate manually
+      });
+    }
+  }, [tasks, onViewTask]);
+
   const handleSpawnSrInvestigation = useCallback(async (signal: SrInvestigationSignal): Promise<string | null> => {
     if (!selectedProjectId) return null;
     try {
@@ -2171,6 +2182,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
               conversion={digest?.investigation_conversion ?? null}
               loading={loading}
               projectId={selectedProjectId}
+              onViewTask={handleViewTaskById}
             />
           )}
           {!loading && (() => {

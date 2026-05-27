@@ -4,7 +4,6 @@ import { List, useDynamicRowHeight, type RowComponentProps } from 'react-window'
 import { apiFetch, API_BASE_URL } from '../api';
 import { timeAgo, formatDurationSec, parseTimestamp } from '../utils/time';
 import { isSafeUrl, FAILURE_CLASS_CONFIG } from './TaskCard';
-import type { Task } from './TaskCard';
 import { TAXONOMY_LABELS, TAXONOMY_COLORS } from './taxonomyConstants';
 
 export type ActivityEventType = 'TASK_COMPLETED' | 'TASK_FAILED' | 'RESEARCH_FINDINGS' | 'DEPLOY_EVENT' | 'TASK_IN_PROGRESS';
@@ -38,7 +37,7 @@ export interface ActivityEvent {
 interface ActivityFeedProps {
   selectedProjectId: string | null;
   refreshInterval: number;
-  onSelectTask: (task: Task) => void;
+  onSelectTask: (task: { id: string }) => void;
   onClose: () => void;
   lastVisitTimestamp?: number | null;
   onEventsChange?: (events: ActivityEvent[]) => void;
@@ -390,7 +389,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
 
   const handleRowClick = useCallback((event: ActivityEvent) => {
     if (!event.task_id) return;
-    onSelectTask({ id: event.task_id } as Task);
+    onSelectTask({ id: event.task_id });
   }, [onSelectTask]);
 
   const toggleExpanded = useCallback((id: string) => {
@@ -448,7 +447,9 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
   const rowHeight = useDynamicRowHeight({ defaultRowHeight: 68 });
 
   return (
-    <div className="flex-1 overflow-hidden flex flex-col min-h-0">
+    <div className="fixed inset-0 z-50 flex">
+      <div className="flex-1 bg-black/40" onClick={onClose} />
+      <div className="w-full max-w-[680px] bg-neutral-950 border-l border-neutral-800 flex flex-col shadow-2xl overflow-hidden">
       {/* Header */}
       <div className="px-6 py-4 border-b border-neutral-800 flex items-center justify-between shrink-0">
         <div className="flex items-center gap-2">
@@ -605,6 +606,7 @@ export default function ActivityFeed({ selectedProjectId, refreshInterval, onSel
           Auto-refreshes every {Math.round(refreshInterval / 1000)}s
         </div>
       )}
+      </div>
     </div>
   );
 }

@@ -381,6 +381,9 @@ export function useAppState() {
         case '2':
           setViewMode('pipeline');
           break;
+        case '3':
+          setViewMode('timeline');
+          break;
         case 'd':
           setShowDirections(prev => !prev);
           break;

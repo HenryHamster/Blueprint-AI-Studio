@@ -108,6 +108,7 @@ export interface RemediationFunnelSectionProps {
   conversion?: InvestigationConversion | null;
   loading?: boolean;
   projectId?: string | null;
+  onViewTask?: (taskId: string) => void;
 }
 
 const CASE_STATUS_STYLES: Record<string, string> = {
@@ -183,7 +184,7 @@ function truncate(s: string, n: number): string {
   return s.slice(0, n).trimEnd() + '…';
 }
 
-export function RemediationFunnelSection({ funnel, conversion, loading, projectId }: RemediationFunnelSectionProps) {
+export function RemediationFunnelSection({ funnel, conversion, loading, projectId, onViewTask }: RemediationFunnelSectionProps) {
   const [investigationsOpen, setInvestigationsOpen] = useState(false);
   const [residuals, setResiduals] = useState<ResidualFingerprintsData | null>(null);
   const [residualsOpen, setResidualsOpen] = useState(false);
@@ -864,13 +865,14 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                       )}
                       <div className="flex gap-2 flex-wrap">
                         {r.example_task_ids.map(id => (
-                          <a
+                          <button
                             key={id}
-                            href={`/tasks/${id}`}
-                            className="font-mono text-[9px] text-neutral-500 hover:text-neutral-300 underline underline-offset-2"
+                            type="button"
+                            onClick={() => onViewTask?.(id)}
+                            className="font-mono text-[9px] text-neutral-500 hover:text-neutral-300 underline underline-offset-2 cursor-pointer"
                           >
                             {id.slice(0, 8)}
-                          </a>
+                          </button>
                         ))}
                       </div>
                     </div>

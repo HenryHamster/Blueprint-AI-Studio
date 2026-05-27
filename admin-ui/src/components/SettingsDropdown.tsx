@@ -15,6 +15,7 @@ import { Settings, GitBranch, RotateCcw, Loader2, Shield, X, Sliders, ListChecks
 import { timeAgo, parseTimestamp } from '../utils/time';
 import { USER_LAUNCHABLE_TASK_TYPE_OPTIONS } from '../taskCapabilities';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
+import type { ViewMode } from '../hooks/useViewPreferences';
 export type { MaxPlanAccount } from '../types/settings';
 import type { AuthMode, CategoryRoutingEntry, DeployState, MaxPlanAccount, ModelPreference, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
 import { DeploySection } from './SettingsDeploySection';
@@ -30,8 +31,8 @@ interface SettingsDropdownProps {
   // Defaults
   defaultTaskType: UserLaunchableTaskType;
   onUpdateDefaultTaskType: (value: UserLaunchableTaskType) => void;
-  viewMode: 'kanban' | 'pipeline' | 'home';
-  onSetViewMode: (mode: 'kanban' | 'pipeline' | 'home') => void;
+  viewMode: ViewMode;
+  onSetViewMode: (mode: ViewMode) => void;
   // Notifications
   notifyOnComplete: boolean;
   onUpdateNotifyOnComplete: (value: boolean) => void;
@@ -546,11 +547,12 @@ export function SettingsDropdown({
               <label className="block text-xs font-medium text-neutral-400 mb-1.5">Default View Mode</label>
               <select
                 value={viewMode}
-                onChange={e => onSetViewMode(e.target.value as 'kanban' | 'pipeline')}
+                onChange={e => onSetViewMode(e.target.value as ViewMode)}
                 className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-600"
               >
                 <option value="kanban">Kanban</option>
                 <option value="pipeline">Pipeline</option>
+                <option value="timeline">Timeline</option>
               </select>
             </div>
             <div>

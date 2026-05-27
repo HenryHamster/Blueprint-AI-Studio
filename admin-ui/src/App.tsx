@@ -28,12 +28,14 @@ import { DashboardHome } from './components/DashboardHome';
 import { BulkActionBar } from './components/BulkActionBar';
 import { KanbanBoard } from './components/KanbanBoard';
 import type { KanbanColumn, SortBy } from './components/KanbanBoard';
+import { TimelineView } from './components/TimelineView';
 import { downloadTaskCsv, orderTasksForKanbanExport } from './utils/taskCsv';
 import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
 import { UserManagement } from './components/UserManagement';
 import { ProjectMembers } from './components/ProjectMembers';
 import { CatchUpPanel } from './components/CatchUpPanel';
+import ActivityFeed from './components/ActivityFeed';
 import { MessagesPanel } from './components/MessagesPanel';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
 import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
@@ -193,6 +195,8 @@ export default function App() {
     if (!p) return undefined;
     return { id: p.id, owner: p.github_owner, repo: p.github_repo };
   }, [setupProjectId, s.projects]);
+
+  const [showActivityFeed, setShowActivityFeed] = useState(false);
 
   // Project members panel
   const [showProjectMembers, setShowProjectMembers] = useState(false);
@@ -485,6 +489,7 @@ export default function App() {
         onToggleArchive={() => s.setShowArchive(!s.showArchive)}
         showMessages={s.showMessages}
         onToggleMessages={() => s.setShowMessages(prev => !prev)}
+        onOpenActivityFeed={() => setShowActivityFeed(true)}
         openMessageCount={openMessageCount}
         newSinceLastVisitCount={newSinceLastVisit}
         needsAttentionCount={s.needsAttentionCount}
@@ -707,6 +712,7 @@ export default function App() {
           onBulkRetry={(taskIds) => s.handleBulkAction('retry', taskIds)}
           wsRef={s.wsRef}
           userEmail={s.user?.email ?? null}
+          onOpenActivityFeed={() => setShowActivityFeed(true)}
         />
       )}
 
@@ -925,7 +931,7 @@ export default function App() {
               onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
             />
             </ErrorBoundary>
-          ) : (
+          ) : s.viewMode === 'pipeline' ? (
             <ErrorBoundary level="panel">
             <main className="flex-1 overflow-hidden flex flex-col">
               <PipelineView
@@ -949,6 +955,16 @@ export default function App() {
                   });
                 }}
                 onUnarchiveTask={s.handleUnarchiveTask}
+              />
+            </main>
+            </ErrorBoundary>
+          ) : (
+            <ErrorBoundary level="panel">
+            <main className="flex-1 overflow-hidden flex flex-col">
+              <TimelineView
+                tasks={filteredTasks}
+                hasActiveFilters={hasActiveFilters}
+                onViewLogs={s.handleViewLogs}
               />
             </main>
             </ErrorBoundary>
@@ -1109,6 +1125,19 @@ export default function App() {
           handleBulkCancel={s.handleBulkCancel}
           handleBulkArchiveColumn={s.handleBulkArchiveColumn}
           toggleSelectionMode={s.toggleSelectionMode}
+        />
+      )}
+
+      {showActivityFeed && (
+        <ActivityFeed
+          selectedProjectId={s.selectedProjectId}
+          refreshInterval={s.refreshInterval}
+          onSelectTask={(task) => {
+            setShowActivityFeed(false);
+            handleViewTask(task.id);
+          }}
+          onClose={() => setShowActivityFeed(false)}
+          lastVisitTimestamp={s.lastVisitTimestamp}
         />
       )}
 

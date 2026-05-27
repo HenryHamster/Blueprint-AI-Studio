@@ -381,7 +381,7 @@ function sortDesc<T>(entries: [string, T][], key: (v: T) => number): [string, T]
   return entries.sort((a, b) => key(b[1]) - key(a[1]));
 }
 
-export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: _lastVisitTimestamp, refreshInterval, onSelectTask, needsAttentionCount = 0, onApprove, onRetry, onBulkApprove, onBulkRetry, wsRef, userEmail }: CatchUpPanelProps) {
+export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: _lastVisitTimestamp, refreshInterval, onSelectTask, onOpenActivityFeed, needsAttentionCount = 0, onApprove, onRetry, onBulkApprove, onBulkRetry, wsRef, userEmail }: CatchUpPanelProps) {
   // Per-operator localStorage key for catch-up viewed timestamp.
   // Falls back to the legacy global key when unauthenticated or email unknown.
   const catchUpViewedKey = userEmail
@@ -827,6 +827,16 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                 {label}
               </button>
             ))}
+            {onOpenActivityFeed && (
+              <button
+                onClick={() => onOpenActivityFeed()}
+                className="px-2 min-h-[44px] flex items-center gap-1 rounded-full text-[10px] font-medium text-neutral-500 hover:text-neutral-300 border border-transparent transition-colors sm:ml-auto"
+                title="Open chronological activity timeline"
+              >
+                <Compass className="w-3 h-3" />
+                Activity
+              </button>
+            )}
           </div>
         )}
       </div>
