@@ -208,5 +208,36 @@ describe('SrMissedRetrospectivesPanel — viewport regression', () => {
     expect(emptyEl.textContent).not.toContain('self-review is catching everything');
     // Must show a filter-aware "No misses" message instead
     expect(emptyEl.textContent).toContain('No misses');
+    // Dropdown must stay visible — server always returns task_types regardless of filter,
+    // so the selector should not disappear when filtered results are empty.
+    const dropdownAfterFilter = screen.queryByRole('combobox', { name: /filter by task type/i });
+    expect(dropdownAfterFilter).toBeTruthy();
+  });
+
+  test('initial fetch passes page=0 to the API matching 0-indexed backend contract', async () => {
+    const { fetchSrMissedRetrospectives } = await import('../api');
+    const spy = fetchSrMissedRetrospectives as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrMissedRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // UI page 1 must map to API page 0 (backend is 0-indexed)
+    expect(spy).toHaveBeenCalledWith('proj-1', expect.objectContaining({ page: 0 }));
   });
 });

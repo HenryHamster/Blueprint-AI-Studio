@@ -1864,9 +1864,10 @@ interface SrMissedRetrospectiveProps {
   selectedCategory?: string;
   windowDays?: 7 | 14 | 30;
   onWindowDaysChange?: (days: 7 | 14 | 30) => void;
+  truncated?: boolean;
 }
 
-export function SrMissedRetrospective({ tasks, onTaskClick, selectedCategory, windowDays = 14, onWindowDaysChange }: SrMissedRetrospectiveProps) {
+export function SrMissedRetrospective({ tasks, onTaskClick, selectedCategory, windowDays = 14, onWindowDaysChange, truncated = false }: SrMissedRetrospectiveProps) {
   const [categoryFilter, setCategoryFilter] = useState(selectedCategory ?? '');
 
   useEffect(() => {
@@ -1895,6 +1896,12 @@ export function SrMissedRetrospective({ tasks, onTaskClick, selectedCategory, wi
 
   return (
     <div data-testid="sr-missed-retrospective" className="flex flex-col gap-2">
+      {truncated && (
+        <div className="bg-amber-950/30 border border-amber-900/50 rounded px-2 py-1.5 text-[10px] text-amber-300 flex items-start gap-2">
+          <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+          <span>Results truncated at 500 items. Task count and filters reflect this subset — apply filters to narrow results for visibility of the full dataset.</span>
+        </div>
+      )}
       <div className="flex flex-wrap items-center gap-2 text-[10px]">
         <span className="text-neutral-500 uppercase tracking-wide">Time</span>
         {WINDOW_OPTIONS.map(w => (

@@ -117,6 +117,7 @@ async def list_sr_missed_retrospectives(
 
     page_items = []
     total_matched = 0
+    all_task_types: set[str] = set()
     task_stream = await session.stream(stmt)
     async for t in task_stream.scalars():
         ctx = t.context or {}
@@ -134,6 +135,10 @@ async def list_sr_missed_retrospectives(
         t_type = (t.first_payload or {}).get("type")
         if category and category not in missed:
             continue
+        # Accumulate task types before the task_type filter so the full type
+        # list is available in the response regardless of which filter is active.
+        if t_type:
+            all_task_types.add(t_type)
         if task_type and t_type != task_type:
             continue
 
@@ -187,7 +192,7 @@ async def list_sr_missed_retrospectives(
             }
         )
 
-    return {"items": items, "total": total_matched}
+    return {"items": items, "total": total_matched, "task_types": sorted(all_task_types)}
 
 
 @router.get("/projects/{project_id}/sr-unhandled-edges-retrospectives")

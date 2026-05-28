@@ -8598,6 +8598,26 @@ async def test_smoketest_passing_does_not_spawn_plan_task(
 
 
 @pytest.mark.asyncio
+async def test_smoketest_result_plan_output_is_dict(client: AsyncClient, db_session, mocker):
+    """SMOKETEST_RESULT plan_output must be a dict so query_findings_index excludes it from the Findings Journal."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    import json as _json
+    _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-dict")
+    token = create_agent_token(str(task.id), "agent-vm-smoke-dict")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task.id), "status": "COMPLETED", "artifact_type": "SMOKETEST_RESULT",
+              "logs": _json.dumps({"passed": True, "tests": [], "suites": {}})},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert isinstance(task.plan_output, dict) and not isinstance(task.plan_output, list)
+
+
+@pytest.mark.asyncio
 async def test_debug_result_high_confidence_spawns_fix_task(
     client: AsyncClient, db_session, mocker
 ):
@@ -8866,6 +8886,35 @@ async def test_debug_result_marks_failed_task_on_fix_spawn(
     assert marked_id == str(fix_task.id), (
         f"Expected failed task context._debug_fix_spawned_task_id={fix_task.id}, got {marked_id}"
     )
+
+
+@pytest.mark.asyncio
+async def test_debug_result_plan_output_is_dict(client: AsyncClient, db_session, mocker):
+    """DEBUG_RESULT plan_output must be a dict so query_findings_index excludes it from the Findings Journal."""
+    mocker.patch("app.main.delete_agent_vm", return_value=None)
+    mocker.patch("app.main._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    import json as _json
+    project = Project(name="Debug Dict", user_id="test-user-debug-dict2")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(project_id=project.id, title="Debug: dict test",
+                payloads=[{"type": "debug", "base_branch": "main"}],
+                vm_instance_id="agent-vm-debug-dict2", status=TaskStatus.IN_PROGRESS)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    token = create_agent_token(str(task.id), "agent-vm-debug-dict2")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task.id), "status": "COMPLETED", "artifact_type": "DEBUG_RESULT",
+              "logs": _json.dumps({"confidence": "low", "root_cause": "test"})},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert isinstance(task.plan_output, dict) and not isinstance(task.plan_output, list)
 
 
 @pytest.mark.asyncio

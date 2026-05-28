@@ -31,10 +31,12 @@ from app.digest_metrics import (
 )
 from app.models import (
     CLOSE_REASON_RECOVERED_UNATTENDED,
+    ArtifactType,
     RegressionCaseStatus,
     RegressionRemediationCase,
     ResidualRemediationCase,
     ResidualRemediationCaseStatus,
+    Artifact,
     Task,
     TaskStatus,
     _utcnow,
@@ -47,6 +49,21 @@ router = APIRouter()
 _REGRESSION_STALL_THRESHOLD_HOURS = (
     4  # ACTIVE case without PR older than this → stalled
 )
+
+
+async def _fetch_pr_urls(
+    session: AsyncSession, task_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, str | None]:
+    """Return map of task_id → pr_url for tasks that have a PULL_REQUEST artifact."""
+    if not task_ids:
+        return {}
+    result = await session.execute(
+        select(Artifact.task_id, Artifact.pr_url).where(
+            Artifact.task_id.in_(task_ids),
+            Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+        )
+    )
+    return {row.task_id: row.pr_url for row in result}
 
 
 @router.get("/residual-fingerprints")
@@ -744,6 +761,10 @@ async def list_regression_manual_intervention_cases(
         .scalars()
         .all()
     )
+    pr_urls = await _fetch_pr_urls(
+        session,
+        [c.last_remediation_task_id for c in rows if c.last_remediation_task_id],
+    )
     return {
         "count": len(rows),
         "cases": [
@@ -755,6 +776,7 @@ async def list_regression_manual_intervention_cases(
                 "status": c.status,
                 "attempts": c.attempts,
                 "last_remediation_pr_number": c.last_remediation_pr_number,
+                "last_remediation_pr_url": pr_urls.get(c.last_remediation_task_id),
                 "last_failure_class": c.last_failure_class,
                 "signal_snapshot_at_spawn": c.signal_snapshot_at_spawn,
                 "signal_snapshot_at_merge": c.signal_snapshot_at_merge,
@@ -833,6 +855,10 @@ async def list_regression_auto_recovered_cases(
         .all()
     )
 
+    pr_urls = await _fetch_pr_urls(
+        session,
+        [c.last_remediation_task_id for c in rows if c.last_remediation_task_id],
+    )
     cases = []
     for c in rows:
         recovered_at = None
@@ -852,6 +878,7 @@ async def list_regression_auto_recovered_cases(
                 "status": c.status,
                 "attempts": c.attempts,
                 "last_remediation_pr_number": c.last_remediation_pr_number,
+                "last_remediation_pr_url": pr_urls.get(c.last_remediation_task_id),
                 "last_failure_class": c.last_failure_class,
                 "signal_snapshot_at_spawn": c.signal_snapshot_at_spawn,
                 "signal_snapshot_at_merge": c.signal_snapshot_at_merge,

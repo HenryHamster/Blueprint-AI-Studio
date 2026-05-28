@@ -568,6 +568,47 @@ async def test_admin_tasks_filter_by_direction_and_type(
 
 
 @pytest.mark.asyncio
+async def test_admin_tasks_filter_by_project_id(client: AsyncClient, db_session):
+    """Admin /api/admin/tasks scopes results server-side when project_id is set."""
+    project_a = await _make_project_with_member(db_session)
+    project_b = await _make_project_with_member(db_session)
+
+    db_session.add_all(
+        [
+            Task(
+                project_id=project_a.id,
+                title="A1",
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "research"}],
+            ),
+            Task(
+                project_id=project_a.id,
+                title="A2",
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "create"}],
+            ),
+            Task(
+                project_id=project_b.id,
+                title="B1",
+                status=TaskStatus.QUEUED,
+                payloads=[{"type": "research"}],
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    resp = await client.get(
+        "/api/admin/tasks",
+        params={"project_id": str(project_a.id), "limit": 100},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert sorted(t["title"] for t in body["tasks"]) == ["A1", "A2"]
+    assert all(t["project_id"] == str(project_a.id) for t in body["tasks"])
+    assert body["total"] == 2
+
+
+@pytest.mark.asyncio
 async def test_bulk_action_invalid_action(client: AsyncClient):
     """POST /api/admin/tasks/bulk-action with unknown action returns 400."""
     response = await client.post(

@@ -207,6 +207,7 @@ async def get_all_tasks(
     created_after: datetime | None = Query(None),
     direction_id: str | None = Query(None),
     task_type: str | None = Query(None),
+    project_id: uuid.UUID | None = Query(None),
     spawned_by: str | None = Query(None, max_length=100),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
@@ -215,6 +216,8 @@ async def get_all_tasks(
 
     # Build shared filter conditions
     filters = [Task.project_id.in_(_user_project_ids(current_user["user_id"]))]
+    if project_id is not None:
+        filters.append(Task.project_id == project_id)
     if status:
         filters.append(Task.status.in_(status))
     elif terminal_only:

@@ -5842,6 +5842,25 @@ class TestPlanSubtaskScopeAwareEffort:
         assert len(children) == 1
         assert children[0].payloads[0]["effort"] == "max"
 
+    @pytest.mark.asyncio
+    async def test_plan_output_stored_as_dict_not_list(self, db_session, mocker):
+        """plan_output for plan tasks must be a dict, not a list.
+
+        query_findings_index (research_completion.py) skips non-list plan_output,
+        so a dict here guarantees plan tasks never pollute the Findings Journal
+        research feed.
+        """
+        task = await self._setup_plan_task(db_session, mocker)
+        logs = self._plan_logs([{"title": "T1", "prompt": "p1"}])
+        await _handle_plan_completion(task, logs, db_session)
+        await db_session.refresh(task)
+        assert isinstance(task.plan_output, dict), (
+            "plan_output must be a dict so query_findings_index excludes it from "
+            "the research findings feed"
+        )
+        assert not isinstance(task.plan_output, list)
+        assert "subtasks" in task.plan_output
+
 
 # ── _record_regression_signal_if_matching ──────────────────────────────────
 

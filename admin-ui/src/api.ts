@@ -181,6 +181,12 @@ export async function fetchResearchActionability(
 export interface SrMissedRetrospectivesResponse {
   items: import('./components/SrTrendBreakdown').SrMissedTask[];
   total: number;
+  /** Full list of task_type values present in the matched result set, when returned by the server. */
+  task_types?: string[];
+  /** Current page number (0-indexed). When present, consumers can determine if results are truncated. */
+  page?: number;
+  /** Items per page. When present with page, consumers can determine if results are truncated. */
+  page_size?: number;
 }
 
 export async function fetchSrMissedRetrospectives(
@@ -978,6 +984,37 @@ export async function fetchRecentFindings(
     `/api/admin/projects/${encodeURIComponent(projectId)}/recent-findings?limit=${limit}`,
   );
   if (!res.ok) throw new Error(`Failed to fetch recent findings: ${res.status}`);
+  return res.json();
+}
+
+export interface ProjectFinding {
+  task_id: string;
+  direction_id: string | null;
+  completed_at: string | null;
+  finding_index: number;
+  finding_title: string;
+  finding_description: string;
+  actionability_grade: 'HIGH' | 'MEDIUM' | 'LOW';
+  claims: string[];
+  sources: Array<{ ref: string; type?: string | null; excerpt?: string | null }>;
+}
+
+export interface ProjectFindingsResponse {
+  findings: ProjectFinding[];
+  count: number;
+}
+
+export async function fetchProjectFindings(
+  projectId: string,
+  params?: { directionId?: string; limit?: number; days?: number },
+): Promise<ProjectFindingsResponse> {
+  const searchParams = new URLSearchParams();
+  if (params?.directionId) searchParams.set('direction_id', params.directionId);
+  if (params?.limit !== undefined) searchParams.set('limit', String(params.limit));
+  if (params?.days !== undefined) searchParams.set('days', String(params.days));
+  const query = searchParams.toString();
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/findings${query ? `?${query}` : ''}`);
+  if (!res.ok) throw new Error(`Failed to fetch project findings: ${res.status}`);
   return res.json();
 }
 

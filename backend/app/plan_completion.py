@@ -204,6 +204,9 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         await session.commit()
         return
 
+    # plan_data is always {"subtasks": [...]} — a dict, not a list.  query_findings_index
+    # (research_completion.py) only processes list-shaped plan_output, so plan tasks are
+    # correctly excluded from the Findings Journal research feed.
     task.plan_output = plan_data
     task.status = TaskStatus.EVALUATING
     session.add(task)

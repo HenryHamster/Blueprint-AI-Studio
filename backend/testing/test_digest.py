@@ -11531,6 +11531,107 @@ async def test_sr_missed_retrospectives_total_not_capped_at_page_size(
     assert len(body["items"]) == 3
 
 
+@pytest.mark.asyncio
+async def test_sr_missed_retrospectives_task_types_returned(
+    client: AsyncClient, db_session
+):
+    """task_types field lists all types in matched set, independent of task_type filter."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for ttype in ("create", "fix"):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Task {ttype}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": ttype}],
+                context={
+                    "_first_attempt_rejection_categories": {"correctness": 1},
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {"correctness": {"passed": True}},
+                        "blind_spots": [],
+                    },
+                },
+            )
+        )
+    await db_session.commit()
+
+    # Without task_type filter: both types returned
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert sorted(body["task_types"]) == ["create", "fix"]
+
+    # With task_type filter: task_types still lists all types, total is filtered
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives?task_type=create"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert sorted(body["task_types"]) == ["create", "fix"]
+    assert body["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sr_missed_retrospectives_zero_based_pagination(
+    client: AsyncClient, db_session
+):
+    """page parameter is 0-based: page=0 is the first page, page=1 skips the first batch."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                title=f"Paginate task {i}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_first_attempt_rejection_categories": {"correctness": 1},
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {"correctness": {"passed": True}},
+                        "blind_spots": [],
+                    },
+                },
+            )
+            for i in range(5)
+        ]
+    )
+    await db_session.commit()
+
+    r0 = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives?page=0&page_size=3"
+    )
+    assert r0.status_code == 200
+    body0 = r0.json()
+    assert body0["total"] == 5
+    assert len(body0["items"]) == 3
+
+    r1 = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives?page=1&page_size=3"
+    )
+    assert r1.status_code == 200
+    body1 = r1.json()
+    assert body1["total"] == 5
+    assert len(body1["items"]) == 2
+
+    ids0 = {item["task_id"] for item in body0["items"]}
+    ids1 = {item["task_id"] for item in body1["items"]}
+    assert ids0.isdisjoint(ids1), "page=0 and page=1 must return non-overlapping task sets"
+
+
 # ---------------------------------------------------------------------------
 # SR recent misses endpoint
 # ---------------------------------------------------------------------------

@@ -739,7 +739,9 @@ async def query_findings_index(
         select(Task)
         .where(
             Task.project_id == project_id,
+            Task.status == TaskStatus.COMPLETED,
             Task.plan_output.isnot(None),
+            Task.payloads[0]["type"].as_string() == "research",
             Task.created_at >= since,
         )
         .order_by(Task.created_at.desc())
@@ -752,6 +754,10 @@ async def query_findings_index(
         ctx = task.context or {}
         task_dir = ctx.get("direction_id")
         if direction_id is not None and task_dir != direction_id:
+            continue
+        if task.status != TaskStatus.COMPLETED:
+            continue
+        if (task.first_payload or {}).get("type") != "research":
             continue
         plan = task.plan_output
         if not isinstance(plan, list):

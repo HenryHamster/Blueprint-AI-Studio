@@ -1087,14 +1087,16 @@ async def _handle_security_audit_completion(
         task.latest_status_message = (
             "Security audit completed with no parseable findings"
         )
-        task.plan_output = []
+        task.plan_output = {"findings": []}
         session.add(task)
         await session.commit()
         await _maybe_release_safeguard_gate(task, findings, session)
         return
 
-    # Store all findings for display
-    task.plan_output = findings
+    # Store all findings for display — wrapped in a dict so query_findings_index
+    # (which only processes list plan_output) does not treat security audit
+    # findings as research findings.
+    task.plan_output = {"findings": findings}
     session.add(task)
     await session.commit()
 
@@ -1256,13 +1258,15 @@ async def _handle_perf_completion(task: Task, logs: str, session: AsyncSession):
         task.latest_status_message = (
             "Perf analysis completed with no parseable findings"
         )
-        task.plan_output = []
+        task.plan_output = {"findings": []}
         session.add(task)
         await session.commit()
         return
 
-    # Store all findings for display
-    task.plan_output = findings
+    # Store all findings for display — wrapped in a dict so query_findings_index
+    # (which only processes list plan_output) does not treat perf audit findings
+    # as research findings.
+    task.plan_output = {"findings": findings}
     session.add(task)
     await session.commit()
 

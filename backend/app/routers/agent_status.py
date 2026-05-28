@@ -1259,6 +1259,8 @@ async def update_agent_status(
     if payload.artifact_type == ArtifactType.SMOKETEST_RESULT and payload.logs:
         try:
             smoketest_data = json.loads(payload.logs)
+            # smoketest_data is always a dict (keys: passed, tests, suites) — query_findings_index
+            # skips non-list plan_output, so smoketest tasks are excluded from the Findings Journal.
             task.plan_output = smoketest_data
             session.add(task)
             # Document every smoketest result (pass or fail) in task history
@@ -1597,6 +1599,8 @@ async def update_agent_status(
     if payload.artifact_type == ArtifactType.DEBUG_RESULT and payload.logs:
         try:
             debug_data = json.loads(payload.logs)
+            # debug_data is always a dict (keys: confidence, fix_prompt, root_cause) — query_findings_index
+            # skips non-list plan_output, so debug tasks are excluded from the Findings Journal.
             task.plan_output = debug_data
             session.add(task)
 

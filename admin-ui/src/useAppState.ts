@@ -92,6 +92,7 @@ export function useAppState() {
     toggleSelectionMode, toggleTaskSelection, bulkColumnToggle, shiftSelectRange,
     confirmDialog, setConfirmDialog,
   } = useUIState();
+  const [researchFeed, setResearchFeed] = useState<Task[]>([]);
 
   const {
     showNewTaskModal, setShowNewTaskModal,
@@ -248,6 +249,22 @@ export function useAppState() {
 
   // Reset page when status filter changes
   useEffect(() => { setPage(1); }, [statusFilter]);
+  useEffect(() => {
+    if (!showResearchBrowser || !selectedProjectId) { setResearchFeed([]); return; }
+    const pid = selectedProjectId;
+    let cancelled = false;
+    apiFetch(
+      `${API_BASE_URL}/api/admin/tasks?task_type=research&archived=false&limit=500&project_id=${encodeURIComponent(pid)}`,
+    )
+      .then(async res => {
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        const all: Task[] = Array.isArray(data) ? data : (data.tasks ?? []);
+        if (!cancelled) setResearchFeed(all.filter(t => t.task_type === 'research' && Array.isArray(t.research_findings) && t.research_findings.length > 0));
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [showResearchBrowser, selectedProjectId]);
 
   // ── Effects ─────────────────────────────────────────────────────────────
 
@@ -1226,6 +1243,7 @@ export function useAppState() {
     logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason, handleViewLogs, closeLogViewer,
     // Research browser
     showResearchBrowser, setShowResearchBrowser,
+    researchFeed,
     // Activity feed
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
     // Messages

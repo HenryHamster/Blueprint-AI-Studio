@@ -36,6 +36,8 @@ interface ResearchBrowserProps {
   onClose: () => void;
   onNavigateToTask?: (taskId: string) => void;
   initialDirectionId?: string;
+  /** Project-wide task feed. Used for research findings and implementation child outcomes when provided. */
+  researchFeed?: Task[];
 }
 
 const FAILURE_CLASS_CONFIG: Record<string, { label: string; color: string }> = {
@@ -211,7 +213,7 @@ const OUTCOME_FILTER_OPTIONS: { value: OutcomeFilter; label: string; color: stri
   { value: 'findings_documented', label: 'Documented', color: 'text-violet-400' },
 ];
 
-export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateToTask, initialDirectionId }: ResearchBrowserProps) {
+export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateToTask, initialDirectionId, researchFeed }: ResearchBrowserProps) {
   const [search, setSearch] = useState('');
   const [outcomeFilter, setOutcomeFilter] = useState<OutcomeFilter>('all');
   const [expandedGroups, setExpandedGroups] = useState<Set<string> | null>(null);
@@ -260,10 +262,11 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
     return null;
   }, [tasks]);
 
-  // Build the map of finding key -> child task info
+  // Build the map of finding key -> child task info from the project-wide feed when available.
   const implementedFindings = useMemo(() => {
+    const outcomeFeed = researchFeed ?? tasks;
     const map = new Map<string, { status: string; taskType?: string; taskId: string; prUrl?: string; failureClass?: string }>();
-    for (const task of tasks) {
+    for (const task of outcomeFeed) {
       const ctx = task.context as Record<string, unknown> | undefined;
       if (ctx?.research_task_id && ctx?.finding_index !== undefined) {
         const key = `${ctx.research_task_id}-${ctx.finding_index}`;
@@ -277,13 +280,14 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
       }
     }
     return map;
-  }, [tasks]);
+  }, [tasks, researchFeed]);
 
-  // Group findings by direction
+  // Group findings by direction — prefer dedicated researchFeed over the paginated tasks prop.
   const groups = useMemo((): FindingGroup[] => {
     const byDirection = new Map<string, EnrichedFinding[]>();
+    const feedTasks = researchFeed ?? tasks;
 
-    for (const task of tasks) {
+    for (const task of feedTasks) {
       if (task.task_type !== 'research' || !task.research_findings) continue;
       if (!INCLUDED_STATUSES.has(task.status)) continue;
       const findings: ResearchFinding[] = Array.isArray(task.research_findings) ? task.research_findings : [];
@@ -334,7 +338,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
     });
 
     return result;
-  }, [tasks, implementedFindings, directionMap]);
+  }, [tasks, researchFeed, implementedFindings, directionMap]);
 
   // Resolve direction name for the active filter chip
   const directionFilterText = useMemo(() => {

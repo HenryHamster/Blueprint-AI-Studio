@@ -5,6 +5,7 @@ import uuid
 from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock
 
+from app.models import TaskStatus
 from app.spawn_calibration import (
     MEDIUM_ANALYSIS_PLAN_FILE_LIMIT,
     SCOPE_FILE_BUDGETS,
@@ -729,7 +730,15 @@ class TestProvenanceWarningsAttachment:
 class TestQueryFindingsIndex:
     """query_findings_index: structured findings view for strategic cycle and admin."""
 
-    def _make_task(self, direction_id, plan_output, days_ago=1):
+    def _make_task(
+        self,
+        direction_id,
+        plan_output,
+        days_ago=1,
+        *,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+    ):
         from app.time_utils import _utcnow
 
         task = MagicMock()
@@ -737,6 +746,8 @@ class TestQueryFindingsIndex:
         task.context = {"direction_id": direction_id}
         task.created_at = _utcnow() - timedelta(days=days_ago)
         task.plan_output = plan_output
+        task.status = status
+        task.first_payload = {"type": task_type}
         return task
 
     def _mock_session(self, tasks):
@@ -885,6 +896,31 @@ class TestQueryFindingsIndex:
             query_findings_index(session, "proj-1")
         )
         assert rows == []
+
+    def test_skips_non_research_and_non_completed_tasks(self):
+        import asyncio
+        from app.research_completion import query_findings_index
+
+        research = self._make_task(
+            "d-1",
+            [{"title": "Research", "description": "D", "claims": [], "sources": []}],
+        )
+        self_audit = self._make_task(
+            "d-1",
+            [{"title": "Audit", "description": "D", "claims": [], "sources": []}],
+            task_type="self_audit",
+        )
+        in_progress = self._make_task(
+            "d-1",
+            [{"title": "In flight", "description": "D", "claims": [], "sources": []}],
+            status=TaskStatus.IN_PROGRESS,
+        )
+        session = self._mock_session([research, self_audit, in_progress])
+
+        rows = asyncio.get_event_loop().run_until_complete(
+            query_findings_index(session, "proj-1")
+        )
+        assert [row["finding_title"] for row in rows] == ["Research"]
 
 
 class TestFindingsDocumentedOutcome:

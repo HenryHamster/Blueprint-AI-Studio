@@ -40,6 +40,7 @@ import ActivityFeed from './components/ActivityFeed';
 import { MessagesPanel } from './components/MessagesPanel';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
 import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
+import type { Task } from './components/TaskCard';
 // StatusBar removed — redundant connection info
 import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
@@ -222,18 +223,42 @@ export default function App() {
 
   const [dismissedZoneAlertIds, setDismissedZoneAlertIds] = useState<Set<string>>(new Set());
   const [researchBrowserDirectionId, setResearchBrowserDirectionId] = useState<string | null>(null);
+  const [researchFeed, setResearchFeed] = useState<Task[]>([]);
+
+  // Fetch project tasks when the Findings Journal opens so findings and implementation child
+  // outcomes are independent of the main paginated table state.
+  useEffect(() => {
+    if (!s.showResearchBrowser || !selectedProjectId) { setResearchFeed([]); return; }
+    const pid = selectedProjectId;
+    let cancelled = false;
+    apiFetch(
+      `${API_BASE_URL}/api/admin/tasks?task_type=research&archived=false&limit=500&project_id=${encodeURIComponent(pid)}`,
+    )
+      .then(async res => {
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        const all: Task[] = Array.isArray(data) ? data : (data.tasks ?? []);
+        if (!cancelled) setResearchFeed(all);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [s.showResearchBrowser, selectedProjectId]);
 
   const [showSrMissed, setShowSrMissed] = useState(false);
   const [srMissedTasks, setSrMissedTasks] = useState<SrMissedTask[]>([]);
   const [srMissedLoading, setSrMissedLoading] = useState(false);
   const [srMissedCategory, setSrMissedCategory] = useState('');
   const [srMissedWindowDays, setSrMissedWindowDays] = useState<7 | 14 | 30>(14);
+  const [srMissedTruncated, setSrMissedTruncated] = useState(false);
   const srMissedRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!showSrMissed || !selectedProjectId) return;
     setSrMissedLoading(true);
     fetchSrMissedRetrospectives(selectedProjectId, { days: srMissedWindowDays, page_size: 500 })
-      .then(r => setSrMissedTasks(r.items))
+      .then(r => {
+        setSrMissedTasks(r.items);
+        setSrMissedTruncated(r.items.length < r.total);
+      })
       .catch(() => {})
       .finally(() => setSrMissedLoading(false));
   }, [showSrMissed, selectedProjectId, srMissedWindowDays]);
@@ -899,7 +924,7 @@ export default function App() {
                   {showSrMissed && (
                     srMissedLoading
                       ? <p className="text-[10px] text-neutral-500 mt-2">Loading…</p>
-                      : <div className="mt-2"><SrMissedRetrospective tasks={srMissedTasks} onTaskClick={handleViewTask} selectedCategory={srMissedCategory} windowDays={srMissedWindowDays} onWindowDaysChange={setSrMissedWindowDays} /></div>
+                      : <div className="mt-2"><SrMissedRetrospective tasks={srMissedTasks} onTaskClick={handleViewTask} selectedCategory={srMissedCategory} windowDays={srMissedWindowDays} onWindowDaysChange={setSrMissedWindowDays} truncated={srMissedTruncated} /></div>
                   )}
                 </div>
               )}
@@ -1044,6 +1069,7 @@ export default function App() {
       {s.showResearchBrowser && (
         <ResearchBrowser
           tasks={s.tasks}
+          researchFeed={researchFeed.length > 0 ? researchFeed : undefined}
           selectedProjectId={s.selectedProjectId}
           initialDirectionId={researchBrowserDirectionId ?? undefined}
           onClose={() => { s.setShowResearchBrowser(false); setResearchBrowserDirectionId(null); }}

@@ -48,6 +48,25 @@ function makeResearchTask(findings: ResearchFinding[]): Task {
   };
 }
 
+function makeImplementationTask(overrides: Partial<Task> = {}): Task {
+  return {
+    id: 'impl-1',
+    title: 'Implementation task',
+    description: 'desc',
+    status: 'COMPLETED',
+    task_type: 'create',
+    created_at: '2026-05-02T00:00:00Z',
+    created_by: 'AGENT',
+    requires_approval: false,
+    context: {
+      research_task_id: 'research-1',
+      finding_index: 0,
+    },
+    pr_url: 'https://example.com/pr/1',
+    ...overrides,
+  };
+}
+
 describe('ResearchBrowser evidence panel', () => {
   it('renders claims with show-more toggle and source refs', async () => {
     const user = userEvent.setup();
@@ -286,5 +305,53 @@ describe('ResearchBrowser research quality card', () => {
     expect(screen.getByText('High-value finding')).toBeInTheDocument();
     expect(screen.getByText('Medium-value finding')).toBeInTheDocument();
     expect(screen.getByText('Low-value finding')).toBeInTheDocument();
+  });
+});
+
+describe('ResearchBrowser researchFeed prop', () => {
+  it('uses researchFeed findings instead of tasks prop when provided', () => {
+    const taskFinding = makeFinding({ title: 'From tasks prop' });
+    const feedFinding = makeFinding({ title: 'From research feed' });
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([taskFinding])]}
+        researchFeed={[makeResearchTask([feedFinding])]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByText('From research feed')).toBeInTheDocument();
+    expect(screen.queryByText('From tasks prop')).not.toBeInTheDocument();
+  });
+
+  it('falls back to tasks prop when researchFeed is not provided', () => {
+    const taskFinding = makeFinding({ title: 'From tasks prop fallback' });
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([taskFinding])]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.getByText('From tasks prop fallback')).toBeInTheDocument();
+  });
+
+  it('uses project-wide feed child tasks for outcome state when paginated tasks omit them', async () => {
+    const user = userEvent.setup();
+    const finding = makeFinding({ title: 'Implemented from off-page task' });
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([finding])]}
+        researchFeed={[makeResearchTask([finding]), makeImplementationTask()]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Shipped' }));
+    expect(screen.getByText('Implemented from off-page task')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Proposed' }));
+    expect(screen.queryByText('Implemented from off-page task')).not.toBeInTheDocument();
   });
 });

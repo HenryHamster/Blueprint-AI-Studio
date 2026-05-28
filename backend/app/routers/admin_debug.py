@@ -1312,6 +1312,7 @@ async def get_recent_findings(
             Task.status == TaskStatus.COMPLETED,
             Task.created_at >= cutoff,
             Task.plan_output.isnot(None),
+            Task.payloads[0]["type"].as_string() == "research",
         )
         .order_by(Task.created_at.desc())
         .limit(100)

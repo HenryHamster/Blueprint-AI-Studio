@@ -36,7 +36,7 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask }:
         days,
         category: categoryFilter || undefined,
         task_type: taskTypeFilter || undefined,
-        page,
+        page: page - 1,  // backend is 0-indexed; UI is 1-indexed
         page_size: PAGE_SIZE,
       });
       if (!mountedRef.current) return;

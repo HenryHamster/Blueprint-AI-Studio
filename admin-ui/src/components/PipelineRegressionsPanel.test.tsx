@@ -335,6 +335,65 @@ describe('ManualInterventionPanel — viewport regression class parsing', () => 
   });
 });
 
+describe('ManualInterventionPanel — remediation PR link vs plain text', () => {
+  it('renders PR number as clickable link when last_remediation_pr_url is present', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([{
+      ...baseCase,
+      last_remediation_pr_number: 9001,
+      last_remediation_pr_url: 'https://github.com/org/repo/pull/9001',
+    }]));
+    render(<ManualInterventionPanel projectId="proj-1" />);
+    await screen.findByText('correctness');
+    const link = screen.getByTestId('remediation-pr-link');
+    expect(link).toBeInTheDocument();
+    expect(link).toHaveAttribute('href', 'https://github.com/org/repo/pull/9001');
+    expect(link).toHaveTextContent('#9001');
+  });
+
+  it('renders PR number as plain text when last_remediation_pr_url is absent', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([{
+      ...baseCase,
+      last_remediation_pr_number: 4001,
+      last_remediation_pr_url: null,
+    }]));
+    render(<ManualInterventionPanel projectId="proj-1" />);
+    await screen.findByText('correctness');
+    expect(screen.getByTestId('remediation-pr-plain')).toHaveTextContent('#4001');
+    expect(screen.queryByTestId('remediation-pr-link')).toBeNull();
+  });
+});
+
+describe('AutoRecoveredPanel — remediation PR link vs plain text', () => {
+  it('renders PR number as clickable link when last_remediation_pr_url is present', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([{
+      ...baseCase,
+      id: 'ar-2',
+      regression_class: 'auto-recovered-case',
+      last_remediation_pr_number: 7777,
+      last_remediation_pr_url: 'https://github.com/org/repo/pull/7777',
+    }]));
+    render(<AutoRecoveredPanel projectId="proj-1" />);
+    await screen.findByText('auto-recovered-case');
+    const link = screen.getByTestId('remediation-pr-link');
+    expect(link).toHaveAttribute('href', 'https://github.com/org/repo/pull/7777');
+    expect(link).toHaveTextContent('#7777');
+  });
+
+  it('renders PR number as plain text when last_remediation_pr_url is absent', async () => {
+    apiFetchMock.mockResolvedValueOnce(response([{
+      ...baseCase,
+      id: 'ar-3',
+      regression_class: 'auto-recovered-case',
+      last_remediation_pr_number: 4001,
+      last_remediation_pr_url: null,
+    }]));
+    render(<AutoRecoveredPanel projectId="proj-1" />);
+    await screen.findByText('auto-recovered-case');
+    expect(screen.getByTestId('remediation-pr-plain')).toHaveTextContent('#4001');
+    expect(screen.queryByTestId('remediation-pr-link')).toBeNull();
+  });
+});
+
 describe('MttaTimelinePanel — per-stage elapsed/ETA display', () => {
   it('displays per-stage elapsed and ETA information for active cases with all fields', async () => {
     const mttaResponse = (): Response => ({

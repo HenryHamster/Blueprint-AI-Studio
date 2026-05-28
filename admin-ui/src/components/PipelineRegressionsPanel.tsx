@@ -230,6 +230,7 @@ interface ManualInterventionCase {
   status: string;
   attempts: number;
   last_remediation_pr_number: number | null;
+  last_remediation_pr_url?: string | null;
   last_failure_class: string | null;
   signal_snapshot_at_spawn: Record<string, unknown> | null;
   signal_snapshot_at_merge: Record<string, unknown> | null;
@@ -623,7 +624,20 @@ export function ManualInterventionPanel({ projectId, filterClass }: Props) {
                     <div className="flex items-center gap-3 mt-1 flex-wrap">
                       {c.last_remediation_pr_number != null && (
                         <span className="text-[10px] text-neutral-400">
-                          Last PR: #{c.last_remediation_pr_number}
+                          Last PR:{' '}
+                          {c.last_remediation_pr_url?.startsWith('https://') ? (
+                            <a
+                              href={c.last_remediation_pr_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="underline hover:text-neutral-200"
+                              data-testid="remediation-pr-link"
+                            >
+                              #{c.last_remediation_pr_number}
+                            </a>
+                          ) : (
+                            <span data-testid="remediation-pr-plain">#{c.last_remediation_pr_number}</span>
+                          )}
                         </span>
                       )}
                       {c.last_failure_class && (
@@ -1465,7 +1479,20 @@ export function AutoRecoveredPanel({ projectId }: Props) {
                   <div className="flex items-center gap-3 mt-1">
                     {c.last_remediation_pr_number != null && (
                       <span className="text-[10px] text-neutral-400">
-                        Last PR: #{c.last_remediation_pr_number}
+                        Last PR:{' '}
+                        {c.last_remediation_pr_url?.startsWith('https://') ? (
+                          <a
+                            href={c.last_remediation_pr_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="underline hover:text-neutral-200"
+                            data-testid="remediation-pr-link"
+                          >
+                            #{c.last_remediation_pr_number}
+                          </a>
+                        ) : (
+                          <span data-testid="remediation-pr-plain">#{c.last_remediation_pr_number}</span>
+                        )}
                       </span>
                     )}
                     {c.last_failure_class && (
