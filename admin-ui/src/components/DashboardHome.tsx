@@ -350,9 +350,16 @@ const REVIEW_CAT_COLORS: Record<string, string> = {
   other: 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30',
 };
 
+interface BlindSpotExample {
+  text: string;
+  task_id: string;
+  task_type: string;
+}
+
 interface BlindSpotTheme {
   theme: string;
   count: number;
+  examples?: BlindSpotExample[];
   layer_distribution?: Record<string, number>;
 }
 
@@ -664,6 +671,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const [taskDurationStats, setTaskDurationStats] = useState<TaskDurationStats | null>(null);
   const [versionLifecycle, setVersionLifecycle] = useState<VersionLifecycleResponse | null>(null);
   const [blindSpots, setBlindSpots] = useState<BlindSpotsData | null>(null);
+  const [expandedBlindSpotThemes, setExpandedBlindSpotThemes] = useState<Set<string>>(new Set());
   const [srRecentMisses, setSrRecentMisses] = useState<SrMissedTask[] | null>(null);
   const [srRecentMissesTotal, setSrRecentMissesTotal] = useState<number>(0);
   const [srReviewerDisagreements, setSrReviewerDisagreements] = useState<SrReviewerDisagreementsData | null>(null);
@@ -1198,32 +1206,70 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
                 <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {blindSpots.total_distinct_themes} themes · {blindSpots.window_days}d</span>
               </p>
               <div className="flex flex-wrap gap-2">
-                {blindSpots.themes.slice(0, 8).map((t, i) => (
-                  <div key={i} className="flex flex-col gap-0.5 min-w-0">
-                    <span
-                      className="inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border bg-violet-500/10 text-violet-400 border-violet-500/20"
-                      title={t.theme}
-                    >
-                      <span className="truncate max-w-[160px]">{t.theme}</span>
-                      <span className="font-bold shrink-0">×{t.count}</span>
-                    </span>
-                    {t.layer_distribution && Object.keys(t.layer_distribution).length > 0 && (
-                      <div className="flex flex-wrap gap-1">
-                        {Object.entries(t.layer_distribution)
-                          .sort((a, b) => b[1] - a[1])
-                          .map(([layer, cnt]) => (
-                            <span
-                              key={layer}
-                              className="inline-flex items-center gap-0.5 text-[9px] px-1.5 py-0.5 rounded border bg-neutral-500/10 text-neutral-400 border-neutral-500/20 max-w-[140px]"
-                            >
-                              <span className="truncate">{layer}</span>
-                              <span className="shrink-0">×{cnt}</span>
-                            </span>
+                {blindSpots.themes.slice(0, 8).map((t, i) => {
+                  const isExpanded = expandedBlindSpotThemes.has(t.theme);
+                  const toggleExpanded = () => {
+                    const newSet = new Set(expandedBlindSpotThemes);
+                    if (newSet.has(t.theme)) {
+                      newSet.delete(t.theme);
+                    } else {
+                      newSet.add(t.theme);
+                    }
+                    setExpandedBlindSpotThemes(newSet);
+                  };
+                  const handleViewExample = (taskId: string) => {
+                    const task = tasks.find(tk => tk.id === taskId);
+                    if (task) {
+                      onViewTask(task);
+                    } else {
+                      fetchTask(taskId).then(onViewTask).catch(() => {
+                        console.error(`Failed to fetch task ${taskId}`);
+                      });
+                    }
+                  };
+                  return (
+                    <div key={i} className="flex flex-col gap-0.5 min-w-0">
+                      <button
+                        onClick={toggleExpanded}
+                        className="inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border bg-violet-500/10 text-violet-400 border-violet-500/20 cursor-pointer hover:bg-violet-500/20 transition-colors min-h-[44px]"
+                        title={t.theme}
+                      >
+                        <span className="truncate max-w-[160px]">{t.theme}</span>
+                        <span className="font-bold shrink-0">×{t.count}</span>
+                      </button>
+                      {isExpanded && t.examples && t.examples.length > 0 && (
+                        <div className="flex flex-col gap-1 ml-1 border-l border-violet-500/20 pl-2">
+                          {t.examples.map((ex, exIdx) => (
+                            <div key={exIdx} className="text-[9px] text-neutral-300">
+                              <span className="text-neutral-500 block mb-0.5">{ex.text}</span>
+                              <button
+                                onClick={() => handleViewExample(ex.task_id)}
+                                className="text-violet-400 hover:text-violet-300 cursor-pointer underline"
+                              >
+                                View task
+                              </button>
+                            </div>
                           ))}
-                      </div>
-                    )}
-                  </div>
-                ))}
+                        </div>
+                      )}
+                      {t.layer_distribution && Object.keys(t.layer_distribution).length > 0 && (
+                        <div className="flex flex-wrap gap-1">
+                          {Object.entries(t.layer_distribution)
+                            .sort((a, b) => b[1] - a[1])
+                            .map(([layer, cnt]) => (
+                              <span
+                                key={layer}
+                                className="inline-flex items-center gap-0.5 text-[9px] px-1.5 py-0.5 rounded border bg-neutral-500/10 text-neutral-400 border-neutral-500/20 max-w-[140px]"
+                              >
+                                <span className="truncate">{layer}</span>
+                                <span className="shrink-0">×{cnt}</span>
+                              </span>
+                            ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </section>
           )}

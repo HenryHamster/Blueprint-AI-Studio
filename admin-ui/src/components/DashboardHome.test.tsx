@@ -5,9 +5,10 @@ import { DashboardHome } from './DashboardHome';
 import type { Task } from '../types/task';
 import type { ProjectDiagnostics } from '../types/diagnostics';
 
-const { apiFetchMock, fetchQualificationVerdictsMock, capturedProps } = vi.hoisted(() => ({
+const { apiFetchMock, fetchQualificationVerdictsMock, fetchTaskMock, capturedProps } = vi.hoisted(() => ({
   apiFetchMock: vi.fn(),
   fetchQualificationVerdictsMock: vi.fn().mockResolvedValue({ verdicts: [], total: 0 }),
+  fetchTaskMock: vi.fn(),
   capturedProps: {
     prMonitor: null as Record<string, unknown> | null,
     remediationFunnel: null as Record<string, unknown> | null,
@@ -20,6 +21,7 @@ const { apiFetchMock, fetchQualificationVerdictsMock, capturedProps } = vi.hoist
 vi.mock('../api', () => ({
   apiFetch: (path: string, init?: RequestInit) => apiFetchMock(path, init),
   fetchQualificationVerdicts: (projectId: string, limit?: number) => fetchQualificationVerdictsMock(projectId, limit),
+  fetchTask: (taskId: string) => fetchTaskMock(taskId),
   fetchSrUnhandledEdgesRetrospectives: vi.fn().mockResolvedValue({ tasks: [] }),
   setVersionPhase: vi.fn(),
   triggerQualify: vi.fn(),
@@ -176,6 +178,7 @@ describe('DashboardHome', () => {
   beforeEach(() => {
     apiFetchMock.mockReset();
     fetchQualificationVerdictsMock.mockReset();
+    fetchTaskMock.mockReset();
     fetchQualificationVerdictsMock.mockResolvedValue({ verdicts: [], total: 0 });
   });
 
@@ -1606,5 +1609,234 @@ describe('DashboardHome', () => {
 
     await screen.findByText('All systems healthy');
     expect(screen.queryByTestId('version-lifecycle-panel')).not.toBeInTheDocument();
+  });
+
+  it('renders SR Blind Spots section with expandable pills and examples', async () => {
+    const mockTask = makeTask({ id: 'task-123', title: 'Example task' });
+    fetchTaskMock.mockResolvedValue(mockTask);
+
+    setupApiMocks({
+      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+      diagnostics: makeDiagnostics(),
+    });
+
+    apiFetchMock.mockImplementation((url: string) => {
+      if (url.includes('/sr-blind-spots')) {
+        return Promise.resolve(jsonResponse({
+          themes: [
+            {
+              theme: 'did not run the full backend',
+              count: 5,
+              examples: [
+                { text: 'did not run the full backend test suite', task_id: 'task-123', task_type: 'create' },
+                { text: 'did not run the full backend integration tests', task_id: 'task-124', task_type: 'fix' },
+                { text: 'did not run the full backend docker tests', task_id: 'task-125', task_type: 'create' },
+              ],
+              layer_distribution: { backend: 3, frontend: 2 },
+            },
+          ],
+          total_distinct_themes: 1,
+          window_days: 14,
+        }));
+      }
+      if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse({}));
+      if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+      return Promise.resolve(notFoundResponse());
+    });
+
+    const { container } = render(
+      <DashboardHome
+        tasks={[mockTask]}
+        selectedProjectId="proj1"
+        onViewTask={vi.fn()}
+      />,
+    );
+
+    // Wait for the section to appear and verify the theme pill is visible
+    expect(await screen.findByText('SR Blind Spots')).toBeInTheDocument();
+    expect(screen.getByText('did not run the full backend')).toBeInTheDocument();
+    expect(screen.getByText('×5')).toBeInTheDocument();
+    void container; // Verify component rendered without error
+
+    // Verify layer distribution is shown
+    expect(screen.getByText('backend')).toBeInTheDocument();
+    expect(screen.getByText('frontend')).toBeInTheDocument();
+
+    // Examples should NOT be visible initially
+    expect(screen.queryByText('did not run the full backend test suite')).not.toBeInTheDocument();
+  });
+
+  it('expands blind spot pill to show examples when clicked', async () => {
+    const mockTask = makeTask({ id: 'task-123', title: 'Example task' });
+    fetchTaskMock.mockResolvedValue(mockTask);
+
+    setupApiMocks({
+      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+      diagnostics: makeDiagnostics(),
+    });
+
+    apiFetchMock.mockImplementation((url: string) => {
+      if (url.includes('/sr-blind-spots')) {
+        return Promise.resolve(jsonResponse({
+          themes: [
+            {
+              theme: 'did not run the full backend',
+              count: 3,
+              examples: [
+                { text: 'did not run the full backend test suite', task_id: 'task-123', task_type: 'create' },
+                { text: 'did not run the full backend integration tests', task_id: 'task-124', task_type: 'fix' },
+              ],
+              layer_distribution: {},
+            },
+          ],
+          total_distinct_themes: 1,
+          window_days: 14,
+        }));
+      }
+      if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse({}));
+      if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+      return Promise.resolve(notFoundResponse());
+    });
+
+    const user = userEvent.setup();
+    render(
+      <DashboardHome
+        tasks={[mockTask]}
+        selectedProjectId="proj1"
+        onViewTask={vi.fn()}
+      />,
+    );
+
+    // Wait for the blind spot to load
+    const pill = await screen.findByRole('button', { name: /did not run the full backend/ });
+    expect(pill).toBeInTheDocument();
+
+    // Click the pill to expand
+    await user.click(pill);
+
+    // Examples should now be visible
+    expect(screen.getByText('did not run the full backend test suite')).toBeInTheDocument();
+    expect(screen.getByText('did not run the full backend integration tests')).toBeInTheDocument();
+    expect(screen.getAllByText('View task').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('calls onViewTask when an example task link is clicked', async () => {
+    const mockTask = makeTask({ id: 'task-123', title: 'Example task' });
+    const mockTask124 = makeTask({ id: 'task-124', title: 'Another task' });
+    const onViewTask = vi.fn();
+    fetchTaskMock.mockResolvedValue(mockTask124);
+
+    setupApiMocks({
+      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+      diagnostics: makeDiagnostics(),
+    });
+
+    apiFetchMock.mockImplementation((url: string) => {
+      if (url.includes('/sr-blind-spots')) {
+        return Promise.resolve(jsonResponse({
+          themes: [
+            {
+              theme: 'did not run the full backend',
+              count: 2,
+              examples: [
+                { text: 'did not run the full backend test suite', task_id: 'task-123', task_type: 'create' },
+                { text: 'did not run the full backend integration tests', task_id: 'task-124', task_type: 'fix' },
+              ],
+              layer_distribution: {},
+            },
+          ],
+          total_distinct_themes: 1,
+          window_days: 14,
+        }));
+      }
+      if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse({}));
+      if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+      return Promise.resolve(notFoundResponse());
+    });
+
+    const user = userEvent.setup();
+    render(
+      <DashboardHome
+        tasks={[mockTask, mockTask124]}
+        selectedProjectId="proj1"
+        onViewTask={onViewTask}
+      />,
+    );
+
+    // Expand the pill
+    const pill = await screen.findByRole('button', { name: /did not run the full backend/ });
+    await user.click(pill);
+
+    // Click the first "View task" link
+    const viewTaskLinks = screen.getAllByText('View task');
+    await user.click(viewTaskLinks[0]);
+
+    // Should call onViewTask with the correct task (task-123)
+    expect(onViewTask).toHaveBeenCalledWith(mockTask);
+  });
+
+  it('expands and collapses blind spot pills independently', async () => {
+    setupApiMocks({
+      digest: { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] },
+      diagnostics: makeDiagnostics(),
+    });
+
+    apiFetchMock.mockImplementation((url: string) => {
+      if (url.includes('/sr-blind-spots')) {
+        return Promise.resolve(jsonResponse({
+          themes: [
+            {
+              theme: 'did not run the full backend',
+              count: 2,
+              examples: [
+                { text: 'backend example 1', task_id: 'task-1', task_type: 'create' },
+              ],
+              layer_distribution: {},
+            },
+            {
+              theme: 'did not run the full frontend',
+              count: 1,
+              examples: [
+                { text: 'frontend example 1', task_id: 'task-2', task_type: 'create' },
+              ],
+              layer_distribution: {},
+            },
+          ],
+          total_distinct_themes: 2,
+          window_days: 14,
+        }));
+      }
+      if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse({}));
+      if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+      return Promise.resolve(notFoundResponse());
+    });
+
+    const user = userEvent.setup();
+    render(
+      <DashboardHome
+        tasks={[]}
+        selectedProjectId="proj1"
+        onViewTask={vi.fn()}
+      />,
+    );
+
+    // Wait for both pills to appear
+    const backendPill = await screen.findByRole('button', { name: /did not run the full backend/ });
+    const frontendPill = screen.getByRole('button', { name: /did not run the full frontend/ });
+
+    // Expand first pill
+    await user.click(backendPill);
+    expect(screen.getByText('backend example 1')).toBeInTheDocument();
+    expect(screen.queryByText('frontend example 1')).not.toBeInTheDocument();
+
+    // Expand second pill
+    await user.click(frontendPill);
+    expect(screen.getByText('frontend example 1')).toBeInTheDocument();
+    expect(screen.getByText('backend example 1')).toBeInTheDocument();
+
+    // Collapse first pill
+    await user.click(backendPill);
+    expect(screen.queryByText('backend example 1')).not.toBeInTheDocument();
+    expect(screen.getByText('frontend example 1')).toBeInTheDocument();
   });
 });

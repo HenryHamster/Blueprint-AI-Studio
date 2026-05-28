@@ -155,6 +155,56 @@ describe('SrUnhandledEdgesRetrospectivesPanel — viewport regression', () => {
     expect(screen.getByText('no lock around state mutation')).toBeTruthy();
   });
 
+  test('refresh button visible when stale and single-page result set (totalPages=1)', async () => {
+    const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
+    const spy = fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+    // Return 2 items — well under PAGE_SIZE=20, so totalPages=1 and pagination is hidden
+    spy.mockResolvedValue({ items: MOCK_ITEMS, total: 2, task_types: ['create', 'fix'] });
+
+    // Pin Date.now() to a fixed value so panelMountTimeRef captures it
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1_000_000);
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrUnhandledEdgesRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // Refresh button must NOT be present when fresh
+    expect(screen.queryByRole('button', { name: /refresh pagination data/i })).toBeNull();
+
+    // Advance time past the 5-minute stale threshold
+    nowSpy.mockReturnValue(1_000_000 + 310_000);
+
+    // Re-render with same props to trigger isStale recomputation
+    await act(async () => {
+      r.render(
+        <SrUnhandledEdgesRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+
+    // Refresh button must now be visible even though totalPages=1 (no pagination shown)
+    expect(screen.getByRole('button', { name: /refresh pagination data/i })).toBeTruthy();
+
+    nowSpy.mockRestore();
+  });
+
   test('initial fetch passes page=0 to the API matching 0-indexed backend contract', async () => {
     const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
     const spy = fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>;

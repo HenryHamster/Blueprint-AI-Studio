@@ -171,20 +171,20 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
                 className="px-1.5 py-0.5 border border-neutral-700 rounded disabled:opacity-40 hover:border-neutral-500"
                 aria-label="Next page"
               >→</button>
-              {isStale && (
-                // eslint-disable-next-line viewport/min-touch-target -- dense control
-                <button
-                  type="button"
-                  onClick={handleRefresh}
-                  disabled={loading}
-                  className="p-1 text-neutral-500 hover:text-neutral-300 disabled:opacity-40"
-                  title="Refresh data (window may have moved)"
-                  aria-label="Refresh pagination data"
-                >
-                  <RefreshCw className="w-3 h-3" />
-                </button>
-              )}
             </div>
+          )}
+          {isStale && (
+            // eslint-disable-next-line viewport/min-touch-target -- dense control
+            <button
+              type="button"
+              onClick={handleRefresh}
+              disabled={loading}
+              className="mt-1 p-1 text-neutral-500 hover:text-neutral-300 disabled:opacity-40"
+              title="Refresh data (window may have moved)"
+              aria-label="Refresh pagination data"
+            >
+              <RefreshCw className="w-3 h-3" />
+            </button>
           )}
         </>
       )}
