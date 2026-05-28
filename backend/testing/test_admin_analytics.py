@@ -381,6 +381,120 @@ class TestTaskCostBreakdown:
             round(1800 * admin_analytics.ON_DEMAND_RATE, 2)
         )
 
+    @pytest.mark.asyncio
+    async def test_banked_retry_cost_added_to_current_vm_interval(
+        self, client: AsyncClient, db_session
+    ):
+        """A retried task's banked cost from prior attempts is included in the total."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        now = _utcnow()
+        completed_at = now - timedelta(minutes=10)
+        started_at = completed_at - timedelta(seconds=1800)
+        banked = 0.02
+        current_attempt_cost = round(1800 * admin_analytics.ON_DEMAND_RATE, 4)
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Retried task",
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "create", "prompt": "x"}],
+                started_at=started_at,
+                created_at=started_at,
+                status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                vm_provisioned_at=started_at,
+                vm_stopped_at=completed_at,
+                vm_spot=False,
+                vm_runtime_cost_banked_db=banked,
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/task-cost-breakdown?project_id={project.id}&window=1h"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["task_count"] == 1
+        assert body["total_estimated_cost_usd"] == pytest.approx(
+            round(banked + current_attempt_cost, 2)
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancelled_task_with_banked_cost_included(
+        self, client: AsyncClient, db_session
+    ):
+        """A CANCELLED task that burned VM cost on a prior attempt counts in the breakdown."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        now = _utcnow()
+        completed_at = now - timedelta(minutes=15)
+        banked = 0.05
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Cancelled with spend",
+                status=TaskStatus.CANCELLED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "create", "prompt": "x"}],
+                created_at=completed_at,
+                status_log=[{"s": "CANCELLED", "t": completed_at.isoformat()}],
+                vm_runtime_cost_banked_db=banked,
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/task-cost-breakdown?project_id={project.id}&window=1h"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["task_count"] == 1
+        assert body["total_estimated_cost_usd"] == pytest.approx(banked)
+
+    @pytest.mark.asyncio
+    async def test_old_created_recently_finished_task_included_by_completion_time(
+        self, client: AsyncClient, db_session
+    ):
+        """A task created before the window but completed within it is counted (windowing
+        uses completion time, not creation time)."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        now = _utcnow()
+        completed_at = now - timedelta(minutes=20)
+        created_at = now - timedelta(hours=3)
+        started_at = completed_at - timedelta(seconds=3600)
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Old created recently finished",
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "create", "prompt": "x"}],
+                started_at=started_at,
+                created_at=created_at,
+                status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                vm_provisioned_at=started_at,
+                vm_stopped_at=completed_at,
+                vm_spot=False,
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/task-cost-breakdown?project_id={project.id}&window=1h"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["task_count"] == 1
+        assert body["total_estimated_cost_usd"] == pytest.approx(
+            round(3600 * admin_analytics.ON_DEMAND_RATE, 2)
+        )
+
 
 class TestOpenPrs:
     @pytest.fixture(autouse=True)

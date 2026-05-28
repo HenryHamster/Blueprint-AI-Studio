@@ -34,8 +34,8 @@ from app.models import (
     Task,
     TaskStatus,
     _utcnow,
+    get_task_total_vm_cost_usd_or_none,
 )
-from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +60,8 @@ async def get_provider_cost_summary(
     """
     window_start = _utcnow() - timedelta(hours=hours)
     filters = [
-        Task.created_at >= window_start,
-        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+        Task.vm_stopped_at >= window_start,
+        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]),
     ]
     if project_id:
         filters.append(Task.project_id == project_id)
@@ -79,6 +79,7 @@ async def get_provider_cost_summary(
                         Task.vm_spot,
                         Task.vm_provisioned_at,
                         Task.vm_stopped_at,
+                        Task.vm_runtime_cost_banked_db,
                     )
                 )
                 .limit(5000)
@@ -132,11 +133,9 @@ async def get_provider_cost_summary(
             g["success_count"] += 1
             if (t.context or {}).get("pr_merged"):
                 g["merged_count"] += 1
-        if t.vm_provisioned_at and t.vm_stopped_at:
-            rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-            g["total_cost_usd"] += (
-                t.vm_stopped_at - t.vm_provisioned_at
-            ).total_seconds() * rate
+        cost = get_task_total_vm_cost_usd_or_none(t)
+        if cost is not None:
+            g["total_cost_usd"] += cost
 
     result_rows = []
     for g in groups.values():

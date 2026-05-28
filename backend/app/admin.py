@@ -35,6 +35,7 @@ from app.models import (
     DeploymentState,
     DeploymentStatus,
     _utcnow,
+    get_task_total_vm_cost_usd_or_none,
 )
 from app.auth import get_current_user
 from app.task_locking import task_lock
@@ -45,17 +46,8 @@ from app.payload_schemas import (
     validate_internal_payload,
     validate_task_payload,
 )
-from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 from app import release_qualifier, release_version
-
-
-def _estimated_cost_usd(task: Task) -> float | None:
-    """Return the VM cost for a task, or None when timing data is incomplete."""
-    if not task.vm_provisioned_at or not task.vm_stopped_at:
-        return None
-    rate = SPOT_RATE if task.vm_spot else ON_DEMAND_RATE
-    return (task.vm_stopped_at - task.vm_provisioned_at).total_seconds() * rate
 
 
 # Per-loop max attempt budgets. lint/test mirror agent/src/constants.ts
@@ -521,7 +513,7 @@ async def get_all_tasks(
             if t.status in (TaskStatus.FAILED, TaskStatus.CANCELLED)
             and t.latest_status_message
             else None,
-            "estimated_cost_usd": _estimated_cost_usd(t),
+            "estimated_cost_usd": get_task_total_vm_cost_usd_or_none(t),
             "fix_loop_summary": _fix_loop_summary(t.fix_loop_history),
         }
         result_list.append(task_dict)
@@ -1377,7 +1369,7 @@ async def get_task(
         "research_findings": research_findings,
         "history": history,
         "child_task_ids": child_task_ids,
-        "estimated_cost_usd": _estimated_cost_usd(task),
+        "estimated_cost_usd": get_task_total_vm_cost_usd_or_none(task),
         "api_call_summary": task.api_call_summary,
     }
 

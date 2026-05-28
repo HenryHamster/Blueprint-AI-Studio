@@ -10,6 +10,8 @@ from app.models import (
     Project,
     RegressionRemediationCase,
     StrategicCycle,
+    Task,
+    get_task_total_vm_cost_usd_or_none,
 )
 
 _PROJECT_ID = uuid.uuid4()
@@ -370,3 +372,58 @@ def test_is_staging_branch_empty_or_none_branch():
     project = _make_project()
     assert project.is_staging_branch("") is False
     assert project.is_staging_branch(None) is False
+
+
+# ---------------------------------------------------------------------------
+# get_task_total_vm_cost_usd_or_none — canonical admin-facing cost helper
+# ---------------------------------------------------------------------------
+
+_PROJ_ID = uuid.uuid4()
+_T_START = datetime(2026, 1, 1, 10, 0, 0)
+_T_STOP = datetime(2026, 1, 1, 10, 0, 30)  # 30s later
+
+
+def _make_task(**kwargs) -> Task:
+    return Task(
+        project_id=_PROJ_ID,
+        title="t",
+        **kwargs,
+    )
+
+
+def test_get_task_total_vm_cost_or_none_returns_none_for_never_ran_task():
+    """Task with no provisioning and no banked cost → None."""
+    task = _make_task()
+    assert get_task_total_vm_cost_usd_or_none(task) is None
+
+
+def test_get_task_total_vm_cost_or_none_returns_current_attempt_cost():
+    """Task with only a current provisioning window → computes cost from it."""
+    task = _make_task(vm_provisioned_at=_T_START, vm_stopped_at=_T_STOP, vm_spot=False)
+    result = get_task_total_vm_cost_usd_or_none(task)
+    assert result is not None
+    assert result > 0.0
+
+
+def test_get_task_total_vm_cost_or_none_returns_banked_only_for_retried_task():
+    """Retried task: vm_provisioned_at cleared after banking; banked cost returned."""
+    task = _make_task(vm_provisioned_at=None, vm_stopped_at=None)
+    task.vm_runtime_cost_banked_db = 2.5
+    result = get_task_total_vm_cost_usd_or_none(task)
+    assert result == 2.5
+
+
+def test_get_task_total_vm_cost_or_none_sums_banked_and_current():
+    """Task with both banked retries and an active/final attempt → sums both."""
+    task = _make_task(vm_provisioned_at=_T_START, vm_stopped_at=_T_STOP, vm_spot=False)
+    task.vm_runtime_cost_banked_db = 1.0
+    result = get_task_total_vm_cost_usd_or_none(task)
+    assert result is not None
+    assert result > 1.0  # banked + current-attempt cost
+
+
+def test_get_task_total_vm_cost_or_none_banked_zero_with_no_provisioning_is_none():
+    """Banked value of zero with no provisioning window: treat as never-ran → None."""
+    task = _make_task()
+    task.vm_runtime_cost_banked_db = 0.0
+    assert get_task_total_vm_cost_usd_or_none(task) is None

@@ -788,7 +788,7 @@ def _build_rollup_pr_body(
             prov_at = getattr(c, "vm_provisioned_at", None)
             stop_at = getattr(c, "vm_stopped_at", None)
             if prov_at and stop_at:
-                from app.admin import SPOT_RATE, ON_DEMAND_RATE
+                from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 
                 rate = SPOT_RATE if getattr(c, "vm_spot", False) else ON_DEMAND_RATE
                 total_cost += (stop_at - prov_at).total_seconds() * rate

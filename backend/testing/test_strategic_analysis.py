@@ -7,6 +7,7 @@ from app.strategic_analysis import (
     _build_retired_directions_summary,
     _index_findings_by_direction,
     _build_retired_approaches_block,
+    _entry_cost_usd,
     _RETIRED_MAX_COUNT,
     _RETIRED_PER_ENTRY_CHAR_CAP,
 )
@@ -2820,3 +2821,119 @@ def test_superseded_direction_with_completed_at_included():
     assert "dir-superseded" in ids, (
         "superseded direction with recent completed_at should be included"
     )
+
+
+# ---------------------------------------------------------------------------
+# _entry_cost_usd — recorded spend preferred over proxy
+# ---------------------------------------------------------------------------
+
+
+def test_entry_cost_usd_uses_recorded_when_positive():
+    """Positive estimated_cost_usd is returned directly without applying the proxy."""
+    entry = {"estimated_cost_usd": 5.50, "tasks_created": 100, "avg_time_to_merge_hours": 10.0}
+    result = _entry_cost_usd(entry, on_demand_rate=0.001)
+    assert result == 5.50
+
+
+def test_entry_cost_usd_falls_back_to_proxy_when_missing():
+    """When estimated_cost_usd is absent, proxy is computed from tasks_created * hours * rate."""
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+
+    entry = {"tasks_created": 4, "avg_time_to_merge_hours": 2.0}
+    expected = 4 * 2.0 * 3600 * ON_DEMAND_RATE
+    assert _entry_cost_usd(entry, ON_DEMAND_RATE) == expected
+
+
+def test_entry_cost_usd_falls_back_to_proxy_when_zero():
+    """Zero estimated_cost_usd is treated as absent (falls back to proxy)."""
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+
+    entry = {"estimated_cost_usd": 0, "tasks_created": 3, "avg_time_to_merge_hours": 1.0}
+    expected = 3 * 1.0 * 3600 * ON_DEMAND_RATE
+    assert _entry_cost_usd(entry, ON_DEMAND_RATE) == expected
+
+
+def test_entry_cost_usd_returns_zero_when_no_data():
+    """Returns 0.0 when neither recorded spend nor proxy fields are present."""
+    assert _entry_cost_usd({}, on_demand_rate=0.001) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Recorded spend in _build_outcome_evaluation
+# ---------------------------------------------------------------------------
+
+
+def test_cost_uses_recorded_spend_over_proxy():
+    """estimated_cost_usd on a history entry is used instead of the proxy."""
+    directions = [
+        {
+            "id": "dir-recorded",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 2,
+                    "tasks_created": 999,
+                    "avg_time_to_merge_hours": 999.0,
+                    "estimated_cost_usd": 7.77,
+                },
+            ],
+        }
+    ]
+    result = _build_outcome_evaluation(_make_project(directions=directions))
+    d = result["directions"][0]
+    assert d["estimated_cost_usd"] == 7.77
+    assert d["cost_per_merged_pr"] == round(7.77 / 2, 2)
+
+
+def test_cost_sums_recorded_and_proxy_entries():
+    """Mixed history: entries with estimated_cost_usd use recorded; others use proxy."""
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+
+    proxy_entry = {"timestamp": "2026-01-01T00:00:00", "prs_merged": 1,
+                   "tasks_created": 2, "avg_time_to_merge_hours": 1.0}
+    recorded_entry = {"timestamp": "2026-01-02T00:00:00", "prs_merged": 1,
+                      "estimated_cost_usd": 4.00}
+    directions = [
+        {
+            "id": "dir-mixed",
+            "status": "active",
+            "research_history": [proxy_entry, recorded_entry],
+        }
+    ]
+    proxy_cost = 2 * 1.0 * 3600 * ON_DEMAND_RATE
+    expected_total = round(proxy_cost + 4.00, 2)
+    result = _build_outcome_evaluation(_make_project(directions=directions))
+    d = result["directions"][0]
+    assert d["estimated_cost_usd"] == expected_total
+
+
+# ---------------------------------------------------------------------------
+# Recorded spend in _build_retired_directions_summary
+# ---------------------------------------------------------------------------
+
+
+def test_retired_summary_uses_recorded_cost_per_merge():
+    """cost_per_merge in retired summary uses estimated_cost_usd when present."""
+    directions = [
+        {
+            "id": "dir-ret-recorded",
+            "text": "Recorded spend direction",
+            "status": "retired",
+            "retired_at": _recent_iso(5),
+            "research_history": [
+                {
+                    "timestamp": _recent_iso(5),
+                    "prs_merged": 4,
+                    "tasks_created": 999,
+                    "avg_time_to_merge_hours": 999.0,
+                    "estimated_cost_usd": 8.00,
+                }
+            ],
+        }
+    ]
+    project = _make_project(directions=directions)
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    entry = result[0]
+    assert entry.get("cost_per_merge") == round(8.00 / 4, 2)

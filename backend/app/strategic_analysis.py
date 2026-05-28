@@ -18,6 +18,24 @@ _RETIRED_MAX_COUNT = 20
 _RETIRED_PER_ENTRY_CHAR_CAP = 800
 
 
+def _entry_cost_usd(entry: dict, on_demand_rate: float) -> float:
+    """Return the recorded spend for a history entry, falling back to the
+    tasks_created * avg_time_to_merge_hours proxy for legacy entries that
+    predate exact attribution (i.e. entries without a positive estimated_cost_usd).
+    """
+    recorded = entry.get("estimated_cost_usd")
+    try:
+        if recorded is not None and float(recorded) > 0:
+            return float(recorded)
+    except (TypeError, ValueError):
+        pass
+    tcount = entry.get("tasks_created", 0) or 0
+    hours = entry.get("avg_time_to_merge_hours")
+    if tcount and hours:
+        return tcount * float(hours) * 3600 * on_demand_rate
+    return 0.0
+
+
 def _build_retired_directions_summary(
     project,
     window_days: int = _RETIRED_WINDOW_DAYS,
@@ -89,14 +107,11 @@ def _build_retired_directions_summary(
             else None
         )
 
-        # Estimated cost per merge
-        cost_seconds = 0.0
-        for h in history:
-            tcount = h.get("tasks_created", 0) or 0
-            hours = h.get("avg_time_to_merge_hours")
-            if tcount and hours:
-                cost_seconds += tcount * hours * 3600
-        estimated_cost_usd = round(cost_seconds * ON_DEMAND_RATE, 2)
+        # Estimated cost per merge — prefer recorded spend; fall back to proxy for
+        # legacy entries that predate exact attribution.
+        estimated_cost_usd = round(
+            sum(_entry_cost_usd(h, ON_DEMAND_RATE) for h in history), 2
+        )
         cost_per_merge = (
             round(estimated_cost_usd / total_merged, 2)
             if total_merged > 0 and estimated_cost_usd > 0
@@ -286,15 +301,11 @@ def _build_outcome_evaluation(
         if avg_time_to_merge_hours is not None:
             outcome["avg_time_to_merge_hours"] = avg_time_to_merge_hours
         outcome["difficulty_index"] = round(_compute_difficulty_index(d), 2)
-        # Estimated cost: sum(tasks_created * avg_time_to_merge_hours) * 3600 * ON_DEMAND_RATE
-        # avg_time_to_merge_hours is a per-cycle proxy for typical task VM runtime.
-        cost_seconds = 0.0
-        for h in window_history:
-            tcount = h.get("tasks_created", 0) or 0
-            hours = h.get("avg_time_to_merge_hours")
-            if tcount and hours:
-                cost_seconds += tcount * hours * 3600
-        estimated_cost_usd = round(cost_seconds * ON_DEMAND_RATE, 2)
+        # Estimated cost — prefer recorded spend per entry; fall back to the
+        # tasks_created * avg_time_to_merge_hours proxy for legacy entries.
+        estimated_cost_usd = round(
+            sum(_entry_cost_usd(h, ON_DEMAND_RATE) for h in window_history), 2
+        )
         cost_budget_usd = d.get("cost_budget_usd")
         if estimated_cost_usd > 0:
             outcome["estimated_cost_usd"] = estimated_cost_usd

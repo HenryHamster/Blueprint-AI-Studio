@@ -264,10 +264,14 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
 
     for t in tasks:
         input_tokens, output_tokens, call_count = get_task_total_llm_totals(t)
-        if (input_tokens <= 0 and output_tokens <= 0) or not t.provider or not t.model:
+        if input_tokens <= 0 and output_tokens <= 0:
             continue
-        provider = t.provider.lower()
-        model = t.model.lower()
+        if not t.provider or not t.model:
+            provider = "unattributed"
+            model = "unknown"
+        else:
+            provider = t.provider.lower()
+            model = t.model.lower()
         key = (provider, model)
         pricing = LLM_TOKEN_PRICING.get(key)
         if pricing:
@@ -377,11 +381,15 @@ def _compute_llm_cost_pricing_coverage(
     """
     priced = 0
     unpriced = 0
+    unattributed = 0
     unpriced_combos: list[str] = []
     for t in tasks:
         input_tokens, output_tokens, _ = get_task_total_llm_totals(t)
         has_tokens = (input_tokens + output_tokens) > 0
-        if not has_tokens or not t.provider or not t.model:
+        if not has_tokens:
+            continue
+        if not t.provider or not t.model:
+            unattributed += 1
             continue
         key = (t.provider.lower(), t.model.lower())
         if key in LLM_TOKEN_PRICING:
@@ -394,13 +402,14 @@ def _compute_llm_cost_pricing_coverage(
                 and len(unpriced_combos) < _UNPRICED_COMBOS_CAP
             ):
                 unpriced_combos.append(combo)
-    priceable = priced + unpriced
+    priceable = priced + unpriced + unattributed
     coverage_fraction: Optional[float] = (
         round(priced / priceable, 4) if priceable else None
     )
     return {
         "priced_tasks": priced,
         "unpriced_tasks": unpriced,
+        "unattributed_tasks": unattributed,
         "coverage_fraction": coverage_fraction,
         "unpriced_combos": unpriced_combos,
     }

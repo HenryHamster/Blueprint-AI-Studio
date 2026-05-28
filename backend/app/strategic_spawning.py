@@ -1558,14 +1558,11 @@ async def _spawn_strategic_review(
         if operator_rejection_rate is not None and total_rejected > 0:
             stat_entry["operator_rejection_rate"] = operator_rejection_rate
         from app.routers.admin_analytics import ON_DEMAND_RATE
+        from app.strategic_analysis import _entry_cost_usd
 
-        cost_seconds = 0.0
-        for h in history:
-            tcount = h.get("tasks_created", 0) or 0
-            hours = h.get("avg_time_to_merge_hours")
-            if tcount and hours:
-                cost_seconds += tcount * hours * 3600
-        estimated_cost_usd = round(cost_seconds * ON_DEMAND_RATE, 2)
+        estimated_cost_usd = round(
+            sum(_entry_cost_usd(h, ON_DEMAND_RATE) for h in history), 2
+        )
         if estimated_cost_usd > 0:
             stat_entry["estimated_cost_usd"] = estimated_cost_usd
             if total_merged > 0:

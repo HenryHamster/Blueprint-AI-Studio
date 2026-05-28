@@ -1221,6 +1221,7 @@ def test_llm_cost_pricing_coverage_shape():
     result = _compute_llm_cost_pricing_coverage([priced, unpriced, no_tokens])
     assert result["priced_tasks"] == 1
     assert result["unpriced_tasks"] == 1
+    assert result["unattributed_tasks"] == 0
     assert result["coverage_fraction"] == 0.5
     assert "fakeprovider:fake-model-x" in result["unpriced_combos"]
 
@@ -1240,7 +1241,43 @@ def test_llm_cost_pricing_coverage_empty_window():
     result = _compute_llm_cost_pricing_coverage([no_tokens])
     assert result["priced_tasks"] == 0
     assert result["unpriced_tasks"] == 0
+    assert result["unattributed_tasks"] == 0
     assert result["coverage_fraction"] is None
+    assert result["unpriced_combos"] == []
+
+
+def test_llm_cost_pricing_coverage_unattributed_tasks():
+    """Token-bearing tasks with null provider/model count as unattributed (not dropped)."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    priced = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # Token-bearing task with no provider/model identity.
+    unattributed = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        api_call_summary={
+            "total_input_tokens": 200,
+            "total_output_tokens": 100,
+        },
+    )
+
+    result = _compute_llm_cost_pricing_coverage([priced, unattributed])
+    assert result["priced_tasks"] == 1
+    assert result["unpriced_tasks"] == 0
+    assert result["unattributed_tasks"] == 1
+    # coverage_fraction denominator includes unattributed: 1 priced / 2 total
+    assert result["coverage_fraction"] == 0.5
     assert result["unpriced_combos"] == []
 
 
@@ -1312,7 +1349,7 @@ def test_compute_llm_cost_breakdown_priced_and_unpriced():
     )
 
     by_provider = {entry["provider"]: entry for entry in result["by_provider"]}
-    assert set(by_provider) == {"anthropic", "openai", "fakeprovider"}
+    assert set(by_provider) == {"anthropic", "openai", "fakeprovider", "unattributed"}
     assert by_provider["anthropic"]["task_count"] == 2
     assert by_provider["anthropic"]["total_input_tokens"] == 3000
     assert by_provider["anthropic"]["total_output_tokens"] == 1500
@@ -1323,23 +1360,30 @@ def test_compute_llm_cost_breakdown_priced_and_unpriced():
     # 1000 * 5e-6 + 200 * 25e-6 = 0.005 + 0.005 = 0.010
     assert by_provider["openai"]["total_cost_usd"] == round(0.010, 6)
     assert by_provider["fakeprovider"]["total_cost_usd"] == 0.0
+    # no_meta has tokens but no provider/model — routed to unattributed sentinel at zero cost
+    assert by_provider["unattributed"]["task_count"] == 1
+    assert by_provider["unattributed"]["total_cost_usd"] == 0.0
 
     by_model = {(e["provider"], e["model"]): e for e in result["by_model"]}
     assert by_model[("anthropic", "claude-sonnet-4-6")]["priced"] is True
     assert by_model[("fakeprovider", "mystery-model")]["priced"] is False
+    assert ("unattributed", "unknown") in by_model
 
     # Priced shares sum to ~1.0 (within float tolerance) across by_provider.
     share_sum = sum(e["share_of_total_cost"] or 0.0 for e in result["by_provider"])
     assert abs(share_sum - 1.0) < 1e-6
 
     totals = result["totals"]
-    assert totals["task_count"] == 4
+    # no_meta now counted: 4 original + 1 unattributed = 5
+    assert totals["task_count"] == 5
     assert totals["priced_task_count"] == 3
-    assert totals["unpriced_task_count"] == 1
-    assert totals["unpriced_coverage_fraction"] == round(3 / 4, 4)
+    # unattributed tasks are unpriced (no pricing entry for sentinel key)
+    assert totals["unpriced_task_count"] == 2
+    assert totals["unpriced_coverage_fraction"] == round(3 / 5, 4)
     assert totals["total_cost_usd"] == round(0.0315 + 0.010, 6)
 
     assert "fakeprovider:mystery-model" in result["unpriced_combos"]
+    assert "unattributed:unknown" in result["unpriced_combos"]
 
 
 def test_compute_llm_cost_breakdown_empty():
@@ -1356,8 +1400,8 @@ def test_compute_llm_cost_breakdown_empty():
     assert totals["unpriced_coverage_fraction"] is None
 
 
-def test_compute_llm_cost_breakdown_skips_missing_fields():
-    """Tasks missing provider/model/tokens or with non-numeric tokens are skipped."""
+def test_compute_llm_cost_breakdown_missing_provider_routes_to_unattributed():
+    """Token-bearing tasks with missing provider/model route to unattributed sentinel bucket."""
     import uuid
 
     project_id = uuid.uuid4()
@@ -1398,9 +1442,15 @@ def test_compute_llm_cost_breakdown_skips_missing_fields():
     result = compute_llm_cost_breakdown(
         [missing_provider, missing_tokens, null_summary, valid]
     )
-    assert result["totals"]["task_count"] == 1
-    assert len(result["by_model"]) == 1
-    assert result["by_model"][0]["provider"] == "anthropic"
+    # missing_provider has tokens: routes to unattributed (task_count=2 total)
+    assert result["totals"]["task_count"] == 2
+    assert (
+        result["totals"]["unpriced_task_count"] == 1
+    )  # unattributed sentinel is unpriced
+    by_provider = {e["provider"]: e for e in result["by_provider"]}
+    assert "unattributed" in by_provider
+    assert by_provider["unattributed"]["total_cost_usd"] == 0.0
+    assert "anthropic" in by_provider
 
 
 @pytest.mark.asyncio

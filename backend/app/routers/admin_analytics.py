@@ -22,6 +22,7 @@ from app.models import (
     ArtifactType,
     ProjectMessage,
     _utcnow,
+    get_task_total_vm_cost_usd_or_none,
 )
 from app.auth import get_current_user, require_admin
 from app.vm_cost_rates import get_vm_rate_per_second, VM_COST_RATES
@@ -280,6 +281,7 @@ async def get_task_cost_breakdown(
                         Task.vm_provisioned_at,
                         Task.vm_stopped_at,
                         Task.vm_spot,
+                        Task.vm_runtime_cost_banked_db,
                     )
                 )
                 .where(*filters)
@@ -294,7 +296,7 @@ async def get_task_cost_breakdown(
         completed_at = _task_completed_at(task)
         if cutoff is not None and completed_at < cutoff:
             continue
-        cost = _task_estimated_cost_usd(task)
+        cost = get_task_total_vm_cost_usd_or_none(task)
         if cost is None:
             continue
         payload = task.first_payload or {}

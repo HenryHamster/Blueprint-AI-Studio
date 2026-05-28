@@ -152,7 +152,10 @@ async def test_get_project_tasks_filter_by_direction_and_type(
 async def test_get_project_tasks_includes_cost_fields(client: AsyncClient, db_session):
     """
     Completed tasks with VM timing data expose duration_seconds and
-    estimated_cost_usd; tasks without timing return null for both.
+    estimated_cost_usd. Tasks with vm_provisioned_at but no stop time
+    return None for duration_seconds and 0.0 for estimated_cost_usd
+    (provisioning is evidence of cost; 0.0 = running but not yet accrued).
+    Tasks with no VM evidence at all return None for both.
     """
     from datetime import datetime, timedelta, timezone
 
@@ -198,7 +201,8 @@ async def test_get_project_tasks_includes_cost_fields(client: AsyncClient, db_se
         3600.0 * (0.067 / 3600)
     )
     assert by_title["Pending"]["duration_seconds"] is None
-    assert by_title["Pending"]["estimated_cost_usd"] is None
+    # vm_provisioned_at is set → evidence of a VM, so 0.0 (not None); no stop time yet
+    assert by_title["Pending"]["estimated_cost_usd"] == pytest.approx(0.0)
 
 
 @pytest.mark.asyncio
@@ -753,6 +757,79 @@ async def test_patch_clears_post_commit_pending(client: AsyncClient, db_session)
     assert ctx.get("pr_merged") is True
     # Status unchanged
     assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_get_project_tasks_banked_retry_cost(client: AsyncClient, db_session):
+    """Retried tasks: banked retry VM spend must appear in estimated_cost_usd, not be
+    silently dropped by reading only the current-attempt vm_provisioned_at window."""
+    project = Project(
+        name="BankedRetryProject", user_id="test-user-123", status=ProjectStatus.DEPLOYING
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(ProjectMember(project_id=project.id, user_id="test-user-123", role="owner"))
+    task = Task(
+        project_id=project.id,
+        title="Retried",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_runtime_cost_banked_db=0.05,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/projects/{project.id}/tasks")
+    assert resp.status_code == 200
+    by_title = {t["title"]: t for t in resp.json()["tasks"]}
+    assert by_title["Retried"]["estimated_cost_usd"] == pytest.approx(0.05)
+
+
+@pytest.mark.asyncio
+async def test_admin_tasks_banked_retry_cost(client: AsyncClient, db_session):
+    """Admin task list and detail must include banked retry VM spend in estimated_cost_usd;
+    a task with both banked and current-attempt cost must expose the sum."""
+    from datetime import datetime, timedelta
+    from app.vm_cost_rates import get_vm_rate_per_second
+
+    project = await _make_project_with_member(db_session)
+    started = datetime.utcnow().replace(microsecond=0) - timedelta(hours=1)
+    stopped = started + timedelta(seconds=3600)
+
+    banked_only = Task(
+        project_id=project.id,
+        title="BankedOnly",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "x"}],
+        vm_runtime_cost_banked_db=0.07,
+    )
+    banked_plus_current = Task(
+        project_id=project.id,
+        title="BankedPlusCurrent",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "y"}],
+        vm_runtime_cost_banked_db=0.03,
+        vm_provisioned_at=started,
+        vm_stopped_at=stopped,
+        vm_spot=False,
+    )
+    db_session.add_all([banked_only, banked_plus_current])
+    await db_session.commit()
+    for t in (banked_only, banked_plus_current):
+        await db_session.refresh(t)
+
+    list_resp = await client.get("/api/admin/tasks", params={"limit": 100})
+    assert list_resp.status_code == 200
+    by_id = {t["id"]: t for t in list_resp.json()["tasks"]}
+    assert by_id[str(banked_only.id)]["estimated_cost_usd"] == pytest.approx(0.07)
+    assert by_id[str(banked_plus_current.id)]["estimated_cost_usd"] == pytest.approx(
+        0.03 + 3600 * get_vm_rate_per_second(spot=False)
+    )
+
+    detail_resp = await client.get(f"/api/admin/tasks/{banked_only.id}")
+    assert detail_resp.status_code == 200
+    assert detail_resp.json()["estimated_cost_usd"] == pytest.approx(0.07)
 
 
 @pytest.mark.asyncio

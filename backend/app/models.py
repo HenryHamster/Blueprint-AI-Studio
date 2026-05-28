@@ -1170,6 +1170,26 @@ def get_task_total_vm_cost_usd(
     ) + get_task_current_attempt_vm_cost_usd(task, stopped_at=stopped_at)
 
 
+def get_task_total_vm_cost_usd_or_none(
+    task: Task, *, stopped_at: datetime | None = None
+) -> float | None:
+    """Total VM cost (banked retries + current attempt), or None for tasks that never ran.
+
+    Drop-in replacement for local ``_estimated_cost_usd`` helpers that compute
+    cost from the current vm_provisioned_at/vm_stopped_at interval only — those
+    silently drop banked retry spend.  Returns None only when there is no VM
+    cost evidence at all (no banked amount and no current provisioning window),
+    preserving the "None means no data" contract those helpers expose to callers
+    that skip or display-blank zero-data rows.
+    """
+    has_evidence = (
+        task.vm_runtime_cost_banked is not None and task.vm_runtime_cost_banked > 0
+    ) or task.vm_provisioned_at is not None
+    if not has_evidence:
+        return None
+    return get_task_total_vm_cost_usd(task, stopped_at=stopped_at)
+
+
 def with_task_attempt_banking(
     task: Task, context: Mapping[str, Any] | None
 ) -> dict[str, Any]:

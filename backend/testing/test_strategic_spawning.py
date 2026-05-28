@@ -1044,6 +1044,45 @@ async def test_cost_fields_absent_without_history_data(db_session):
 
 
 @pytest.mark.asyncio
+async def test_cost_fields_use_recorded_spend_over_proxy(db_session):
+    """When estimated_cost_usd is present in a history entry, it is used instead of the proxy."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-cost-recorded",
+                "status": "active",
+                "text": "Direction with recorded cost",
+                "priority": "medium",
+                "research_history": [
+                    {
+                        "prs_merged": 2,
+                        "tasks_created": 999,
+                        "avg_time_to_merge_hours": 999.0,
+                        "estimated_cost_usd": 6.50,
+                    },
+                ],
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-cost-recorded")
+
+    assert d_stat["estimated_cost_usd"] == 6.50
+    assert d_stat["cost_per_merged_pr"] == round(6.50 / 2, 2)
+
+
+@pytest.mark.asyncio
 async def test_tasks_failed_infra_includes_history_aggregate(db_session):
     """tasks_failed_infra aggregates from both research_history and history_aggregate."""
     project = _make_project(

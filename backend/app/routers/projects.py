@@ -35,13 +35,13 @@ from app.models import (
     ProjectStatus,
     Task,
     TaskStatus,
+    get_task_total_vm_cost_usd_or_none,
 )
 from app.payload_schemas import validate_task_payload
 from app.schemas import DeployPayload
 from app.shared_state import backfill_branch_columns, limiter
 from app.broadcast import manager, broadcast_to_project, _sanitize_log
 from app.event_fanout import enqueue_agent_log
-from app.routers.admin_analytics import ON_DEMAND_RATE, SPOT_RATE
 
 logger = logging.getLogger(__name__)
 
@@ -329,11 +329,9 @@ async def get_project_tasks(
     for t in tasks:
         if t.vm_provisioned_at and t.vm_stopped_at:
             duration_seconds = (t.vm_stopped_at - t.vm_provisioned_at).total_seconds()
-            rate = SPOT_RATE if t.vm_spot else ON_DEMAND_RATE
-            estimated_cost_usd = duration_seconds * rate
         else:
             duration_seconds = None
-            estimated_cost_usd = None
+        estimated_cost_usd = get_task_total_vm_cost_usd_or_none(t)
         task_dict = {
             "id": t.id,
             "title": t.title,

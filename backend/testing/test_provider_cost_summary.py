@@ -132,11 +132,18 @@ class TestProviderCostSummary:
         db_session.add(acct)
 
         ctx = {"llm_account_id": str(acct_id)}
+        now = _utcnow()
         t_a = make_task(
-            project_id=project_a.id, status=TaskStatus.COMPLETED, context=ctx
+            project_id=project_a.id,
+            status=TaskStatus.COMPLETED,
+            context=ctx,
+            vm_stopped_at=now,
         )
         t_b = make_task(
-            project_id=project_b.id, status=TaskStatus.COMPLETED, context=ctx
+            project_id=project_b.id,
+            status=TaskStatus.COMPLETED,
+            context=ctx,
+            vm_stopped_at=now,
         )
         db_session.add(t_a)
         db_session.add(t_b)
@@ -172,6 +179,7 @@ class TestProviderCostSummary:
             project_id=project.id,
             status=TaskStatus.COMPLETED,
             context={"llm_account_id": str(acct_id)},
+            vm_stopped_at=_utcnow(),
         )
         db_session.add(t)
         await db_session.commit()
@@ -195,6 +203,7 @@ class TestProviderCostSummary:
             project_id=project.id,
             status=TaskStatus.COMPLETED,
             context={"llm_account_id": unknown_id},
+            vm_stopped_at=_utcnow(),
         )
         db_session.add(t)
         await db_session.commit()
@@ -205,6 +214,135 @@ class TestProviderCostSummary:
         assert len(rows) == 1
         assert rows[0]["account_name"] == "unknown"
         assert rows[0]["provider"] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_retried_task_includes_banked_cost(
+        self, client: AsyncClient, db_session
+    ):
+        """Banked retry spend from prior attempts is included in total_cost_usd."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.flush()
+
+        acct_id = uuid.uuid4()
+        acct = MaxPlanAccount(
+            id=acct_id,
+            user_id="test-user-123",
+            name="Retry Account",
+            provider=LLMProviderName.ANTHROPIC,
+            auth_mode=LLMAuthMode.OAUTH,
+        )
+        db_session.add(acct)
+
+        now = _utcnow()
+        prov_at = now - timedelta(hours=1)
+        stop_at = prov_at + timedelta(seconds=600)
+        banked_cost = 1.50  # cost banked from a previous failed attempt
+
+        t = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"llm_account_id": str(acct_id)},
+            vm_provisioned_at=prov_at,
+            vm_stopped_at=stop_at,
+            vm_spot=False,
+            vm_runtime_cost_banked_db=banked_cost,
+        )
+        db_session.add(t)
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/provider-cost-summary")
+        assert resp.status_code == 200
+        row = resp.json()["rows"][0]
+
+        current_attempt_cost = 600 * ON_DEMAND_RATE
+        expected_total = round(banked_cost + current_attempt_cost, 2)
+        assert row["total_cost_usd"] == pytest.approx(expected_total, abs=0.01)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_task_with_spend_included(
+        self, client: AsyncClient, db_session
+    ):
+        """CANCELLED tasks that burned VM time appear in cost rows."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.flush()
+
+        acct_id = uuid.uuid4()
+        acct = MaxPlanAccount(
+            id=acct_id,
+            user_id="test-user-123",
+            name="Cancel Account",
+            provider=LLMProviderName.ANTHROPIC,
+            auth_mode=LLMAuthMode.OAUTH,
+        )
+        db_session.add(acct)
+
+        now = _utcnow()
+        prov_at = now - timedelta(hours=1)
+        stop_at = prov_at + timedelta(seconds=300)
+
+        t = make_task(
+            project_id=project.id,
+            status=TaskStatus.CANCELLED,
+            context={"llm_account_id": str(acct_id)},
+            vm_provisioned_at=prov_at,
+            vm_stopped_at=stop_at,
+            vm_spot=False,
+        )
+        db_session.add(t)
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/provider-cost-summary")
+        assert resp.status_code == 200
+        rows = resp.json()["rows"]
+        assert len(rows) == 1
+        assert rows[0]["total_tasks"] == 1
+        expected_cost = round(300 * ON_DEMAND_RATE, 2)
+        assert rows[0]["total_cost_usd"] == pytest.approx(expected_cost, abs=0.01)
+
+    @pytest.mark.asyncio
+    async def test_old_created_recently_finished_included(
+        self, client: AsyncClient, db_session
+    ):
+        """Tasks created before the window but stopped within it are included."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.flush()
+
+        acct_id = uuid.uuid4()
+        acct = MaxPlanAccount(
+            id=acct_id,
+            user_id="test-user-123",
+            name="Long Runner Account",
+            provider=LLMProviderName.ANTHROPIC,
+            auth_mode=LLMAuthMode.OAUTH,
+        )
+        db_session.add(acct)
+
+        now = _utcnow()
+        # Created 48h ago (outside a 24h window by creation time)
+        created = now - timedelta(hours=48)
+        # But stopped only 1h ago (inside the 24h window)
+        stop_at = now - timedelta(hours=1)
+
+        t = make_task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            context={"llm_account_id": str(acct_id)},
+            created_at=created,
+            vm_provisioned_at=created,
+            vm_stopped_at=stop_at,
+            vm_spot=False,
+        )
+        db_session.add(t)
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/provider-cost-summary?hours=24")
+        assert resp.status_code == 200
+        rows = resp.json()["rows"]
+        assert len(rows) == 1, "task stopped within window should appear even if created before it"
+        assert rows[0]["total_tasks"] == 1
 
     @pytest.mark.asyncio
     async def test_rows_sorted_by_spend_descending(

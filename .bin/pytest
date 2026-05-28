@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Align ./check test with the task prompt's documented lightweight backend gate.
+exec bash ../scripts/test-backend.sh --standalone --no-postgres
