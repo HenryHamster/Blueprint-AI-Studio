@@ -48,6 +48,7 @@
     "release_readiness.py": 500,
     "release_stall_alerts.py": 800,
     "release_promotion.py": 1600,
+    "sr_analytics.py": 5000,
     "playbook_learning.py": 7100,
     "playbook_capacity.py": 200,
     "review_learning.py": 1100,
