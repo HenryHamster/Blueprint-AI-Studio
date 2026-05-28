@@ -1913,6 +1913,63 @@ async def test_digest_retirement_eligibility_boundary_cases(
 
 
 @pytest.mark.asyncio
+async def test_digest_direction_progress_evicted_findings_count(
+    client: AsyncClient, db_session
+):
+    """evicted_findings_count surfaces len(history_aggregate.evicted_findings) per direction."""
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-with-evicted",
+                "text": "Direction with evicted findings",
+                "status": "active",
+                "history_aggregate": {
+                    "evicted_findings": [
+                        {"title": "evicted 1"},
+                        {"title": "evicted 2"},
+                        {"title": "evicted 3"},
+                    ],
+                },
+            },
+            {
+                "id": "dir-no-evicted",
+                "text": "Direction with empty evicted list",
+                "status": "active",
+                "history_aggregate": {"evicted_findings": []},
+            },
+            {
+                "id": "dir-no-aggregate",
+                "text": "Direction with no history_aggregate",
+                "status": "active",
+            },
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for dir_id in ("dir-with-evicted", "dir-no-evicted", "dir-no-aggregate"):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Research task",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "research"}],
+                context={"direction_id": dir_id},
+            )
+        )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    by_id = {dp["direction_id"]: dp for dp in response.json()["direction_progress"]}
+
+    assert by_id["dir-with-evicted"]["evicted_findings_count"] == 3
+    assert by_id["dir-no-evicted"]["evicted_findings_count"] == 0
+    assert by_id["dir-no-aggregate"]["evicted_findings_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_digest_direction_progress_sorted_by_cycles(
     client: AsyncClient, db_session
 ):

@@ -8,8 +8,15 @@ vi.mock('./StrategicAuditPanel', () => ({
   StrategicAuditPanel: () => null,
 }));
 
+const { fetchEvictedFindingsMock } = vi.hoisted(() => ({
+  fetchEvictedFindingsMock: vi.fn(),
+}));
+
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
+  fetchEvictedFindings: fetchEvictedFindingsMock,
+  API_BASE_URL: '',
+  authGet: vi.fn(async () => new Response('{}', { status: 200 })),
 }));
 
 function makeDirection(): DirectionProgress {
@@ -66,6 +73,55 @@ describe('DirectionPortfolioSection — viewport regression', () => {
             selfSufficientCount={1}
           />,
         );
+      });
+    });
+  });
+
+  test('renders the dense evicted-findings drawer without horizontal overflow at 375px', async () => {
+    fetchEvictedFindingsMock.mockResolvedValue({
+      direction_id: 'dir-1',
+      total: 11,
+      offset: 0,
+      limit: 10,
+      evicted_findings: Array.from({ length: 10 }, (_, i) => ({
+        title: `Evicted finding ${i + 1}`,
+        claims: [`Claim ${i + 1}`],
+        source_refs: [`backend/app/example_${i + 1}.py:12`],
+        status: 'evicted',
+        evicted_at: new Date(Date.now() - (i + 1) * 60_000).toISOString(),
+      })),
+    });
+
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <DirectionPortfolioSection
+            directions={[{
+              ...makeDirection(),
+              history_aggregate: { evicted_findings: 11 },
+            }]}
+            loading={false}
+            productPct={null}
+            totalDirPRs={12}
+            hasAttribution={false}
+            totalAutonomousPRs={null}
+            totalAssistedPRs={null}
+            selfSufficientCount={1}
+            projectId="proj-1"
+          />,
+        );
+      });
+      await act(async () => {
+        const btn = host?.querySelector('button[title="View evicted findings for this direction"]') as HTMLButtonElement | null;
+        btn?.click();
+      });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
       });
     });
   });

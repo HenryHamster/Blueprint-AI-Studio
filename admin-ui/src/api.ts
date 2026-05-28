@@ -322,6 +322,37 @@ export async function fetchDirectionSrBreakdown(
   return res.json();
 }
 
+export interface EvictedFinding {
+  title: string;
+  claims: string[];
+  source_refs: string[];
+  status: string;
+  evicted_at: string;
+}
+
+export interface EvictedFindingsResponse {
+  direction_id: string;
+  total: number;
+  offset: number;
+  limit: number;
+  evicted_findings: EvictedFinding[];
+}
+
+export async function fetchEvictedFindings(
+  projectId: string,
+  directionId: string,
+  params?: { offset?: number; limit?: number },
+): Promise<EvictedFindingsResponse> {
+  const searchParams = new URLSearchParams();
+  if (params?.offset !== undefined) searchParams.set('offset', String(params.offset));
+  if (params?.limit !== undefined) searchParams.set('limit', String(params.limit));
+  const query = searchParams.toString();
+  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/directions/${encodeURIComponent(directionId)}/evicted-findings${query ? `?${query}` : ''}`;
+  const res = await apiFetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch evicted findings: ${res.status}`);
+  return res.json();
+}
+
 export interface DispatcherRejectionReasons {
   dedup: number;
   cooldown: number;

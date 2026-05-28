@@ -1,7 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AlertTriangle, CheckCircle, ChevronLeft, ChevronRight, RefreshCw, X } from 'lucide-react';
 import { STAGE_DROPOUT_LABELS, TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import { StrategicAuditPanel } from './StrategicAuditPanel';
-import { apiFetch } from '../api';
+import { isSafeUrl } from './TaskCard';
+import { apiFetch, fetchEvictedFindings, type EvictedFinding } from '../api';
+import { timeAgo } from '../utils/time';
 
 export interface DirectionProgress {
   direction_id: string;
@@ -39,8 +42,9 @@ export interface DirectionProgress {
   review_quality?: { reviews_dismissed?: number; reviews_overridden?: number; user_issues_caught?: number } | null;
   stage_dropout?: Record<string, number> | null;
   recent_failure_titles?: string[] | null;
-  history_aggregate?: { total_autonomous_prs_merged?: number | null; total_operator_actions?: number | null; [key: string]: unknown } | null;
+  history_aggregate?: { total_autonomous_prs_merged?: number | null; total_operator_actions?: number | null; evicted_findings?: number | null; [key: string]: unknown } | null;
   research_history?: Array<{ autonomous_prs_merged?: number | null; operator_action_count?: number | null; [key: string]: unknown }> | null;
+  evicted_findings_count?: number | null;
 }
 
 interface DirectionPortfolioSectionProps {
@@ -240,6 +244,14 @@ function SectionSkeleton() {
   return <div className="h-28 w-full animate-pulse rounded bg-neutral-900/50 border border-neutral-800/50" />;
 }
 
+const EVICTED_FINDINGS_PAGE_SIZE = 10;
+
+interface EvictedDrawerState {
+  directionId: string;
+  directionText: string;
+  evictedCount: number;
+}
+
 export function DirectionPortfolioSection({
   directions,
   loading,
@@ -258,6 +270,16 @@ export function DirectionPortfolioSection({
   calibrationFloor,
 }: DirectionPortfolioSectionProps) {
   const [srBreakdown, setSrBreakdown] = useState<Record<string, DirectionSrEntry>>({});
+  const [evictedDrawer, setEvictedDrawer] = useState<EvictedDrawerState | null>(null);
+  const [evictedItems, setEvictedItems] = useState<EvictedFinding[]>([]);
+  const [evictedTotal, setEvictedTotal] = useState(0);
+  const [evictedOffset, setEvictedOffset] = useState(0);
+  const [evictedLoading, setEvictedLoading] = useState(false);
+  const [evictedError, setEvictedError] = useState<string | null>(null);
+  const [evictedRefreshTick, setEvictedRefreshTick] = useState(0);
+  const [evictedIsStale, setEvictedIsStale] = useState(false);
+  const evictedLoadedAtRef = useRef<number>(0);
+  const evictedDrawerDirectionId = evictedDrawer?.directionId ?? null;
 
   const taxonomyVisibleKeysByDir = useMemo(() => {
     const result = new Map<string, Array<typeof TAXONOMY_ORDER[number]>>();
@@ -295,7 +317,106 @@ export function DirectionPortfolioSection({
       .catch(() => {});
   }, [projectId]);
 
+  /* eslint-disable react-hooks/set-state-in-effect -- sync drawer-local state when the selected project changes */
+  useEffect(() => {
+    setEvictedDrawer(null);
+    setEvictedItems([]);
+    setEvictedTotal(0);
+    setEvictedOffset(0);
+    setEvictedError(null);
+    setEvictedLoading(false);
+    setEvictedRefreshTick(0);
+    evictedLoadedAtRef.current = 0;
+  }, [projectId]);
+  /* eslint-enable react-hooks/set-state-in-effect */
+
+  /* eslint-disable react-hooks/set-state-in-effect -- async fetch updates local drawer state after the request resolves */
+  useEffect(() => {
+    if (!projectId || !evictedDrawerDirectionId) return;
+    let cancelled = false;
+    setEvictedLoading(true);
+    setEvictedError(null);
+    fetchEvictedFindings(projectId, evictedDrawerDirectionId, { offset: evictedOffset, limit: EVICTED_FINDINGS_PAGE_SIZE })
+      .then(data => {
+        if (cancelled) return;
+        setEvictedItems(data.evicted_findings ?? []);
+        setEvictedTotal(data.total ?? 0);
+        evictedLoadedAtRef.current = Date.now();
+      })
+      .catch(e => {
+        if (cancelled) return;
+        setEvictedError(e instanceof Error ? e.message : 'network error');
+      })
+      .finally(() => {
+        if (!cancelled) setEvictedLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, evictedDrawerDirectionId, evictedOffset, evictedRefreshTick]);
+  /* eslint-enable react-hooks/set-state-in-effect */
+
+  /* eslint-disable react-hooks/set-state-in-effect -- interval syncs stale badge state for the open drawer */
+  useEffect(() => {
+    if (!evictedDrawerDirectionId) {
+      setEvictedIsStale(false);
+      return;
+    }
+    const update = () => {
+      setEvictedIsStale(
+        evictedLoadedAtRef.current > 0 && (Date.now() - evictedLoadedAtRef.current) > 300_000,
+      );
+    };
+    update();
+    const timer = window.setInterval(update, 60_000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [evictedDrawerDirectionId, evictedOffset, evictedTotal, evictedRefreshTick]);
+  /* eslint-enable react-hooks/set-state-in-effect */
+
+  const openEvictedDrawer = useCallback((d: DirectionProgress) => {
+    const evictedCount = Math.max(
+      0,
+      Math.trunc(d.evicted_findings_count ?? d.history_aggregate?.evicted_findings ?? 0),
+    );
+    setEvictedDrawer(prev => (
+      prev?.directionId === d.direction_id
+        ? null
+        : { directionId: d.direction_id, directionText: d.direction_text, evictedCount }
+    ));
+    setEvictedOffset(0);
+    setEvictedItems([]);
+    setEvictedTotal(0);
+    setEvictedError(null);
+    setEvictedLoading(false);
+    evictedLoadedAtRef.current = 0;
+  }, []);
+
+  const closeEvictedDrawer = useCallback(() => {
+    setEvictedDrawer(null);
+    setEvictedItems([]);
+    setEvictedTotal(0);
+    setEvictedOffset(0);
+    setEvictedError(null);
+    setEvictedLoading(false);
+    evictedLoadedAtRef.current = 0;
+  }, []);
+
+  const refreshEvictedDrawer = useCallback(() => {
+    setEvictedRefreshTick(t => t + 1);
+  }, []);
+
+  const evictedTotalPages = Math.max(1, Math.ceil(evictedTotal / EVICTED_FINDINGS_PAGE_SIZE));
+  const evictedPage = Math.min(evictedTotalPages, Math.floor(evictedOffset / EVICTED_FINDINGS_PAGE_SIZE) + 1);
+  const evictedMaxOffset = evictedTotal > 0
+    ? Math.floor((evictedTotal - 1) / EVICTED_FINDINGS_PAGE_SIZE) * EVICTED_FINDINGS_PAGE_SIZE
+    : 0;
+  const evictedStart = evictedTotal === 0 ? 0 : evictedOffset + 1;
+  const evictedEnd = Math.min(evictedOffset + EVICTED_FINDINGS_PAGE_SIZE, evictedTotal);
+
   return (
+    <>
     <section>
       <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Direction Portfolio</h2>
       {loading ? (
@@ -350,6 +471,10 @@ export function DirectionPortfolioSection({
               const accColor = acc == null ? 'text-neutral-500' : acc >= 60 ? 'text-emerald-400' : acc >= 30 ? 'text-amber-400' : 'text-red-400';
               const fas = d.first_attempt_success_rate != null ? Math.round(d.first_attempt_success_rate * 100) : null;
               const fasColor = fas == null ? 'text-neutral-500' : fas >= 60 ? 'text-emerald-400' : fas >= 30 ? 'text-amber-400' : 'text-red-400';
+              const evictedCount = Math.max(
+                0,
+                Math.trunc(d.evicted_findings_count ?? d.history_aggregate?.evicted_findings ?? 0),
+              );
               return (
                 <div
                   key={d.direction_id}
@@ -370,6 +495,18 @@ export function DirectionPortfolioSection({
                     <span>{d.prs_merged} PR{d.prs_merged !== 1 ? 's' : ''}{d.prs_rejected != null && d.prs_rejected > 0 && <span className="text-red-400" title={`${d.prs_rejected} PR${d.prs_rejected !== 1 ? 's' : ''} rejected`}> · {d.prs_rejected} rej</span>}</span>
                     {d.product_ratio != null && (
                       <span className={d.product_ratio >= 0.6 ? 'text-emerald-400' : d.product_ratio >= 0.3 ? 'text-amber-400' : 'text-red-400'}>{Math.round(d.product_ratio * 100)}% prod</span>
+                    )}
+                    {evictedCount > 0 && (
+                      // eslint-disable-next-line viewport/min-touch-target -- dense inline badge inside compact direction card
+                      <button
+                        type="button"
+                        className="text-[9px] leading-none px-1.5 py-0.5 rounded border border-violet-500/20 bg-violet-500/10 text-violet-300 hover:bg-violet-500/20"
+                        title="View evicted findings for this direction"
+                        aria-label="View evicted findings for this direction"
+                        onClick={e => { e.stopPropagation(); openEvictedDrawer(d); }}
+                      >
+                        {evictedCount} evicted
+                      </button>
                     )}
                     {d.estimated_cost_usd != null && (
                       <CostBreakdownPill direction={d} />
@@ -434,5 +571,138 @@ export function DirectionPortfolioSection({
         <StrategicAuditPanel projectId={projectId} calibrationFloor={calibrationFloor} />
       )}
     </section>
+    {evictedDrawer && (
+      <div className="fixed inset-0 z-50 flex">
+        <div className="flex-1 bg-black/40" onClick={closeEvictedDrawer} />
+        <div className="w-full max-w-[720px] bg-neutral-950 border-l border-neutral-800 flex flex-col shadow-2xl">
+          <div className="flex items-start justify-between gap-3 p-4 border-b border-neutral-800 shrink-0">
+            <div className="min-w-0">
+              <p className="text-[9px] uppercase tracking-widest text-neutral-500">Evicted findings</p>
+              <h3 className="text-sm font-semibold text-neutral-100 truncate">{evictedDrawer.directionText}</h3>
+              <p className="text-[10px] text-neutral-500 mt-0.5">
+                {evictedTotal === 0
+                  ? 'No evicted findings stored for this direction'
+                  : `${evictedTotal} total · showing ${evictedStart}–${evictedEnd}`}
+              </p>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              {evictedIsStale && (
+                // eslint-disable-next-line viewport/min-touch-target -- dense refresh affordance matches adjacent retrospective panels
+                <button
+                  type="button"
+                  onClick={refreshEvictedDrawer}
+                  disabled={evictedLoading}
+                  className="p-1 text-neutral-500 hover:text-neutral-300 disabled:opacity-40"
+                  title="Refresh evicted findings"
+                  aria-label="Refresh evicted findings"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={closeEvictedDrawer}
+                className="text-neutral-500 hover:text-neutral-300 transition-colors"
+                aria-label="Close evicted findings drawer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+
+          <div className="flex-1 overflow-y-auto p-4">
+            {evictedLoading ? (
+              <div className="h-28 w-full animate-pulse rounded bg-neutral-900/50 border border-neutral-800/50" />
+            ) : evictedError ? (
+              <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex items-center gap-2" role="status">
+                <AlertTriangle className="w-3.5 h-3.5 text-neutral-500 shrink-0" aria-hidden="true" />
+                <span>Error fetching evicted findings</span>
+                <span className="text-[10px] text-neutral-600 truncate" title={evictedError}>{evictedError}</span>
+              </div>
+            ) : evictedTotal === 0 ? (
+              <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-emerald-400 flex items-center gap-2" role="status">
+                <CheckCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                <span>No evicted findings for this direction</span>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {evictedItems.map((finding, index) => (
+                  <div key={`${finding.title}-${index}`} className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
+                    <div className="flex flex-wrap items-start gap-2">
+                      <div className="min-w-0 flex-1">
+                        <h4 className="text-sm text-neutral-100 font-medium break-words">{finding.title}</h4>
+                        <div className="mt-1 flex flex-wrap items-center gap-2 text-[10px] text-neutral-500">
+                          <span className="px-1.5 py-0.5 rounded border border-neutral-700/60 bg-neutral-900 text-neutral-300 uppercase tracking-wide">{finding.status}</span>
+                          <span title={finding.evicted_at}>{timeAgo(finding.evicted_at)}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    {finding.claims.length > 0 && (
+                      <div className="mt-2">
+                        <div className="text-[10px] uppercase tracking-wide text-neutral-500 mb-0.5">Claims</div>
+                        <ul className="list-disc list-inside text-[11px] text-neutral-300 space-y-0.5">
+                          {finding.claims.map((claim, claimIndex) => (
+                            <li key={claimIndex}>{claim}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
+                    {finding.source_refs.length > 0 && (
+                      <div className="mt-2">
+                        <div className="text-[10px] uppercase tracking-wide text-neutral-500 mb-0.5">Source refs</div>
+                        <ul className="space-y-0.5 text-[11px]">
+                          {finding.source_refs.map((ref, refIndex) => (
+                            <li key={refIndex} className="leading-snug break-all">
+                              {/^https?:\/\//i.test(ref) && isSafeUrl(ref) ? (
+                                <a href={ref} target="_blank" rel="noopener noreferrer" className="font-mono text-blue-400 hover:text-blue-300">
+                                  {ref}
+                                </a>
+                              ) : (
+                                <span className="font-mono text-neutral-300">{ref}</span>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                ))}
+
+                {evictedTotalPages > 1 && (
+                  <div className="flex flex-wrap items-center gap-2 mt-1 text-[10px] text-neutral-400">
+                    {/* eslint-disable-next-line viewport/min-touch-target -- compact pager in dense drawer footer */}
+                    <button
+                      type="button"
+                      disabled={evictedOffset === 0 || evictedLoading}
+                      onClick={() => setEvictedOffset(offset => Math.max(0, offset - EVICTED_FINDINGS_PAGE_SIZE))}
+                      className="px-1.5 py-0.5 border border-neutral-700 rounded disabled:opacity-40 hover:border-neutral-500"
+                      aria-label="Previous page"
+                    >
+                      <ChevronLeft className="w-3 h-3" />
+                    </button>
+                    <span>
+                      Page {evictedPage} of {evictedTotalPages} · {evictedTotal} total
+                    </span>
+                    {/* eslint-disable-next-line viewport/min-touch-target -- compact pager in dense drawer footer */}
+                    <button
+                      type="button"
+                      disabled={evictedOffset >= evictedMaxOffset || evictedLoading}
+                      onClick={() => setEvictedOffset(offset => Math.min(evictedMaxOffset, offset + EVICTED_FINDINGS_PAGE_SIZE))}
+                      className="px-1.5 py-0.5 border border-neutral-700 rounded disabled:opacity-40 hover:border-neutral-500"
+                      aria-label="Next page"
+                    >
+                      <ChevronRight className="w-3 h-3" />
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    )}
+    </>
   );
 }

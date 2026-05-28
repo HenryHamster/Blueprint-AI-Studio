@@ -3231,6 +3231,7 @@ async def compute_direction_progress(
         retirement_eligible = (
             lifetime_autonomous_prs_merged >= 10 and lifetime_operator_actions == 0
         )
+        evicted_findings_count = len(_agg.get("evicted_findings") or [])
 
         direction_text = (d.get("text") or d.get("description") or "")[:80]
         total_prs = prs_merged + prs_rejected
@@ -3456,6 +3457,7 @@ async def compute_direction_progress(
                 "lifetime_autonomous_prs_merged": lifetime_autonomous_prs_merged,
                 "lifetime_operator_actions": lifetime_operator_actions,
                 "retirement_eligible": retirement_eligible,
+                "evicted_findings_count": evicted_findings_count,
                 "review_quality": {
                     "reviews_dismissed": dir_reviews_dismissed,
                     "reviews_overridden": dir_reviews_overridden,

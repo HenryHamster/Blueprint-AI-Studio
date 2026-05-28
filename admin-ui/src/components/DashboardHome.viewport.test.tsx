@@ -207,6 +207,13 @@ vi.mock('../api', () => ({
   fetchSrMissedRetrospectives: vi.fn(async () => ({ items: [], total: 0 })),
   fetchSrRecentMisses: vi.fn(async () => ({ items: [] })),
   fetchSrUnhandledEdgesRetrospectives: vi.fn(async () => ({ items: [], total: 0 })),
+  fetchEvictedFindings: vi.fn(async () => ({
+    direction_id: '',
+    total: 0,
+    offset: 0,
+    limit: 10,
+    evicted_findings: [],
+  })),
   fetchDirectionSrBreakdown: vi.fn(async () => ({ directions: [] })),
   fetchCrossLayerCompliance: vi.fn(async () => ({
     total_classified: 0,

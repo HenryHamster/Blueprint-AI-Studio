@@ -231,6 +231,46 @@ describe('SrUnhandledEdgesRetrospectivesPanel — viewport regression', () => {
     expect(spy).toHaveBeenCalledWith('proj-1', expect.objectContaining({ page: 0 }));
   });
 
+  test('resets pagination to page 0 when a filter changes (days selector)', async () => {
+    const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
+    const spy = fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+    // Return total=40 so totalPages=2 and pagination controls are rendered
+    spy.mockResolvedValue({ items: MOCK_ITEMS, total: 40, task_types: ['create', 'fix'] });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrUnhandledEdgesRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    spy.mockClear();
+
+    // Click the 30d days button to trigger a filter change
+    const btn30d = screen.getByRole('button', { name: '30d' });
+    await act(async () => {
+      fireEvent.click(btn30d);
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // After filter change, panel must re-fetch with page: 0 (pagination reset)
+    expect(spy).toHaveBeenCalledWith('proj-1', expect.objectContaining({ page: 0 }));
+  });
+
   test('filtered-empty state shows filter-aware message, not all-clear', async () => {
     const { fetchSrUnhandledEdgesRetrospectives } = await import('../api');
     (fetchSrUnhandledEdgesRetrospectives as ReturnType<typeof vi.fn>)

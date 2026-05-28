@@ -6,8 +6,16 @@ vi.mock('./StrategicAuditPanel', () => ({
   StrategicAuditPanel: () => null,
 }));
 
-const { apiFetchMock } = vi.hoisted(() => ({ apiFetchMock: vi.fn() }));
-vi.mock('../api', () => ({ apiFetch: apiFetchMock }));
+const { apiFetchMock, fetchEvictedFindingsMock } = vi.hoisted(() => ({
+  apiFetchMock: vi.fn(),
+  fetchEvictedFindingsMock: vi.fn(),
+}));
+vi.mock('../api', () => ({
+  apiFetch: apiFetchMock,
+  fetchEvictedFindings: fetchEvictedFindingsMock,
+  API_BASE_URL: '',
+  authGet: vi.fn(),
+}));
 
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
 
@@ -28,6 +36,7 @@ describe('DirectionPortfolioSection', () => {
   beforeEach(() => {
     apiFetchMock.mockReset();
     apiFetchMock.mockResolvedValue({ ok: false });
+    fetchEvictedFindingsMock.mockReset();
   });
   it('shows loading skeleton state', () => {
     const { container } = render(
@@ -202,6 +211,125 @@ describe('DirectionPortfolioSection', () => {
     const trendEl = screen.getByText(/↓-10pp/);
     expect(trendEl).toBeInTheDocument();
     expect(trendEl).toHaveClass('text-red-400');
+  });
+
+  it('shows an evicted findings badge only when the aggregate count is positive', () => {
+    render(
+      <DirectionPortfolioSection
+        directions={[
+          makeDirection({ direction_id: 'dir-1', history_aggregate: { evicted_findings: 3 } }),
+          makeDirection({ direction_id: 'dir-2', direction_text: 'No evictions', history_aggregate: { evicted_findings: 0 } }),
+        ]}
+        loading={false}
+        productPct={null}
+        totalDirPRs={2}
+        hasAttribution={false}
+        totalAutonomousPRs={null}
+        totalAssistedPRs={null}
+        selfSufficientCount={1}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /view evicted findings for this direction/i })).toHaveTextContent('3 evicted');
+    expect(screen.queryByText('0 evicted')).not.toBeInTheDocument();
+  });
+
+  it('opens the evicted findings drawer and paginates results', async () => {
+    const user = userEvent.setup();
+    const pageOne = Array.from({ length: 10 }, (_, i) => ({
+      title: `Evicted finding ${i + 1}`,
+      claims: [`Claim ${i + 1}`],
+      source_refs: [`backend/app/example_${i + 1}.py:12`],
+      status: 'evicted',
+      evicted_at: new Date(Date.now() - (i + 1) * 60_000).toISOString(),
+    }));
+    const pageTwo = [{
+      title: 'Evicted finding 11',
+      claims: ['Claim 11'],
+      source_refs: ['https://example.com/finding/11'],
+      status: 'evicted',
+      evicted_at: new Date(Date.now() - 11 * 60_000).toISOString(),
+    }];
+
+    fetchEvictedFindingsMock.mockImplementation(async (_projectId: string, _directionId: string, params?: { offset?: number; limit?: number }) => {
+      if (params?.offset === 10) {
+        return { direction_id: 'dir-1', total: 11, offset: 10, limit: 10, evicted_findings: pageTwo };
+      }
+      return { direction_id: 'dir-1', total: 11, offset: 0, limit: 10, evicted_findings: pageOne };
+    });
+
+    render(
+      <DirectionPortfolioSection
+        directions={[makeDirection({ direction_id: 'dir-1', direction_text: 'Eviction demo', history_aggregate: { evicted_findings: 11 } })]}
+        loading={false}
+        productPct={null}
+        totalDirPRs={2}
+        hasAttribution={false}
+        totalAutonomousPRs={null}
+        totalAssistedPRs={null}
+        selfSufficientCount={1}
+        projectId="proj-1"
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /view evicted findings for this direction/i }));
+
+    expect(await screen.findByText('Evicted finding 1')).toBeInTheDocument();
+    expect(screen.getByText('Claim 1')).toBeInTheDocument();
+    expect(screen.getByText('backend/app/example_1.py:12')).toBeInTheDocument();
+    expect(fetchEvictedFindingsMock).toHaveBeenCalledWith('proj-1', 'dir-1', { offset: 0, limit: 10 });
+
+    await user.click(screen.getByRole('button', { name: /next page/i }));
+
+    expect(await screen.findByText('Evicted finding 11')).toBeInTheDocument();
+    expect(fetchEvictedFindingsMock).toHaveBeenCalledWith('proj-1', 'dir-1', { offset: 10, limit: 10 });
+  });
+
+  it('renders empty and error drawer states', async () => {
+    const user = userEvent.setup();
+    fetchEvictedFindingsMock.mockResolvedValueOnce({
+      direction_id: 'dir-1',
+      total: 0,
+      offset: 0,
+      limit: 10,
+      evicted_findings: [],
+    });
+
+    const { rerender } = render(
+      <DirectionPortfolioSection
+        directions={[makeDirection({ direction_id: 'dir-1', direction_text: 'Empty evictions', history_aggregate: { evicted_findings: 1 } })]}
+        loading={false}
+        productPct={null}
+        totalDirPRs={2}
+        hasAttribution={false}
+        totalAutonomousPRs={null}
+        totalAssistedPRs={null}
+        selfSufficientCount={1}
+        projectId="proj-1"
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /view evicted findings for this direction/i }));
+    expect(await screen.findByText('No evicted findings for this direction')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /close evicted findings drawer/i }));
+    fetchEvictedFindingsMock.mockRejectedValueOnce(new Error('boom'));
+    rerender(
+      <DirectionPortfolioSection
+        directions={[makeDirection({ direction_id: 'dir-1', direction_text: 'Empty evictions', history_aggregate: { evicted_findings: 1 } })]}
+        loading={false}
+        productPct={null}
+        totalDirPRs={2}
+        hasAttribution={false}
+        totalAutonomousPRs={null}
+        totalAssistedPRs={null}
+        selfSufficientCount={1}
+        projectId="proj-1"
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /view evicted findings for this direction/i }));
+    expect(await screen.findByText('Error fetching evicted findings')).toBeInTheDocument();
   });
 
   it('does not render SR pill when no project id is provided', () => {
