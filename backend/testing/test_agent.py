@@ -2435,9 +2435,12 @@ async def test_playbook_set_rejects_when_nothing_evictable(
     # Patch _playbook_size_bytes to always report > 30KB cap, and
     # _maybe_archive_for_capacity to return doc unchanged (nothing evictable).
     with (
-        patch("app.main._playbook_size_bytes", return_value=32_000),
         patch(
-            "app.main._maybe_archive_for_capacity", side_effect=lambda doc, est=0: doc
+            "app.routers.admin_agent_ops._playbook_size_bytes", return_value=32_000
+        ),
+        patch(
+            "app.routers.admin_agent_ops._maybe_archive_for_capacity",
+            side_effect=lambda doc, est=0: doc,
         ),
     ):
         resp = await client.post(

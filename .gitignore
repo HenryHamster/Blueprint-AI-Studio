@@ -21,7 +21,7 @@ database.sqlite
 .blueprint-config.json
 *.tsbuildinfo
 backend/CLAUDE.md
-backend/.testmondata
+backend/.testmondata*
 # Agent runtime tool scripts (auto-generated in workspace, must not be committed)
 /note
 /messages
