@@ -47,6 +47,10 @@ export const EXEMPT_FROM_VIEWPORT_TEST = new Set([
   // Sub-panel rendered exclusively inside DashboardHome; viewport coverage
   // is provided by DashboardHome.viewport.test.tsx which exercises it inline.
   'VersionLifecyclePanel',
+  // Message-row sub-component rendered exclusively inside MessagesPanel;
+  // viewport coverage is provided by MessagesPanel.viewport.test.tsx which
+  // exercises the bubble inline (overflow, text-truncation, touch-target).
+  'MessageBubble',
 ]);
 
 /**

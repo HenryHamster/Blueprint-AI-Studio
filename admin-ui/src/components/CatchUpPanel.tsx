@@ -20,7 +20,7 @@ import {
 import type { RecentCompletion, TimeWindow, DismissedState } from './catchupHelpers';
 import { WaitingBadge, CompletionRow, SkeletonRow } from './catchupRows';
 import { SrTrendBreakdown, type SrTrendData } from './SrTrendBreakdown';
-import { PipelineRegressionsPanel } from './DashboardHome';
+import { PipelineRegressionsPanel } from './PipelineRegressionsPanel';
 import type { Project } from '../types/project';
 
 interface NeedsAttentionItem {

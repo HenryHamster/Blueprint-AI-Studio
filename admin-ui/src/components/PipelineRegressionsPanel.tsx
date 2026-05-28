@@ -1375,6 +1375,128 @@ export function FirstAttemptComplianceTrendPanel({ projectId }: Props) {
   );
 }
 
+export interface PipelineRegression {
+  signal_name: string;
+  detected_at: string;
+  current_rate?: number | null;
+  prior_rate?: number | null;
+  severity: 'critical' | 'warning' | 'info';
+  resolved: boolean;
+  resolved_at?: string | null;
+  spawned_task_id?: string | null;
+  spawned_task_title?: string | null;
+  spawned_task_status?: string | null;
+  regression_class?: string | null;
+}
+
+const _REGRESSION_SEVERITY_BORDER: Record<string, string> = {
+  critical: 'border-l-red-500',
+  warning: 'border-l-amber-500',
+  info: 'border-l-blue-500',
+};
+const _REGRESSION_STATUS_PILL: Record<string, string> = {
+  IN_PROGRESS: 'bg-blue-500/15 text-blue-400 border-blue-500/30',
+  PROVISIONING: 'bg-blue-500/15 text-blue-400 border-blue-500/30',
+  EVALUATING: 'bg-amber-500/15 text-amber-400 border-amber-500/30',
+  QUEUED: 'bg-neutral-700/30 text-neutral-400 border-neutral-700/30',
+  COMPLETED: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30',
+  FAILED: 'bg-red-500/15 text-red-400 border-red-500/30',
+};
+
+export function PipelineRegressionsPanel({ projectId }: { projectId: string }) {
+  const [regressions, setRegressions] = useState<PipelineRegression[]>([]);
+  const [loaded, setLoaded] = useState(false);
+
+  const fetchRegressions = useCallback(async () => {
+    try {
+      const res = await apiFetch(`/api/admin/pipeline-regressions?project_id=${encodeURIComponent(projectId)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setRegressions(data.regressions ?? []);
+        setLoaded(true);
+      } else if (res.status !== 200) {
+        setLoaded(true);
+      }
+    } catch { /* silent */ }
+  }, [projectId]);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- async fetch sets state after await, intentional
+    fetchRegressions();
+    const id = setInterval(fetchRegressions, 60_000);
+    return () => clearInterval(id);
+  }, [fetchRegressions]);
+
+  if (!loaded) return null;
+
+  const active = regressions.filter(r => !r.resolved);
+  const recentResolved = regressions.filter(r => r.resolved).slice(0, 2);
+  const all = [...active, ...recentResolved];
+
+  return (
+    <section data-testid="pipeline-regressions-panel">
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">
+        Pipeline Regressions
+        {active.length > 0 && (
+          <span className="ml-2 text-red-400 font-normal normal-case tracking-normal">· {active.length} active</span>
+        )}
+      </h2>
+      {all.length === 0 ? (
+        <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 flex items-center gap-2 text-emerald-400 text-xs">
+          <CheckCircle className="w-4 h-4 shrink-0" />
+          No active pipeline regressions — system healthy
+        </div>
+      ) : (
+        <div className="space-y-1.5">
+          {all.map((r, i) => {
+            const borderCls = r.resolved ? 'border-l-neutral-600' : (_REGRESSION_SEVERITY_BORDER[r.severity] ?? 'border-l-neutral-600');
+            const statusCls = r.spawned_task_status ? (_REGRESSION_STATUS_PILL[r.spawned_task_status] ?? 'bg-neutral-700/30 text-neutral-400 border-neutral-700/30') : null;
+            return (
+              <div key={i} className={`bg-neutral-900/50 border border-neutral-800/50 border-l-2 ${borderCls} rounded-lg px-3 py-2 ${r.resolved ? 'opacity-60' : ''}`}>
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs text-neutral-200 font-medium">{r.signal_name}</p>
+                    <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                      <span className="text-[10px] text-neutral-500">{timeAgo(r.detected_at)}</span>
+                      {r.current_rate != null && r.prior_rate != null && (
+                        <span className="text-[10px] font-mono text-neutral-400">
+                          {Math.round(r.prior_rate * 100)}% → {Math.round(r.current_rate * 100)}%
+                        </span>
+                      )}
+                      {r.resolved && r.resolved_at && (
+                        <span className="text-[10px] text-emerald-500">resolved {timeAgo(r.resolved_at)}</span>
+                      )}
+                    </div>
+                    {r.spawned_task_title && (
+                      <p className="text-[10px] text-neutral-500 truncate mt-0.5">{r.spawned_task_title}</p>
+                    )}
+                  </div>
+                  <div className="flex flex-col items-end gap-1 shrink-0">
+                    {statusCls && r.spawned_task_id ? (
+                      <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded border ${statusCls}`} title={`Task ${r.spawned_task_id}`}>
+                        {r.spawned_task_status}
+                      </span>
+                    ) : !r.spawned_task_id ? (
+                      <span className="text-[9px] font-semibold px-1.5 py-0.5 rounded border bg-neutral-800/50 text-neutral-500 border-neutral-700/30">
+                        no action
+                      </span>
+                    ) : null}
+                    {!r.resolved && (
+                      <span className={`text-[9px] px-1.5 py-0.5 rounded ${r.severity === 'critical' ? 'bg-red-500/10 text-red-400' : r.severity === 'warning' ? 'bg-amber-500/10 text-amber-400' : 'bg-blue-500/10 text-blue-400'}`}>
+                        {r.severity}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
 export function AutoRecoveredPanel({ projectId }: Props) {
   const [cases, setCases] = useState<ManualInterventionCase[]>([]);
   const [loaded, setLoaded] = useState(false);

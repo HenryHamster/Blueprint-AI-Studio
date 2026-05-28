@@ -4,7 +4,7 @@ import { apiFetch } from '../api';
 
 export type { Alert } from '../types/alert';
 import type { Alert } from '../types/alert';
-import type { PipelineRegression } from './DashboardHome';
+import type { PipelineRegression } from './PipelineRegressionsPanel';
 import type { SrInvestigationSignal } from './SrTrendBreakdown';
 
 export type { PipelineRegression };

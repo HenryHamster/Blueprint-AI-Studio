@@ -20,6 +20,7 @@
     "SearchFilterBar",
     "PlaybookPanel",
     "CatchUpPanel",
-    "DiagnosticsPanel"
+    "DiagnosticsPanel",
+    "SettingsAccountsSection"
   ]
 }

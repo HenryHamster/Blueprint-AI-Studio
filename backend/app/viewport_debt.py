@@ -53,6 +53,9 @@ _EXEMPT_FROM_VIEWPORT_TEST: frozenset[str] = frozenset(
         "catchupRows",
         "regressionPhaseChips",
         "VersionLifecyclePanel",
+        # Message-row sub-component rendered exclusively inside MessagesPanel;
+        # viewport coverage is provided by MessagesPanel.viewport.test.tsx.
+        "MessageBubble",
     ]
 )
 

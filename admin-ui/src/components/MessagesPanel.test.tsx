@@ -4,6 +4,8 @@ import { act } from 'react';
 import { render, waitFor } from '@testing-library/react';
 import { MessagesPanel } from './MessagesPanel';
 import { classifySignalLevel, effectiveSignal, loadEventPrefs, EVENT_PREFS_KEY, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, isCriticalSeverity, loadTemporaryMutes, saveTemporaryMutes, isEventTypeTemporarilyMuted } from './MessagesPanel.utils';
+import type { ProjectMessage } from './MessageBubble';
+import type { SavedView } from './MessagesPanel.utils';
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: { email: 'test-user@example.com' } },

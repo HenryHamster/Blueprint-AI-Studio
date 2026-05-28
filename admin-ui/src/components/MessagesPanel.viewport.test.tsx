@@ -304,7 +304,7 @@ describe('MessagesPanel — viewport regression', () => {
     });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
 
-    const bubbles = host.querySelectorAll('[class*="rounded-2xl"]');
+    const bubbles = host.querySelectorAll('[data-testid="message-bubble"]');
     const visibleContent = Array.from(bubbles)
       .map(el => el.textContent || '')
       .join(' ');
@@ -349,7 +349,7 @@ describe('MessagesPanel — viewport regression', () => {
     });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
 
-    let bubbles = host.querySelectorAll('[class*="rounded-2xl"]');
+    let bubbles = host.querySelectorAll('[data-testid="message-bubble"]');
     expect(bubbles.length).toBeGreaterThan(0);
 
     await act(async () => {
@@ -357,7 +357,7 @@ describe('MessagesPanel — viewport regression', () => {
     });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
 
-    bubbles = host.querySelectorAll('[class*="rounded-2xl"]');
+    bubbles = host.querySelectorAll('[data-testid="message-bubble"]');
     expect(bubbles.length).toBe(2);
   });
 
