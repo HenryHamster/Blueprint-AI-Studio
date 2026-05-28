@@ -1,7 +1,7 @@
 import { describe, test, expect, vi, afterEach, beforeEach } from 'vitest';
 import { render, screen, waitFor, fireEvent, cleanup } from '@testing-library/react';
 import { WarmVmPanel } from './WarmVmPanel';
-import type { WarmVmStateResponse } from '../types/warmVm';
+import type { WarmVmStateResponse, BacklogReuseFunnelSnapshot } from '../types/warmVm';
 
 const baseState: WarmVmStateResponse = {
   active_vms: [],
@@ -172,6 +172,75 @@ describe('WarmVmPanel — backlog-reuse toggle + attribution', () => {
 
     await screen.findByText('backlog reuse');
     expect(screen.queryByText(/Spawn Pin Funnel/)).toBeNull();
+  });
+
+  test('renders backlog reuse funnel with stage counters and dynamic skip reasons', async () => {
+    const stateWithBacklogFunnel: WarmVmStateResponse = {
+      ...baseState,
+      backlog_reuse_funnel: {
+        window_hours: 24,
+        completed_vms_with_eligible_backlog: 80,
+        teardown_defers_scheduled: 60,
+        next_role_polls_during_defer: 45,
+        warm_claims_succeeded: 33,
+        claim_skipped_by_reason: {
+          disabled: 4,
+          breaker_tripped: 2,
+          source_cold: 5,
+          zero_reason: 0,
+        },
+        claim_skipped_total: 11,
+        scan_polls_with_depends_on_skip: 7,
+        scan_polls_with_pinned_vm_skip: 3,
+        scan_polls_with_file_conflict_skip: 0,
+        scan_polls_saturated: 2,
+      },
+    };
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateWithBacklogFunnel), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByText('Backlog Reuse Funnel (24h)');
+    expect(screen.getByText('eligible').parentElement?.textContent).toContain('80');
+    expect(screen.getByText('defers').parentElement?.textContent).toContain('60');
+    expect(screen.getByText('polls').parentElement?.textContent).toContain('45');
+    expect(screen.getByText('claimed').parentElement?.textContent).toContain('33');
+    // Skip reasons render dynamically — including ones not hardcoded in the component.
+    expect(screen.getByTestId('backlog-reuse-skip-disabled').textContent).toContain('4');
+    expect(screen.getByTestId('backlog-reuse-skip-breaker_tripped').textContent).toContain('2');
+    expect(screen.getByTestId('backlog-reuse-skip-source_cold').textContent).toContain('5');
+    // Zero-count reason MUST NOT render.
+    expect(screen.queryByTestId('backlog-reuse-skip-zero_reason')).toBeNull();
+    // Eligibility-scan skip chips: non-zero render with their counts.
+    expect(screen.getByTestId('backlog-reuse-scan-depends_on').textContent).toContain('7');
+    expect(screen.getByTestId('backlog-reuse-scan-pinned_vm').textContent).toContain('3');
+    expect(screen.getByTestId('backlog-reuse-scan-saturated').textContent).toContain('2');
+    // Zero-count scan stage MUST NOT render.
+    expect(screen.queryByTestId('backlog-reuse-scan-file_conflict')).toBeNull();
+  });
+
+  test('renders without crash when backlog_reuse_funnel is absent', async () => {
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByText('backlog reuse');
+    expect(screen.queryByText(/Backlog Reuse Funnel/)).toBeNull();
+  });
+
+  test('does not render backlog reuse funnel when backend returned empty object', async () => {
+    // The backend defensive-import helper returns {} on failure; guard with
+    // window_hours so the row stays hidden in that case.
+    const stateWithEmptyFunnel = {
+      ...baseState,
+      backlog_reuse_funnel: {} as BacklogReuseFunnelSnapshot,
+    };
+    (authGet as ReturnType<typeof vi.fn>).mockResolvedValue(
+      new Response(JSON.stringify(stateWithEmptyFunnel), { status: 200 }),
+    );
+    render(<WarmVmPanel onViewTask={() => {}} />);
+
+    await screen.findByText('backlog reuse');
+    expect(screen.queryByText(/Backlog Reuse Funnel/)).toBeNull();
   });
 
   test('renders per-reason clear chips for non-zero reasons only', async () => {

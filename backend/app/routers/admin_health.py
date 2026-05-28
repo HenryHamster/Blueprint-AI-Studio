@@ -894,6 +894,7 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         ),
         "chain_continuity_funnel": _get_chain_continuity_funnel(),
         "spawn_pin_funnel": _get_spawn_pin_funnel(),
+        "backlog_reuse_funnel": _get_backlog_reuse_funnel(),
     }
 
 
@@ -911,6 +912,15 @@ def _get_spawn_pin_funnel() -> dict:
         from app.warm_backlog_reuse import get_spawn_pin_funnel_snapshot
 
         return get_spawn_pin_funnel_snapshot()
+    except Exception:
+        return {}
+
+
+def _get_backlog_reuse_funnel() -> dict:
+    try:
+        from app.warm_backlog_reuse import get_reuse_funnel_snapshot
+
+        return get_reuse_funnel_snapshot()
     except Exception:
         return {}
 

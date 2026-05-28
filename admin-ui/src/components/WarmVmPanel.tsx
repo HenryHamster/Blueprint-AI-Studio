@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { ChevronDown, ChevronUp, Server, Flame, AlertTriangle, Clock } from 'lucide-react';
 import { API_BASE_URL, apiFetch, authGet } from '../api';
 import { parseTimestamp } from '../utils/time';
-import type { WarmVmStateResponse, WarmVmRow, ChainContinuityFunnelSnapshot, SpawnPinFunnelSnapshot } from '../types/warmVm';
+import type { WarmVmStateResponse, WarmVmRow, ChainContinuityFunnelSnapshot, SpawnPinFunnelSnapshot, BacklogReuseFunnelSnapshot } from '../types/warmVm';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 
 const POLL_INTERVAL_MS = 10_000;
@@ -245,6 +245,10 @@ export function WarmVmPanel({ onViewTask }: Props) {
                 <SpawnPinFunnelRow funnel={data.spawn_pin_funnel} />
               )}
 
+              {data.backlog_reuse_funnel && data.backlog_reuse_funnel.window_hours && (
+                <BacklogReuseFunnelRow funnel={data.backlog_reuse_funnel} />
+              )}
+
               {data.chain_continuity_funnel && (
                 <ChainFunnelRow funnel={data.chain_continuity_funnel} />
               )}
@@ -324,6 +328,59 @@ function SpawnPinFunnelRow({ funnel }: { funnel: SpawnPinFunnelSnapshot }) {
       )}
       {skippedSuppressed > 0 && (
         <span><span className="text-neutral-500">skip suppressed</span>: <span className="font-mono text-neutral-300">{skippedSuppressed}</span></span>
+      )}
+    </div>
+  );
+}
+
+function BacklogReuseFunnelRow({ funnel }: { funnel: BacklogReuseFunnelSnapshot }) {
+  const skipReasons = Object.entries(funnel.claim_skipped_by_reason ?? {})
+    .filter(([, count]) => count > 0);
+  const scanDep = funnel.scan_polls_with_depends_on_skip ?? 0;
+  const scanPin = funnel.scan_polls_with_pinned_vm_skip ?? 0;
+  const scanFile = funnel.scan_polls_with_file_conflict_skip ?? 0;
+  const scanSat = funnel.scan_polls_saturated ?? 0;
+  return (
+    <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60">
+      <span className="text-neutral-500 font-bold uppercase tracking-widest w-full">
+        Backlog Reuse Funnel ({funnel.window_hours}h)
+      </span>
+      <span><span className="text-neutral-500">eligible</span>: <span className="font-mono text-neutral-300">{funnel.completed_vms_with_eligible_backlog}</span></span>
+      <span><span className="text-neutral-500">defers</span>: <span className="font-mono text-neutral-300">{funnel.teardown_defers_scheduled}</span></span>
+      <span><span className="text-neutral-500">polls</span>: <span className="font-mono text-neutral-300">{funnel.next_role_polls_during_defer}</span></span>
+      <span><span className="text-neutral-500">claimed</span>: <span className="font-mono text-emerald-400">{funnel.warm_claims_succeeded}</span></span>
+      {skipReasons.map(([reason, count]) => (
+        <span key={reason} data-testid={`backlog-reuse-skip-${reason}`}>
+          <span className="text-neutral-500">skip {reason}</span>
+          :{' '}
+          <span className={`font-mono ${reason === 'breaker_tripped' ? 'text-red-400' : reason === 'disabled' ? 'text-amber-400' : 'text-neutral-300'}`}>
+            {count}
+          </span>
+        </span>
+      ))}
+      {scanDep > 0 && (
+        <span data-testid="backlog-reuse-scan-depends_on">
+          <span className="text-neutral-500">skip dep</span>:{' '}
+          <span className="font-mono text-neutral-300">{scanDep}</span>
+        </span>
+      )}
+      {scanPin > 0 && (
+        <span data-testid="backlog-reuse-scan-pinned_vm">
+          <span className="text-neutral-500">skip pin</span>:{' '}
+          <span className="font-mono text-neutral-300">{scanPin}</span>
+        </span>
+      )}
+      {scanFile > 0 && (
+        <span data-testid="backlog-reuse-scan-file_conflict">
+          <span className="text-neutral-500">skip file</span>:{' '}
+          <span className="font-mono text-neutral-300">{scanFile}</span>
+        </span>
+      )}
+      {scanSat > 0 && (
+        <span data-testid="backlog-reuse-scan-saturated">
+          <span className="text-neutral-500">saturated</span>:{' '}
+          <span className="font-mono text-amber-400">{scanSat}</span>
+        </span>
       )}
     </div>
   );

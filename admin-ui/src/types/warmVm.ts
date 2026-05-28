@@ -51,6 +51,22 @@ export interface ChainContinuityFunnelSnapshot {
   skipped_total: number;
 }
 
+export interface BacklogReuseFunnelSnapshot {
+  window_hours: number;
+  completed_vms_with_eligible_backlog: number;
+  teardown_defers_scheduled: number;
+  next_role_polls_during_defer: number;
+  warm_claims_succeeded: number;
+  claim_skipped_by_reason: Record<string, number>;
+  claim_skipped_total: number;
+  // Eligibility-scan skip-reason rolling counters: per-poll aggregation
+  // (one poll that skipped N rows for the same reason counts as 1).
+  scan_polls_with_depends_on_skip: number;
+  scan_polls_with_pinned_vm_skip: number;
+  scan_polls_with_file_conflict_skip: number;
+  scan_polls_saturated: number;
+}
+
 export interface SpawnPinFunnelSnapshot {
   window_hours: number;
   spawn_attempts: number;
@@ -82,4 +98,5 @@ export interface WarmVmStateResponse {
   next_role_poll_timeout_secs: number;
   chain_continuity_funnel?: ChainContinuityFunnelSnapshot;
   spawn_pin_funnel?: SpawnPinFunnelSnapshot;
+  backlog_reuse_funnel?: BacklogReuseFunnelSnapshot;
 }

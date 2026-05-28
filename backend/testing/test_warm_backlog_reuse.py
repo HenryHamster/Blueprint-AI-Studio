@@ -538,6 +538,10 @@ def _clear_funnel_events(wbr):
     wbr._next_role_polls_during_defer_events.clear()
     wbr._warm_claims_succeeded_events.clear()
     wbr._claim_skipped_events.clear()
+    wbr._scan_skipped_depends_on_events.clear()
+    wbr._scan_skipped_pinned_vm_events.clear()
+    wbr._scan_skipped_file_conflict_events.clear()
+    wbr._scan_saturated_events.clear()
 
 
 def test_funnel_counters_and_snapshot():
@@ -654,5 +658,137 @@ async def test_funnel_no_eligible_increments_skipped(
         snap = wbr.get_reuse_funnel_snapshot()
         assert snap["warm_claims_succeeded"] == 0
         assert snap["claim_skipped_by_reason"].get("no_eligible", 0) >= 1
+    finally:
+        _clear_funnel_events(wbr)
+
+
+# ---------------------------------------------------------------------------
+# Eligibility-scan skip-reason funnel tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_scan_skip_reasons_increment_each_stage_once(db_session):
+    """A single scan that triggers each structural skip reason at least once
+    increments each new snapshot field by exactly 1."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_funnel_events(wbr)
+    try:
+        project = await _make_project(db_session, name="Scan Mixed")
+        vm_id = "agent-vm-scan-mixed"
+
+        # IN_PROGRESS task editing src/app.py — file-conflict source.
+        await _make_backlog_task(
+            db_session,
+            project.id,
+            status=TaskStatus.IN_PROGRESS,
+            context={"related_files": ["src/app.py"]},
+        )
+        # File-conflict candidate.
+        await _make_backlog_task(
+            db_session, project.id, context={"related_files": ["src/app.py"]}
+        )
+        # Depends_on candidate.
+        await _make_backlog_task(
+            db_session,
+            project.id,
+            depends_on=["00000000-0000-0000-0000-000000000123"],
+        )
+        # Pinned to a different VM.
+        await _make_backlog_task(
+            db_session,
+            project.id,
+            context={"warm_target_vm_id": "agent-vm-other"},
+        )
+        # One clean candidate so the scan still includes non-skip rows.
+        await _make_backlog_task(
+            db_session, project.id, context={"related_files": ["docs/readme.md"]}
+        )
+
+        await wbr._eligible_backlog_ids(db_session, project.id, vm_id)
+        snap = wbr.get_reuse_funnel_snapshot()
+        assert snap["scan_polls_with_depends_on_skip"] == 1
+        assert snap["scan_polls_with_pinned_vm_skip"] == 1
+        assert snap["scan_polls_with_file_conflict_skip"] == 1
+        # 5 QUEUED rows fits under the default _BACKLOG_SCAN_LIMIT (10).
+        assert snap["scan_polls_saturated"] == 0
+    finally:
+        _clear_funnel_events(wbr)
+
+
+@pytest.mark.asyncio
+async def test_scan_skip_aggregates_per_poll_not_per_row(db_session):
+    """A poll that skips multiple rows for the same reason increments the
+    counter by 1 (per-poll aggregation), not by the row count."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_funnel_events(wbr)
+    try:
+        project = await _make_project(db_session, name="Scan Per Poll")
+        vm_id = "agent-vm-scan-poll"
+
+        # Three depends_on-skipped candidates.
+        for _ in range(3):
+            await _make_backlog_task(
+                db_session,
+                project.id,
+                depends_on=["00000000-0000-0000-0000-000000000999"],
+            )
+
+        await wbr._eligible_backlog_ids(db_session, project.id, vm_id)
+        snap = wbr.get_reuse_funnel_snapshot()
+        # 3 skipped rows in one poll == exactly 1 event.
+        assert snap["scan_polls_with_depends_on_skip"] == 1
+
+        # A second poll with the same backlog: counter advances by exactly 1.
+        await wbr._eligible_backlog_ids(db_session, project.id, vm_id)
+        snap = wbr.get_reuse_funnel_snapshot()
+        assert snap["scan_polls_with_depends_on_skip"] == 2
+    finally:
+        _clear_funnel_events(wbr)
+
+
+@pytest.mark.asyncio
+async def test_scan_saturated_increments_when_at_limit(db_session, monkeypatch):
+    """When rows_fetched hits _BACKLOG_SCAN_LIMIT, scan_polls_saturated increments."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_funnel_events(wbr)
+    try:
+        project = await _make_project(db_session, name="Scan Saturated")
+        vm_id = "agent-vm-scan-sat"
+
+        # Lower the scan limit so the test stays cheap.
+        monkeypatch.setattr(wbr, "_BACKLOG_SCAN_LIMIT", 3)
+        for _ in range(3):
+            await _make_backlog_task(db_session, project.id)
+
+        await wbr._eligible_backlog_ids(db_session, project.id, vm_id)
+        snap = wbr.get_reuse_funnel_snapshot()
+        assert snap["scan_polls_saturated"] == 1
+    finally:
+        _clear_funnel_events(wbr)
+
+
+@pytest.mark.asyncio
+async def test_scan_skip_no_events_when_all_eligible(db_session):
+    """A scan where every candidate is eligible records zero skip events."""
+    import app.warm_backlog_reuse as wbr
+
+    _clear_funnel_events(wbr)
+    try:
+        project = await _make_project(db_session, name="Scan Clean")
+        vm_id = "agent-vm-scan-clean"
+        await _make_backlog_task(
+            db_session, project.id, context={"related_files": ["docs/x.md"]}
+        )
+
+        await wbr._eligible_backlog_ids(db_session, project.id, vm_id)
+        snap = wbr.get_reuse_funnel_snapshot()
+        assert snap["scan_polls_with_depends_on_skip"] == 0
+        assert snap["scan_polls_with_pinned_vm_skip"] == 0
+        assert snap["scan_polls_with_file_conflict_skip"] == 0
+        assert snap["scan_polls_saturated"] == 0
     finally:
         _clear_funnel_events(wbr)

@@ -152,6 +152,17 @@ async def _eligible_backlog_ids(
                 continue
         eligible.append(task_id)
 
+    # Per-poll funnel aggregation: each reason fires AT MOST ONCE per scan,
+    # so one giant scan can't dominate the chart over many small ones.
+    if skipped_depends_on > 0:
+        record_scan_skipped_depends_on()
+    if skipped_pinned_vm > 0:
+        record_scan_skipped_pinned_vm()
+    if skipped_file_conflict > 0:
+        record_scan_skipped_file_conflict()
+    if saturated:
+        record_scan_saturated()
+
     logger.debug(
         "[BACKLOG-REUSE] scan project_id=%s vm_instance_id=%s "
         "rows_fetched=%d rows_eligible=%d saturated=%s "
@@ -258,6 +269,35 @@ _next_role_polls_during_defer_events: deque = deque(maxlen=500)
 _warm_claims_succeeded_events: deque = deque(maxlen=500)
 _claim_skipped_events: deque = deque(maxlen=500)  # (datetime, reason)
 
+# Eligibility-scan skip-reason events. Each entry is a single _utcnow() per
+# poll where that reason fired (one or more rows skipped). This per-poll
+# aggregation matches the semantics of _claim_skipped_events: one big scan
+# that skipped 8 rows for the same reason counts as one event, not eight.
+_scan_skipped_depends_on_events: deque = deque(maxlen=500)
+_scan_skipped_pinned_vm_events: deque = deque(maxlen=500)
+_scan_skipped_file_conflict_events: deque = deque(maxlen=500)
+_scan_saturated_events: deque = deque(maxlen=500)
+
+
+def record_scan_skipped_depends_on() -> None:
+    """Stage A: an eligibility scan skipped >=1 candidate for unresolved depends_on."""
+    _scan_skipped_depends_on_events.append(_utcnow())
+
+
+def record_scan_skipped_pinned_vm() -> None:
+    """Stage A: an eligibility scan skipped >=1 candidate pinned to a different VM."""
+    _scan_skipped_pinned_vm_events.append(_utcnow())
+
+
+def record_scan_skipped_file_conflict() -> None:
+    """Stage A: an eligibility scan skipped >=1 candidate via related_files conflict."""
+    _scan_skipped_file_conflict_events.append(_utcnow())
+
+
+def record_scan_saturated() -> None:
+    """Stage A: an eligibility scan hit the per-poll _BACKLOG_SCAN_LIMIT."""
+    _scan_saturated_events.append(_utcnow())
+
 
 def record_vm_with_eligible_backlog() -> None:
     """Stage 1: a COMPLETION event found ≥1 eligible QUEUED backlog task."""
@@ -314,6 +354,18 @@ def get_reuse_funnel_snapshot(window_hours: int = 24) -> dict:
         ),
         "claim_skipped_by_reason": skipped_by_reason,
         "claim_skipped_total": sum(skipped_by_reason.values()),
+        "scan_polls_with_depends_on_skip": sum(
+            1 for ts in _scan_skipped_depends_on_events if ts >= cutoff
+        ),
+        "scan_polls_with_pinned_vm_skip": sum(
+            1 for ts in _scan_skipped_pinned_vm_events if ts >= cutoff
+        ),
+        "scan_polls_with_file_conflict_skip": sum(
+            1 for ts in _scan_skipped_file_conflict_events if ts >= cutoff
+        ),
+        "scan_polls_saturated": sum(
+            1 for ts in _scan_saturated_events if ts >= cutoff
+        ),
     }
 
 

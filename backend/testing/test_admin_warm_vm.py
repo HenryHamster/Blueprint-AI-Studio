@@ -51,6 +51,19 @@ async def test_warm_vm_state_empty(client: AsyncClient, db_session):
         for key in ("window_hours", "spawn_attempts", "pin_set", "skipped_by_reason", "skipped_total"):
             assert key in spawn_funnel, f"missing key {key} in spawn_pin_funnel"
         assert isinstance(spawn_funnel["skipped_by_reason"], dict)
+        backlog_funnel = body.get("backlog_reuse_funnel", {})
+        assert isinstance(backlog_funnel, dict)
+        for key in (
+            "window_hours",
+            "completed_vms_with_eligible_backlog",
+            "teardown_defers_scheduled",
+            "next_role_polls_during_defer",
+            "warm_claims_succeeded",
+            "claim_skipped_by_reason",
+            "claim_skipped_total",
+        ):
+            assert key in backlog_funnel, f"missing key {key} in backlog_reuse_funnel"
+        assert isinstance(backlog_funnel["claim_skipped_by_reason"], dict)
     finally:
         _shared_state.vm_last_heartbeat.clear()
         _shared_state.vm_last_heartbeat.update(saved_hb)
