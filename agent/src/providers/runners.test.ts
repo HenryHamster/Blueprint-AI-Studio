@@ -1,0 +1,307 @@
+import { vi, describe, it, expect, beforeEach } from 'vitest';
+
+// ── Hoisted setup ─────────────────────────────────────────────────────────────
+const { mockRecordToolUse, mockRecordCheckOutcome, mockIsCheckInvocation, mockSendLog } =
+  vi.hoisted(() => {
+    process.env.PROVIDER = 'anthropic';
+    process.env.AUTH_MODE = 'oauth';
+    delete process.env.LLM_CLI_TRANSLATION;
+    delete process.env.DISABLE_CHECK_RUNAWAY_WATCHDOG;
+    return {
+      mockRecordToolUse: vi.fn(),
+      mockRecordCheckOutcome: vi.fn(),
+      mockIsCheckInvocation: vi.fn((s: string) => /\.\/check(?:\s|")/.test(s)),
+      mockSendLog: vi.fn(),
+    };
+  });
+
+// ── Module mocks ─────────────────────────────────────────────────────────────
+vi.mock('fs', () => ({
+  default: {
+    writeFileSync: vi.fn(),
+    unlinkSync: vi.fn(),
+    existsSync: vi.fn().mockReturnValue(false),
+    appendFileSync: vi.fn(),
+    mkdirSync: vi.fn(),
+    openSync: vi.fn().mockReturnValue(3),
+    closeSync: vi.fn(),
+    chmodSync: vi.fn(),
+    readdirSync: vi.fn().mockReturnValue([]),
+  },
+}));
+
+vi.mock('child_process', () => ({
+  spawn: vi.fn(),
+}));
+
+vi.mock('../index.js', () => ({
+  WORKSPACE: '',
+  getAgentToken: vi.fn().mockReturnValue(null),
+  log: vi.fn(),
+  sendLog: mockSendLog,
+  strVal: vi.fn((v: unknown) => (typeof v === 'string' ? v : '')),
+  recordToolUse: mockRecordToolUse,
+  recordLlmCallStart: vi.fn(),
+  recordLlmTokens: vi.fn(),
+  estimateTokensFromChars: vi.fn().mockReturnValue(0),
+  sanitize: vi.fn((s: string) => s),
+  ClaudeTimeoutError: class ClaudeTimeoutError extends Error {
+    constructor(msg: string) { super(msg); this.name = 'ClaudeTimeoutError'; }
+  },
+}));
+
+vi.mock('../fix-loop-events.js', () => ({
+  isCheckInvocation: mockIsCheckInvocation,
+  recordCheckOutcome: mockRecordCheckOutcome,
+  getCheckRunawayStatus: vi.fn().mockReturnValue({ totalChecks: 0, shouldTrigger: false }),
+}));
+
+vi.mock('../processTracking.js', () => ({
+  registerChildPid: vi.fn(),
+  unregisterChildPid: vi.fn(),
+}));
+
+// ── Imports (after mocks) ─────────────────────────────────────────────────────
+import { spawn } from 'child_process';
+import { runProviderAgent } from './runners.js';
+import { CLAUDE_RESULT_GRACE_MS } from '../constants.js';
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+type SpawnMock = ReturnType<typeof spawn>;
+
+/**
+ * Creates a mock spawn that emits each JSON line as a separate stdout data
+ * event, then fires 'close' one setImmediate tick later.  All events are
+ * queued via the real setImmediate so the fake-less tests keep real timer
+ * semantics.
+ */
+function emitStream(jsonLines: string[], exitCode = 0): void {
+  vi.mocked(spawn).mockImplementationOnce(
+    (_cmd: string, _args: readonly string[], _opts?: unknown) => {
+      const stdoutCbs: Array<(d: Buffer) => void> = [];
+      const closeCbs: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = [];
+      const proc = {
+        pid: 12345,
+        exitCode: null as number | null,
+        signalCode: null as NodeJS.Signals | null,
+        stdin: { on: vi.fn(), end: vi.fn() },
+        stdout: {
+          on: vi.fn((event: string, cb: (d: Buffer) => void) => {
+            if (event === 'data') stdoutCbs.push(cb);
+          }),
+        },
+        stderr: { on: vi.fn() },
+        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+          if (event === 'close') {
+            closeCbs.push(cb as (code: number | null, signal: NodeJS.Signals | null) => void);
+          }
+        }),
+        kill: vi.fn(),
+      };
+      setImmediate(() => {
+        for (const line of jsonLines) {
+          for (const cb of stdoutCbs) cb(Buffer.from(line + '\n'));
+        }
+        setImmediate(() => {
+          proc.exitCode = exitCode;
+          for (const cb of closeCbs) cb(exitCode, null);
+        });
+      });
+      return proc as unknown as SpawnMock;
+    },
+  );
+}
+
+// ── Test suites ───────────────────────────────────────────────────────────────
+
+describe('drainJsonChunks — assistant event dispatch', () => {
+  beforeEach(() => {
+    mockRecordToolUse.mockClear();
+    mockRecordCheckOutcome.mockClear();
+    mockIsCheckInvocation.mockClear();
+    mockSendLog.mockClear();
+    vi.mocked(spawn).mockReset();
+  });
+
+  it('calls recordToolUse for a tool_use block', async () => {
+    emitStream([
+      JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'echo hi' } }] },
+      }),
+    ]);
+    await runProviderAgent('prompt', null, { value: '' });
+    expect(mockRecordToolUse).toHaveBeenCalledOnce();
+    expect(mockRecordToolUse).toHaveBeenCalledWith('Bash', { command: 'echo hi' });
+  });
+
+  it('does NOT call recordToolUse when event type is "message" — regression trap for dropped dispatch key', async () => {
+    // If runners.ts reverts from 'assistant' to 'message', this test passes
+    // but the test above fails.  Together they pin the exact dispatch key.
+    emitStream([
+      JSON.stringify({
+        type: 'message',
+        message: { content: [{ type: 'tool_use', name: 'Bash', input: {} }] },
+      }),
+    ]);
+    await runProviderAgent('prompt', null, { value: '' });
+    expect(mockRecordToolUse).not.toHaveBeenCalled();
+  });
+
+  it('updates statusRef.value to the first 100 chars of a text block', async () => {
+    const longText = 'a'.repeat(200);
+    const statusRef = { value: '' };
+    emitStream([
+      JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: longText }] },
+      }),
+    ]);
+    await runProviderAgent('prompt', null, statusRef);
+    expect(statusRef.value).toBe('a'.repeat(100));
+  });
+
+  it('updates statusRef.value for a tool_use block', async () => {
+    const statusRef = { value: '' };
+    emitStream([
+      JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'Read', input: {} }] },
+      }),
+    ]);
+    await runProviderAgent('prompt', null, statusRef);
+    expect(statusRef.value).toBe('Using tool: Read');
+  });
+});
+
+describe('drainJsonChunks — result event dispatch', () => {
+  beforeEach(() => {
+    mockSendLog.mockClear();
+    vi.mocked(spawn).mockReset();
+  });
+
+  it('populates lastResultText from obj.result', async () => {
+    emitStream([
+      JSON.stringify({ type: 'result', result: 'Task completed successfully.' }),
+    ]);
+    const { lastResultText } = await runProviderAgent('prompt', null, { value: '' });
+    expect(lastResultText).toBe('Task completed successfully.');
+  });
+
+  it('arms the grace timer (setTimeout with CLAUDE_RESULT_GRACE_MS) after a result event', async () => {
+    const setTimeoutSpy = vi.spyOn(global, 'setTimeout');
+    try {
+      emitStream([
+        JSON.stringify({ type: 'result', result: 'done' }),
+      ]);
+      await runProviderAgent('prompt', null, { value: '' });
+      const graceCalls = setTimeoutSpy.mock.calls.filter(call => call[1] === CLAUDE_RESULT_GRACE_MS);
+      expect(graceCalls).toHaveLength(1);
+    } finally {
+      setTimeoutSpy.mockRestore();
+    }
+  });
+
+  it('clears the grace timer when the process closes after a result event', async () => {
+    const clearTimeoutSpy = vi.spyOn(global, 'clearTimeout');
+    try {
+      emitStream([
+        JSON.stringify({ type: 'result', result: 'done' }),
+      ]);
+      await runProviderAgent('prompt', null, { value: '' });
+      // clearTimeout must be called in the close handler to prevent stray kills
+      expect(clearTimeoutSpy).toHaveBeenCalled();
+    } finally {
+      clearTimeoutSpy.mockRestore();
+    }
+  });
+});
+
+describe('drainJsonChunks — check-runaway detection (assistant + user events)', () => {
+  beforeEach(() => {
+    mockRecordCheckOutcome.mockClear();
+    mockIsCheckInvocation.mockClear();
+    vi.mocked(spawn).mockReset();
+  });
+
+  it('calls isCheckInvocation and records an outcome when Bash tool invokes ./check', async () => {
+    emitStream([
+      JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: './check test' } }] },
+      }),
+      JSON.stringify({ type: 'user' }),
+    ]);
+    await runProviderAgent('prompt', null, { value: '' }, undefined, undefined, undefined, true);
+    expect(mockIsCheckInvocation).toHaveBeenCalledOnce();
+    expect(mockRecordCheckOutcome).toHaveBeenCalledOnce();
+  });
+
+  it('does NOT record an outcome for non-check Bash invocations', async () => {
+    mockIsCheckInvocation.mockReturnValueOnce(false);
+    emitStream([
+      JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'npm test' } }] },
+      }),
+      JSON.stringify({ type: 'user' }),
+    ]);
+    await runProviderAgent('prompt', null, { value: '' }, undefined, undefined, undefined, true);
+    expect(mockRecordCheckOutcome).not.toHaveBeenCalled();
+  });
+
+  it('does NOT call isCheckInvocation for non-Bash tools', async () => {
+    emitStream([
+      JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: './check' } }] },
+      }),
+      JSON.stringify({ type: 'user' }),
+    ]);
+    await runProviderAgent('prompt', null, { value: '' }, undefined, undefined, undefined, true);
+    expect(mockIsCheckInvocation).not.toHaveBeenCalled();
+    expect(mockRecordCheckOutcome).not.toHaveBeenCalled();
+  });
+
+  it('passes a string of at most 200 chars to isCheckInvocation (slice cap)', async () => {
+    // JSON.stringify({ command: longCommand }) produces >200 chars;
+    // the runner must slice before calling isCheckInvocation.
+    const longCommand = './check test ' + 'x'.repeat(300);
+    emitStream([
+      JSON.stringify({
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: longCommand } }] },
+      }),
+    ]);
+    await runProviderAgent('prompt', null, { value: '' }, undefined, undefined, undefined, true);
+    expect(mockIsCheckInvocation).toHaveBeenCalledOnce();
+    const [arg] = mockIsCheckInvocation.mock.calls[0] as [string];
+    expect(arg.length).toBeLessThanOrEqual(200);
+    // Confirm the raw JSON would have exceeded 200 chars — otherwise the test proves nothing
+    expect(JSON.stringify({ command: longCommand }).length).toBeGreaterThan(200);
+  });
+});
+
+describe('drainJsonChunks — dispatch completeness', () => {
+  beforeEach(() => {
+    mockSendLog.mockClear();
+    vi.mocked(spawn).mockReset();
+  });
+
+  it.each([
+    ['assistant', { type: 'assistant', message: { content: [] } }],
+    ['result', { type: 'result', result: '' }],
+    ['error', { type: 'error', error: { message: 'oops' } }],
+    ['system', { type: 'system' }],
+    ['user', { type: 'user' }],
+  ])('event type "%s" does not fall through to the unknown-type branch', async (eventType, payload) => {
+    emitStream([JSON.stringify(payload)]);
+    await runProviderAgent('prompt', null, { value: '' });
+    const unknownCalls = mockSendLog.mock.calls.filter(
+      (args: unknown[]) =>
+        typeof args[1] === 'string' && args[1].includes(`[claude-stream unknown type: ${eventType}]`),
+    );
+    expect(unknownCalls).toHaveLength(0);
+  });
+});

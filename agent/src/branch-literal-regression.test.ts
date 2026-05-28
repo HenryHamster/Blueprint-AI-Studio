@@ -73,8 +73,8 @@ const ALLOWLIST: AllowEntry[] = [
     // hardcoded 'main' default is the documented behavior: payload →
     // project_metadata.integration_branch → fallback. Every other agent
     // call site must route through this helper.
-    path: 'handlers/review-fix.ts',
-    line: 340,
+    path: 'prompts/review-prompt.ts',
+    line: 281,
     pattern: 'fallback-main',
     rationale:
       "buildRollupReviewGuidance is downstream of resolveBaseBranch; the " +
@@ -82,8 +82,8 @@ const ALLOWLIST: AllowEntry[] = [
       "for a UI display string, not a branch-decision regression.",
   },
   {
-    path: 'handlers/review-fix.ts',
-    line: 781,
+    path: 'prompts/review-prompt.ts',
+    line: 105,
     pattern: 'fallback-main',
     rationale:
       "Local-variable defensive default downstream of resolveBaseBranch; " +

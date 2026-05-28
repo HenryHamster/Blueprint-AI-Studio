@@ -30,6 +30,15 @@ vi.mock('../workspacePrep.js', () => ({
   prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
 }));
 
+// handlers/index.ts imports the three audit handlers from ./audits.js.
+// Mock them here so the registry tests are isolated from the audit handler
+// implementation; the implementations are exercised in audits.test.ts.
+vi.mock('./audits.js', () => ({
+  handleSecurityAudit: vi.fn().mockResolvedValue(undefined),
+  handleSelfAudit: vi.fn().mockResolvedValue(undefined),
+  handleReleaseAudit: vi.fn().mockResolvedValue(undefined),
+}));
+
 // Mock fs and child_process so handler files that import them at module level
 // don't cause side effects.
 vi.mock('fs', () => ({
