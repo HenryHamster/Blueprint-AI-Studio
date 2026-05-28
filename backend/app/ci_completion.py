@@ -876,12 +876,30 @@ async def _attempt_merge_with_retry_and_escalation(
                 f"  4. Commit the resolution and force-push with `--force-with-lease`.\n\n"
                 f"Original merge error: {merge_msg[:500]}"
             )
+            # Defense-in-depth (incident 2026-05-26..28): prefer the PR's
+            # actual head ref over our parent-task-derived ``ci_branch`` when
+            # they diverge.  The agent always pushes to ``blueprint/...`` but
+            # the orchestrator derives from per-project namespace, so a
+            # misconfigured ``task_branch_namespace`` strands the fix-task's
+            # initial ``git clone --branch`` against a nonexistent ref.  The
+            # PR is the source of truth for the branch we're trying to fix.
+            _pr_head_ref = (_recheck_pr or {}).get("head", {}).get("ref", "")
+            _spawn_branch = ci_branch
+            if _pr_head_ref and ci_branch and _pr_head_ref != ci_branch:
+                logger.warning(
+                    "[CI] PR #%s branch drift: derived=%r vs PR.head.ref=%r — "
+                    "using PR head ref for fix-spawn to avoid clone-against-missing-branch",
+                    ci_pr_number,
+                    ci_branch,
+                    _pr_head_ref,
+                )
+                _spawn_branch = _pr_head_ref
             fix_task, _ = await _spawn_pipeline_task(
                 task,
                 "fix",
                 session,
                 ci_pr_number,
-                ci_branch,
+                _spawn_branch,
                 ci_base,
                 fix_prompt=conflict_prompt,
                 original_task_id=ci_orig_id,

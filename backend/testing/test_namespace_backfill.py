@@ -77,15 +77,89 @@ class TestBackfillTaskBranchNamespace:
         assert project.build_config["task_branch_namespace"] == "blueprint"
 
     @pytest.mark.asyncio
-    async def test_blueprintaistudio_repo_slugifies_normally(self):
-        """github_repo='BlueprintAIStudio' that is NOT the self-repo gets slugified namespace."""
+    async def test_blueprintaistudio_repo_alias_gets_blueprint_even_when_flag_false(self):
+        """``github_repo='BlueprintAIStudio'`` with ``is_self_repo=False`` still
+        gets the ``"blueprint"`` namespace.  This is the wedge for incident
+        2026-05-26..28: Blueprint's own project had the flag misset False,
+        so the slug path wrote ``"blueprintaistudio"`` and every
+        merge-conflict fix-spawn tried to clone a nonexistent branch."""
         project = _project(github_repo="BlueprintAIStudio", is_self_repo=False)
         session = _make_session([project])
 
         summary = await backfill_task_branch_namespace(session)
 
         assert summary["namespace_filled"] == 1
-        assert project.build_config["task_branch_namespace"] == "blueprintaistudio"
+        assert project.build_config["task_branch_namespace"] == "blueprint"
+
+    @pytest.mark.asyncio
+    async def test_self_repo_with_stale_namespace_is_corrected(self):
+        """Self-repo project with a stale non-``"blueprint"`` namespace is
+        force-overwritten on backfill — without this corrective path the
+        idempotent skip silently preserved the bug indefinitely."""
+        project = _project(
+            is_self_repo=True,
+            build_config={"task_branch_namespace": "blueprintaistudio"},
+        )
+        session = _make_session([project])
+
+        summary = await backfill_task_branch_namespace(session)
+
+        assert summary["namespace_corrected"] == 1
+        assert summary["namespace_skipped"] == 0
+        assert summary["namespace_filled"] == 0
+        assert project.build_config["task_branch_namespace"] == "blueprint"
+
+    @pytest.mark.asyncio
+    async def test_blueprintaistudio_alias_with_stale_namespace_is_corrected(self):
+        """``BlueprintAIStudio`` alias + ``is_self_repo=False`` + stale stored
+        namespace = corrected.  The exact production state of project
+        ``37d445e1`` before the wedge landed."""
+        project = _project(
+            github_repo="BlueprintAIStudio",
+            is_self_repo=False,
+            build_config={"task_branch_namespace": "blueprintaistudio"},
+        )
+        session = _make_session([project])
+
+        summary = await backfill_task_branch_namespace(session)
+
+        assert summary["namespace_corrected"] == 1
+        assert project.build_config["task_branch_namespace"] == "blueprint"
+
+    @pytest.mark.asyncio
+    async def test_self_repo_already_correct_is_skipped(self):
+        """Self-repo project already at ``"blueprint"`` is left untouched."""
+        project = _project(
+            is_self_repo=True,
+            build_config={"task_branch_namespace": "blueprint"},
+        )
+        session = _make_session([project])
+
+        summary = await backfill_task_branch_namespace(session)
+
+        assert summary["namespace_skipped"] == 1
+        assert summary["namespace_corrected"] == 0
+        assert summary["namespace_filled"] == 0
+
+    @pytest.mark.asyncio
+    async def test_non_blueprint_repo_with_stale_namespace_is_still_skipped(self):
+        """The corrective overwrite is Blueprint-only: an unrelated project
+        whose stored namespace looks stale is NOT touched — operators may
+        have set a custom value deliberately."""
+        project = _project(
+            github_repo="acme-service",
+            is_self_repo=False,
+            build_config={"task_branch_namespace": "operator-chose-this"},
+        )
+        session = _make_session([project])
+
+        summary = await backfill_task_branch_namespace(session)
+
+        assert summary["namespace_skipped"] == 1
+        assert summary["namespace_corrected"] == 0
+        assert (
+            project.build_config["task_branch_namespace"] == "operator-chose-this"
+        )
 
     @pytest.mark.asyncio
     async def test_idempotent_second_call_skips(self):

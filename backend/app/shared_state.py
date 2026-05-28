@@ -807,8 +807,11 @@ async def backfill_branch_columns(session, project_id=None) -> dict:
                     ),
                 )
                 session.add(alert)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as alert_exc:  # noqa: BLE001
+                logger.debug(
+                    "[BRANCH_BACKFILL] alert insertion failed (non-fatal): %s",
+                    alert_exc,
+                )
             summary["errored"] += 1
             continue
 
@@ -834,29 +837,66 @@ async def backfill_branch_columns(session, project_id=None) -> dict:
     return summary
 
 
+# Historical Blueprint repo aliases whose canonical task-branch namespace is
+# "blueprint".  Slug-derivation of "BlueprintAIStudio" would otherwise produce
+# "blueprintaistudio" — divergent from what the agent's hardcoded push path
+# uses, which strands every merge-conflict fix spawn (incident 2026-05-26..28,
+# six failed fix tasks before the wedge below landed).
+_BLUEPRINT_REPO_ALIASES = frozenset({"blueprintaistudio"})
+
+
+def _is_blueprint_self_repo(project) -> bool:
+    """True when *project* should use the canonical ``"blueprint"`` namespace.
+
+    Catches both the correctly-flagged case (``is_self_repo=True``) and the
+    historically-broken case where ``is_self_repo`` is misset False but the
+    GitHub repo name is a known Blueprint alias.
+    """
+    if getattr(project, "is_self_repo", False):
+        return True
+    github_repo = getattr(project, "github_repo", "") or ""
+    return github_repo.lower() in _BLUEPRINT_REPO_ALIASES
+
+
 async def backfill_task_branch_namespace(session, project_id=None) -> dict:
-    """Populate missing task_branch_namespace in build_config for legacy projects.
+    """Populate or correct ``task_branch_namespace`` in ``build_config``.
 
-    Runs at startup and via the admin backfill endpoint.  Idempotent: only
-    writes projects where build_config['task_branch_namespace'] is absent or
-    empty.  Self-repo (Blueprint) projects always get 'blueprint'; all others
-    get the slugified GitHub repo name (matching _derive_task_branch_namespace
-    in admin_onboard.py).
+    Runs at startup and via the admin backfill endpoint.
 
-    When project_id is provided, only that project is processed.
+    Two paths:
+      * **Fill-when-empty (legacy):** if the namespace is absent or empty, set
+        it to ``"blueprint"`` for Blueprint self-repo projects and to a
+        slugified ``github_repo`` for everything else.  Mirrors
+        ``_derive_task_branch_namespace`` in ``admin_onboard.py``.
+      * **Corrective overwrite (incident 2026-05-26..28):** if the project is
+        the Blueprint self-repo (by flag or by historical alias —
+        ``BlueprintAIStudio``) but the persisted namespace differs from
+        ``"blueprint"``, force-overwrite it.  The agent always pushes to
+        ``blueprint/...``; an out-of-sync orchestrator-side namespace makes
+        every merge-conflict fix-spawn try to clone a nonexistent branch.
+        Six failed fix tasks tripped this in ~36h before the wedge landed.
 
-    Returns a summary dict:
-      {
-        "namespace_filled": int,   # projects updated
-        "namespace_skipped": int,  # projects already had a value
-      }
+    Idempotent for projects already at the expected value.  When *project_id*
+    is provided only that project is processed.
+
+    Returns a summary dict::
+
+        {
+          "namespace_filled":    int,  # missing value populated
+          "namespace_skipped":   int,  # already correct, untouched
+          "namespace_corrected": int,  # stale value overwritten
+        }
     """
     import re as _re
 
     from app.models import Project
     from sqlmodel import select
 
-    summary = {"namespace_filled": 0, "namespace_skipped": 0}
+    summary = {
+        "namespace_filled": 0,
+        "namespace_skipped": 0,
+        "namespace_corrected": 0,
+    }
 
     try:
         query = select(Project)
@@ -870,27 +910,52 @@ async def backfill_task_branch_namespace(session, project_id=None) -> dict:
 
     for project in projects:
         build_config = project.build_config or {}
-        if build_config.get("task_branch_namespace"):
+        current_ns = build_config.get("task_branch_namespace") or ""
+        github_repo = getattr(project, "github_repo", "") or ""
+        is_blueprint = _is_blueprint_self_repo(project)
+
+        if is_blueprint:
+            expected_ns = "blueprint"
+            if current_ns == expected_ns:
+                summary["namespace_skipped"] += 1
+                continue
+            if current_ns:
+                logger.warning(
+                    "[NS_BACKFILL] project %s (%s): correcting stale namespace %r -> %r",
+                    project.id,
+                    github_repo or "<no-repo>",
+                    current_ns,
+                    expected_ns,
+                )
+                summary["namespace_corrected"] += 1
+            else:
+                summary["namespace_filled"] += 1
+            project.build_config = {
+                **build_config,
+                "task_branch_namespace": expected_ns,
+            }
+            flag_modified(project, "build_config")
+            session.add(project)
+            continue
+
+        # Non-Blueprint project: legacy fill-when-empty path remains idempotent.
+        if current_ns:
             summary["namespace_skipped"] += 1
             continue
 
-        github_repo = getattr(project, "github_repo", "") or ""
-        if project.is_self_repo:
-            namespace = "blueprint"
-        else:
-            slug = _re.sub(r"[^a-z0-9]+", "-", github_repo.lower()).strip("-")
-            namespace = slug[:40] if slug else "project"
-
+        slug = _re.sub(r"[^a-z0-9]+", "-", github_repo.lower()).strip("-")
+        namespace = slug[:40] if slug else "project"
         project.build_config = {**build_config, "task_branch_namespace": namespace}
         flag_modified(project, "build_config")
         session.add(project)
         summary["namespace_filled"] += 1
 
-    if summary["namespace_filled"]:
+    if summary["namespace_filled"] or summary["namespace_corrected"]:
         logger.info(
-            "[NS_BACKFILL] complete: namespace_filled=%d namespace_skipped=%d",
+            "[NS_BACKFILL] complete: namespace_filled=%d namespace_skipped=%d namespace_corrected=%d",
             summary["namespace_filled"],
             summary["namespace_skipped"],
+            summary["namespace_corrected"],
         )
 
     return summary
@@ -2474,7 +2539,7 @@ def get_reaper_halt_state() -> Dict[str, Any]:
     Returns a safe default dict when the reaper module is not yet imported.
     """
     try:
-        import app.reaper as _reaper_mod  # noqa: PLC0415
+        import app.reaper as _reaper_mod
 
         state = _reaper_mod._reaper_halt_state
         ts = state.get("halt_timestamp")
@@ -2505,7 +2570,7 @@ def reset_reaper_halt_state() -> bool:
     False if it was not halted.
     """
     try:
-        import app.reaper as _reaper_mod  # noqa: PLC0415
+        import app.reaper as _reaper_mod
 
         state = _reaper_mod._reaper_halt_state
         if not state.get("halted"):

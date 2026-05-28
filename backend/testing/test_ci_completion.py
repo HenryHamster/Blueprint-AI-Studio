@@ -2087,6 +2087,85 @@ async def test_suppress_warm_handoff_merge_conflict(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_merge_conflict_uses_pr_head_ref_on_drift(db_session, mocker, caplog):
+    """When the spawn-derived ``ci_branch`` diverges from the PR's actual
+    ``head.ref`` (incident 2026-05-26..28: misconfigured
+    ``task_branch_namespace`` made the orchestrator derive
+    ``blueprintaistudio/refactor-X`` while the agent had pushed
+    ``blueprint/refactor-X``), the fix-spawn must use ``PR.head.ref`` — not
+    the stale derived branch — and log a drift warning.
+
+    Without this correction the fix task's ``git clone --branch`` runs
+    against a nonexistent branch and exhausts its 3 retries, leaving the
+    parent PR stranded and burning an agent-VM provision per incident."""
+    import logging
+
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "merged": False,
+            "state": "open",
+            "head": {"ref": "blueprint/test-branch", "sha": "abc"},
+        },
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": False, "conflict": True, "message": "merge conflict"},
+    )
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+
+    project = Project(name="Drift correction test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Parent task has the stale derived branch in review_loop + payload —
+    # exactly the production state when the wedge was missing.
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"branch": "blueprintaistudio/test-branch"},
+    )
+    task.payloads = [
+        {
+            "type": "review",
+            "pr_number": 42,
+            "branch": "blueprintaistudio/test-branch",
+            "base_branch": "main",
+        }
+    ]
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    with caplog.at_level(logging.WARNING, logger="app.ci_completion"):
+        await _attempt_merge_with_retry_and_escalation(
+            task, "fake-token", "owner", "repo", db_session, source="poll"
+        )
+
+    spawn_mock.assert_called_once()
+    # branch is the 5th positional argument to _spawn_pipeline_task
+    # (task, "fix", session, ci_pr_number, branch, base, ...)
+    spawn_branch_arg = spawn_mock.call_args.args[4]
+    assert spawn_branch_arg == "blueprint/test-branch", (
+        f"Drift correction must use PR.head.ref='blueprint/test-branch', "
+        f"not the stale derived branch — got {spawn_branch_arg!r}"
+    )
+    drift_warnings = [
+        r for r in caplog.records if "branch drift" in r.getMessage()
+    ]
+    assert drift_warnings, "Expected a 'branch drift' WARNING to be logged"
+
+
+@pytest.mark.asyncio
 async def test_suppress_warm_handoff_merge_blocked_rebase(db_session, mocker):
     """Issue 9b: ci_completion.py:568 merge-blocked rebase spawn (transient
     merge failure that survives retries with no existing in-flight fix) must
