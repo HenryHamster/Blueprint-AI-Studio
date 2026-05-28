@@ -48,6 +48,14 @@ from app.payload_schemas import (
 )
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 from app import release_qualifier, release_version
+from app.admin_helpers import (  # noqa: F401
+    _ROLE_LEVEL,
+    _user_project_ids,
+    _get_user_project,
+    _get_user_project_with_role,
+    _get_user_task,
+    _get_user_task_with_role,
+)
 
 
 # Per-loop max attempt budgets. lint/test mirror agent/src/constants.ts
@@ -174,101 +182,6 @@ def _record_failure_result(task: Task, failure_class: str) -> None:
 router = APIRouter(
     prefix="/api/admin", tags=["admin"], dependencies=[Depends(get_current_user)]
 )
-
-_ROLE_LEVEL = {"viewer": 0, "member": 1, "owner": 2}
-
-
-def _user_project_ids(user_id: str):
-    """Subquery returning project IDs the user is a member of (any role)."""
-    return select(ProjectMember.project_id).where(ProjectMember.user_id == user_id)
-
-
-async def _get_user_project(
-    project_id: uuid.UUID, user_id: str, session: AsyncSession
-) -> Project:
-    """Fetch a project ensuring the user is a member. Raises 404 if not found."""
-    project = await session.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    member = (
-        await session.execute(
-            select(ProjectMember).where(
-                ProjectMember.project_id == project_id,
-                ProjectMember.user_id == user_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if not member:
-        raise HTTPException(status_code=404, detail="Project not found")
-    return project
-
-
-async def _get_user_project_with_role(
-    project_id: uuid.UUID, user_id: str, session: AsyncSession, min_role: str = "viewer"
-) -> Project:
-    """Fetch a project ensuring the user has at least min_role. Raises 403 if insufficient."""
-    project = await session.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    member = (
-        await session.execute(
-            select(ProjectMember).where(
-                ProjectMember.project_id == project_id,
-                ProjectMember.user_id == user_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if not member:
-        raise HTTPException(status_code=404, detail="Project not found")
-    if _ROLE_LEVEL.get(member.role, 0) < _ROLE_LEVEL[min_role]:
-        raise HTTPException(
-            status_code=403, detail=f"Requires {min_role} role on this project"
-        )
-    return project
-
-
-async def _get_user_task(
-    task_id: uuid.UUID, user_id: str, session: AsyncSession
-) -> Task:
-    """Fetch a task ensuring the user is a member of its project. Raises 404 if not found."""
-    task = await session.get(Task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    member = (
-        await session.execute(
-            select(ProjectMember).where(
-                ProjectMember.project_id == task.project_id,
-                ProjectMember.user_id == user_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if not member:
-        raise HTTPException(status_code=404, detail="Task not found")
-    return task
-
-
-async def _get_user_task_with_role(
-    task_id: uuid.UUID, user_id: str, session: AsyncSession, min_role: str = "member"
-) -> Task:
-    """Fetch a task ensuring the user has at least min_role on its project."""
-    task = await session.get(Task, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-    member = (
-        await session.execute(
-            select(ProjectMember).where(
-                ProjectMember.project_id == task.project_id,
-                ProjectMember.user_id == user_id,
-            )
-        )
-    ).scalar_one_or_none()
-    if not member:
-        raise HTTPException(status_code=404, detail="Task not found")
-    if _ROLE_LEVEL.get(member.role, 0) < _ROLE_LEVEL[min_role]:
-        raise HTTPException(
-            status_code=403, detail=f"Requires {min_role} role on this project"
-        )
-    return task
 
 
 TERMINAL_STATUSES = [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
