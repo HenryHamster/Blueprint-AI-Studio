@@ -1083,7 +1083,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         _healthy_accounts = sum(
             1
             for a in _all_pool_accounts
-            if _pool_mod._account_available_for_model(a, "claude-opus-4-7")
+            if _pool_mod._account_available_for_model(a, "claude-opus-4-8")
         )
         _cap_by_accounts = _healthy_accounts * 3
     else:

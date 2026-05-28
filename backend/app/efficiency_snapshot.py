@@ -102,6 +102,7 @@ ALL_AXES: tuple[str, ...] = (
 # timeout and kill cases are covered. Gemini pricing entries below price those estimates.
 LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
     # Anthropic
+    ("anthropic", "claude-opus-4-8"): (15e-6, 75e-6),
     ("anthropic", "claude-opus-4-7"): (15e-6, 75e-6),
     ("anthropic", "claude-opus-4-6"): (15e-6, 75e-6),
     ("anthropic", "claude-sonnet-4-6"): (3e-6, 15e-6),

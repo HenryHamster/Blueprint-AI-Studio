@@ -928,7 +928,7 @@ async def reset_account_rate_limits(
 async def clear_account_model_regression_quarantine(
     account_id: str,
     provider: str = Query(..., description="provider name (e.g. anthropic)"),
-    model: str = Query(..., description="exact model name (e.g. claude-opus-4-7)"),
+    model: str = Query(..., description="exact model name (e.g. claude-opus-4-8)"),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):

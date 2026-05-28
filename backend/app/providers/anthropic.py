@@ -47,10 +47,21 @@ _QUOTA_EXHAUSTED_PATTERNS: tuple[str, ...] = (
 )
 
 _DEFAULT_TIER_MODELS = {
-    "opus": "claude-opus-4-7",
+    "opus": "claude-opus-4-8",
     "sonnet": "claude-sonnet-4-6",
     "haiku": "claude-haiku-4-5-20251001",
 }
+
+# Opus model IDs the executor may run as. Advisor pairing is gated on this set
+# (an opus executor silently ignores an opus advisor); keeping prior opus
+# versions here means a version bump doesn't re-enable a dead advisor knob on a
+# task still pinned to the older opus.
+_OPUS_MODELS: frozenset[str] = frozenset(
+    {
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+    }
+)
 
 
 # Models that accept the `[1m]` suffix for 1M-token context. Per Anthropic
@@ -59,6 +70,7 @@ _DEFAULT_TIER_MODELS = {
 # suffix with an unsupported marker when the effective model can't use it.
 _1M_CONTEXT_MODELS: frozenset[str] = frozenset(
     {
+        "claude-opus-4-8",
         "claude-opus-4-7",
         "claude-opus-4-6",
         "claude-sonnet-4-6",
@@ -131,6 +143,7 @@ class AnthropicProvider(LLMProvider):
                 "model": {
                     "type": "string",
                     "enum": [
+                        "claude-opus-4-8",
                         "claude-opus-4-7",
                         "claude-sonnet-4-6",
                         "claude-haiku-4-5-20251001",
@@ -156,7 +169,7 @@ class AnthropicProvider(LLMProvider):
                     "description": (
                         "Opt into the 1M-token context window. Appends `[1m]` to "
                         "the model ID so Claude Code routes to the 1M variant. "
-                        "Requires opus-4-7, opus-4-6, or sonnet-4-6 — haiku "
+                        "Requires opus-4-8, opus-4-7, opus-4-6, or sonnet-4-6 — haiku "
                         "ignores the suffix (we drop it with an unsupported "
                         "marker). 1M costs more and is only worth it when the "
                         "prompt or exploration genuinely needs the extra window."
@@ -175,6 +188,7 @@ class AnthropicProvider(LLMProvider):
                 "fallback_model": {
                     "type": "string",
                     "enum": [
+                        "claude-opus-4-8",
                         "claude-opus-4-7",
                         "claude-sonnet-4-6",
                         "claude-haiku-4-5-20251001",
@@ -210,7 +224,7 @@ class AnthropicProvider(LLMProvider):
                         "enabled": {"type": "boolean"},
                         "model": {
                             "type": "string",
-                            "enum": ["claude-opus-4-7"],
+                            "enum": ["claude-opus-4-8", "claude-opus-4-7"],
                         },
                     },
                 },
@@ -239,7 +253,7 @@ class AnthropicProvider(LLMProvider):
             elif use_1m:
                 unsupported.append(
                     f"use_1m_context=true requires a 1M-capable model "
-                    f"(opus-4-7, opus-4-6, sonnet-4-6); effective model "
+                    f"(opus-4-8, opus-4-7, opus-4-6, sonnet-4-6); effective model "
                     f"{model!r} — suffix dropped, plain --model sent"
                 )
                 args += ["--model", model]
@@ -281,8 +295,8 @@ class AnthropicProvider(LLMProvider):
             # executor model must be non-opus for pairing to make sense. When
             # configured we append a prompt fragment so the executor at least
             # behaves advisor-ish, and log it as unsupported for observability.
-            if model == "claude-opus-4-7":
-                unsupported.append("advisor.enabled (ignored: executor is opus-4-7)")
+            if model in _OPUS_MODELS:
+                unsupported.append(f"advisor.enabled (ignored: executor is {model})")
             else:
                 prompt_fragments.append(
                     "An opus-class advisor is available in principle, but the "

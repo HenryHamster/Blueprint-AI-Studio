@@ -269,7 +269,7 @@ runtime_config: Dict = {
     # can enable provider-aware resolution without another config shape change.
     "provider_tier_model_map": {
         "anthropic": {
-            "opus": "claude-opus-4-7",
+            "opus": "claude-opus-4-8",
             "sonnet": "claude-sonnet-4-6",
             "haiku": "claude-haiku-4-5-20251001",
         },
@@ -342,8 +342,8 @@ runtime_config: Dict = {
         "anthropic": {
             "low": {"model": "claude-haiku-4-5-20251001", "effort": "low"},
             "medium": {"model": "claude-sonnet-4-6", "effort": "medium"},
-            "high": {"model": "claude-opus-4-7", "effort": "high"},
-            "max": {"model": "claude-opus-4-7", "effort": "max"},
+            "high": {"model": "claude-opus-4-8", "effort": "high"},
+            "max": {"model": "claude-opus-4-8", "effort": "max"},
         },
         "openai": {
             # Verbosity is graded to task-type category, not capability:

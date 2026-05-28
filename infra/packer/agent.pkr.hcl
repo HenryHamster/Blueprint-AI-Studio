@@ -44,6 +44,10 @@ variable "cache_repo" {
 # - Current HEAD memo handler state: full extraction path and reopen retry are correct
 #   on main; this rebuild bakes these fixes into the deployed agent image.
 # Rebuild trigger 2026-05-27: redeploy after memo task c461ab10 failed on stale handler — ensure PR #5792 / #5921 / #6138 are in active VM image.
+# Rebuild trigger 2026-05-28: pipeline default Opus bumped claude-opus-4-7 -> claude-opus-4-8.
+# The @anthropic-ai/claude-code install below is unpinned, so this rebuild bakes the current
+# CLI that recognizes `--model claude-opus-4-8`. Bake + deploy this image BEFORE flipping the
+# live runtime_config to opus-4-8 — otherwise every Anthropic task fails on an unknown --model.
 source "googlecompute" "agent_image" {
   project_id          = var.project_id
   source_image_family = "ubuntu-2204-lts"

@@ -1024,34 +1024,41 @@ class TestMaxPlanAccountPool:
         )  # second hit → count=2 → 60 min cooldown
 
     # ── Model tier cascade tests ──────────────────────────────────────────────
-    # Post-opus-4-7 migration: all new tasks use claude-opus-4-7. Haiku shares
+    # Post-opus-4-8 migration: all new tasks use claude-opus-4-8. Haiku shares
     # Opus's meter exactly — it has no separate bucket, so rate-limit tracking
-    # normalizes Haiku → Opus via _normalize_rl_model(). Legacy 4-6 model names
-    # (claude-opus-4-6, claude-sonnet-4-6) still cascade to the opus-4-7 bucket
-    # so prior-queued tasks resolve correctly against the current meter.
+    # normalizes Haiku → Opus via _normalize_rl_model(). Legacy model names
+    # (claude-opus-4-7, claude-opus-4-6, claude-sonnet-4-6) still cascade to the
+    # opus-4-8 bucket so prior-queued tasks resolve correctly against the current
+    # meter.
 
-    def test_cascade_opus_4_7_covers_opus_4_7(self):
-        """Primary model: opus-4-7 cascade is a single entry under the new single-tier
+    def test_cascade_opus_4_8_covers_opus_4_8(self):
+        """Primary model: opus-4-8 cascade is a single entry under the single-tier
         architecture (no separate sonnet bucket)."""
-        cascade = cascade_disabled_models("claude-opus-4-7")
-        assert cascade == ("claude-opus-4-7",)
+        cascade = cascade_disabled_models("claude-opus-4-8")
+        assert cascade == ("claude-opus-4-8",)
 
-    def test_cascade_legacy_opus_4_6_maps_to_opus_4_7(self):
-        """Legacy opus-4-6 cascades to the current opus-4-7 meter so prior-queued
+    def test_cascade_legacy_opus_4_7_maps_to_opus_4_8(self):
+        """Legacy opus-4-7 cascades to the current opus-4-8 meter so prior-queued
+        tasks still disable the shared bucket correctly."""
+        cascade = cascade_disabled_models("claude-opus-4-7")
+        assert cascade == ("claude-opus-4-8",)
+
+    def test_cascade_legacy_opus_4_6_maps_to_opus_4_8(self):
+        """Legacy opus-4-6 cascades to the current opus-4-8 meter so prior-queued
         tasks still disable the shared bucket correctly."""
         cascade = cascade_disabled_models("claude-opus-4-6")
-        assert cascade == ("claude-opus-4-7",)
+        assert cascade == ("claude-opus-4-8",)
 
-    def test_cascade_legacy_sonnet_4_6_maps_to_opus_4_7(self):
-        """Legacy sonnet-4-6 cascades to opus-4-7 (single shared meter) — there is no
+    def test_cascade_legacy_sonnet_4_6_maps_to_opus_4_8(self):
+        """Legacy sonnet-4-6 cascades to opus-4-8 (single shared meter) — there is no
         longer a separate sonnet-only bucket under the post-migration architecture."""
         cascade = cascade_disabled_models("claude-sonnet-4-6")
-        assert cascade == ("claude-opus-4-7",)
+        assert cascade == ("claude-opus-4-8",)
 
-    def test_cascade_haiku_normalizes_to_opus_4_7(self):
-        """Haiku shares Opus's meter — cascade must key off Opus-4-7's bucket."""
+    def test_cascade_haiku_normalizes_to_opus_4_8(self):
+        """Haiku shares Opus's meter — cascade must key off Opus-4-8's bucket."""
         cascade = cascade_disabled_models("claude-haiku-4-5-20251001")
-        assert cascade == ("claude-opus-4-7",)
+        assert cascade == ("claude-opus-4-8",)
         assert "claude-haiku-4-5-20251001" not in cascade
 
     def test_cascade_disabled_models_unknown_falls_back_to_single(self):
@@ -1063,8 +1070,8 @@ class TestMaxPlanAccountPool:
     def test_opus_rate_limit_blocks_opus_and_haiku_via_mark_cascade(
         self, clean_max_plan_pool
     ):
-        """After an Opus-4-7 429, the mark path writes the opus-4-7 cascade entry.
-        A Haiku lookup normalizes to Opus-4-7, so haiku requests are also blocked."""
+        """After an Opus-4-8 429, the mark path writes the opus-4-8 cascade entry.
+        A Haiku lookup normalizes to Opus-4-8, so haiku requests are also blocked."""
         now = datetime.utcnow()
         acct = {
             "id": "a1",
@@ -1074,11 +1081,11 @@ class TestMaxPlanAccountPool:
             "oauth_token": "sk-ant-test",
             "disabled_models": {
                 m: {"hits": 1, "at": now}
-                for m in cascade_disabled_models("claude-opus-4-7")
+                for m in cascade_disabled_models("claude-opus-4-8")
             },
         }
-        assert _account_available_for_model(acct, "claude-opus-4-7") is False
-        # Haiku normalizes to Opus-4-7 → also blocked (shared meter).
+        assert _account_available_for_model(acct, "claude-opus-4-8") is False
+        # Haiku normalizes to Opus-4-8 → also blocked (shared meter).
         assert _account_available_for_model(acct, "claude-haiku-4-5-20251001") is False
 
     def test_account_available_unknown_model_skips_account_with_disables(
@@ -1094,7 +1101,7 @@ class TestMaxPlanAccountPool:
             "active_tasks": 0,
             "oauth_token": "sk-ant-test",
             "disabled_models": {
-                "claude-opus-4-7": {"hits": 1, "at": datetime.utcnow()}
+                "claude-opus-4-8": {"hits": 1, "at": datetime.utcnow()}
             },
         }
         assert _account_available_for_model(acct, None) is False
@@ -1116,7 +1123,7 @@ class TestMaxPlanAccountPool:
     async def test_select_skips_account_after_opus_rate_limit_cascade(
         self, clean_max_plan_pool
     ):
-        """After an Opus-4-7 429 marks the opus-4-7 meter, another Opus-4-7 request must
+        """After an Opus-4-8 429 marks the opus-4-8 meter, another Opus-4-8 request must
         skip that account in favor of a healthy one — even if the healthy
         account has more active tasks."""
         now = datetime.utcnow()
@@ -1128,7 +1135,7 @@ class TestMaxPlanAccountPool:
                 "active_tasks": 0,
                 "disabled_models": {
                     m: {"hits": 1, "at": now}
-                    for m in cascade_disabled_models("claude-opus-4-7")
+                    for m in cascade_disabled_models("claude-opus-4-8")
                 },
             }
         )
@@ -1140,7 +1147,7 @@ class TestMaxPlanAccountPool:
                 "active_tasks": 5,
             }
         )
-        result = await select_max_plan_account(_TEST_USER, model="claude-opus-4-7")
+        result = await select_max_plan_account(_TEST_USER, model="claude-opus-4-8")
         assert result is not None
         assert (
             result["id"] == "a2"
@@ -1149,10 +1156,11 @@ class TestMaxPlanAccountPool:
 
 # ─── Circuit Breaker (healthy / probing / unavailable) ──────────────────────
 
-# Post-migration: all new tasks use opus-4-7, haiku shares opus-4-7's meter.
-# Legacy sonnet-4-6 and opus-4-6 still exist in cascade map for backward compat,
-# but tests exercise the current single-tier behavior against opus-4-7 directly.
-OPUS = "claude-opus-4-7"
+# Post-migration: all new tasks use opus-4-8, haiku shares opus-4-8's meter.
+# Legacy opus-4-7, sonnet-4-6 and opus-4-6 still exist in cascade map for
+# backward compat, but tests exercise the current single-tier behavior against
+# opus-4-8 directly.
+OPUS = "claude-opus-4-8"
 HAIKU = "claude-haiku-4-5-20251001"
 
 

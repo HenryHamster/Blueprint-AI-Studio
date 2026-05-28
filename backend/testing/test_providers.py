@@ -341,7 +341,7 @@ class TestOpenAITierAndEffort:
 # ---------------------------------------------------------------------------
 # Anthropic 1M context opt-in — regression for the missed capability.
 # The [1m] suffix on the model ID is the documented activation mechanism;
-# model-gated to opus-4-7, opus-4-6, sonnet-4-6.
+# model-gated to opus-4-8, opus-4-7, opus-4-6, sonnet-4-6.
 # ---------------------------------------------------------------------------
 
 
@@ -349,6 +349,7 @@ class TestAnthropic1MContext:
     @pytest.mark.parametrize(
         "model",
         [
+            "claude-opus-4-8",
             "claude-opus-4-7",
             "claude-opus-4-6",
             "claude-sonnet-4-6",

@@ -17,7 +17,7 @@ async def test_get_settings_includes_provider_scaffolding(client):
     assert "providers" in body
     assert "provider_settings_defaults" in body
     assert "task_type_provider_overrides" in body
-    assert body["provider_tier_model_map"]["anthropic"]["opus"] == "claude-opus-4-7"
+    assert body["provider_tier_model_map"]["anthropic"]["opus"] == "claude-opus-4-8"
     # Categories ship with sensible defaults; user can move task types between them.
     assert "build" in body["task_type_categories"]
     assert "create" in body["task_type_categories"]["build"]

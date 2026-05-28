@@ -44,7 +44,7 @@ from app.max_plan_pool import (
     summarize_pool_state,
 )
 
-OPUS = "claude-opus-4-7"
+OPUS = "claude-opus-4-8"
 HAIKU = "claude-haiku-4-5-20251001"
 
 

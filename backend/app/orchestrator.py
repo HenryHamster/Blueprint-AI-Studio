@@ -447,7 +447,7 @@ from app.orchestrator_health import (  # noqa: F401
 
 
 _ENV_FALLBACK_DEFAULT_MODELS = {
-    "anthropic": "claude-opus-4-7",
+    "anthropic": "claude-opus-4-8",
     "openai": "gpt-5.4",
     "gemini": "gemini-2.5-pro",
 }
