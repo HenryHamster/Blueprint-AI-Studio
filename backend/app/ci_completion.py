@@ -578,6 +578,12 @@ async def _attempt_merge_with_retry_and_escalation(
             _recheck_pr.get("merged") or _recheck_pr.get("state") == "closed"
         ):
             task.status = TaskStatus.COMPLETED
+            # Mark a deliberate success-close so the rollup's _verify_pr_merged
+            # doesn't later re-fetch this now-closed PR, see closed-not-merged,
+            # and downgrade this COMPLETED child back to FAILED (the work landed
+            # via the other task's PR — desired outcome achieved).
+            task.context = {**(task.context or {}), "pr_closed_success": True}
+            flag_modified(task, "context")
             task.latest_status_message = (
                 f"PR #{ci_pr_number} already merged by another task"
             )

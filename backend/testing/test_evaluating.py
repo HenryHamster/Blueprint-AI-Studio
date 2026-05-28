@@ -668,6 +668,83 @@ async def test_verify_pr_merged_closed_pr_sets_status_message(eval_db, mocker):
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker", ["pr_closed_success", "pr_closed_empty"])
+async def test_verify_pr_merged_deliberate_success_close_completes(
+    eval_db, mocker, marker
+):
+    """A PR closed-without-merging that the system marked as a *deliberate
+    success-close* (work landed elsewhere) must COMPLETE the child, not FAIL it.
+
+    Two markers carry this signal:
+      • pr_closed_success — the same change merged via a sibling/dedup PR
+        ("already merged by another task"), or an agent early-exit.
+      • pr_closed_empty   — the empty/branch-equivalent rollup-PR close.
+
+    Failing such a child mislabels a success and can cascade a rollup parent
+    into a partial-failure finalize. Regression for incident 2026-05-28
+    (1a828018 / 6540dd42 'via #6628' were hand-cancelled because the verifier
+    would otherwise have wrongly FAILED them).
+    """
+    from app.rollup_management import _verify_pr_merged
+    from app.models import Artifact, ArtifactType
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="Success Close Verify Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "make a thing"}],
+        status=TaskStatus.COMPLETED,
+        context={marker: True},
+        latest_status_message="done",
+    )
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+
+    eval_db.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/foo/bar/pull/77",
+        )
+    )
+    await eval_db.commit()
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new=AsyncMock(return_value=("tok", "foo", "bar")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "closed", "merged": False}),
+    )
+    # Force the persisting write_session to fail so we also prove the in-memory
+    # mutation (status + pr_merged) is set regardless of the DB write.
+    mocker.patch(
+        "app.rollup_management.AsyncSessionLocal",
+        side_effect=RuntimeError("simulated row lock"),
+    )
+
+    result = await _verify_pr_merged(task, eval_db)
+
+    assert result is True, "success-close child must resolve True (work landed)"
+    assert task.status == TaskStatus.COMPLETED, (
+        f"deliberate success-close must stay COMPLETED, got {task.status}"
+    )
+    assert task.context.get("pr_merged") is True, (
+        "success-close must set pr_merged so the rollup treats work as landed"
+    )
+    assert task.context.get("pr_closed_unmerged") is not True, (
+        "success-close must NOT be flagged as a rejected/abandoned PR"
+    )
+
+
 # ── skip_locked lock contention tests ────────────────────────────────────────
 
 

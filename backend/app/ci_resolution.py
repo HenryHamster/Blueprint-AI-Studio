@@ -25,6 +25,15 @@ qualifier's strict resolution path (originally lifted from
      with ``source="unresolved"`` — the orchestrator must keep polling, never
      promote on the absence of a signal.
 
+The final ``state`` distinguishes a *definitive* absence of CI
+(``state="no_checks"``: the branch HEAD and every reachable PR-event SHA were
+queried successfully and carry zero check-runs) from a *transient* failure to
+resolve (``state="pending"``: an I/O error, or checks still in progress).
+Both keep ``ci_passed=False``, but the orchestrator treats them differently —
+a definitive ``no_checks`` on an internal staging branch (research/plan
+rollups, which CI path-filters out by design) means CI will never run, so the
+merge gate may proceed; a transient ``pending`` must keep polling.
+
 Public API: ``resolve_pr_ci_status``.
 """
 
@@ -193,12 +202,17 @@ async def resolve_pr_ci_status(
             head_shas.append(head_sha)
 
     if not head_shas:
+        # HEAD carries no check-runs and there is no distinct PR-event SHA to
+        # fall back to — CI is *definitively* absent here (we queried and found
+        # nothing), not merely slow. Report ``no_checks`` so the orchestrator
+        # can distinguish "CI will never run" (e.g. an internal staging-branch
+        # PR that CI path-filters out) from a transient resolution failure.
         return {
             "ci_passed": False,
             "conclusion": None,
             "head_sha_resolved": branch_sha,
             "source": "unresolved",
-            "state": _CI_PENDING,
+            "state": _CI_NO_CHECKS,
             "details": [],
         }
 
@@ -208,6 +222,11 @@ async def resolve_pr_ci_status(
     first_red_result: dict | None = None
     first_green_sha: str | None = None
     first_green_result: dict | None = None
+    # Track whether we saw a real in-progress build or a fetch error: either
+    # means the absence of a green/red is *transient* (keep polling), as
+    # opposed to every reachable head definitively carrying zero check-runs.
+    saw_pending = False
+    saw_error = False
     for head_sha in head_shas:
         try:
             pr_checks = await github.get_check_runs_cached(
@@ -226,6 +245,7 @@ async def resolve_pr_ci_status(
                 head_sha[:8],
                 exc,
             )
+            saw_error = True
             continue
         pr_state = _classify_check_runs(pr_checks)
         if pr_state == _CI_RED and first_red_sha is None:
@@ -234,6 +254,8 @@ async def resolve_pr_ci_status(
         elif pr_state == _CI_GREEN and first_green_sha is None:
             first_green_sha = head_sha
             first_green_result = pr_checks
+        elif pr_state == _CI_PENDING:
+            saw_pending = True
 
     if first_red_sha is not None:
         return {
@@ -253,11 +275,15 @@ async def resolve_pr_ci_status(
             "state": _CI_GREEN,
             "details": (first_green_result or {}).get("details", []),
         }
+    # No green and no red across the reachable heads. If any head had checks
+    # in progress (or a fetch errored), the verdict is merely not-final-yet →
+    # ``pending`` (keep polling). Only when every head was queried cleanly and
+    # carried zero check-runs is CI *definitively* absent → ``no_checks``.
     return {
         "ci_passed": False,
         "conclusion": None,
         "head_sha_resolved": branch_sha,
         "source": "unresolved",
-        "state": _CI_PENDING,
+        "state": _CI_PENDING if (saw_pending or saw_error) else _CI_NO_CHECKS,
         "details": [],
     }

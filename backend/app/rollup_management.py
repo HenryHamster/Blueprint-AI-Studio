@@ -59,6 +59,57 @@ logger = logging.getLogger(__name__)
 MAX_REVIEW_RESPAWNS = 5
 
 
+def _branch_task_id_prefix(branch: str | None) -> str:
+    """Recover the owning task's id-prefix from an agent work-branch name.
+
+    Agent work branches are ``{namespace}/{prefix}-{8hex}`` where ``8hex`` is
+    the first 8 hex chars of the task UUID (see
+    ``shared_state.derive_task_branch``). Returns that trailing token
+    lowercased, or ``""`` when the branch doesn't match the shape (custom /
+    promotion / CI-fix branches), so callers can fall back to treating the PR
+    as un-attributable.
+    """
+    if not branch or "/" not in branch:
+        return ""
+    last = branch.rsplit("/", 1)[-1]
+    if "-" not in last:
+        return ""
+    token = last.rsplit("-", 1)[-1].strip().lower()
+    if len(token) == 8 and all(c in "0123456789abcdef" for c in token):
+        return token
+    return ""
+
+
+def _partition_orphan_prs(
+    open_prs: list[dict],
+    cancelled_child_id_prefixes: set[str],
+) -> tuple[list[dict], list[dict]]:
+    """Split staging-branch open PRs into ``(live, orphaned)``.
+
+    A PR is *orphaned* when its head branch maps to a child task that has been
+    CANCELLED: no live task will ever drive it to merge, so blocking the rollup
+    on it strands the parent in EVALUATING forever (incident 2026-05-28: an
+    orphan safeguard PR from a cancelled, retry-replaced child wedged a research
+    rollup — the cancel path left the PR open and it carried 0 CI checks, so the
+    merge gate never fired either).
+
+    Attribution is by the work-branch id-prefix (see
+    :func:`_branch_task_id_prefix`). PRs whose head ref can't be positively
+    attributed to a *cancelled* child are kept **live** — we never close a PR we
+    can't prove belongs to a dead task.
+    """
+    live: list[dict] = []
+    orphan: list[dict] = []
+    for pr in open_prs:
+        head_ref = (pr.get("head") or {}).get("ref") or ""
+        prefix = _branch_task_id_prefix(head_ref)
+        if prefix and prefix in cancelled_child_id_prefixes:
+            orphan.append(pr)
+        else:
+            live.append(pr)
+    return live, orphan
+
+
 def _review_respawn_count(task: Task) -> int:
     """Times the stale-PR rollup recovery has respawned a review for *task*.
 
@@ -361,6 +412,47 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 return True
             # Detect closed-but-not-merged (rejected/abandoned PR) — don't block rollup forever
             if pr_data.get("state") == "closed" and not pr_data.get("merged"):
+                _ctx = task.context or {}
+                # Distinguish a DELIBERATE success-close from a rejection. A PR
+                # can be closed *because the work was already achieved* — not
+                # rejected:
+                #   • pr_closed_empty   — the empty/branch-equivalent rollup PR
+                #     close (review pipeline) found no diff to merge.
+                #   • pr_closed_success — the same change merged via a sibling /
+                #     dedup PR ("already merged by another task", set by
+                #     ci_completion), or an agent exercised its early-exit right.
+                # In those cases the task's desired outcome IS in the target
+                # branch, so the child is COMPLETED, not FAILED — failing it
+                # mislabels a success and can cascade a rollup parent into a
+                # partial-failure finalize. A genuine rejection (review-cap
+                # exhausted, manual close) carries neither marker → stays FAILED.
+                if _ctx.get("pr_closed_empty") or _ctx.get("pr_closed_success"):
+                    logger.info(
+                        f"[PR_VERIFY] Task {task.id} PR #{pr_number} closed without "
+                        f"merging, but marked as a deliberate success-close (work "
+                        f"landed elsewhere) — completing instead of failing"
+                    )
+                    task.context = {**_ctx, "pr_merged": True}
+                    if task.status != TaskStatus.COMPLETED:
+                        task.status = TaskStatus.COMPLETED
+                    try:
+                        async with AsyncSessionLocal() as write_session:
+                            db_task = await write_session.get(Task, task.id)
+                            if db_task:
+                                db_task.context = {
+                                    **(db_task.context or {}),
+                                    "pr_merged": True,
+                                }
+                                if db_task.status != TaskStatus.COMPLETED:
+                                    db_task.status = TaskStatus.COMPLETED
+                                write_session.add(db_task)
+                                await write_session.commit()
+                    except Exception as _sc_err:
+                        logger.warning(
+                            f"[PR_VERIFY] Failed to persist success-close for task "
+                            f"{task.id}: {_sc_err}"
+                        )
+                    return True
                 logger.warning(
                     f"[PR_VERIFY] Task {task.id} PR #{pr_number} was closed without merging — marking as rejected"
                 )
@@ -1244,6 +1336,69 @@ async def _check_and_trigger_rollup(child_task: Task, session: AsyncSession) -> 
                         return
                     else:
                         raise
+
+                # ── Drop orphan PRs left by CANCELLED children ──
+                # A child task that was cancelled (e.g. requeue-replaced after a
+                # timeout, or SCOPE_EMPTY pre-empted) can leave its PR open: no
+                # live task will ever drive it to merge, so blocking the rollup
+                # on it strands the parent in EVALUATING forever (incident
+                # 2026-05-28). The cancel path can't always close it — the PR ref
+                # may live under a non-canonical context key (e.g. a safeguard
+                # PR) so close_orphan_pr_if_any finds nothing. Attribute each
+                # open PR to its owning child by work-branch id-prefix and close
+                # the ones owned by a cancelled child, then block only on the
+                # rest. This runs in the lock-released window: the child query is
+                # read-only and the GitHub close is independent of the DB lock.
+                if open_prs:
+                    try:
+                        _child_rows = (
+                            await session.execute(
+                                select(Task.id, Task.status).where(
+                                    Task.parent_task_id == parent_id_local
+                                )
+                            )
+                        ).all()
+                        _cancelled_prefixes = {
+                            str(_cid).replace("-", "")[:8].lower()
+                            for _cid, _cstatus in _child_rows
+                            if _cstatus == TaskStatus.CANCELLED
+                        }
+                        _live_prs, _orphan_prs = _partition_orphan_prs(
+                            open_prs, _cancelled_prefixes
+                        )
+                        if _orphan_prs:
+                            from app.github import close_pull_request
+
+                            for _opr in _orphan_prs:
+                                _onum = _opr.get("number")
+                                _oref = (_opr.get("head") or {}).get("ref", "")
+                                try:
+                                    await close_pull_request(
+                                        gh_token,
+                                        owner,
+                                        repo,
+                                        _onum,
+                                        project_id=str(project_id_local),
+                                    )
+                                    logger.info(
+                                        f"[ROLLUP] Closed orphan PR #{_onum} (head "
+                                        f"'{_oref}') from a cancelled child — was "
+                                        f"blocking rollup of {parent_id_local}"
+                                    )
+                                except Exception as _oerr:
+                                    logger.warning(
+                                        f"[ROLLUP] Failed to close orphan PR #{_onum} "
+                                        f"for {parent_id_local}: {_oerr} — excluding "
+                                        f"from the blocking set anyway"
+                                    )
+                            open_prs = _live_prs
+                    except Exception as _orphan_exc:
+                        # Never let orphan-cleanup crash the rollup cycle; fall
+                        # back to the raw open-PR set (original behavior).
+                        logger.warning(
+                            f"[ROLLUP] Orphan-PR filtering failed for "
+                            f"{parent_id_local}: {_orphan_exc} — using raw open-PR set"
+                        )
 
                 # Verify target branch exists before creating PR.
                 # Distinguish 404 (actually deleted) from transient GitHub errors

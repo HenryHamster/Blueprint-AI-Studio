@@ -4410,8 +4410,58 @@ async def orchestrator_worker():
                                     "details": _resolved.get("details", []),
                                     "failed_logs": "",
                                 }
-                            elif _r_state == "no_checks" or _r_source == "unresolved":
-                                # No real CI signal anywhere — keep polling.
+                            elif _r_state == "no_checks":
+                                # CI is *definitively* absent: the branch HEAD
+                                # and every reachable PR-event SHA were queried
+                                # cleanly and carry zero check-runs. For PRs
+                                # targeting an internal staging branch
+                                # (research/*, plan/*), CI is path-filtered out
+                                # by design and will NEVER run — polling forever
+                                # strands the rollup (incident 2026-05-28:
+                                # 0-check PR wedged parent c4d3402e). Treat
+                                # 0-checks on a staging base as CI-not-applicable
+                                # → green so the orchestrator proceeds to the
+                                # mergeability-gated merge (the merge attempt
+                                # itself still enforces no-conflicts). CI-gated
+                                # bases (main/automain) without checks keep
+                                # polling — never merge on absence of signal.
+                                _ci_base_ref = (pr_data.get("base") or {}).get(
+                                    "ref", ""
+                                )
+                                _ci_proj = (
+                                    await session.get(
+                                        Project, ci_task.project_id
+                                    )
+                                    if ci_task.project_id
+                                    else None
+                                )
+                                if _ci_proj is not None and _ci_proj.is_staging_branch(
+                                    _ci_base_ref
+                                ):
+                                    logger.info(
+                                        f"[CI] PR #{ci_pr_number} targets internal "
+                                        f"staging branch '{_ci_base_ref}' with 0 "
+                                        f"check-runs (CI not applicable) — treating "
+                                        f"as passed so the rollup can proceed"
+                                    )
+                                    ci_result = {
+                                        "status": "completed",
+                                        "conclusion": "success",
+                                        "details": _resolved.get("details", []),
+                                        "failed_logs": "",
+                                    }
+                                else:
+                                    ci_result = {
+                                        "status": "pending",
+                                        "conclusion": None,
+                                        "details": _resolved.get("details", []),
+                                        "failed_logs": "",
+                                    }
+                            elif _r_source == "unresolved":
+                                # Transient: couldn't resolve a verdict (GitHub
+                                # I/O error, or checks not yet visible). Keep
+                                # polling — never merge on the absence of a
+                                # signal.
                                 ci_result = {
                                     "status": "pending",
                                     "conclusion": None,

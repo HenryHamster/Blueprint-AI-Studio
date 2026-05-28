@@ -104,11 +104,17 @@ async def test_branch_head_bare_pr_event_merge_sha_resolves_green(mocker):
 
 
 @pytest.mark.asyncio
-async def test_branch_head_bare_no_pr_event_resolves_unresolved_not_green(mocker):
+async def test_branch_head_bare_no_pr_event_resolves_no_checks_not_green(mocker):
     """Branch HEAD has 0 check-runs AND no PR-event merge SHA exists →
-    ci_passed=False, source='unresolved'.  This is the bug the strict mode
-    fixes: the lenient default would mark this green and the orchestrator
-    would attempt to merge against the absence of a CI signal."""
+    ci_passed=False.  This is the bug the strict mode fixes: the lenient
+    default would mark this green and the orchestrator would attempt to merge
+    against the absence of a CI signal.
+
+    The state is ``no_checks`` (a *definitive* absence: we queried HEAD and
+    found no PR-event SHA to fall back to), NOT ``pending`` — so the merge gate
+    can distinguish "CI will never run here" (e.g. an internal staging-branch
+    PR that CI path-filters out) from a transient resolution failure. It still
+    refuses to pass: ci_passed is False on CI-gated bases."""
     mocker.patch(
         "app.github.get_check_runs_cached",
         new=AsyncMock(
@@ -130,6 +136,124 @@ async def test_branch_head_bare_no_pr_event_resolves_unresolved_not_green(mocker
 
     assert result["ci_passed"] is False
     assert result["source"] == "unresolved"
+    assert result["state"] == "no_checks"
+
+
+@pytest.mark.asyncio
+async def test_all_pr_heads_no_checks_returns_no_checks(mocker):
+    """Branch HEAD bare and every reachable PR-event head also carries zero
+    check-runs → ``no_checks`` (definitive). Distinguishes this from a head
+    with in-progress checks (which must stay ``pending``)."""
+
+    async def _check_runs_side_effect(token, owner, repo, sha, **kwargs):
+        # Every SHA — branch HEAD and the PR head — has no checks.
+        return {"status": "no_checks", "conclusion": None, "details": []}
+
+    mocker.patch(
+        "app.github.get_check_runs_cached", side_effect=_check_runs_side_effect
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(
+            return_value=[
+                {
+                    "number": 42,
+                    "merged_at": "2026-01-01T00:00:00Z",
+                    "head": {"sha": "pr_head_no_checks"},
+                }
+            ]
+        ),
+    )
+
+    result = await ci_resolution.resolve_pr_ci_status(
+        pr_number=42,
+        branch_sha="bare_branch_head",
+        token="tok",
+        owner="o",
+        repo="r",
+    )
+
+    assert result["ci_passed"] is False
+    assert result["state"] == "no_checks"
+
+
+@pytest.mark.asyncio
+async def test_pr_head_in_progress_returns_pending_not_no_checks(mocker):
+    """Branch HEAD bare but a PR-event head has checks IN PROGRESS → ``pending``
+    (a real, not-yet-final signal). Must NOT be reported as ``no_checks`` —
+    that would let the staging-branch merge bypass fire while CI is still
+    running."""
+
+    async def _check_runs_side_effect(token, owner, repo, sha, **kwargs):
+        if sha == "bare_branch_head":
+            return {"status": "no_checks", "conclusion": None, "details": []}
+        return {"status": "in_progress", "conclusion": None, "details": []}
+
+    mocker.patch(
+        "app.github.get_check_runs_cached", side_effect=_check_runs_side_effect
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(
+            return_value=[
+                {
+                    "number": 42,
+                    "merged_at": "2026-01-01T00:00:00Z",
+                    "head": {"sha": "pr_head_running"},
+                }
+            ]
+        ),
+    )
+
+    result = await ci_resolution.resolve_pr_ci_status(
+        pr_number=42,
+        branch_sha="bare_branch_head",
+        token="tok",
+        owner="o",
+        repo="r",
+    )
+
+    assert result["ci_passed"] is False
+    assert result["state"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_pr_head_fetch_error_returns_pending_not_no_checks(mocker):
+    """Branch HEAD bare and the only PR-event head's check-runs fetch raises →
+    ``pending`` (transient). A fetch error must not be mistaken for a confirmed
+    absence of checks, or the staging-branch bypass could merge on a network
+    blip."""
+
+    async def _check_runs_side_effect(token, owner, repo, sha, **kwargs):
+        if sha == "bare_branch_head":
+            return {"status": "no_checks", "conclusion": None, "details": []}
+        raise RuntimeError("network down")
+
+    mocker.patch(
+        "app.github.get_check_runs_cached", side_effect=_check_runs_side_effect
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(
+            return_value=[
+                {
+                    "number": 42,
+                    "merged_at": "2026-01-01T00:00:00Z",
+                    "head": {"sha": "pr_head_err"},
+                }
+            ]
+        ),
+    )
+
+    result = await ci_resolution.resolve_pr_ci_status(
+        pr_number=42,
+        branch_sha="bare_branch_head",
+        token="tok",
+        owner="o",
+        repo="r",
+    )
+
+    assert result["ci_passed"] is False
     assert result["state"] == "pending"
 
 
