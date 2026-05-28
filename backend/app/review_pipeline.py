@@ -2305,12 +2305,26 @@ async def _spawn_pipeline_task(
     # warm fields and provisions normally.
     spawn_vm_instance_id: str | None = vm_name
     warm_continuity_enabled = bool(_runtime_config.get("warm_continuity_enabled", True))
-    if (
-        warm_continuity_enabled
-        and not suppress_warm_handoff
-        and not is_warm_continuity_suppressed()
-        and source_task.vm_instance_id
-    ):
+    # Funnel observability: every spawn that reaches this decision block counts
+    # as an attempt; exactly one outcome (pin_set or one skip reason) is also
+    # recorded. Guards are ordered as a flat sequence so each branch is
+    # distinguishable in the funnel snapshot.
+    from app.warm_backlog_reuse import (
+        record_spawn_attempt,
+        record_spawn_pin_set,
+        record_spawn_pin_skipped,
+    )
+
+    record_spawn_attempt()
+    if suppress_warm_handoff:
+        record_spawn_pin_skipped("caller_suppressed")
+    elif not warm_continuity_enabled:
+        record_spawn_pin_skipped("disabled")
+    elif is_warm_continuity_suppressed():
+        record_spawn_pin_skipped("breaker_tripped")
+    elif not source_task.vm_instance_id:
+        record_spawn_pin_skipped("source_cold")
+    else:
         # Source task is eligible if it's currently running OR completed
         # recently enough to keep the warm chain warm. Use the most recent
         # heartbeat as the "completion" reference. Note: routers/agent_status.py
@@ -2323,7 +2337,9 @@ async def _spawn_pipeline_task(
         if not is_in_progress and source_task.last_heartbeat is not None:
             elapsed = (_utcnow() - source_task.last_heartbeat).total_seconds()
             is_recent_terminal = elapsed <= WARM_HANDOFF_WINDOW_SECS
-        if is_in_progress or is_recent_terminal:
+        if not (is_in_progress or is_recent_terminal):
+            record_spawn_pin_skipped("stale_source")
+        else:
             propagated_ctx["warm_target_vm_id"] = source_task.vm_instance_id
             # Stored as int — query side uses .as_string() which on Postgres reads
             # ->> (text), so int → "<n>" conversion is automatic. SQLite test
@@ -2336,6 +2352,7 @@ async def _spawn_pipeline_task(
                 _utcnow() + timedelta(seconds=WARM_HANDOFF_WINDOW_SECS)
             ).isoformat()
             spawn_vm_instance_id = None
+            record_spawn_pin_set()
             logger.info(
                 f"[PIPELINE] Warm-VM pin set for {task_type} PR #{pr_number}: "
                 f"target_vm={source_task.vm_instance_id} "

@@ -315,3 +315,129 @@ def get_reuse_funnel_snapshot(window_hours: int = 24) -> dict:
         "claim_skipped_by_reason": skipped_by_reason,
         "claim_skipped_total": sum(skipped_by_reason.values()),
     }
+
+
+# ---------------------------------------------------------------------------
+# Chain-continuity funnel observability counters
+# ---------------------------------------------------------------------------
+# Mirrors the backlog-reuse funnel above for the chain-continuity branch of
+# /next-role. Each entry is a UTC datetime (or (datetime, reason) tuple for
+# the multi-reason skipped stage). Bounded by maxlen=500 to prevent
+# unbounded growth on a long-lived process.
+
+_chain_poll_events: deque = deque(maxlen=500)
+_chain_claimed_events: deque = deque(maxlen=500)
+_chain_no_pinned_events: deque = deque(maxlen=500)
+_chain_other_vm_pr_events: deque = deque(maxlen=500)
+_chain_doomed_events: deque = deque(maxlen=500)
+_chain_skipped_events: deque = deque(maxlen=500)  # (datetime, reason)
+
+
+def record_chain_poll() -> None:
+    """Total poll arrivals: every /next-role call that enters the chain branch."""
+    _chain_poll_events.append(_utcnow())
+
+
+def record_chain_claimed() -> None:
+    """Poll successfully claimed a warm-pinned chain task via _finalize_warm_claim."""
+    _chain_claimed_events.append(_utcnow())
+
+
+def record_chain_no_pinned() -> None:
+    """Poll found no pinned task (chain was active) and returned 204."""
+    _chain_no_pinned_events.append(_utcnow())
+
+
+def record_chain_other_vm_pr() -> None:
+    """Poll exited because another VM owns an IN_PROGRESS task for this PR."""
+    _chain_other_vm_pr_events.append(_utcnow())
+
+
+def record_chain_doomed() -> None:
+    """Poll returned 204 because the VM is scheduled for orchestrator-initiated deletion."""
+    _chain_doomed_events.append(_utcnow())
+
+
+def record_chain_skipped(reason: str) -> None:
+    """Chain lookup was skipped; reason is 'disabled' or 'breaker_tripped'."""
+    _chain_skipped_events.append((_utcnow(), reason))
+
+
+def get_chain_continuity_funnel_snapshot(window_hours: int = 24) -> dict:
+    """Return rolling funnel counts for the chain-continuity claim path.
+
+    All counts cover the trailing ``window_hours`` (default 24h).
+    """
+    cutoff = _utcnow() - timedelta(hours=window_hours)
+    skipped_by_reason: dict = {}
+    for ts, reason in _chain_skipped_events:
+        if ts >= cutoff:
+            skipped_by_reason[reason] = skipped_by_reason.get(reason, 0) + 1
+    return {
+        "window_hours": window_hours,
+        "poll_arrivals": sum(1 for ts in _chain_poll_events if ts >= cutoff),
+        "chain_claimed": sum(1 for ts in _chain_claimed_events if ts >= cutoff),
+        "no_pinned_task": sum(1 for ts in _chain_no_pinned_events if ts >= cutoff),
+        "another_vm_owns_pr": sum(
+            1 for ts in _chain_other_vm_pr_events if ts >= cutoff
+        ),
+        "doomed_vm": sum(1 for ts in _chain_doomed_events if ts >= cutoff),
+        "skipped_by_reason": skipped_by_reason,
+        "skipped_total": sum(skipped_by_reason.values()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Spawn-time warm-pin funnel observability counters
+# ---------------------------------------------------------------------------
+# Mirrors the chain-continuity funnel above, but for the *spawn-side* warm-pin
+# decision in review_pipeline._spawn_pipeline_task: when a review/fix/audit/perf
+# task is created, did it get pinned to the source task's warm VM or not, and
+# if not, why? Each entry is a UTC datetime (or (datetime, reason) tuple for
+# the multi-reason skipped stage). Bounded by maxlen=500 to prevent unbounded
+# growth on a long-lived process.
+
+_spawn_attempt_events: deque = deque(maxlen=500)
+_spawn_pin_set_events: deque = deque(maxlen=500)
+_spawn_pin_skipped_events: deque = deque(maxlen=500)  # (datetime, reason)
+
+
+def record_spawn_attempt() -> None:
+    """Stage 1: a pipeline spawn reached the warm-pin decision block."""
+    _spawn_attempt_events.append(_utcnow())
+
+
+def record_spawn_pin_set() -> None:
+    """Stage 2 (success): the spawned task was pinned to the source VM."""
+    _spawn_pin_set_events.append(_utcnow())
+
+
+def record_spawn_pin_skipped(reason: str) -> None:
+    """Stage 2 (miss): warm-pin skipped.
+
+    reason should be one of: "disabled" (warm_continuity_enabled flag off),
+    "breaker_tripped" (is_warm_continuity_suppressed() true),
+    "caller_suppressed" (suppress_warm_handoff=True),
+    "source_cold" (source task has no vm_instance_id),
+    "stale_source" (source heartbeat older than WARM_HANDOFF_WINDOW_SECS).
+    """
+    _spawn_pin_skipped_events.append((_utcnow(), reason))
+
+
+def get_spawn_pin_funnel_snapshot(window_hours: int = 24) -> dict:
+    """Return rolling funnel counts for the spawn-time warm-pin decision.
+
+    All counts cover the trailing ``window_hours`` (default 24h).
+    """
+    cutoff = _utcnow() - timedelta(hours=window_hours)
+    skipped_by_reason: dict = {}
+    for ts, reason in _spawn_pin_skipped_events:
+        if ts >= cutoff:
+            skipped_by_reason[reason] = skipped_by_reason.get(reason, 0) + 1
+    return {
+        "window_hours": window_hours,
+        "spawn_attempts": sum(1 for ts in _spawn_attempt_events if ts >= cutoff),
+        "pin_set": sum(1 for ts in _spawn_pin_set_events if ts >= cutoff),
+        "skipped_by_reason": skipped_by_reason,
+        "skipped_total": sum(skipped_by_reason.values()),
+    }

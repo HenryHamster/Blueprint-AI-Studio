@@ -40,11 +40,38 @@ export interface WarmVmRow {
   recent_completions: WarmVmRecentCompletion[];
 }
 
+export interface ChainContinuityFunnelSnapshot {
+  window_hours: number;
+  poll_arrivals: number;
+  chain_claimed: number;
+  no_pinned_task: number;
+  another_vm_owns_pr: number;
+  doomed_vm: number;
+  skipped_by_reason: { disabled?: number; breaker_tripped?: number };
+  skipped_total: number;
+}
+
+export interface SpawnPinFunnelSnapshot {
+  window_hours: number;
+  spawn_attempts: number;
+  pin_set: number;
+  skipped_by_reason: {
+    disabled?: number;
+    breaker_tripped?: number;
+    source_cold?: number;
+    stale_source?: number;
+    caller_suppressed?: number;
+  };
+  skipped_total: number;
+}
+
 export interface WarmVmStateResponse {
   active_vms: WarmVmRow[];
   warm_pin_metrics: {
     clears_last_hour: number;
     clears_last_24h: number;
+    clears_by_reason_last_hour?: Record<string, number>;
+    clears_by_reason_last_24h?: Record<string, number>;
     active_pinned_queued_total: number;
     active_warm_chains: number;
     active_backlog_reuse_claims: number;
@@ -53,4 +80,6 @@ export interface WarmVmStateResponse {
   warm_continuity_enabled: boolean;
   warm_backlog_reuse_enabled: boolean;
   next_role_poll_timeout_secs: number;
+  chain_continuity_funnel?: ChainContinuityFunnelSnapshot;
+  spawn_pin_funnel?: SpawnPinFunnelSnapshot;
 }

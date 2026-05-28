@@ -3897,6 +3897,10 @@ async def next_role(
     # Liveness signal: receiving the request itself proves the VM is alive.
     _shared_state.record_vm_heartbeat(req.vm_instance_id)
 
+    from app.warm_backlog_reuse import record_chain_poll as _record_chain_poll
+
+    _record_chain_poll()
+
     # Race guard: refuse warm-claim on a VM that was just scheduled for
     # orchestrator-initiated deletion. With fire_and_forget_vm_delete
     # (main.py — released the agent_completion lock window), there is now
@@ -3914,6 +3918,9 @@ async def next_role(
             f"[NEXT-ROLE] Refusing warm-claim on doomed VM {req.vm_instance_id} "
             f"(delete reason={_delete_reason})"
         )
+        from app.warm_backlog_reuse import record_chain_doomed as _record_chain_doomed
+
+        _record_chain_doomed()
         return Response(status_code=204)
 
     # Postgres can use the JSONB ``?`` operator (``has_key``) against
@@ -3961,6 +3968,11 @@ async def next_role(
             result = await _finalize_warm_claim(
                 session, task, req.vm_instance_id, origin="next_role_endpoint"
             )
+            from app.warm_backlog_reuse import (
+                record_chain_claimed as _record_chain_claimed,
+            )
+
+            _record_chain_claimed()
             logger.info(
                 f"[NEXT-ROLE] Warm-start claim (chain): task={result['task_id']} "
                 f"vm={req.vm_instance_id} prior_task={req.prior_task_id} "
@@ -3973,6 +3985,14 @@ async def next_role(
             "skipping chain-continuity claim for VM %s",
             req.vm_instance_id,
         )
+        from app.warm_backlog_reuse import (
+            record_chain_skipped as _record_chain_skipped,
+        )
+
+        if not _shared_state.runtime_config.get("warm_continuity_enabled", True):
+            _record_chain_skipped("disabled")
+        else:
+            _record_chain_skipped("breaker_tripped")
 
     # Backlog-reuse branch (efficiency direction d-91d8dede). When the flag is
     # enabled an idle VM with no chain-pinned follow-on may claim the next
@@ -4056,12 +4076,24 @@ async def next_role(
         other_stmt = select(Task).where(*other_pr_filters)
         other = (await session.execute(other_stmt)).scalars().first()
         if other is not None:
+            if warm_continuity_active:
+                from app.warm_backlog_reuse import (
+                    record_chain_other_vm_pr as _record_chain_other_vm_pr,
+                )
+
+                _record_chain_other_vm_pr()
             return {
                 "action": "exit",
                 "reason": "another_vm_owns_this_pr",
             }
 
     # Nothing to claim. Tell the agent to keep polling.
+    if warm_continuity_active:
+        from app.warm_backlog_reuse import (
+            record_chain_no_pinned as _record_chain_no_pinned,
+        )
+
+        _record_chain_no_pinned()
     return Response(status_code=204)
 
 

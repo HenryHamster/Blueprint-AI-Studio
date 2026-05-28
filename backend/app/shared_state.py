@@ -1580,6 +1580,24 @@ def count_recent_warm_pin_clears(window_seconds: int = 3600) -> int:
     return sum(1 for ts, _, _ in warm_pin_clear_events if ts >= cutoff)
 
 
+def count_recent_warm_pin_clears_by_reason(window_seconds: int) -> dict[str, int]:
+    """Per-reason histogram of clear-out events in the trailing window.
+
+    Mirrors ``count_recent_warm_pin_clears`` cutoff arithmetic so the sum of
+    values equals the total. Empty / missing reasons map to ``"unknown"`` so
+    the invariant ``sum(hist.values()) == count_recent_warm_pin_clears(w)``
+    holds even when legacy entries lack a reason.
+    """
+    cutoff = _utcnow() - timedelta(seconds=window_seconds)
+    histogram: dict[str, int] = {}
+    for ts, _vm, reason in warm_pin_clear_events:
+        if ts < cutoff:
+            continue
+        key = reason if reason else "unknown"
+        histogram[key] = histogram.get(key, 0) + 1
+    return histogram
+
+
 # Auto-suppression deadline set by is_warm_continuity_suppressed() when the
 # pin-clear rate exceeds warm_pin_clear_rate_threshold. None means not suppressed.
 warm_continuity_suppressed_until: datetime | None = None

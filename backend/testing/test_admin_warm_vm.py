@@ -32,6 +32,8 @@ async def test_warm_vm_state_empty(client: AsyncClient, db_session):
         assert body["active_vms"] == []
         assert body["warm_pin_metrics"]["clears_last_hour"] == 0
         assert body["warm_pin_metrics"]["clears_last_24h"] == 0
+        assert body["warm_pin_metrics"]["clears_by_reason_last_hour"] == {}
+        assert body["warm_pin_metrics"]["clears_by_reason_last_24h"] == {}
         assert body["warm_pin_metrics"]["active_pinned_queued_total"] == 0
         assert body["warm_pin_metrics"]["active_warm_chains"] == 0
         assert body["warm_pin_metrics"]["active_backlog_reuse_claims"] == 0
@@ -40,6 +42,15 @@ async def test_warm_vm_state_empty(client: AsyncClient, db_session):
         assert "warm_backlog_reuse_enabled" in body
         assert isinstance(body["warm_backlog_reuse_enabled"], bool)
         assert isinstance(body["next_role_poll_timeout_secs"], int)
+        funnel = body.get("chain_continuity_funnel", {})
+        assert isinstance(funnel, dict)
+        for key in ("poll_arrivals", "chain_claimed", "no_pinned_task", "another_vm_owns_pr", "doomed_vm", "skipped_total"):
+            assert key in funnel, f"missing key {key} in chain_continuity_funnel"
+        spawn_funnel = body.get("spawn_pin_funnel", {})
+        assert isinstance(spawn_funnel, dict)
+        for key in ("window_hours", "spawn_attempts", "pin_set", "skipped_by_reason", "skipped_total"):
+            assert key in spawn_funnel, f"missing key {key} in spawn_pin_funnel"
+        assert isinstance(spawn_funnel["skipped_by_reason"], dict)
     finally:
         _shared_state.vm_last_heartbeat.clear()
         _shared_state.vm_last_heartbeat.update(saved_hb)
@@ -263,3 +274,41 @@ async def test_warm_vm_state_requires_admin(override_get_session, db_session):
     finally:
         app.dependency_overrides.pop(get_current_user, None)
         app.dependency_overrides.pop(require_admin, None)
+
+
+@pytest.mark.asyncio
+async def test_warm_vm_state_clears_by_reason_histogram(client: AsyncClient):
+    """Per-reason histogram surfaces each reason with the correct count and
+    sums back to the existing clears_last_hour total."""
+    saved_clears = list(_shared_state.warm_pin_clear_events)
+    _shared_state.warm_pin_clear_events.clear()
+    try:
+        # Two deadline_expired, one vm_unresponsive — plus a legacy entry with
+        # an empty reason that must be coerced to "unknown" so the sum-of-values
+        # invariant holds.
+        _shared_state.record_warm_pin_clear("vm-a", "deadline_expired")
+        _shared_state.record_warm_pin_clear("vm-b", "deadline_expired")
+        _shared_state.record_warm_pin_clear("vm-c", "vm_unresponsive")
+        _shared_state.record_warm_pin_clear("vm-d", "")
+
+        resp = await client.get("/api/admin/warm-vm-state")
+        assert resp.status_code == 200
+        metrics = resp.json()["warm_pin_metrics"]
+
+        hist_1h = metrics["clears_by_reason_last_hour"]
+        assert isinstance(hist_1h, dict)
+        assert hist_1h.get("deadline_expired") == 2
+        assert hist_1h.get("vm_unresponsive") == 1
+        assert hist_1h.get("unknown") == 1
+        assert sum(hist_1h.values()) == metrics["clears_last_hour"]
+
+        # 24h field is present and at least as big as 1h (same events fit
+        # in both windows).
+        hist_24h = metrics["clears_by_reason_last_24h"]
+        assert isinstance(hist_24h, dict)
+        assert hist_24h.get("deadline_expired") == 2
+        assert hist_24h.get("vm_unresponsive") == 1
+        assert sum(hist_24h.values()) == metrics["clears_last_24h"]
+    finally:
+        _shared_state.warm_pin_clear_events.clear()
+        _shared_state.warm_pin_clear_events.extend(saved_clears)

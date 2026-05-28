@@ -853,6 +853,12 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         "warm_pin_metrics": {
             "clears_last_hour": _shared_state.count_recent_warm_pin_clears(3600),
             "clears_last_24h": _shared_state.count_recent_warm_pin_clears(86400),
+            "clears_by_reason_last_hour": _shared_state.count_recent_warm_pin_clears_by_reason(
+                3600
+            ),
+            "clears_by_reason_last_24h": _shared_state.count_recent_warm_pin_clears_by_reason(
+                86400
+            ),
             "active_pinned_queued_total": sum(len(v) for v in pinned_by_vm.values()),
             "active_warm_chains": active_warm_chains,
             "active_backlog_reuse_claims": active_backlog_reuse_claims,
@@ -886,7 +892,27 @@ async def _compute_warm_vm_state(*, session: AsyncSession) -> Dict[str, Any]:
         "next_role_poll_timeout_secs": int(
             _shared_state.runtime_config.get("next_role_poll_timeout_secs", 180)
         ),
+        "chain_continuity_funnel": _get_chain_continuity_funnel(),
+        "spawn_pin_funnel": _get_spawn_pin_funnel(),
     }
+
+
+def _get_chain_continuity_funnel() -> dict:
+    try:
+        from app.warm_backlog_reuse import get_chain_continuity_funnel_snapshot
+
+        return get_chain_continuity_funnel_snapshot()
+    except Exception:
+        return {}
+
+
+def _get_spawn_pin_funnel() -> dict:
+    try:
+        from app.warm_backlog_reuse import get_spawn_pin_funnel_snapshot
+
+        return get_spawn_pin_funnel_snapshot()
+    except Exception:
+        return {}
 
 
 @router.get("/pr-behind-detector-stats")

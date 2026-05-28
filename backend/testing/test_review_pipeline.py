@@ -7312,3 +7312,314 @@ def test_review_fix_goal_preamble_warns_against_dropping_adjacent_guarantees():
     # cost more iterations than the cited finding — otherwise narrow-patching
     # remains the implicit default.
     assert "regression in adjacent behavior" in REVIEW_FIX_GOAL_PREAMBLE
+
+
+# ---------------------------------------------------------------------------
+# Spawn-time warm-pin funnel — _spawn_pipeline_task records exactly one
+# outcome per spawn that reaches the warm-pinning decision block.
+# ---------------------------------------------------------------------------
+
+
+def _clear_spawn_pin_events() -> None:
+    import app.warm_backlog_reuse as wbr
+
+    wbr._spawn_attempt_events.clear()
+    wbr._spawn_pin_set_events.clear()
+    wbr._spawn_pin_skipped_events.clear()
+
+
+async def _make_pin_source_task(db_session, *, vm_instance_id, status, last_heartbeat):
+    """Build + persist a source review task suitable for driving the warm-pin
+    decision in _spawn_pipeline_task. Pin decisions look at vm_instance_id,
+    status, and last_heartbeat — the rest is generic chain bookkeeping."""
+    project = await _make_db_project(db_session)
+    original = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"scope": "small"},
+    )
+    db_session.add(original)
+    await db_session.commit()
+    await db_session.refresh(original)
+
+    source = make_task(
+        project_id=project.id,
+        status=status,
+        vm_instance_id=vm_instance_id,
+        last_heartbeat=last_heartbeat,
+        payloads=[
+            {
+                "type": "review",
+                "pr_number": 901,
+                "branch": "feat/warm-pin",
+                "base_branch": "main",
+                "original_task_id": str(original.id),
+            }
+        ],
+        context={
+            "scope": "small",
+            "review_loop": {
+                "iteration": 0,
+                "original_task_id": str(original.id),
+            },
+        },
+    )
+    db_session.add(source)
+    await db_session.commit()
+    await db_session.refresh(source)
+    return source, original
+
+
+@pytest.mark.asyncio
+async def test_spawn_pin_funnel_records_pin_set(db_session, mocker):
+    """Eligible source (IN_PROGRESS, has vm_instance_id, flag on) → pin_set."""
+    from app.time_utils import _utcnow
+    import app.warm_backlog_reuse as wbr
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.review_pipeline.is_warm_continuity_suppressed", return_value=False
+    )
+    _clear_spawn_pin_events()
+    try:
+        source, original = await _make_pin_source_task(
+            db_session,
+            vm_instance_id="agent-vm-xyz",
+            status=TaskStatus.IN_PROGRESS,
+            last_heartbeat=_utcnow(),
+        )
+
+        result, _was_created = await _spawn_pipeline_task(
+            source,
+            "fix",
+            db_session,
+            pr_number=901,
+            branch="feat/warm-pin",
+            base_branch="main",
+            original_task_id=str(original.id),
+            fix_prompt="Fix the issue",
+        )
+        assert result is not None
+        assert (result.context or {}).get("warm_target_vm_id") == "agent-vm-xyz"
+
+        snap = wbr.get_spawn_pin_funnel_snapshot()
+        assert snap["spawn_attempts"] == 1
+        assert snap["pin_set"] == 1
+        assert snap["skipped_total"] == 0
+        assert snap["skipped_by_reason"] == {}
+    finally:
+        _clear_spawn_pin_events()
+
+
+@pytest.mark.asyncio
+async def test_spawn_pin_funnel_records_skip_disabled(db_session, mocker):
+    """warm_continuity_enabled=False → skip reason 'disabled'."""
+    from app.time_utils import _utcnow
+    import app.warm_backlog_reuse as wbr
+    import app.review_pipeline as rp
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.review_pipeline.is_warm_continuity_suppressed", return_value=False
+    )
+    mocker.patch.dict(
+        rp._runtime_config, {"warm_continuity_enabled": False}, clear=False
+    )
+    _clear_spawn_pin_events()
+    try:
+        source, original = await _make_pin_source_task(
+            db_session,
+            vm_instance_id="agent-vm-xyz",
+            status=TaskStatus.IN_PROGRESS,
+            last_heartbeat=_utcnow(),
+        )
+
+        result, _was_created = await _spawn_pipeline_task(
+            source,
+            "fix",
+            db_session,
+            pr_number=901,
+            branch="feat/warm-pin",
+            base_branch="main",
+            original_task_id=str(original.id),
+            fix_prompt="Fix the issue",
+        )
+        assert result is not None
+        assert "warm_target_vm_id" not in (result.context or {})
+
+        snap = wbr.get_spawn_pin_funnel_snapshot()
+        assert snap["spawn_attempts"] == 1
+        assert snap["pin_set"] == 0
+        assert snap["skipped_by_reason"] == {"disabled": 1}
+        assert snap["skipped_total"] == 1
+    finally:
+        _clear_spawn_pin_events()
+
+
+@pytest.mark.asyncio
+async def test_spawn_pin_funnel_records_skip_breaker_tripped(db_session, mocker):
+    """is_warm_continuity_suppressed()==True → skip reason 'breaker_tripped'."""
+    from app.time_utils import _utcnow
+    import app.warm_backlog_reuse as wbr
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.review_pipeline.is_warm_continuity_suppressed", return_value=True
+    )
+    _clear_spawn_pin_events()
+    try:
+        source, original = await _make_pin_source_task(
+            db_session,
+            vm_instance_id="agent-vm-xyz",
+            status=TaskStatus.IN_PROGRESS,
+            last_heartbeat=_utcnow(),
+        )
+
+        result, _was_created = await _spawn_pipeline_task(
+            source,
+            "fix",
+            db_session,
+            pr_number=901,
+            branch="feat/warm-pin",
+            base_branch="main",
+            original_task_id=str(original.id),
+            fix_prompt="Fix the issue",
+        )
+        assert result is not None
+        assert "warm_target_vm_id" not in (result.context or {})
+
+        snap = wbr.get_spawn_pin_funnel_snapshot()
+        assert snap["spawn_attempts"] == 1
+        assert snap["pin_set"] == 0
+        assert snap["skipped_by_reason"] == {"breaker_tripped": 1}
+        assert snap["skipped_total"] == 1
+    finally:
+        _clear_spawn_pin_events()
+
+
+@pytest.mark.asyncio
+async def test_spawn_pin_funnel_records_skip_source_cold(db_session, mocker):
+    """Source has no vm_instance_id → skip reason 'source_cold'."""
+    from app.time_utils import _utcnow
+    import app.warm_backlog_reuse as wbr
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.review_pipeline.is_warm_continuity_suppressed", return_value=False
+    )
+    _clear_spawn_pin_events()
+    try:
+        source, original = await _make_pin_source_task(
+            db_session,
+            vm_instance_id=None,
+            status=TaskStatus.IN_PROGRESS,
+            last_heartbeat=_utcnow(),
+        )
+
+        result, _was_created = await _spawn_pipeline_task(
+            source,
+            "fix",
+            db_session,
+            pr_number=901,
+            branch="feat/warm-pin",
+            base_branch="main",
+            original_task_id=str(original.id),
+            fix_prompt="Fix the issue",
+        )
+        assert result is not None
+        assert "warm_target_vm_id" not in (result.context or {})
+
+        snap = wbr.get_spawn_pin_funnel_snapshot()
+        assert snap["spawn_attempts"] == 1
+        assert snap["pin_set"] == 0
+        assert snap["skipped_by_reason"] == {"source_cold": 1}
+        assert snap["skipped_total"] == 1
+    finally:
+        _clear_spawn_pin_events()
+
+
+@pytest.mark.asyncio
+async def test_spawn_pin_funnel_records_skip_stale_source(db_session, mocker):
+    """COMPLETED source with stale heartbeat → skip reason 'stale_source'."""
+    from app.time_utils import _utcnow
+    import app.warm_backlog_reuse as wbr
+    from app.review_pipeline import WARM_HANDOFF_WINDOW_SECS
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.review_pipeline.is_warm_continuity_suppressed", return_value=False
+    )
+    _clear_spawn_pin_events()
+    try:
+        # Heartbeat just past the warm-handoff window.
+        stale_hb = _utcnow() - timedelta(seconds=WARM_HANDOFF_WINDOW_SECS + 10)
+        source, original = await _make_pin_source_task(
+            db_session,
+            vm_instance_id="agent-vm-xyz",
+            status=TaskStatus.COMPLETED,
+            last_heartbeat=stale_hb,
+        )
+
+        result, _was_created = await _spawn_pipeline_task(
+            source,
+            "fix",
+            db_session,
+            pr_number=901,
+            branch="feat/warm-pin",
+            base_branch="main",
+            original_task_id=str(original.id),
+            fix_prompt="Fix the issue",
+        )
+        assert result is not None
+        assert "warm_target_vm_id" not in (result.context or {})
+
+        snap = wbr.get_spawn_pin_funnel_snapshot()
+        assert snap["spawn_attempts"] == 1
+        assert snap["pin_set"] == 0
+        assert snap["skipped_by_reason"] == {"stale_source": 1}
+        assert snap["skipped_total"] == 1
+    finally:
+        _clear_spawn_pin_events()
+
+
+@pytest.mark.asyncio
+async def test_spawn_pin_funnel_records_skip_caller_suppressed(db_session, mocker):
+    """suppress_warm_handoff=True → skip reason 'caller_suppressed'."""
+    from app.time_utils import _utcnow
+    import app.warm_backlog_reuse as wbr
+
+    mocker.patch("app.review_pipeline.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.review_pipeline.is_warm_continuity_suppressed", return_value=False
+    )
+    _clear_spawn_pin_events()
+    try:
+        source, original = await _make_pin_source_task(
+            db_session,
+            vm_instance_id="agent-vm-xyz",
+            status=TaskStatus.IN_PROGRESS,
+            last_heartbeat=_utcnow(),
+        )
+
+        result, _was_created = await _spawn_pipeline_task(
+            source,
+            "fix",
+            db_session,
+            pr_number=901,
+            branch="feat/warm-pin",
+            base_branch="main",
+            original_task_id=str(original.id),
+            fix_prompt="Fix the issue",
+            suppress_warm_handoff=True,
+        )
+        assert result is not None
+        assert "warm_target_vm_id" not in (result.context or {})
+
+        snap = wbr.get_spawn_pin_funnel_snapshot()
+        assert snap["spawn_attempts"] == 1
+        assert snap["pin_set"] == 0
+        assert snap["skipped_by_reason"] == {"caller_suppressed": 1}
+        assert snap["skipped_total"] == 1
+    finally:
+        _clear_spawn_pin_events()

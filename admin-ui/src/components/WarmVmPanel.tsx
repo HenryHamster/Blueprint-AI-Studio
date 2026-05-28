@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { ChevronDown, ChevronUp, Server, Flame, AlertTriangle, Clock } from 'lucide-react';
 import { API_BASE_URL, apiFetch, authGet } from '../api';
 import { parseTimestamp } from '../utils/time';
-import type { WarmVmStateResponse, WarmVmRow } from '../types/warmVm';
+import type { WarmVmStateResponse, WarmVmRow, ChainContinuityFunnelSnapshot, SpawnPinFunnelSnapshot } from '../types/warmVm';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 
 const POLL_INTERVAL_MS = 10_000;
@@ -216,6 +216,19 @@ export function WarmVmPanel({ onViewTask }: Props) {
                 <span><span className="text-neutral-500">pinned queued</span>: <span className="font-mono text-neutral-300">{pinnedQueued}</span></span>
                 <span><span className="text-neutral-500">clears/hr</span>: <span className={`font-mono ${overThreshold ? 'text-red-400' : 'text-neutral-300'}`}>{clearsHour}</span></span>
                 <span><span className="text-neutral-500">clears/24h</span>: <span className="font-mono text-neutral-300">{data.warm_pin_metrics.clears_last_24h}</span></span>
+                {Object.entries(data.warm_pin_metrics.clears_by_reason_last_hour ?? {})
+                  .filter(([, count]) => count > 0)
+                  .map(([reason, count]) => (
+                    <span key={reason} data-testid={`clears-by-reason-${reason}`}>
+                      <span className="text-neutral-500">{reason}</span>
+                      :{' '}
+                      <span
+                        className={`font-mono ${reason === 'vm_unresponsive' ? 'text-red-400' : 'text-neutral-300'}`}
+                      >
+                        {count}
+                      </span>
+                    </span>
+                  ))}
                 <span><span className="text-neutral-500">poll timeout</span>: <span className="font-mono text-neutral-300">{data.next_role_poll_timeout_secs}s</span></span>
               </div>
 
@@ -226,6 +239,14 @@ export function WarmVmPanel({ onViewTask }: Props) {
                   <EffMetric label="reuse rate" value={fmtEffRate(efficiency.window_24h?.warm_reuse_rate)} delta={efficiency.window_24h?.vs_prior_warm_reuse_rate_delta} lowerIsBetter={false} />
                   <EffMetric label="review cycles" value={fmtEffIter(efficiency.window_7d?.review_iter_median)} delta={efficiency.window_7d?.vs_prior_review_iter_median_delta} lowerIsBetter />
                 </div>
+              )}
+
+              {data.spawn_pin_funnel && (
+                <SpawnPinFunnelRow funnel={data.spawn_pin_funnel} />
+              )}
+
+              {data.chain_continuity_funnel && (
+                <ChainFunnelRow funnel={data.chain_continuity_funnel} />
               )}
 
               {overThreshold && (
@@ -271,6 +292,61 @@ export function WarmVmPanel({ onViewTask }: Props) {
             </>
           )}
         </div>
+      )}
+    </div>
+  );
+}
+
+function SpawnPinFunnelRow({ funnel }: { funnel: SpawnPinFunnelSnapshot }) {
+  const skippedDisabled = funnel.skipped_by_reason?.disabled ?? 0;
+  const skippedBreaker = funnel.skipped_by_reason?.breaker_tripped ?? 0;
+  const skippedSourceCold = funnel.skipped_by_reason?.source_cold ?? 0;
+  const skippedStale = funnel.skipped_by_reason?.stale_source ?? 0;
+  const skippedSuppressed = funnel.skipped_by_reason?.caller_suppressed ?? 0;
+  return (
+    <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60">
+      <span className="text-neutral-500 font-bold uppercase tracking-widest w-full">
+        Spawn Pin Funnel ({funnel.window_hours}h)
+      </span>
+      <span><span className="text-neutral-500">attempts</span>: <span className="font-mono text-neutral-300">{funnel.spawn_attempts}</span></span>
+      <span><span className="text-neutral-500">pin set</span>: <span className="font-mono text-emerald-400">{funnel.pin_set}</span></span>
+      {skippedDisabled > 0 && (
+        <span><span className="text-neutral-500">skip disabled</span>: <span className="font-mono text-amber-400">{skippedDisabled}</span></span>
+      )}
+      {skippedBreaker > 0 && (
+        <span><span className="text-neutral-500">skip breaker</span>: <span className="font-mono text-red-400">{skippedBreaker}</span></span>
+      )}
+      {skippedSourceCold > 0 && (
+        <span><span className="text-neutral-500">skip source cold</span>: <span className="font-mono text-neutral-300">{skippedSourceCold}</span></span>
+      )}
+      {skippedStale > 0 && (
+        <span><span className="text-neutral-500">skip stale source</span>: <span className="font-mono text-neutral-300">{skippedStale}</span></span>
+      )}
+      {skippedSuppressed > 0 && (
+        <span><span className="text-neutral-500">skip suppressed</span>: <span className="font-mono text-neutral-300">{skippedSuppressed}</span></span>
+      )}
+    </div>
+  );
+}
+
+function ChainFunnelRow({ funnel }: { funnel: ChainContinuityFunnelSnapshot }) {
+  const skippedDisabled = funnel.skipped_by_reason?.disabled ?? 0;
+  const skippedBreaker = funnel.skipped_by_reason?.breaker_tripped ?? 0;
+  return (
+    <div className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-neutral-400 pt-2 border-t border-neutral-800/60">
+      <span className="text-neutral-500 font-bold uppercase tracking-widest w-full">
+        Chain Continuity Funnel ({funnel.window_hours}h)
+      </span>
+      <span><span className="text-neutral-500">polls</span>: <span className="font-mono text-neutral-300">{funnel.poll_arrivals}</span></span>
+      <span><span className="text-neutral-500">claimed</span>: <span className="font-mono text-emerald-400">{funnel.chain_claimed}</span></span>
+      <span><span className="text-neutral-500">no pinned</span>: <span className="font-mono text-neutral-300">{funnel.no_pinned_task}</span></span>
+      <span><span className="text-neutral-500">other VM</span>: <span className="font-mono text-neutral-300">{funnel.another_vm_owns_pr}</span></span>
+      <span><span className="text-neutral-500">doomed</span>: <span className="font-mono text-neutral-300">{funnel.doomed_vm}</span></span>
+      {skippedDisabled > 0 && (
+        <span><span className="text-neutral-500">skip disabled</span>: <span className="font-mono text-amber-400">{skippedDisabled}</span></span>
+      )}
+      {skippedBreaker > 0 && (
+        <span><span className="text-neutral-500">skip breaker</span>: <span className="font-mono text-red-400">{skippedBreaker}</span></span>
       )}
     </div>
   );
