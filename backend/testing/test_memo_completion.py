@@ -665,3 +665,180 @@ async def test_recover_memo_from_incomplete_failure(db_session, _quiet_broadcast
     assert persisted["citations"] == memo["citations"]
 
     assert task.plan_output["memo"]["summary"] == memo["summary"]
+
+
+# ── Strategy 1: recovered-agent-message-text marker blocks ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_recover_memo_from_recovered_marker_block(db_session, _quiet_broadcast):
+    """Recovery succeeds when logs contain a '--- recovered-agent-message-text ---'
+    block with a valid memo JSON — the strategy-1 path added to support the new
+    agent failure-log format."""
+    project = make_project(name="RecoveryMarkerProj")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Memo: marker recovery",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "memo", "topic": "Z", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        context={"agent_failure_category_raw": "parse_failed"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    memo = {
+        "summary": "Marker-recovered summary",
+        "reasoning": "Marker-recovered reasoning with full detail.",
+        "citations": ["task:marker123", "direction:d-marker"],
+        "tags": ["marker-recovery", "test"],
+    }
+    # Simulate the failure log the agent now emits: error header + tail + marker block
+    logs = (
+        "Memo handler could not extract a JSON object with all required keys "
+        "(summary, reasoning, citations, tags). exitCode=0, allOutput=3000b, "
+        "lastResultText=200b\n"
+        "--- output tail ---\n"
+        "...truncated tail...\n"
+        "--- recovered-agent-message-text ---\n" + json.dumps(memo) + "\n"
+    )
+
+    recovered = await _try_recover_memo_from_parse_failure(task, logs, db_session)
+
+    assert recovered is True
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+    artifacts = (
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1
+    assert artifacts[0].artifact_type == ArtifactType.MEMO
+    persisted = json.loads(artifacts[0].logs)
+    assert persisted["summary"] == memo["summary"]
+    assert persisted["citations"] == memo["citations"]
+    assert task.plan_output["memo"]["tags"] == memo["tags"]
+
+
+@pytest.mark.asyncio
+async def test_recover_memo_from_recovered_marker_block_multiple_blocks(
+    db_session, _quiet_broadcast
+):
+    """When multiple marker blocks are present (first invalid, second valid),
+    recovery succeeds using the first valid block."""
+    project = make_project(name="RecoveryMultiMarker")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Memo: multi-marker",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "memo", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    valid_memo = {
+        "summary": "Valid block summary",
+        "reasoning": "Valid reasoning here.",
+        "citations": [],
+        "tags": ["multi"],
+    }
+    # First block has only partial keys (invalid); second has the full memo
+    logs = (
+        "--- output tail ---\n...\n"
+        "--- recovered-agent-message-text ---\n"
+        + json.dumps({"summary": "partial", "reasoning": "only two keys"})
+        + "\n"
+        "--- recovered-agent-message-text ---\n" + json.dumps(valid_memo) + "\n"
+    )
+
+    recovered = await _try_recover_memo_from_parse_failure(task, logs, db_session)
+
+    assert recovered is True
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.plan_output["memo"]["summary"] == valid_memo["summary"]
+
+
+# ── Strategy 3: escaped-JSON tail fallback ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_recover_memo_from_escaped_tail(db_session, _quiet_broadcast):
+    """Recovery succeeds when logs contain only the suffix of an agent_message
+    envelope (truncated mid-line) and the memo JSON is visible in escaped form
+    — the strategy-3 escaped-JSON fallback path."""
+    project = make_project(name="RecoveryEscapedTail")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        title="Memo: escaped tail",
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "memo", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        context={"agent_failure_category_raw": "parse_failed"},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    memo = {
+        "summary": "Escaped tail summary",
+        "reasoning": "Escaped tail reasoning that was recovered from a truncated log.",
+        "citations": ["direction:d-escape"],
+        "tags": ["escape-recovery"],
+    }
+
+    # Build the JSONL line that would appear in allOutput using compact JSON
+    # (no spaces after : or ,) to match the TypeScript JSON.stringify format.
+    full_line = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": json.dumps(memo, separators=(",", ":")),
+            },
+        },
+        separators=(",", ":"),
+    )
+    # Simulate the tail being truncated: only part of the JSONL line
+    # appears in the logs — starting mid-line at the "text" key.
+    tail_start = full_line.find('"text":"')
+    assert tail_start != -1, "Compact JSON must contain 'text\":\"' without spaces"
+    truncated_tail = full_line[tail_start:]
+
+    logs = (
+        "Memo handler could not extract a JSON object ...\n"
+        "--- output tail ---\n" + truncated_tail
+    )
+
+    recovered = await _try_recover_memo_from_parse_failure(task, logs, db_session)
+
+    assert recovered is True
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+    artifacts = (
+        (await db_session.execute(select(Artifact).where(Artifact.task_id == task.id)))
+        .scalars()
+        .all()
+    )
+    assert len(artifacts) == 1
+    persisted = json.loads(artifacts[0].logs)
+    assert persisted["summary"] == memo["summary"]
+    assert persisted["citations"] == memo["citations"]

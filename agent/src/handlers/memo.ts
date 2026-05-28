@@ -9,27 +9,37 @@ import {
 } from '../prompt.js';
 import { extractJsonObjectDetailed, describeJsonExtractionResult, JsonExtractionError } from '../json-extract.js';
 
-// Scan raw Codex JSONL output for an item.completed agent_message event and
-// return its full item.text. This recovers the memo JSON when allOutput
-// contains Codex JSONL envelopes (where the memo JSON is embedded as an
-// escaped string in item.text and cannot be found by the normal extractor).
-function extractCodexAgentMessageText(text: string): string | null {
+// Scan raw Codex JSONL output for agent_message events and return ALL
+// candidate item.text values, prioritising item.completed over item.updated
+// and longer texts over shorter within each group. This recovers the memo
+// JSON when allOutput contains Codex JSONL envelopes (where the memo JSON is
+// embedded as an escaped string in item.text and cannot be found by the
+// normal extractor). Returning all candidates lets tryExtractMemoObject pick
+// the first one that yields a valid memo JSON with all required keys.
+function extractCodexAgentMessageTexts(text: string): string[] {
+  const completedTexts: string[] = [];
+  const updatedTexts: string[] = [];
   for (const line of text.split('\n')) {
     if (!line.startsWith('{')) continue;
     try {
       const ev = JSON.parse(line) as Record<string, unknown>;
-      if (
-        (ev.type === 'item.completed' || ev.type === 'item.updated') &&
-        ev.item != null && typeof ev.item === 'object'
-      ) {
+      if (ev.item != null && typeof ev.item === 'object') {
         const item = ev.item as Record<string, unknown>;
         if (item.type === 'agent_message' && typeof item.text === 'string') {
-          return item.text;
+          if (ev.type === 'item.completed') {
+            completedTexts.push(item.text);
+          } else if (ev.type === 'item.updated') {
+            updatedTexts.push(item.text);
+          }
         }
       }
     } catch { /* not a parseable JSONL envelope — skip */ }
   }
-  return null;
+  // Within each group sort by descending length so the most complete text comes first.
+  completedTexts.sort((a, b) => b.length - a.length);
+  updatedTexts.sort((a, b) => b.length - a.length);
+  // item.completed takes priority over item.updated.
+  return [...completedTexts, ...updatedTexts];
 }
 
 // ── Handler: Memo (terminal reasoning artifact, no repo clone, no PR) ────────
@@ -178,8 +188,10 @@ Rules:
     if (lastResultText) sources.push({ label: 'lastResultText', text: lastResultText });
     if (allOutput) sources.push({ label: 'allOutput', text: allOutput });
     if (allOutput) {
-      const codexText = extractCodexAgentMessageText(allOutput);
-      if (codexText) sources.push({ label: 'allOutput[codex-agent_message]', text: codexText });
+      const codexTexts = extractCodexAgentMessageTexts(allOutput);
+      codexTexts.forEach((t, idx) => {
+        sources.push({ label: `allOutput[codex-agent_message#${idx}]`, text: t });
+      });
     }
     return sources;
   };
@@ -318,6 +330,16 @@ Output ONLY the JSON object now — no preamble, no markdown code fences, no add
       ? `, codexTurnCompleted=${String(finalCodexTurnCompleted)}`
       : '';
 
+    // If any agent_message candidates were found in the most recent run's output,
+    // append each one verbatim (capped at 64 KB) so the backend recovery path
+    // can re-attempt extraction even when the output tail was truncated.
+    const recoveredCandidates = extractCodexAgentMessageTexts(causeCAllOutput);
+    const recoveredSuffix = recoveredCandidates.length > 0
+      ? recoveredCandidates.map((candidate) =>
+          `\n--- recovered-agent-message-text ---\n${candidate.slice(0, 65536)}`
+        ).join('')
+      : '';
+
     await persistAndPostStatus(taskId, {
       task_id: taskId,
       status: 'FAILED',
@@ -328,7 +350,7 @@ Output ONLY the JSON object now — no preamble, no markdown code fences, no add
         `(summary, reasoning, citations, tags). exitCode=${exitCode}, ` +
         `allOutput=${(allOutput || '').length}b, ` +
         `lastResultText=${(lastResultText || '').length}b${retrySuffix}${codexSuffix}\n` +
-        `--- output tail ---\n${tail}${stderrSuffix}`,
+        `--- output tail ---\n${tail}${stderrSuffix}${recoveredSuffix}`,
     });
     return;
   }

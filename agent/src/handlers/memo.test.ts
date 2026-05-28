@@ -508,4 +508,86 @@ describe('handleMemo', () => {
     // so this is a real parse failure, not a silent CLI death.
     expect(call.failure_category).toBe('parse_failed');
   });
+
+  // ── Multiple agent_message events (2026-05-27) ───────────────────────────
+  // When allOutput contains multiple agent_message JSONL lines (e.g. a short
+  // item.updated followed by a full item.completed), extractCodexAgentMessageTexts
+  // must return all of them in priority order so tryExtractMemoObject can pick
+  // the first one with a valid memo schema.
+
+  it('succeeds when allOutput has a short item.updated followed by a full item.completed memo', async () => {
+    // item.updated arrives first with only partial text; item.completed carries
+    // the full memo JSON. The handler must succeed using the completed event.
+    const fullMemoJson = JSON.stringify({
+      summary: 'Full memo summary.',
+      reasoning: 'Full reasoning from item.completed envelope.',
+      citations: ['task:abc'],
+      tags: ['completed'],
+    });
+    const shortText = 'partial output, no JSON yet';
+
+    const updatedLine = JSON.stringify({
+      type: 'item.updated',
+      item: { type: 'agent_message', text: shortText },
+    });
+    const completedLine = JSON.stringify({
+      type: 'item.completed',
+      item: { type: 'agent_message', text: fullMemoJson },
+    });
+
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      // lastResultText truncated — doesn't have the full JSON
+      lastResultText: shortText,
+      allOutput: `${updatedLine}\n${completedLine}\n`,
+      codexTurnCompleted: true,
+      stderrTail: '',
+    });
+
+    await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBeUndefined();
+    expect(call.logs).toContain('Full memo summary.');
+  });
+
+  it('includes recovered-agent-message-text marker in failure log when agent_message candidates exist', async () => {
+    // When extraction fails but the allOutput contains agent_message envelopes,
+    // the failure log must include the recovered-agent-message-text marker blocks
+    // so the backend recovery path can re-attempt extraction.
+    const candidateText = JSON.stringify({
+      summary: 'Almost valid',
+      reasoning: 'Reasoning present',
+      // deliberately missing citations and tags — will fail extraction
+    });
+    const completedLine = JSON.stringify({
+      type: 'item.completed',
+      item: { type: 'agent_message', text: candidateText },
+    });
+
+    // Both runs fail to find a valid memo (missing required keys)
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: completedLine,
+        lastResultText: '',
+        codexTurnCompleted: true,
+        stderrTail: '',
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: completedLine,
+        lastResultText: '',
+        codexTurnCompleted: true,
+        stderrTail: '',
+      });
+
+    await handleMemo(TASK_ID, {}, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.logs).toContain('--- recovered-agent-message-text ---');
+    expect(call.logs).toContain(candidateText);
+  });
 });

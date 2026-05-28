@@ -1645,6 +1645,9 @@ async def _handle_memo_completion(task: Task, logs: str, session: AsyncSession):
     logger.info(f"[MEMO] Persisted memo artifact {artifact.id} for task {task.id}")
 
 
+_RECOVERED_AGENT_MESSAGE_MARKER = "--- recovered-agent-message-text ---"
+
+
 async def _try_recover_memo_from_parse_failure(
     task: Task, logs: str, session: AsyncSession
 ) -> bool:
@@ -1652,10 +1655,19 @@ async def _try_recover_memo_from_parse_failure(
 
     When a memo task fails with failure_category='parse_failed' the Codex agent
     may have already emitted a schema-valid memo JSON inside an item.completed /
-    item.updated event that the deployed agent handler failed to extract.  Scans
-    ``logs`` line-by-line for those envelopes, tries ``_parse_memo_output`` on
-    the text payload, and on success calls ``_handle_memo_completion`` to persist
-    the MEMO Artifact and promote the task to COMPLETED.
+    item.updated event that the deployed agent handler failed to extract.  Tries
+    three strategies in order:
+
+    1. ``--- recovered-agent-message-text ---`` marker blocks appended by the
+       agent handler's failure path — each block contains the full raw text of a
+       candidate agent_message, which may be longer than what fits in the truncated
+       JSONL tail.
+    2. Line-by-line JSONL scan for item.completed / item.updated agent_message
+       envelopes (original strategy, handles the intact-line case).
+    3. Escaped-JSON fallback: if the logs contain ``\\"summary\\"`` and
+       ``\\"reasoning\\"`` (the escaped forms that appear when a JSONL line is
+       only partially captured), unescape the substring following the nearest
+       ``"text":"`` and call ``_parse_memo_output`` on the result.
 
     Returns True on successful recovery, False if no valid memo is found (leaving
     the task status unchanged so the caller can decide how to proceed).
@@ -1663,6 +1675,26 @@ async def _try_recover_memo_from_parse_failure(
     if not logs:
         return False
 
+    # Strategy 1: recovered-agent-message-text marker blocks.
+    if _RECOVERED_AGENT_MESSAGE_MARKER in logs:
+        parts = logs.split(_RECOVERED_AGENT_MESSAGE_MARKER)
+        for part in parts[1:]:  # skip the content before the first marker
+            # Text up to the next '---' marker or end of string
+            next_sep = part.find("\n---")
+            candidate_text = part[:next_sep].strip() if next_sep != -1 else part.strip()
+            if not candidate_text:
+                continue
+            parsed = _parse_memo_output(candidate_text)
+            if parsed is not None and all(k in parsed for k in _MEMO_REQUIRED_KEYS):
+                logger.info(
+                    "[MEMO] Recovery: found valid memo JSON in recovered-agent-message-text "
+                    "block for task %s",
+                    task.id,
+                )
+                await _handle_memo_completion(task, candidate_text, session)
+                return True
+
+    # Strategy 2: line-by-line JSONL scan (original path).
     for raw_line in logs.splitlines():
         line = raw_line.strip()
         if not line:
@@ -1705,6 +1737,30 @@ async def _try_recover_memo_from_parse_failure(
         )
         await _handle_memo_completion(task, text, session)
         return True
+
+    # Strategy 3: escaped-JSON fallback for truncated JSONL tails.
+    # The escaped forms \"summary\" and \"reasoning\" appear when the JSONL line
+    # was cut and only the interior of the JSON-escaped text value is visible.
+    if '\\"summary\\"' in logs and '\\"reasoning\\"' in logs:
+        text_key = '"text":"'
+        idx = logs.rfind(text_key)
+        if idx != -1:
+            raw_escaped = logs[idx + len(text_key) :]
+            # Unescape JSON string escapes so _parse_memo_output can find the object.
+            unescaped = (
+                raw_escaped.replace('\\"', '"')
+                .replace("\\\\", "\\")
+                .replace("\\n", "\n")
+            )
+            parsed = _parse_memo_output(unescaped)
+            if parsed is not None and all(k in parsed for k in _MEMO_REQUIRED_KEYS):
+                logger.info(
+                    "[MEMO] Recovery: found valid memo JSON via escaped-tail fallback "
+                    "for task %s",
+                    task.id,
+                )
+                await _handle_memo_completion(task, unescaped, session)
+                return True
 
     return False
 
