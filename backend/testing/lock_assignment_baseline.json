@@ -17,7 +17,10 @@
     "routers/admin_projects.py": 1,
     "routers/agent.py": 2,
     "routers/agent_status.py": 3,
-    "sr_analytics.py": 17,
+    "sr_analytics.py": 0,
+    "sr_catch_rate_trends.py": 12,
+    "sr_reviewer_trends.py": 3,
+    "sr_signal_trends.py": 2,
     "task_locking.py": 1
   },
   "directions": {
