@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.models import Task, Project, ProjectMember
+from app.admin_task_mutations import modify_task_apply as modify_task_apply  # noqa: F401
 
 _ROLE_LEVEL = {"viewer": 0, "member": 1, "owner": 2}
 

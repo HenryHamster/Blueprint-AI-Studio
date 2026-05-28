@@ -9,6 +9,9 @@ Covers the critical functions:
   5. _process_post_commit — task not found guard and rollup triggering
 """
 
+import ast
+import importlib
+import os
 import uuid
 
 import pytest
@@ -4916,3 +4919,77 @@ class TestCloseOrphanPrIfAny:
 
         closed = await tl.close_orphan_pr_if_any(task, session, reason="dedup")
         assert closed is False  # swallowed, not raised
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Modularity tripwire — task_lifecycle_requeue extraction
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+_TASK_LIFECYCLE_PATH = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "app", "task_lifecycle.py")
+)
+
+_EXTRACTED_TO_REQUEUE = (
+    "_record_parent_failure",
+    "_requeue_parent_task",
+)
+
+
+def _top_level_defs_in_file(path: str) -> dict:
+    """Return {name: kind} for module-level function/class/assignment defs."""
+    with open(path, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    found: dict = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            found.setdefault(node.name, "function")
+        elif isinstance(node, ast.AsyncFunctionDef):
+            found.setdefault(node.name, "async function")
+        elif isinstance(node, ast.ClassDef):
+            found.setdefault(node.name, "class")
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    found.setdefault(target.id, "assignment")
+        elif isinstance(node, ast.AnnAssign) and isinstance(
+            node.target, ast.Name
+        ):
+            found.setdefault(node.target.id, "assignment")
+    return found
+
+
+class TestRequeueExtractionTripwire:
+    """Ensures _record_parent_failure / _requeue_parent_task stay in
+    task_lifecycle_requeue.py and are not silently re-defined in task_lifecycle.py.
+    """
+
+    def test_symbols_not_redefined_in_task_lifecycle(self):
+        defs = _top_level_defs_in_file(_TASK_LIFECYCLE_PATH)
+        violations = [
+            f"  {name} ({defs[name]})" for name in _EXTRACTED_TO_REQUEUE if name in defs
+        ]
+        assert not violations, (
+            "task_lifecycle.py re-defines symbols that were extracted to "
+            "task_lifecycle_requeue.py. Drop the local definition and rely on "
+            "the re-export.\n\nViolations:\n" + "\n".join(violations)
+        )
+
+    @pytest.mark.parametrize("symbol", _EXTRACTED_TO_REQUEUE)
+    def test_symbol_importable_from_task_lifecycle(self, symbol: str):
+        facade = importlib.import_module("app.task_lifecycle")
+        canonical = importlib.import_module("app.task_lifecycle_requeue")
+
+        assert hasattr(facade, symbol), (
+            f"app.task_lifecycle.{symbol} is no longer importable. "
+            f"Add: from app.task_lifecycle_requeue import {symbol}  # noqa: F401"
+        )
+        assert hasattr(canonical, symbol), (
+            f"app.task_lifecycle_requeue.{symbol} is missing — restore the "
+            f"definition or remove it from the tripwire."
+        )
+        assert getattr(facade, symbol) is getattr(canonical, symbol), (
+            f"app.task_lifecycle.{symbol} is not the same object as "
+            f"app.task_lifecycle_requeue.{symbol}. The facade is shadowing "
+            f"the canonical implementation."
+        )

@@ -5,6 +5,7 @@ Tests for three admin routers:
 3. admin_notifications.py — alerts, messages, playbook
 """
 
+import json
 import uuid
 from unittest.mock import AsyncMock, patch
 
@@ -15,6 +16,7 @@ from sqlmodel import select
 from app.main import app
 from app.models import (
     AllowedUser,
+    ArtifactType,
     Project,
     ProjectMember,
     ReleaseVersion,
@@ -27,6 +29,7 @@ from app.models import (
     _on_task_terminal_callbacks,
 )
 from app.auth import get_current_user, require_admin
+from app.schemas import AgentStatusPayload
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -5123,3 +5126,431 @@ class TestGetAuditFindings:
         data = resp.json()
         assert data["findings"] == []
         assert data["source"] == "last_qualification"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# agent_status_spawn.py — maybe_spawn_smoketest_fix / maybe_spawn_debug_create
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _make_smoketest_payload(task_id, *, passed=False):
+    """Build an AgentStatusPayload for a SMOKETEST_RESULT artifact."""
+    logs = json.dumps(
+        {
+            "passed": passed,
+            "tests": [
+                {"name": "test_login", "status": "fail" if not passed else "pass", "message": "auth error"},
+            ],
+            "suites": {"startup": {"passed": passed, "tests": []}},
+            "guardrail_violations": [],
+        }
+    )
+    return AgentStatusPayload(
+        task_id=task_id,
+        status=TaskStatus.FAILED if not passed else TaskStatus.COMPLETED,
+        artifact_type=ArtifactType.SMOKETEST_RESULT,
+        logs=logs,
+    )
+
+
+def _make_debug_payload(task_id, *, confidence="high", fix_prompt="Fix the auth module"):
+    """Build an AgentStatusPayload for a DEBUG_RESULT artifact."""
+    logs = json.dumps(
+        {
+            "confidence": confidence,
+            "fix_prompt": fix_prompt,
+            "root_cause": "null pointer in auth",
+        }
+    )
+    return AgentStatusPayload(
+        task_id=task_id,
+        status=TaskStatus.COMPLETED,
+        artifact_type=ArtifactType.DEBUG_RESULT,
+        logs=logs,
+    )
+
+
+class TestMaybeSpawnSmoketestFix:
+    """Seam tests for agent_status_spawn.maybe_spawn_smoketest_fix."""
+
+    @pytest.mark.asyncio
+    async def test_spawns_fix_task_and_alert_on_failure(self, db_session, mock_broadcast):
+        """On smoketest failure, a plan task and an ERROR alert are created."""
+        from app.agent_status_spawn import maybe_spawn_smoketest_fix
+
+        project = await _make_project(db_session)
+        smoketest_task = Task(
+            project_id=project.id,
+            title="Smoketest on main",
+            payloads=[{"type": "smoketest", "base_branch": "main"}],
+            status=TaskStatus.FAILED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(smoketest_task)
+        await db_session.commit()
+        await db_session.refresh(smoketest_task)
+
+        payload = _make_smoketest_payload(smoketest_task.id, passed=False)
+
+        with patch("app.agent_status_spawn.broadcast_to_project", new_callable=AsyncMock):
+            await maybe_spawn_smoketest_fix(smoketest_task, payload, db_session, str(smoketest_task.id))
+            await db_session.commit()
+
+        spawned = (
+            (await db_session.execute(select(Task).where(Task.parent_task_id == smoketest_task.id)))
+            .scalars()
+            .all()
+        )
+        assert len(spawned) == 1, "Expected exactly one spawned fix task"
+        fix_task = spawned[0]
+        assert fix_task.status == TaskStatus.QUEUED
+        assert "smoketest" in fix_task.title.lower() or "fix" in fix_task.title.lower()
+        assert fix_task.project_id == project.id
+
+        alerts = (
+            (await db_session.execute(select(Alert).where(Alert.task_id == smoketest_task.id)))
+            .scalars()
+            .all()
+        )
+        assert len(alerts) == 1
+        assert alerts[0].severity == "ERROR"
+
+    @pytest.mark.asyncio
+    async def test_dedup_skips_spawn_when_fix_task_exists(self, db_session, mock_broadcast):
+        """If a child task already exists, no second fix task is spawned."""
+        from app.agent_status_spawn import maybe_spawn_smoketest_fix
+
+        project = await _make_project(db_session)
+        smoketest_task = Task(
+            project_id=project.id,
+            title="Smoketest on main",
+            payloads=[{"type": "smoketest", "base_branch": "main"}],
+            status=TaskStatus.FAILED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(smoketest_task)
+        await db_session.commit()
+        await db_session.refresh(smoketest_task)
+
+        existing_fix = Task(
+            project_id=project.id,
+            title="Fix: pre-existing",
+            parent_task_id=smoketest_task.id,
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(existing_fix)
+        await db_session.commit()
+
+        payload = _make_smoketest_payload(smoketest_task.id, passed=False)
+
+        with patch("app.agent_status_spawn.broadcast_to_project", new_callable=AsyncMock):
+            await maybe_spawn_smoketest_fix(smoketest_task, payload, db_session, str(smoketest_task.id))
+            await db_session.commit()
+
+        children = (
+            (await db_session.execute(select(Task).where(Task.parent_task_id == smoketest_task.id)))
+            .scalars()
+            .all()
+        )
+        assert len(children) == 1, "Dedup: must not spawn a second fix task"
+
+    @pytest.mark.asyncio
+    async def test_skips_spawn_for_qualifier_smoketest(self, db_session, mock_broadcast):
+        """Fix spawn is skipped when the task context marks it as a qualifier smoketest."""
+        from app.agent_status_spawn import maybe_spawn_smoketest_fix
+
+        project = await _make_project(db_session)
+        smoketest_task = Task(
+            project_id=project.id,
+            title="Qualifier smoketest",
+            payloads=[{"type": "smoketest", "base_branch": "main"}],
+            status=TaskStatus.FAILED,
+            context={"qualifier_smoketest": True},
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(smoketest_task)
+        await db_session.commit()
+        await db_session.refresh(smoketest_task)
+
+        payload = _make_smoketest_payload(smoketest_task.id, passed=False)
+
+        with patch("app.agent_status_spawn.broadcast_to_project", new_callable=AsyncMock):
+            await maybe_spawn_smoketest_fix(smoketest_task, payload, db_session, str(smoketest_task.id))
+            await db_session.commit()
+
+        children = (
+            (await db_session.execute(select(Task).where(Task.parent_task_id == smoketest_task.id)))
+            .scalars()
+            .all()
+        )
+        assert len(children) == 0, "Qualifier smoketest must not trigger fix spawn"
+
+
+class TestMaybeSpawnDebugCreate:
+    """Seam tests for agent_status_spawn.maybe_spawn_debug_create."""
+
+    @pytest.mark.asyncio
+    async def test_spawns_fix_task_on_high_confidence(self, db_session, mock_broadcast):
+        """High-confidence debug result with fix_prompt spawns a create task."""
+        from app.agent_status_spawn import maybe_spawn_debug_create
+
+        project = await _make_project(db_session)
+        debug_task = Task(
+            project_id=project.id,
+            title="Debug: auth regression",
+            payloads=[{"type": "debug", "base_branch": "main"}],
+            status=TaskStatus.COMPLETED,
+            context={},
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(debug_task)
+        await db_session.commit()
+        await db_session.refresh(debug_task)
+
+        payload = _make_debug_payload(debug_task.id, confidence="high", fix_prompt="Patch the auth module")
+
+        with patch("app.agent_status_spawn.broadcast_to_project", new_callable=AsyncMock):
+            await maybe_spawn_debug_create(debug_task, payload, db_session, str(debug_task.id))
+            await db_session.commit()
+
+        fix_tasks = (
+            (await db_session.execute(select(Task).where(Task.title.like("Fix:%"))))
+            .scalars()
+            .all()
+        )
+        assert len(fix_tasks) == 1
+        assert fix_tasks[0].status == TaskStatus.QUEUED
+        assert "auth regression" in fix_tasks[0].title
+
+    @pytest.mark.asyncio
+    async def test_no_spawn_when_confidence_not_high(self, db_session, mock_broadcast):
+        """Low-confidence debug result does not spawn a fix task."""
+        from app.agent_status_spawn import maybe_spawn_debug_create
+
+        project = await _make_project(db_session)
+        debug_task = Task(
+            project_id=project.id,
+            title="Debug: flaky test",
+            payloads=[{"type": "debug", "base_branch": "main"}],
+            status=TaskStatus.COMPLETED,
+            context={},
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(debug_task)
+        await db_session.commit()
+        await db_session.refresh(debug_task)
+
+        payload = _make_debug_payload(debug_task.id, confidence="low", fix_prompt="maybe fix here")
+
+        with patch("app.agent_status_spawn.broadcast_to_project", new_callable=AsyncMock):
+            await maybe_spawn_debug_create(debug_task, payload, db_session, str(debug_task.id))
+            await db_session.commit()
+
+        fix_tasks = (
+            (await db_session.execute(select(Task).where(Task.title.like("Fix:%"))))
+            .scalars()
+            .all()
+        )
+        assert len(fix_tasks) == 0, "Low-confidence debug must not spawn a fix task"
+
+    @pytest.mark.asyncio
+    async def test_dedup_skips_spawn_when_failed_task_replaced_by_requeue(
+        self, db_session, mock_broadcast
+    ):
+        """Skips fix spawn when the failed task was already replaced by _requeue_parent_task."""
+        from app.agent_status_spawn import maybe_spawn_debug_create
+
+        project = await _make_project(db_session)
+
+        replacement_task = Task(
+            project_id=project.id,
+            title="Replacement task",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(replacement_task)
+        await db_session.commit()
+        await db_session.refresh(replacement_task)
+
+        failed_task = Task(
+            project_id=project.id,
+            title="Failed task",
+            status=TaskStatus.CANCELLED,
+            context={"_replaced_by_task_id": str(replacement_task.id)},
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(failed_task)
+        await db_session.commit()
+        await db_session.refresh(failed_task)
+
+        debug_task = Task(
+            project_id=project.id,
+            title="Debug: failed task",
+            payloads=[{"type": "debug", "base_branch": "main"}],
+            status=TaskStatus.COMPLETED,
+            context={"failed_task_id": str(failed_task.id)},
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add(debug_task)
+        await db_session.commit()
+        await db_session.refresh(debug_task)
+
+        payload = _make_debug_payload(debug_task.id, confidence="high", fix_prompt="Fix it")
+
+        with patch("app.agent_status_spawn.broadcast_to_project", new_callable=AsyncMock):
+            await maybe_spawn_debug_create(debug_task, payload, db_session, str(debug_task.id))
+            await db_session.commit()
+
+        fix_tasks = (
+            (await db_session.execute(select(Task).where(Task.title.like("Fix:%"))))
+            .scalars()
+            .all()
+        )
+        assert len(fix_tasks) == 0, "Dedup: must not spawn fix when failed task already replaced by requeue"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_task_mutations.py — Seam tests for modify_task_apply helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestModifyTaskApplySeam:
+    """Seam tests that call admin_task_mutations helpers directly (no HTTP).
+
+    These validate the per-phase logic extracted from modify_task so the
+    individual mutation phases are testable in isolation.
+    """
+
+    async def _make_task(self, session, project_id, status=TaskStatus.QUEUED):
+        task = Task(
+            project_id=project_id,
+            title="Seam test task",
+            status=status,
+            created_by="ORCHESTRATOR",
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        return task
+
+    @pytest.mark.asyncio
+    async def test_apply_simple_mutations_payloads(self, db_session):
+        """_apply_simple_mutations updates task.payloads when payload key present."""
+        from app.admin_task_mutations import _apply_simple_mutations
+
+        project = await _make_project(db_session)
+        task = await self._make_task(db_session, project.id)
+
+        changes: dict = {}
+        await _apply_simple_mutations(
+            task, {"payloads": [{"type": "create", "prompt": "hello"}]}, changes
+        )
+
+        assert task.payloads == [{"type": "create", "prompt": "hello"}]
+        assert changes["payloads"] == "updated"
+
+    @pytest.mark.asyncio
+    async def test_apply_simple_mutations_context_merge(self, db_session):
+        """_apply_simple_mutations merges context dicts rather than replacing them."""
+        from app.admin_task_mutations import _apply_simple_mutations
+
+        project = await _make_project(db_session)
+        task = await self._make_task(db_session, project.id)
+        task.context = {"existing_key": "existing_val"}
+
+        changes: dict = {}
+        await _apply_simple_mutations(task, {"context": {"new_key": "new_val"}}, changes)
+
+        assert task.context["existing_key"] == "existing_val"
+        assert task.context["new_key"] == "new_val"
+        assert changes["context"] == "updated"
+
+    @pytest.mark.asyncio
+    async def test_apply_simple_mutations_no_op_when_keys_absent(self, db_session):
+        """_apply_simple_mutations does nothing when payload has no recognised keys."""
+        from app.admin_task_mutations import _apply_simple_mutations
+
+        project = await _make_project(db_session)
+        task = await self._make_task(db_session, project.id)
+        original_payloads = task.payloads
+
+        changes: dict = {}
+        await _apply_simple_mutations(task, {"unrelated_key": "value"}, changes)
+
+        assert task.payloads == original_payloads
+        assert changes == {}
+
+    @pytest.mark.asyncio
+    async def test_apply_simple_mutations_context_size_guard(self, db_session):
+        """_apply_simple_mutations raises 400 when merged context exceeds 100 KB."""
+        from fastapi import HTTPException
+        from app.admin_task_mutations import _apply_simple_mutations
+
+        project = await _make_project(db_session)
+        task = await self._make_task(db_session, project.id)
+        task.context = {}
+
+        big_value = "x" * 200_000
+        with pytest.raises(HTTPException) as exc_info:
+            await _apply_simple_mutations(task, {"context": {"big": big_value}}, {})
+
+        assert exc_info.value.status_code == 400
+        assert "100KB" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_apply_depends_on_mutation_sets_deps(self, db_session):
+        """_apply_depends_on_mutation persists a valid depends_on list."""
+        from app.admin_task_mutations import _apply_depends_on_mutation
+
+        project = await _make_project(db_session)
+        task = await self._make_task(db_session, project.id)
+        dep_task = await self._make_task(db_session, project.id)
+
+        changes: dict = {}
+        await _apply_depends_on_mutation(
+            task, {"depends_on": [str(dep_task.id)]}, db_session, changes
+        )
+
+        assert task.depends_on == [str(dep_task.id)]
+        assert changes["depends_on"] == [str(dep_task.id)]
+
+    @pytest.mark.asyncio
+    async def test_apply_depends_on_mutation_rejects_nonexistent(self, db_session):
+        """_apply_depends_on_mutation raises 400 for an unknown task UUID."""
+        from fastapi import HTTPException
+        from app.admin_task_mutations import _apply_depends_on_mutation
+
+        project = await _make_project(db_session)
+        task = await self._make_task(db_session, project.id)
+        missing_id = str(uuid.uuid4())
+
+        with pytest.raises(HTTPException) as exc_info:
+            await _apply_depends_on_mutation(
+                task, {"depends_on": [missing_id]}, db_session, {}
+            )
+
+        assert exc_info.value.status_code == 400
+        assert "do not exist" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_modify_task_apply_returns_expected_shape(self, db_session):
+        """modify_task_apply returns the standard response shape with no mutations."""
+        from fastapi import BackgroundTasks
+        from unittest.mock import patch, AsyncMock
+        from app.admin_helpers import modify_task_apply
+
+        project = await _make_project(db_session)
+        task = await self._make_task(db_session, project.id)
+
+        with patch("app.admin_task_mutations.broadcast_to_project", new_callable=AsyncMock):
+            result = await modify_task_apply(
+                task=task,
+                payload={},
+                background_tasks=BackgroundTasks(),
+                session=db_session,
+            )
+
+        assert result["id"] == str(task.id)
+        assert result["project_id"] == str(task.project_id)
+        assert result["status"] == task.status
+        assert "requires_approval" in result

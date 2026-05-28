@@ -5391,7 +5391,7 @@ class TestHandleInvestigationTerminalFailure:
         await db_session.commit()
 
         boom = mocker.patch(
-            "app.task_completion._maybe_spawn_reinvestigation_after_failure",
+            "app.task_completion_investigation._maybe_spawn_reinvestigation_after_failure",
             new_callable=AsyncMock,
             side_effect=RuntimeError("db blew up"),
         )

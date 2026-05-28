@@ -3114,7 +3114,9 @@ async def test_infra_recovery_does_not_resurrect_when_no_zone_available(
 ):
     """A PROVISION_FAILURE task stays FAILED when no zone is available."""
     _common_infra_recovery_mocks(mocker)
-    mocker.patch("app.reaper.any_zone_available", return_value=False)
+    # The infra-recovery sweep calls any_zone_available from reaper_infra_recovery
+    # (extracted in PR #6524). Patch the call-site module, not app.reaper.
+    mocker.patch("app.reaper_infra_recovery.any_zone_available", return_value=False)
 
     project = Project(name="No Zone Available Test", user_id="user1")
     reaper_db.add(project)
@@ -3228,7 +3230,9 @@ async def test_infra_recovery_skips_agent_timeout_when_no_zone_available(
 ):
     """An AGENT_TIMEOUT task is not resurrected when no zone is available."""
     _common_infra_recovery_mocks(mocker)
-    mocker.patch("app.reaper.any_zone_available", return_value=False)
+    # The infra-recovery sweep calls any_zone_available from reaper_infra_recovery
+    # (extracted in PR #6524). Patch the call-site module, not app.reaper.
+    mocker.patch("app.reaper_infra_recovery.any_zone_available", return_value=False)
 
     project = Project(name="AGENT_TIMEOUT No Zone Test", user_id="user1")
     reaper_db.add(project)

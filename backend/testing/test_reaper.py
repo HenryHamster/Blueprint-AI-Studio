@@ -48,6 +48,7 @@ from app.reaper import (
     is_reaper_halted,
 )
 from app.shared_state import runtime_config as _runtime_config
+import app.reaper_sweeps as _rs
 
 
 def test_heartbeat_stale_cutoff_respects_runtime_config_override():
@@ -3287,7 +3288,7 @@ async def test_orphan_sweep_clears_hold_when_direction_missing(reaper_db):
     """A held direction whose id is absent from every project's directions
     list must have its hold cleared — otherwise tasks stay stuck forever."""
     import app.shared_state as _ss
-    from app.reaper import _sweep_orphan_direction_holds
+    from app.reaper_infra_recovery import _sweep_orphan_direction_holds
 
     _ss.direction_failure_streaks.clear()
     # Project has no directions at all — all held directions are orphans.
@@ -3312,7 +3313,7 @@ async def test_orphan_sweep_clears_hold_when_direction_missing(reaper_db):
 async def test_orphan_sweep_preserves_hold_when_direction_live(reaper_db):
     """A held direction that still exists (status=active) must NOT be cleared."""
     import app.shared_state as _ss
-    from app.reaper import _sweep_orphan_direction_holds
+    from app.reaper_infra_recovery import _sweep_orphan_direction_holds
 
     _ss.direction_failure_streaks.clear()
     live_did = "d-" + _uuid_mod.uuid4().hex[:8]
@@ -3343,7 +3344,7 @@ async def test_orphan_sweep_preserves_hold_when_direction_live(reaper_db):
 async def test_orphan_sweep_clears_hold_when_direction_completed(reaper_db):
     """A direction with status=completed is no longer live — hold is orphaned."""
     import app.shared_state as _ss
-    from app.reaper import _sweep_orphan_direction_holds
+    from app.reaper_infra_recovery import _sweep_orphan_direction_holds
 
     _ss.direction_failure_streaks.clear()
     completed_did = "d-" + _uuid_mod.uuid4().hex[:8]
@@ -3374,7 +3375,7 @@ async def test_orphan_sweep_clears_hold_when_direction_completed(reaper_db):
 async def test_orphan_sweep_ignores_unheld_streaks(reaper_db):
     """Streaks without held=True are untouched regardless of direction state."""
     import app.shared_state as _ss
-    from app.reaper import _sweep_orphan_direction_holds
+    from app.reaper_infra_recovery import _sweep_orphan_direction_holds
 
     _ss.direction_failure_streaks.clear()
     await _make_project(reaper_db)
@@ -3400,7 +3401,7 @@ async def test_sweep_stale_residual_cases_closes_active_old(reaper_db):
     """An ACTIVE case older than 72 h must be closed and its fingerprint marked."""
     import app.failure_classification as _fc
     from app.models import ResidualRemediationCase, ResidualCaseStatus
-    from app.reaper import _sweep_stale_residual_cases
+    from app.reaper_infra_recovery import _sweep_stale_residual_cases
 
     _fc._residual_closed_fingerprints.clear()
     stale_case = ResidualRemediationCase(
@@ -3425,7 +3426,7 @@ async def test_sweep_stale_residual_cases_ignores_recent(reaper_db):
     """An ACTIVE case seen within 72 h must not be touched."""
     import app.failure_classification as _fc
     from app.models import ResidualRemediationCase, ResidualCaseStatus
-    from app.reaper import _sweep_stale_residual_cases
+    from app.reaper_infra_recovery import _sweep_stale_residual_cases
 
     _fc._residual_closed_fingerprints.clear()
     recent_case = ResidualRemediationCase(
@@ -3450,7 +3451,7 @@ async def test_sweep_stale_residual_cases_ignores_already_closed(reaper_db):
     """A case already in CLOSED_ORGANICALLY must not be counted or re-touched."""
     import app.failure_classification as _fc
     from app.models import ResidualRemediationCase, ResidualCaseStatus
-    from app.reaper import _sweep_stale_residual_cases
+    from app.reaper_infra_recovery import _sweep_stale_residual_cases
 
     _fc._residual_closed_fingerprints.clear()
     already_closed = ResidualRemediationCase(
@@ -3473,7 +3474,7 @@ async def test_sweep_stale_residual_cases_resolves_stale_remediating(reaper_db, 
     """A REMEDIATING case quiet beyond the cutoff auto-resolves and emits an event."""
     import app.failure_classification as _fc
     from app.models import ResidualRemediationCase, ResidualCaseStatus
-    from app.reaper import _sweep_stale_residual_cases
+    from app.reaper_infra_recovery import _sweep_stale_residual_cases
 
     event_mock = mocker.patch(
         "app.notification_dispatch.post_event_message", new_callable=AsyncMock
@@ -3505,7 +3506,7 @@ async def test_sweep_stale_residual_cases_keeps_recent_remediating(reaper_db, mo
     """A REMEDIATING case with recent spawn/seen timestamps should not auto-resolve."""
     import app.failure_classification as _fc
     from app.models import ResidualRemediationCase, ResidualCaseStatus
-    from app.reaper import _sweep_stale_residual_cases
+    from app.reaper_infra_recovery import _sweep_stale_residual_cases
 
     event_mock = mocker.patch(
         "app.notification_dispatch.post_event_message", new_callable=AsyncMock
@@ -5235,3 +5236,55 @@ async def test_reap_with_open_pr_uses_project_namespace(
     assert _spawned_branch.startswith("autoproj/"), (
         f"expected autoproj/* branch, got {_spawned_branch!r}"
     )
+
+
+# ── reaper_sweeps seam tests (direct helper invocations) ─────────────────────
+# These tests call the extracted sweep helpers directly, proving the extraction
+# boundary is well-formed and exercising behaviors that the full-cycle tests
+# (which go through _run_reaper_once) do not cover.
+
+@pytest.mark.asyncio
+async def test_sweep_routine_message_retention_commits_when_purged(mocker):
+    """sweep_routine_message_retention commits the session when messages are purged."""
+    mocker.patch(
+        "app.reaper_sweeps._purge_stale_routine_messages",
+        new_callable=AsyncMock,
+        return_value=3,
+    )
+    mock_session = AsyncMock()
+    result = await _rs.sweep_routine_message_retention(mock_session)
+    assert result == 3
+    mock_session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sweep_routine_message_retention_skips_commit_when_nothing_purged(mocker):
+    """sweep_routine_message_retention does NOT commit when there is nothing to purge."""
+    mocker.patch(
+        "app.reaper_sweeps._purge_stale_routine_messages",
+        new_callable=AsyncMock,
+        return_value=0,
+    )
+    mock_session = AsyncMock()
+    result = await _rs.sweep_routine_message_retention(mock_session)
+    assert result == 0
+    mock_session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sweep_regression_scan_cadence_gate_suppresses_second_call(mocker):
+    """sweep_regression_scan returns 0 immediately when called within the 15-min window."""
+    _rs._last_regression_scan = None  # reset to force first call through
+    scan_mock = mocker.patch(
+        "app.reaper_sweeps._run_regression_scan_and_notify",
+        new_callable=AsyncMock,
+        return_value=1,
+    )
+    mock_session = AsyncMock()
+    first = await _rs.sweep_regression_scan(mock_session)
+    second = await _rs.sweep_regression_scan(mock_session)
+
+    assert first == 1
+    assert second == 0, "cadence gate must suppress second call within 15 min"
+    scan_mock.assert_awaited_once()
+    _rs._last_regression_scan = None  # restore for test isolation
