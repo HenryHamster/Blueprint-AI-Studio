@@ -1,7 +1,7 @@
-import { afterEach, describe, test, vi } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { screen } from '@testing-library/react';
+import { screen, fireEvent } from '@testing-library/react';
 import { SrMissedRetrospectivesPanel } from './SrMissedRetrospectivesPanel';
 import { expectNoOverflowAt } from '../test/viewport';
 
@@ -23,6 +23,13 @@ const MOCK_ITEMS = [
     missed_categories: ['correctness', 'error-handling'],
     caught_categories: ['security', 'type-safety'],
     pr_url: 'https://github.com/example/repo/pull/42',
+    sr_check_results: {
+      correctness: { passed: false, issue: 'Off-by-one in pagination logic' },
+      'error-handling': { passed: true },
+    },
+    reviewer_findings: [
+      { category: 'correctness', severity: 'HIGH', description: 'Pagination skips the last item due to incorrect boundary check' },
+    ],
   },
   {
     task_id: 'task-sr-2',
@@ -33,6 +40,12 @@ const MOCK_ITEMS = [
     missed_categories: ['performance'],
     caught_categories: [],
     pr_url: null,
+    sr_check_results: {
+      performance: { passed: false, issue: 'Connection pool limit not adjusted for concurrent requests' },
+    },
+    reviewer_findings: [
+      { category: 'performance', severity: 'CRITICAL', description: 'Connection pool exhausts under load — no backpressure mechanism' },
+    ],
   },
 ];
 
@@ -41,6 +54,7 @@ vi.mock('../api', () => ({
   fetchSrMissedRetrospectives: vi.fn(async () => ({
     items: MOCK_ITEMS,
     total: 2,
+    task_types: ['create', 'fix'],
   })),
   API_BASE_URL: 'http://localhost:8000',
   authGet: vi.fn(async () => new Response(JSON.stringify({}), { status: 200 })),
@@ -78,9 +92,9 @@ describe('SrMissedRetrospectivesPanel — viewport regression', () => {
     });
   });
 
-  test('shows empty state when no SR misses', async () => {
+  test('shows all-clear empty state when no SR misses and no filter active', async () => {
     const { fetchSrMissedRetrospectives } = await import('../api');
-    (fetchSrMissedRetrospectives as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ items: [], total: 0 });
+    (fetchSrMissedRetrospectives as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ items: [], total: 0, task_types: [] });
 
     host = document.createElement('div');
     host.style.width = '375px';
@@ -101,6 +115,7 @@ describe('SrMissedRetrospectivesPanel — viewport regression', () => {
     });
     const emptyEl = screen.getByTestId('sr-missed-empty');
     if (!emptyEl) throw new Error('Expected empty state element to be present');
+    expect(emptyEl.textContent).toContain('self-review is catching everything');
   });
 
   test('returns null when no project selected', async () => {
@@ -120,5 +135,78 @@ describe('SrMissedRetrospectivesPanel — viewport regression', () => {
     });
     const panel = host.querySelector('[data-testid="sr-missed-retrospectives-panel"]');
     if (panel) throw new Error('Expected panel to not render when no project selected');
+  });
+
+  test('expanded drill-down shows reviewer description and SR issue text per category', async () => {
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrMissedRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // Click the expand chevron on the first row (aria-label starts with "expand <title>")
+    const expandBtns = screen.getAllByRole('button', { name: /^expand /i });
+    await act(async () => {
+      fireEvent.click(expandBtns[0]);
+    });
+
+    // Reviewer description text for the 'correctness' category must appear
+    expect(screen.getByText('Pagination skips the last item due to incorrect boundary check')).toBeTruthy();
+    // SR issue text for the 'correctness' category must also appear
+    expect(screen.getByText('Off-by-one in pagination logic')).toBeTruthy();
+  });
+
+  test('filtered-empty state shows filter-aware message, not all-clear', async () => {
+    const { fetchSrMissedRetrospectives } = await import('../api');
+    // First fetch returns data with task_types; second (after filter) returns empty
+    (fetchSrMissedRetrospectives as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ items: MOCK_ITEMS, total: 2, task_types: ['create', 'fix'] })
+      .mockResolvedValueOnce({ items: [], total: 0, task_types: ['create', 'fix'] });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrMissedRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // Apply a task-type filter — selector is populated via task_types from the server response
+    const taskTypeSelect = screen.getByRole('combobox', { name: /filter by task type/i });
+    await act(async () => {
+      fireEvent.change(taskTypeSelect, { target: { value: 'create' } });
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    const emptyEl = screen.getByTestId('sr-missed-empty');
+    expect(emptyEl).toBeTruthy();
+    // Must NOT show the celebratory all-clear message when a filter is active
+    expect(emptyEl.textContent).not.toContain('self-review is catching everything');
+    // Must show a filter-aware "No misses" message instead
+    expect(emptyEl.textContent).toContain('No misses');
   });
 });

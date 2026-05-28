@@ -4,6 +4,7 @@ import { fetchSrMissedRetrospectives } from '../api';
 import type { SrMissedTask } from './SrTrendBreakdown';
 import { SR_CANONICAL_CATEGORIES } from './SrTrendBreakdown';
 import { timeAgo } from '../utils/time';
+import { isSafeUrl } from './TaskCard';
 
 const PAGE_SIZE = 20;
 const DAY_OPTIONS = [7, 14, 30, 90];
@@ -22,6 +23,8 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask }:
   const [categoryFilter, setCategoryFilter] = useState('');
   const [taskTypeFilter, setTaskTypeFilter] = useState('');
   const [page, setPage] = useState(1);
+  const [stableTaskTypes, setStableTaskTypes] = useState<string[]>([]);
+  const taskTypesAccRef = useRef<Set<string>>(new Set());
   const mountedRef = useRef(true);
 
   const fetchData = useCallback(async () => {
@@ -39,6 +42,13 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask }:
       if (!mountedRef.current) return;
       setItems(result.items);
       setTotal(result.total);
+      const serverTypes = (result as { task_types?: string[] }).task_types;
+      if (serverTypes) {
+        setStableTaskTypes(serverTypes.slice().sort());
+      } else {
+        result.items.forEach(t => { if (t.task_type) taskTypesAccRef.current.add(t.task_type); });
+        setStableTaskTypes(Array.from(taskTypesAccRef.current).sort());
+      }
     } catch (e) {
       if (!mountedRef.current) return;
       setFetchError(e instanceof Error ? e.message : 'network error');
@@ -59,6 +69,8 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask }:
     const prev = prevFiltersRef.current;
     if (prev.days !== days || prev.categoryFilter !== categoryFilter || prev.taskTypeFilter !== taskTypeFilter || prev.selectedProjectId !== selectedProjectId) {
       setPage(1);
+      taskTypesAccRef.current = new Set();
+      setStableTaskTypes([]);
       prevFiltersRef.current = { days, categoryFilter, taskTypeFilter, selectedProjectId };
     }
   }, [days, categoryFilter, taskTypeFilter, selectedProjectId]);
@@ -74,11 +86,6 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask }:
     }
     return Object.entries(freq).sort((a, b) => b[1] - a[1]);
   }, [items]);
-
-  const allTypes = useMemo(
-    () => Array.from(new Set(items.map(t => t.task_type).filter((v): v is string => Boolean(v)))).sort(),
-    [items],
-  );
 
   if (!selectedProjectId) return null;
 
@@ -105,7 +112,7 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask }:
           <option value="">All categories</option>
           {SR_CANONICAL_CATEGORIES.map(c => <option key={c.id} value={c.id}>{c.label}</option>)}
         </select>
-        {allTypes.length > 0 && (
+        {stableTaskTypes.length > 0 && (
           <select
             value={taskTypeFilter}
             onChange={e => setTaskTypeFilter(e.target.value)}
@@ -113,7 +120,7 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask }:
             aria-label="Filter by task type"
           >
             <option value="">All types</option>
-            {allTypes.map(t => <option key={t} value={t}>{t}</option>)}
+            {stableTaskTypes.map(t => <option key={t} value={t}>{t}</option>)}
           </select>
         )}
       </div>
@@ -130,14 +137,29 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask }:
           <span className="text-[10px] text-neutral-600 truncate" title={fetchError}>{fetchError}</span>
         </div>
       ) : items.length === 0 ? (
-        <div
-          className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-emerald-400 flex items-center gap-2"
-          role="status"
-          data-testid="sr-missed-empty"
-        >
-          <CheckCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-          <span>No SR misses in the last {days} days — self-review is catching everything</span>
-        </div>
+        categoryFilter || taskTypeFilter ? (
+          <div
+            className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-neutral-400 flex items-center gap-2"
+            role="status"
+            data-testid="sr-missed-empty"
+          >
+            <AlertTriangle className="w-3.5 h-3.5 text-neutral-500 shrink-0" aria-hidden="true" />
+            <span>
+              No misses for{categoryFilter ? ` category "${categoryFilter}"` : ''}{taskTypeFilter ? ` type "${taskTypeFilter}"` : ''}.{' '}
+              {/* eslint-disable-next-line viewport/min-touch-target -- inline text link, dense context */}
+              <button type="button" className="underline hover:text-neutral-300" onClick={() => { setCategoryFilter(''); setTaskTypeFilter(''); }}>Clear filters</button>
+            </span>
+          </div>
+        ) : (
+          <div
+            className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 text-xs text-emerald-400 flex items-center gap-2"
+            role="status"
+            data-testid="sr-missed-empty"
+          >
+            <CheckCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+            <span>No SR misses in the last {days} days — self-review is catching everything</span>
+          </div>
+        )
       ) : (
         <>
           {catFreq.length > 0 && (
@@ -224,6 +246,11 @@ function SrMissRow({ task, onClick }: { task: SrMissedTask; onClick: () => void 
         {task.caught_categories.length > 0 && (
           <span className="text-neutral-600 text-[9px]">{task.caught_categories.length} caught</span>
         )}
+        {task.scope && <span className="text-neutral-600 text-[9px]">{task.scope}</span>}
+        {task.pr_url && isSafeUrl(task.pr_url) && (
+          // eslint-disable-next-line viewport/min-touch-target -- dense inline link
+          <a href={task.pr_url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} className="text-blue-400 hover:underline text-[9px]">PR</a>
+        )}
       </div>
       {expanded && task.missed_categories.length > 0 && (
         <div className="mt-1.5 pl-4 flex flex-col gap-1">
@@ -233,20 +260,26 @@ function SrMissRow({ task, onClick }: { task: SrMissedTask; onClick: () => void 
             return (
               <div key={cat} className="rounded border border-neutral-800/60 bg-neutral-950/50 p-1.5">
                 <div className="mb-1 text-neutral-400 font-medium">{cat}</div>
-                <div className="grid gap-1 grid-cols-2 text-[9px]">
-                  <div>
+                <div className="flex flex-wrap gap-x-3 text-[9px] mb-0.5">
+                  <span>
                     <span className="text-neutral-500">SR: </span>
                     {sr ? (
                       <span className={sr.passed ? 'text-emerald-400' : 'text-red-400'}>{sr.passed ? 'passed' : 'failed'}</span>
                     ) : <span className="text-neutral-600">—</span>}
-                  </div>
-                  <div>
+                  </span>
+                  <span>
                     <span className="text-neutral-500">Reviewer: </span>
                     {reviewer ? (
                       <span className="text-amber-400">{reviewer.severity ?? 'flagged'}</span>
                     ) : <span className="text-neutral-600">—</span>}
-                  </div>
+                  </span>
                 </div>
+                {reviewer?.description && (
+                  <div className="text-[9px] text-neutral-300 leading-relaxed">{reviewer.description}</div>
+                )}
+                {sr && !sr.passed && sr.issue && (
+                  <div className="text-[9px] text-neutral-500 leading-relaxed italic mt-0.5">{sr.issue}</div>
+                )}
               </div>
             );
           })}
