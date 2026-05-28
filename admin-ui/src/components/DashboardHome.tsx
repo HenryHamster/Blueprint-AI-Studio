@@ -7,10 +7,10 @@ import {
   ExternalLink,
   GitMerge,
   Minus,
-  Search,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { apiFetch, fetchQualificationVerdicts, fetchSrUnhandledEdgesRetrospectives, setVersionPhase, triggerQualify, fetchTask, type AuditFinding, type AuditReconciliation, type CiResolution, type LatestAudit, type PromptFingerprintAnalyticsResponse, type QualificationVerdictRecord, type SrUnhandledEdgesTask, type VersionLifecycleResponse, type VersionQualification, type PromotionReadiness } from '../api';
+import { apiFetch, fetchSrUnhandledEdgesRetrospectives, fetchTask, type PromptFingerprintAnalyticsResponse, type SrUnhandledEdgesTask, type VersionLifecycleResponse } from '../api';
+import { VersionLifecyclePanel } from './VersionLifecyclePanel';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import { timeAgo, formatDurationSec } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
@@ -30,7 +30,8 @@ import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
-import { SrTrendBreakdown, SrMissedRetrospective, SrReviewerDisagreementsPanel, SrUnhandledEdgesRetrospective, EdgesTrendBreakdown, DirectionSrBreakdownPanel, type SrTrendData, type SrMissedTask, type SrReviewerDisagreementsData, type EdgesTrend, type DirectionSrEntry, type SrInvestigationSignal } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
+import { SrMissedRetrospective, SrReviewerDisagreementsPanel, SrUnhandledEdgesRetrospective, DirectionSrBreakdownPanel, type SrMissedTask, type SrReviewerDisagreementsData, type EdgesTrend, type DirectionSrEntry } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
+import { ReviewQualitySection, type SrFixIterationBucket, type SrTrendWithFixIterations } from './ReviewQualitySection';
 import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import { ManualInterventionPanel, AutoRecoveredPanel, AnomalyTrackerPanel } from './PipelineRegressionsPanel';
 import { RecentlyResolvedRegressionsPanel } from './RecentlyResolvedRegressionsPanel';
@@ -316,8 +317,8 @@ interface DigestData {
   recent_cycle_memo_stats?: Array<{ cycle_id: string | null; started_at: string | null; memos_available: number; memos_cited: number }> | null;
 }
 
-interface SrFixIterationBucket { hit_rate?: number | null; miss_rate?: number | null; sample_count?: number | null; }
-type SrTrendWithFixIterations = SrTrendData & { by_fix_iteration?: Record<string, SrFixIterationBucket> | null; fix_iteration_breakdown?: Record<string, SrFixIterationBucket> | null; iteration_breakdown?: Record<string, SrFixIterationBucket> | null; overall_hit_rate?: number | null; previous_overall_hit_rate?: number | null; overall_trend_verdict?: 'improving' | 'declining' | 'stable' | null; overall_trend_significant?: boolean | null; overall_sr_alone_hit_rate?: number | null; previous_overall_sr_alone_hit_rate?: number | null; overall_sr_alone_trend_verdict?: 'improving' | 'declining' | 'stable' | null; overall_sr_alone_trend_significant?: boolean | null; };
+// SrFixIterationBucket and SrTrendWithFixIterations are defined and exported from ReviewQualitySection
+export type { SrFixIterationBucket, SrTrendWithFixIterations };
 
 // Per-direction SR catch-rate breakdown (endpoint: GET /projects/{id}/direction-sr-breakdown)
 // DirectionSrEntry is re-exported from SrTrendBreakdown (canonical model)
@@ -362,43 +363,6 @@ const REVIEW_CAT_COLORS: Record<string, string> = {
   other: 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30',
 };
 
-const FIX_ITERATION_BUCKETS = ['1', '2', '3+'] as const;
-
-function FixIterationBreakdown({ trends }: { trends: SrTrendWithFixIterations | null | undefined }) {
-  const breakdown = trends?.by_fix_iteration ?? trends?.fix_iteration_breakdown ?? trends?.iteration_breakdown ?? null;
-  if (!breakdown) return null;
-  return (
-    <section>
-      <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">SR by Fix Iteration</p>
-      <div className="flex flex-wrap gap-1.5">
-        {FIX_ITERATION_BUCKETS.map(bucket => {
-          const stats = breakdown[bucket] ?? breakdown[`fix-${bucket}`] ?? breakdown[`fix_${bucket}`] ?? breakdown[bucket.replace('+', 'plus')] ?? null;
-          const sampleCount = stats?.sample_count ?? 0;
-          const enoughSignal = sampleCount >= 5 && stats?.hit_rate != null && stats?.miss_rate != null;
-          return (
-            <span
-              key={bucket}
-              className="inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border bg-neutral-500/10 text-neutral-300 border-neutral-700/40"
-              title={enoughSignal ? `n=${sampleCount}` : 'insufficient signal (<5 qualifying tasks)'}
-            >
-              fix-{bucket}
-              {enoughSignal ? (
-                <>
-                  <span className="font-bold text-emerald-400">{Math.round((stats.hit_rate ?? 0) * 100)}%</span>
-                  <span className="opacity-70">miss {Math.round((stats.miss_rate ?? 0) * 100)}%</span>
-                  <span className="text-neutral-500 font-normal">n={sampleCount}</span>
-                </>
-              ) : (
-                <span className="text-neutral-500 font-normal">insufficient signal</span>
-              )}
-            </span>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
 interface BlindSpotTheme {
   theme: string;
   count: number;
@@ -415,350 +379,6 @@ interface SparkPoint {
   active: number;
   queued: number;
   failed: number;
-}
-
-// ---------- Version Lifecycle Panel ----------
-
-const QUAL_VERDICT_COLOR: Record<string, string> = {
-  pending: 'text-blue-400',
-  promoted: 'text-emerald-400',
-  dry_run: 'text-blue-400',
-  already_dry_run: 'text-blue-400',
-  not_promoted: 'text-amber-400',
-  promotion_failed: 'text-red-400',
-  error: 'text-red-400',
-  sha_error: 'text-red-400',
-};
-
-function QualSummary({ q }: { q: VersionQualification | null }) {
-  if (!q || q.confidence == null) return <span className="text-neutral-500 text-[10px]">—</span>;
-  const conf = `${Math.round(q.confidence * 100)}%`;
-  const thr = q.threshold != null ? `/${Math.round(q.threshold * 100)}%` : '';
-  const status = q.status ?? 'unknown';
-  return (
-    <span className={`font-mono text-[10px] ${QUAL_VERDICT_COLOR[status] ?? 'text-neutral-400'}`}>
-      {conf}{thr} {status.replace(/_/g, '-')}
-    </span>
-  );
-}
-
-const CI_STATE_STYLE: Record<string, string> = {
-  green: 'text-emerald-400',
-  red: 'text-red-400',
-  pending: 'text-amber-400',
-  no_checks: 'text-neutral-500',
-};
-
-function CiBadge({ ci }: { ci: CiResolution }) {
-  const color = CI_STATE_STYLE[ci.state] ?? 'text-neutral-500';
-  return (
-    <span className={`font-mono text-[9px] ${color}`} title={ci.detail}>
-      ci:{ci.state}{ci.resolved_sha ? ` @${ci.resolved_sha.slice(0, 7)}` : ''}
-    </span>
-  );
-}
-
-const AUDIT_MISSING_REASON_LABELS: Record<string, string> = {
-  no_findings_key: 'audit findings key missing',
-  empty_findings_list: 'audit findings list empty',
-  audit_score_null_no_findings: 'audit score missing with no findings',
-  parseable_but_unscoreable: 'audit findings present but missing severity tags',
-};
-
-const FINDING_SEVERITY_STYLE: Record<string, string> = {
-  critical: 'bg-red-500/10 text-red-400 border-red-500/20',
-  high: 'bg-orange-500/10 text-orange-400 border-orange-500/20',
-  medium: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
-  low: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
-};
-const FINDING_SEVERITY_ORDER = ['critical', 'high', 'medium', 'low'];
-
-function AuditFindingsList({ audit }: { audit: LatestAudit }) {
-  if (!audit.report) {
-    return (
-      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20">
-        audit crashed — no report
-      </span>
-    );
-  }
-  const findings: AuditFinding[] = audit.report.findings ?? [];
-  if (findings.length === 0) {
-    return <span className="text-[10px] text-neutral-500 italic">audit: no findings</span>;
-  }
-  const sorted = [...findings].sort((a, b) => {
-    const ai = FINDING_SEVERITY_ORDER.indexOf(a.severity?.toLowerCase() ?? '');
-    const bi = FINDING_SEVERITY_ORDER.indexOf(b.severity?.toLowerCase() ?? '');
-    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
-  });
-  return (
-    <div className="space-y-0.5">
-      <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Audit Findings</p>
-      {sorted.map((f, i) => (
-        <div key={i} className={`flex items-start gap-1.5 text-[10px] px-1.5 py-0.5 rounded border ${FINDING_SEVERITY_STYLE[f.severity?.toLowerCase() ?? ''] ?? 'bg-neutral-800/50 text-neutral-400 border-neutral-700/50'}`}>
-          <span className="font-semibold shrink-0">{f.severity ?? '?'}</span>
-          <span>{f.summary}</span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function AuditReconciliationRow({ rec }: { rec: AuditReconciliation }) {
-  const hasDivergence = rec.score_delta != null && rec.score_delta >= 0.1;
-  return (
-    <div className="flex flex-wrap gap-1.5 items-center pt-0.5">
-      <span className="text-[10px] text-neutral-600 shrink-0">reconciliation:</span>
-      {rec.model_reported_score != null && (
-        <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
-          model {Math.round(rec.model_reported_score * 100)}%
-        </span>
-      )}
-      {rec.findings_derived_score != null && (
-        <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
-          findings {Math.round(rec.findings_derived_score * 100)}%
-        </span>
-      )}
-      {rec.score_delta != null && (
-        <span className={`text-[10px] px-1.5 py-0.5 rounded border font-mono ${hasDivergence ? 'bg-amber-950/40 text-amber-400 border-amber-900/50' : 'bg-neutral-800 text-neutral-500 border-neutral-700'}`}>
-          δ {Math.round(rec.score_delta * 100)}%
-        </span>
-      )}
-      {rec.excluded_findings_count > 0 && (
-        <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-500 border border-amber-900/50">
-          {rec.excluded_findings_count} finding{rec.excluded_findings_count !== 1 ? 's' : ''} excluded
-        </span>
-      )}
-    </div>
-  );
-}
-
-
-function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadiness | null | undefined }) {
-  if (!readiness) return null;
-  const { ready, reason, verdicts_evaluated, would_promote_rate, consecutive_clean_passes, recurring_blockers } = readiness;
-  const hasBlockers = Object.keys(recurring_blockers ?? {}).length > 0;
-  return (
-    <div className="mt-1 pt-1 border-t border-neutral-700/50 space-y-0.5">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${ready ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-amber-500/10 border-amber-500/30 text-amber-400'}`}>
-          {ready ? 'ready to promote' : 'not ready'}
-        </span>
-        {verdicts_evaluated > 0 && (
-          <span className="text-[10px] text-neutral-500">{verdicts_evaluated} dry-run{verdicts_evaluated !== 1 ? 's' : ''}</span>
-        )}
-        {verdicts_evaluated > 0 && (
-          <span className="text-[10px] text-neutral-500">{Math.round(would_promote_rate * 100)}% pass rate</span>
-        )}
-        {consecutive_clean_passes > 0 && (
-          <span className="text-[10px] text-neutral-500">{consecutive_clean_passes} clean streak</span>
-        )}
-      </div>
-      {!ready && reason && (
-        <p className="text-[10px] text-neutral-400 line-clamp-2">{reason}</p>
-      )}
-      {hasBlockers && (
-        <p className="text-[10px] text-red-400 truncate">
-          recurring: {Object.entries(recurring_blockers).map(([k, n]) => `${k}×${n}`).join(', ')}
-        </p>
-      )}
-    </div>
-  );
-}
-
-function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: VersionLifecycleResponse | null; loading: boolean; projectId: string | null; onRefresh: () => void }) {
-  const [actionLoading, setActionLoading] = useState<string | null>(null);
-  const [actionMsg, setActionMsg] = useState<string | null>(null);
-  const [verdicts, setVerdicts] = useState<QualificationVerdictRecord[]>([]);
-  useEffect(() => {
-    if (!projectId) { setVerdicts([]); return; }
-    fetchQualificationVerdicts(projectId, 10).then(r => setVerdicts(r.verdicts)).catch(() => {});
-  }, [projectId]);
-
-  if (loading || !data || (!data.current_version && data.recent_versions.length === 0)) return null;
-  const cv = data.current_version;
-  const recent = data.recent_versions;
-  const promotionEnabled = data.promotion_enabled ?? false;
-  const readiness = data.promotion_readiness;
-
-  const handleSetPhase = async (phase: 'build' | 'stabilize') => {
-    if (!projectId) return;
-    setActionLoading('phase');
-    setActionMsg(null);
-    try {
-      await setVersionPhase(projectId, phase, 'operator advance');
-      setActionMsg(`Phase → ${phase}`);
-      onRefresh();
-    } catch {
-      setActionMsg('Request failed');
-    } finally {
-      setActionLoading(null);
-    }
-  };
-
-  const handleQualify = async () => {
-    if (!projectId) return;
-    setActionLoading('qualify');
-    setActionMsg(null);
-    try {
-      const result = await triggerQualify(projectId);
-      setActionMsg(`qualify: ${result.status ?? 'done'}`);
-      onRefresh();
-    } catch {
-      setActionMsg('Request failed');
-    } finally {
-      setActionLoading(null);
-    }
-  };
-
-  return (
-    <section data-testid="version-lifecycle-panel">
-      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Version Lifecycle</h2>
-      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 text-xs">
-        <div className="flex flex-wrap items-center gap-2">
-          {data.promotion_enabled !== undefined && (
-            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${promotionEnabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`}>
-              {promotionEnabled ? 'LIVE' : 'DRY-RUN'}
-            </span>
-          )}
-        </div>
-        {cv && (
-          <div className="space-y-1">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="font-bold text-neutral-200">v{cv.version_number}</span>
-              <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${cv.phase === 'stabilize' ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 'bg-blue-500/10 border-blue-500/30 text-blue-400'}`}>{cv.phase}</span>
-              {cv.phase_changed_at && <span className="text-[10px] text-neutral-500">{timeAgo(cv.phase_changed_at)}</span>}
-              <span className="text-[10px] text-neutral-500">{cv.merged_task_count} tasks merged</span>
-              {cv.qualification_attempts > 0 && <span className="text-[10px] text-neutral-500">{cv.qualification_attempts} qual{cv.qualification_attempts !== 1 ? 's' : ''}</span>}
-            </div>
-            {cv.goal && (
-              <p className="text-[11px] text-neutral-300" title={cv.goal}>
-                <span className="text-neutral-500">Goal: </span>{cv.goal}
-              </p>
-            )}
-            {cv.phase_reasoning && (
-              <p className="text-[10px] text-neutral-400 italic truncate" title={cv.phase_reasoning}>{cv.phase_reasoning}</p>
-            )}
-            {cv.last_qualification && (
-              <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
-                <QualSummary q={cv.last_qualification} />
-                {(cv.last_qualification.sub_scores || cv.last_qualification.ci_resolution) && (
-                  <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-neutral-500">
-                    {cv.last_qualification.sub_scores && (
-                      <>
-                        <span>audit {Math.round(cv.last_qualification.sub_scores.audit * 100)}%</span>
-                        <span>erosion {Math.round(cv.last_qualification.sub_scores.test_erosion * 100)}%</span>
-                        <span>smoke {Math.round(cv.last_qualification.sub_scores.smoketest * 100)}%</span>
-                      </>
-                    )}
-                    {cv.last_qualification.ci_resolution && (
-                      <CiBadge ci={cv.last_qualification.ci_resolution} />
-                    )}
-                  </div>
-                )}
-                {cv.last_qualification.blocker && (
-                  <p className="text-[10px] text-red-400 truncate">{cv.last_qualification.blocker}</p>
-                )}
-                {(cv.last_qualification.audit_missing_reason || (cv.last_qualification.consecutive_infra_errors ?? 0) > 0 || (cv.last_qualification.status === 'infra_failure' && cv.last_qualification.error)) && (
-                  <div className="flex flex-wrap gap-1.5">
-                    {cv.last_qualification.audit_missing_reason && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/20">
-                        {AUDIT_MISSING_REASON_LABELS[cv.last_qualification.audit_missing_reason] ?? cv.last_qualification.audit_missing_reason}
-                      </span>
-                    )}
-                    {(cv.last_qualification.consecutive_infra_errors ?? 0) > 0 && (
-                      <span className={`text-[10px] px-1.5 py-0.5 rounded border ${(cv.last_qualification.consecutive_infra_errors ?? 0) >= 3 ? 'bg-red-500/10 text-red-400 border-red-500/20' : 'bg-orange-500/10 text-orange-400 border-orange-500/20'}`}>
-                        {cv.last_qualification.consecutive_infra_errors} consecutive infra failures
-                      </span>
-                    )}
-                    {cv.last_qualification.status === 'infra_failure' && cv.last_qualification.error && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20">
-                        {cv.last_qualification.error}
-                      </span>
-                    )}
-                  </div>
-                )}
-                {cv.last_qualification.audit_reconciliation && (
-                  <AuditReconciliationRow rec={cv.last_qualification.audit_reconciliation} />
-                )}
-              </div>
-            )}
-            {cv.latest_audit && (
-              <div className="pl-2 border-l border-neutral-700/50">
-                <AuditFindingsList audit={cv.latest_audit} />
-              </div>
-            )}
-            {projectId && (
-              <div data-testid="phase-controls" className="flex flex-wrap items-center gap-2 pt-1">
-                {cv.phase === 'build' ? (
-                  <button
-                    onClick={() => handleSetPhase('stabilize')}
-                    disabled={actionLoading !== null}
-                    className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    {actionLoading === 'phase' ? '…' : '→ stabilize'}
-                  </button>
-                ) : (
-                  <button
-                    onClick={() => handleSetPhase('build')}
-                    disabled={actionLoading !== null}
-                    className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-blue-500/40 text-blue-400 hover:bg-blue-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    {actionLoading === 'phase' ? '…' : '→ build'}
-                  </button>
-                )}
-                {cv.phase === 'stabilize' && (
-                  <button
-                    onClick={handleQualify}
-                    disabled={actionLoading !== null}
-                    className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    {actionLoading === 'qualify' ? '…' : 'Run Qualify'}
-                  </button>
-                )}
-                {actionMsg && (
-                  <span className="text-[10px] text-neutral-400 italic">{actionMsg}</span>
-                )}
-              </div>
-            )}
-          </div>
-        )}
-        {readiness !== undefined && <PromotionReadinessSummary readiness={readiness} />}
-        {verdicts.length > 0 && (
-          <div data-testid="verdict-history">
-            <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Verdict History</p>
-            <div className="space-y-1">
-              {verdicts.slice(0, 8).map(v => (
-                <div key={v.id} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] pl-2 border-l-2 border-neutral-700/40">
-                  <span className={`font-mono font-semibold ${v.would_promote ? 'text-emerald-400' : 'text-amber-400'}`}>{v.confidence != null ? `${Math.round(v.confidence * 100)}%` : '—'}</span>
-                  <span className={QUAL_VERDICT_COLOR[v.terminal_status ?? ''] ?? 'text-neutral-400'}>{v.terminal_status?.replace(/_/g, '-') ?? '?'}</span>
-                  {v.promotion_enabled && <span className="text-[9px] font-mono text-emerald-600">LIVE</span>}
-                  {v.sub_scores && <span className="text-neutral-600 font-mono text-[9px]">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)} s:{Math.round(v.sub_scores.smoketest * 100)}</span>}
-                  {v.sub_scores?.ci_resolution && <CiBadge ci={v.sub_scores.ci_resolution} />}
-                  {v.blocker && <span className="text-red-400 truncate max-w-[120px]" title={v.blocker}>{v.blocker}</span>}
-                  <span className="text-neutral-700 font-mono">{v.candidate_sha.slice(0, 7)}</span>
-                  {v.finalized_at && <span className="text-neutral-600">{timeAgo(v.finalized_at)}</span>}
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-        {recent.length > 0 && (
-          <div>
-            <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">History</p>
-            <div className="space-y-0.5">
-              {recent.slice(0, 4).map(v => (
-                <div key={v.version_number} className="flex flex-wrap items-center gap-2 text-[10px]">
-                  <span className="text-neutral-400 font-mono w-8">v{v.version_number}</span>
-                  <span className="text-neutral-500">{v.status}</span>
-                  <QualSummary q={v.last_qualification} />
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-    </section>
-  );
 }
 
 // ---------- Pipeline Efficiency Panel ----------
@@ -1064,10 +684,6 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const [srReviewerDisagreements, setSrReviewerDisagreements] = useState<SrReviewerDisagreementsData | null>(null);
   const [directionSrBreakdown, setDirectionSrBreakdown] = useState<DirectionSrBreakdownData | null>(null);
   const [fingerprintAnalytics, setFingerprintAnalytics] = useState<PromptFingerprintAnalyticsResponse | null>(null);
-  const [srInvestigationTaskIds, setSrInvestigationTaskIds] = useState<Record<string, string>>({});
-  const [srTrendDrilldownOpen, setSrTrendDrilldownOpen] = useState(false);
-  const [srTrendDrilldownRows, setSrTrendDrilldownRows] = useState<{ task_id: string; title: string; missed_categories: string[]; sr_verdict: string | null }[]>([]);
-  const [srTrendDrilldownLoading, setSrTrendDrilldownLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [healthOverview, setHealthOverview] = useState<HealthOverviewResponse | null>(null);
   const [fixLoopTrendDays, setFixLoopTrendDays] = useState<7 | 14 | 30>(7);
@@ -1123,23 +739,6 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       });
     }
   }, [tasks, onViewTask]);
-
-  const handleSpawnSrInvestigation = useCallback(async (signal: SrInvestigationSignal): Promise<string | null> => {
-    if (!selectedProjectId) return null;
-    try {
-      const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-investigation`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(signal),
-      });
-      if (!res.ok) return null;
-      const data = (await res.json()) as { task_id: string; created: boolean };
-      setSrInvestigationTaskIds(prev => ({ ...prev, [signal.category]: data.task_id }));
-      return data.task_id;
-    } catch {
-      return null;
-    }
-  }, [selectedProjectId]);
 
   // Fetch data
   const fetchData = useCallback(async () => {
@@ -1275,15 +874,6 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             if (res.ok) setVersionLifecycle(await res.json());
           } catch { /* silent */ }
         })(),
-        (async () => {
-          try {
-            const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-investigation-task-ids`);
-            if (res.ok) {
-              const data = (await res.json()) as { task_ids?: Record<string, string> };
-              setSrInvestigationTaskIds(data.task_ids ?? {});
-            }
-          } catch { /* silent */ }
-        })(),
       );
     }
 
@@ -1325,19 +915,6 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/version-lifecycle`);
       if (res.ok) setVersionLifecycle(await res.json());
     } catch { /* silent */ }
-  }, [selectedProjectId]);
-
-  const fetchSrTrendDrilldown = useCallback(async (categories: string[]) => {
-    if (!selectedProjectId || categories.length === 0) return;
-    setSrTrendDrilldownLoading(true);
-    try {
-      const params = new URLSearchParams({ alert_type: 'trends' });
-      categories.forEach(c => params.append('categories', c));
-      const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-alert-drilldown?${params}`);
-      if (res.ok) setSrTrendDrilldownRows(((await res.json()) as { items: { task_id: string; title: string; missed_categories: string[]; sr_verdict: string | null }[] }).items ?? []);
-    } finally {
-      setSrTrendDrilldownLoading(false);
-    }
   }, [selectedProjectId]);
 
   // Initial + polling
@@ -1595,389 +1172,19 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           })()}
 
           {/* Section 1d3: Review Quality */}
-          {!loading && (digest?.review_accuracy != null || digest?.self_review_effectiveness != null || digest?.self_review_prediction_accuracy != null || digest?.self_review_prediction_accuracy_trends != null || digest?.self_review_skip_rate != null || digest?.sr_disallowed_blind_spot_rate != null || digest?.fresh_reviewer_effectiveness != null || digest?.sr_false_attestation_trends != null) && (
-            <section ref={reviewQualitySectionRef}>
-              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">Review Quality</p>
-              <div className="flex flex-wrap gap-3">
-                {digest?.review_accuracy?.precision != null && (
-                  <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]">
-                    <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">Precision</p>
-                    <p className={`text-xl font-bold font-mono ${digest.review_accuracy.precision >= 0.8 ? 'text-emerald-400' : digest.review_accuracy.precision >= 0.6 ? 'text-amber-400' : 'text-red-400'}`}>
-                      {Math.round(digest.review_accuracy.precision * 100)}%
-                    </p>
-                    <p className="text-[9px] text-neutral-600 mt-0.5">{digest.review_accuracy.total_reviews} reviews</p>
-                  </div>
-                )}
-                {digest?.review_accuracy?.recall != null && (
-                  <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]">
-                    <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">Recall</p>
-                    <p className={`text-xl font-bold font-mono ${digest.review_accuracy.recall >= 0.8 ? 'text-emerald-400' : digest.review_accuracy.recall >= 0.6 ? 'text-amber-400' : 'text-red-400'}`}>
-                      {Math.round(digest.review_accuracy.recall * 100)}%
-                    </p>
-                    <p className="text-[9px] text-neutral-600 mt-0.5">{digest.review_accuracy.total_approvals} approvals</p>
-                  </div>
-                )}
-                {digest?.self_review_effectiveness?.with_self_review_approval_rate != null && (
-                  <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]">
-                    <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Approval Lift</p>
-                    {(() => {
-                      const sre = digest.self_review_effectiveness ?? {};
-                      const withSR = sre.with_self_review_approval_rate ?? 0;
-                      const withoutSR = sre.without_self_review_approval_rate;
-                      const lift = withoutSR != null ? withSR - withoutSR : null;
-                      return (
-                        <>
-                          <p className={`text-xl font-bold font-mono ${withSR >= 0.7 ? 'text-emerald-400' : withSR >= 0.5 ? 'text-amber-400' : 'text-red-400'}`}>
-                            {Math.round(withSR * 100)}%
-                          </p>
-                          {lift != null && (
-                            <p className={`text-[9px] mt-0.5 ${lift > 0 ? 'text-emerald-500' : lift < 0 ? 'text-red-500' : 'text-neutral-600'}`}>
-                              {lift > 0 ? '+' : ''}{Math.round(lift * 100)}pp vs no SR
-                            </p>
-                          )}
-                        </>
-                      );
-                    })()}
-                  </div>
-                )}
-                {(() => {
-                  const sre = digest?.self_review_effectiveness;
-                  const sample = sre?.sample_size ?? 0;
-                  const fixedCount = sre?.sr_fixed_count;
-                  const cleanCount = sre?.sr_clean_count;
-                  if (
-                    sre == null ||
-                    sample < 5 ||
-                    fixedCount == null ||
-                    cleanCount == null
-                  ) {
-                    return null;
-                  }
-                  const fixedShare = fixedCount / sample;
-                  const cleanShare = cleanCount / sample;
-                  const fixedApproval = sre.fixed_verdict_approval_rate;
-                  const cleanApproval = sre.clean_verdict_approval_rate;
-                  const approvalColor = (rate: number | null | undefined) =>
-                    rate == null
-                      ? 'text-neutral-500'
-                      : rate >= 0.7
-                        ? 'text-emerald-400'
-                        : rate >= 0.5
-                          ? 'text-amber-400'
-                          : 'text-red-400';
-                  return (
-                    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[200px]">
-                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Self-Fix Path</p>
-                      <div className="space-y-0.5">
-                        <div className="flex items-baseline justify-between gap-3">
-                          <span className="text-[10px] text-neutral-400">Self-fixed</span>
-                          <span className="text-xs font-mono text-neutral-200">
-                            {Math.round(fixedShare * 100)}%
-                            <span className="text-[9px] text-neutral-600 ml-1">(n={fixedCount} of {sample})</span>
-                            {fixedApproval != null && (
-                              <span className={`text-[9px] ml-1 ${approvalColor(fixedApproval)}`}>
-                                {Math.round(fixedApproval * 100)}% approved
-                              </span>
-                            )}
-                          </span>
-                        </div>
-                        <div className="flex items-baseline justify-between gap-3">
-                          <span className="text-[10px] text-neutral-400">Clean SR</span>
-                          <span className="text-xs font-mono text-neutral-200">
-                            {Math.round(cleanShare * 100)}%
-                            <span className="text-[9px] text-neutral-600 ml-1">(n={cleanCount})</span>
-                            {cleanApproval != null && (
-                              <span className={`text-[9px] ml-1 ${approvalColor(cleanApproval)}`}>
-                                {Math.round(cleanApproval * 100)}% approved
-                              </span>
-                            )}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })()}
-                {digest?.self_review_prediction_accuracy?.prediction_hit_rate != null && (
-                  <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]">
-                    <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Prediction Hit</p>
-                    <p className={`text-xl font-bold font-mono ${digest.self_review_prediction_accuracy.prediction_hit_rate >= 0.7 ? 'text-emerald-400' : digest.self_review_prediction_accuracy.prediction_hit_rate >= 0.4 ? 'text-amber-400' : 'text-red-400'}`}>
-                      {Math.round(digest.self_review_prediction_accuracy.prediction_hit_rate * 100)}%
-                    </p>
-                    {digest.self_review_prediction_accuracy.false_alarm_rate != null && (
-                      <p className="text-[9px] text-neutral-600 mt-0.5">{Math.round(digest.self_review_prediction_accuracy.false_alarm_rate * 100)}% false alarms</p>
-                    )}
-                  </div>
-                )}
-                {(() => {
-                  const spa = digest?.self_review_prediction_accuracy;
-                  const rate = spa?.self_flagged_shipped_unfixed_task_rate ?? null;
-                  const taskCount = spa?.self_flagged_shipped_unfixed_task_count;
-                  if (rate == null && taskCount == null) return null;
-                  const color = rate == null ? 'text-neutral-300' : rate <= 0.2 ? 'text-emerald-400' : rate <= 0.4 ? 'text-amber-400' : 'text-red-400';
-                  const tooltip = [
-                    'SR Unfixed Flags: tasks where SR already failed a category but the agent submitted without fixing it and a reviewer confirmed the same category.',
-                    taskCount != null ? `${taskCount} tasks with at least one self-flagged unresolved category` : null,
-                  ].filter(Boolean).join('\n');
-                  return (
-                    <div
-                      className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]"
-                      title={tooltip}
-                      data-testid="sr-self-flagged-unresolved-tile"
-                    >
-                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Unfixed Flags</p>
-                      <p className={`text-xl font-bold font-mono ${color}`}>
-                        {rate != null ? `${Math.round(rate * 100)}%` : '--'}
-                      </p>
-                      <p className="text-[9px] text-neutral-600 mt-0.5">
-                        {taskCount != null ? `${taskCount} tasks` : ''}
-                      </p>
-                    </div>
-                  );
-                })()}
-                {digest?.sr_regression_risk_test_signal_trends?.current?.miss_by_test_signal_rate != null && (() => {
-                  const rrts = digest.sr_regression_risk_test_signal_trends!;
-                  const missRate = rrts.current!.miss_by_test_signal_rate!;
-                  const numer = rrts.current!.numerator ?? 0;
-                  const denom = rrts.current!.denominator ?? 0;
-                  const trend = rrts.trend;
-                  const delta = rrts.miss_by_test_signal_rate_delta;
-                  const color = missRate <= 0.15 ? 'text-emerald-400' : missRate <= 0.35 ? 'text-amber-400' : 'text-red-400';
-                  const trendIcon = trend === 'improving' ? '↓' : trend === 'regressing' ? '↑' : '→';
-                  const trendColor = trend === 'improving' ? 'text-emerald-500' : trend === 'regressing' ? 'text-red-500' : 'text-neutral-500';
-                  const tooltip = [
-                    'SR regression_risk catch vs test-failure signal',
-                    `Miss rate: SR passed but testFix loop ran (${numer}/${denom})`,
-                    'A miss = SR said regression_risk:passed yet the task\'s testFix loop subsequently ran ≥1 iteration.',
-                    delta != null ? `Δ vs previous period: ${delta >= 0 ? '+' : ''}${Math.round(delta * 100)}pp` : null,
-                  ].filter(Boolean).join('\n');
-                  return (
-                    <div
-                      className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
-                      title={tooltip}
-                    >
-                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">RR vs Test Signal</p>
-                      <p className={`text-xl font-bold font-mono ${color}`}>
-                        {Math.round(missRate * 100)}%
-                      </p>
-                      <p className="text-[9px] text-neutral-600 mt-0.5">
-                        {numer}/{denom} miss <span className={trendColor}>{trendIcon}</span>
-                      </p>
-                    </div>
-                  );
-                })()}
-                {digest?.self_review_skip_rate != null && (() => {
-                  const skip = digest.self_review_skip_rate;
-                  const rate = skip.overall_rate;
-                  const color = rate <= 0.05 ? 'text-emerald-400' : rate <= 0.15 ? 'text-amber-400' : 'text-red-400';
-                  const byTypeEntries = Object.entries(skip.by_task_type ?? {});
-                  const tooltip = byTypeEntries.length
-                    ? byTypeEntries.map(([t, b]) => `${t}: ${Math.round(b.rate * 100)}% (n=${b.sample_size})`).join('\n')
-                    : undefined;
-                  return (
-                    <div
-                      className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
-                      title={tooltip}
-                    >
-                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Skip Rate</p>
-                      <p className={`text-xl font-bold font-mono ${color}`}>
-                        {Math.round(rate * 100)}%
-                      </p>
-                      <p className="text-[9px] text-neutral-600 mt-0.5">n={skip.sample_size}</p>
-                    </div>
-                  );
-                })()}
-                {digest?.self_review_prediction_accuracy_trends?.reviewer_hallucination_rate != null && (() => {
-                  const hall = digest.self_review_prediction_accuracy_trends.reviewer_hallucination_rate!;
-                  const curr = hall.current_rate;
-                  const prev = hall.previous_rate;
-                  const sample = hall.current_sample ?? 0;
-                  const hasSample = sample >= 5;
-                  const color = !hasSample ? 'text-neutral-500' : curr == null ? 'text-neutral-500' : curr <= 0.05 ? 'text-emerald-400' : curr <= 0.15 ? 'text-amber-400' : 'text-red-400';
-                  const tooltip = [
-                    'Reviewer hallucination rate: share of fresh-reviewer findings that reference non-existent files/lines',
-                    hasSample ? `Current: ${Math.round((curr ?? 0) * 100)}% (n=${sample})` : `Insufficient sample (n=${sample})`,
-                    prev != null ? `Previous: ${Math.round(prev * 100)}%` : null,
-                    hall.delta != null ? `Δ vs previous cycle: ${hall.delta >= 0 ? '+' : ''}${Math.round(hall.delta * 100)}pp` : null,
-                  ].filter(Boolean).join('\n');
-                  return (
-                    <div
-                      className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[140px]"
-                      title={tooltip}
-                      data-testid="reviewer-hallucination-rate-tile"
-                    >
-                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">Reviewer Hallucination</p>
-                      {hasSample && curr != null ? (
-                        <>
-                          <p className={`text-xl font-bold font-mono ${color}`}>
-                            {Math.round(curr * 100)}%
-                          </p>
-                          {prev != null && hall.delta != null && (
-                            <p className={`text-[9px] mt-0.5 ${hall.delta > 0.005 ? 'text-red-400' : hall.delta < -0.005 ? 'text-emerald-400' : 'text-neutral-600'}`}>
-                              {hall.delta >= 0 ? '+' : ''}
-                              {Math.round(hall.delta * 100)}pp
-                            </p>
-                          )}
-                          <p className="text-[9px] text-neutral-600 mt-0.5">n={sample}</p>
-                        </>
-                      ) : (
-                        <p className="text-[9px] text-neutral-500 mt-2">insufficient sample</p>
-                      )}
-                    </div>
-                  );
-                })()}
-                {digest?.sr_disallowed_blind_spot_rate != null && (() => {
-                  const dbs = digest.sr_disallowed_blind_spot_rate!;
-                  const rate = dbs.overall_rate;
-                  const color = rate <= 0.05 ? 'text-emerald-400' : rate <= 0.15 ? 'text-amber-400' : 'text-red-400';
-                  const byTypeEntries = Object.entries(dbs.by_task_type ?? {});
-                  // Cross-reference: backend/app/sr_blind_spots.py DISALLOWED_BLIND_SPOT_EXAMPLES
-                  const categoryLabels = 'full backend test suite, docker pytest, viewport tests';
-                  const tooltip = [
-                    `Disallowed patterns: ${categoryLabels}`,
-                    ...(byTypeEntries.length
-                      ? byTypeEntries.map(([t, b]) => `${t}: ${Math.round(b.rate * 100)}% (n=${b.sample_size})`)
-                      : []),
-                  ].join('\n');
-                  return (
-                    <div
-                      className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[110px]"
-                      title={tooltip}
-                      data-testid="sr-disallowed-blind-spot-tile"
-                    >
-                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR Disallowed</p>
-                      <p className={`text-xl font-bold font-mono ${color}`}>
-                        {Math.round(rate * 100)}%
-                      </p>
-                      <p className="text-[9px] text-neutral-600 mt-0.5">n={dbs.sample_size}</p>
-                    </div>
-                  );
-                })()}
-                {digest?.sr_false_attestation_trends?.per_category != null && (() => {
-                  const cats = digest.sr_false_attestation_trends!.per_category!;
-                  const entries = Object.entries(cats).filter(([, v]) => v.false_attestation_rate != null);
-                  if (entries.length === 0) return null;
-                  const CAT_LABELS: Record<string, string> = {
-                    tests_executed_cleanly: 'Tests',
-                    lint_executed_cleanly: 'Lint',
-                    typecheck_executed_cleanly: 'Typecheck',
-                  };
-                  const tooltipLines = entries.map(([cat, v]) => {
-                    const label = CAT_LABELS[cat] ?? cat;
-                    const rate = v.false_attestation_rate!;
-                    const n = (v.ci_confirmed ?? 0) + (v.false_attested ?? 0);
-                    const trendStr = v.trend === 'improving' ? '↓' : v.trend === 'regressing' ? '↑' : '→';
-                    return `${label}: ${Math.round(rate * 100)}% (${v.false_attested ?? 0}/${n}) ${trendStr}`;
-                  });
-                  const worstRate = Math.max(...entries.map(([, v]) => v.false_attestation_rate ?? 0));
-                  const color = worstRate <= 0.05 ? 'text-emerald-400' : worstRate <= 0.1 ? 'text-amber-400' : 'text-red-400';
-                  return (
-                    <div
-                      className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]"
-                      title={['SR False Attestation (SR passed but CI failed):', ...tooltipLines].join('\n')}
-                      data-testid="sr-false-attestation-tile"
-                    >
-                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">SR False Attest</p>
-                      <p className={`text-xl font-bold font-mono ${color}`}>
-                        {Math.round(worstRate * 100)}%
-                      </p>
-                      <div className="flex flex-col gap-0.5 mt-0.5">
-                        {entries.map(([cat, v]) => {
-                          const label = CAT_LABELS[cat] ?? cat;
-                          const rate = v.false_attestation_rate!;
-                          const trendIcon = v.trend === 'improving' ? '↓' : v.trend === 'regressing' ? '↑' : '→';
-                          const trendColor = v.trend === 'improving' ? 'text-emerald-500' : v.trend === 'regressing' ? 'text-red-500' : 'text-neutral-500';
-                          return (
-                            <p key={cat} className="text-[9px] text-neutral-600">
-                              {label}: {Math.round(rate * 100)}% <span className={trendColor}>{trendIcon}</span>
-                            </p>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  );
-                })()}
-                <SrTrendBreakdown
-                  trends={digest?.self_review_prediction_accuracy_trends}
-                  variant="card"
-                  onCategoryClick={handleCategoryClick}
-                  srCatchRateTargets={srCatchRateTargets}
-                  onConfigureTargets={handleConfigureTargets}
-                  onSpawnSrInvestigation={selectedProjectId ? handleSpawnSrInvestigation : undefined}
-                  activeInvestigationTaskIds={srInvestigationTaskIds}
-                />
-                <FixIterationBreakdown trends={digest?.self_review_prediction_accuracy_trends} />
-                <EdgesTrendBreakdown trend={digest?.edges_trend} />
-                {digest?.fresh_reviewer_effectiveness != null && (() => {
-                  const fre = digest.fresh_reviewer_effectiveness;
-                  const n = fre.fresh_reviewer_sample_size;
-                  const freRate = fre.fresh_reviewer_first_attempt_approval_rate;
-                  const baseRate = fre.baseline_first_attempt_approval_rate;
-                  const lift = freRate != null && baseRate != null ? freRate - baseRate : null;
-                  const freColor = freRate != null ? (freRate >= 0.8 ? 'text-emerald-400' : freRate >= 0.5 ? 'text-amber-400' : 'text-red-400') : 'text-neutral-300';
-                  const liftColor = lift == null ? 'text-neutral-400' : lift >= 0.05 ? 'text-emerald-400' : lift >= 0 ? 'text-amber-400' : 'text-red-400';
-                  return (
-                    <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg px-3 py-2 min-w-[130px]">
-                      <p className="text-[9px] text-neutral-500 uppercase tracking-wide mb-0.5">FR Approval Lift</p>
-                      {n < 5 ? (
-                        <p className="text-xs text-neutral-500">n={n} — too small</p>
-                      ) : (
-                        <>
-                          <p className={`text-xl font-bold font-mono ${freColor}`}>{freRate != null ? `${Math.round(freRate * 100)}%` : '--'}</p>
-                          {lift != null && (
-                            <p className={`text-[9px] mt-0.5 ${liftColor}`}>{lift >= 0 ? '+' : ''}{Math.round(lift * 100)}pp vs baseline</p>
-                          )}
-                          <p className="text-[9px] text-neutral-600 mt-0.5">n={n}</p>
-                        </>
-                      )}
-                    </div>
-                  );
-                })()}
-              </div>
-              {selectedProjectId && (() => {
-                const cats = Object.entries(
-                  digest?.self_review_prediction_accuracy_trends?.categories ?? {}
-                ).filter(([, c]) => c.trend === 'decreasing').map(([k]) => k);
-                if (cats.length === 0) return null;
-                return (
-                  <div className="mt-2">
-                    <button
-                      onClick={() => {
-                        if (srTrendDrilldownOpen) { setSrTrendDrilldownOpen(false); return; }
-                        setSrTrendDrilldownOpen(true);
-                        void fetchSrTrendDrilldown(cats);
-                      }}
-                      className="text-[10px] flex items-center gap-1 text-amber-400/70 hover:text-amber-400 transition-colors mb-1"
-                    >
-                      <Search className="w-3 h-3" />
-                      <span>{srTrendDrilldownOpen ? 'Hide' : 'Investigate'} regression ({cats.join(', ')})</span>
-                    </button>
-                    {srTrendDrilldownOpen && (
-                      <div className="bg-neutral-900/60 border border-neutral-700/40 rounded-lg px-3 py-2 text-xs text-neutral-300 flex flex-col gap-1.5">
-                        {srTrendDrilldownLoading && <span className="text-neutral-500">Loading…</span>}
-                        {!srTrendDrilldownLoading && srTrendDrilldownRows.length === 0 && <span className="text-neutral-500">No contributing tasks found.</span>}
-                        {!srTrendDrilldownLoading && srTrendDrilldownRows.map(row => (
-                          <div key={row.task_id} className="flex items-start gap-2">
-                            <span className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded border font-medium ${row.sr_verdict === 'pass' ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' : 'bg-red-500/10 text-red-400 border-red-500/30'}`}>
-                              SR {row.sr_verdict ?? '?'}
-                            </span>
-                            <div className="flex-1 min-w-0">
-                              <span className="text-neutral-200 truncate block">{row.title}</span>
-                              <span className="text-neutral-500 text-[10px]">missed: {row.missed_categories.join(', ')}</span>
-                            </div>
-                            <button onClick={() => { const t = tasks.find(t => t.id === row.task_id); if (t) onViewTask(t); }} className="shrink-0 opacity-60 hover:opacity-100 transition-opacity" title="View task SR panel">
-                              <ExternalLink className="w-3 h-3" />
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
-            </section>
-          )}
+          <ReviewQualitySection
+            digest={digest}
+            loading={loading}
+            selectedProjectId={selectedProjectId}
+            tasks={tasks}
+            onViewTask={onViewTask}
+            srCatchRateTargets={srCatchRateTargets}
+            onCategoryClick={handleCategoryClick}
+            onConfigureTargets={handleConfigureTargets}
+            sectionRef={reviewQualitySectionRef}
+          />
 
-          {/* SR Recent Misses */}
+                    {/* SR Recent Misses */}
           {!loading && srRecentMisses && srRecentMisses.length > 0 && (
             <section>
               <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">

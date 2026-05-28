@@ -1,0 +1,357 @@
+import { useState, useEffect } from 'react';
+import {
+  fetchQualificationVerdicts,
+  setVersionPhase,
+  triggerQualify,
+  type AuditFinding,
+  type AuditReconciliation,
+  type CiResolution,
+  type LatestAudit,
+  type QualificationVerdictRecord,
+  type VersionLifecycleResponse,
+  type VersionQualification,
+  type PromotionReadiness,
+} from '../api';
+import { timeAgo } from '../utils/time';
+
+const QUAL_VERDICT_COLOR: Record<string, string> = {
+  pending: 'text-blue-400',
+  promoted: 'text-emerald-400',
+  dry_run: 'text-blue-400',
+  already_dry_run: 'text-blue-400',
+  not_promoted: 'text-amber-400',
+  promotion_failed: 'text-red-400',
+  error: 'text-red-400',
+  sha_error: 'text-red-400',
+};
+
+function QualSummary({ q }: { q: VersionQualification | null }) {
+  if (!q || q.confidence == null) return <span className="text-neutral-500 text-[10px]">—</span>;
+  const conf = `${Math.round(q.confidence * 100)}%`;
+  const thr = q.threshold != null ? `/${Math.round(q.threshold * 100)}%` : '';
+  const status = q.status ?? 'unknown';
+  return (
+    <span className={`font-mono text-[10px] ${QUAL_VERDICT_COLOR[status] ?? 'text-neutral-400'}`}>
+      {conf}{thr} {status.replace(/_/g, '-')}
+    </span>
+  );
+}
+
+const CI_STATE_STYLE: Record<string, string> = {
+  green: 'text-emerald-400',
+  red: 'text-red-400',
+  pending: 'text-amber-400',
+  no_checks: 'text-neutral-500',
+};
+
+function CiBadge({ ci }: { ci: CiResolution }) {
+  const color = CI_STATE_STYLE[ci.state] ?? 'text-neutral-500';
+  return (
+    <span className={`font-mono text-[9px] ${color}`} title={ci.detail}>
+      ci:{ci.state}{ci.resolved_sha ? ` @${ci.resolved_sha.slice(0, 7)}` : ''}
+    </span>
+  );
+}
+
+const AUDIT_MISSING_REASON_LABELS: Record<string, string> = {
+  no_findings_key: 'audit findings key missing',
+  empty_findings_list: 'audit findings list empty',
+  audit_score_null_no_findings: 'audit score missing with no findings',
+  parseable_but_unscoreable: 'audit findings present but missing severity tags',
+};
+
+const FINDING_SEVERITY_STYLE: Record<string, string> = {
+  critical: 'bg-red-500/10 text-red-400 border-red-500/20',
+  high: 'bg-orange-500/10 text-orange-400 border-orange-500/20',
+  medium: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+  low: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
+};
+const FINDING_SEVERITY_ORDER = ['critical', 'high', 'medium', 'low'];
+
+function AuditFindingsList({ audit }: { audit: LatestAudit }) {
+  if (!audit.report) {
+    return (
+      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20">
+        audit crashed — no report
+      </span>
+    );
+  }
+  const findings: AuditFinding[] = audit.report.findings ?? [];
+  if (findings.length === 0) {
+    return <span className="text-[10px] text-neutral-500 italic">audit: no findings</span>;
+  }
+  const sorted = [...findings].sort((a, b) => {
+    const ai = FINDING_SEVERITY_ORDER.indexOf(a.severity?.toLowerCase() ?? '');
+    const bi = FINDING_SEVERITY_ORDER.indexOf(b.severity?.toLowerCase() ?? '');
+    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+  });
+  return (
+    <div className="space-y-0.5">
+      <p className="text-[10px] text-neutral-500 uppercase tracking-wide">Audit Findings</p>
+      {sorted.map((f, i) => (
+        <div key={i} className={`flex items-start gap-1.5 text-[10px] px-1.5 py-0.5 rounded border ${FINDING_SEVERITY_STYLE[f.severity?.toLowerCase() ?? ''] ?? 'bg-neutral-800/50 text-neutral-400 border-neutral-700/50'}`}>
+          <span className="font-semibold shrink-0">{f.severity ?? '?'}</span>
+          <span>{f.summary}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AuditReconciliationRow({ rec }: { rec: AuditReconciliation }) {
+  const hasDivergence = rec.score_delta != null && rec.score_delta >= 0.1;
+  return (
+    <div className="flex flex-wrap gap-1.5 items-center pt-0.5">
+      <span className="text-[10px] text-neutral-600 shrink-0">reconciliation:</span>
+      {rec.model_reported_score != null && (
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
+          model {Math.round(rec.model_reported_score * 100)}%
+        </span>
+      )}
+      {rec.findings_derived_score != null && (
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700 font-mono">
+          findings {Math.round(rec.findings_derived_score * 100)}%
+        </span>
+      )}
+      {rec.score_delta != null && (
+        <span className={`text-[10px] px-1.5 py-0.5 rounded border font-mono ${hasDivergence ? 'bg-amber-950/40 text-amber-400 border-amber-900/50' : 'bg-neutral-800 text-neutral-500 border-neutral-700'}`}>
+          δ {Math.round(rec.score_delta * 100)}%
+        </span>
+      )}
+      {rec.excluded_findings_count > 0 && (
+        <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-500 border border-amber-900/50">
+          {rec.excluded_findings_count} finding{rec.excluded_findings_count !== 1 ? 's' : ''} excluded
+        </span>
+      )}
+    </div>
+  );
+}
+
+
+function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadiness | null | undefined }) {
+  if (!readiness) return null;
+  const { ready, reason, verdicts_evaluated, would_promote_rate, consecutive_clean_passes, recurring_blockers } = readiness;
+  const hasBlockers = Object.keys(recurring_blockers ?? {}).length > 0;
+  return (
+    <div className="mt-1 pt-1 border-t border-neutral-700/50 space-y-0.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${ready ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-amber-500/10 border-amber-500/30 text-amber-400'}`}>
+          {ready ? 'ready to promote' : 'not ready'}
+        </span>
+        {verdicts_evaluated > 0 && (
+          <span className="text-[10px] text-neutral-500">{verdicts_evaluated} dry-run{verdicts_evaluated !== 1 ? 's' : ''}</span>
+        )}
+        {verdicts_evaluated > 0 && (
+          <span className="text-[10px] text-neutral-500">{Math.round(would_promote_rate * 100)}% pass rate</span>
+        )}
+        {consecutive_clean_passes > 0 && (
+          <span className="text-[10px] text-neutral-500">{consecutive_clean_passes} clean streak</span>
+        )}
+      </div>
+      {!ready && reason && (
+        <p className="text-[10px] text-neutral-400 line-clamp-2">{reason}</p>
+      )}
+      {hasBlockers && (
+        <p className="text-[10px] text-red-400 truncate">
+          recurring: {Object.entries(recurring_blockers).map(([k, n]) => `${k}×${n}`).join(', ')}
+        </p>
+      )}
+    </div>
+  );
+}
+
+export function VersionLifecyclePanel({ data, loading, projectId, onRefresh }: { data: VersionLifecycleResponse | null; loading: boolean; projectId: string | null; onRefresh: () => void }) {
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [actionMsg, setActionMsg] = useState<string | null>(null);
+  const [verdicts, setVerdicts] = useState<QualificationVerdictRecord[]>([]);
+  useEffect(() => {
+    if (!projectId) { setVerdicts([]); return; }
+    fetchQualificationVerdicts(projectId, 10).then(r => setVerdicts(r.verdicts)).catch(() => {});
+  }, [projectId]);
+
+  if (loading || !data || (!data.current_version && data.recent_versions.length === 0)) return null;
+  const cv = data.current_version;
+  const recent = data.recent_versions;
+  const promotionEnabled = data.promotion_enabled ?? false;
+  const readiness = data.promotion_readiness;
+
+  const handleSetPhase = async (phase: 'build' | 'stabilize') => {
+    if (!projectId) return;
+    setActionLoading('phase');
+    setActionMsg(null);
+    try {
+      await setVersionPhase(projectId, phase, 'operator advance');
+      setActionMsg(`Phase → ${phase}`);
+      onRefresh();
+    } catch {
+      setActionMsg('Request failed');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleQualify = async () => {
+    if (!projectId) return;
+    setActionLoading('qualify');
+    setActionMsg(null);
+    try {
+      const result = await triggerQualify(projectId);
+      setActionMsg(`qualify: ${result.status ?? 'done'}`);
+      onRefresh();
+    } catch {
+      setActionMsg('Request failed');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  return (
+    <section data-testid="version-lifecycle-panel">
+      <h2 className="text-[11px] font-bold text-neutral-400 uppercase tracking-widest mb-2">Version Lifecycle</h2>
+      <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 space-y-2 text-xs">
+        <div className="flex flex-wrap items-center gap-2">
+          {data.promotion_enabled !== undefined && (
+            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${promotionEnabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-neutral-500/10 border-neutral-500/30 text-neutral-400'}`}>
+              {promotionEnabled ? 'LIVE' : 'DRY-RUN'}
+            </span>
+          )}
+        </div>
+        {cv && (
+          <div className="space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-bold text-neutral-200">v{cv.version_number}</span>
+              <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${cv.phase === 'stabilize' ? 'bg-amber-500/10 border-amber-500/30 text-amber-400' : 'bg-blue-500/10 border-blue-500/30 text-blue-400'}`}>{cv.phase}</span>
+              {cv.phase_changed_at && <span className="text-[10px] text-neutral-500">{timeAgo(cv.phase_changed_at)}</span>}
+              <span className="text-[10px] text-neutral-500">{cv.merged_task_count} tasks merged</span>
+              {cv.qualification_attempts > 0 && <span className="text-[10px] text-neutral-500">{cv.qualification_attempts} qual{cv.qualification_attempts !== 1 ? 's' : ''}</span>}
+            </div>
+            {cv.goal && (
+              <p className="text-[11px] text-neutral-300" title={cv.goal}>
+                <span className="text-neutral-500">Goal: </span>{cv.goal}
+              </p>
+            )}
+            {cv.phase_reasoning && (
+              <p className="text-[10px] text-neutral-400 italic truncate" title={cv.phase_reasoning}>{cv.phase_reasoning}</p>
+            )}
+            {cv.last_qualification && (
+              <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
+                <QualSummary q={cv.last_qualification} />
+                {(cv.last_qualification.sub_scores || cv.last_qualification.ci_resolution) && (
+                  <div className="flex flex-wrap gap-x-2 gap-y-0.5 text-[10px] text-neutral-500">
+                    {cv.last_qualification.sub_scores && (
+                      <>
+                        <span>audit {Math.round(cv.last_qualification.sub_scores.audit * 100)}%</span>
+                        <span>erosion {Math.round(cv.last_qualification.sub_scores.test_erosion * 100)}%</span>
+                        <span>smoke {Math.round(cv.last_qualification.sub_scores.smoketest * 100)}%</span>
+                      </>
+                    )}
+                    {cv.last_qualification.ci_resolution && (
+                      <CiBadge ci={cv.last_qualification.ci_resolution} />
+                    )}
+                  </div>
+                )}
+                {cv.last_qualification.blocker && (
+                  <p className="text-[10px] text-red-400 truncate">{cv.last_qualification.blocker}</p>
+                )}
+                {(cv.last_qualification.audit_missing_reason || (cv.last_qualification.consecutive_infra_errors ?? 0) > 0 || (cv.last_qualification.status === 'infra_failure' && cv.last_qualification.error)) && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {cv.last_qualification.audit_missing_reason && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-amber-500/10 text-amber-400 border-amber-500/20">
+                        {AUDIT_MISSING_REASON_LABELS[cv.last_qualification.audit_missing_reason] ?? cv.last_qualification.audit_missing_reason}
+                      </span>
+                    )}
+                    {(cv.last_qualification.consecutive_infra_errors ?? 0) > 0 && (
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded border ${(cv.last_qualification.consecutive_infra_errors ?? 0) >= 3 ? 'bg-red-500/10 text-red-400 border-red-500/20' : 'bg-orange-500/10 text-orange-400 border-orange-500/20'}`}>
+                        {cv.last_qualification.consecutive_infra_errors} consecutive infra failures
+                      </span>
+                    )}
+                    {cv.last_qualification.status === 'infra_failure' && cv.last_qualification.error && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded border bg-red-500/10 text-red-400 border-red-500/20">
+                        {cv.last_qualification.error}
+                      </span>
+                    )}
+                  </div>
+                )}
+                {cv.last_qualification.audit_reconciliation && (
+                  <AuditReconciliationRow rec={cv.last_qualification.audit_reconciliation} />
+                )}
+              </div>
+            )}
+            {cv.latest_audit && (
+              <div className="pl-2 border-l border-neutral-700/50">
+                <AuditFindingsList audit={cv.latest_audit} />
+              </div>
+            )}
+            {projectId && (
+              <div data-testid="phase-controls" className="flex flex-wrap items-center gap-2 pt-1">
+                {cv.phase === 'build' ? (
+                  <button
+                    onClick={() => handleSetPhase('stabilize')}
+                    disabled={actionLoading !== null}
+                    className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-amber-500/40 text-amber-400 hover:bg-amber-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {actionLoading === 'phase' ? '…' : '→ stabilize'}
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => handleSetPhase('build')}
+                    disabled={actionLoading !== null}
+                    className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-blue-500/40 text-blue-400 hover:bg-blue-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {actionLoading === 'phase' ? '…' : '→ build'}
+                  </button>
+                )}
+                {cv.phase === 'stabilize' && (
+                  <button
+                    onClick={handleQualify}
+                    disabled={actionLoading !== null}
+                    className="text-[10px] px-2 py-0.5 min-h-[44px] sm:min-h-0 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {actionLoading === 'qualify' ? '…' : 'Run Qualify'}
+                  </button>
+                )}
+                {actionMsg && (
+                  <span className="text-[10px] text-neutral-400 italic">{actionMsg}</span>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+        {readiness !== undefined && <PromotionReadinessSummary readiness={readiness} />}
+        {verdicts.length > 0 && (
+          <div data-testid="verdict-history">
+            <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">Verdict History</p>
+            <div className="space-y-1">
+              {verdicts.slice(0, 8).map(v => (
+                <div key={v.id} className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] pl-2 border-l-2 border-neutral-700/40">
+                  <span className={`font-mono font-semibold ${v.would_promote ? 'text-emerald-400' : 'text-amber-400'}`}>{v.confidence != null ? `${Math.round(v.confidence * 100)}%` : '—'}</span>
+                  <span className={QUAL_VERDICT_COLOR[v.terminal_status ?? ''] ?? 'text-neutral-400'}>{v.terminal_status?.replace(/_/g, '-') ?? '?'}</span>
+                  {v.promotion_enabled && <span className="text-[9px] font-mono text-emerald-600">LIVE</span>}
+                  {v.sub_scores && <span className="text-neutral-600 font-mono text-[9px]">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)} s:{Math.round(v.sub_scores.smoketest * 100)}</span>}
+                  {v.sub_scores?.ci_resolution && <CiBadge ci={v.sub_scores.ci_resolution} />}
+                  {v.blocker && <span className="text-red-400 truncate max-w-[120px]" title={v.blocker}>{v.blocker}</span>}
+                  <span className="text-neutral-700 font-mono">{v.candidate_sha.slice(0, 7)}</span>
+                  {v.finalized_at && <span className="text-neutral-600">{timeAgo(v.finalized_at)}</span>}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        {recent.length > 0 && (
+          <div>
+            <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-1">History</p>
+            <div className="space-y-0.5">
+              {recent.slice(0, 4).map(v => (
+                <div key={v.version_number} className="flex flex-wrap items-center gap-2 text-[10px]">
+                  <span className="text-neutral-400 font-mono w-8">v{v.version_number}</span>
+                  <span className="text-neutral-500">{v.status}</span>
+                  <QualSummary q={v.last_qualification} />
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}

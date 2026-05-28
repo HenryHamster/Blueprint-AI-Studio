@@ -44,6 +44,9 @@ export const EXEMPT_FROM_VIEWPORT_TEST = new Set([
   // Internal mapper: generates chip DOM from phase data; not standalone,
   // layout controlled by parent container.
   'regressionPhaseChips',
+  // Sub-panel rendered exclusively inside DashboardHome; viewport coverage
+  // is provided by DashboardHome.viewport.test.tsx which exercises it inline.
+  'VersionLifecyclePanel',
 ]);
 
 /**

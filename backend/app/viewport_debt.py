@@ -52,6 +52,7 @@ _EXEMPT_FROM_VIEWPORT_TEST: frozenset[str] = frozenset(
         "Toasts",
         "catchupRows",
         "regressionPhaseChips",
+        "VersionLifecyclePanel",
     ]
 )
 
