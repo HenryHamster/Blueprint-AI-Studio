@@ -10290,30 +10290,33 @@ async def test_next_role_broadcasts_on_claim(client: AsyncClient, db_session, mo
 
 
 def test_terminal_idempotent_freshness_default_is_300():
-    """_TERMINAL_IDEMPOTENT_FRESHNESS_SECS defaults to 300 when env var is unset."""
+    """_TERMINAL_IDEMPOTENT_FRESHNESS_SECS defaults to 300 when the env var is unset.
+
+    Reads the already-imported module constant directly. The previous version
+    deleted ``app.routers.agent`` from ``sys.modules`` and re-imported it to
+    "force re-evaluation" — but that rebuilt the module, creating a NEW
+    ``verify_agent_token`` object. ``admin_agent_ops`` / ``agent_status`` /
+    ``agent_credentials`` had already captured the ORIGINAL object via
+    ``from app.routers.agent import verify_agent_token`` in their route
+    ``Depends(...)``, so after this test every later test that overrode
+    ``verify_agent_token`` by object identity (test_directions strategic API,
+    test_pipeline set_vision) silently lost its override and got a 422 — a
+    deterministic, order-dependent full-suite failure that passed in isolation.
+    The test environment never sets this env var, so the constant already
+    reflects the unset-env default; assert the premise to make a stray override
+    explicit rather than a confusing value mismatch.
+    """
     import os
-    import importlib
-    import sys
 
-    env_key = "AGENT_TERMINAL_IDEMPOTENT_FRESHNESS_SECS"
-    original = os.environ.pop(env_key, None)
-    try:
-        # Force re-evaluation of the module-level constant by reimporting.
-        mod_name = "app.routers.agent"
-        if mod_name in sys.modules:
-            del sys.modules[mod_name]
-        from app.routers import agent as agent_mod
+    from app.routers.agent import _TERMINAL_IDEMPOTENT_FRESHNESS_SECS
 
-        assert agent_mod._TERMINAL_IDEMPOTENT_FRESHNESS_SECS == 300, (
-            f"Expected default 300, got {agent_mod._TERMINAL_IDEMPOTENT_FRESHNESS_SECS}"
-        )
-    finally:
-        if original is not None:
-            os.environ[env_key] = original
-        # Restore the cached module so other tests aren't affected.
-        if mod_name in sys.modules:
-            del sys.modules[mod_name]
-        importlib.import_module(mod_name)
+    assert os.getenv("AGENT_TERMINAL_IDEMPOTENT_FRESHNESS_SECS") is None, (
+        "test premise: AGENT_TERMINAL_IDEMPOTENT_FRESHNESS_SECS must be unset so "
+        "the module constant reflects the compiled-in default"
+    )
+    assert _TERMINAL_IDEMPOTENT_FRESHNESS_SECS == 300, (
+        f"Expected default 300, got {_TERMINAL_IDEMPOTENT_FRESHNESS_SECS}"
+    )
 
 
 def _make_jwt_with_iat(task_id: str, vm_instance_id: str, iat_offset_secs: int):

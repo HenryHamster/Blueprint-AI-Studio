@@ -18,20 +18,22 @@ from app.release_scoring import _audit_missing_reason, _score_audit
 _FIXTURE_PATH = pathlib.Path(__file__).parent / "fixtures" / "release_audit_sample.json"
 
 
-def _resolve_specialized_ts_path() -> "str | None":
-    """Locate ``agent/src/handlers/specialized.ts`` across local + Docker envs.
+def _resolve_audits_ts_path() -> "str | None":
+    """Locate ``agent/src/handlers/audits.ts`` across local + Docker envs.
 
-    Mirrors ``_resolve_prompt_ts_path`` in test_invariants.py.  CI runs pytest
-    inside the backend Docker image (built from ./backend only), so the agent
-    tree is not on the filesystem unless ``scripts/test-backend.sh`` mounts it
-    at ``/agent/src``.  Returns the first existing path or ``None`` to let the
-    test skip rather than error.
+    The release-audit prompt and its JSON schema block live in ``audits.ts``
+    (moved out of ``specialized.ts`` when the agent handlers were decomposed
+    into focused modules in #6597).  Mirrors ``_resolve_prompt_ts_path`` in
+    test_invariants.py.  CI runs pytest inside the backend Docker image (built
+    from ./backend only), so the agent tree is not on the filesystem unless
+    ``scripts/test-backend.sh`` mounts it at ``/agent/src``.  Returns the first
+    existing path or ``None`` to let the test skip rather than error.
     """
-    env_override = os.getenv("AGENT_SPECIALIZED_TS")
+    env_override = os.getenv("AGENT_AUDITS_TS")
     candidates = []
     if env_override:
         candidates.append(env_override)
-    candidates.append("/agent/src/handlers/specialized.ts")
+    candidates.append("/agent/src/handlers/audits.ts")
     candidates.append(
         os.path.normpath(
             os.path.join(
@@ -41,7 +43,7 @@ def _resolve_specialized_ts_path() -> "str | None":
                 "agent",
                 "src",
                 "handlers",
-                "specialized.ts",
+                "audits.ts",
             )
         )
     )
@@ -92,34 +94,36 @@ class TestReleaseAuditFixtureShape:
             )
 
 
-class TestSpecializedTsSchemaContract:
-    """Introspect agent/src/handlers/specialized.ts to ensure it documents
-    'findings' and 'severity' in its JSON schema block, not legacy 'issues'/'level'.
+class TestAuditsTsSchemaContract:
+    """Introspect agent/src/handlers/audits.ts to ensure the release-audit prompt
+    documents 'findings' and 'severity' in its JSON schema block, not legacy
+    'issues'/'level'.  (The release-audit handler moved here from specialized.ts
+    when the agent handlers were decomposed into focused modules in #6597.)
     """
 
     @pytest.fixture(scope="class")
     def ts_source(self) -> str:
-        path = _resolve_specialized_ts_path()
+        path = _resolve_audits_ts_path()
         if path is None:
             pytest.skip(
-                "agent/src/handlers/specialized.ts not available in this test "
+                "agent/src/handlers/audits.ts not available in this test "
                 "environment (CI docker context builds from ./backend; run via "
                 "scripts/test-backend.sh from a checkout for enforcement)"
             )
         return pathlib.Path(path).read_text()
 
-    def test_specialized_ts_uses_findings_not_issues(self, ts_source):
+    def test_audits_ts_uses_findings_not_issues(self, ts_source):
         """The agent prompt must reference 'findings' as the top-level key."""
         # The JSON schema block emitted to the LLM must instruct it to use "findings".
         assert '"findings"' in ts_source, (
-            "agent/src/handlers/specialized.ts does not contain '\"findings\"'; "
+            "agent/src/handlers/audits.ts does not contain '\"findings\"'; "
             "the prompt may have drifted to a legacy key name"
         )
 
-    def test_specialized_ts_uses_severity_not_level_in_schema(self, ts_source):
+    def test_audits_ts_uses_severity_not_level_in_schema(self, ts_source):
         """The agent prompt's findings schema must use 'severity', not 'level'."""
         assert '"severity"' in ts_source, (
-            "agent/src/handlers/specialized.ts does not contain '\"severity\"'; "
+            "agent/src/handlers/audits.ts does not contain '\"severity\"'; "
             "the prompt may have drifted to a legacy field name"
         )
 
@@ -136,11 +140,11 @@ class TestSpecializedTsSchemaContract:
         audit_blocks = [b for b in blocks if "audit_score" in b]
         assert audit_blocks, (
             "Could not find a fenced JSON block containing 'audit_score' in "
-            "agent/src/handlers/specialized.ts — schema block may have been removed"
+            "agent/src/handlers/audits.ts — schema block may have been removed"
         )
         return audit_blocks[0]
 
-    def test_specialized_ts_does_not_instruct_issues_key(self, ts_source):
+    def test_audits_ts_does_not_instruct_issues_key(self, ts_source):
         """The agent prompt's documented JSON example must not use 'issues' as the
         findings key — that is the legacy shape the backend falls back to but does
         not prefer.  If the prompt documents 'issues', newly emitted artifacts will
@@ -148,17 +152,17 @@ class TestSpecializedTsSchemaContract:
         """
         schema_block = self._extract_audit_schema_block(ts_source)
         assert '"issues"' not in schema_block, (
-            "The JSON schema block in specialized.ts documents 'issues' as the "
+            "The JSON schema block in audits.ts documents 'issues' as the "
             "findings key — must use 'findings' to avoid drift"
         )
 
-    def test_specialized_ts_does_not_use_level_in_findings_schema(self, ts_source):
+    def test_audits_ts_does_not_use_level_in_findings_schema(self, ts_source):
         """The agent prompt's finding entry schema must not list 'level' as the
         severity field name — that is a legacy alias the backend tolerates but the
         primary parse path uses 'severity'.
         """
         schema_block = self._extract_audit_schema_block(ts_source)
         assert '"level"' not in schema_block, (
-            "The JSON schema block in specialized.ts uses 'level' as a severity "
+            "The JSON schema block in audits.ts uses 'level' as a severity "
             "field name — must use 'severity' to avoid drift"
         )
