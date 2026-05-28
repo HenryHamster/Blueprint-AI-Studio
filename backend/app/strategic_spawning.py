@@ -497,6 +497,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         "priority": "medium",
         "summarize": _summarize_efficiency_snapshot,
     },
+    # Global pool utilization snapshot. Tiny fixed-size dict; low priority
+    # since it's purely observational and the prompt_suffix note carries the
+    # headline numbers when this gets dropped.
+    "parallelism_snapshot": {"priority": "low"},
 }
 
 
@@ -1892,6 +1896,54 @@ async def _spawn_strategic_review(
             _efficiency_snapshot = _summarize_efficiency_snapshot(_raw_snapshot)
     except Exception:
         logger.exception("[STRATEGIC] efficiency snapshot fetch failed; continuing")
+    # Global pool utilization snapshot — observational signal so the strategic
+    # agent can factor parallelism into width decisions. Pool capacity is
+    # global (shared across projects), so this query is intentionally not
+    # project-scoped. Best-effort: any failure logs and leaves the field unset.
+    _parallelism_snapshot: dict | None = None
+    try:
+        _cap_raw = _runtime_config.get("max_concurrent_vms")
+        _now_p = _utcnow()
+        _window_seconds = 60 * 60
+        _window_start = _now_p - timedelta(seconds=_window_seconds)
+        _stmt = (
+            select(Task.vm_started_at, Task.vm_stopped_at, Task.context)
+            .where(Task.vm_started_at.is_not(None))
+            .where(Task.vm_started_at < _now_p)
+            .where(
+                or_(Task.vm_stopped_at.is_(None), Task.vm_stopped_at > _window_start)
+            )
+        )
+        _rows = (await session.execute(_stmt)).all()
+        _overlap_total = 0.0
+        _current_active = 0
+        _directions_in_flight: set[str] = set()
+        for _vs, _ve, _ctx in _rows:
+            if _vs is None:
+                continue
+            _end_t = _ve if _ve is not None else _now_p
+            _start_t = _vs if _vs > _window_start else _window_start
+            if _end_t > _start_t:
+                _overlap_total += (_end_t - _start_t).total_seconds()
+            if _ve is None:
+                _current_active += 1
+                _dir_id = (_ctx or {}).get("direction_id")
+                if _dir_id:
+                    _directions_in_flight.add(str(_dir_id))
+        _recent_avg = round(_overlap_total / _window_seconds, 2)
+        _parallelism_snapshot = {
+            "pool_capacity_slots": _cap_raw,
+            "current_active_vms": _current_active,
+            "recent_avg_active_vms": _recent_avg,
+            "recent_window_minutes": _window_seconds // 60,
+            "directions_in_flight": len(_directions_in_flight),
+        }
+        if isinstance(_cap_raw, int) and _cap_raw > 0:
+            _parallelism_snapshot["utilization_pct"] = round(
+                (_recent_avg / _cap_raw) * 100, 1
+            )
+    except Exception:
+        logger.exception("[STRATEGIC] parallelism snapshot build failed; continuing")
     # Post-promotion handoff — when a fresh version has just opened from a
     # successful promotion, its `goal` field was snapshotted verbatim from
     # `problem_model.intent.current_focus` at the moment the prior version
@@ -2117,6 +2169,34 @@ async def _spawn_strategic_review(
                 if prompt_suffix
                 else _approaches_block
             )
+    if _parallelism_snapshot:
+        _ps_parts = []
+        _ps_cap = _parallelism_snapshot.get("pool_capacity_slots")
+        _ps_avg = _parallelism_snapshot.get("recent_avg_active_vms")
+        _ps_util = _parallelism_snapshot.get("utilization_pct")
+        _ps_dirs = _parallelism_snapshot.get("directions_in_flight")
+        if _ps_cap is not None:
+            _ps_parts.append(f"pool capacity {_ps_cap} slots")
+        if _ps_avg is not None:
+            _ps_parts.append(f"recent avg {_ps_avg} active VMs over last hour")
+        if _ps_util is not None:
+            _ps_parts.append(f"utilization {_ps_util}%")
+        if _ps_dirs is not None:
+            _ps_parts.append(f"{_ps_dirs} directions currently in flight")
+        _ps_stats = "; ".join(_ps_parts)
+        _parallelism_note = (
+            "Note: pipeline throughput depends on how many directions are in "
+            "flight at once. Review iteration serializes work within a "
+            "direction (~half of its lifetime), so a small number of "
+            "directions leaves pool capacity idle even when each direction "
+            "is fully busy."
+            + (f" ({_ps_stats})." if _ps_stats else "")
+        )
+        prompt_suffix = (
+            f"{prompt_suffix}\n{_parallelism_note}"
+            if prompt_suffix
+            else _parallelism_note
+        )
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",
@@ -2187,6 +2267,11 @@ async def _spawn_strategic_review(
             **(
                 {"efficiency_snapshot": _efficiency_snapshot}
                 if _efficiency_snapshot
+                else {}
+            ),
+            **(
+                {"parallelism_snapshot": _parallelism_snapshot}
+                if _parallelism_snapshot
                 else {}
             ),
             "base_branch": get_project_integration_branch(project),

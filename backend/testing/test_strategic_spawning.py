@@ -3228,6 +3228,98 @@ async def test_strategic_review_omits_efficiency_snapshot_when_no_data(db_sessio
 
 
 # ---------------------------------------------------------------------------
+# parallelism_snapshot in strategic payload
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_includes_parallelism_snapshot(db_session):
+    """parallelism_snapshot is built from runtime_config + Task vm timing rows.
+
+    Seeds two Tasks: one currently active (vm_started_at set, vm_stopped_at
+    null) and one that completed inside the last hour. Verifies the snapshot
+    captures both the current-active count and the time-weighted recent avg,
+    plus utilization_pct derived from max_concurrent_vms.
+    """
+    project = _make_project(
+        directions=[
+            {"id": "d-par01", "status": "active", "text": "x", "priority": "medium"}
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    # Active task — running for 30 minutes, still in flight.
+    active_task = Task(
+        project_id=project.id,
+        title="active",
+        description="",
+        payloads=[{"type": "research"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_started_at=now - timedelta(minutes=30),
+        context={"direction_id": "d-par01"},
+    )
+    # Completed task — ran 20 minutes inside the last hour.
+    done_task = Task(
+        project_id=project.id,
+        title="done",
+        description="",
+        payloads=[{"type": "research"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_started_at=now - timedelta(minutes=40),
+        vm_stopped_at=now - timedelta(minutes=20),
+        context={"direction_id": "d-par99"},
+    )
+    db_session.add_all([active_task, done_task])
+    await db_session.commit()
+
+    prev_cap = _shared_state.runtime_config.get("max_concurrent_vms")
+    _shared_state.runtime_config["max_concurrent_vms"] = 15
+    try:
+        spawned = await _spawn_strategic_review(project, db_session)
+    finally:
+        if prev_cap is None:
+            _shared_state.runtime_config.pop("max_concurrent_vms", None)
+        else:
+            _shared_state.runtime_config["max_concurrent_vms"] = prev_cap
+
+    assert spawned is True
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    strategic_tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert strategic_tasks
+    payload = strategic_tasks[0].payloads[0]
+    assert "parallelism_snapshot" in payload
+    snap = payload["parallelism_snapshot"]
+    assert snap["pool_capacity_slots"] == 15
+    assert snap["current_active_vms"] == 1
+    assert snap["recent_window_minutes"] == 60
+    # Active task overlaps the window for 30 min, done task for 20 min →
+    # total ~50 min of overlap / 60 min window = ~0.83 avg active VMs.
+    assert 0.7 <= snap["recent_avg_active_vms"] <= 0.95
+    assert snap["directions_in_flight"] == 1  # only active task counts
+    assert 0 < snap["utilization_pct"] < 10
+    # And the observation note should land in prompt_suffix.
+    suffix = payload.get("prompt_suffix") or ""
+    assert "throughput depends on" in suffix
+    assert "pool capacity 15 slots" in suffix
+
+
+# ---------------------------------------------------------------------------
 # _build_failure_feedback_mitigation unit tests
 # ---------------------------------------------------------------------------
 
