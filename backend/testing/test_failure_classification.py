@@ -2299,7 +2299,6 @@ class TestResidualFingerprintDbWrite:
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = Path(__file__).parents[2]
-_AGENT_INDEX = _REPO_ROOT / "agent" / "src" / "index.ts"
 _VIEWPORT_TS = _REPO_ROOT / "admin-ui" / "src" / "test" / "viewport.ts"
 
 
@@ -2328,6 +2327,33 @@ class TestCrossLanguageClassificationContracts:
             )
         return path.read_text(encoding="utf-8").lower()
 
+    @staticmethod
+    def _agent_src_contains(needle: str) -> bool:
+        """True if ``needle`` (case-insensitive) appears anywhere in the agent's
+        non-test TypeScript sources.
+
+        Scans the whole ``agent/src`` tree rather than a single file: heartbeat
+        status strings legitimately move between modules during refactors (e.g.
+        ``Using tool:`` migrated index.ts → providers/runners.ts in the 2026-05
+        agent decomposition). A single-file pin breaks the moment that happens,
+        producing a false drift alarm even though the contract still holds.
+        """
+        agent_src = _REPO_ROOT / "agent" / "src"
+        if not agent_src.is_dir():
+            pytest.skip(
+                f"{agent_src} not available in this environment — the backend "
+                "test image ships no agent/ tree (build context is ./backend). "
+                "This cross-language drift guard runs wherever the full repo "
+                "tree is checked out (local dev, agent VM workspace)."
+            )
+        needle = needle.lower()
+        for path in agent_src.rglob("*.ts"):
+            if path.name.endswith(".test.ts"):
+                continue
+            if needle in path.read_text(encoding="utf-8").lower():
+                return True
+        return False
+
     # ------------------------------------------------------------------
     # Agent heartbeat / status strings
     # ------------------------------------------------------------------
@@ -2339,9 +2365,8 @@ class TestCrossLanguageClassificationContracts:
         mid-PR-push will fall through to CODE_ERROR and generate spurious
         residual fingerprints.
         """
-        src = self._src(_AGENT_INDEX)
-        assert "creating pull request for" in src, (
-            "agent/src/index.ts no longer emits 'Creating pull request for …'; "
+        assert self._agent_src_contains("creating pull request for"), (
+            "agent/src no longer emits 'Creating pull request for …'; "
             "update the 'creating pull request for blueprint/' pattern in "
             "failure_classification._classify_failure_class to match the new string, "
             "or update the agent to keep the same prefix."
@@ -2353,9 +2378,8 @@ class TestCrossLanguageClassificationContracts:
         Claude Code tool call.  If renamed, tasks reaped mid-tool-call will fall
         through to CODE_ERROR instead of AGENT_TIMEOUT.
         """
-        src = self._src(_AGENT_INDEX)
-        assert "using tool:" in src, (
-            "agent/src/index.ts no longer emits 'Using tool: <Name>'; "
+        assert self._agent_src_contains("using tool:"), (
+            "agent/src no longer emits 'Using tool: <Name>'; "
             "update the 'using tool: ' pattern in "
             "failure_classification._classify_failure_class to match the new string, "
             "or update the agent to keep the same prefix."

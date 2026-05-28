@@ -335,7 +335,7 @@ async def _emit_all_accounts_blocked_stall(
                         },
                     )
                 asyncio.ensure_future(
-                    dispatch_external_notification(  # noqa: RUF006
+                    dispatch_external_notification(
                         proj_id,
                         "PIPELINE_STALLED",
                         {
@@ -356,6 +356,16 @@ async def _emit_all_accounts_blocked_stall(
 # Timestamp updated each orchestrator cycle — used by /debug endpoint
 _orchestrator_last_cycle: datetime | None = None
 _orchestrator_cycle_started: datetime | None = None
+# In-cycle progress heartbeat. Updated frequently *within* a cycle (cycle
+# start + once per CI-poll task) so liveness reflects "the worker is making
+# progress", NOT "a full cycle finished within N seconds". A cycle's wall
+# time grows O(EVALUATING backlog) — gating liveness on full-cycle completion
+# kills a slow-but-healthy worker, discarding its progress and spiralling
+# (incident 2026-05-28: O(N) CI-poll cycle outgrew the fixed 60s /health
+# window → Cloud Run liveness death-loop → whole pipeline froze). The /health
+# liveness verdict reads this; only a genuinely wedged worker (no heartbeat
+# for ORCHESTRATOR_HANG_SECONDS) is reported unhealthy and restarted.
+_orchestrator_last_progress: datetime | None = None
 
 # Consecutive error counters for exponential backoff
 _orchestrator_consecutive_errors: int = 0
@@ -363,6 +373,40 @@ _orchestrator_consecutive_monitoring_errors: int = 0
 
 # Configurable throttle sleep when high failure rate detected
 ORCHESTRATOR_THROTTLE_SECONDS = int(os.getenv("ORCHESTRATOR_THROTTLE_SECONDS", "30"))
+
+# How long the worker may go without a progress heartbeat before /health
+# reports it as wedged (→ Cloud Run liveness restart). Must comfortably exceed
+# the longest single awaited step in a cycle (a CI GitHub call + its retries,
+# the 30s session-acquire timeout, etc.) so a slow-but-progressing worker is
+# never killed — only a truly hung one. Env-overridable for ops tuning.
+ORCHESTRATOR_HANG_SECONDS = int(os.getenv("ORCHESTRATOR_HANG_SECONDS", "180"))
+
+
+def _mark_orchestrator_progress() -> None:
+    """Heartbeat that the orchestrator worker is actively progressing within a
+    cycle. Liveness (`/health`) is gated on the freshness of this timestamp, not
+    on full-cycle completion, so a legitimately long cycle (large EVALUATING
+    backlog → many sequential CI polls) is not mistaken for a hung process and
+    killed — which would discard the cycle's progress and spiral. See
+    [[reference-orchestrator-liveness-deathspiral]] / incident 2026-05-28."""
+    global _orchestrator_last_progress
+    _orchestrator_last_progress = _utcnow()
+
+
+def _resolve_ci_fix_branch(
+    review_loop: dict | None, payload: dict | None, pr_data: dict | None
+) -> str:
+    """Resolve the head branch for a CI/conflict fix-task spawn.
+
+    Prefers our stored branch (``review_loop`` then ``payload``) but falls back
+    to the PR's *live* head ref when both are empty/stale, so a missing stored
+    branch can't reach ``_spawn_pipeline_task`` as an empty ``FixPayload.branch``
+    — which raises a ValueError every cycle and wedges the task as a poison pill
+    (incident 2026-05-28: task cf1d2a25 / 7f0e7ec5)."""
+    branch = (review_loop or {}).get("branch", "") or (payload or {}).get("branch", "")
+    if not branch:
+        branch = ((pr_data or {}).get("head", {}) or {}).get("ref", "")
+    return branch or ""
 
 # Track in-flight provision coroutines so stale recovery can cancel them.
 # Without cancellation, zombie provisions hold semaphore slots for up to 360s,
@@ -394,7 +438,7 @@ ACTIVE_TASKS_LIGHT_COLUMNS = (
 # Symbols below are re-exported so ``from app.orchestrator import ...`` keeps
 # working for existing callers and tests.
 # ---------------------------------------------------------------------------
-from app.orchestrator_health import (  # noqa: E402,F401
+from app.orchestrator_health import (  # noqa: F401
     _CRITICAL_EXTERNAL_DEPS,
     _classify_stuck_tasks,
     _find_cycle_members,
@@ -422,8 +466,8 @@ def _resolve_env_runtime_fallback(
     provider: str | None,
     model: str | None,
     execution_mode: str | None,
-    task: Task,  # noqa: ARG001 — kept for signature stability
-    runtime_config: dict[str, Any],  # noqa: ARG001
+    task: Task,
+    runtime_config: dict[str, Any],
 ) -> tuple[str | None, str, str | None, str | None, str | None, dict[str, str]]:
     """Return env-backed runtime credentials when no pool account is available.
 
@@ -580,7 +624,7 @@ def _sync_task_payload_runtime_fields(
     return changed
 
 
-from app.orchestrator_health import (  # noqa: E402,F401
+from app.orchestrator_health import (
     _check_candidate_task_deps,
     get_confirmed_down_critical_deps,
 )
@@ -647,6 +691,7 @@ async def orchestrator_worker():
         try:
             _orchestrator_cycle_started = _utcnow()
             cycle_start = time.monotonic()
+            _mark_orchestrator_progress()
             tasks_recovered = 0
 
             # Periodic pool refresh — pick up admin changes without restart
@@ -732,7 +777,7 @@ async def orchestrator_worker():
             # pipeline adjustments without depending on autonomous research cycles.
             global _last_anomaly_sweep
             if (_utcnow() - _last_anomaly_sweep).total_seconds() >= 600:
-                from app.anomaly_detection import anomaly_maintenance_sweep  # noqa: PLC0415
+                from app.anomaly_detection import anomaly_maintenance_sweep
 
                 try:
                     await anomaly_maintenance_sweep()
@@ -2451,7 +2496,7 @@ async def orchestrator_worker():
                             from app.max_plan_pool import (
                                 summarize_pool_state,
                                 describe_pool_blockage,
-                            )  # noqa: PLC0415
+                            )
 
                             _pool_summary = summarize_pool_state(
                                 task_model, user_id=dispatch_user_id
@@ -3167,7 +3212,7 @@ async def orchestrator_worker():
                             f"{_cycle_dispatched} task(s) dispatched after prior all-accounts-blocked episode"
                         )
                         try:
-                            from app.broadcast import manager as _ws_manager  # noqa: PLC0415
+                            from app.broadcast import manager as _ws_manager
 
                             await _ws_manager.broadcast_to_all(
                                 "rate_limit_stall_resolved",
@@ -3193,7 +3238,7 @@ async def orchestrator_worker():
                 # pipeline_throttle alert: this fires every cycle any tasks are held.
                 if _cycle_accounts_blocked > 0:
                     try:
-                        from app.broadcast import manager as _ws_manager  # noqa: PLC0415
+                        from app.broadcast import manager as _ws_manager
 
                         await _ws_manager.broadcast_to_all(
                             "tasks_held_by_rate_limit",
@@ -3229,6 +3274,11 @@ async def orchestrator_worker():
                     .all()
                 )
                 for ci_task_id in ci_waiting_task_ids:
+                    # Heartbeat per task: this loop is O(EVALUATING backlog) and
+                    # is the dominant contributor to cycle wall-time. Marking
+                    # progress each iteration keeps liveness fresh across an
+                    # arbitrarily long poll pass (incident 2026-05-28).
+                    _mark_orchestrator_progress()
                     ci_task = await _lock_task_for_mutation(
                         session,
                         ci_task_id,
@@ -3259,7 +3309,7 @@ async def orchestrator_worker():
                     # without setting ci_wait_started, which silently disables the timeout.
                     # Commit immediately, then reacquire task_lock before more mutations below.
                     if not ci_loop.get("ci_wait_started"):
-                        from app import pause_clock  # noqa: PLC0415
+                        from app import pause_clock
 
                         ci_loop["ci_wait_started"] = _utcnow().isoformat()
                         ci_loop[
@@ -3274,7 +3324,7 @@ async def orchestrator_worker():
                         # dict shares the same review_loop reference as the
                         # old. Drives the 2026-04-24 "CI wait exceeded 20min"
                         # flap where escalated/ci_last_polled never persisted.
-                        from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                        from sqlalchemy.orm.attributes import flag_modified
 
                         flag_modified(ci_task, "context")
                         session.add(ci_task)
@@ -3339,7 +3389,7 @@ async def orchestrator_worker():
                                 # reads escalated=False, and this whole block
                                 # re-fires every 2-4s, which is exactly the
                                 # "CI wait exceeded 20min" flap pattern.
-                                from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                                from sqlalchemy.orm.attributes import flag_modified
 
                                 flag_modified(ci_task, "context")
                                 ci_task.latest_status_message = f"CI wait exceeded {CI_WAIT_TIMEOUT_MINUTES}min on PR #{ci_pr_number} — retrying, alert sent"
@@ -3485,7 +3535,7 @@ async def orchestrator_worker():
                                     **(ci_task.context or {}),
                                     "review_loop": ci_loop,
                                 }
-                                from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                                from sqlalchemy.orm.attributes import flag_modified
 
                                 flag_modified(ci_task, "context")
                                 logger.warning(
@@ -3530,7 +3580,7 @@ async def orchestrator_worker():
                                 and not pr_data.get("merged")
                                 and ci_loop.get("pending_reopen")
                             ):
-                                from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                                from sqlalchemy.orm.attributes import flag_modified
 
                                 _reopen_attempts = ci_loop.get("reopen_attempts", 0) + 1
                                 ci_loop["reopen_attempts"] = _reopen_attempts
@@ -3891,7 +3941,7 @@ async def orchestrator_worker():
                                     ci_loop["head_sha"] = ""
                                     # Reset behind-retry counter — any prior transient failures resolved.
                                     ci_loop.pop("_behind_update_retries", None)
-                                    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                                    from sqlalchemy.orm.attributes import flag_modified
 
                                     ci_task.context = {
                                         **(ci_task.context or {}),
@@ -3927,7 +3977,7 @@ async def orchestrator_worker():
                                     ci_loop["polls_since_pr_fetch"] = 999
                                     ci_loop["head_sha"] = ""
                                     ci_loop.pop("_behind_update_retries", None)
-                                    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                                    from sqlalchemy.orm.attributes import flag_modified
 
                                     ci_task.context = {
                                         **(ci_task.context or {}),
@@ -3958,7 +4008,7 @@ async def orchestrator_worker():
                                         f"PR #{ci_pr_number} behind base — update_branch failed "
                                         f"({_upd_msg}); retrying next sweep ({_behind_retries}/{_behind_budget})"
                                     )
-                                    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                                    from sqlalchemy.orm.attributes import flag_modified
 
                                     ci_task.context = {
                                         **(ci_task.context or {}),
@@ -4022,7 +4072,7 @@ async def orchestrator_worker():
                                         f"PR #{ci_pr_number} stuck in mergeable_state={_ms_key} "
                                         f"for {deferred_count} consecutive CI polls",
                                     )
-                                from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                                from sqlalchemy.orm.attributes import flag_modified
 
                                 ci_task.context = {
                                     **(ci_task.context or {}),
@@ -4040,8 +4090,12 @@ async def orchestrator_worker():
                                 )
                                 continue
                             ci_payload = ci_task.first_payload
-                            ci_branch = ci_loop.get("branch", "") or ci_payload.get(
-                                "branch", ""
+                            # Resolve the fix-spawn head branch with a live-PR
+                            # fallback so a missing/stale stored branch can't
+                            # produce an empty FixPayload.branch (incident
+                            # 2026-05-28). See _resolve_ci_fix_branch.
+                            ci_branch = _resolve_ci_fix_branch(
+                                ci_loop, ci_payload, pr_data
                             )
                             _orch_ci_project = (
                                 await session.get(Project, ci_task.project_id)
@@ -4109,7 +4163,7 @@ async def orchestrator_worker():
                                         f"after update_branch retries exhausted — skipping fix spawn"
                                     )
                                     ci_loop.pop("_behind_update_retries", None)
-                                    from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                                    from sqlalchemy.orm.attributes import flag_modified
 
                                     ci_task.context = {
                                         **(ci_task.context or {}),
@@ -4173,6 +4227,17 @@ async def orchestrator_worker():
                                     f"(b) local lint/type/test suites pass on changed files, and (c) you've committed "
                                     f"every fix — do not leave uncommitted changes."
                                 )
+                            if not ci_branch:
+                                # Could not resolve a head branch from review_loop,
+                                # payload, or the live PR. Skip the spawn (it would
+                                # raise a FixPayload ValueError) and re-evaluate next
+                                # cycle rather than wedge on a poison task.
+                                logger.error(
+                                    f"[CI] PR #{ci_pr_number}: cannot resolve head branch "
+                                    f"for conflict-fix spawn (task {ci_task_id}) — skipping this cycle"
+                                )
+                                await session.rollback()
+                                continue
                             fix_task, fix_was_created = await _spawn_pipeline_task(
                                 ci_task,
                                 "fix",
@@ -4460,7 +4525,7 @@ async def orchestrator_worker():
                             # otherwise ci_last_polled/poll_interval don't
                             # persist and the per-task 30s skip never engages,
                             # so the orchestrator hammers GitHub every 2s.
-                            from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
+                            from sqlalchemy.orm.attributes import flag_modified
 
                             flag_modified(ci_task, "context")
                             session.add(ci_task)

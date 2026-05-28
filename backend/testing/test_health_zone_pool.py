@@ -94,11 +94,17 @@ def clean_max_plan_pool():
 
 @pytest.fixture()
 def healthy_orchestrator():
-    """Set _orchestrator_last_cycle to now so /health sees a live orchestrator."""
-    original = _orch_module._orchestrator_last_cycle
+    """Set the cycle + progress heartbeat to now so /health sees a live
+    orchestrator. Liveness is gated on the progress heartbeat (not full-cycle
+    completion) since the 2026-05-28 death-spiral fix, so a healthy orchestrator
+    must have a fresh heartbeat too."""
+    original_cycle = _orch_module._orchestrator_last_cycle
+    original_progress = _orch_module._orchestrator_last_progress
     _orch_module._orchestrator_last_cycle = datetime.utcnow()
+    _orch_module._orchestrator_last_progress = datetime.utcnow()
     yield
-    _orch_module._orchestrator_last_cycle = original
+    _orch_module._orchestrator_last_cycle = original_cycle
+    _orch_module._orchestrator_last_progress = original_progress
 
 
 @pytest.fixture()
@@ -205,9 +211,13 @@ class TestHealthEndpoint:
     async def test_health_orchestrator_never_started_returns_503(
         self, health_client: AsyncClient, all_deps_healthy
     ):
-        """Returns 503 when the orchestrator has never completed a cycle."""
-        original = _orch_module._orchestrator_last_cycle
+        """Returns 503 when the orchestrator has never completed a cycle (no
+        cycle AND no progress heartbeat yet — the cold-start window covered by
+        the liveness probe's initialDelaySeconds)."""
+        original_cycle = _orch_module._orchestrator_last_cycle
+        original_progress = _orch_module._orchestrator_last_progress
         _orch_module._orchestrator_last_cycle = None
+        _orch_module._orchestrator_last_progress = None
         try:
             resp = await health_client.get("/health")
             assert resp.status_code == 503
@@ -216,23 +226,52 @@ class TestHealthEndpoint:
             assert data["orchestrator_alive"] is False
             assert data["orchestrator_cycle_age_seconds"] is None
         finally:
-            _orch_module._orchestrator_last_cycle = original
+            _orch_module._orchestrator_last_cycle = original_cycle
+            _orch_module._orchestrator_last_progress = original_progress
 
     @pytest.mark.asyncio
-    async def test_health_stale_orchestrator_returns_503(
+    async def test_health_wedged_orchestrator_returns_503(
         self, health_client: AsyncClient, all_deps_healthy
     ):
-        """Returns 503 when the orchestrator last ran more than 60 seconds ago."""
-        original = _orch_module._orchestrator_last_cycle
-        _orch_module._orchestrator_last_cycle = datetime.utcnow() - timedelta(
-            seconds=90
+        """Returns 503 only when the worker is genuinely WEDGED — no progress
+        heartbeat for longer than ORCHESTRATOR_HANG_SECONDS. (Liveness is gated
+        on the heartbeat, not full-cycle completion, since the 2026-05-28
+        death-spiral fix.)"""
+        original_cycle = _orch_module._orchestrator_last_cycle
+        original_progress = _orch_module._orchestrator_last_progress
+        wedged = datetime.utcnow() - timedelta(
+            seconds=_orch_module.ORCHESTRATOR_HANG_SECONDS + 30
         )
+        _orch_module._orchestrator_last_cycle = wedged
+        _orch_module._orchestrator_last_progress = wedged
         try:
             resp = await health_client.get("/health")
             assert resp.status_code == 503
             assert resp.json()["status"] == "unhealthy"
         finally:
-            _orch_module._orchestrator_last_cycle = original
+            _orch_module._orchestrator_last_cycle = original_cycle
+            _orch_module._orchestrator_last_progress = original_progress
+
+    @pytest.mark.asyncio
+    async def test_health_slow_cycle_but_progressing_returns_200(
+        self, health_client: AsyncClient, all_deps_healthy
+    ):
+        """The core death-spiral fix: a cycle running far longer than the old
+        60s window is still HEALTHY as long as it keeps heartbeating. Pre-fix
+        this returned 503 and Cloud Run killed the container mid-cycle."""
+        original_cycle = _orch_module._orchestrator_last_cycle
+        original_progress = _orch_module._orchestrator_last_progress
+        now = datetime.utcnow()
+        _orch_module._orchestrator_last_cycle = now - timedelta(seconds=240)
+        _orch_module._orchestrator_last_progress = now - timedelta(seconds=2)
+        try:
+            resp = await health_client.get("/health")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert "orchestrator_slow_cycle" in data["degraded_deps"]
+        finally:
+            _orch_module._orchestrator_last_cycle = original_cycle
+            _orch_module._orchestrator_last_progress = original_progress
 
     @pytest.mark.asyncio
     async def test_health_cycle_age_seconds_reflects_elapsed_time(

@@ -1804,15 +1804,29 @@ async def health_check():
             },
         )
 
-    orchestrator_alive = _orch._orchestrator_last_cycle is not None
+    # Liveness is gated on the worker's in-cycle progress *heartbeat*, NOT on
+    # full-cycle completion. A cycle's wall time scales with the EVALUATING
+    # backlog (O(N) CI polling); gating liveness on a fixed 60s full-cycle
+    # window killed a slow-but-healthy worker, discarding its progress and
+    # spiralling into a Cloud Run restart loop that froze the whole pipeline
+    # (incident 2026-05-28). Now only a genuinely wedged worker — no heartbeat
+    # for ORCHESTRATOR_HANG_SECONDS — is reported unhealthy (→ liveness restart).
+    last_progress = _orch._orchestrator_last_progress or _orch._orchestrator_last_cycle
+    progress_age = (
+        (_utcnow() - last_progress).total_seconds() if last_progress else None
+    )
+    orchestrator_alive = last_progress is not None
+    orchestrator_healthy = orchestrator_alive and (
+        progress_age is not None and progress_age < _orch.ORCHESTRATOR_HANG_SECONDS
+    )
+
+    # cycle_age = time since the last *completed* cycle. Still surfaced and used
+    # as a soft "slow cycle" degraded signal for alerting, but it no longer
+    # removes the instance from the LB or triggers a liveness kill.
     cycle_age = None
     if _orch._orchestrator_last_cycle:
         cycle_age = (_utcnow() - _orch._orchestrator_last_cycle).total_seconds()
-
-    # Orchestrator is unhealthy if it hasn't cycled in 60+ seconds
-    orchestrator_healthy = orchestrator_alive and (
-        cycle_age is not None and cycle_age < 60
-    )
+    slow_cycle = cycle_age is not None and cycle_age >= 120
 
     # Detect hung orchestrator (cycle started but not completed in 5+ minutes)
     orchestrator_hung = False
@@ -1831,6 +1845,8 @@ async def health_check():
     ]
     if orchestrator_hung:
         degraded_deps.append("orchestrator_hung")
+    if slow_cycle:
+        degraded_deps.append("orchestrator_slow_cycle")
 
     healthy = orchestrator_healthy and critical_healthy
     status = (
@@ -1850,6 +1866,7 @@ async def health_check():
             "revision": _current_revision,
             "orchestrator_alive": orchestrator_alive,
             "orchestrator_cycle_age_seconds": cycle_age,
+            "orchestrator_progress_age_seconds": progress_age,
             "external_deps": {
                 k: v
                 for k, v in external_health.items()
