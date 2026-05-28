@@ -1516,6 +1516,118 @@ async def test_post_commit_sweep_still_retries_completed_and_failed(svc_db, mock
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# _sweep_post_commit_pending — childless-EVALUATING recovery (incident 2026-05-27)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_post_commit_sweep_recovers_childless_evaluating_task(svc_db, mocker):
+    """Incident 2026-05-27: a plan task (e39bd5a3) flipped COMPLETED→EVALUATING
+    and released its lock in _ensure_branch BEFORE spawning children, then its
+    post-commit died. It stranded EVALUATING with zero children — the reaper
+    Step 3 needs a COMPLETED child and Step 4 skips childless parents, and the
+    old sweep filter (COMPLETED/FAILED only) ignored it — so it pinned its
+    research grandparent for ~6h.
+
+    The sweep must now retry an EVALUATING task that carries a failure-set
+    pending marker AND has zero children (the spawn loop demonstrably never
+    ran), re-running the completion handler to create the missing children."""
+    import uuid as _uuid
+
+    project = await _make_project(svc_db)
+    task_id = _uuid.uuid4()
+    task = Task(
+        id=task_id,
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "decompose"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=True,
+        context={
+            "_post_commit_pending_meta": {
+                "at": _naive_utcnow().isoformat(),
+                "reason": "post_commit_error",
+                "payload": {
+                    "task_id": str(task_id),
+                    "status": "COMPLETED",
+                    "logs": "{}",
+                },
+                "attempts": 1,
+            }
+        },
+    )
+    svc_db.add(task)
+    await svc_db.commit()
+
+    mock_process = AsyncMock()  # succeed silently
+    mocker.patch("app.routers.agent_status._process_post_commit", mock_process)
+
+    await _sweep_post_commit_pending()
+
+    mock_process.assert_called_once()
+    assert mock_process.call_args.args[0] == task_id
+
+
+@pytest.mark.asyncio
+async def test_post_commit_sweep_skips_childed_evaluating_task(svc_db, mocker):
+    """The childless guard is essential: an EVALUATING parent that already
+    spawned children is a normally-parked parent whose pending marker is
+    stale. Re-running its completion handler would DUPLICATE children (child
+    creation is unconditional). The sweep must NOT re-run it — instead it
+    clears the stale marker so the row stops reappearing."""
+    import uuid as _uuid
+
+    project = await _make_project(svc_db)
+    parent_id = _uuid.uuid4()
+    parent = Task(
+        id=parent_id,
+        project_id=project.id,
+        payloads=[{"type": "plan", "prompt": "decompose"}],
+        status=TaskStatus.EVALUATING,
+        created_by="ORCHESTRATOR",
+        post_commit_pending=True,
+        context={
+            "_post_commit_pending_meta": {
+                "at": _naive_utcnow().isoformat(),
+                "reason": "post_commit_error",
+                "payload": {
+                    "task_id": str(parent_id),
+                    "status": "COMPLETED",
+                    "logs": "{}",
+                },
+                "attempts": 1,
+            }
+        },
+    )
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent_id,
+        payloads=[{"type": "create", "prompt": "do the thing"}],
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+    )
+    svc_db.add_all([parent, child])
+    await svc_db.commit()
+
+    mock_process = AsyncMock(
+        side_effect=AssertionError(
+            "must not re-run a childed EVALUATING parent (would duplicate children)"
+        )
+    )
+    mocker.patch("app.routers.agent_status._process_post_commit", mock_process)
+
+    await _sweep_post_commit_pending()
+
+    mock_process.assert_not_called()
+    await svc_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING, "parent stays parked"
+    assert parent.post_commit_pending is False, "stale marker must be cleared"
+    assert "_post_commit_pending_meta" not in (parent.context or {}), (
+        "stale pending meta must be cleared alongside the flag"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # _sweep_post_commit_pending — write-ahead marker age-gate (incident 2026-05-21)
 # ══════════════════════════════════════════════════════════════════════════════
 

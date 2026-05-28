@@ -2227,13 +2227,28 @@ async def _sweep_post_commit_pending():
             # CANCELLED tasks with post_commit_pending=True are cleaned up
             # below as a separate sub-query so the flag doesn't keep
             # reappearing in the sweep candidate set.
+            #
+            # EVALUATING is included for the childless-zombie recovery path
+            # (incident 2026-05-27, below): a completion handler can flip its
+            # parent to EVALUATING and release the row lock *before* spawning
+            # children, then die — leaving a pending marker that the old
+            # COMPLETED/FAILED-only filter never picked up and the reaper
+            # never rescues. The per-task EVALUATING guard below restricts the
+            # retry to childless parents so a normally-parked parent is never
+            # re-run (which would duplicate its children).
             tasks = (
                 (
                     await session.execute(
                         select(Task)
                         .where(
                             Task.post_commit_pending.is_(True),
-                            Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+                            Task.status.in_(
+                                [
+                                    TaskStatus.COMPLETED,
+                                    TaskStatus.FAILED,
+                                    TaskStatus.EVALUATING,
+                                ]
+                            ),
                             Task.archived.is_(False),
                         )
                         .limit(50)
@@ -2305,6 +2320,49 @@ async def _sweep_post_commit_pending():
                             _age = None
                     if _age is not None and _age < INLINE_RUNNING_GRACE_S:
                         continue
+
+                # Childless-EVALUATING recovery (incident 2026-05-27: plan
+                # e39bd5a3 pinned research 9c3a4bc2 for ~6h). A completion
+                # handler (_handle_plan_completion / _handle_research_completion)
+                # flips its parent COMPLETED→EVALUATING and releases the row
+                # lock inside _ensure_branch BEFORE the child-spawn loop runs.
+                # If post-commit then dies, the parent is stranded EVALUATING
+                # with zero children: the reaper's Step 3 needs a COMPLETED
+                # child and Step 4 explicitly skips childless parents, so
+                # nothing ever recovers it. Re-running the handler (it
+                # dispatches on the saved payload.status=COMPLETED, not the
+                # live row status) fixes it — but ONLY when the parent has zero
+                # children. Child creation in those handlers is unconditional
+                # and atomic (one commit for all children), so a non-zero
+                # child count means the spawn already ran and re-running would
+                # DUPLICATE children. A childed EVALUATING parent is a normal
+                # parked parent whose marker is stale; clear it without re-run.
+                if task.status == TaskStatus.EVALUATING:
+                    child_count = (
+                        await session.execute(
+                            select(func.count())
+                            .select_from(Task)
+                            .where(Task.parent_task_id == task.id)
+                        )
+                    ).scalar_one()
+                    if child_count:
+                        logger.info(
+                            f"[POST_COMMIT SWEEP] Task {str(task.id)[:8]} is "
+                            f"EVALUATING with {child_count} child(ren) — handler "
+                            f"already spawned; clearing stale pending marker "
+                            f"without re-run (avoids duplicate children)"
+                        )
+                        from sqlalchemy.orm.attributes import flag_modified
+
+                        new_ctx = dict(ctx)
+                        new_ctx.pop("_post_commit_pending_meta", None)
+                        task.context = new_ctx
+                        task.post_commit_pending = False
+                        flag_modified(task, "context")
+                        session.add(task)
+                        await session.commit()
+                        continue
+
                 attempts = int(pending_meta.get("attempts", 0) or 0)
                 payload_dump = pending_meta.get("payload")
 
