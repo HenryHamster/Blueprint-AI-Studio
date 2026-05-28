@@ -3,6 +3,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import {
   SrTrendBreakdown,
+  SrCatchRateFreshnessPill,
   SrMissedRetrospective,
   DirectionSrBreakdownPanel,
   EdgesTrendBreakdown,
@@ -1385,7 +1386,7 @@ describe('SrReviewerDisagreementsPanel severity stratification', () => {
         { category: 'security', task_type: 'create', count: 2, max_severity: 'CRITICAL', severity_breakdown: { CRITICAL: 2 } },
       ])} />,
     );
-    const badges = container.querySelectorAll('[data-testid="sr-reviewer-disagreements"] > span');
+    const badges = container.querySelectorAll('[data-testid="sr-reviewer-disagreements"] > div > span');
     // First two should be CRITICAL (count 3 before 2), third HIGH, fourth MEDIUM
     expect(badges[0].textContent).toContain('correctness');
     expect(badges[1].textContent).toContain('security');
@@ -1401,6 +1402,66 @@ describe('SrReviewerDisagreementsPanel severity stratification', () => {
     );
     const badge = container.querySelector('[title*="max: CRITICAL"]');
     expect(badge).not.toBeNull();
+  });
+});
+
+describe('SrReviewerDisagreementsPanel drill-through', () => {
+  function makeDrillData(): SrReviewerDisagreementsData {
+    return {
+      window_days: 7, total_entries: 1,
+      disagreements: [{
+        category: 'correctness', task_type: 'create', count: 3,
+        max_severity: 'CRITICAL',
+        examples: [
+          { severity: 'HIGH', description: 'missed null check', task_id: 'task-abc' },
+          { severity: 'CRITICAL', description: 'logic bug', task_id: 'task-def' },
+        ],
+      }],
+    };
+  }
+
+  it('clicking a badge with examples expands the drill-through panel', async () => {
+    const user = userEvent.setup();
+    render(<SrReviewerDisagreementsPanel data={makeDrillData()} />);
+    expect(screen.queryByTestId('sr-disagreement-examples')).not.toBeInTheDocument();
+    await user.click(screen.getByText('correctness').parentElement!);
+    expect(screen.getByTestId('sr-disagreement-examples')).toBeInTheDocument();
+  });
+
+  it('clicking the expanded badge again collapses the panel', async () => {
+    const user = userEvent.setup();
+    render(<SrReviewerDisagreementsPanel data={makeDrillData()} />);
+    const badge = screen.getByText('correctness').parentElement!;
+    await user.click(badge);
+    await user.click(badge);
+    expect(screen.queryByTestId('sr-disagreement-examples')).not.toBeInTheDocument();
+  });
+
+  it('clicking an example row invokes onSelectTask with the example task_id', async () => {
+    const onSelectTask = vi.fn();
+    const user = userEvent.setup();
+    render(<SrReviewerDisagreementsPanel data={makeDrillData()} onSelectTask={onSelectTask} />);
+    await user.click(screen.getByText('correctness').parentElement!);
+    await user.click(screen.getByText('missed null check'));
+    expect(onSelectTask).toHaveBeenCalledWith('task-abc');
+  });
+
+  it('examples in the expanded panel are sorted CRITICAL before HIGH', async () => {
+    const user = userEvent.setup();
+    render(<SrReviewerDisagreementsPanel data={makeDrillData()} />);
+    await user.click(screen.getByText('correctness').parentElement!);
+    const text = screen.getByTestId('sr-disagreement-examples').textContent ?? '';
+    expect(text.indexOf('logic bug')).toBeLessThan(text.indexOf('missed null check'));
+  });
+
+  it('applies red fp color (>50%) and amber fp color (>30%) in the badge', () => {
+    const data = makeDrillData();
+    data.disagreements[0].false_positive_rate = 0.6;
+    const { container, rerender } = render(<SrReviewerDisagreementsPanel data={data} />);
+    expect(container.querySelector('[title="false-positive rate"]')?.className).toContain('text-red-400');
+    data.disagreements[0].false_positive_rate = 0.4;
+    rerender(<SrReviewerDisagreementsPanel data={{ ...data, disagreements: [...data.disagreements] }} />);
+    expect(container.querySelector('[title="false-positive rate"]')?.className).toContain('text-amber-400');
   });
 });
 
@@ -2211,6 +2272,112 @@ describe('SrTrendBreakdown is_stale badge', () => {
     render(<SrTrendBreakdown trends={trends} variant="inline" />);
     expect(screen.getByTestId('sr-trend-stale-badge')).toBeInTheDocument();
     expect(screen.getByTestId('sr-trend-stale-badge').textContent).toContain('[stale]');
+  });
+});
+
+describe('SrCatchRateFreshnessPill', () => {
+  it('renders healthy, stale, low-data, and missing states with stable labels and tooltips', () => {
+    const healthStates = [
+      {
+        health: {
+          status: 'healthy' as const,
+          data_sufficient: true,
+          last_sufficient_computed_at: '2026-05-27T00:00:00Z',
+          last_sufficient_age_hours: 1.2,
+          signal_last_computed_at: '2026-05-27T00:00:00Z',
+          signal_age_hours: 1.2,
+          category_count: 4,
+          categories_with_hit_rate: 4,
+          overall_hit_rate: 0.75,
+        },
+        label: 'fresh',
+        tooltip: 'Fresh snapshot',
+      },
+      {
+        health: {
+          status: 'stale' as const,
+          data_sufficient: true,
+          last_sufficient_computed_at: '2026-05-25T00:00:00Z',
+          last_sufficient_age_hours: 30,
+          signal_last_computed_at: '2026-05-27T00:00:00Z',
+          signal_age_hours: 2,
+          category_count: 4,
+          categories_with_hit_rate: 3,
+          overall_hit_rate: 0.62,
+        },
+        label: 'snapshot stale (30h)',
+        tooltip: 'Snapshot stale',
+      },
+      {
+        health: {
+          status: 'low_data' as const,
+          data_sufficient: false,
+          last_sufficient_computed_at: '2026-05-27T00:00:00Z',
+          last_sufficient_age_hours: 1.5,
+          signal_last_computed_at: '2026-05-27T00:00:00Z',
+          signal_age_hours: 1.5,
+          category_count: 5,
+          categories_with_hit_rate: 1,
+          overall_hit_rate: 0.4,
+        },
+        label: 'low data (n=1)',
+        tooltip: 'Low data',
+      },
+      {
+        health: {
+          status: 'missing' as const,
+          data_sufficient: false,
+          last_sufficient_computed_at: null,
+          last_sufficient_age_hours: null,
+          signal_last_computed_at: null,
+          signal_age_hours: null,
+          category_count: 0,
+          categories_with_hit_rate: 0,
+          overall_hit_rate: null,
+        },
+        label: 'no snapshot',
+        tooltip: 'No snapshot',
+      },
+    ];
+
+    healthStates.forEach(({ health, label, tooltip }) => {
+      const { unmount } = render(<SrCatchRateFreshnessPill health={health} />);
+      const pill = screen.getByText(label);
+      expect(pill).toBeInTheDocument();
+      const wrapper = pill.closest('[data-testid]');
+      if (!wrapper) throw new Error('Expected freshness pill wrapper');
+      expect(wrapper).toHaveAttribute('title', expect.stringContaining(tooltip));
+      expect(wrapper).toHaveAttribute('title', expect.stringContaining('sample'));
+      unmount();
+    });
+  });
+});
+
+describe('SrTrendBreakdown catch-rate health header', () => {
+  it('wires the freshness pill into the card and inline headers', () => {
+    const health = {
+      status: 'stale' as const,
+      data_sufficient: true,
+      last_sufficient_computed_at: '2026-05-25T00:00:00Z',
+      last_sufficient_age_hours: 30,
+      signal_last_computed_at: '2026-05-27T00:00:00Z',
+      signal_age_hours: 2,
+      category_count: 4,
+      categories_with_hit_rate: 3,
+      overall_hit_rate: 0.62,
+    };
+    const trends: SrTrendData = {
+      categories: {
+        correctness: { miss_rate: 0.3, trend: 'stable' },
+      },
+    };
+
+    const { rerender } = render(<SrTrendBreakdown trends={trends} variant="card" srCatchRateHealth={health} />);
+    expect(screen.getByTestId('sr-catch-rate-health-stale')).toHaveTextContent('snapshot stale (30h)');
+    expect(screen.getByTestId('sr-catch-rate-health-stale')).toHaveAttribute('title', expect.stringContaining('signal age 2h'));
+
+    rerender(<SrTrendBreakdown trends={trends} variant="inline" srCatchRateHealth={health} />);
+    expect(screen.getByTestId('sr-catch-rate-health-stale')).toHaveTextContent('snapshot stale (30h)');
   });
 });
 

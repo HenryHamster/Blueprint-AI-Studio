@@ -660,7 +660,7 @@ _REVIEWER_ORIGINS = frozenset(
 _SEVERITY_LEVELS = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 
 _REVIEWER_EXAMPLE_CAP = 3
-_REVIEWER_EXAMPLE_CHAR_CAP = 200
+_REVIEWER_EXAMPLE_CHAR_CAP = 256
 
 
 def _max_severity(sev_counts: Dict[str, int]) -> str | None:
@@ -760,7 +760,14 @@ def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, dict]:
                     :_REVIEWER_EXAMPLE_CHAR_CAP
                 ]
                 if desc:
-                    bucket_examples.append({"severity": sev, "description": desc})
+                    bucket_examples.append(
+                        {
+                            "severity": sev,
+                            "description": desc,
+                            "task_id": str(t.id),
+                            "task_type": task_type,
+                        }
+                    )
         for cat in sr_failed:
             bucket = counts[(cat, task_type)]
             if cat in reviewer_cats:

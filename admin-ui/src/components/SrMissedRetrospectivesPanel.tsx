@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, RefreshCw } from 'lucide-react';
-import { fetchSrMissedRetrospectives } from '../api';
+import { fetchSrCatchRateHealth, fetchSrMissedRetrospectives, type SrCatchRateHealthResponse } from '../api';
 import type { SrMissedTask } from './SrTrendBreakdown';
-import { SR_CANONICAL_CATEGORIES } from './SrTrendBreakdown';
+import { SR_CANONICAL_CATEGORIES, SrCatchRateFreshnessPill } from './SrTrendBreakdown';
 import { timeAgo } from '../utils/time';
 import { isSafeUrl } from './TaskCard';
 
@@ -26,7 +26,9 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
   const [page, setPage] = useState(1);
   const [stableTaskTypes, setStableTaskTypes] = useState<string[]>([]);
   const [categoryCounts, setCategoryCounts] = useState<Record<string, number>>({});
+  const [catchRateHealth, setCatchRateHealth] = useState<SrCatchRateHealthResponse | null>(null);
   const taskTypesAccRef = useRef<Set<string>>(new Set());
+  const catchRateHealthCacheRef = useRef(new Map<string, Promise<SrCatchRateHealthResponse>>());
   const mountedRef = useRef(true);
   const panelMountTimeRef = useRef<number>(Date.now());
 
@@ -62,6 +64,30 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
       if (mountedRef.current) setLoading(false);
     }
   }, [selectedProjectId, days, categoryFilter, taskTypeFilter, page]);
+
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setCatchRateHealth(null);
+      return;
+    }
+
+    const cacheKey = `${selectedProjectId}:${days}`;
+    const cached = catchRateHealthCacheRef.current.get(cacheKey);
+    let active = true;
+    const request = cached ?? fetchSrCatchRateHealth(selectedProjectId);
+    if (!cached) catchRateHealthCacheRef.current.set(cacheKey, request);
+
+    request.then((result) => {
+      if (active) setCatchRateHealth(result);
+    }).catch(() => {
+      if (active) setCatchRateHealth(null);
+      catchRateHealthCacheRef.current.delete(cacheKey);
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [selectedProjectId, days]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -135,6 +161,7 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, a
             {stableTaskTypes.map(t => <option key={t} value={t}>{t}</option>)}
           </select>
         )}
+        <SrCatchRateFreshnessPill health={catchRateHealth} />
       </div>
 
       {loading ? (

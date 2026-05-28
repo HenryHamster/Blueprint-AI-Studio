@@ -101,8 +101,8 @@ class TestSchemaRevisionSync:
         which excludes agent/, .gitignore, and .git). Locally and in any
         environment that does see the repo root the check fires normally.
         """
-        prompt_path = os.path.join(
-            os.path.dirname(__file__), "..", "..", "agent", "src", "prompt.ts"
+        helpers_path = os.path.join(
+            os.path.dirname(__file__), "..", "..", "agent", "src", "prompts", "code-change-helpers.ts"
         )
         gitignore_path = os.path.join(
             os.path.dirname(__file__), "..", "..", ".gitignore"
@@ -111,7 +111,7 @@ class TestSchemaRevisionSync:
             os.path.join(os.path.dirname(__file__), "..", "..")
         )
         if not (
-            os.path.exists(prompt_path)
+            os.path.exists(helpers_path)
             and os.path.exists(gitignore_path)
             and os.path.isdir(os.path.join(repo_root, ".git"))
         ):
@@ -121,10 +121,10 @@ class TestSchemaRevisionSync:
                 "scripts/test-backend.sh from a checkout for enforcement)"
             )
 
-        with open(prompt_path) as f:
+        with open(helpers_path) as f:
             prompt = f.read()
         match = re.search(r"export const AGENT_HELPER_NAMES = \[(.*?)\];", prompt, re.S)
-        assert match, "Could not find AGENT_HELPER_NAMES literal in agent/src/prompt.ts"
+        assert match, "Could not find AGENT_HELPER_NAMES literal in agent/src/prompts/code-change-helpers.ts"
         helpers = [
             name.strip().strip("'\"")
             for name in match.group(1).split(",")

@@ -191,6 +191,24 @@ export interface SrMissedRetrospectivesResponse {
   category_counts?: Record<string, number>;
 }
 
+export interface SrCatchRateHealthResponse {
+  status: 'healthy' | 'stale' | 'low_data' | 'frozen' | 'never_sufficient' | 'missing';
+  data_sufficient: boolean;
+  last_sufficient_computed_at: string | null;
+  last_sufficient_age_hours: number | null;
+  signal_last_computed_at: string | null;
+  signal_age_hours: number | null;
+  category_count: number;
+  categories_with_hit_rate: number;
+  overall_hit_rate?: number | null;
+  previous_overall_hit_rate?: number | null;
+  overall_trend_verdict?: string | null;
+  overall_trend_significant?: boolean | null;
+  bucket_mode?: string | null;
+  prompt_version_changed?: boolean;
+  mixed_prompt_versions?: boolean;
+}
+
 export async function fetchSrMissedRetrospectives(
   projectId: string,
   params?: {
@@ -211,6 +229,12 @@ export async function fetchSrMissedRetrospectives(
   const url = `/api/admin/projects/${encodeURIComponent(projectId)}/sr-missed-retrospectives${query ? `?${query}` : ''}`;
   const res = await apiFetch(url);
   if (!res.ok) throw new Error(`Failed to fetch SR missed retrospectives: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchSrCatchRateHealth(projectId: string): Promise<SrCatchRateHealthResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/sr_catch_rate/health`);
+  if (!res.ok) throw new Error(`Failed to fetch SR catch-rate health: ${res.status}`);
   return res.json();
 }
 

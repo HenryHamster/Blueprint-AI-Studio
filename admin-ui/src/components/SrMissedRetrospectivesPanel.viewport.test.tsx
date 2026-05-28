@@ -49,6 +49,22 @@ const MOCK_ITEMS = [
   },
 ];
 
+const MOCK_HEALTH_HEALTHY = {
+  status: 'healthy' as const,
+  data_sufficient: true,
+  last_sufficient_computed_at: new Date(Date.now() - 90 * 60_000).toISOString(),
+  last_sufficient_age_hours: 1.5,
+  signal_last_computed_at: new Date(Date.now() - 90 * 60_000).toISOString(),
+  signal_age_hours: 1.5,
+  category_count: 4,
+  categories_with_hit_rate: 4,
+  overall_hit_rate: 0.75,
+  previous_overall_hit_rate: 0.7,
+  bucket_mode: 'cycle',
+  prompt_version_changed: false,
+  mixed_prompt_versions: false,
+};
+
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response(JSON.stringify({}), { status: 200 })),
   fetchSrMissedRetrospectives: vi.fn(async () => ({
@@ -56,6 +72,7 @@ vi.mock('../api', () => ({
     total: 2,
     task_types: ['create', 'fix'],
   })),
+  fetchSrCatchRateHealth: vi.fn(async () => MOCK_HEALTH_HEALTHY),
   API_BASE_URL: 'http://localhost:8000',
   authGet: vi.fn(async () => new Response(JSON.stringify({}), { status: 200 })),
 }));
@@ -212,6 +229,65 @@ describe('SrMissedRetrospectivesPanel — viewport regression', () => {
     // so the selector should not disappear when filtered results are empty.
     const dropdownAfterFilter = screen.queryByRole('combobox', { name: /filter by task type/i });
     expect(dropdownAfterFilter).toBeTruthy();
+  });
+
+  test('caches catch-rate health by project and day window, but not pagination', async () => {
+    const { fetchSrMissedRetrospectives, fetchSrCatchRateHealth } = await import('../api');
+    const missSpy = fetchSrMissedRetrospectives as ReturnType<typeof vi.fn>;
+    const healthSpy = fetchSrCatchRateHealth as ReturnType<typeof vi.fn>;
+    missSpy.mockClear();
+    healthSpy.mockClear();
+    missSpy.mockResolvedValue({ items: MOCK_ITEMS, total: 40, task_types: ['create', 'fix'] });
+    healthSpy
+      .mockResolvedValueOnce(MOCK_HEALTH_HEALTHY)
+      .mockResolvedValueOnce({
+        ...MOCK_HEALTH_HEALTHY,
+        status: 'stale',
+        last_sufficient_age_hours: 30,
+        signal_age_hours: 2,
+      });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrMissedRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    expect(screen.getByTestId('sr-catch-rate-health-healthy')).toBeTruthy();
+    expect(healthSpy).toHaveBeenCalledTimes(1);
+
+    const nextPage = screen.getByRole('button', { name: /next page/i });
+    await act(async () => {
+      fireEvent.click(nextPage);
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    expect(missSpy).toHaveBeenCalledWith('proj-1', expect.objectContaining({ page: 1, page_size: 20 }));
+    expect(healthSpy).toHaveBeenCalledTimes(1);
+
+    const day30 = screen.getByRole('button', { name: '30d' });
+    await act(async () => {
+      fireEvent.click(day30);
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    expect(healthSpy).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId('sr-catch-rate-health-stale')).toHaveTextContent('snapshot stale (30h)');
   });
 
   test('syncs categoryFilter and resets page when activeCategory prop changes', async () => {

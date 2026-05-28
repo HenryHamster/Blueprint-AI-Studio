@@ -553,7 +553,13 @@ function SrDiagnosticsStack({
             SR ↔ Reviewer Disagreements
             <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {srReviewerDisagreements.window_days}d · {srReviewerDisagreements.total_entries} categor{srReviewerDisagreements.total_entries !== 1 ? 'ies' : 'y'}</span>
           </p>
-          <SrReviewerDisagreementsPanel data={srReviewerDisagreements} />
+          <SrReviewerDisagreementsPanel
+            data={srReviewerDisagreements}
+            onSelectTask={(taskId) => {
+              const task = tasks.find(t => t.id === taskId);
+              if (task) onViewTask(task);
+            }}
+          />
         </section>
       )}
 

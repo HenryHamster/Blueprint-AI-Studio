@@ -10505,11 +10505,18 @@ async def test_sr_reviewer_disagreements_basic(db_session):
         days=30,
         limit=10,
     )
-    by_key = {(r["category"], r["task_type"]): r["count"] for r in results}
-    assert by_key[("correctness", "create")] == 3
-    assert by_key[("security", "fix")] == 1
+    by_key = {(r["category"], r["task_type"]): r for r in results}
+    assert by_key[("correctness", "create")]["count"] == 3
+    assert by_key[("security", "fix")]["count"] == 1
     # Already-failed category must not appear
     assert ("correctness", "fix") not in by_key
+    # Examples must include task_id for frontend drill-through
+    correctness_entry = by_key[("correctness", "create")]
+    assert len(correctness_entry["examples"]) > 0
+    example = correctness_entry["examples"][0]
+    assert "task_id" in example
+    assert example["task_id"]  # non-empty UUID string
+    assert example["task_type"] == "create"
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
-import { TrendingUp, TrendingDown, Minus, ChevronRight, ChevronDown, AlertTriangle, ArrowDownRight, ArrowUpRight, Search, Loader2 } from 'lucide-react';
+import { TrendingUp, TrendingDown, Minus, ChevronRight, ChevronDown, AlertTriangle, ArrowDownRight, ArrowUpRight, Search, Loader2, Check } from 'lucide-react';
+import type { SrCatchRateHealthResponse } from '../api';
 
 export interface SrMissExample {
   severity: 'CRITICAL' | 'MAJOR' | 'MINOR';
@@ -205,6 +206,86 @@ export interface SrTrendData {
   by_direction?: Record<string, Record<string, DirectionSrCatStat>> | null;
   co_failure_pairs?: SrCoFailurePair[] | null;
   reviewer_hallucination_rate?: ReviewerHallucinationRate | null;
+}
+
+const CATCH_RATE_HEALTH_STATUS_STYLE: Record<SrCatchRateHealthResponse['status'], { badge: string; label: string; titlePrefix: string }> = {
+  healthy: {
+    badge: 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20',
+    label: 'fresh',
+    titlePrefix: 'Fresh snapshot',
+  },
+  stale: {
+    badge: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+    label: 'snapshot stale',
+    titlePrefix: 'Snapshot stale',
+  },
+  frozen: {
+    badge: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+    label: 'snapshot stale',
+    titlePrefix: 'Frozen snapshot',
+  },
+  low_data: {
+    badge: 'bg-neutral-800/70 text-neutral-300 border-neutral-700/70',
+    label: 'low data',
+    titlePrefix: 'Low data',
+  },
+  never_sufficient: {
+    badge: 'bg-orange-500/10 text-orange-400 border-orange-500/20',
+    label: 'never sufficient',
+    titlePrefix: 'Never sufficient',
+  },
+  missing: {
+    badge: 'bg-red-500/10 text-red-400 border-red-500/20',
+    label: 'no snapshot',
+    titlePrefix: 'No snapshot',
+  },
+};
+
+function formatHealthAge(hours: number | null | undefined): string | null {
+  if (hours == null || Number.isNaN(hours)) return null;
+  const rounded = hours >= 10 ? Math.round(hours) : Math.round(hours * 10) / 10;
+  return `${rounded}h`;
+}
+
+function healthSampleLabel(health: SrCatchRateHealthResponse): string {
+  return `${health.categories_with_hit_rate}/${health.category_count} categories with hit rate`;
+}
+
+function healthTooltip(health: SrCatchRateHealthResponse): string {
+  const style = CATCH_RATE_HEALTH_STATUS_STYLE[health.status];
+  const lines = [style.titlePrefix];
+  const signalAge = formatHealthAge(health.signal_age_hours);
+  const sufficientAge = formatHealthAge(health.last_sufficient_age_hours);
+  if (signalAge) lines.push(`signal age ${signalAge}`);
+  if (sufficientAge) lines.push(`sufficient age ${sufficientAge}`);
+  lines.push(`sample ${healthSampleLabel(health)}`);
+  if (health.overall_hit_rate != null) {
+    lines.push(`overall ${Math.round(health.overall_hit_rate * 100)}% hit rate`);
+  }
+  return lines.join(' · ');
+}
+
+export function SrCatchRateFreshnessPill({ health }: { health?: SrCatchRateHealthResponse | null }) {
+  if (!health) return null;
+  const style = CATCH_RATE_HEALTH_STATUS_STYLE[health.status];
+  const sufficientAge = formatHealthAge(health.last_sufficient_age_hours);
+  const label = (() => {
+    if (health.status === 'healthy') return style.label;
+    if ((health.status === 'stale' || health.status === 'frozen') && sufficientAge) return `${style.label} (${sufficientAge})`;
+    if (health.status === 'low_data') return `${style.label} (n=${health.categories_with_hit_rate})`;
+    return style.label;
+  })();
+
+  return (
+    <span
+      data-testid={`sr-catch-rate-health-${health.status}`}
+      className={`inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded border text-[9px] font-mono ${style.badge}`}
+      title={healthTooltip(health)}
+    >
+      {health.status === 'healthy' && <Check className="w-2.5 h-2.5 shrink-0" aria-hidden="true" />}
+      <span>{label}</span>
+    </span>
+  );
 }
 
 const SKIP_RATE_AMBER_THRESHOLD = 0.25;
@@ -1112,6 +1193,7 @@ interface SrTrendBreakdownProps {
   onSpawnSrInvestigation?: (signal: SrInvestigationSignal) => Promise<string | null>;
   /** Map from category id → open investigation task id; used to dedup stacking. */
   activeInvestigationTaskIds?: Record<string, string> | null;
+  srCatchRateHealth?: SrCatchRateHealthResponse | null;
 }
 
 function CategoryRow({
@@ -1514,7 +1596,7 @@ function CategoryRow({
   );
 }
 
-export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRateTargets, onConfigureTargets, onSpawnSrInvestigation, activeInvestigationTaskIds }: SrTrendBreakdownProps) {
+export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRateTargets, onConfigureTargets, onSpawnSrInvestigation, activeInvestigationTaskIds, srCatchRateHealth }: SrTrendBreakdownProps) {
   const categories = trends?.categories;
   if (!categories || Object.keys(categories).length === 0) return null;
   const entries = sortedEntries(categories);
@@ -1553,6 +1635,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRate
           {promptVersionLabel && (
             <span className="text-[9px] text-amber-600 font-mono" title="SR prompt version for this window">{promptVersionLabel}</span>
           )}
+          <SrCatchRateFreshnessPill health={srCatchRateHealth} />
           {trends?.mixed_prompt_versions && (
             <span
               data-testid="mixed-prompt-versions-badge"
@@ -1683,6 +1766,7 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRate
           </span>
         );
       })()}
+      <SrCatchRateFreshnessPill health={srCatchRateHealth} />
       {trends?.by_severity && Object.keys(trends.by_severity).length > 0 && (
         <SeveritySection bySeverity={trends.by_severity} inline />
       )}
@@ -1693,12 +1777,23 @@ export function SrTrendBreakdown({ trends, variant, onCategoryClick, srCatchRate
   );
 }
 
+export interface SrDisagreementExample {
+  severity: string;
+  description: string;
+  task_id: string;
+  task_type?: string | null;
+}
+
 export interface SrReviewerDisagreement {
   category: string;
   task_type: string;
   count: number;
   severity_breakdown?: Record<string, number> | null;
   max_severity?: string | null;
+  examples?: SrDisagreementExample[] | null;
+  false_positive_count?: number | null;
+  true_positive_count?: number | null;
+  false_positive_rate?: number | null;
 }
 
 export interface SrReviewerDisagreementsData {
@@ -1724,35 +1819,90 @@ function sortDisagreements(items: SrReviewerDisagreement[]): SrReviewerDisagreem
   });
 }
 
-export function SrReviewerDisagreementsPanel({ data }: { data: SrReviewerDisagreementsData }) {
+function _exampleSevColor(sev: string): string {
+  if (sev === 'CRITICAL') return 'text-red-400';
+  if (sev === 'HIGH') return 'text-orange-400';
+  if (sev === 'MEDIUM' || sev === 'MAJOR') return 'text-amber-400';
+  return 'text-neutral-400';
+}
+
+export function SrReviewerDisagreementsPanel({
+  data,
+  onSelectTask,
+}: {
+  data: SrReviewerDisagreementsData;
+  onSelectTask?: (taskId: string) => void;
+}) {
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
   if (!data.disagreements.length) return null;
   const sorted = sortDisagreements(data.disagreements);
   return (
-    <div data-testid="sr-reviewer-disagreements" className="flex flex-wrap gap-1.5">
-      {sorted.slice(0, 8).map((d, i) => {
-        const sev = d.max_severity;
-        const breakdown = d.severity_breakdown;
-        const showSevDetail = (sev === 'CRITICAL' || sev === 'HIGH') && breakdown;
-        const sevDetail = showSevDetail && breakdown
-          ? (['CRITICAL', 'HIGH'] as const)
-              .filter(s => (breakdown[s] ?? 0) > 0)
-              .map(s => `${breakdown[s]} ${s}`)
-              .join(', ')
-          : null;
+    <div data-testid="sr-reviewer-disagreements" className="flex flex-col gap-1.5">
+      <div className="flex flex-wrap gap-1.5">
+        {sorted.slice(0, 8).map((d, i) => {
+          const sev = d.max_severity;
+          const breakdown = d.severity_breakdown;
+          const showSevDetail = (sev === 'CRITICAL' || sev === 'HIGH') && breakdown;
+          const sevDetail = showSevDetail && breakdown
+            ? (['CRITICAL', 'HIGH'] as const)
+                .filter(s => (breakdown[s] ?? 0) > 0)
+                .map(s => `${breakdown[s]} ${s}`)
+                .join(', ')
+            : null;
+          const key = `${d.category}:${d.task_type}:${i}`;
+          const isExpanded = expandedKey === key;
+          const hasExamples = (d.examples?.length ?? 0) > 0;
+          const fp = d.false_positive_rate;
+          return (
+            // eslint-disable-next-line viewport/min-touch-target
+            <span
+              key={i}
+              title={`${d.count} task${d.count !== 1 ? 's' : ''} where self-review passed ${d.category} but reviewer flagged it${sev ? ` (max: ${sev})` : ''}${hasExamples ? ' — click to expand' : ''}`}
+              onClick={() => hasExamples ? setExpandedKey(isExpanded ? null : key) : undefined}
+              className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${disagreementBadgeClass(sev)}${hasExamples ? ' cursor-pointer' : ''}`}
+            >
+              <span className="truncate max-w-[120px]">{d.category}</span>
+              {d.task_type && <span className="opacity-60 font-normal">·</span>}
+              {d.task_type && <span className="opacity-70 font-normal">{d.task_type}</span>}
+              <span className="font-bold shrink-0">×{d.count}</span>
+              {fp != null && (
+                <span className={`font-mono font-normal ${fpRateColorClass(fp)}`} title="false-positive rate">fp:{Math.round(fp * 100)}%</span>
+              )}
+              {sevDetail && <span className="font-normal opacity-80">({sevDetail})</span>}
+              {hasExamples && <span className="opacity-50 font-normal">{isExpanded ? '▲' : '▼'}</span>}
+            </span>
+          );
+        })}
+      </div>
+      {expandedKey !== null && (() => {
+        const idx = sorted.slice(0, 8).findIndex((d, i) => `${d.category}:${d.task_type}:${i}` === expandedKey);
+        const d = idx >= 0 ? sorted[idx] : null;
+        if (!d?.examples?.length) return null;
+        const examples = [...d.examples].sort((a, b) => {
+          const order: Record<string, number> = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, MAJOR: 2, LOW: 3, MINOR: 3 };
+          return (order[a.severity] ?? 4) - (order[b.severity] ?? 4);
+        });
         return (
-          <span
-            key={i}
-            title={`${d.count} task${d.count !== 1 ? 's' : ''} where self-review passed ${d.category} but reviewer flagged it${sev ? ` (max: ${sev})` : ''}`}
-            className={`inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border ${disagreementBadgeClass(sev)}`}
+          <div
+            data-testid="sr-disagreement-examples"
+            className="mt-0.5 rounded border border-neutral-800/60 bg-neutral-900/60 divide-y divide-neutral-800/40 text-[10px]"
           >
-            <span className="truncate max-w-[120px]">{d.category}</span>
-            {d.task_type && <span className="opacity-60 font-normal">·</span>}
-            {d.task_type && <span className="opacity-70 font-normal">{d.task_type}</span>}
-            <span className="font-bold shrink-0">×{d.count}</span>
-            {sevDetail && <span className="font-normal opacity-80">({sevDetail})</span>}
-          </span>
+            {examples.map((ex, ei) => (
+              <div
+                key={ei}
+                onClick={() => onSelectTask && ex.task_id ? onSelectTask(ex.task_id) : undefined}
+                className={`flex items-start gap-2 px-2.5 py-1.5${onSelectTask && ex.task_id ? ' cursor-pointer hover:bg-neutral-800/40' : ''}`}
+              >
+                <span className={`shrink-0 font-bold ${_exampleSevColor(ex.severity)}`}>{ex.severity}</span>
+                <span className="text-neutral-300 leading-snug flex-1">{ex.description}</span>
+                {ex.task_id && onSelectTask && (
+                  <span className="shrink-0 text-neutral-600 font-mono">{ex.task_id.slice(0, 8)}</span>
+                )}
+              </div>
+            ))}
+          </div>
         );
-      })}
+      })()}
     </div>
   );
 }
