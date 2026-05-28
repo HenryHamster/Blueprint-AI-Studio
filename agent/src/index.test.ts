@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -81,6 +81,7 @@ import {
   CLAUDE_STREAM_STALL_MS,
   TOKEN_REFRESH_FLOOR_MS,
   TOKEN_REFRESH_CEILING_MS,
+  BOOTSTRAP_TOKEN_THRESHOLD_MS,
 } from './constants.js';
 import { execFileSync, spawn, execSync } from 'child_process';
 import fs from 'fs';
@@ -142,6 +143,46 @@ describe('computeRefreshDelayMs', () => {
     const delay = computeRefreshDelayMs(mockJwtWithExp(expSec), now);
     expect(delay).toBeGreaterThanOrEqual(TOKEN_REFRESH_FLOOR_MS);
     expect(delay).toBeLessThanOrEqual(TOKEN_REFRESH_CEILING_MS);
+  });
+});
+
+// ── isBootstrapToken ─────────────────────────────────────────────────────────
+describe('isBootstrapToken', () => {
+  it('returns true for a token with remaining lifetime above threshold', () => {
+    const now = 1_000_000_000_000;
+    const expSec = Math.floor(now / 1000) + 5400; // 90 min remaining
+    expect(isBootstrapToken(mockJwtWithExp(expSec), now)).toBe(true);
+  });
+
+  it('returns false for a normal short-TTL token (1h remaining)', () => {
+    const now = 1_000_000_000_000;
+    const expSec = Math.floor(now / 1000) + 3600; // 60 min — below 75 min threshold
+    expect(isBootstrapToken(mockJwtWithExp(expSec), now)).toBe(false);
+  });
+
+  it('returns false exactly at the threshold boundary', () => {
+    const now = 1_000_000_000_000;
+    const expSec = Math.floor(now / 1000) + BOOTSTRAP_TOKEN_THRESHOLD_MS / 1000;
+    // remaining == threshold is NOT above threshold
+    expect(isBootstrapToken(mockJwtWithExp(expSec), now)).toBe(false);
+  });
+
+  it('returns true just above the threshold boundary', () => {
+    const now = 1_000_000_000_000;
+    const expSec = Math.floor(now / 1000) + BOOTSTRAP_TOKEN_THRESHOLD_MS / 1000 + 1;
+    expect(isBootstrapToken(mockJwtWithExp(expSec), now)).toBe(true);
+  });
+
+  it('returns false for an unparseable token', () => {
+    expect(isBootstrapToken('not-a-jwt')).toBe(false);
+  });
+
+  it('returns false for a token with no exp claim', () => {
+    const now = 1_000_000_000_000;
+    const header = Buffer.from(JSON.stringify({ alg: 'HS256' })).toString('base64url');
+    const payload = Buffer.from(JSON.stringify({ sub: 'test' })).toString('base64url');
+    const token = `${header}.${payload}.sig`;
+    expect(isBootstrapToken(token, now)).toBe(false);
   });
 });
 

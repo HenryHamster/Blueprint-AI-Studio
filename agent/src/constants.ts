@@ -59,6 +59,14 @@ export const TOKEN_REFRESH_FRACTION = 0.75;
 export const TOKEN_REFRESH_FLOOR_MS = 3 * 60_000;    // 3 min minimum
 export const TOKEN_REFRESH_CEILING_MS = 55 * 60_000; // 55 min maximum
 
+// Bootstrap JWT detection: a remaining lifetime above this threshold
+// (75 min) indicates a long bootstrap token rather than a normal short TTL
+// (~60 min). When detected, the agent fires an early confirmation refresh
+// after BOOTSTRAP_CONFIRMATION_DELAY_MS so it promptly downgrades to the
+// short TTL without waiting for the normal proactive cadence.
+export const BOOTSTRAP_TOKEN_THRESHOLD_MS = 75 * 60_000; // 75 min
+export const BOOTSTRAP_CONFIRMATION_DELAY_MS = 30_000;   // 30 s
+
 // WebSocket log buffer
 export const MAX_LOG_BUFFER = 1_000;
 

@@ -36,6 +36,7 @@ import {
   HEARTBEAT_INTERVAL, MAX_LOG_BUFFER,
   HEARTBEAT_API_TIMEOUT, HEARTBEAT_API_MAX_RETRIES,
   TOKEN_REFRESH_FRACTION, TOKEN_REFRESH_FLOOR_MS, TOKEN_REFRESH_CEILING_MS,
+  BOOTSTRAP_TOKEN_THRESHOLD_MS, BOOTSTRAP_CONFIRMATION_DELAY_MS,
   GIT_CLONE_TIMEOUT, CLONE_MAX_RETRIES, CLONE_RETRY_BASE_DELAY,
   CONFLICT_CHECK_TIMEOUT,
   MAX_TEST_FIX_ATTEMPTS,
@@ -1000,12 +1001,45 @@ export function computeRefreshDelayMs(token: string, now = Date.now()): number {
   return Math.max(TOKEN_REFRESH_FLOOR_MS, Math.min(TOKEN_REFRESH_CEILING_MS, target));
 }
 
+/** Returns true when `token` has a remaining lifetime that exceeds the normal
+ *  short-TTL window, indicating it is a long bootstrap token. */
+export function isBootstrapToken(token: string, now = Date.now()): boolean {
+  const exp = decodeJwtExp(token);
+  if (exp === null) return false;
+  return (exp * 1000 - now) > BOOTSTRAP_TOKEN_THRESHOLD_MS;
+}
+
 function scheduleProactiveTokenRefresh(token: string): void {
   // Defensively clear any existing timer so callers that re-schedule without
   // an intervening stop (e.g. warm-poll rotation then runRoleOnce) don't orphan
   // a self-re-scheduling setTimeout, which would otherwise accumulate one extra
   // refresh schedule per warm-VM rotation.
   stopProactiveTokenRefresh();
+
+  // Bootstrap detection: if holding a long bootstrap JWT, fire a one-time
+  // early confirmation refresh so the agent quickly downgrades to the short
+  // TTL rather than waiting for the normal cadence (which would fire near the
+  // 55-min ceiling, long after short tasks have finished).
+  if (isBootstrapToken(token)) {
+    log(`Proactive token refresh: bootstrap token detected — early confirmation refresh in ${BOOTSTRAP_CONFIRMATION_DELAY_MS / 1000}s`);
+    tokenRefreshTimer = setTimeout(() => {
+      void (async () => {
+        log('Proactive token refresh: bootstrap confirmation refresh firing');
+        const ok = await tryRefreshToken();
+        if (ok) {
+          log('Proactive token refresh: bootstrap confirmation succeeded — now on short TTL');
+        } else {
+          log('Proactive token refresh: bootstrap confirmation failed — continuing on existing token');
+        }
+        // Regardless of success/failure, reschedule from the current token's
+        // real exp. On success AGENT_TOKEN is now the short-TTL token; on
+        // failure it stays the bootstrap token and the normal cadence retries.
+        scheduleProactiveTokenRefresh(AGENT_TOKEN);
+      })();
+    }, BOOTSTRAP_CONFIRMATION_DELAY_MS);
+    return;
+  }
+
   const delay = computeRefreshDelayMs(token);
   log(`Proactive token refresh: next refresh in ${Math.round(delay / 1000)}s`);
   tokenRefreshTimer = setTimeout(() => {

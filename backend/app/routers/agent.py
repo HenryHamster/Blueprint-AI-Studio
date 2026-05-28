@@ -17,7 +17,12 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.auth import verify_agent_jwt, create_agent_token, AGENT_TOKEN_TTL_HOURS
+from app.auth import (
+    verify_agent_jwt,
+    create_agent_token,
+    AGENT_TOKEN_TTL_HOURS,
+    AGENT_BOOTSTRAP_TOKEN_TTL_HOURS,
+)
 from app.database import get_session, AsyncSessionLocal
 from app.models import (
     Project,
@@ -837,8 +842,18 @@ async def agent_refresh_token(
         TaskStatus.QUEUED,
     ):
         raise HTTPException(status_code=409, detail=f"task_not_active:{task.status}")
+    # A successful refresh PROVES the agent is refresh-capable. Stamping
+    # last_token_refresh_at marks this task — and, via the VM-level lookup in
+    # _vm_is_refresh_capable, every subsequent warm handoff on this VM — as
+    # confirmed, so the long cold-start bootstrap window never sticks past the
+    # first refresh.
     task.last_token_refresh_at = _utcnow()
     await session.commit()
+    # The refreshed token always carries the short security-bounded TTL
+    # (create_agent_token defaults to AGENT_TOKEN_TTL_HOURS), regardless of
+    # whether the incoming token was a long bootstrap grant. This is the
+    # downgrade point: proving refresh capability immediately retires the
+    # wider bootstrap replay window.
     new_token = create_agent_token(
         task_id,
         vm_id,
@@ -3782,12 +3797,42 @@ async def vm_heartbeat(
     return Response(status_code=204)
 
 
+async def _vm_is_refresh_capable(
+    session: AsyncSession, vm_instance_id: str | None
+) -> bool:
+    """Return True if any task previously assigned to this VM proved it can
+    refresh (i.e. recorded ``last_token_refresh_at``).
+
+    The warm-handoff path mints a token for a brand-new QUEUED task that has
+    never refreshed, so capability cannot be read off the task being claimed.
+    Instead we look across the VM's whole role chain: a single successful
+    /api/agent/refresh-token on ANY prior role on this VM proves the
+    long-lived agent process can refresh. Reusing the existing
+    ``last_token_refresh_at`` signal (set in ``agent_refresh_token``) keeps
+    this VM-level check from inventing a parallel capability marker. An old
+    image that cannot refresh never stamps the column, so it correctly keeps
+    receiving the long bootstrap window across handoffs.
+    """
+    if not vm_instance_id:
+        return False
+    stmt = (
+        select(Task.id)
+        .where(
+            Task.vm_instance_id == vm_instance_id,
+            Task.last_token_refresh_at.is_not(None),
+        )
+        .limit(1)
+    )
+    return (await session.execute(stmt)).first() is not None
+
+
 async def _finalize_warm_claim(
     session: AsyncSession,
     task: Task,
     vm_instance_id: str,
     *,
     origin: str,
+    refresh_capable: bool,
 ) -> dict:
     """Flip a locked QUEUED task to IN_PROGRESS for a warm VM and build the
     /next-role claim response.
@@ -3799,6 +3844,11 @@ async def _finalize_warm_claim(
     cold-start) by the efficiency snapshot, mints a fresh task-scoped JWT,
     commits, and broadcasts the status change. On JWT-mint failure it rolls
     back (restoring QUEUED) and raises 500.
+
+    ``refresh_capable`` gates the minted token's TTL: a VM already proven
+    refresh-capable gets the short security-bounded TTL (no fresh bootstrap
+    window), while an unconfirmed VM keeps the long bootstrap window so a
+    deploy/rebake cutover can't 401 it mid-task.
     """
     from app.compute import VM_PROVISIONING_MODEL
 
@@ -3837,12 +3887,16 @@ async def _finalize_warm_claim(
             task_type = str(payloads[0].get("type") or "")
     except Exception:  # noqa: BLE001 — task_type is best-effort metadata
         task_type = ""
+    ttl_hours = (
+        AGENT_TOKEN_TTL_HOURS if refresh_capable else AGENT_BOOTSTRAP_TOKEN_TTL_HOURS
+    )
     try:
         agent_token = create_agent_token(
             task_id=str(task.id),
             vm_instance_id=vm_instance_id,
             task_type=task_type,
             project_id=str(task.project_id) if task.project_id else "",
+            ttl_hours=ttl_hours,
         )
     except Exception as exc:
         await session.rollback()
@@ -3929,6 +3983,12 @@ async def next_role(
     # lookup and the chain-fork exit below need it.
     use_jsonb_has_key = session.get_bind().dialect.name == "postgresql"
 
+    # Determine once whether this VM has proven it can refresh, so every warm
+    # claim below (chain-continuity and backlog-reuse) mints the short TTL for
+    # a confirmed VM and only falls back to the long bootstrap window for a VM
+    # that has never refreshed (e.g. an old image). See _vm_is_refresh_capable.
+    vm_refresh_capable = await _vm_is_refresh_capable(session, req.vm_instance_id)
+
     # Circuit-breaker / feature-flag gate: if warm continuity is disabled or
     # auto-suppressed (pin-clear rate exceeded the threshold), skip the warm-
     # chain-continuity lookup so no new warm chains start. The orchestrator's
@@ -3966,7 +4026,11 @@ async def next_role(
 
         if task is not None:
             result = await _finalize_warm_claim(
-                session, task, req.vm_instance_id, origin="next_role_endpoint"
+                session,
+                task,
+                req.vm_instance_id,
+                origin="next_role_endpoint",
+                refresh_capable=vm_refresh_capable,
             )
             from app.warm_backlog_reuse import (
                 record_chain_claimed as _record_chain_claimed,
@@ -4046,6 +4110,7 @@ async def next_role(
                             backlog_task,
                             req.vm_instance_id,
                             origin="backlog_reuse",
+                            refresh_capable=vm_refresh_capable,
                         )
                     except Exception:
                         _shared_state.record_backlog_reuse_failure("finalize_error")

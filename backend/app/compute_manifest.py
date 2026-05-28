@@ -11,7 +11,7 @@ import os
 import re
 import uuid
 
-from app.auth import create_agent_token
+from app.auth import create_agent_token, AGENT_BOOTSTRAP_TOKEN_TTL_HOURS
 from app.models import LLMAuthMode, LLMProviderName
 from app.providers.base import FileMaterial
 from app.providers.registry import get_provider
@@ -49,11 +49,18 @@ def build_agent_secret_manifest(
     project_id: str = "",
 ) -> dict:
     """Build the provider-aware secret manifest consumed by agent startup."""
+    # This is the cold-start INITIAL grant: the VM has not yet proven it can
+    # refresh, so it receives the long bootstrap TTL to survive a deploy /
+    # rebake cutover that straddles token expiry. The agent is rotated back
+    # down to the short TTL the moment it calls /api/agent/refresh-token
+    # (see agent_refresh_token) or is warm-handed-off on a VM already proven
+    # refresh-capable (see _finalize_warm_claim).
     agent_jwt = create_agent_token(
         str(task_id),
         vm_instance_id,
         task_type=task_type,
         project_id=project_id,
+        ttl_hours=AGENT_BOOTSTRAP_TOKEN_TTL_HOURS,
     )
     provider_name = provider or LLMProviderName.ANTHROPIC.value
     provider_enum = LLMProviderName(provider_name)

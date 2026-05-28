@@ -78,6 +78,18 @@ def verify_ws_ticket(ticket: str) -> dict:
 # without also shortening the proactive refresh interval.
 AGENT_TOKEN_TTL_HOURS = 1
 
+# Long-lived *bootstrap* window granted ONLY to cold-start agents that have
+# not yet proven they can refresh. A non-atomic backend-deploy / agent-rebake
+# cutover can straddle token expiry; an old-image agent that cannot call
+# /api/agent/refresh-token would 401 mid-task if it held only the 1h token.
+# The bootstrap window keeps such an in-flight agent alive across that cutover.
+# This wider replay window is a deliberate, bounded cost paid ONLY until an
+# agent demonstrates refresh capability: the moment it successfully calls
+# /api/agent/refresh-token (or is warm-handed-off on a VM already proven
+# refresh-capable) it is rotated back down to AGENT_TOKEN_TTL_HOURS. Do NOT
+# use this TTL for refresh-confirmed agents.
+AGENT_BOOTSTRAP_TOKEN_TTL_HOURS = 8
+
 
 def create_agent_token(
     task_id: str,

@@ -13589,3 +13589,235 @@ async def test_fix_task_transient_close_pr_preserves_re_review(db_session, mocke
         f"Expected re-review spawn with type='review', got {call_args.args[1]!r} — "
         f"a transiently-closed PR must not be treated as abandoned"
     )
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap-JWT TTL gating: confirm-refresh + warm-handoff downgrade to short
+# TTL, while unconfirmed (old-image) VMs keep the long deploy-survival window.
+# ---------------------------------------------------------------------------
+
+
+def _jwt_ttl_seconds(token: str) -> int:
+    """Return the encoded TTL (exp - iat) in seconds for an agent JWT."""
+    from app.auth import verify_agent_jwt
+
+    claims = verify_agent_jwt(token)
+    return int(claims["exp"]) - int(claims["iat"])
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_downgrades_bootstrap_to_short_ttl(
+    client: AsyncClient, db_session
+):
+    """A cold-start agent that mints with the long bootstrap TTL and then
+    proves it can refresh MUST be rotated down to the short TTL.
+
+    This exercises the REAL bootstrap timing (not the 1h happy path): the
+    incoming token carries AGENT_BOOTSTRAP_TOKEN_TTL_HOURS, yet the token
+    returned by /api/agent/refresh-token must reflect AGENT_TOKEN_TTL_HOURS.
+    """
+    from app.auth import AGENT_TOKEN_TTL_HOURS, AGENT_BOOTSTRAP_TOKEN_TTL_HOURS
+
+    assert AGENT_BOOTSTRAP_TOKEN_TTL_HOURS > AGENT_TOKEN_TTL_HOURS, (
+        "bootstrap TTL must be strictly longer than the short TTL for the "
+        "downgrade to be observable"
+    )
+
+    project = Project(name="Bootstrap Downgrade", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        vm_instance_id="agent-vm-bootstrap-downgrade",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    task_id_str = str(task.id)
+
+    # Mint with the LONG bootstrap TTL, as compute_manifest does for a cold
+    # start that has not yet proven refresh capability.
+    bootstrap_token = create_agent_token(
+        task_id_str,
+        "agent-vm-bootstrap-downgrade",
+        project_id=str(project.id),
+        ttl_hours=AGENT_BOOTSTRAP_TOKEN_TTL_HOURS,
+    )
+    assert (
+        abs(_jwt_ttl_seconds(bootstrap_token) - AGENT_BOOTSTRAP_TOKEN_TTL_HOURS * 3600)
+        <= 5
+    ), "precondition: incoming token must carry the long bootstrap TTL"
+
+    resp = await client.post(
+        "/api/agent/refresh-token",
+        headers={"x-agent-token": bootstrap_token},
+    )
+    assert resp.status_code == 200, resp.text
+    refreshed = resp.json()["token"]
+
+    refreshed_ttl = _jwt_ttl_seconds(refreshed)
+    assert abs(refreshed_ttl - AGENT_TOKEN_TTL_HOURS * 3600) <= 5, (
+        f"refresh-token must downgrade to the short TTL "
+        f"({AGENT_TOKEN_TTL_HOURS}h); got {refreshed_ttl}s"
+    )
+    assert refreshed_ttl < AGENT_BOOTSTRAP_TOKEN_TTL_HOURS * 3600, (
+        "refreshed token must NOT retain the long bootstrap window"
+    )
+
+    # Capability proof must be persisted so subsequent warm handoffs on this
+    # VM also issue the short TTL.
+    await db_session.refresh(task)
+    assert task.last_token_refresh_at is not None
+
+
+@pytest.mark.asyncio
+async def test_warm_handoff_issues_short_ttl_for_refresh_capable_vm(
+    client: AsyncClient, db_session
+):
+    """The warm-handoff path mints the short TTL when the VM has already
+    proven it can refresh (a prior role on the VM recorded
+    last_token_refresh_at)."""
+    from app.auth import AGENT_TOKEN_TTL_HOURS, AGENT_BOOTSTRAP_TOKEN_TTL_HOURS
+
+    project = Project(name="Warm Handoff Short TTL", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-warm-confirmed"
+    prior_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 4242}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.COMPLETED,
+        # The agent refreshed during this prior role — proves capability.
+        last_token_refresh_at=datetime.utcnow(),
+    )
+    db_session.add(prior_task)
+    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    pinned_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "pr_number": 4242, "branch": "feat/x"}],
+        vm_instance_id=None,
+        status=TaskStatus.QUEUED,
+        context={
+            "warm_target_vm_id": vm_id,
+            "warm_target_pr": "4242",
+            "warm_handoff_deadline": deadline,
+        },
+    )
+    db_session.add(pinned_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+    await db_session.refresh(pinned_task)
+
+    token = create_agent_token(str(prior_task.id), vm_id)
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": vm_id,
+            "prior_task_id": str(prior_task.id),
+            "prior_pr_number": 4242,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["action"] == "claim"
+
+    warm_ttl = _jwt_ttl_seconds(body["agent_token"])
+    assert abs(warm_ttl - AGENT_TOKEN_TTL_HOURS * 3600) <= 5, (
+        f"warm handoff for a refresh-capable VM must mint the short TTL; "
+        f"got {warm_ttl}s"
+    )
+    assert warm_ttl < AGENT_BOOTSTRAP_TOKEN_TTL_HOURS * 3600, (
+        "a confirmed VM must NOT receive a fresh bootstrap window on handoff"
+    )
+
+
+@pytest.mark.asyncio
+async def test_warm_handoff_keeps_bootstrap_ttl_for_unconfirmed_vm(
+    client: AsyncClient, db_session
+):
+    """Deploy-survival regression guard: a VM that has NEVER refreshed (e.g.
+    an old image that cannot call /refresh-token) must keep receiving the long
+    bootstrap window on warm handoff."""
+    from app.auth import AGENT_BOOTSTRAP_TOKEN_TTL_HOURS
+
+    project = Project(name="Warm Handoff Bootstrap TTL", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    vm_id = "agent-vm-warm-unconfirmed"
+    prior_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review", "pr_number": 5252}],
+        vm_instance_id=vm_id,
+        status=TaskStatus.COMPLETED,
+        # Never refreshed — capability unproven.
+        last_token_refresh_at=None,
+    )
+    db_session.add(prior_task)
+    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    pinned_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "pr_number": 5252, "branch": "feat/y"}],
+        vm_instance_id=None,
+        status=TaskStatus.QUEUED,
+        context={
+            "warm_target_vm_id": vm_id,
+            "warm_target_pr": "5252",
+            "warm_handoff_deadline": deadline,
+        },
+    )
+    db_session.add(pinned_task)
+    await db_session.commit()
+    await db_session.refresh(prior_task)
+    await db_session.refresh(pinned_task)
+
+    token = create_agent_token(str(prior_task.id), vm_id)
+    resp = await client.post(
+        "/api/agent/next-role",
+        json={
+            "vm_instance_id": vm_id,
+            "prior_task_id": str(prior_task.id),
+            "prior_pr_number": 5252,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["action"] == "claim"
+
+    warm_ttl = _jwt_ttl_seconds(body["agent_token"])
+    assert abs(warm_ttl - AGENT_BOOTSTRAP_TOKEN_TTL_HOURS * 3600) <= 5, (
+        f"warm handoff for an unconfirmed VM must keep the long bootstrap TTL "
+        f"so a deploy cutover can't 401 it mid-task; got {warm_ttl}s"
+    )
+
+
+def test_cold_start_manifest_issues_bootstrap_ttl():
+    """The cold-start manifest grant carries the long bootstrap TTL so an
+    in-flight agent survives a deploy/rebake cutover that straddles expiry."""
+    from app.compute import build_agent_secret_manifest
+    from app.auth import AGENT_BOOTSTRAP_TOKEN_TTL_HOURS
+
+    task_id = uuid.uuid4()
+    manifest = build_agent_secret_manifest(
+        vm_instance_id="agent-vm-cold-bootstrap",
+        task_id=task_id,
+        oauth_token="sk-ant-test",
+        task_type="create",
+        provider="anthropic",
+        auth_mode="oauth",
+    )
+    ttl = _jwt_ttl_seconds(manifest["env"]["AGENT_SECRET_TOKEN"])
+    assert abs(ttl - AGENT_BOOTSTRAP_TOKEN_TTL_HOURS * 3600) <= 5, (
+        f"cold-start manifest must mint the long bootstrap TTL; got {ttl}s"
+    )
