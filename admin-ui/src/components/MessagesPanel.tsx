@@ -11,6 +11,8 @@ import { type RoutineRow, type MessageWithDivider, routineSummary, groupRoutineM
 import { loadLastSeen, saveLastSeen } from './lastSeen';
 import { fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews, fetchServerTempMutes, saveServerTempMutes, fetchServerMuteWindow, saveServerMuteWindow } from './serverSync';
 import { type ProjectMessage, TYPE_CONFIG, MessageBubble, formatFromType } from './MessageBubble';
+import { SaveViewDialog } from './SaveViewDialog';
+import { MessagesSummaryCard } from './MessagesSummaryCard';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -53,6 +55,15 @@ interface WebhookStats {
   last_failure_at: string | null;
   retry_queue_depth: number;
 }
+
+type MessageSummaryCounts = {
+  blockers: number;
+  questions: number;
+  feedback: number;
+  bugReports: number;
+  routine: number;
+  highSignalNotes: number;
+};
 
 interface MessagesPanelProps {
   selectedProjectId: string | null;
@@ -414,7 +425,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const highSignalCount = countHighSignalMessages(messages, eventPrefs, tempMutes);
 
   // Count new messages by type for the summary card (respecting mute prefs and criticalOnly)
-  const newMessageCounts = useMemo(() => dividerTime
+  const newMessageCounts = useMemo<MessageSummaryCounts>(() => dividerTime
     ? {
         blockers: openMessages.filter(m =>
           m.message_type === 'BLOCKER' &&
@@ -1426,71 +1437,18 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
 
       {/* Save view dialog */}
       {showSaveDialog && (
-        <>
-          <div className="fixed inset-0 z-40 bg-black/50" onClick={closeSaveDialog} />
-          <div
-            role="dialog"
-            aria-label={saveDialogMode === 'rename' ? 'Rename saved view' : 'Save current filters as a view'}
-            className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-[min(420px,90vw)] bg-neutral-900 border border-neutral-700 rounded-xl shadow-2xl p-4 space-y-3"
-          >
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold text-neutral-100">
-                {saveDialogMode === 'rename' ? 'Rename view' : 'Save view'}
-              </h3>
-              <button onClick={closeSaveDialog} className="text-neutral-500 hover:text-neutral-300 p-1 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <label className="block text-xs text-neutral-400">
-              Name
-              <input
-                type="text"
-                value={saveDialogName}
-                onChange={e => { setSaveDialogName(e.target.value); setSaveDialogError(null); }}
-                onKeyDown={e => { if (e.key === 'Enter') commitSaveDialog(); if (e.key === 'Escape') closeSaveDialog(); }}
-                placeholder="e.g. Unresolved BLOCKERs"
-                className="mt-1 w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
-                autoFocus
-              />
-            </label>
-            <label className="block text-xs text-neutral-400">
-              Description (optional)
-              <input
-                type="text"
-                value={saveDialogDescription}
-                onChange={e => setSaveDialogDescription(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') commitSaveDialog(); if (e.key === 'Escape') closeSaveDialog(); }}
-                placeholder="What is this view for?"
-                className="mt-1 w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-600 placeholder-neutral-600"
-              />
-            </label>
-            {saveDialogMode === 'create' && (
-              <div className="text-[11px] text-neutral-500 bg-neutral-950/50 border border-neutral-800/60 rounded-md px-3 py-2">
-                <span className="text-neutral-400">Saving:</span>{' '}
-                {viewSummaryLine(searchQuery, eventPrefs, sortMode, showResolved, showOnlyNew)}
-              </div>
-            )}
-            {saveDialogError && (
-              <div role="alert" className="text-[11px] text-red-400 bg-red-500/10 border border-red-500/30 rounded-md px-3 py-2">
-                {saveDialogError}
-              </div>
-            )}
-            <div className="flex items-center justify-end gap-2 pt-1">
-              <button
-                onClick={closeSaveDialog}
-                className="text-xs px-3 py-1.5 rounded-lg text-neutral-400 hover:text-neutral-200 border border-neutral-800 hover:border-neutral-700 transition-colors min-h-[36px]"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={commitSaveDialog}
-                className="text-xs px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors min-h-[36px]"
-              >
-                {saveDialogMode === 'rename' ? 'Save' : 'Save view'}
-              </button>
-            </div>
-          </div>
-        </>
+        <SaveViewDialog
+          open={showSaveDialog}
+          mode={saveDialogMode === 'rename' ? 'rename' : 'create'}
+          name={saveDialogName}
+          description={saveDialogDescription}
+          error={saveDialogError}
+          summaryText={viewSummaryLine(searchQuery, eventPrefs, sortMode, showResolved, showOnlyNew)}
+          onNameChange={value => { setSaveDialogName(value); setSaveDialogError(null); }}
+          onDescriptionChange={setSaveDialogDescription}
+          onCommit={commitSaveDialog}
+          onClose={closeSaveDialog}
+        />
       )}
 
       {/* Messages list — chat-style scroll area */}
@@ -1631,77 +1589,18 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
 
             {/* Summary card: show counts of new messages if divider is active */}
             {dividerTime && !dividerDismissedRef.current && (newMessageCounts.blockers > 0 || newMessageCounts.questions > 0 || newMessageCounts.feedback > 0 || newMessageCounts.bugReports > 0 || newMessageCounts.routine > 0 || newMessageCounts.highSignalNotes > 0) && (
-              <div className="mx-2 my-3 p-3 rounded-lg bg-gradient-to-r from-blue-950/40 to-blue-900/30 border border-blue-800/40 text-[11px] text-blue-200/90">
-                <div className="font-semibold mb-2 text-blue-300">Since you last looked</div>
-                <div className="space-y-1.5">
-                  {newMessageCounts.blockers > 0 && (
-                    <button
-                      onClick={() => {
-                        blockersRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                      }}
-                      className="block w-full text-left hover:text-blue-100 transition-colors"
-                      data-testid="summary-card-blockers"
-                    >
-                      <span className="font-medium text-amber-300">{newMessageCounts.blockers}</span> new blocker{newMessageCounts.blockers !== 1 ? 's' : ''}
-                    </button>
-                  )}
-                  {newMessageCounts.questions > 0 && (
-                    <button
-                      onClick={() => {
-                        questionsRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                      }}
-                      className="block w-full text-left hover:text-blue-100 transition-colors"
-                      data-testid="summary-card-questions"
-                    >
-                      <span className="font-medium text-blue-300">{newMessageCounts.questions}</span> question{newMessageCounts.questions !== 1 ? 's' : ''} waiting
-                    </button>
-                  )}
-                  {newMessageCounts.bugReports > 0 && (
-                    <button
-                      onClick={() => {
-                        blockersRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                      }}
-                      className="block w-full text-left hover:text-blue-100 transition-colors"
-                      data-testid="summary-card-bugs"
-                    >
-                      <span className="font-medium text-red-300">{newMessageCounts.bugReports}</span> new bug{newMessageCounts.bugReports !== 1 ? 's' : ''}
-                    </button>
-                  )}
-                  {newMessageCounts.feedback > 0 && (
-                    <button
-                      onClick={() => {
-                        blockersRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                      }}
-                      className="block w-full text-left hover:text-blue-100 transition-colors"
-                      data-testid="summary-card-feedback"
-                    >
-                      <span className="font-medium text-purple-300">{newMessageCounts.feedback}</span> new feedback
-                    </button>
-                  )}
-                  {newMessageCounts.routine > 0 && (
-                    <button
-                      onClick={() => {
-                        routineRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                      }}
-                      className="block w-full text-left hover:text-blue-100 transition-colors"
-                      data-testid="summary-card-routine"
-                    >
-                      <span className="font-medium text-neutral-300">{newMessageCounts.routine}</span> routine ops
-                    </button>
-                  )}
-                  {newMessageCounts.highSignalNotes > 0 && (
-                    <button
-                      onClick={() => {
-                        blockersRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                      }}
-                      className="block w-full text-left hover:text-blue-100 transition-colors"
-                      data-testid="summary-card-alerts"
-                    >
-                      <span className="font-medium text-orange-300">{newMessageCounts.highSignalNotes}</span> alert{newMessageCounts.highSignalNotes !== 1 ? 's' : ''}
-                    </button>
-                  )}
-                </div>
-              </div>
+              <MessagesSummaryCard
+                newMessageCounts={newMessageCounts}
+                onScrollToBlockers={() => {
+                  blockersRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }}
+                onScrollToQuestions={() => {
+                  questionsRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }}
+                onScrollToRoutine={() => {
+                  routineRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }}
+              />
             )}
 
             {/* Other high-signal open messages */}

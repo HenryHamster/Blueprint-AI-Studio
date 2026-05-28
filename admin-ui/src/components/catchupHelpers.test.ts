@@ -6,7 +6,9 @@ import {
   formatDuration,
   windowToHours,
   resolveLastCatchUpViewed,
+  computeClassTrend,
 } from './catchupHelpers';
+import type { TrendPeriod } from './catchupHelpers';
 
 describe('getCatchUpViewedKey', () => {
   it('returns the global key when no userEmail is provided', () => {
@@ -150,5 +152,69 @@ describe('windowToHours', () => {
     expect(windowToHours('6h', null)).toBe(6);
     expect(windowToHours('24h', null)).toBe(24);
     expect(windowToHours('7d', null)).toBe(168);
+  });
+});
+
+function makePeriod(failed_by_class: Record<string, number>): TrendPeriod {
+  return { period_end: '2026-01-01', success_rate: null, completed: 0, failed: 0, failed_by_class };
+}
+
+describe('computeClassTrend', () => {
+  it('returns neutral arrow when fewer than 4 periods', () => {
+    const history = [makePeriod({ CODE_ERROR: 1 }), makePeriod({ CODE_ERROR: 2 })];
+    expect(computeClassTrend(history, 'CODE_ERROR')).toEqual({ arrow: '–', color: 'text-neutral-500' });
+  });
+
+  it('returns up arrow when recent 2 periods exceed prior 2 periods', () => {
+    const history = [
+      makePeriod({ CODE_ERROR: 1 }),
+      makePeriod({ CODE_ERROR: 1 }),
+      makePeriod({ CODE_ERROR: 3 }),
+      makePeriod({ CODE_ERROR: 3 }),
+    ];
+    expect(computeClassTrend(history, 'CODE_ERROR')).toEqual({ arrow: '↑', color: 'text-red-400' });
+  });
+
+  it('returns down arrow when recent 2 periods are below prior 2 periods', () => {
+    const history = [
+      makePeriod({ CODE_ERROR: 4 }),
+      makePeriod({ CODE_ERROR: 4 }),
+      makePeriod({ CODE_ERROR: 1 }),
+      makePeriod({ CODE_ERROR: 1 }),
+    ];
+    expect(computeClassTrend(history, 'CODE_ERROR')).toEqual({ arrow: '↓', color: 'text-emerald-400' });
+  });
+
+  it('returns neutral arrow when recent and prior counts are equal', () => {
+    const history = [
+      makePeriod({ CODE_ERROR: 2 }),
+      makePeriod({ CODE_ERROR: 2 }),
+      makePeriod({ CODE_ERROR: 2 }),
+      makePeriod({ CODE_ERROR: 2 }),
+    ];
+    expect(computeClassTrend(history, 'CODE_ERROR')).toEqual({ arrow: '–', color: 'text-neutral-500' });
+  });
+
+  it('returns neutral when failure class is absent from all periods', () => {
+    const history = [
+      makePeriod({ RATE_LIMIT: 5 }),
+      makePeriod({ RATE_LIMIT: 5 }),
+      makePeriod({ RATE_LIMIT: 5 }),
+      makePeriod({ RATE_LIMIT: 5 }),
+    ];
+    expect(computeClassTrend(history, 'CODE_ERROR')).toEqual({ arrow: '–', color: 'text-neutral-500' });
+  });
+
+  it('uses only the last 4 periods when history is longer', () => {
+    const history = [
+      makePeriod({ CODE_ERROR: 100 }),
+      makePeriod({ CODE_ERROR: 100 }),
+      makePeriod({ CODE_ERROR: 1 }),
+      makePeriod({ CODE_ERROR: 1 }),
+      makePeriod({ CODE_ERROR: 3 }),
+      makePeriod({ CODE_ERROR: 3 }),
+    ];
+    // Last 4: [1,1,3,3] → prior=[1,1]=2, recent=[3,3]=6 → up
+    expect(computeClassTrend(history, 'CODE_ERROR')).toEqual({ arrow: '↑', color: 'text-red-400' });
   });
 });

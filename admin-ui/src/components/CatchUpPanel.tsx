@@ -10,7 +10,6 @@ import type { DirectionProgress } from './DirectionProgressSection';
 import { ErrorBoundary } from './ErrorBoundary';
 import { TAXONOMY_ORDER, TAXONOMY_LABELS, TAXONOMY_COLORS, STAGE_ORDER, STAGE_COLORS } from './taxonomyConstants';
 import {
-  TIMEOUT_SUBTYPE_LABELS,
   loadDismissed,
   saveDismissed,
   formatSnoozeRemaining,
@@ -18,9 +17,12 @@ import {
   windowToHours,
 } from './catchupHelpers';
 import type { RecentCompletion, TimeWindow, DismissedState } from './catchupHelpers';
+import { sortDesc, trendFor } from './catchupAnalytics';
 import { WaitingBadge, CompletionRow, SkeletonRow } from './catchupRows';
-import { SrTrendBreakdown, type SrTrendData } from './SrTrendBreakdown';
+import type { SrTrendData } from './SrTrendBreakdown';
 import { PipelineRegressionsPanel } from './PipelineRegressionsPanel';
+import { CatchUpReviewQualitySection } from './CatchUpReviewQualitySection';
+import { RecentFailureGroupsSection } from './RecentFailureGroupsSection';
 import type { Project } from '../types/project';
 
 interface NeedsAttentionItem {
@@ -377,10 +379,6 @@ export interface CatchUpPanelProps {
   userEmail?: string | null;
 }
 
-function sortDesc<T>(entries: [string, T][], key: (v: T) => number): [string, T][] {
-  return entries.sort((a, b) => key(b[1]) - key(a[1]));
-}
-
 export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: _lastVisitTimestamp, refreshInterval, onSelectTask, onOpenActivityFeed, needsAttentionCount = 0, onApprove, onRetry, onBulkApprove, onBulkRetry, wsRef, userEmail }: CatchUpPanelProps) {
   // Per-operator localStorage key for catch-up viewed timestamp.
   // Falls back to the legacy global key when unauthenticated or email unknown.
@@ -431,9 +429,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
   const [remediationExpanded, setRemediationExpanded] = useState(false);
   const [investigationsExpanded, setInvestigationsExpanded] = useState(false);
   const [cycleSummaryExpanded, setCycleSummaryExpanded] = useState(false);
-  const [reviewQualityExpanded, setReviewQualityExpanded] = useState(false);
   const [expandedSnippets, setExpandedSnippets] = useState<Set<string>>(new Set());
-  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [activeTaxonomyFilter, setActiveTaxonomyFilter] = useState<string | null>(null);
   const [activeStageFilter, setActiveStageFilter] = useState<string | null>(null);
   const [dismissed, setDismissed] = useState<DismissedState>(() => {
@@ -758,14 +754,8 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
     };
   }, [digest?.remediation_funnel]);
 
-  const trendFor = useCallback((cat: string): { arrow: string; color: string } => {
-    if (history.length < 4) return { arrow: '–', color: 'text-neutral-500' };
-    const sumAt = (arr: typeof history) => arr.reduce((a, p) => a + (p.failed_by_taxonomy?.[cat] ?? 0), 0);
-    const recent = sumAt(history.slice(-2));
-    const prior = sumAt(history.slice(-4, -2));
-    if (recent > prior) return { arrow: '↑', color: 'text-red-400' };
-    if (recent < prior) return { arrow: '↓', color: 'text-emerald-400' };
-    return { arrow: '–', color: 'text-neutral-500' };
+  const trendForCallback = useCallback((cat: string): { arrow: string; color: string } => {
+    return trendFor(history, cat);
   }, [history]);
 
   return (
@@ -1647,7 +1637,7 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
                       const entry = ftd.categories[cat];
                       if (!entry || entry.count === 0) return null;
                       const cost = costByTaxonomy[cat];
-                      const trend = trendFor(cat);
+                      const trend = trendForCallback(cat);
                       const isActive = activeTaxonomyFilter === cat;
                       const isDominant = ftd.dominant_category === cat;
                       return (
@@ -2295,322 +2285,31 @@ export function CatchUpPanel({ selectedProjectId, projects, lastVisitTimestamp: 
               )}
 
               {/* Review quality */}
-              {(() => {
-                const sre = digest.self_review_effectiveness;
-                const spa = digest.self_review_prediction_accuracy;
-                const spaTrends = digest.self_review_prediction_accuracy_trends;
-                const ra = digest.review_accuracy;
-                const fra = digest.first_review_approval_rate;
-                const skip = digest.self_review_skip_rate;
-                const fre = digest.fresh_reviewer_effectiveness;
-                const hasSre = sre && (sre.with_self_review_approval_rate != null || sre.without_self_review_approval_rate != null);
-                const hasSpa = spa && (spa.prediction_hit_rate != null || spa.false_alarm_rate != null);
-                const hasSpaTrends = !!(spaTrends && spaTrends.categories && Object.keys(spaTrends.categories).length > 0);
-                const hasRa = ra && (ra.precision != null || ra.recall != null);
-                const hasFra = fra && fra.overall != null && fra.sample_size >= 5;
-                const hasSkip = !!skip;
-                const hasFre = !!(fre && fre.fresh_reviewer_sample_size >= 0);
-                if (!hasSre && !hasSpa && !hasSpaTrends && !hasRa && !hasFra && !hasSkip && !hasFre) return null;
-                const fraOverall = fra?.overall;
-                const fraColor = fraOverall != null
-                  ? (fraOverall >= 0.8 ? 'text-emerald-400' : fraOverall >= 0.5 ? 'text-amber-400' : 'text-red-400')
-                  : 'text-neutral-300';
-                const pct = (v: number | null | undefined) => v == null ? null : `${Math.round(v * 100)}%`;
-                return (
-                  <div>
-                    <button
-                      onClick={() => setReviewQualityExpanded(v => !v)}
-                      aria-expanded={reviewQualityExpanded}
-                      className="flex items-center gap-1.5 text-[10px] font-bold text-neutral-500 uppercase tracking-widest hover:text-neutral-400 transition-colors"
-                    >
-                      {reviewQualityExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-                      Review quality
-                    </button>
-                    {reviewQualityExpanded && (
-                      <div className="flex flex-col gap-1 mt-1 ml-1">
-                        {sre && hasSre && (
-                          <div className="flex flex-wrap items-center gap-1.5">
-                            <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Self-review</span>
-                            {sre.with_self_review_approval_rate != null && (
-                              <span className="text-[10px] text-neutral-400">
-                                with <span className="text-emerald-400">{pct(sre.with_self_review_approval_rate)}</span>
-                              </span>
-                            )}
-                            {sre.without_self_review_approval_rate != null && (
-                              <span className="text-[10px] text-neutral-400">
-                                · without <span className="text-neutral-300">{pct(sre.without_self_review_approval_rate)}</span>
-                              </span>
-                            )}
-                            <span className="text-[10px] text-neutral-500">· n={sre.sample_size}</span>
-                          </div>
-                        )}
-                        {spa && hasSpa && (
-                          <div className="flex flex-wrap items-center gap-1.5">
-                            <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Prediction</span>
-                            {spa.prediction_hit_rate != null && (
-                              <span className="text-[10px] text-neutral-400">
-                                hit <span className="text-emerald-400">{pct(spa.prediction_hit_rate)}</span>
-                              </span>
-                            )}
-                            {spa.false_alarm_rate != null && (
-                              <span className="text-[10px] text-neutral-400">
-                                · false alarm <span className="text-amber-400">{pct(spa.false_alarm_rate)}</span>
-                              </span>
-                            )}
-                            <span className="text-[10px] text-neutral-500">· n={spa.sample_size}</span>
-                          </div>
-                        )}
-                        {skip && hasSkip && (() => {
-                          const rate = skip.overall_rate;
-                          const skipColor = rate <= 0.05 ? 'text-emerald-400' : rate <= 0.15 ? 'text-amber-400' : 'text-red-400';
-                          const byTypeEntries = Object.entries(skip.by_task_type ?? {});
-                          return (
-                            <div className="flex flex-wrap items-center gap-1.5">
-                              <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">SR Skip</span>
-                              <span className="text-[10px] text-neutral-400">
-                                rate <span className={skipColor}>{pct(rate)}</span>
-                              </span>
-                              <span className="text-[10px] text-neutral-500">· {skip.skipped_count}/{skip.sample_size}</span>
-                              {byTypeEntries.map(([ttype, b]) => (
-                                <span key={ttype} className="text-[10px] text-neutral-500">
-                                  · {ttype} <span className="text-neutral-300">{pct(b.rate)}</span> (n={b.sample_size})
-                                </span>
-                              ))}
-                            </div>
-                          );
-                        })()}
-                        {hasSpaTrends && (
-                          <div className="flex flex-col gap-0.5">
-                            <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Prediction by category</span>
-                            <SrTrendBreakdown trends={spaTrends} variant="inline" srCatchRateTargets={srCatchRateTargets} />
-                          </div>
-                        )}
-                        {ra && hasRa && (
-                          <div className="flex flex-wrap items-center gap-1.5">
-                            <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Review accuracy</span>
-                            {ra.precision != null && (
-                              <span className="text-[10px] text-neutral-400">
-                                precision <span className="text-emerald-400">{pct(ra.precision)}</span>
-                              </span>
-                            )}
-                            {ra.recall != null && (
-                              <span className="text-[10px] text-neutral-400">
-                                · recall <span className="text-emerald-400">{pct(ra.recall)}</span>
-                              </span>
-                            )}
-                            <span className="text-[10px] text-neutral-500">· n={ra.total_reviews}</span>
-                          </div>
-                        )}
-                        {fra && hasFra && (
-                          <div className="flex flex-wrap items-center gap-1.5">
-                            <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">First-review approval</span>
-                            <span className="text-[10px] text-neutral-400">
-                              <span className={fraColor}>{pct(fra.overall)}</span>
-                            </span>
-                            <span className="text-[10px] text-neutral-500">· n={fra.sample_size}</span>
-                          </div>
-                        )}
-                        {fre && hasFre && (() => {
-                          const n = fre.fresh_reviewer_sample_size;
-                          const freRate = fre.fresh_reviewer_first_attempt_approval_rate;
-                          const baseRate = fre.baseline_first_attempt_approval_rate;
-                          const lift = freRate != null && baseRate != null ? freRate - baseRate : null;
-                          const freColor = freRate != null
-                            ? (freRate >= 0.8 ? 'text-emerald-400' : freRate >= 0.5 ? 'text-amber-400' : 'text-red-400')
-                            : 'text-neutral-300';
-                          const liftColor = lift == null ? 'text-neutral-400' : lift >= 0.05 ? 'text-emerald-400' : lift >= 0 ? 'text-amber-400' : 'text-red-400';
-                          const hitEntries = Object.entries(fre.per_category_hit_rate ?? {}).slice(0, 3);
-                          return (
-                            <div className="flex flex-col gap-0.5">
-                              <div className="flex flex-wrap items-center gap-1.5">
-                                <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Fresh-reviewer</span>
-                                {n < 5 ? (
-                                  <span className="text-[10px] text-neutral-500">sample too small (n={n})</span>
-                                ) : (
-                                  <>
-                                    {freRate != null && (
-                                      <span className="text-[10px] text-neutral-400">approval <span className={freColor}>{pct(freRate)}</span></span>
-                                    )}
-                                    {baseRate != null && (
-                                      <span className="text-[10px] text-neutral-400">· baseline <span className="text-neutral-300">{pct(baseRate)}</span></span>
-                                    )}
-                                    {lift != null && (
-                                      <span className="text-[10px] text-neutral-400">· lift <span className={liftColor}>{lift >= 0 ? '+' : ''}{Math.round(lift * 100)}pp</span></span>
-                                    )}
-                                    <span className="text-[10px] text-neutral-500">· n={n}</span>
-                                  </>
-                                )}
-                              </div>
-                              {hitEntries.length > 0 && n >= 5 && (
-                                <div className="flex flex-wrap items-center gap-1.5 ml-2">
-                                  <span className="text-[10px] text-neutral-600">hit rate:</span>
-                                  {hitEntries.map(([cat, rate]) => (
-                                    <span key={cat} className="text-[10px] text-neutral-500">{cat} <span className="text-neutral-300">{pct(rate)}</span></span>
-                                  ))}
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })()}
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
+              <CatchUpReviewQualitySection
+                selfReviewEffectiveness={digest.self_review_effectiveness}
+                selfReviewPredictionAccuracy={digest.self_review_prediction_accuracy}
+                selfReviewPredictionAccuracyTrends={digest.self_review_prediction_accuracy_trends}
+                selfReviewSkipRate={digest.self_review_skip_rate}
+                reviewAccuracy={digest.review_accuracy}
+                firstReviewApprovalRate={digest.first_review_approval_rate}
+                freshReviewerEffectiveness={digest.fresh_reviewer_effectiveness}
+                srCatchRateTargets={srCatchRateTargets}
+              />
 
 
               {/* Recent failures grouped by classification (not in needs_attention) */}
-              {extraFailureGroups.length > 0 && (() => {
-                const filteredGroups = (activeTaxonomyFilter || activeStageFilter)
-                  ? extraFailureGroups
-                      .map(g => ({
-                        ...g,
-                        tasks: g.tasks.filter(t =>
-                          (!activeTaxonomyFilter || t.taxonomy === activeTaxonomyFilter) &&
-                          (!activeStageFilter || t.failure_stage === activeStageFilter)
-                        ),
-                      }))
-                      .filter(g => g.tasks.length > 0)
-                  : extraFailureGroups;
-                const totalCount = filteredGroups.reduce((s, g) => s + g.tasks.length, 0);
-                const filterLabel = activeTaxonomyFilter
-                  ? `${TAXONOMY_LABELS[activeTaxonomyFilter] ?? activeTaxonomyFilter}`
-                  : activeStageFilter ?? null;
-                return (
-                <div>
-                  <button
-                    onClick={() => setFailuresExpanded(v => !v)}
-                    aria-expanded={failuresExpanded}
-                    className="flex items-center gap-1.5 text-[11px] font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors mb-1.5"
-                  >
-                    {failuresExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-                    <XCircle className="w-3 h-3 text-red-500" />
-                    Recent failures ({totalCount}{filterLabel ? ` filtered: ${filterLabel}` : ''})
-                  </button>
-                  {failuresExpanded && (
-                    <div className="flex flex-col gap-2">
-                      {filteredGroups.length === 0 && (
-                        <div className="text-[11px] text-neutral-500 italic">No failures match the active filter.</div>
-                      )}
-                      {filteredGroups.map(group => {
-                        const isGroupExpanded = expandedGroups.has(group.failure_class);
-                        const badgeClass = group.failure_class === 'CODE_ERROR'
-                          ? 'bg-red-500/10 text-red-400 border-red-500/20'
-                          : group.failure_class === 'RATE_LIMIT' || group.failure_class === 'EXTERNAL_API'
-                          ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
-                          : 'bg-neutral-700/20 text-neutral-400 border-neutral-700/30';
-                        const classHistory = digest.trend_history ?? [];
-                        let classTrend: {arrow: string; color: string} = {arrow: '–', color: 'text-neutral-500'};
-                        if (classHistory.length >= 4) {
-                          const sumAt = (arr: typeof classHistory) => arr.reduce((a, p) => a + (p.failed_by_class?.[group.failure_class] ?? 0), 0);
-                          const recent = sumAt(classHistory.slice(-2));
-                          const prior = sumAt(classHistory.slice(-4, -2));
-                          if (recent > prior) classTrend = {arrow: '↑', color: 'text-red-400'};
-                          else if (recent < prior) classTrend = {arrow: '↓', color: 'text-emerald-400'};
-                        }
-                        return (
-                          <div key={group.failure_class}>
-                            <button
-                              onClick={() => setExpandedGroups(prev => {
-                                const next = new Set(prev);
-                                if (next.has(group.failure_class)) next.delete(group.failure_class);
-                                else next.add(group.failure_class);
-                                return next;
-                              })}
-                              aria-expanded={isGroupExpanded}
-                              className="flex flex-wrap items-center gap-2 w-full text-left hover:opacity-80 transition-opacity mb-1"
-                            >
-                              {isGroupExpanded ? <ChevronUp className="w-3 h-3 text-neutral-500 shrink-0" /> : <ChevronDown className="w-3 h-3 text-neutral-500 shrink-0" />}
-                              <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${badgeClass}`}>
-                                {group.label}
-                              </span>
-                              <span className="text-[11px] text-neutral-500">× {group.tasks.length}</span>
-                              <span className={`text-[11px] font-bold ${classTrend.color}`} title="Trend: recent 2 periods vs prior 2 periods">{classTrend.arrow}</span>
-                              {digest.cost_by_failure_class?.[group.failure_class] != null && digest.cost_by_failure_class[group.failure_class] > 0 && (
-                                <span className="text-[10px] text-red-400/70 font-mono" title={`Cost of ${group.label} failures`}>
-                                  ${digest.cost_by_failure_class[group.failure_class].toFixed(2)}
-                                </span>
-                              )}
-                            </button>
-                            {isGroupExpanded && (
-                              <div className="flex flex-col gap-1 ml-5 max-w-full">
-                                {group.tasks.map(t => (
-                                  <div key={t.task_id} className="flex flex-col gap-0.5">
-                                    <div
-                                      role="button"
-                                      tabIndex={0}
-                                      className="flex flex-wrap items-center gap-2 text-xs bg-neutral-950 border border-neutral-800/80 px-2 py-1.5 rounded cursor-pointer hover:bg-neutral-800/50 min-h-[44px]"
-                                      onClick={() => onSelectTask({ id: t.task_id })}
-                                      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelectTask({ id: t.task_id }); } }}
-                                    >
-                                      {t.taxonomy && TAXONOMY_LABELS[t.taxonomy] && (
-                                        <span className={`shrink-0 text-[9px] leading-none px-1 py-0.5 rounded border ${TAXONOMY_COLORS[t.taxonomy] ?? 'bg-neutral-500/20 text-neutral-400 border-neutral-500/30'}`} title={TAXONOMY_LABELS[t.taxonomy]}>
-                                          {TAXONOMY_LABELS[t.taxonomy]}
-                                        </span>
-                                      )}
-                                      <span className="flex-1 truncate text-neutral-400">{t.title}</span>
-                                      {t.direction_text && (
-                                        <span
-                                          className="shrink-0 text-[9px] px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40 truncate max-w-[9rem] sm:max-w-[12rem]"
-                                          title={t.direction_text}
-                                        >
-                                          {t.direction_text.length > 40 ? t.direction_text.slice(0, 40) + '…' : t.direction_text}
-                                        </span>
-                                      )}
-                                      {t.failure_stage && (
-                                        <span
-                                          className="shrink-0 text-[9px] font-mono px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-400 border border-neutral-700/40"
-                                          title={`Failure stage: ${t.failure_stage}`}
-                                        >
-                                          {t.failure_stage}
-                                        </span>
-                                      )}
-                                      {group.failure_class === 'AGENT_TIMEOUT' && t.timeout_subtype && (
-                                        <span
-                                          className="shrink-0 text-[9px] font-mono px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400/80 border border-amber-500/20"
-                                          title={`Timeout subtype: ${t.timeout_subtype}`}
-                                        >
-                                          {TIMEOUT_SUBTYPE_LABELS[t.timeout_subtype] ?? t.timeout_subtype}
-                                        </span>
-                                      )}
-                                      {t.attempt_count > 1 && (
-                                        <span className="shrink-0 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-neutral-700/30 text-neutral-500 border border-neutral-700/40">
-                                          attempt {t.attempt_count}
-                                        </span>
-                                      )}
-                                      {t.waiting_hours != null && t.waiting_hours > 0 && (
-                                        <span className="shrink-0 text-[10px] text-neutral-600 font-mono">{t.waiting_hours}h ago</span>
-                                      )}
-                                    </div>
-                                    {t.error_snippet && (
-                                      <div className="px-2">
-                                        <button
-                                          onClick={() => toggleSnippet(t.task_id)}
-                                          aria-expanded={expandedSnippets.has(t.task_id)}
-                                          aria-label={expandedSnippets.has(t.task_id) ? 'Hide error details' : 'Show error details'}
-                                          className="text-[10px] text-neutral-600 hover:text-neutral-400 transition-colors"
-                                        >
-                                          {expandedSnippets.has(t.task_id) ? 'hide error ▲' : 'show error ▼'}
-                                        </button>
-                                        {expandedSnippets.has(t.task_id) && (
-                                          <pre className="mt-1 text-[10px] text-red-400/80 bg-red-950/20 border border-red-900/30 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all">
-                                            {t.error_snippet}
-                                          </pre>
-                                        )}
-                                      </div>
-                                    )}
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-                );
-              })()}
+              <RecentFailureGroupsSection
+                extraFailureGroups={extraFailureGroups}
+                activeTaxonomyFilter={activeTaxonomyFilter}
+                activeStageFilter={activeStageFilter}
+                trendHistory={digest.trend_history}
+                costByFailureClass={digest.cost_by_failure_class}
+                expandedSnippets={expandedSnippets}
+                onToggleSnippet={toggleSnippet}
+                onSelectTask={onSelectTask}
+                failuresExpanded={failuresExpanded}
+                onToggleFailuresExpanded={() => setFailuresExpanded(v => !v)}
+              />
 
               {/* Remediation pipeline */}
               {digest.remediation_funnel && (

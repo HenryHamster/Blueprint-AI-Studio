@@ -93,3 +93,28 @@ export function windowToHours(window: TimeWindow, lastViewed: number | null): nu
     case '7d': return 168;
   }
 }
+
+export type TrendPeriod = {
+  period_end: string;
+  success_rate: number | null;
+  completed: number;
+  failed: number;
+  failed_by_taxonomy?: Record<string, number>;
+  failed_by_class?: Record<string, number>;
+  first_attempt_success_rate?: number | null;
+  period_cost_usd?: number | null;
+};
+
+export type ClassTrend = { arrow: string; color: string };
+
+/** Computes trend arrow/color for a failure class by comparing the recent 2 periods vs prior 2 periods. */
+export function computeClassTrend(classHistory: TrendPeriod[], failureClass: string): ClassTrend {
+  if (classHistory.length < 4) return { arrow: '–', color: 'text-neutral-500' };
+  const sumAt = (arr: TrendPeriod[]) =>
+    arr.reduce((a, p) => a + (p.failed_by_class?.[failureClass] ?? 0), 0);
+  const recent = sumAt(classHistory.slice(-2));
+  const prior = sumAt(classHistory.slice(-4, -2));
+  if (recent > prior) return { arrow: '↑', color: 'text-red-400' };
+  if (recent < prior) return { arrow: '↓', color: 'text-emerald-400' };
+  return { arrow: '–', color: 'text-neutral-500' };
+}
