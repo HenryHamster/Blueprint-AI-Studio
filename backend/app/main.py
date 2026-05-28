@@ -329,18 +329,18 @@ async def _deferred_backlog_teardown(vm_id: str, reason: str) -> None:
 
     Backlog reuse (efficiency direction d-91d8dede): when a COMPLETED task's
     VM has eligible QUEUED backlog work in its project, this defers teardown
-    for WARM_BACKLOG_TEARDOWN_DEFER_SECS so the agent's /next-role poll can
-    claim that work and run it warm. After the window, the VM is deleted iff
-    it never claimed anything.
+    by runtime_config['warm_backlog_teardown_defer_secs'] (read fresh per call)
+    so the agent's /next-role poll can claim that work and run it warm. After
+    the window, the VM is deleted iff it never claimed anything.
 
     Crucially this does NOT pre-record the orchestrator-deleted marker (unlike
     fire_and_forget_vm_delete): that marker makes is_orchestrator_initiated_delete
     return True, and the /next-role doomed-VM guard would then refuse the VM's
     own warm claim. The marker is only written if/when we actually delete.
     """
-    from app.warm_backlog_reuse import WARM_BACKLOG_TEARDOWN_DEFER_SECS
+    from app.warm_backlog_reuse import _teardown_defer_secs
 
-    await asyncio.sleep(WARM_BACKLOG_TEARDOWN_DEFER_SECS)
+    await asyncio.sleep(_teardown_defer_secs())
     try:
         async with AsyncSessionLocal() as s:
             claimed = (

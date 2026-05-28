@@ -23,6 +23,7 @@ from sqlalchemy import or_, select
 
 from app.models import Task, TaskStatus
 from app.orchestrator_filters import _prod_files
+from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
 logger = logging.getLogger("blueprint")
@@ -32,12 +33,38 @@ logger = logging.getLogger("blueprint")
 # is torn down. Sized to comfortably exceed the agent's poll cadence (5s) plus
 # one round-trip. If nothing is claimed within the window, teardown proceeds
 # exactly as before.
-WARM_BACKLOG_TEARDOWN_DEFER_SECS = 20
 
-# How many QUEUED candidates to scan per poll. A small cap keeps the endpoint
-# cheap (it can be hit by many idle VMs at up to 600/min) while still giving
-# the file-conflict / skip-locked filters enough rows to find a claimable one.
-_BACKLOG_SCAN_LIMIT = 10
+
+def _runtime_int(key: str, fallback: int, *, min_value: int, max_value: int) -> int:
+    try:
+        value = int(_runtime_config.get(key, fallback) or fallback)
+    except (TypeError, ValueError):
+        return fallback
+    if value < min_value or value > max_value:
+        return fallback
+    return value
+
+
+def _backlog_scan_limit() -> int:
+    # How many QUEUED candidates to scan per poll. A small cap keeps the
+    # endpoint cheap (it can be hit by many idle VMs at up to 600/min) while
+    # still giving the file-conflict / skip-locked filters enough rows to find
+    # a claimable one.
+    return _runtime_int(
+        "warm_backlog_scan_limit",
+        10,
+        min_value=1,
+        max_value=100,
+    )
+
+
+def _teardown_defer_secs() -> int:
+    return _runtime_int(
+        "warm_backlog_teardown_defer_secs",
+        20,
+        min_value=5,
+        max_value=120,
+    )
 
 
 async def _project_in_progress_files(session, project_id) -> set[str]:
@@ -110,12 +137,12 @@ async def _eligible_backlog_ids(
                 ),
             )
             .order_by(Task.priority.desc().nullslast(), Task.created_at.asc())
-            .limit(_BACKLOG_SCAN_LIMIT)
+            .limit(_backlog_scan_limit())
         )
     ).all()
 
     rows_fetched = len(rows)
-    saturated = rows_fetched >= _BACKLOG_SCAN_LIMIT
+    saturated = rows_fetched >= _backlog_scan_limit()
 
     if not rows:
         logger.debug(
@@ -295,7 +322,8 @@ def record_scan_skipped_file_conflict() -> None:
 
 
 def record_scan_saturated() -> None:
-    """Stage A: an eligibility scan hit the per-poll _BACKLOG_SCAN_LIMIT."""
+    """Stage A: an eligibility scan hit the per-poll _backlog_scan_limit()
+    (runtime key ``warm_backlog_scan_limit``)."""
     _scan_saturated_events.append(_utcnow())
 
 

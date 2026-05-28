@@ -711,7 +711,7 @@ async def test_scan_skip_reasons_increment_each_stage_once(db_session):
         assert snap["scan_polls_with_depends_on_skip"] == 1
         assert snap["scan_polls_with_pinned_vm_skip"] == 1
         assert snap["scan_polls_with_file_conflict_skip"] == 1
-        # 5 QUEUED rows fits under the default _BACKLOG_SCAN_LIMIT (10).
+        # 5 QUEUED rows fits under the default _backlog_scan_limit() (10).
         assert snap["scan_polls_saturated"] == 0
     finally:
         _clear_funnel_events(wbr)
@@ -751,7 +751,7 @@ async def test_scan_skip_aggregates_per_poll_not_per_row(db_session):
 
 @pytest.mark.asyncio
 async def test_scan_saturated_increments_when_at_limit(db_session, monkeypatch):
-    """When rows_fetched hits _BACKLOG_SCAN_LIMIT, scan_polls_saturated increments."""
+    """When rows_fetched hits _backlog_scan_limit(), scan_polls_saturated increments."""
     import app.warm_backlog_reuse as wbr
 
     _clear_funnel_events(wbr)
@@ -760,7 +760,7 @@ async def test_scan_saturated_increments_when_at_limit(db_session, monkeypatch):
         vm_id = "agent-vm-scan-sat"
 
         # Lower the scan limit so the test stays cheap.
-        monkeypatch.setattr(wbr, "_BACKLOG_SCAN_LIMIT", 3)
+        monkeypatch.setitem(wbr._runtime_config, "warm_backlog_scan_limit", 3)
         for _ in range(3):
             await _make_backlog_task(db_session, project.id)
 
