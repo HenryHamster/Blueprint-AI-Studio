@@ -51,6 +51,25 @@
     "playbook_auto.py": 450,
     "playbook_sr_metrics.py": 3100
   },
+  "agent": {
+    "index.ts": 4600,
+    "prompt.ts": 3600,
+    "handlers/research-plan.ts": 3100,
+    "handlers/standard.ts": 1550,
+    "handlers/review-fix.ts": 1700,
+    "handlers/specialized.ts": 1400,
+    "handlers/memo.ts": 400,
+    "handlers/code-change.ts": 450,
+    "prompts/discovery.ts": 750,
+    "prompts/project-context.ts": 850,
+    "prompts/self-review.ts": 500,
+    "prompts/analysis.ts": 250,
+    "fix-loop-events.ts": 320,
+    "constants.ts": 350,
+    "json-extract.ts": 330,
+    "workspacePrep.ts": 240,
+    "reset.ts": 240
+  },
   "frontend": {
     "useAppState.ts": 3000,
     "components/DirectionsPanel.tsx": 3000,

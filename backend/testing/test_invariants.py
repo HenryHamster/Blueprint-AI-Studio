@@ -1116,6 +1116,7 @@ def _load_size_limits() -> dict:
 
 _SIZE_LIMITS = _load_size_limits()
 MODULE_SIZE_LIMITS = _SIZE_LIMITS["backend"]
+AGENT_SIZE_LIMITS = _SIZE_LIMITS["agent"]
 
 
 def _size_breach_message(
@@ -1240,6 +1241,54 @@ class TestBackendModuleSizeGuardrails:
 
     def test_playbook_auto(self):
         self._check_module("playbook_auto.py")
+
+
+_AGENT_SRC_ROOT = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "agent", "src")
+) if os.path.isdir(
+    os.path.join(os.path.dirname(__file__), "..", "..", "agent", "src")
+) else None
+
+
+class TestAgentModuleSizeGuardrails:
+    @staticmethod
+    def _require_agent_src() -> None:
+        import pytest
+
+        if _AGENT_SRC_ROOT is None:
+            pytest.skip("agent/src not available in this test environment")
+
+    def _check_agent(self, relative_path: str) -> None:
+        self._require_agent_src()
+        max_lines = AGENT_SIZE_LIMITS[relative_path]
+        path = os.path.join(_AGENT_SRC_ROOT, relative_path)
+        with open(path) as f:
+            count = len(f.readlines())
+        assert count <= max_lines, _size_breach_message(
+            relative_path, count, max_lines, "agent"
+        )
+
+    def test_agent_modules(self):
+        for relative_path in (
+            "index.ts",
+            "prompt.ts",
+            "handlers/research-plan.ts",
+            "handlers/standard.ts",
+            "handlers/review-fix.ts",
+            "handlers/specialized.ts",
+            "handlers/memo.ts",
+            "handlers/code-change.ts",
+            "prompts/discovery.ts",
+            "prompts/project-context.ts",
+            "prompts/self-review.ts",
+            "prompts/analysis.ts",
+            "fix-loop-events.ts",
+            "constants.ts",
+            "json-extract.ts",
+            "workspacePrep.ts",
+            "reset.ts",
+        ):
+            self._check_agent(relative_path)
 
 
 # ── Frontend File Size Guardrails ─────────────────────────────────────────────
