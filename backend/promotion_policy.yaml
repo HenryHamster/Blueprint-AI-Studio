@@ -18,9 +18,5 @@ weights:
   test_erosion: 0.30   # did automain delete tests or weaken coverage vs main
   smoketest: 0.30      # qualify-time smoketest pass ratio
 
-threshold: 0.75        # composite confidence required to promote.
-# Lowered from the conservative 0.90 calibration bar to the 0.75 design target.
-# Rationale: audit-precision work (the qualifier's own measurement) lands on
-# automain first, so an over-strict bar can pin promotion at the imprecise audit
-# and strand the very fix meant to improve it. 0.75 gives that work room to
-# promote while still requiring a clear majority-confident composite.
+threshold: 0.90        # composite confidence required to promote.
+# Raised back to the conservative 0.90 calibration bar.

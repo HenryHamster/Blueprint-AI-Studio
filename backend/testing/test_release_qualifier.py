@@ -569,7 +569,7 @@ class TestLoadPolicy:
         assert policy["weights"]["audit"] == pytest.approx(0.40)
         assert policy["weights"]["test_erosion"] == pytest.approx(0.30)
         assert policy["weights"]["smoketest"] == pytest.approx(0.30)
-        assert policy["threshold"] == pytest.approx(0.75)
+        assert policy["threshold"] == pytest.approx(0.90)
 
     def test_fallback_on_missing_file(self, mocker, tmp_path):
         """A missing policy file falls back to hardcoded defaults, no raise."""
@@ -580,21 +580,23 @@ class TestLoadPolicy:
             "test_erosion": 0.30,
             "smoketest": 0.30,
         }
-        assert policy["threshold"] == 0.75
+        assert policy["threshold"] == 0.90
 
     def test_fallback_on_malformed_yaml(self, mocker, tmp_path):
         """Malformed YAML falls back to defaults instead of raising."""
         _point_policy_at(mocker, tmp_path, "weights: {unterminated: [1, 2")
         policy = rq._load_policy()
-        assert policy["threshold"] == 0.75
+        assert policy["threshold"] == 0.90
         assert policy["weights"]["audit"] == 0.40
 
     def test_fallback_on_missing_weights_key(self, mocker, tmp_path):
         """A policy file with no 'weights' mapping falls back to defaults."""
-        _point_policy_at(mocker, tmp_path, "threshold: 0.9\n")
+        # Use a sentinel threshold that differs from the default so the
+        # fallback (vs the file's parsed value) is unambiguous.
+        _point_policy_at(mocker, tmp_path, "threshold: 0.55\n")
         policy = rq._load_policy()
         assert policy["weights"]["audit"] == 0.40
-        assert policy["threshold"] == 0.75
+        assert policy["threshold"] == 0.90
 
     def test_fallback_on_non_numeric_weight(self, mocker, tmp_path):
         """A non-numeric weight value triggers the fallback."""
@@ -613,7 +615,7 @@ class TestLoadPolicy:
         _point_policy_at(mocker, tmp_path, "just-a-string\n")
         policy = rq._load_policy()
         assert policy["weights"]["audit"] == 0.40
-        assert policy["threshold"] == 0.75
+        assert policy["threshold"] == 0.90
 
     def test_fallback_when_weights_sum_above_one(self, mocker, tmp_path):
         """Weights summing to >1.0 saturate confidence and disable the gate —
@@ -631,7 +633,7 @@ class TestLoadPolicy:
             "test_erosion": 0.30,
             "smoketest": 0.30,
         }
-        assert policy["threshold"] == 0.75
+        assert policy["threshold"] == 0.90
 
     def test_fallback_when_weights_sum_below_one(self, mocker, tmp_path):
         """Weights summing to <1.0 mean nothing can clear the threshold — that
@@ -685,7 +687,7 @@ class TestLoadPolicy:
         # A fresh fallback must still see the real defaults.
         fresh = rq._load_policy()
         assert fresh["weights"]["audit"] == 0.40
-        assert fresh["threshold"] == 0.75
+        assert fresh["threshold"] == 0.90
 
     def test_parses_custom_valid_yaml(self, mocker, tmp_path):
         """A well-formed custom policy is parsed (not just the fallback)."""
@@ -2744,7 +2746,7 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
         project,
         version,
         # Three findings derive audit 0.68; with erosion 1.0 and smoketest 0.5
-        # (half-passing), the composite lands at 0.722, just under the 0.75
+        # (half-passing), the composite lands at 0.722, under the 0.90
         # bar and on the soft-miss path.
         audit_logs={
             "audit_score": 0.35,
@@ -8391,7 +8393,7 @@ async def test_finalize_below_threshold_posts_operator_message(db_session):
 
     project, version = await _make_project_and_version(db_session)
     # 2 high + 1 low findings → derived audit 0.68, erosion 1.0, smoketest 0.5
-    # (half-passing) → composite 0.722, well under the 0.75 threshold, but no
+    # (half-passing) → composite 0.722, well under the 0.90 threshold, but no
     # hard blocker (audit present, no test deletion, CI green).
     await _seed_qualification_children(
         db_session,

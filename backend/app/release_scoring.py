@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # parse failure degrades to the intended rubric rather than a silent surprise.
 _DEFAULT_POLICY: dict[str, Any] = {
     "weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
-    "threshold": 0.75,
+    "threshold": 0.90,
 }
 
 
