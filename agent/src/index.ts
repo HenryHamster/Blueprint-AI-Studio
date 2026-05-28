@@ -30,8 +30,6 @@ import {
 } from './fix-loop-events.js';
 import {
   API_TIMEOUT, API_MAX_RETRIES, LOGS_MAX_LENGTH, API_RETRY_BACKOFF_MAX_MS,
-  STALE_RESULT_RETRY_BASE_MS, STALE_RESULT_RETRY_MAX_MS,
-  STALE_RESULT_MAX_ATTEMPTS, STALE_RESULT_MAX_AGE_MS,
   PROCESS_KILL_GRACE_MS, LOG_TAIL_BYTES,
   HEARTBEAT_INTERVAL, MAX_LOG_BUFFER,
   HEARTBEAT_API_TIMEOUT, HEARTBEAT_API_MAX_RETRIES,
@@ -39,13 +37,28 @@ import {
   CONFLICT_CHECK_TIMEOUT,
   MAX_TEST_FIX_ATTEMPTS,
   TEST_RUNNER_TIMEOUT, TEST_RUNNER_DOCKER_TIMEOUT, TEST_BASELINE_TIMEOUT, TEST_BASELINE_DOCKER_TIMEOUT,
-  FIX_LOOP_JACCARD_THRESHOLD, FIX_LOOP_DIFF_REVERT_THRESHOLD,
 } from './constants.js';
 import {
   initTokenModule, tryRefreshToken,
   scheduleProactiveTokenRefresh, stopProactiveTokenRefresh,
   computeRefreshDelayMs, isBootstrapToken,
 } from './utils/agent-token.js';
+import { sanitize } from './utils/sanitize.js';
+import {
+  type StaleResultEnvelope,
+  createStaleResultEnvelope, parseStaleResultFile,
+  staleResultBackoffMs, shouldAbandonStaleResult, markStaleResultFailure,
+} from './utils/stale-result.js';
+import {
+  type DiffLines,
+  jaccardSimilarity, captureDiffLines, detectLoopDivergence,
+} from './utils/diff-detection.js';
+import {
+  type BuildConfig, type TestRunner,
+  detectTestRunners, isDockerRunner,
+  parseFailingTests, normalizePytestSelectorForRunner,
+  extractPytestSelectorsFromOutput, buildTargetedPytestRunners,
+} from './utils/test-runners.js';
 import {
   PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE, LLM_CLI_TRANSLATION,
   parseLLMCliTranslation, matchesRateLimit, RateLimitError, getProviderRunner,
@@ -137,33 +150,8 @@ export class ClaudeTimeoutError extends Error {
 }
 
 // ── Build configuration (from project settings, passed via claim response) ───
-export interface DirectoryConfig {
-  path: string;
-  type: string; // 'python' | 'node' | 'go' | 'rust'
-  install_cmd?: string;
-  lint_cmd?: string;
-  build_cmd?: string;
-  test_cmd?: string;
-}
-export interface BuildConfig {
-  language?: string;
-  directories?: DirectoryConfig[];
-  env_vars?: Record<string, string>;
-  git_user_name?: string;
-  git_user_email?: string;
-  enable_fresh_reviewer?: boolean;
-  enable_parallel_review?: boolean;
-  /** Namespace prefix for agent work branches (``{namespace}/{prefix}-{8hex}``).
-   *  Defaults to ``"blueprint"`` so the self-repo's branch names are unchanged.
-   *  Mirrors ``project.task_branch_namespace`` on the backend (resolved via
-   *  ``shared_state.get_project_task_branch_namespace``). */
-  task_branch_namespace?: string;
-  /** Ordered staging-branch prefixes that identify research/plan rollup heads.
-   *  Defaults to ``["research/", "plan/"]`` when unset. Mirrors
-   *  ``project.staging_branch_prefixes`` on the backend (see
-   *  ``backend/app/models.py``). */
-  staging_branch_prefixes?: string[];
-}
+export type { DirectoryConfig } from './utils/test-runners.js';
+export type { BuildConfig };
 
 // ── Environment ─────────────────────────────────────────────────────────────
 const ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL || 'http://localhost:8080';
@@ -394,86 +382,8 @@ export async function apiPost(path: string, body: Record<string, unknown> = {}, 
   );
 }
 
-/** Persist result payload to disk before POSTing status, then clean up on success.
- *  If the POST fails (network error, VM kill), the file survives for retry on next startup. */
-export type StaleResultEnvelope = {
-  payload: Record<string, unknown>;
-  retry: {
-    attempts: number;
-    createdAt: number;
-    nextAttemptAt: number;
-    lastAttemptAt?: number;
-    lastError?: string;
-  };
-};
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-export function createStaleResultEnvelope(
-  payload: Record<string, unknown>,
-  now = Date.now(),
-): StaleResultEnvelope {
-  return {
-    payload,
-    retry: {
-      attempts: 0,
-      createdAt: now,
-      nextAttemptAt: 0,
-    },
-  };
-}
-
-export function parseStaleResultFile(raw: string, now = Date.now()): StaleResultEnvelope {
-  const parsed = JSON.parse(raw) as unknown;
-  if (!isRecord(parsed)) throw new Error('stale result file is not a JSON object');
-  const payload = parsed.payload;
-  const retry = parsed.retry;
-  if (isRecord(payload) && isRecord(retry)) {
-    return {
-      payload,
-      retry: {
-        attempts: typeof retry.attempts === 'number' ? retry.attempts : 0,
-        createdAt: typeof retry.createdAt === 'number' ? retry.createdAt : now,
-        nextAttemptAt: typeof retry.nextAttemptAt === 'number' ? retry.nextAttemptAt : 0,
-        lastAttemptAt: typeof retry.lastAttemptAt === 'number' ? retry.lastAttemptAt : undefined,
-        lastError: typeof retry.lastError === 'string' ? retry.lastError : undefined,
-      },
-    };
-  }
-  return createStaleResultEnvelope(parsed, now);
-}
-
-export function staleResultBackoffMs(attempts: number): number {
-  const exponent = Math.max(0, Math.min(attempts - 1, 10));
-  return Math.min(STALE_RESULT_RETRY_BASE_MS * Math.pow(2, exponent), STALE_RESULT_RETRY_MAX_MS);
-}
-
-export function shouldAbandonStaleResult(envelope: StaleResultEnvelope, now = Date.now()): boolean {
-  return envelope.retry.attempts >= STALE_RESULT_MAX_ATTEMPTS
-    || now - envelope.retry.createdAt > STALE_RESULT_MAX_AGE_MS;
-}
-
-export function markStaleResultFailure(
-  envelope: StaleResultEnvelope,
-  error: unknown,
-  now = Date.now(),
-): StaleResultEnvelope {
-  const attempts = envelope.retry.attempts + 1;
-  const nextAttemptAt = now + staleResultBackoffMs(attempts);
-  const lastError = error instanceof Error ? error.message : String(error);
-  return {
-    payload: envelope.payload,
-    retry: {
-      ...envelope.retry,
-      attempts,
-      lastAttemptAt: now,
-      nextAttemptAt,
-      lastError: sanitize(lastError).slice(0, 500),
-    },
-  };
-}
+export type { StaleResultEnvelope };
+export { createStaleResultEnvelope, parseStaleResultFile, staleResultBackoffMs, shouldAbandonStaleResult, markStaleResultFailure };
 
 function writeStaleResultFile(path: string, envelope: StaleResultEnvelope): void {
   writePrivateFileSync(path, JSON.stringify(envelope));
@@ -1241,18 +1151,7 @@ async function connectLogStream(taskId: string): Promise<WebSocket | null> {
   return null;
 }
 
-export function sanitize(text: string): string {
-  return text
-    .replace(/https:\/\/x-access-token:[^@]+@/g, 'https://x-access-token:***@')
-    .replace(/ghp_[A-Za-z0-9_]+/g, 'ghp_***')
-    .replace(/ghs_[A-Za-z0-9_]+/g, 'ghs_***')
-    .replace(/github_pat_[A-Za-z0-9_]+/g, 'github_pat_***')
-    .replace(/sk-ant-[A-Za-z0-9_-]+/g, 'sk-ant-***')
-    .replace(/eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, 'eyJ***')
-    .replace(/Bearer\s+[^\s,'"]+/gi, 'Bearer ***')
-    .replace(/oauth_token[=:]\s*[^\s&'"]+/gi, 'oauth_token=***')
-    .replace(/-----BEGIN[A-Z\s]+PRIVATE\s+KEY-----[\s\S]*?-----END[A-Z\s]+PRIVATE\s+KEY-----/g, '***PRIVATE KEY***');
-}
+export { sanitize };
 
 export function readHandlerOutput(
   taskId: string,
@@ -1742,86 +1641,9 @@ export function estimateTokensFromChars(chars: number): number {
 }
 
 // ── Divergence detection helpers ─────────────────────────────────────────────
-
-const _TOKEN_RE = /\w+/g;
-
-/** Jaccard token-set similarity between two strings. Range [0,1]. */
-export function jaccardSimilarity(a: string, b: string): number {
-  const tokA = new Set(a.toLowerCase().match(_TOKEN_RE) ?? []);
-  const tokB = new Set(b.toLowerCase().match(_TOKEN_RE) ?? []);
-  if (tokA.size === 0 && tokB.size === 0) return 1;
-  if (tokA.size === 0 || tokB.size === 0) return 0;
-  let intersection = 0;
-  for (const t of tokA) if (tokB.has(t)) intersection++;
-  return intersection / (tokA.size + tokB.size - intersection);
-}
-
-interface DiffLines { added: Set<string>; removed: Set<string> }
-
-/** Capture the set of added/removed lines in the working tree vs HEAD. */
-function captureDiffLines(): DiffLines {
-  const added = new Set<string>();
-  const removed = new Set<string>();
-  try {
-    const raw = execSync('git diff HEAD --no-color', { cwd: WORKSPACE, timeout: 10_000 }).toString();
-    let count = 0;
-    for (const line of raw.split('\n')) {
-      if (++count > 5000) break;
-      const content = line.slice(1).trim();
-      if (!content) continue;
-      if (line.startsWith('+') && !line.startsWith('+++')) added.add(content);
-      else if (line.startsWith('-') && !line.startsWith('---')) removed.add(content);
-    }
-  } catch { /* git unavailable or clean tree */ }
-  return { added, removed };
-}
-
-/**
- * True when currDiff substantially undoes prevDiff — meaning that a large
- * fraction of prevDiff's added lines have vanished in currDiff.
- */
-function detectDiffRevert(prev: DiffLines, curr: DiffLines, threshold: number): boolean {
-  if (prev.added.size === 0) return false;
-  let vanished = 0;
-  for (const line of prev.added) if (!curr.added.has(line)) vanished++;
-  return vanished / prev.added.size >= threshold;
-}
-
-type DivergenceReason = 'divergence_oscillation' | 'divergence_similar_error' | 'divergence_diff_revert';
-
-/**
- * Check for three divergence patterns after at least 3 fix iterations.
- * Returns the first detected reason, or null if none found.
- * Conservative: does not fire until fingerprintHistory has ≥ 3 entries.
- */
-export function detectLoopDivergence(
-  fingerprintHistory: string[],
-  errorTextHistory: string[],
-  prevDiff: DiffLines | null,
-  currDiff: DiffLines | null,
-): DivergenceReason | null {
-  if (fingerprintHistory.length < 3) return null;
-  const N = fingerprintHistory.length - 1;
-
-  // Oscillation: error A -> error B -> error A (fingerprint repeats at N-2)
-  if (fingerprintHistory[N] === fingerprintHistory[N - 2] && fingerprintHistory[N - 1] !== fingerprintHistory[N]) {
-    return 'divergence_oscillation';
-  }
-
-  // Jaccard: both consecutive error pairs are semantically near-identical
-  const j1 = jaccardSimilarity(errorTextHistory[N], errorTextHistory[N - 1]);
-  const j2 = jaccardSimilarity(errorTextHistory[N - 1], errorTextHistory[N - 2]);
-  if (j1 >= FIX_LOOP_JACCARD_THRESHOLD && j2 >= FIX_LOOP_JACCARD_THRESHOLD) {
-    return 'divergence_similar_error';
-  }
-
-  // Diff revert: last Claude iteration substantially undid the previous one
-  if (prevDiff !== null && currDiff !== null && detectDiffRevert(prevDiff, currDiff, FIX_LOOP_DIFF_REVERT_THRESHOLD)) {
-    return 'divergence_diff_revert';
-  }
-
-  return null;
-}
+export type { DivergenceReason } from './utils/diff-detection.js';
+export type { DiffLines };
+export { jaccardSimilarity, detectLoopDivergence };
 
 // Build + buffer a FixLoopEvent from one wrapper-loop iteration. Centralized
 // so lintFixLoop and testFixLoop record identical-shaped events; the buffer
@@ -1869,226 +1691,8 @@ function buildFixLoopGuidanceSuffix(): string {
 }
 
 // ── Test runner detection (shared by testFixLoop and captureTestBaseline) ───
-export interface TestRunner {
-  cmd: string;
-  args: string[];
-  cwd: string;
-  label: string;
-}
-
-/** Returns true if the runner invokes Docker or the backend test shell script. */
-function isDockerRunner(runner: TestRunner): boolean {
-  const cmdAndArgs = [runner.cmd, ...runner.args].join(' ');
-  return cmdAndArgs.includes('docker') || cmdAndArgs.includes('scripts/test-backend.sh');
-}
-
-function isDockerAvailable(): boolean {
-  try {
-    execSync('docker version', { stdio: 'ignore', timeout: 2000 });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
-  const { existsSync, readFileSync } = fs;
-  const runners: TestRunner[] = [];
-
-  // --- BuildConfig-based detection (takes precedence over auto-detection) ---
-  if (buildConfig?.directories) {
-    for (const dir of buildConfig.directories) {
-      if (dir.test_cmd) {
-        const cwd = dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE;
-        const parts = dir.test_cmd.split(/\s+/);
-        runners.push({ cmd: parts[0], args: parts.slice(1), cwd, label: `${dir.test_cmd} (${dir.path || 'root'})` });
-      }
-    }
-  }
-
-  // --- Auto-detection (only if buildConfig produced no runners) ---
-  // TS doesn't track .push() mutations, so use a Boolean accessor that always reads the
-  // current length to avoid spurious "always-true" narrowing on the literal-empty array.
-  const noRunners = (): boolean => runners.length === 0;
-  if (noRunners()) {
-    const pkgPath = `${WORKSPACE}/package.json`;
-    const pytestIniPath = `${WORKSPACE}/pytest.ini`;
-    const pyprojectPath = `${WORKSPACE}/pyproject.toml`;
-    const cargoPath = `${WORKSPACE}/Cargo.toml`;
-
-    if (existsSync(pkgPath)) {
-      try {
-        const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as { scripts?: { test?: string } };
-        if (pkg.scripts?.test) {
-          runners.push({ cmd: 'npm', args: ['test'], cwd: WORKSPACE, label: 'npm test (root)' });
-        }
-      } catch { /* malformed package.json — skip */ }
-    }
-
-    if (noRunners()) {
-      if (existsSync(pytestIniPath)) {
-        runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: WORKSPACE, label: 'pytest (root)' });
-      } else if (existsSync(pyprojectPath)) {
-        try {
-          if (readFileSync(pyprojectPath, 'utf-8').includes('pytest')) {
-            runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: WORKSPACE, label: 'pytest (root pyproject)' });
-          }
-        } catch { /* unreadable — skip */ }
-      }
-    }
-
-    if (noRunners() && existsSync(cargoPath)) {
-      runners.push({ cmd: 'cargo', args: ['test'], cwd: WORKSPACE, label: 'cargo test (root)' });
-    }
-
-    // --- Subdirectory detection (only if no root-level runner found) ---
-    if (noRunners()) {
-      const backendPytestIni = `${WORKSPACE}/backend/pytest.ini`;
-      const backendPyproject = `${WORKSPACE}/backend/pyproject.toml`;
-      const backendTestScript = `${WORKSPACE}/scripts/test-backend.sh`;
-      const agentPkg = `${WORKSPACE}/agent/package.json`;
-
-      // --postgres makes test-backend.sh stand up a Postgres sidecar so the
-      // local run matches CI. Without it, the script defaults to in-memory
-      // SQLite and Postgres-only failures (enum/JSONB/migration drift) only
-      // surface on CI, after a push, burning a full review-fix iteration.
-      // When Docker is unavailable, fall back to --no-postgres so tests still
-      // run locally via the in-memory SQLite path rather than hard-failing.
-      const pgFlag = isDockerAvailable() ? '--postgres' : '--no-postgres';
-      if (existsSync(backendPytestIni)) {
-        if (existsSync(backendTestScript)) {
-          runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh', pgFlag], cwd: WORKSPACE, label: 'pytest (backend)' });
-        } else {
-          runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend)' });
-        }
-      } else if (existsSync(backendPyproject)) {
-        try {
-          if (readFileSync(backendPyproject, 'utf-8').includes('pytest')) {
-            if (existsSync(backendTestScript)) {
-              runners.push({ cmd: 'bash', args: ['scripts/test-backend.sh', pgFlag], cwd: WORKSPACE, label: 'pytest (backend pyproject)' });
-            } else {
-              runners.push({ cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WORKSPACE}/backend`, label: 'pytest (backend pyproject)' });
-            }
-          }
-        } catch { /* unreadable — skip */ }
-      }
-
-      if (existsSync(agentPkg)) {
-        try {
-          const pkg = JSON.parse(readFileSync(agentPkg, 'utf-8')) as { scripts?: { test?: string } };
-          if (pkg.scripts?.test) {
-            runners.push({ cmd: 'npm', args: ['test'], cwd: `${WORKSPACE}/agent`, label: 'npm test (agent)' });
-          }
-        } catch { /* malformed package.json — skip */ }
-      }
-    }
-  }
-
-  return runners;
-}
-
-/**
- * Parse failing test identifiers from test runner output.
- * Returns a Set of stable test IDs (e.g. "path/test_foo.py::test_bar" for pytest,
- * "test description" for vitest) for baseline comparison.
- */
-export function parseFailingTests(output: string): Set<string> {
-  const failing = new Set<string>();
-  for (const line of output.split('\n')) {
-    const trimmed = line.trim();
-    // pytest: "FAILED backend/testing/test_foo.py::test_bar - AssertionError: ..."
-    if (trimmed.startsWith('FAILED ')) {
-      const id = trimmed.slice('FAILED '.length).split(' - ')[0].trim();
-      if (id) failing.add(id);
-    }
-    // vitest file-level failure line: " FAIL  src/foo.test.ts > suite > test"
-    // (the default reporter emits one per failing file/test, leading space
-    // trims away). This was silently missing from the prior parser —
-    // vitest does NOT use "FAILED" (the pytest word) and doesn't always
-    // use ✕ markers for per-test failures, so a vitest baseline run
-    // with real failures was reporting 0.
-    //
-    // Tightened to `FAIL` + 2+ spaces + non-space body to avoid false
-    // positives from test-output lines like `FAIL reason: expected...`
-    // (tests that verify failure-formatting can emit FAIL as part of
-    // their own stdout). JSON reporter remains the primary path — this
-    // is only a fallback.
-    const vitestFailMatch = trimmed.match(/^FAIL\s{2,}(\S.*)$/);
-    if (vitestFailMatch) failing.add(vitestFailMatch[1]);
-    // vitest: "✕ test description" or "× test description" or "✗ test description".
-    // Fallback only — prefer parseFailingTestsFromVitestJson when available,
-    // since stdout scanning mis-classifies simulated failure output inside
-    // passing tests (a test that verifies failure-formatting logic can print
-    // a mocked "✕ foo" line that this regex matches even though the real
-    // test passed).
-    const vitestMatch = trimmed.match(/^[✕✗×⨯]\s+(.+)$/u);
-    if (vitestMatch) failing.add(vitestMatch[1].trim());
-  }
-  return failing;
-}
-
-export function normalizePytestSelectorForRunner(selector: string, runner?: TestRunner): string {
-  const normalized = selector.trim().replace(/\\/g, '/');
-  if (!normalized) return '';
-  const invokesBackendScript = Boolean(
-    runner && [runner.cmd, ...runner.args].some(arg => arg.includes('scripts/test-backend.sh'))
-  );
-  const cwd = runner?.cwd.replace(/\\/g, '/') || '';
-  const runsFromBackend = invokesBackendScript || cwd.endsWith('/backend');
-  if (runsFromBackend && normalized.startsWith('backend/')) {
-    return normalized.slice('backend/'.length);
-  }
-  if (!runsFromBackend && normalized.startsWith('testing/')) {
-    return `backend/${normalized}`;
-  }
-  return normalized;
-}
-
-export function extractPytestSelectorsFromOutput(output: string): string[] {
-  const selectors = new Set<string>();
-  for (const id of parseFailingTests(output)) {
-    const normalized = id.trim().replace(/\\/g, '/');
-    if (/^(backend\/)?testing\/.+\.py(?:::|$)/.test(normalized)) {
-      selectors.add(normalized);
-    }
-  }
-
-  const selectorPattern = /\b((?:backend\/)?testing\/[A-Za-z0-9_./-]+\.py(?:::[^\s\r\n]+)?)/g;
-  for (const line of output.split('\n')) {
-    if (!/\b(?:FAILED|ERROR)\b|::error\b/i.test(line)) continue;
-    for (const match of line.matchAll(selectorPattern)) {
-      selectors.add(match[1].trim().replace(/\\/g, '/'));
-    }
-  }
-
-  return Array.from(selectors);
-}
-
-function acceptsPytestSelectors(runner: TestRunner): boolean {
-  const cmdAndArgs = [runner.cmd, ...runner.args].join(' ');
-  return cmdAndArgs.includes('pytest') || cmdAndArgs.includes('scripts/test-backend.sh');
-}
-
-function withPytestSelectors(runner: TestRunner, selectors: string[]): TestRunner | null {
-  if (!acceptsPytestSelectors(runner)) return null;
-  const normalized = Array.from(new Set(
-    selectors
-      .map(selector => normalizePytestSelectorForRunner(selector, runner))
-      .filter(Boolean)
-  ));
-  if (normalized.length === 0) return null;
-  return {
-    ...runner,
-    args: [...runner.args, ...normalized],
-    label: `${runner.label} (targeted CI failures)`,
-  };
-}
-
-export function buildTargetedPytestRunners(runners: TestRunner[], selectors: string[]): TestRunner[] {
-  return runners
-    .map(runner => withPytestSelectors(runner, selectors))
-    .filter((runner): runner is TestRunner => runner !== null);
-}
+export type { TestRunner };
+export { detectTestRunners, parseFailingTests, normalizePytestSelectorForRunner, extractPytestSelectorsFromOutput, buildTargetedPytestRunners };
 
 function withRequiredTestmon(runner: TestRunner): TestRunner {
   const invokesBackendScript = [runner.cmd, ...runner.args].some(arg => arg.includes('scripts/test-backend.sh'));

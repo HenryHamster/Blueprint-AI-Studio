@@ -1,0 +1,162 @@
+// Task-type-specific self-review focus blocks. Each block overlays the generic
+// CODE_CHANGE_HELPER_GUIDANCE with concrete, type-specific scrutiny targeting
+// the dominant miss patterns observed per task type in sr_catch_rate_trends.
+// Handlers compose these into the prompt via getTaskTypeFocusBlock(taskType).
+
+export const MIGRATE_TASK_FOCUS = `
+## Self-review focus: migrate tasks
+
+Migrate tasks carry the highest regression_risk because schema or data changes
+ripple into existing tests. Apply these additional checks before \`./done\`:
+
+1. **Down-revision chain** — verify the new migration's \`down_revision\` matches
+   the current alembic head (\`alembic heads\`). A broken chain silently skips
+   the migration in CI.
+2. **Affected tests** — scan for tests that exercise the changed models or tables.
+   Name them explicitly; record them in the \`regression_risk\` issue field even
+   when they still pass (e.g. \`"issue": "affected_tests: [test_foo, test_bar] — all still pass"\`).
+3. **EXPECTED_SCHEMA_REVISION** — if \`backend/app/main.py\` declares this constant,
+   bump it to match the new alembic head or the invariant test will fail.
+`;
+
+export const REFACTOR_TASK_FOCUS = `
+## Self-review focus: refactor tasks
+
+Refactor tasks must guarantee NO new behavior is introduced. The dominant miss
+is accidental scope-drift or subtle behavioral changes that bypass tests.
+
+1. **Scope-drift (mandatory)** — run BOTH \`git diff --stat HEAD\` AND
+   \`git diff --name-only HEAD\`. Both triggers apply: the diff-size threshold
+   (Trigger A) and the file-set check against the declared \`related_files\`
+   (Trigger B, modulo the incidental allowlist — lockfiles, generated outputs,
+   sibling test files). If ANY externally-observable behavior changed (return
+   values, side effects, error messages, API shape), record it under \`correctness\`
+   with explicit before/after: \`"issue": "behavior changed: foo() returned X, now returns Y"\`.
+2. **Caller inventory** — grep for every caller of renamed or restructured exports.
+   Verify each call site is updated and behavior-preserving.
+3. **Test delta** — a pure refactor should need no new tests; if you added tests,
+   explain why in \`blind_spots\`.
+`;
+
+export const QA_TASK_FOCUS = `
+## Self-review focus: qa tasks
+
+QA tasks must produce meaningful coverage — the dominant miss is trivial tests
+that don't exercise edge cases or new behaviors.
+
+1. **Behavior enumeration** — list every new behavior or code path under test. In
+   \`test-coverage\`, explicitly attest that each has a test: \`"issue": "behaviors
+   covered: [X, Y, Z] — each has a dedicated test"\`.
+2. **Edge cases** — for each behavior, name at least one non-happy-path scenario
+   (empty input, error branch, boundary value) and confirm a test exercises it.
+3. **Assertion strength** — tests that only check a function runs without error are
+   insufficient. Verify assertions check actual return values or side effects.
+`;
+
+export const CREATE_TASK_FOCUS = `
+## Self-review focus: create tasks
+
+Create tasks most commonly miss test coverage for new behavior and drift outside
+the declared scope. Apply these additional checks before \`./done\`:
+
+1. **Test coverage** — for every new function, class, or behavior you shipped,
+   confirm there is at least one test. In \`test-coverage\`, attest explicitly:
+   \`"issue": "new behavior X has a test in test_foo.py"\` (or note the gap).
+2. **Scope-drift** — run BOTH \`git diff --stat HEAD\` AND \`git diff --name-only HEAD\`.
+   Trigger A: diff size against the declared scope threshold. Trigger B: every
+   modified file must be in the declared \`related_files\` set OR in the incidental
+   allowlist (lockfiles like \`package-lock.json\`/\`poetry.lock\`/\`Cargo.lock\`/\`go.sum\`,
+   generated outputs, \`.gitignore\`, sibling \`*.test.*\`/\`*.spec.*\` files). Any
+   modified file outside \`related_files\` and outside the allowlist is off-scope —
+   record under \`scope-drift\` with \`passed: false\` and list the off-scope files
+   (e.g. "modified files outside declared scope: backend/app/foo.py — declared related_files: [agent/src/baz.ts]").
+3. **Cross-file consistency** — when the diff touches multiple files, identify the dominant
+   pattern introduced or modified (e.g., 'added null guard before .map calls', 'switched
+   timestamps to UTC-aware', 'added try/except around external HTTP call'). Enumerate every
+   touched file and attest that the pattern is applied consistently. If the pattern is
+   inconsistently applied across files, record under \`correctness\` with \`passed: false\`
+   and the issue: "pattern X inconsistently applied: present in [files], missing/divergent in [files]".
+4. **Caller compatibility** — grep for callers of any function or export you
+   added or modified; confirm their call sites still compile and behave correctly.
+`;
+
+export const FIX_TASK_FOCUS = `
+## Self-review focus: fix tasks
+
+Fix tasks most commonly introduce regression risk on the surface that was already
+failing, and scope creep into unrelated files. Apply these additional checks:
+
+1. **Regression surface** — identify the specific code path that was failing before
+   your fix. Confirm the fix targets ONLY that path and does not silently change
+   adjacent behavior. Record in \`regression_risk\` even when passing:
+   \`"issue": "fixed path: foo() — adjacent callers bar(), baz() verified unchanged"\`.
+2. **Scope-drift** — run BOTH \`git diff --stat HEAD\` AND \`git diff --name-only HEAD\`.
+   Fixes should be surgical, so both triggers apply: diff-size threshold (Trigger A)
+   AND the file-set check against \`related_files\` (Trigger B). Any modified file
+   outside \`related_files\` (after the incidental allowlist — lockfiles, generated
+   outputs, sibling test files like \`foo.test.ts\` next to \`foo.ts\`) is off-scope.
+   Record unjustified additions under \`scope-drift\` with \`passed: false\` and list
+   the off-scope file paths.
+3. **Root-cause vs. symptom** — confirm the fix addresses the root cause, not just
+   the observable symptom. If you only masked the symptom, record it under
+   \`correctness\` with \`passed: false\`.
+4. **Fresh verdict — do not reuse the original create task's SR** — your self-review
+   must reflect THIS iteration's diff only. The original task's self-review (propagated
+   as \`_self_review_outcome\` in context) is reference material, not a template to copy.
+   Write to \`/tmp/self_review_<YOUR_task_id>.json\` using the CURRENT task ID from the
+   ORCHESTRATOR env — never a prior task's ID.
+5. **Cross-file consistency** — when the fix touches multiple files, confirm the fix pattern
+   is applied consistently across all affected files. Identify the primary fix pattern and
+   verify it is applied in all relevant locations. If the fix is incomplete across files,
+   record under \`correctness\` with \`passed: false\` and the issue: "fix pattern inconsistency:
+   [description of where pattern is/isn't applied]".
+`;
+
+export const DOCS_TASK_FOCUS = `
+## Self-review focus: docs tasks
+
+Docs tasks most commonly ship stale links or descriptions that diverge from
+current code behavior. Apply these additional checks before \`./done\`:
+
+1. **Link rot** — for every URL or cross-reference you added or kept, verify it
+   resolves. Dead links in published docs are high-visibility failures.
+2. **Code-comment vs. behavior** — for every code snippet or function description
+   you wrote, re-read the actual implementation and confirm it matches. Divergence
+   between docs and code is worse than no docs.
+3. **Production-code untouched** — confirm \`git diff --name-only HEAD\` shows only
+   documentation files (README, docs/, docstrings). Any production-code change
+   that is not in \`related_files\` (and not an incidental allowlisted file like a
+   lockfile) belongs in a separate task; record under \`scope-drift\` with
+   \`passed: false\` and list the off-scope files.
+`;
+
+export const DEPS_TASK_FOCUS = `
+## Self-review focus: deps tasks
+
+Deps tasks most commonly leave lockfile/manifest drift or miss transitive breakage.
+Apply these additional checks before \`./done\`:
+
+1. **Lockfile/manifest parity** — confirm every file that declares a dependency
+   (package.json, requirements.txt, pyproject.toml, Cargo.toml, go.mod) has a
+   corresponding updated lockfile (package-lock.json, poetry.lock, Cargo.lock,
+   go.sum). A manifest update without a lockfile update is a broken state.
+2. **Transitive impact** — check whether bumped packages pulled in new transitive
+   deps or dropped old ones. Run the build to confirm no implicit peer-dep errors.
+3. **Major-version guard** — confirm no package crossed a major version boundary.
+   Record any that did under \`correctness\` with \`passed: false\`.
+`;
+
+// Returns the task-type-specific self-review focus block to append after
+// CODE_CHANGE_HELPER_GUIDANCE. Returns '' for task types without a custom block.
+export function getTaskTypeFocusBlock(taskType: string): string {
+  switch (taskType) {
+    case 'migrate': return MIGRATE_TASK_FOCUS;
+    case 'refactor': return REFACTOR_TASK_FOCUS;
+    case 'qa': return QA_TASK_FOCUS;
+    case 'create': return CREATE_TASK_FOCUS;
+    case 'fix': return FIX_TASK_FOCUS;
+    case 'docs': return DOCS_TASK_FOCUS;
+    case 'deps': return DEPS_TASK_FOCUS;
+    default: return '';
+  }
+}
