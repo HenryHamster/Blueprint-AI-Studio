@@ -9,7 +9,7 @@ import {
   Minus,
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { apiFetch, fetchSrUnhandledEdgesRetrospectives, fetchTask, type PromptFingerprintAnalyticsResponse, type SrUnhandledEdgesTask, type VersionLifecycleResponse } from '../api';
+import { apiFetch, fetchTask, type PromptFingerprintAnalyticsResponse, type VersionLifecycleResponse } from '../api';
 import { VersionLifecyclePanel } from './VersionLifecyclePanel';
 import { useEfficiencySnapshot, fmtEffSecs, fmtEffRate, fmtEffIter } from '../hooks/useEfficiencySnapshot';
 import { timeAgo, formatDurationSec } from '../utils/time';
@@ -30,7 +30,8 @@ import { DriftSignalsCard } from './DriftSignalsCard';
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { SystemMaturityCard, type SystemMaturityRow } from './SystemMaturityCard';
 import { DirectionPortfolioSection, type DirectionProgress } from './DirectionPortfolioSection';
-import { SrMissedRetrospective, SrReviewerDisagreementsPanel, SrUnhandledEdgesRetrospective, DirectionSrBreakdownPanel, type SrMissedTask, type SrReviewerDisagreementsData, type EdgesTrend, type DirectionSrEntry } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
+import { SrMissedRetrospective, SrReviewerDisagreementsPanel, DirectionSrBreakdownPanel, type SrMissedTask, type SrReviewerDisagreementsData, type EdgesTrend, type DirectionSrEntry } from './SrTrendBreakdown'; // EdgesTrend used in DigestData
+import { SrUnhandledEdgesRetrospectivesPanel } from './SrUnhandledEdgesRetrospectivesPanel';
 import { ReviewQualitySection, type SrFixIterationBucket, type SrTrendWithFixIterations } from './ReviewQualitySection';
 import { TAXONOMY_COLORS, TAXONOMY_LABELS, TAXONOMY_ORDER } from './dashboardConstants';
 import { ManualInterventionPanel, AutoRecoveredPanel, AnomalyTrackerPanel, PipelineRegressionsPanel } from './PipelineRegressionsPanel';
@@ -665,8 +666,6 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const [blindSpots, setBlindSpots] = useState<BlindSpotsData | null>(null);
   const [srRecentMisses, setSrRecentMisses] = useState<SrMissedTask[] | null>(null);
   const [srRecentMissesTotal, setSrRecentMissesTotal] = useState<number>(0);
-  const [srUnhandledEdgesWindowDays, setSrUnhandledEdgesWindowDays] = useState<7 | 14 | 30>(14);
-  const [srUnhandledEdgesTasks, setSrUnhandledEdgesTasks] = useState<SrUnhandledEdgesTask[] | null>(null);
   const [srReviewerDisagreements, setSrReviewerDisagreements] = useState<SrReviewerDisagreementsData | null>(null);
   const [directionSrBreakdown, setDirectionSrBreakdown] = useState<DirectionSrBreakdownData | null>(null);
   const [fingerprintAnalytics, setFingerprintAnalytics] = useState<PromptFingerprintAnalyticsResponse | null>(null);
@@ -838,12 +837,6 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
         })(),
         (async () => {
           try {
-            const data = await fetchSrUnhandledEdgesRetrospectives(selectedProjectId, { days: srUnhandledEdgesWindowDays, page_size: 500 });
-            setSrUnhandledEdgesTasks(data.items ?? []);
-          } catch { /* silent */ }
-        })(),
-        (async () => {
-          try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/direction-sr-breakdown`);
             if (res.ok) setDirectionSrBreakdown(await res.json());
           } catch { /* silent */ }
@@ -893,7 +886,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       ? !digestOk && !diagnosticsOk && !openPRsOk
       : !digestOk;
     setLastFetchError(allFailed);
-  }, [selectedProjectId, windowHours, selectedSrCategory, srUnhandledEdgesWindowDays]);
+  }, [selectedProjectId, windowHours, selectedSrCategory]);
 
   const refreshVersionLifecycle = useCallback(async () => {
     if (!selectedProjectId) return;
@@ -1189,23 +1182,13 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
           )}
 
           {/* SR Unhandled Edges */}
-          {!loading && srUnhandledEdgesTasks && srUnhandledEdgesTasks.length > 0 && (
-            <section>
-              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
-                Unhandled Edge Cases
-                <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {srUnhandledEdgesTasks.length} task{srUnhandledEdgesTasks.length !== 1 ? 's' : ''}</span>
-              </p>
-              <SrUnhandledEdgesRetrospective
-                tasks={srUnhandledEdgesTasks}
-                onTaskClick={(taskId) => {
-                  const task = tasks.find(t => t.id === taskId);
-                  if (task) onViewTask(task);
-                }}
-                windowDays={srUnhandledEdgesWindowDays}
-                onWindowDaysChange={setSrUnhandledEdgesWindowDays}
-              />
-            </section>
-          )}
+          <SrUnhandledEdgesRetrospectivesPanel
+            selectedProjectId={selectedProjectId}
+            onSelectTask={(taskId) => {
+              const task = tasks.find(t => t.id === taskId);
+              if (task) onViewTask(task);
+            }}
+          />
 
           {/* SR Blind Spots aggregation */}
           {!loading && blindSpots && blindSpots.themes.length > 0 && (

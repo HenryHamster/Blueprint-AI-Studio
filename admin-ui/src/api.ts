@@ -187,6 +187,8 @@ export interface SrMissedRetrospectivesResponse {
   page?: number;
   /** Items per page. When present with page, consumers can determine if results are truncated. */
   page_size?: number;
+  /** Per-category miss counts across the full filtered match set (not just the current page). */
+  category_counts?: Record<string, number>;
 }
 
 export async function fetchSrMissedRetrospectives(
@@ -265,6 +267,7 @@ export interface SrUnhandledEdgesTask {
 export interface SrUnhandledEdgesRetrospectiveResponse {
   items: SrUnhandledEdgesTask[];
   total: number;
+  task_types?: string[];
 }
 
 export async function fetchSrUnhandledEdgesRetrospectives(

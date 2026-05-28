@@ -118,6 +118,7 @@ async def list_sr_missed_retrospectives(
     page_items = []
     total_matched = 0
     all_task_types: set[str] = set()
+    category_counts: Dict[str, int] = defaultdict(int)
     task_stream = await session.stream(stmt)
     async for t in task_stream.scalars():
         ctx = t.context or {}
@@ -144,6 +145,8 @@ async def list_sr_missed_retrospectives(
 
         current_index = total_matched
         total_matched += 1
+        for cat in missed:
+            category_counts[cat] += 1
         if current_index < page_start or current_index >= page_end:
             continue
 
@@ -188,11 +191,13 @@ async def list_sr_missed_retrospectives(
                 "created_at": m["created_at"],
                 "missed_categories": m["missed_categories"],
                 "caught_categories": m["caught_categories"],
+                "sr_check_results": m["sr_check_results"],
+                "reviewer_findings": m["reviewer_findings"],
                 "pr_url": pr_map.get(m["task_id"]),
             }
         )
 
-    return {"items": items, "total": total_matched, "task_types": sorted(all_task_types)}
+    return {"items": items, "total": total_matched, "task_types": sorted(all_task_types), "category_counts": dict(category_counts)}
 
 
 @router.get("/projects/{project_id}/sr-unhandled-edges-retrospectives")
@@ -237,6 +242,7 @@ async def list_sr_unhandled_edges_retrospectives(
 
     page_items = []
     total_matched = 0
+    all_task_types: set[str] = set()
     task_stream = await session.stream(stmt)
     async for t in task_stream.scalars():
         ctx = t.context or {}
@@ -253,6 +259,10 @@ async def list_sr_unhandled_edges_retrospectives(
             continue
 
         t_type = (t.first_payload or {}).get("type")
+        # Accumulate task types before the task_type filter so the full type
+        # list is available in the response regardless of which filter is active.
+        if t_type:
+            all_task_types.add(t_type)
         if task_type and t_type != task_type:
             continue
 
@@ -300,7 +310,7 @@ async def list_sr_unhandled_edges_retrospectives(
             }
         )
 
-    return {"items": items, "total": total_matched}
+    return {"items": items, "total": total_matched, "task_types": sorted(all_task_types)}
 
 
 @router.get("/projects/{project_id}/sr-alert-drilldown")

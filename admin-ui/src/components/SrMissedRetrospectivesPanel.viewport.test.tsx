@@ -214,6 +214,52 @@ describe('SrMissedRetrospectivesPanel — viewport regression', () => {
     expect(dropdownAfterFilter).toBeTruthy();
   });
 
+  test('syncs categoryFilter and resets page when activeCategory prop changes', async () => {
+    const { fetchSrMissedRetrospectives } = await import('../api');
+    const spy = fetchSrMissedRetrospectives as ReturnType<typeof vi.fn>;
+    spy.mockClear();
+    // First fetch: page 1 with items (so pagination appears), then re-fetch when activeCategory changes
+    spy.mockResolvedValue({ items: MOCK_ITEMS, total: 40, task_types: ['create', 'fix'] });
+
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '900px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <SrMissedRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+          activeCategory=""
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    spy.mockClear();
+
+    // Now update activeCategory to 'correctness' — should seed categoryFilter and trigger a re-fetch
+    await act(async () => {
+      r.render(
+        <SrMissedRetrospectivesPanel
+          selectedProjectId="proj-1"
+          onSelectTask={() => {}}
+          activeCategory="correctness"
+        />,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    // The re-fetch should include the new category filter and reset to page 0
+    expect(spy).toHaveBeenCalledWith('proj-1', expect.objectContaining({ category: 'correctness', page: 0 }));
+  });
+
   test('initial fetch passes page=0 to the API matching 0-indexed backend contract', async () => {
     const { fetchSrMissedRetrospectives } = await import('../api');
     const spy = fetchSrMissedRetrospectives as ReturnType<typeof vi.fn>;

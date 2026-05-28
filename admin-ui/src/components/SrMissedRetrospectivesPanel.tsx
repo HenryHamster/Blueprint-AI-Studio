@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight } from 'lucide-react';
+import { AlertTriangle, CheckCircle, ChevronDown, ChevronRight, RefreshCw } from 'lucide-react';
 import { fetchSrMissedRetrospectives } from '../api';
 import type { SrMissedTask } from './SrTrendBreakdown';
 import { SR_CANONICAL_CATEGORIES } from './SrTrendBreakdown';
@@ -12,9 +12,10 @@ const DAY_OPTIONS = [7, 14, 30, 90];
 export interface SrMissedRetrospectivesPanelProps {
   selectedProjectId: string | null;
   onSelectTask: (taskId: string) => void;
+  activeCategory?: string;
 }
 
-export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask }: SrMissedRetrospectivesPanelProps) {
+export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask, activeCategory }: SrMissedRetrospectivesPanelProps) {
   const [items, setItems] = useState<SrMissedTask[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -24,8 +25,10 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask }:
   const [taskTypeFilter, setTaskTypeFilter] = useState('');
   const [page, setPage] = useState(1);
   const [stableTaskTypes, setStableTaskTypes] = useState<string[]>([]);
+  const [categoryCounts, setCategoryCounts] = useState<Record<string, number>>({});
   const taskTypesAccRef = useRef<Set<string>>(new Set());
   const mountedRef = useRef(true);
+  const panelMountTimeRef = useRef<number>(Date.now());
 
   const fetchData = useCallback(async () => {
     if (!selectedProjectId) return;
@@ -49,6 +52,9 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask }:
         result.items.forEach(t => { if (t.task_type) taskTypesAccRef.current.add(t.task_type); });
         setStableTaskTypes(Array.from(taskTypesAccRef.current).sort());
       }
+      if (result.category_counts) {
+        setCategoryCounts(result.category_counts);
+      }
     } catch (e) {
       if (!mountedRef.current) return;
       setFetchError(e instanceof Error ? e.message : 'network error');
@@ -63,6 +69,11 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask }:
     return () => { mountedRef.current = false; };
   }, [fetchData]);
 
+  // Sync external activeCategory prop into internal categoryFilter
+  useEffect(() => {
+    if (activeCategory !== undefined) setCategoryFilter(activeCategory);
+  }, [activeCategory]);
+
   // Reset page when filters change
   const prevFiltersRef = useRef({ days, categoryFilter, taskTypeFilter, selectedProjectId });
   useEffect(() => {
@@ -71,21 +82,22 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask }:
       setPage(1);
       taskTypesAccRef.current = new Set();
       setStableTaskTypes([]);
+      setCategoryCounts({});
       prevFiltersRef.current = { days, categoryFilter, taskTypeFilter, selectedProjectId };
     }
   }, [days, categoryFilter, taskTypeFilter, selectedProjectId]);
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const isStale = Date.now() - panelMountTimeRef.current > 300_000; // 5 minutes
+  const handleRefresh = useCallback(() => {
+    panelMountTimeRef.current = Date.now();
+    fetchData();
+  }, [fetchData]);
 
-  const catFreq = useMemo(() => {
-    const freq: Record<string, number> = {};
-    for (const t of items) {
-      for (const cat of t.missed_categories) {
-        freq[cat] = (freq[cat] ?? 0) + 1;
-      }
-    }
-    return Object.entries(freq).sort((a, b) => b[1] - a[1]);
-  }, [items]);
+  const catFreq = useMemo(
+    () => Object.entries(categoryCounts).sort((a, b) => b[1] - a[1]),
+    [categoryCounts]
+  );
 
   if (!selectedProjectId) return null;
 
@@ -185,7 +197,7 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask }:
             ))}
           </div>
           {totalPages > 1 && (
-            <div className="flex items-center gap-2 mt-2 text-[10px] text-neutral-400">
+            <div className="flex flex-wrap items-center gap-2 mt-2 text-[10px] text-neutral-400">
               {/* eslint-disable-next-line viewport/min-touch-target -- compact pagination, consistent with adjacent panels */}
               <button
                 type="button"
@@ -194,7 +206,10 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask }:
                 className="px-1.5 py-0.5 border border-neutral-700 rounded disabled:opacity-40 hover:border-neutral-500"
                 aria-label="Previous page"
               >←</button>
-              <span>{page} / {totalPages}</span>
+              <span>
+                Page {page} of {totalPages} · {total} total
+                {total > 0 && ` · showing ${(page - 1) * PAGE_SIZE + 1}–${Math.min(page * PAGE_SIZE, total)}`}
+              </span>
               {/* eslint-disable-next-line viewport/min-touch-target -- compact pagination, consistent with adjacent panels */}
               <button
                 type="button"
@@ -203,6 +218,19 @@ export function SrMissedRetrospectivesPanel({ selectedProjectId, onSelectTask }:
                 className="px-1.5 py-0.5 border border-neutral-700 rounded disabled:opacity-40 hover:border-neutral-500"
                 aria-label="Next page"
               >→</button>
+              {isStale && (
+                // eslint-disable-next-line viewport/min-touch-target -- dense control
+                <button
+                  type="button"
+                  onClick={handleRefresh}
+                  disabled={loading}
+                  className="p-1 text-neutral-500 hover:text-neutral-300 disabled:opacity-40"
+                  title="Refresh data (window may have moved)"
+                  aria-label="Refresh pagination data"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                </button>
+              )}
             </div>
           )}
         </>

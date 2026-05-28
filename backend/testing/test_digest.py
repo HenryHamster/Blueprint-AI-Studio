@@ -11632,6 +11632,276 @@ async def test_sr_missed_retrospectives_zero_based_pagination(
     assert ids0.isdisjoint(ids1), "page=0 and page=1 must return non-overlapping task sets"
 
 
+@pytest.mark.asyncio
+async def test_sr_missed_retrospectives_category_counts_stable_across_pages(
+    client: AsyncClient, db_session
+):
+    """category_counts is identical on every page and matches actual per-category totals."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # 12 tasks missed 'correctness', 8 tasks missed 'architecture', 5 missed both
+    for i in range(12):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Correctness-only task {i}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_first_attempt_rejection_categories": {"correctness": 1},
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {"correctness": {"passed": True}},
+                        "blind_spots": [],
+                    },
+                },
+            )
+        )
+    for i in range(8):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Architecture-only task {i}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "fix"}],
+                context={
+                    "_first_attempt_rejection_categories": {"architecture": 1},
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {"architecture": {"passed": True}},
+                        "blind_spots": [],
+                    },
+                },
+            )
+        )
+    for i in range(5):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Both-category task {i}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_first_attempt_rejection_categories": {"correctness": 1, "architecture": 1},
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "check_results": {
+                            "correctness": {"passed": True},
+                            "architecture": {"passed": True},
+                        },
+                        "blind_spots": [],
+                    },
+                },
+            )
+        )
+    await db_session.commit()
+
+    # Fetch page 0 and page 1 with small page_size to force multi-page
+    r0 = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives?page=0&page_size=10"
+    )
+    assert r0.status_code == 200
+    body0 = r0.json()
+
+    r1 = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives?page=1&page_size=10"
+    )
+    assert r1.status_code == 200
+    body1 = r1.json()
+
+    # category_counts must be present on both pages
+    assert "category_counts" in body0
+    assert "category_counts" in body1
+
+    # counts are identical across pages
+    assert body0["category_counts"] == body1["category_counts"]
+
+    # correctness: 12 solo + 5 both = 17; architecture: 8 solo + 5 both = 13
+    assert body0["category_counts"]["correctness"] == 17
+    assert body0["category_counts"]["architecture"] == 13
+
+    # With task_type=create filter: only create tasks (12 correctness-only + 5 both)
+    r_create = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives?task_type=create&page_size=5"
+    )
+    assert r_create.status_code == 200
+    body_create = r_create.json()
+    assert body_create["category_counts"]["correctness"] == 17
+    assert body_create["category_counts"]["architecture"] == 5
+
+
+@pytest.mark.asyncio
+async def test_sr_missed_retrospectives_drilldown_fields_present(
+    client: AsyncClient, db_session
+):
+    """sr_check_results and reviewer_findings are included in each response item."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    long_desc = "y" * 450
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Drilldown task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "create"}],
+            context={
+                "_first_attempt_rejection_categories": {"correctness": 1},
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "check_results": {
+                        "correctness": {
+                            "passed": True,
+                            "issue": "sr note",
+                            "origin": "reviewer",
+                        },
+                        "performance": {"passed": False},
+                    },
+                    "reviewer_findings": [
+                        {
+                            "category": "correctness",
+                            "severity": "HIGH",
+                            "description": long_desc,
+                        },
+                        {
+                            "category": "security",
+                            "severity": "LOW",
+                            "description": "ignored category",
+                        },
+                    ],
+                },
+            },
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-missed-retrospectives"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    row = body["items"][0]
+    # sr_check_results must be present and filtered to missed categories only
+    assert "sr_check_results" in row, "sr_check_results missing from response item"
+    assert set(row["sr_check_results"]) == {"correctness"}
+    assert row["sr_check_results"]["correctness"]["origin"] == "reviewer"
+    assert row["sr_check_results"]["correctness"]["issue"] == "sr note"
+    # reviewer_findings must be present and filtered to missed categories, description truncated
+    assert "reviewer_findings" in row, "reviewer_findings missing from response item"
+    assert row["reviewer_findings"] == [
+        {
+            "category": "correctness",
+            "severity": "HIGH",
+            "description": long_desc[:400],
+        }
+    ]
+
+
+# ---------------------------------------------------------------------------
+# SR unhandled edges endpoint — task_types and pagination parity tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sr_unhandled_edges_task_types_returned(
+    client: AsyncClient, db_session
+):
+    """task_types field lists all types in matched set, independent of task_type filter."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    for ttype in ("create", "fix"):
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title=f"Task {ttype}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": ttype}],
+                context={
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "edges_considered": [
+                            {"case": "empty input", "handled": False}
+                        ],
+                        "blind_spots": [],
+                    },
+                },
+            )
+        )
+    await db_session.commit()
+
+    # Without task_type filter: both types returned
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-unhandled-edges-retrospectives"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert sorted(body["task_types"]) == ["create", "fix"]
+
+    # With task_type filter: task_types still lists all types, total is filtered
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-unhandled-edges-retrospectives?task_type=create"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert sorted(body["task_types"]) == ["create", "fix"]
+    assert body["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sr_unhandled_edges_total_not_capped_at_page_size(
+    client: AsyncClient, db_session
+):
+    """Backlog total counts all matching tasks, not just the returned page."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add_all(
+        [
+            make_task(
+                project_id=project.id,
+                title=f"Edge task {i}",
+                status=TaskStatus.COMPLETED,
+                payloads=[{"type": "create"}],
+                context={
+                    "_self_review_outcome": {
+                        "verdict": "pass",
+                        "fixes_applied": False,
+                        "edges_considered": [
+                            {"case": "null pointer", "handled": False}
+                        ],
+                        "blind_spots": [],
+                    },
+                },
+            )
+            for i in range(205)
+        ]
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/admin/projects/{project.id}/sr-unhandled-edges-retrospectives?page_size=3"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 205
+    assert len(body["items"]) == 3
+
+
 # ---------------------------------------------------------------------------
 # SR recent misses endpoint
 # ---------------------------------------------------------------------------
