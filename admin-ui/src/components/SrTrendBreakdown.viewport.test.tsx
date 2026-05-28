@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { SrTrendBreakdown, type SrTrendData } from './SrTrendBreakdown';
+import { SrTrendBreakdown, SrMissedRetrospective, SrUnhandledEdgesRetrospective, type SrTrendData, type SrMissedTask, type SrUnhandledEdgesTask } from './SrTrendBreakdown';
 import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
 
 const sampleTrends: SrTrendData = {
@@ -203,5 +203,121 @@ describe('SrTrendBreakdown — viewport regression', () => {
         );
       });
     });
+  });
+});
+
+describe('SrMissedRetrospective — cutoff recalculates on windowDays change', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    vi.useRealTimers();
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) {
+      host.remove();
+      host = null;
+    }
+  });
+
+  test('tasks outside the new window disappear when windowDays shrinks', async () => {
+    const base = new Date('2026-05-28T12:00:00Z').getTime();
+    vi.useFakeTimers();
+    vi.setSystemTime(base);
+
+    // Task created 8 days ago — inside a 14-day window, outside a 7-day window
+    const borderTask: SrMissedTask = {
+      task_id: 'border-1',
+      title: 'Border task',
+      missed_categories: ['correctness'],
+      caught_categories: [],
+      created_at: new Date(base - 8 * 86400_000).toISOString(),
+    };
+    // Task created 3 days ago — inside both windows
+    const safeTask: SrMissedTask = {
+      task_id: 'safe-1',
+      title: 'Safe task',
+      missed_categories: ['correctness'],
+      caught_categories: [],
+      created_at: new Date(base - 3 * 86400_000).toISOString(),
+    };
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+
+    // Render with 14-day window — both tasks visible
+    await act(async () => {
+      r.render(<SrMissedRetrospective tasks={[borderTask, safeTask]} windowDays={14} />);
+    });
+    expect(host.textContent).toContain('2 tasks');
+
+    // Advance time slightly then switch to 7-day window — border task should drop out
+    vi.setSystemTime(base + 60_000);
+    await act(async () => {
+      r.render(<SrMissedRetrospective tasks={[borderTask, safeTask]} windowDays={7} />);
+    });
+    expect(host.textContent).toContain('1 task');
+    expect(host.textContent).toContain('Safe task');
+    expect(host.textContent).not.toContain('Border task');
+  });
+});
+
+describe('SrUnhandledEdgesRetrospective — cutoff recalculates on windowDays change', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    vi.useRealTimers();
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) {
+      host.remove();
+      host = null;
+    }
+  });
+
+  test('tasks outside the new window disappear when windowDays shrinks', async () => {
+    const base = new Date('2026-05-28T12:00:00Z').getTime();
+    vi.useFakeTimers();
+    vi.setSystemTime(base);
+
+    const borderTask: SrUnhandledEdgesTask = {
+      task_id: 'border-2',
+      title: 'Border unhandled task',
+      unhandled_edges: [{ case: 'null-payload', handled: false }],
+      created_at: new Date(base - 8 * 86400_000).toISOString(),
+    };
+    const safeTask: SrUnhandledEdgesTask = {
+      task_id: 'safe-2',
+      title: 'Safe unhandled task',
+      unhandled_edges: [{ case: 'timeout', handled: false }],
+      created_at: new Date(base - 3 * 86400_000).toISOString(),
+    };
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+
+    await act(async () => {
+      r.render(<SrUnhandledEdgesRetrospective tasks={[borderTask, safeTask]} windowDays={14} />);
+    });
+    expect(host.textContent).toContain('2 tasks');
+
+    vi.setSystemTime(base + 60_000);
+    await act(async () => {
+      r.render(<SrUnhandledEdgesRetrospective tasks={[borderTask, safeTask]} windowDays={7} />);
+    });
+    expect(host.textContent).toContain('1 task');
+    expect(host.textContent).toContain('Safe unhandled task');
+    expect(host.textContent).not.toContain('Border unhandled task');
   });
 });

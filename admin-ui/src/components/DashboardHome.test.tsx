@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { DashboardHome } from './DashboardHome';
 import type { Task } from '../types/task';
@@ -15,6 +15,7 @@ const { apiFetchMock, fetchQualificationVerdictsMock, fetchTaskMock, capturedPro
     providerCostPanel: null as Record<string, unknown> | null,
     scopeTrends: null as Record<string, unknown> | null,
     directionAutoPause: null as Record<string, unknown> | null,
+    srUnhandledEdges: null as Record<string, unknown> | null,
   },
 }));
 
@@ -92,6 +93,13 @@ vi.mock('./StrategicAuditPanel', () => ({
   StrategicAuditPanel: () => null,
 }));
 
+vi.mock('./SrUnhandledEdgesRetrospectivesPanel', () => ({
+  SrUnhandledEdgesRetrospectivesPanel: (props: Record<string, unknown>) => {
+    capturedProps.srUnhandledEdges = props;
+    return <div data-testid="sr-unhandled-edges-panel">SrUnhandledEdgesRetrospectivesPanel</div>;
+  },
+}));
+
 function jsonResponse(data: unknown): Response {
   return {
     ok: true,
@@ -106,6 +114,14 @@ function notFoundResponse(): Response {
     status: 404,
     json: async () => ({}),
   } as Response;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>(r => {
+    resolve = r;
+  });
+  return { promise, resolve };
 }
 
 function makeTask(overrides: Partial<Task> = {}): Task {
@@ -693,6 +709,7 @@ describe('DashboardHome', () => {
       capturedProps.providerCostPanel = null;
       capturedProps.scopeTrends = null;
       capturedProps.directionAutoPause = null;
+      capturedProps.srUnhandledEdges = null;
     });
 
     const baseDigest = { failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] };
@@ -758,6 +775,82 @@ describe('DashboardHome', () => {
       expect(cpProps.windowHours).toBe(48);
     });
 
+    it('keeps stale project-scoped responses from overwriting the current dashboard context', async () => {
+      const staleOpenPrs = deferred<Response>();
+
+      apiFetchMock.mockImplementation((url: string) => {
+        if (url.includes('/api/admin/digest')) return Promise.resolve(jsonResponse({ failed_count: 0, pending_approval_count: 0, completed_count: 0, failure_groups: [], direction_progress: [], recent_completions: [] }));
+        if (url.includes('/diagnostics')) return Promise.resolve(jsonResponse(makeDiagnostics()));
+        if (url.includes('/api/admin/open-prs?project_id=proj-a')) return staleOpenPrs.promise;
+        if (url.includes('/api/admin/open-prs?project_id=proj-b')) {
+          return Promise.resolve(jsonResponse({
+            open_prs: [
+              {
+                pr_number: 202,
+                pr_url: 'https://example.com/proj-b',
+                pr_title: 'Project B PR',
+                pr_branch: 'proj-b/feature',
+                pr_base_branch: 'main',
+                pr_created_at: '2026-05-01T00:00:00Z',
+                tasks: [],
+                is_orphaned: false,
+              },
+            ],
+            project_integration_branch: 'main',
+            project_promotion_target: 'main',
+          }));
+        }
+        if (url.includes('/api/admin/medium-scope-measurement')) return Promise.resolve(jsonResponse({}));
+        if (url.includes('/api/admin/scope-baselines')) return Promise.resolve(jsonResponse({}));
+        if (url.includes('/api/admin/max-plan-accounts/health')) return Promise.resolve(jsonResponse({ accounts: [] }));
+        if (url.includes('/api/admin/projects/') && url.includes('/system-maturity')) return Promise.resolve(jsonResponse([]));
+        if (url.includes('/api/admin/projects/') && url.includes('/sr-blind-spots')) return Promise.resolve(notFoundResponse());
+        if (url.includes('/api/admin/projects/') && url.includes('/sr-reviewer-disagreements')) return Promise.resolve(notFoundResponse());
+        if (url.includes('/api/admin/projects/') && url.includes('/sr-recent-misses')) return Promise.resolve(notFoundResponse());
+        if (url.includes('/api/admin/projects/') && url.includes('/direction-sr-breakdown')) return Promise.resolve(notFoundResponse());
+        if (url.includes('/api/admin/projects/') && url.includes('/prompt-fingerprint-analytics')) return Promise.resolve(notFoundResponse());
+        if (url.includes('/api/admin/projects/') && url.includes('/version-lifecycle')) return Promise.resolve(notFoundResponse());
+        if (url.includes('/api/admin/task-duration-stats')) return Promise.resolve(jsonResponse({}));
+        if (url.includes('/api/admin/health-overview')) return Promise.resolve(jsonResponse({ overall_status: 'healthy', success_rate: { current: null, trend: null, window_hours: 24 }, queue_depth: { queued: 0, active: 0, evaluating: 0 }, actionable_issues: [] }));
+        return Promise.resolve(notFoundResponse());
+      });
+
+      const user = userEvent.setup();
+      const { rerender } = render(<DashboardHome tasks={[]} selectedProjectId="proj-a" onViewTask={vi.fn()} />);
+
+      rerender(<DashboardHome tasks={[]} selectedProjectId="proj-b" onViewTask={vi.fn()} />);
+
+      await user.selectOptions(screen.getByRole('combobox'), '48');
+      await waitFor(() => {
+        const prProps = capturedProps.prMonitor as { openPRs?: Array<{ pr_title: string }>; loading?: boolean } | null;
+        expect(prProps?.loading).toBe(false);
+        expect(prProps?.openPRs?.[0]?.pr_title).toBe('Project B PR');
+      });
+
+      staleOpenPrs.resolve(jsonResponse({
+        open_prs: [
+          {
+            pr_number: 101,
+            pr_url: 'https://example.com/proj-a',
+            pr_title: 'Project A PR',
+            pr_branch: 'proj-a/feature',
+            pr_base_branch: 'main',
+            pr_created_at: '2026-05-01T00:00:00Z',
+            tasks: [],
+            is_orphaned: false,
+          },
+        ],
+        project_integration_branch: 'main',
+        project_promotion_target: 'main',
+      }));
+
+      await waitFor(() => {
+        const prProps = capturedProps.prMonitor as { openPRs?: Array<{ pr_title: string }> } | null;
+        expect(prProps?.openPRs?.[0]?.pr_title).toBe('Project B PR');
+        expect(prProps?.openPRs?.some(pr => pr.pr_title === 'Project A PR')).toBe(false);
+      });
+    });
+
     it('passes open=false and onToggle to ScopeTrendsSection', async () => {
       setupApiMocks({ digest: baseDigest, diagnostics: makeDiagnostics() });
 
@@ -777,6 +870,23 @@ describe('DashboardHome', () => {
       await screen.findByText('All systems healthy');
       const daProps = capturedProps.directionAutoPause ?? {};
       expect(daProps.selectedProjectId).toBe('proj-xyz');
+    });
+
+    it('passes selectedProjectId and onSelectTask to SrUnhandledEdgesRetrospectivesPanel', async () => {
+      setupApiMocks({ digest: baseDigest, diagnostics: makeDiagnostics() });
+      const onViewTask = vi.fn();
+      const task = makeTask({ id: 'task-unhandled' });
+
+      render(<DashboardHome tasks={[task]} selectedProjectId="proj-abc" onViewTask={onViewTask} />);
+
+      await screen.findByText('All systems healthy');
+      const ueProps = capturedProps.srUnhandledEdges ?? {};
+      expect(ueProps.selectedProjectId).toBe('proj-abc');
+      expect(typeof ueProps.onSelectTask).toBe('function');
+
+      // onSelectTask should call onViewTask with the matching task
+      (ueProps.onSelectTask as (id: string) => void)('task-unhandled');
+      expect(onViewTask).toHaveBeenCalledWith(task);
     });
   });
 

@@ -56,6 +56,9 @@ _EXEMPT_FROM_VIEWPORT_TEST: frozenset[str] = frozenset(
         # Message-row sub-component rendered exclusively inside MessagesPanel;
         # viewport coverage is provided by MessagesPanel.viewport.test.tsx.
         "MessageBubble",
+        # Needs-attention worklist sub-component rendered exclusively inside
+        # CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx.
+        "CatchUpNeedsAttentionSection",
     ]
 )
 

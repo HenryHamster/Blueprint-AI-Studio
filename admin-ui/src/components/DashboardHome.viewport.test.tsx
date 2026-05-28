@@ -537,6 +537,51 @@ describe('DashboardHome — viewport regression', () => {
     }, { selector: '[data-testid="phase-controls"] button' });
   });
 
+  test('SR diagnostics stack renders without overflow when recent-miss data is present at 375px', async () => {
+    const savedImpl = vi.mocked(apiFetch).getMockImplementation();
+    vi.mocked(apiFetch).mockImplementation(async (url: string) => {
+      if (url.includes('/sr-recent-misses')) {
+        return new Response(JSON.stringify({
+          misses: [{
+            task_id: 'task-sr-1',
+            title: 'feat: refactor DashboardHome SR diagnostics stack for focused home-screen section',
+            task_type: 'refactor',
+            scope: 'small',
+            created_at: new Date(Date.now() - 3_600_000).toISOString(),
+            missed_categories: ['correctness', 'security', 'test-coverage'],
+            caught_categories: ['style-conventions'],
+            pr_url: null,
+          }],
+          total: 1,
+        }), { status: 200 });
+      }
+      if (url.includes('/digest')) return new Response(JSON.stringify({ failed_count: 3, pending_approval_count: 1, direction_progress: [], recent_completions: [], failure_groups: [], success_rate: 0.82, trend: 'stable', trend_history: [], completed_count: 24 }), { status: 200 });
+      if (url.includes('/task-duration-stats')) return new Response(JSON.stringify({ stats: {}, scope_duration_stats: {}, phase_duration_stats: {} }), { status: 200 });
+      if (url.includes('/health-overview')) return new Response(JSON.stringify({ overall_status: 'healthy', success_rate: { current: 0.87, trend: 'stable', window_hours: 24 }, queue_depth: { queued: 2, active: 3, evaluating: 1 }, actionable_issues: [] }), { status: 200 });
+      if (url.includes('/version-lifecycle')) return new Response(JSON.stringify(versionLifecycleResponse), { status: 200 });
+      return new Response('not found', { status: 404 });
+    });
+
+    try {
+      await expectNoOverflowAt(375, async () => {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<DashboardHome tasks={POPULATED_TASKS} selectedProjectId="proj-abc" onViewTask={() => {}} />);
+        });
+        await act(async () => {
+          await new Promise<void>((resolve) => setTimeout(resolve, 50));
+        });
+        expect(screen.getByText('Recent SR Misses')).toBeInTheDocument();
+      });
+    } finally {
+      if (savedImpl) vi.mocked(apiFetch).mockImplementation(savedImpl);
+    }
+  });
+
   test('direction portfolio cards with realistic data do not overflow at 375px', async () => {
     vi.mocked(apiFetch).mockImplementationOnce(async (url: string) => {
       if (url.includes('/digest')) {

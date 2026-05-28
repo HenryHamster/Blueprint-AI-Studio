@@ -155,6 +155,16 @@ function MessageTypeDropdown({ value, onChange }: { value: string; onChange: (v:
   );
 }
 
+function TimeDividerRow({ label, className }: { label: string; className?: string }) {
+  return (
+    <div className={`flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2${className ? ` ${className}` : ''}`}>
+      <div className="flex-1 border-t border-neutral-800/60" />
+      <span className="shrink-0">{label}</span>
+      <div className="flex-1 border-t border-neutral-800/60" />
+    </div>
+  );
+}
+
 async function fetchBackendLastSeen(projectId: string): Promise<number | null> {
   try {
     const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/last-seen?project_id=${encodeURIComponent(projectId)}`);
@@ -298,6 +308,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // of toasts for project B's pre-existing open BLOCKER/BUG/FEEDBACK items).
   // Also reload event prefs and initialize divider time for new project.
   useEffect(() => {
+    let active = true;
     seenMessageIdsRef.current = new Set();
     seenPromotedGroupKeysRef.current = new Set();
     hasInitiallyLoadedRef.current = false;
@@ -314,6 +325,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       // Prefer backend last-seen over localStorage — if backend has a more recent
       // timestamp (e.g. dismissed on another device), update the divider position.
       fetchBackendLastSeen(selectedProjectId).then(backendTs => {
+        if (!active) return;
         if (backendTs !== null && backendTs > (dividerTimeRef.current ?? 0)) {
           setDividerTime(backendTs);
           dividerTimeRef.current = backendTs;
@@ -330,6 +342,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       });
       // Prefer server noise prefs over localStorage — picks up prefs set on another device.
       fetchServerNoisePrefs(selectedProjectId).then(serverPrefs => {
+        if (!active) return;
         if (serverPrefs !== null) {
           setEventPrefs(serverPrefs);
           saveEventPrefs(auth.currentUser?.email, selectedProjectId, serverPrefs);
@@ -337,6 +350,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       });
       // Prefer server temp-mutes over localStorage — expiry semantics preserved (expired entries dropped).
       fetchServerTempMutes(selectedProjectId).then(serverMutes => {
+        if (!active) return;
         if (serverMutes !== null) {
           setTempMutes(serverMutes);
           saveTemporaryMutes(auth.currentUser?.email, selectedProjectId, serverMutes);
@@ -344,6 +358,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       });
       // Prefer server mute-window over localStorage — undefined = fetch failed, keep local fallback.
       fetchServerMuteWindow(selectedProjectId).then(serverWin => {
+        if (!active) return;
         if (serverWin !== undefined) {
           setMuteWindow(serverWin);
           if (serverWin !== null) {
@@ -361,12 +376,14 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     if (selectedProjectId) {
       // Prefer server saved views over localStorage — picks up views created on another device.
       fetchServerSavedViews(selectedProjectId).then(serverViews => {
+        if (!active) return;
         if (serverViews !== null) {
           setSavedViews(serverViews);
           saveSavedViews(auth.currentUser?.email, selectedProjectId, serverViews);
         }
       });
     }
+    return () => { active = false; };
   }, [selectedProjectId]);
 
   // Close kebab menu on outside click — same pattern as MessageTypeDropdown.
@@ -1528,11 +1545,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
                 </div>
                 {insertTimeDividers(pinnedBlockers).map((item, idx) =>
                   item.kind === 'divider' ? (
-                    <div key={`divider-pinned-${idx}`} className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2">
-                      <div className="flex-1 border-t border-neutral-800/60" />
-                      <span className="shrink-0">{item.label}</span>
-                      <div className="flex-1 border-t border-neutral-800/60" />
-                    </div>
+                    <TimeDividerRow key={`divider-pinned-${idx}`} label={item.label} />
                   ) : (
                     <MessageBubble key={item.msg.id} msg={item.msg} allMessages={messages} {...bubbleProps} />
                   )
@@ -1552,11 +1565,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
                   </div>
                   {insertTimeDividers(pinnedQuestions).map((item, idx) =>
                     item.kind === 'divider' ? (
-                      <div key={`divider-questions-${idx}`} className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2">
-                        <div className="flex-1 border-t border-neutral-800/60" />
-                        <span className="shrink-0">{item.label}</span>
-                        <div className="flex-1 border-t border-neutral-800/60" />
-                      </div>
+                      <TimeDividerRow key={`divider-questions-${idx}`} label={item.label} />
                     ) : (
                       <MessageBubble key={item.msg.id} msg={item.msg} allMessages={messages} {...bubbleProps} />
                     )
@@ -1607,11 +1616,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
             <div ref={blockersRefEl}>
               {insertTimeDividers(otherHighSignal).map((item, idx) =>
                 item.kind === 'divider' ? (
-                  <div key={`divider-high-${idx}`} className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2">
-                    <div className="flex-1 border-t border-neutral-800/60" />
-                    <span className="shrink-0">{item.label}</span>
-                    <div className="flex-1 border-t border-neutral-800/60" />
-                  </div>
+                  <TimeDividerRow key={`divider-high-${idx}`} label={item.label} />
                 ) : (
                   <MessageBubble key={item.msg.id} msg={item.msg} allMessages={messages} {...bubbleProps} />
                 )
@@ -1756,11 +1761,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
                           return (
                             <div key={row.key}>
                               {hasDividerBefore && dividerLabel && (
-                                <div className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2 mb-2">
-                                  <div className="flex-1 border-t border-neutral-800/60" />
-                                  <span className="shrink-0">{dividerLabel}</span>
-                                  <div className="flex-1 border-t border-neutral-800/60" />
-                                </div>
+                                <TimeDividerRow label={dividerLabel} className="mb-2" />
                               )}
                               <div className="border border-neutral-800/40 rounded-xl overflow-hidden">
                                 <div className="flex items-center gap-2 px-3 py-2 bg-neutral-900/30">
@@ -1800,11 +1801,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
                           return (
                             <div key={digestKey}>
                               {hasDividerBefore && dividerLabel && (
-                                <div className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2 mb-2">
-                                  <div className="flex-1 border-t border-neutral-800/60" />
-                                  <span className="shrink-0">{dividerLabel}</span>
-                                  <div className="flex-1 border-t border-neutral-800/60" />
-                                </div>
+                                <TimeDividerRow label={dividerLabel} className="mb-2" />
                               )}
                               <div className="border border-neutral-800/40 rounded-xl overflow-hidden opacity-60">
                                 <button
@@ -1828,11 +1825,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
                         return (
                           <div key={`single-${row.msg.id}`}>
                             {hasDividerBefore && dividerLabel && (
-                              <div className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2 mb-2">
-                                <div className="flex-1 border-t border-neutral-800/60" />
-                                <span className="shrink-0">{dividerLabel}</span>
-                                <div className="flex-1 border-t border-neutral-800/60" />
-                              </div>
+                              <TimeDividerRow label={dividerLabel} className="mb-2" />
                             )}
                             <MessageBubble key={row.msg.id} msg={row.msg} allMessages={messages} {...bubbleProps} />
                           </div>
@@ -1847,11 +1840,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
             {/* Resolved messages (faded) */}
             {insertTimeDividers(visibleResolved).map((item, idx) =>
               item.kind === 'divider' ? (
-                <div key={`divider-resolved-${idx}`} className="flex items-center gap-1.5 text-[11px] text-neutral-600 font-semibold uppercase tracking-wide px-1 mt-2">
-                  <div className="flex-1 border-t border-neutral-800/60" />
-                  <span className="shrink-0">{item.label}</span>
-                  <div className="flex-1 border-t border-neutral-800/60" />
-                </div>
+                <TimeDividerRow key={`divider-resolved-${idx}`} label={item.label} />
               ) : (
                 <MessageBubble key={item.msg.id} msg={item.msg} faded allMessages={messages} {...bubbleProps} />
               )

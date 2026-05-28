@@ -415,6 +415,209 @@ function PipelineEfficiencyPanel({ projectId }: { projectId: string | null }) {
   );
 }
 
+// ---------- SR diagnostics stack ----------
+
+interface SrDiagnosticsStackProps {
+  loading: boolean;
+  selectedProjectId: string | null;
+  tasks: Task[];
+  onViewTask: (task: Task) => void;
+  onDirectionClick?: (directionId: string) => void;
+  srRecentMisses: SrMissedTask[] | null;
+  srRecentMissesTotal: number;
+  selectedSrCategory: string;
+  blindSpots: BlindSpotsData | null;
+  expandedBlindSpotThemes: Set<string>;
+  onToggleBlindSpotTheme: (theme: string) => void;
+  srReviewerDisagreements: SrReviewerDisagreementsData | null;
+  directionSrBreakdown: DirectionSrBreakdownData | null;
+  fingerprintAnalytics: PromptFingerprintAnalyticsResponse | null;
+}
+
+function SrDiagnosticsStack({
+  loading,
+  selectedProjectId,
+  tasks,
+  onViewTask,
+  onDirectionClick,
+  srRecentMisses,
+  srRecentMissesTotal,
+  selectedSrCategory,
+  blindSpots,
+  expandedBlindSpotThemes,
+  onToggleBlindSpotTheme,
+  srReviewerDisagreements,
+  directionSrBreakdown,
+  fingerprintAnalytics,
+}: SrDiagnosticsStackProps) {
+  return (
+    <>
+      {/* SR Recent Misses */}
+      {!loading && srRecentMisses && srRecentMisses.length > 0 && (
+        <section>
+          <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
+            Recent SR Misses
+            <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {srRecentMissesTotal} task{srRecentMissesTotal !== 1 ? 's' : ''}</span>
+          </p>
+          <SrMissedRetrospective
+            tasks={srRecentMisses}
+            selectedCategory={selectedSrCategory}
+            onTaskClick={(taskId) => {
+              const task = tasks.find(t => t.id === taskId);
+              if (task) onViewTask(task);
+            }}
+          />
+        </section>
+      )}
+
+      {/* SR Unhandled Edges */}
+      <SrUnhandledEdgesRetrospectivesPanel
+        selectedProjectId={selectedProjectId}
+        onSelectTask={(taskId) => {
+          const task = tasks.find(t => t.id === taskId);
+          if (task) onViewTask(task);
+        }}
+      />
+
+      {/* SR Blind Spots aggregation */}
+      {!loading && blindSpots && blindSpots.themes.length > 0 && (
+        <section>
+          <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
+            SR Blind Spots
+            <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {blindSpots.total_distinct_themes} themes · {blindSpots.window_days}d</span>
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {blindSpots.themes.slice(0, 8).map((t, i) => {
+              const isExpanded = expandedBlindSpotThemes.has(t.theme);
+              const handleViewExample = (taskId: string) => {
+                const task = tasks.find(tk => tk.id === taskId);
+                if (task) {
+                  onViewTask(task);
+                } else {
+                  fetchTask(taskId).then(onViewTask).catch(() => {
+                    console.error(`Failed to fetch task ${taskId}`);
+                  });
+                }
+              };
+              return (
+                <div key={i} className="flex flex-col gap-0.5 min-w-0">
+                  <button
+                    onClick={() => onToggleBlindSpotTheme(t.theme)}
+                    className="inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border bg-violet-500/10 text-violet-400 border-violet-500/20 cursor-pointer hover:bg-violet-500/20 transition-colors min-h-[44px]"
+                    title={t.theme}
+                  >
+                    <span className="truncate max-w-[160px]">{t.theme}</span>
+                    <span className="font-bold shrink-0">×{t.count}</span>
+                  </button>
+                  {isExpanded && t.examples && t.examples.length > 0 && (
+                    <div className="flex flex-col gap-1 ml-1 border-l border-violet-500/20 pl-2">
+                      {t.examples.map((ex, exIdx) => (
+                        <div key={exIdx} className="text-[9px] text-neutral-300">
+                          <span className="text-neutral-500 block mb-0.5">{ex.text}</span>
+                          <button
+                            onClick={() => handleViewExample(ex.task_id)}
+                            className="text-violet-400 hover:text-violet-300 cursor-pointer underline"
+                          >
+                            View task
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {t.layer_distribution && Object.keys(t.layer_distribution).length > 0 && (
+                    <div className="flex flex-wrap gap-1">
+                      {Object.entries(t.layer_distribution)
+                        .sort((a, b) => b[1] - a[1])
+                        .map(([layer, cnt]) => (
+                          <span
+                            key={layer}
+                            className="inline-flex items-center gap-0.5 text-[9px] px-1.5 py-0.5 rounded border bg-neutral-500/10 text-neutral-400 border-neutral-500/20 max-w-[140px]"
+                          >
+                            <span className="truncate">{layer}</span>
+                            <span className="shrink-0">×{cnt}</span>
+                          </span>
+                        ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      {/* SR Reviewer Disagreements */}
+      {!loading && srReviewerDisagreements && srReviewerDisagreements.disagreements.length > 0 && (
+        <section>
+          <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
+            SR ↔ Reviewer Disagreements
+            <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {srReviewerDisagreements.window_days}d · {srReviewerDisagreements.total_entries} categor{srReviewerDisagreements.total_entries !== 1 ? 'ies' : 'y'}</span>
+          </p>
+          <SrReviewerDisagreementsPanel data={srReviewerDisagreements} />
+        </section>
+      )}
+
+      {/* Per-Direction SR Catch-Rate */}
+      {!loading && directionSrBreakdown && directionSrBreakdown.directions.length > 0 && (
+        <section data-testid="direction-sr-breakdown">
+          <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
+            SR Catch-Rate by Direction
+            <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">
+              · {directionSrBreakdown.directions.length} direction{directionSrBreakdown.directions.length !== 1 ? 's' : ''} · worst-first
+            </span>
+          </p>
+          <DirectionSrBreakdownPanel
+            entries={directionSrBreakdown.directions}
+            onDirectionClick={onDirectionClick}
+          />
+        </section>
+      )}
+
+      {/* Prompt Fingerprint SR Quality */}
+      {!loading && fingerprintAnalytics && fingerprintAnalytics.fingerprints.length > 0 && (
+        <section data-testid="prompt-fingerprint-sr-quality">
+          <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
+            Prompt Fingerprint SR Quality
+            <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">
+              · {fingerprintAnalytics.fingerprints.length} regime{fingerprintAnalytics.fingerprints.length !== 1 ? 's' : ''} · {fingerprintAnalytics.window_days}d
+            </span>
+          </p>
+          <div className="flex flex-col gap-1">
+            {fingerprintAnalytics.fingerprints.map((fp) => {
+              const catchRate = fp.sr_catch_rate;
+              const catchColor = catchRate == null ? 'text-neutral-500' : catchRate >= 0.7 ? 'text-emerald-400' : catchRate >= 0.4 ? 'text-amber-400' : 'text-red-400';
+              const delta = fp.sr_catch_rate_delta_vs_project_mean;
+              const deltaColor = delta == null ? '' : delta >= 0 ? 'text-emerald-400' : 'text-red-400';
+              return (
+                <div key={fp.fingerprint} className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-[11px]">
+                  <div className="flex items-center gap-2 mb-0.5">
+                    <span className="font-mono text-neutral-400 text-[10px]">{fp.fingerprint.slice(0, 12)}…</span>
+                    <span className="text-neutral-600 text-[10px]">n={fp.sample_size}</span>
+                  </div>
+                  <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-neutral-500">
+                    <span>catch <span className={`font-semibold ${catchColor}`}>{catchRate != null ? `${Math.round(catchRate * 100)}%` : '--'}</span>{' '}<span className="text-neutral-600">n={fp.sr_catch_sample_size}</span>{delta != null && <span className={`ml-1 ${deltaColor}`}>({delta >= 0 ? '+' : ''}{Math.round(delta * 100)}pp)</span>}</span>
+                    <span>rescue <span className="font-semibold text-neutral-300">{fp.reviewer_rescue_rate != null ? `${Math.round(fp.reviewer_rescue_rate * 100)}%` : '--'}</span>{' '}<span className="text-neutral-600">n={fp.reviewer_rescue_sample_size}</span></span>
+                    {fp.sr_false_positive_rate != null && <span>FP <span className="font-semibold text-neutral-300">{Math.round(fp.sr_false_positive_rate * 100)}%</span>{' '}<span className="text-neutral-600">n={fp.sr_false_positive_sample_size}</span></span>}
+                  </div>
+                  {fp.sr_reviewer_disagreement_top_categories.length > 0 && (
+                    <div className="flex flex-wrap gap-1 mt-1">
+                      {fp.sr_reviewer_disagreement_top_categories.slice(0, 3).map((d) => (
+                        <span key={d.category} className="text-[9px] px-1 py-0.5 rounded bg-neutral-800/60 text-neutral-400 border border-neutral-700/40">
+                          {d.category}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+    </>
+  );
+}
+
 // ---------- props ----------
 
 export interface DashboardHomeProps {
@@ -688,17 +891,47 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   const sparkRef = useRef<SparkPoint[]>([]);
   const [sparkData, setSparkData] = useState<SparkPoint[]>([]);
   const reviewQualitySectionRef = useRef<HTMLElement>(null);
+  const dashboardRequestIdRef = useRef(0);
+  const openPRsRequestIdRef = useRef(0);
+  const versionLifecycleRequestIdRef = useRef(0);
 
   const selectedProject = projects?.find(p => p.id === selectedProjectId);
   const srCatchRateTargets = selectedProject?.sr_catch_rate_targets;
 
+  const resetProjectScopedState = useCallback(() => {
+    setDigest(null);
+    setOpenPRs([]);
+    setOpenPRsIntegrationBranch(null);
+    setOpenPRsPromotionTarget(null);
+    setMeasurementData(null);
+    setScopeBaselines(null);
+    setAccountHealth(null);
+    setSystemMaturity(null);
+    setTaskDurationStats(null);
+    setVersionLifecycle(null);
+    setBlindSpots(null);
+    setExpandedBlindSpotThemes(new Set());
+    setSrRecentMisses(null);
+    setSrRecentMissesTotal(0);
+    setSrReviewerDisagreements(null);
+    setDirectionSrBreakdown(null);
+    setFingerprintAnalytics(null);
+    setHealthOverview(null);
+    setSparkData([]);
+    sparkRef.current = [];
+    setOpenPRsRefreshing(false);
+    setLoading(true);
+    setLastFetchError(false);
+  }, []);
+
   // Fetch open PRs only — used by manual refresh button
   const fetchOpenPRs = useCallback(async () => {
     if (!selectedProjectId) return;
+    const requestId = ++openPRsRequestIdRef.current;
     setOpenPRsRefreshing(true);
     try {
       const res = await apiFetch(`/api/admin/open-prs?project_id=${encodeURIComponent(selectedProjectId)}`);
-      if (res.ok) {
+      if (res.ok && requestId === openPRsRequestIdRef.current) {
         const data = await res.json();
         setOpenPRs(data.open_prs ?? []);
         setOpenPRsIntegrationBranch(data.project_integration_branch ?? null);
@@ -706,7 +939,9 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
       }
     } catch { /* silent */ }
     finally {
-      setOpenPRsRefreshing(false);
+      if (requestId === openPRsRequestIdRef.current) {
+        setOpenPRsRefreshing(false);
+      }
     }
   }, [selectedProjectId]);
 
@@ -723,6 +958,15 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
     onConfigureTargets?.();
   }, [onConfigureTargets]);
 
+  const handleToggleBlindSpotTheme = useCallback((theme: string) => {
+    setExpandedBlindSpotThemes(prev => {
+      const newSet = new Set(prev);
+      if (newSet.has(theme)) newSet.delete(theme);
+      else newSet.add(theme);
+      return newSet;
+    });
+  }, []);
+
   const handleViewTaskById = useCallback((taskId: string) => {
     const task = tasks.find(t => t.id === taskId);
     if (task) {
@@ -735,7 +979,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
   }, [tasks, onViewTask]);
 
   // Fetch data
-  const fetchData = useCallback(async () => {
+  const fetchData = useCallback(async (requestId: number) => {
     let digestOk = false;
     const fetches: Promise<void>[] = [];
 
@@ -747,19 +991,21 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             ? `/api/admin/digest?hours=${windowHours}&project_id=${encodeURIComponent(selectedProjectId)}`
             : `/api/admin/digest?hours=${windowHours}`;
           const res = await apiFetch(url);
-          if (res.ok) {
+          if (res.ok && requestId === dashboardRequestIdRef.current) {
             const data = await res.json();
-            if (assertDigestContract(data)) {
+            if (requestId === dashboardRequestIdRef.current && assertDigestContract(data)) {
               setDigest(data);
               digestOk = true;
-            } else {
+            } else if (requestId === dashboardRequestIdRef.current) {
               setDigest(null);
             }
-          } else {
+          } else if (requestId === dashboardRequestIdRef.current) {
             setDigest(null);
           }
         } catch {
-          setDigest(null);
+          if (requestId === dashboardRequestIdRef.current) {
+            setDigest(null);
+          }
           /* silent */
         }
       })(),
@@ -773,13 +1019,13 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
         (async () => {
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/diagnostics`);
-            if (res.ok) { diagnosticsOk = true; }
+            if (res.ok && requestId === dashboardRequestIdRef.current) { diagnosticsOk = true; }
           } catch { /* silent */ }
         })(),
         (async () => {
           try {
             const res = await apiFetch(`/api/admin/open-prs?project_id=${encodeURIComponent(selectedProjectId)}`);
-            if (res.ok) {
+            if (res.ok && requestId === dashboardRequestIdRef.current) {
               const data = await res.json();
               setOpenPRs(data.open_prs ?? []);
               setOpenPRsIntegrationBranch(data.project_integration_branch ?? null);
@@ -791,19 +1037,19 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
         (async () => {
           try {
             const res = await apiFetch(`/api/admin/medium-scope-measurement?project_id=${encodeURIComponent(selectedProjectId)}&lookback_days=90`);
-            if (res.ok) setMeasurementData(await res.json());
+            if (res.ok && requestId === dashboardRequestIdRef.current) setMeasurementData(await res.json());
           } catch { /* silent */ }
         })(),
         (async () => {
           try {
             const res = await apiFetch(`/api/admin/scope-baselines?project_id=${encodeURIComponent(selectedProjectId)}&lookback_days=30`);
-            if (res.ok) setScopeBaselines(await res.json());
+            if (res.ok && requestId === dashboardRequestIdRef.current) setScopeBaselines(await res.json());
           } catch { /* silent */ }
         })(),
         (async () => {
           try {
             const res = await apiFetch(`/api/admin/max-plan-accounts/health`);
-            if (res.ok) {
+            if (res.ok && requestId === dashboardRequestIdRef.current) {
               const data = await res.json();
               setAccountHealth(data.accounts ?? []);
             }
@@ -812,7 +1058,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
         (async () => {
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/system-maturity`);
-            if (res.ok) {
+            if (res.ok && requestId === dashboardRequestIdRef.current) {
               const data = await res.json();
               setSystemMaturity(Array.isArray(data) ? data : []);
             }
@@ -821,13 +1067,13 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
         (async () => {
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-blind-spots`);
-            if (res.ok) setBlindSpots(await res.json());
+            if (res.ok && requestId === dashboardRequestIdRef.current) setBlindSpots(await res.json());
           } catch { /* silent */ }
         })(),
         (async () => {
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-reviewer-disagreements`);
-            if (res.ok) setSrReviewerDisagreements(await res.json());
+            if (res.ok && requestId === dashboardRequestIdRef.current) setSrReviewerDisagreements(await res.json());
           } catch { /* silent */ }
         })(),
         (async () => {
@@ -837,7 +1083,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             const query = params.toString();
             const url = `/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-recent-misses${query ? `?${query}` : ''}`;
             const res = await apiFetch(url);
-            if (res.ok) {
+            if (res.ok && requestId === dashboardRequestIdRef.current) {
               const data = await res.json();
               setSrRecentMisses(data.misses ?? []);
               setSrRecentMissesTotal(data.total ?? (data.misses ?? []).length);
@@ -847,19 +1093,19 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
         (async () => {
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/direction-sr-breakdown`);
-            if (res.ok) setDirectionSrBreakdown(await res.json());
+            if (res.ok && requestId === dashboardRequestIdRef.current) setDirectionSrBreakdown(await res.json());
           } catch { /* silent */ }
         })(),
         (async () => {
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/prompt-fingerprint-analytics`);
-            if (res.ok) setFingerprintAnalytics(await res.json());
+            if (res.ok && requestId === dashboardRequestIdRef.current) setFingerprintAnalytics(await res.json());
           } catch { /* silent */ }
         })(),
         (async () => {
           try {
             const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/version-lifecycle`);
-            if (res.ok) setVersionLifecycle(await res.json());
+            if (res.ok && requestId === dashboardRequestIdRef.current) setVersionLifecycle(await res.json());
           } catch { /* silent */ }
         })(),
       );
@@ -872,7 +1118,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             ? `/api/admin/task-duration-stats?project_id=${encodeURIComponent(selectedProjectId)}`
             : `/api/admin/task-duration-stats`;
           const res = await apiFetch(url);
-          if (res.ok) setTaskDurationStats(await res.json());
+          if (res.ok && requestId === dashboardRequestIdRef.current) setTaskDurationStats(await res.json());
         } catch { /* silent */ }
       })(),
       (async () => {
@@ -881,13 +1127,18 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             ? `/api/admin/health-overview?project_id=${encodeURIComponent(selectedProjectId)}&lookback_hours=${windowHours}`
             : `/api/admin/health-overview?lookback_hours=${windowHours}`;
           const res = await apiFetch(url);
-          if (res.ok) setHealthOverview(await res.json());
-          else setHealthOverview(null);
-        } catch { setHealthOverview(null); }
+          if (requestId === dashboardRequestIdRef.current) {
+            if (res.ok) setHealthOverview(await res.json());
+            else setHealthOverview(null);
+          }
+        } catch {
+          if (requestId === dashboardRequestIdRef.current) setHealthOverview(null);
+        }
       })(),
     );
 
     await Promise.allSettled(fetches);
+    if (requestId !== dashboardRequestIdRef.current) return;
     setLoading(false);
 
     // Show error banner only when all primary fetches fail (backend unreachable)
@@ -899,18 +1150,23 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
 
   const refreshVersionLifecycle = useCallback(async () => {
     if (!selectedProjectId) return;
+    const requestId = ++versionLifecycleRequestIdRef.current;
     try {
       const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(selectedProjectId)}/version-lifecycle`);
-      if (res.ok) setVersionLifecycle(await res.json());
+      if (res.ok && requestId === versionLifecycleRequestIdRef.current) setVersionLifecycle(await res.json());
     } catch { /* silent */ }
   }, [selectedProjectId]);
 
   // Initial + polling
   useEffect(() => {
-    fetchData();
-    const id = setInterval(fetchData, 30_000);
+    const requestId = ++dashboardRequestIdRef.current;
+    openPRsRequestIdRef.current += 1;
+    versionLifecycleRequestIdRef.current += 1;
+    resetProjectScopedState();
+    void fetchData(requestId);
+    const id = setInterval(() => void fetchData(requestId), 30_000);
     return () => clearInterval(id);
-  }, [fetchData]);
+  }, [fetchData, resetProjectScopedState]);
 
   const { activeCount, queuedCount } = useMemo(() => ({
     activeCount: tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING').length,
@@ -1172,177 +1428,23 @@ export function DashboardHome({ tasks, selectedProjectId, projects, onViewTask, 
             sectionRef={reviewQualitySectionRef}
           />
 
-                    {/* SR Recent Misses */}
-          {!loading && srRecentMisses && srRecentMisses.length > 0 && (
-            <section>
-              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
-                Recent SR Misses
-                <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {srRecentMissesTotal} task{srRecentMissesTotal !== 1 ? 's' : ''}</span>
-              </p>
-              <SrMissedRetrospective
-                tasks={srRecentMisses}
-                selectedCategory={selectedSrCategory}
-                onTaskClick={(taskId) => {
-                  const task = tasks.find(t => t.id === taskId);
-                  if (task) onViewTask(task);
-                }}
-              />
-            </section>
-          )}
-
-          {/* SR Unhandled Edges */}
-          <SrUnhandledEdgesRetrospectivesPanel
+          {/* SR diagnostics stack */}
+          <SrDiagnosticsStack
+            loading={loading}
             selectedProjectId={selectedProjectId}
-            onSelectTask={(taskId) => {
-              const task = tasks.find(t => t.id === taskId);
-              if (task) onViewTask(task);
-            }}
+            tasks={tasks}
+            onViewTask={onViewTask}
+            onDirectionClick={onDirectionClick}
+            srRecentMisses={srRecentMisses}
+            srRecentMissesTotal={srRecentMissesTotal}
+            selectedSrCategory={selectedSrCategory}
+            blindSpots={blindSpots}
+            expandedBlindSpotThemes={expandedBlindSpotThemes}
+            onToggleBlindSpotTheme={handleToggleBlindSpotTheme}
+            srReviewerDisagreements={srReviewerDisagreements}
+            directionSrBreakdown={directionSrBreakdown}
+            fingerprintAnalytics={fingerprintAnalytics}
           />
-
-          {/* SR Blind Spots aggregation */}
-          {!loading && blindSpots && blindSpots.themes.length > 0 && (
-            <section>
-              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
-                SR Blind Spots
-                <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {blindSpots.total_distinct_themes} themes · {blindSpots.window_days}d</span>
-              </p>
-              <div className="flex flex-wrap gap-2">
-                {blindSpots.themes.slice(0, 8).map((t, i) => {
-                  const isExpanded = expandedBlindSpotThemes.has(t.theme);
-                  const toggleExpanded = () => {
-                    const newSet = new Set(expandedBlindSpotThemes);
-                    if (newSet.has(t.theme)) {
-                      newSet.delete(t.theme);
-                    } else {
-                      newSet.add(t.theme);
-                    }
-                    setExpandedBlindSpotThemes(newSet);
-                  };
-                  const handleViewExample = (taskId: string) => {
-                    const task = tasks.find(tk => tk.id === taskId);
-                    if (task) {
-                      onViewTask(task);
-                    } else {
-                      fetchTask(taskId).then(onViewTask).catch(() => {
-                        console.error(`Failed to fetch task ${taskId}`);
-                      });
-                    }
-                  };
-                  return (
-                    <div key={i} className="flex flex-col gap-0.5 min-w-0">
-                      <button
-                        onClick={toggleExpanded}
-                        className="inline-flex items-center gap-1.5 text-[10px] font-semibold px-2 py-0.5 rounded border bg-violet-500/10 text-violet-400 border-violet-500/20 cursor-pointer hover:bg-violet-500/20 transition-colors min-h-[44px]"
-                        title={t.theme}
-                      >
-                        <span className="truncate max-w-[160px]">{t.theme}</span>
-                        <span className="font-bold shrink-0">×{t.count}</span>
-                      </button>
-                      {isExpanded && t.examples && t.examples.length > 0 && (
-                        <div className="flex flex-col gap-1 ml-1 border-l border-violet-500/20 pl-2">
-                          {t.examples.map((ex, exIdx) => (
-                            <div key={exIdx} className="text-[9px] text-neutral-300">
-                              <span className="text-neutral-500 block mb-0.5">{ex.text}</span>
-                              <button
-                                onClick={() => handleViewExample(ex.task_id)}
-                                className="text-violet-400 hover:text-violet-300 cursor-pointer underline"
-                              >
-                                View task
-                              </button>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                      {t.layer_distribution && Object.keys(t.layer_distribution).length > 0 && (
-                        <div className="flex flex-wrap gap-1">
-                          {Object.entries(t.layer_distribution)
-                            .sort((a, b) => b[1] - a[1])
-                            .map(([layer, cnt]) => (
-                              <span
-                                key={layer}
-                                className="inline-flex items-center gap-0.5 text-[9px] px-1.5 py-0.5 rounded border bg-neutral-500/10 text-neutral-400 border-neutral-500/20 max-w-[140px]"
-                              >
-                                <span className="truncate">{layer}</span>
-                                <span className="shrink-0">×{cnt}</span>
-                              </span>
-                            ))}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </section>
-          )}
-
-          {/* SR Reviewer Disagreements */}
-          {!loading && srReviewerDisagreements && srReviewerDisagreements.disagreements.length > 0 && (
-            <section>
-              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
-                SR ↔ Reviewer Disagreements
-                <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">· {srReviewerDisagreements.window_days}d · {srReviewerDisagreements.total_entries} categor{srReviewerDisagreements.total_entries !== 1 ? 'ies' : 'y'}</span>
-              </p>
-              <SrReviewerDisagreementsPanel data={srReviewerDisagreements} />
-            </section>
-          )}
-
-          {/* Per-Direction SR Catch-Rate */}
-          {!loading && directionSrBreakdown && directionSrBreakdown.directions.length > 0 && (
-            <section data-testid="direction-sr-breakdown">
-              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
-                SR Catch-Rate by Direction
-                <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">
-                  · {directionSrBreakdown.directions.length} direction{directionSrBreakdown.directions.length !== 1 ? 's' : ''} · worst-first
-                </span>
-              </p>
-              <DirectionSrBreakdownPanel
-                entries={directionSrBreakdown.directions}
-                onDirectionClick={onDirectionClick}
-              />
-            </section>
-          )}
-
-          {/* Prompt Fingerprint SR Quality */}
-          {!loading && fingerprintAnalytics && fingerprintAnalytics.fingerprints.length > 0 && (
-            <section data-testid="prompt-fingerprint-sr-quality">
-              <p className="text-[10px] text-neutral-500 uppercase tracking-wide mb-2">
-                Prompt Fingerprint SR Quality
-                <span className="ml-1 text-neutral-600 font-normal normal-case tracking-normal">
-                  · {fingerprintAnalytics.fingerprints.length} regime{fingerprintAnalytics.fingerprints.length !== 1 ? 's' : ''} · {fingerprintAnalytics.window_days}d
-                </span>
-              </p>
-              <div className="flex flex-col gap-1">
-                {fingerprintAnalytics.fingerprints.map((fp) => {
-                  const catchRate = fp.sr_catch_rate;
-                  const catchColor = catchRate == null ? 'text-neutral-500' : catchRate >= 0.7 ? 'text-emerald-400' : catchRate >= 0.4 ? 'text-amber-400' : 'text-red-400';
-                  const delta = fp.sr_catch_rate_delta_vs_project_mean;
-                  const deltaColor = delta == null ? '' : delta >= 0 ? 'text-emerald-400' : 'text-red-400';
-                  return (
-                    <div key={fp.fingerprint} className="bg-neutral-900/50 border border-neutral-800/50 rounded px-2 py-1.5 text-[11px]">
-                      <div className="flex items-center gap-2 mb-0.5">
-                        <span className="font-mono text-neutral-400 text-[10px]">{fp.fingerprint.slice(0, 12)}…</span>
-                        <span className="text-neutral-600 text-[10px]">n={fp.sample_size}</span>
-                      </div>
-                      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-neutral-500">
-                        <span>catch <span className={`font-semibold ${catchColor}`}>{catchRate != null ? `${Math.round(catchRate * 100)}%` : '--'}</span>{' '}<span className="text-neutral-600">n={fp.sr_catch_sample_size}</span>{delta != null && <span className={`ml-1 ${deltaColor}`}>({delta >= 0 ? '+' : ''}{Math.round(delta * 100)}pp)</span>}</span>
-                        <span>rescue <span className="font-semibold text-neutral-300">{fp.reviewer_rescue_rate != null ? `${Math.round(fp.reviewer_rescue_rate * 100)}%` : '--'}</span>{' '}<span className="text-neutral-600">n={fp.reviewer_rescue_sample_size}</span></span>
-                        {fp.sr_false_positive_rate != null && <span>FP <span className="font-semibold text-neutral-300">{Math.round(fp.sr_false_positive_rate * 100)}%</span>{' '}<span className="text-neutral-600">n={fp.sr_false_positive_sample_size}</span></span>}
-                      </div>
-                      {fp.sr_reviewer_disagreement_top_categories.length > 0 && (
-                        <div className="flex flex-wrap gap-1 mt-1">
-                          {fp.sr_reviewer_disagreement_top_categories.slice(0, 3).map((d) => (
-                            <span key={d.category} className="text-[9px] px-1 py-0.5 rounded bg-neutral-800/60 text-neutral-400 border border-neutral-700/40">
-                              {d.category}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </section>
-          )}
 
           {/* Section 1d4: Cost of Failures */}
           {!loading && (digest?.total_failed_cost_usd ?? 0) > 0 && (

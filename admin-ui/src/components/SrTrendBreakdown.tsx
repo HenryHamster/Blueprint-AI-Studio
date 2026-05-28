@@ -1876,12 +1876,14 @@ export function SrMissedRetrospective({ tasks, onTaskClick, selectedCategory, wi
   }, [selectedCategory]);
   const [typeFilter, setTypeFilter] = useState('');
   const [openTaskIds, setOpenTaskIds] = useState<Set<string>>(() => new Set());
-  const [mountedAt] = useState(() => Date.now());
+  const [cutoff, setCutoff] = useState(() => Date.now() - windowDays * 86400_000);
+  useEffect(() => {
+    setCutoff(Date.now() - windowDays * 86400_000);
+  }, [windowDays]);
 
   const allCategories = Array.from(new Set(tasks.flatMap(t => t.missed_categories))).sort();
   const allTypes = Array.from(new Set(tasks.map(t => t.task_type).filter(Boolean) as string[])).sort();
 
-  const cutoff = mountedAt - windowDays * 86400_000;
   const visible = tasks.filter(t => {
     if (t.created_at && new Date(t.created_at).getTime() < cutoff) return false;
     if (categoryFilter && !t.missed_categories.includes(categoryFilter)) return false;
@@ -2028,11 +2030,13 @@ interface SrUnhandledEdgesRetrospectiveProps {
 export function SrUnhandledEdgesRetrospective({ tasks, onTaskClick, windowDays = 14, onWindowDaysChange }: SrUnhandledEdgesRetrospectiveProps) {
   const [typeFilter, setTypeFilter] = useState('');
   const [openTaskIds, setOpenTaskIds] = useState<Set<string>>(() => new Set());
-  const [mountedAt] = useState(() => Date.now());
+  const [cutoff, setCutoff] = useState(() => Date.now() - windowDays * 86400_000);
+  useEffect(() => {
+    setCutoff(Date.now() - windowDays * 86400_000);
+  }, [windowDays]);
 
   const allTypes = Array.from(new Set(tasks.map(t => t.task_type).filter(Boolean) as string[])).sort();
 
-  const cutoff = mountedAt - windowDays * 86400_000;
   const visible = tasks.filter(t => {
     if (t.created_at && new Date(t.created_at).getTime() < cutoff) return false;
     if (typeFilter && t.task_type !== typeFilter) return false;

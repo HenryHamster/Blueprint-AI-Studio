@@ -359,9 +359,7 @@ describe('isFailingGroup', () => {
 
 // ── Component rendering tests ─────────────────────────────────────────────────
 
-function makeMsg(overrides: Partial<{
-  id: string; message_type: string; from_type: string; context: Record<string, unknown>; status: string;
-}>) {
+function makeMsg(overrides: Partial<ProjectMessage> = {}): ProjectMessage {
   return {
     id: 'msg-1', project_id: 'proj-1', message_type: 'NOTE', from_type: 'system',
     from_task_id: null, content: 'test content', context: {}, status: 'open',
@@ -3120,6 +3118,133 @@ describe('MessagesPanel since-last-visit count accuracy', () => {
     const routineRow = el.querySelector('[data-testid="summary-card-routine"]');
     expect(routineRow).toBeTruthy();
     expect(routineRow?.textContent).toContain('1');
+  });
+});
+
+// ── Project-switch async race guards ─────────────────────────────────────────
+// These tests verify that stale in-flight responses for the old project are
+// discarded when the user switches projects. Each async path guards with an
+// `active` flag; if the guard were removed, the stale response would corrupt
+// the new project's state (hence these tests would regress without it).
+
+describe('MessagesPanel project-switch async race guards', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(() => { localStorage.clear(); });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  test('stale server noise-prefs for project A do not mute events in project B', async () => {
+    // Deferred promise simulates a slow noise-prefs GET that resolves after the project switch.
+    let resolveNoisePrefsA!: (r: Response) => void;
+    const deferredA = new Promise<Response>(res => { resolveNoisePrefsA = res; });
+    const projBMsg = makeMsg({ id: 'r1', from_type: 'system', context: { event_type: 'pr_merged' }, content: 'proj-B routine' });
+
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/noise-prefs') && urlStr.includes('proj-A') && method === 'GET') {
+        return deferredA;
+      }
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        const msgs = urlStr.includes('proj-B') ? [projBMsg] : [];
+        return new Response(JSON.stringify({ messages: msgs }), { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    });
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+
+    // Mount proj-A — noise-prefs fetch is in-flight (deferred).
+    await act(async () => {
+      root!.render(<MessagesPanel selectedProjectId="proj-A" onClose={() => {}} addToast={() => {}} onMessageCountChange={() => {}} />);
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 20)); });
+
+    // Switch to proj-B — sets active=false on proj-A's effect cleanup.
+    _suppressSinceLastVisit('test-user@example.com', 'proj-B');
+    await act(async () => {
+      root!.render(<MessagesPanel selectedProjectId="proj-B" onClose={() => {}} addToast={() => {}} onMessageCountChange={() => {}} />);
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 60)); });
+
+    // proj-B's pr_merged message should be visible in routine ops.
+    expect(host!.textContent).toContain('routine ops');
+
+    // Resolve the stale proj-A noise-prefs response: pr_merged=mute.
+    // The active guard discards this — without it, pr_merged would be muted in B.
+    await act(async () => {
+      resolveNoisePrefsA(new Response(JSON.stringify({ prefs: { pr_merged: 'mute' } }), { status: 200 }));
+      await new Promise<void>(res => setTimeout(res, 30));
+    });
+
+    // Routine ops still visible — pr_merged was NOT muted by the stale A response.
+    expect(host!.textContent).toContain('routine ops');
+  });
+
+  test('stale server saved-views for project A do not appear in project B tab strip', async () => {
+    let resolveViewsA!: (r: Response) => void;
+    const deferredViewsA = new Promise<Response>(res => { resolveViewsA = res; });
+
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/saved-views') && urlStr.includes('proj-A') && method === 'GET') {
+        return deferredViewsA;
+      }
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    });
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+
+    await act(async () => {
+      root!.render(<MessagesPanel selectedProjectId="proj-A" onClose={() => {}} addToast={() => {}} onMessageCountChange={() => {}} />);
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 20)); });
+
+    // Switch to proj-B — deactivates proj-A's saved-views fetch.
+    await act(async () => {
+      root!.render(<MessagesPanel selectedProjectId="proj-B" onClose={() => {}} addToast={() => {}} onMessageCountChange={() => {}} />);
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 30)); });
+
+    // proj-B tab strip shows only Default.
+    const tabsBefore = [...host!.querySelectorAll('[data-testid="saved-views-tab-strip"] button')];
+    expect(tabsBefore.some(b => b.textContent?.trim().startsWith('Default'))).toBe(true);
+    expect(tabsBefore.every(b => !b.textContent?.trim().startsWith('A-only'))).toBe(true);
+
+    // Resolve stale proj-A saved-views — should be discarded.
+    const staleView = { id: 'v_a', name: 'A-only', query: '', prefs: {}, sort: 'importance', showResolved: false, routineExpanded: false, createdAt: Date.now() };
+    await act(async () => {
+      resolveViewsA(new Response(JSON.stringify({ saved_views: [staleView] }), { status: 200 }));
+      await new Promise<void>(res => setTimeout(res, 30));
+    });
+
+    // 'A-only' tab must NOT appear in proj-B's tab strip.
+    const tabsAfter = [...host!.querySelectorAll('[data-testid="saved-views-tab-strip"] button')];
+    expect(tabsAfter.every(b => !b.textContent?.trim().startsWith('A-only'))).toBe(true);
   });
 });
 

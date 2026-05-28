@@ -2,6 +2,7 @@ import { afterEach, describe, test, vi, expect } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { MessagesPanel } from './MessagesPanel';
+import type { ProjectMessage } from './MessageBubble';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt, stressStrings } from '../test/viewport';
 
 // React patches the input `value` setter on its prototype to track controlled-input
@@ -24,9 +25,7 @@ vi.mock('../api', () => ({
   authHeaders: vi.fn(async () => ({ 'Authorization': 'Bearer test', 'Content-Type': 'application/json' })),
 }));
 
-function makeMsg(overrides: Partial<{
-  id: string; message_type: string; from_type: string; context: Record<string, unknown>; status: string; content: string;
-}>) {
+function makeMsg(overrides: Partial<ProjectMessage> = {}): ProjectMessage {
   return {
     id: 'msg-1', project_id: 'proj-1', message_type: 'NOTE', from_type: 'system',
     from_task_id: null, content: 'viewport test content', context: {}, status: 'open',
@@ -35,7 +34,7 @@ function makeMsg(overrides: Partial<{
   };
 }
 
-async function renderPanel(root: Root, messages: ReturnType<typeof makeMsg>[]) {
+async function renderPanel(root: Root, messages: ProjectMessage[]) {
   const { apiFetch } = await import('../api');
   (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
     new Response(JSON.stringify({ messages }), { status: 200 }),

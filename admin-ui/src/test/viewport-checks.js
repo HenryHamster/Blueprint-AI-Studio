@@ -51,6 +51,10 @@ export const EXEMPT_FROM_VIEWPORT_TEST = new Set([
   // viewport coverage is provided by MessagesPanel.viewport.test.tsx which
   // exercises the bubble inline (overflow, text-truncation, touch-target).
   'MessageBubble',
+  // Needs-attention worklist sub-component rendered exclusively inside
+  // CatchUpPanel; viewport coverage is provided by CatchUpPanel.viewport.test.tsx
+  // which exercises it inline.
+  'CatchUpNeedsAttentionSection',
 ]);
 
 /**
