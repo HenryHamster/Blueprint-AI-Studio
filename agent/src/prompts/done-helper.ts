@@ -1,0 +1,312 @@
+import fs from 'fs';
+import { WORKSPACE } from '../index.js';
+import { validateCfgShellSafety, type CodeChangeHelperConfig } from './code-change-helpers.js';
+
+export function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
+  validateCfgShellSafety(cfg);
+  // Posts COMPLETED to the orchestrator with the PR URL from /tmp/pr_url_<task_id>.
+  // Also writes /tmp/done_<task_id> as a marker for the wrapper to detect on
+  // exit and skip its fallback push.
+  const script = `#!/bin/bash
+# ./done — mark task COMPLETED. Requires ./pr open to have run first
+# (writes /tmp/pr_url_${cfg.taskId} which this reads). Posts the COMPLETED
+# status to the orchestrator with the PR URL, then writes a marker so the
+# wrapper exits cleanly without re-doing commit/push.
+#
+# Usage:
+#   ./done                                     # standard: ./check must pass
+#   ./done --warn-out-of-scope "<reason>"      # judgment-call escape hatch:
+#       ship despite ./check failures when those failures are PRE-EXISTING
+#       on origin/${cfg.baseBranch} and out of scope for this PR. Posts a FEEDBACK
+#       project message describing the pre-existing issues + your reason
+#       so strategic/operators can spawn cleanup work later. The reason
+#       text MUST include the specific gates/files that failed and why
+#       fixing them is out of scope (e.g., "admin-ui eslint reports 4
+#       errors in DashboardHome.tsx that pre-date this PR; fixing them
+#       requires refactoring the digest-card layout which is not in
+#       scope for this auth-flow change").
+#
+#       USE ./blocked INSTEAD when the failure requires introducing a
+#       new bug or precondition (missing package, infra gap, agent
+#       can't even start the work). --warn-out-of-scope is for issues
+#       that already existed on main BEFORE this PR.
+
+set -uo pipefail
+
+WARN_OUT_OF_SCOPE_REASON=""
+SKIP_NEXT=0
+for i in "$@"; do
+  if [ "$SKIP_NEXT" = "1" ]; then
+    WARN_OUT_OF_SCOPE_REASON="$i"
+    SKIP_NEXT=0
+    continue
+  fi
+  case "$i" in
+    --warn-out-of-scope)
+      SKIP_NEXT=1
+      ;;
+    --warn-out-of-scope=*)
+      WARN_OUT_OF_SCOPE_REASON="\${i#--warn-out-of-scope=}"
+      ;;
+  esac
+done
+if [ "$SKIP_NEXT" = "1" ] && [ -z "$WARN_OUT_OF_SCOPE_REASON" ]; then
+  echo "Error: --warn-out-of-scope requires a reason argument" >&2
+  echo "Usage: ./done --warn-out-of-scope \\"<reason>\\"" >&2
+  exit 2
+fi
+if [ -n "$WARN_OUT_OF_SCOPE_REASON" ] && [ \${#WARN_OUT_OF_SCOPE_REASON} -lt 30 ]; then
+  echo "Error: --warn-out-of-scope reason must be at least 30 chars (you gave \${#WARN_OUT_OF_SCOPE_REASON})." >&2
+  echo "       Be specific: which gates failed, which files, why fixing is out of scope." >&2
+  exit 2
+fi
+
+PR_FILE="/tmp/pr_url_${cfg.taskId}"
+if [ ! -s "$PR_FILE" ]; then
+  echo "Error: $PR_FILE missing or empty — run ./pr open first." >&2
+  exit 2
+fi
+PR_URL=$(cat "$PR_FILE")
+# Validate shape — must be a canonical GitHub pull URL.
+# Aligned with agent/src/handlers/code-change.ts:337 (same regex).
+PR_URL_RE='^https://github\\.com/[^/[:space:]]+/[^/[:space:]]+/pull/[0-9]+$'
+if ! printf '%s' "$PR_URL" | grep -qE "$PR_URL_RE"; then
+  echo "[done] Error: $PR_FILE contains an invalid PR URL: $PR_URL" >&2
+  echo "[done]   Expected: https://github.com/<owner>/<repo>/pull/<number>" >&2
+  echo "[done]   ./pr open must produce a canonical pull URL (not /commit/, /compare/, etc.)." >&2
+  exit 2
+fi
+
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+TASK="${cfg.taskId}"
+
+# Idempotency: if marker already exists, this is a re-run — no-op cleanly.
+if [ -f /tmp/done_${cfg.taskId} ]; then
+  echo "[done] already marked — no-op (PR: $PR_URL)"
+  exit 0
+fi
+
+# Optional enrichment: if Claude wrote /tmp/fix_responses_<task_id>.json
+# (review-fix dialog-system response), include it in the payload so the
+# orchestrator's verify-mode reviewer can chain-of-custody the fix
+# rationale forward (review_pipeline.py:1664-1681).
+FIX_RESPONSES_FILE="/tmp/fix_responses_${cfg.taskId}.json"
+FIX_RESPONSES_JSON=""
+if [ -s "$FIX_RESPONSES_FILE" ]; then
+  if jq empty "$FIX_RESPONSES_FILE" >/dev/null 2>&1; then
+    FIX_RESPONSES_JSON=$(cat "$FIX_RESPONSES_FILE")
+  else
+    echo "[done] /tmp/fix_responses_${cfg.taskId}.json exists but is not valid JSON — skipping enrichment" >&2
+  fi
+fi
+
+# Soft-fallback self-review outcome. Claude should write a structured
+# self-review JSON to /tmp/self_review_<task_id>.json before calling
+# ./done; we forward it as self_review_outcome on the payload so
+# downstream consumers (review_pipeline retry context, admin_digest
+# catch-rate metrics, reaper retry pairing) get the signal. If missing
+# or invalid, we emit a minimal fallback envelope so the gap is visible
+# in metrics but the task doesn't block.
+SELF_REVIEW_FILE="/tmp/self_review_${cfg.taskId}.json"
+SELF_REVIEW_JSON=""
+if [ -s "$SELF_REVIEW_FILE" ]; then
+  if jq empty "$SELF_REVIEW_FILE" >/dev/null 2>&1; then
+    SELF_REVIEW_JSON=$(cat "$SELF_REVIEW_FILE")
+  else
+    echo "[done] /tmp/self_review_${cfg.taskId}.json exists but is not valid JSON — using fallback envelope" >&2
+    SELF_REVIEW_JSON='{"verdict":"unknown","check_results":{},"blind_spots":["self-review JSON parsing failed"],"skip_reason":"json_parse_failed"}'
+  fi
+else
+  echo "[done] /tmp/self_review_${cfg.taskId}.json not found — using minimal fallback envelope" >&2
+  SKIP_REASON="json_missing"; MARKER="/tmp/self_review_skip_reason_${cfg.taskId}.txt"; [ -s "$MARKER" ] && SKIP_REASON=$(head -c 64 "$MARKER" | tr -dc 'a-z_')
+  SELF_REVIEW_JSON='{"verdict":"unknown","check_results":{},"blind_spots":["self-review skipped — investigate"],"skip_reason":"'"$SKIP_REASON"'"}'
+fi
+
+# Regressing-category reasoning gate: require non-trivial reasoning for categories
+# that have above-floor miss rates for this task type (embedded at write time).
+# If any are missing, print the gap and exit so Claude can fix the SR JSON first.
+${cfg.regressingCategories && cfg.regressingCategories.length > 0
+  ? `REGRESSING_CATS=(${cfg.regressingCategories.map((c) => `"${c}"`).join(' ')})
+MISSING_REASONING=()
+for _CAT in "\${REGRESSING_CATS[@]}"; do
+  _R=$(printf '%s' "$SELF_REVIEW_JSON" | jq -r --arg c "$_CAT" '.check_results[$c].reasoning // ""' 2>/dev/null || echo "")
+  if [ "\${#_R}" -lt 10 ]; then
+    # Short reasoning passes if it contains a file:line evidence anchor
+    _HAS_ANCHOR=0
+    if printf '%s' "$_R" | grep -qE '[a-zA-Z0-9._/-]+[.][a-z]+:[0-9]+' 2>/dev/null; then
+      _HAS_ANCHOR=1
+    fi
+    if [ "\${_HAS_ANCHOR}" = "0" ]; then
+      MISSING_REASONING+=("$_CAT")
+    fi
+  fi
+done
+if [ "\${#MISSING_REASONING[@]}" -gt 0 ]; then
+  echo "[done] Regressing categories need a reasoning field (>=10 chars, or a file:line anchor) in check_results:" >&2
+  for _CAT in "\${MISSING_REASONING[@]}"; do echo "  - $_CAT" >&2; done
+  echo "Update /tmp/self_review_${cfg.taskId}.json and re-run ./done." >&2
+  exit 1
+fi`
+  : '# No regressing categories for this task type — reasoning check skipped.'}
+
+# High-stakes-category evidence-anchor gate: require concrete evidence anchors for PASS verdicts
+# on correctness, error-handling, security, regression_risk, and scope-drift. Anchors must be
+# file:line, diff stats reference, or file-list reference. If any are missing, print the gap and
+# exit so Claude can fix the SR JSON.
+HIGH_STAKES_CATS=("correctness" "error-handling" "security" "regression_risk" "scope-drift")
+MISSING_EVIDENCE=()
+for _CAT in "\${HIGH_STAKES_CATS[@]}"; do
+  _PASSED=$(printf '%s' "$SELF_REVIEW_JSON" | jq -r --arg c "$_CAT" '.check_results[$c].passed // false' 2>/dev/null || echo "false")
+  _REASONING=$(printf '%s' "$SELF_REVIEW_JSON" | jq -r --arg c "$_CAT" '.check_results[$c].reasoning // ""' 2>/dev/null || echo "")
+
+  if [ "$_PASSED" = "true" ]; then
+    # Check if reasoning has evidence anchor: file:line format, diff stats, or file list reference
+    _HAS_ANCHOR=0
+    # File:line reference (e.g., path/to/file.ts:42)
+    if printf '%s' "$_REASONING" | grep -E '[a-zA-Z0-9._/-]+[.][a-z]+:[0-9]+' > /dev/null 2>&1; then
+      _HAS_ANCHOR=1
+    # Diff-stat reference (e.g., "lines / files" or "diff:")
+    elif printf '%s' "$_REASONING" | grep -iE 'diff.*lines|files|threshold' > /dev/null 2>&1; then
+      _HAS_ANCHOR=1
+    # File-list reference (e.g., "related_files" or list of files)
+    elif printf '%s' "$_REASONING" | grep -iE 'related_files|modified files|checked.*files?' > /dev/null 2>&1; then
+      _HAS_ANCHOR=1
+    # Substantial reasoning (20+ chars)
+    elif printf '%s' "$_REASONING" | grep '.' > /dev/null 2>&1 && [ "\${#_REASONING}" -ge 20 ]; then
+      _HAS_ANCHOR=1
+    fi
+    if [ "\${_HAS_ANCHOR}" = "0" ]; then
+      MISSING_EVIDENCE+=("$_CAT")
+    fi
+  fi
+done
+if [ "\${#MISSING_EVIDENCE[@]}" -gt 0 ]; then
+  echo "[done] PASS verdicts on high-stakes categories must include evidence anchors (file:line, diff stats, or file list):" >&2
+  for _CAT in "\${MISSING_EVIDENCE[@]}"; do echo "  - $_CAT" >&2; done
+  echo "Update /tmp/self_review_${cfg.taskId}.json with evidence anchors in reasoning and re-run ./done." >&2
+  exit 1
+fi
+
+# scope-drift overage gate: if the diff materially exceeds the "large" scope threshold
+# (800 lines / 15 files), do not allow scope-drift PASS — the agent must mark it FAIL.
+# This catches cases where the diff is unexpectedly huge despite a smaller scope declaration.
+_SCOPE_DRIFT_PASSED=$(printf '%s' "$SELF_REVIEW_JSON" | jq -r '.check_results["scope-drift"].passed // false' 2>/dev/null || echo "false")
+if [ "$_SCOPE_DRIFT_PASSED" = "true" ]; then
+  _DIFF_STAT=$(git -C "${WORKSPACE}" diff --stat HEAD 2>/dev/null | tail -1 || echo "")
+  if [ -n "$_DIFF_STAT" ]; then
+    # Parse "X files changed, Y insertions(+), Z deletions(-)" — extract files and total lines
+    _FILES=$(printf '%s' "$_DIFF_STAT" | grep -oE '^[[:space:]]*[0-9]+' | xargs)
+    _LINES=$(printf '%s' "$_DIFF_STAT" | grep -oE '[0-9]+[[:space:]]*(insertion|deletion)' | grep -oE '[0-9]+' | paste -sd+ | bc 2>/dev/null || echo "0")
+    # If diff exceeds large threshold (800 lines, 15 files), block PASS
+    if [ "$_FILES" -gt 15 ] || [ "$_LINES" -gt 800 ]; then
+      echo "[done] scope-drift cannot be PASS when diff exceeds large threshold (800 lines / 15 files):" >&2
+      echo "       Detected: $_LINES lines / $_FILES files" >&2
+      echo "       Mark scope-drift as FAIL with the overage details, or revise your scope claim." >&2
+      echo "       Update /tmp/self_review_${cfg.taskId}.json and re-run ./done." >&2
+      exit 1
+    fi
+  fi
+fi
+
+# Optional enrichment: changed_files from git diff — review-pipeline scope
+# analysis, direction credit, rollup management all read this from
+# task.context._pr_changed_files. Without it those signals degrade.
+CHANGED_FILES_JSON=""
+if BASE_COMMIT_FILE="/tmp/base_commit_${cfg.taskId}" && [ -s "$BASE_COMMIT_FILE" ]; then
+  BASE_COMMIT=$(cat "$BASE_COMMIT_FILE")
+  CHANGED_FILES=$(git -C "${WORKSPACE}" diff --name-only "$BASE_COMMIT..HEAD" 2>/dev/null | head -50 | jq -R . | jq -s .)
+  if [ -n "$CHANGED_FILES" ] && [ "$CHANGED_FILES" != "[]" ]; then
+    CHANGED_FILES_JSON="$CHANGED_FILES"
+  fi
+fi
+
+# Retry on 429/5xx/network — orchestrator returns 429 on FOR-UPDATE
+# contention with Retry-After: 5. Without retry, contended completions
+# never reach the orchestrator and the task stays IN_PROGRESS until the
+# reaper kicks in minutes later.
+# --warn-out-of-scope: post a FEEDBACK project message BEFORE the
+# COMPLETED post so the warning is visible to strategic even if the
+# COMPLETED post stalls or fails. Best-effort: a message-post failure
+# does not block ./done — the warn_out_of_scope_reason field on the
+# COMPLETED payload is the durable record.
+if [ -n "$WARN_OUT_OF_SCOPE_REASON" ]; then
+  WARN_MSG="[shipped via ./done --warn-out-of-scope by task ${cfg.taskId}]
+PR: $PR_URL
+
+The agent shipped this diff despite ./check failures, asserting that
+the failures are pre-existing on origin/${cfg.baseBranch} and out of
+scope for this PR. Reason given:
+
+$WARN_OUT_OF_SCOPE_REASON
+
+Strategic / operators: this is a signal to spawn cleanup work for the
+referenced files/gates. The PR itself is intended to merge as-is."
+  jq -n --arg tid "$TASK" --arg c "$WARN_MSG" \\
+    '{task_id: $tid, op: "create_message", data: {type: "FEEDBACK", content: $c}}' | \\
+    curl -sS --max-time 30 --connect-timeout 10 -X POST "$API/api/agent/strategic" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @- \\
+    > /tmp/done_warn_msg_${cfg.taskId}.log 2>&1 || \\
+    echo "[done] warn-out-of-scope FEEDBACK message post failed (best-effort) — see /tmp/done_warn_msg_${cfg.taskId}.log" >&2
+fi
+
+PAYLOAD=$(jq -n --arg tid "$TASK" --arg pr "$PR_URL" \\
+  --argjson fix_responses "\${FIX_RESPONSES_JSON:-null}" \\
+  --argjson self_review "$SELF_REVIEW_JSON" \\
+  --argjson changed_files "\${CHANGED_FILES_JSON:-null}" \\
+  --arg warn_reason "\${WARN_OUT_OF_SCOPE_REASON:-}" \\
+  '{task_id: $tid, status: "COMPLETED", artifact_type: "PULL_REQUEST", pr_url: $pr, logs: ("Task complete. PR: " + $pr)}
+   + (if $fix_responses then {fix_agent_responses: $fix_responses} else {} end)
+   + {self_review_outcome: $self_review}
+   + (if $changed_files then {changed_files: $changed_files} else {} end)
+   + (if ($warn_reason | length) > 0 then {warn_out_of_scope_reason: $warn_reason} else {} end)')
+
+# Stale-result envelope: persist BEFORE attempting the POST so that if
+# the VM is killed mid-retry, the next agent boot can scan for the
+# envelope and replay the COMPLETED post. Mirrors the TS-side behaviour
+# in persistAndPostStatus (index.ts:567). Without this, a kill during
+# the bash 45s retry window leaves the task IN_PROGRESS until the reaper
+# sweeps it as orphan, then re-runs from scratch — duplicate work + retry
+# budget burn.
+ENVELOPE="/tmp/task_${cfg.taskId}_result.json"
+printf '%s' "$PAYLOAD" > "$ENVELOPE" 2>/dev/null || \
+  echo "[done] WARNING: failed to persist stale-result envelope to $ENVELOPE" >&2
+
+POSTED=0
+for attempt in 1 2 3 4 5; do
+  HTTP=$(printf '%s' "$PAYLOAD" | curl -sS -o /tmp/done_resp_${cfg.taskId} -w '%{http_code}' --max-time 30 \\
+    -X POST "$API/api/agent/status" \\
+    -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-) || HTTP="000"
+  if [ "$HTTP" = "200" ] || [ "$HTTP" = "202" ]; then
+    POSTED=1
+    break
+  fi
+  if [ "$HTTP" = "429" ] || [ "\${HTTP:0:1}" = "5" ] || [ "$HTTP" = "000" ]; then
+    BACKOFF=$((attempt * 3))
+    echo "[done] POST attempt $attempt got HTTP=$HTTP — retrying in \${BACKOFF}s..." >&2
+    sleep "$BACKOFF"
+    continue
+  fi
+  # 4xx other than 429: don't retry — likely a permanent error.
+  echo "[done] POST attempt $attempt got HTTP=$HTTP (permanent failure):" >&2
+  cat /tmp/done_resp_${cfg.taskId} >&2
+  rm -f /tmp/done_resp_${cfg.taskId}
+  exit 1
+done
+rm -f /tmp/done_resp_${cfg.taskId}
+if [ "$POSTED" = "0" ]; then
+  echo "[done] POST failed after 5 retries — orchestrator unreachable. Marker NOT written; wrapper will fall back to its own status post." >&2
+  exit 1
+fi
+
+# Marker is written ONLY after a successful POST. The wrapper inspects it
+# to decide whether to skip its fallback completion path.
+touch /tmp/done_${cfg.taskId}
+# Envelope replayed successfully — remove it so the next agent boot doesn't
+# resend a duplicate COMPLETED post for this task ID.
+rm -f "$ENVELOPE"
+echo ""
+echo "[done] OK — wrapper will exit cleanly. PR: $PR_URL"
+`;
+  fs.writeFileSync(`${WORKSPACE}/done`, script, { mode: 0o755 });
+}

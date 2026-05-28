@@ -61,6 +61,7 @@ vi.mock('../prompt.js', async (importOriginal) => {
 import fs from 'fs';
 import { runClaudeCode, persistAndPostStatus, getProviderRunner } from '../index.js';
 import { handlePlan, handleResearch } from './research-plan.js';
+import { handleStrategic } from './strategic.js';
 import {
   calcMessageAge,
   parseResearchContext,
@@ -1519,12 +1520,13 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
   const EX_WS = null;
   const EX_STATUS_REF = () => ({ value: '' });
   const EX_TASK = { title: 'Strategic cycle', description: 'strategic', context: {}, project_context: {} };
-  // research_mode 'strategic' is what routes handleResearch into the
-  // thinker→executor two-pass flow where the executor prompt lives.
+  // research_mode 'strategic' is the canonical strategic-flow payload shape;
+  // handleStrategic owns the thinker→executor two-pass flow where the executor
+  // prompt lives.
   const EX_PAYLOAD = { base_branch: 'main', research_mode: 'strategic', prompt: 'run the cycle' };
 
   /**
-   * Drives handleResearch through the strategic two-pass flow and returns the
+   * Drives handleStrategic through the strategic two-pass flow and returns the
    * executor (pass-2) prompt — the SECOND runClaudeCode invocation. The first
    * is the thinker; we make the thinker exit 0 and report both handoff files
    * present so runThinkerWithGate passes and the executor runs. The executor's
@@ -1544,7 +1546,7 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     // Returning true for every existsSync keeps the gate happy.
     vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(true);
 
-    await handleResearch(
+    await handleStrategic(
       EX_TASK_ID, EX_PAYLOAD, EX_TASK, EX_GH_TOKEN, EX_OWNER, EX_REPO, EX_WS, EX_STATUS_REF(),
     );
 

@@ -3,6 +3,7 @@ import type { AgentTaskType } from '../taskCapabilities.js';
 import { handleCreate, handleRefactor, handleDocs, handleDeps, handleQA } from './standard.js';
 import { handleReview, handleFix } from './review-fix.js';
 import { handlePlan, handleResearch } from './research-plan.js';
+import { handleStrategic } from './strategic.js';
 import { handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
 import { handleMigrate, handleSmoketest, handleDebug, handlePerf, handleInvestigate } from './specialized.js';
 import { handleDesignDocUpdate } from './design-doc.js';
@@ -14,12 +15,22 @@ export type Handler = (
   model?: string, effort?: string
 ) => Promise<void>;
 
+// research task type forwards to the strategic handler when research_mode is
+// 'strategic'; otherwise it runs the tactical research path. strategic_review
+// always goes directly to handleStrategic.
+const dispatchResearch: Handler = (taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort) => {
+  if (payload.research_mode === 'strategic') {
+    return handleStrategic(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
+  }
+  return handleResearch(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
+};
+
 export const handlers: Record<AgentTaskType, Handler> = {
   create: handleCreate,
   review: handleReview,
   fix: handleFix,
   plan: handlePlan,
-  research: handleResearch,
+  research: dispatchResearch,
   docs: handleDocs,
   security_audit: handleSecurityAudit,
   self_audit: handleSelfAudit,
@@ -32,7 +43,7 @@ export const handlers: Record<AgentTaskType, Handler> = {
   perf: handlePerf,
   investigate: handleInvestigate,
   design_doc_update: handleDesignDocUpdate,
-  strategic_review: handleResearch,  // Reuses research handler; branches on research_mode
+  strategic_review: handleStrategic,
   release_audit: handleReleaseAudit,
   memo: handleMemo,
 };

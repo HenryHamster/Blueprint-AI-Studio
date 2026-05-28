@@ -107,17 +107,14 @@ describe('handlers registry', () => {
     }
   });
 
-  it('strategic_review reuses the same function reference as research', () => {
-    expect(handlers.strategic_review).toBe(handlers.research);
+  it('strategic_review and research are distinct handlers — research dispatches to strategic only when payload.research_mode is "strategic"', () => {
+    expect(handlers.strategic_review).not.toBe(handlers.research);
   });
 
-  it('all other handlers are distinct function references from each other', () => {
-    // strategic_review is intentionally the same as research — skip that pair.
-    const uniqueTypes = EXPECTED_TYPES.filter((t) => t !== 'strategic_review');
+  it('all handlers are distinct function references from each other', () => {
     const seen = new Set<unknown>();
-    for (const type of uniqueTypes) {
+    for (const type of EXPECTED_TYPES) {
       const fn = handlers[type];
-      // Each type in this subset should have a unique function
       expect(seen.has(fn), `duplicate handler found for "${type}"`).toBe(false);
       seen.add(fn);
     }
@@ -193,6 +190,49 @@ describe('task type class classification — cross-cutting invariants', () => {
       expect(seen, `"${type}" appears more than once in TASK_CLASS_MAP`).not.toContain(type);
       seen.add(type);
     }
+  });
+});
+
+// ── Strategic dispatch smoke ──────────────────────────────────────────────────
+// Locks in the contract that handlers.research forwards strategic-mode payloads
+// to handleStrategic, and that handlers.strategic_review goes directly to it.
+// Both paths must write the strategic helper script — that's the observable
+// signal that the strategic flow ran (not the tactical research flow).
+describe('strategic dispatch smoke', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('handlers.strategic_review writes the strategic helper to the workspace', async () => {
+    const { runClaudeCode } = await import('../index.js');
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    const fs = (await import('fs')).default;
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+
+    const payload = { base_branch: 'main', research_mode: 'strategic' };
+    const task = { title: 'Strategic', description: '', context: {} };
+    await handlers.strategic_review('smoke-strategic-001', payload, task, '', 'owner', 'repo', null, { value: '' });
+
+    const writeCalls = vi.mocked(fs.writeFileSync).mock.calls as unknown as [string, string][];
+    const strategicHelperWritten = writeCalls.some(([path]) => path.endsWith('/strategic'));
+    expect(strategicHelperWritten, 'strategic helper script must be written by strategic_review dispatch').toBe(true);
+    const fetchHelperWritten = writeCalls.some(([path]) => path.endsWith('/fetch'));
+    expect(fetchHelperWritten, 'fetch helper script must be written by strategic_review dispatch').toBe(true);
+  });
+
+  it('handlers.research with research_mode="strategic" routes to handleStrategic (writes strategic helper)', async () => {
+    const { runClaudeCode } = await import('../index.js');
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    const fs = (await import('fs')).default;
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+
+    const payload = { base_branch: 'main', research_mode: 'strategic' };
+    const task = { title: 'Strategic', description: '', context: {} };
+    await handlers.research('smoke-research-strategic-001', payload, task, '', 'owner', 'repo', null, { value: '' });
+
+    const writeCalls = vi.mocked(fs.writeFileSync).mock.calls as unknown as [string, string][];
+    const strategicHelperWritten = writeCalls.some(([path]) => path.endsWith('/strategic'));
+    expect(strategicHelperWritten, 'research dispatch must reach handleStrategic and write the strategic helper').toBe(true);
   });
 });
 
