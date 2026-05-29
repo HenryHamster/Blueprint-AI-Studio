@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, setupWorkspace, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, flushLogBuffer, snapshotLogBuffer, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, getAgentHeaders, ClaudeTimeoutError, jaccardSimilarity, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, type FailureCategory } from './index.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
 import {
   drainFixLoopEventBuffer,
@@ -424,6 +424,57 @@ describe('FailureCategory', () => {
       expect(typeof value).toBe('string');
     }
     expect(expectedCategories).toHaveLength(8);
+  });
+});
+
+// ── isTaskNoLongerActiveError ─────────────────────────────────────────────────
+// Regression: the startup /api/agent/github/token GET 401s with "Task is no
+// longer active" when the task goes terminal (CANCELLED/COMPLETED/superseded)
+// between /claim and the token fetch. That benign cancellation must NOT be
+// classified as a fatal CODE failure — runRoleOnce's catch special-cases it
+// (stops the heartbeat, exits 0) and skips the failure_category='fatal' FAILED
+// status post. This classifier is the gate for that graceful path.
+describe('isTaskNoLongerActiveError', () => {
+  it('matches the github/token startup 401 "Task is no longer active" error', () => {
+    const err = new Error(
+      'GET /api/agent/github/token?task_id=abc failed (401): {"error":{"code":401,"message":"Task is no longer active"}}',
+    );
+    expect(isTaskNoLongerActiveError(err)).toBe(true);
+  });
+
+  it('matches the lowercase "no longer active" phrasing', () => {
+    const err = new Error('GET /api/agent/credentials failed (401): task is no longer active');
+    expect(isTaskNoLongerActiveError(err)).toBe(true);
+  });
+
+  it('does NOT match a 401 that is not a cancellation (e.g. bad token)', () => {
+    const err = new Error('GET /api/agent/github/token failed (401): {"message":"Invalid agent token"}');
+    expect(isTaskNoLongerActiveError(err)).toBe(false);
+  });
+
+  it('does NOT match a non-401 status that mentions "no longer active"', () => {
+    const err = new Error('GET /api/agent/foo failed (404): Task is no longer active');
+    expect(isTaskNoLongerActiveError(err)).toBe(false);
+  });
+
+  it('does NOT match a non-Error value', () => {
+    expect(isTaskNoLongerActiveError('GET failed (401): no longer active')).toBe(false);
+    expect(isTaskNoLongerActiveError(null)).toBe(false);
+    expect(isTaskNoLongerActiveError(undefined)).toBe(false);
+  });
+
+  it('confirms the FAILED-classification fatal path is bypassed for this error shape', () => {
+    // The catch block in runRoleOnce computes failure_category as
+    // 'fatal' (errorCategory ?? 'fatal') for un-typed errors. This benign
+    // 401 must short-circuit BEFORE that classification so no FAILED status
+    // with failure_category='fatal' is posted. Asserting the classifier
+    // returns true is what guarantees the early return is taken.
+    const benign = new Error(
+      'GET /api/agent/github/token?task_id=df6057d3 failed (401): {"error":{"code":401,"message":"Task is no longer active"}}',
+    );
+    const genuinelyFatal = new Error('handler threw: undefined is not a function');
+    expect(isTaskNoLongerActiveError(benign)).toBe(true);
+    expect(isTaskNoLongerActiveError(genuinelyFatal)).toBe(false);
   });
 });
 

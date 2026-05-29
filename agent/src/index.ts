@@ -393,6 +393,23 @@ function statusFlagsForTask(taskId: string): Record<string, unknown> {
   return pendingStatusFlagsByTask.get(taskId) ?? {};
 }
 
+/**
+ * True when an error is the backend's benign "task went terminal" 401 — i.e.
+ * the task was CANCELLED/COMPLETED/superseded between /api/agent/claim and a
+ * subsequent task-scoped GET (notably the startup /api/agent/github/token
+ * fetch, which is intentionally NOT on verify_agent_token's idempotent-path
+ * allowlist). The thrown apiGet error carries the shape
+ * "GET /api/agent/... failed (401): {...\"Task is no longer active\"...}".
+ *
+ * This is NOT a code fault — it must not be recorded as failure_category
+ * 'fatal'. Mirrors the graceful handling already in apiPost's 401 interceptor
+ * (~line 362) and the heartbeat 4xx self-terminate branch (~line 1012).
+ */
+export function isTaskNoLongerActiveError(e: unknown): boolean {
+  if (!(e instanceof Error)) return false;
+  return /failed \(401\)/.test(e.message) && /no longer active/i.test(e.message);
+}
+
 function isTerminalStatus(status: unknown): boolean {
   return status === 'COMPLETED' || status === 'FAILED' || status === 'CANCELLED';
 }
@@ -2097,6 +2114,27 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     sendLog(ws, '\nTask completed.\n');
 
   } catch (error) {
+    // Benign cancellation during startup: the task went terminal
+    // (CANCELLED/COMPLETED/superseded) between /api/agent/claim and the
+    // /api/agent/github/token fetch above, so verify_agent_token 401s with
+    // "Task is no longer active". This is NOT a code fault — do not record it
+    // as failure_category 'fatal' or post a FAILED status (the task is already
+    // terminal and the backend would reject the status anyway). Mirror the
+    // heartbeat reassignment path (~line 1012): stop the heartbeat, allow a
+    // brief wind-down, and exit 0 so the role loop winds down cleanly instead
+    // of crash-reporting a fatal failure.
+    if (isTaskNoLongerActiveError(error)) {
+      log('Task no longer active (cancelled/superseded during startup) — abandoning role gracefully');
+      sendLog(ws, '\nTask no longer active (cancelled/superseded during startup) — abandoning role gracefully.\n');
+      statusRef.value = 'Task no longer active — abandoning role gracefully';
+      stopHeartbeat();
+      if (ws) ws.close();
+      // VM TTL self-destruct is the ultimate backstop; the short delay lets
+      // the final sendLog/ws close flush before exit, matching the heartbeat
+      // path's 5s wind-down (shorter here — there is no in-flight task work).
+      setTimeout(() => process.exit(0), 2000);
+      return { taskId, prNumber, baseBranch: baseBranchForReset };
+    }
     const errMsg = error instanceof Error ? error.message : String(error);
     const safeErr = sanitize(errMsg);
     log(`Fatal error: ${safeErr}`);
