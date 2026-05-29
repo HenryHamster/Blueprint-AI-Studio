@@ -96,7 +96,11 @@ from app.task_completion import (
     _ensure_branch,
     _apply_synthesized_memo,
 )
-from app.task_locking import with_design_doc_locked, with_directions_locked
+from app.task_locking import (
+    with_design_doc_locked,
+    with_directions_locked,
+    with_vision_locked,
+)
 from app.plan_completion import (
     _validate_plan_dependencies,
     _log_file_overlaps,
@@ -906,14 +910,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # where one strategic_review spawned 4 research tasks AT ONCE and
     # immediately tripped the modulo-6 gate for the next strategic_review.
     project_obj = await session.get(Project, task.project_id)
+
+    def _increment_research_spawn_count(vision: dict) -> None:
+        vision["_research_spawn_count"] = (vision.get("_research_spawn_count") or 0) + 1
+
     if project_obj is not None:
-        new_count = ((project_obj.vision or {}).get("_research_spawn_count") or 0) + 1
-        project_obj.vision = {
-            **(project_obj.vision or {}),
-            "_research_spawn_count": new_count,
-        }
-        flag_modified(project_obj, "vision")
-        session.add(project_obj)
+        await with_vision_locked(
+            session, task.project_id, _increment_research_spawn_count
+        )
 
     # Depth guard: prevent infinite research recursion
     MAX_RESEARCH_DEPTH = 3

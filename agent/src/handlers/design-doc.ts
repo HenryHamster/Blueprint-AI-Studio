@@ -10,7 +10,7 @@ import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   readClaudeMd, buildContextPrefix, buildFileTree, configureAgentPermissions,
-  writePlaybookHelper, writeMessagesHelper, excludeAgentHelpers, buildRetryContext, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE,
+  writePlaybookHelper, writeMessagesHelper, writeDesignDocHelper, buildRetryContext, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE,
   computePromptFingerprint,
 } from '../prompt.js';
 import { parseBackendTimestamp } from '../utils/time.js';
@@ -109,66 +109,10 @@ export async function handleDesignDocUpdate(
   }
 
   // Write the design-doc helper script that the inner agent can call via bash.
-  // The script reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env (passed by runClaudeCode)
-  // so the token is never written to disk.
-  // Uses printf + pipe to avoid shell expansion of JSON values in curl -d.
-  const helperScript = `#!/bin/bash
-# Design doc wiki tool — updates pages incrementally via API
-# Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env (no secrets on disk)
-# Usage:
-#   ./design-doc get <key>                — read a section
-#   ./design-doc set <key> '<json-value>' — write a section
-#   ./design-doc delete <key>
-#   ./design-doc list                     — list all section keys
-
-OP="\${1:?Usage: design-doc get|set|delete|list <key> [json-value]}"
-KEY="$2"
-VALUE="$3"
-API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
-TASK="${taskId}"
-CURL_OPTS="-f -sS --max-time 30 --connect-timeout 10"
-
-if [ "$OP" = "list" ]; then
-  printf '{"task_id":"%s","op":"list"}' "$TASK" | \\
-    curl $CURL_OPTS -X POST "$API/api/agent/design-doc" \\
-      -H "Content-Type: application/json" \\
-      -H "X-Agent-Token: $TOKEN" \\
-      --data-binary @-
-elif [ "$OP" = "get" ]; then
-  if [ -z "$KEY" ]; then
-    echo "Error: get requires <key>" >&2; exit 1
-  fi
-  printf '{"task_id":"%s","op":"get","key":"%s"}' "$TASK" "$KEY" | \\
-    curl $CURL_OPTS -X POST "$API/api/agent/design-doc" \\
-      -H "Content-Type: application/json" \\
-      -H "X-Agent-Token: $TOKEN" \\
-      --data-binary @-
-elif [ "$OP" = "set" ]; then
-  if [ -z "$KEY" ] || [ -z "$VALUE" ]; then
-    echo "Error: set requires <key> and <json-value>" >&2; exit 1
-  fi
-  printf '{"task_id":"%s","op":"set","key":"%s","value":%s}' "$TASK" "$KEY" "$VALUE" | \\
-    curl $CURL_OPTS -X POST "$API/api/agent/design-doc" \\
-      -H "Content-Type: application/json" \\
-      -H "X-Agent-Token: $TOKEN" \\
-      --data-binary @-
-elif [ "$OP" = "delete" ]; then
-  if [ -z "$KEY" ]; then
-    echo "Error: delete requires <key>" >&2; exit 1
-  fi
-  printf '{"task_id":"%s","op":"delete","key":"%s"}' "$TASK" "$KEY" | \\
-    curl $CURL_OPTS -X POST "$API/api/agent/design-doc" \\
-      -H "Content-Type: application/json" \\
-      -H "X-Agent-Token: $TOKEN" \\
-      --data-binary @-
-else
-  echo "Unknown op: $OP. Use get, set, delete, or list." >&2; exit 1
-fi
-echo ""
-`;
-  fs.writeFileSync(`${WORKSPACE}/design-doc`, helperScript, { mode: 0o755 });
-  excludeAgentHelpers();
+  // The script reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env (passed by
+  // runClaudeCode) so the token is never written to disk. set/delete retry on
+  // 429/5xx contention; see writeDesignDocHelper in prompt.ts.
+  writeDesignDocHelper(taskId);
   writeMessagesHelper(taskId);
 
   // CLAUDE.md as persistent reminder

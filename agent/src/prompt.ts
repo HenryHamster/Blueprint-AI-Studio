@@ -564,6 +564,114 @@ echo ""
   excludeAgentHelpers();
 }
 
+// ── Design-doc helper ─────────────────────────────────────────────────────────
+// Single canonical generator for the ./design-doc CLI, shared by the
+// design_doc_update handler (design-doc.ts) and the strategic_review handler
+// (strategic.ts) so both task types get identical, durable write behavior.
+//
+// READ ops (list/get) are fail-fast: a single curl, no retry.
+// WRITE ops (set/delete) are durable under contention: the backend serializes
+// concurrent design-doc writers with a NON-BLOCKING project-row lock and
+// returns HTTP 429 + Retry-After on contention (and transient 5xx under load),
+// expecting the client to retry (see backend/app/task_locking.py). A single
+// fail-fast curl would drop the page write silently, so set/delete retry a
+// bounded number of times, honoring Retry-After, before surfacing a real error.
+export function writeDesignDocHelper(taskId: string, workspace: string = WORKSPACE): void {
+  const helperScript = `#!/bin/bash
+# Design doc wiki tool — updates pages incrementally via API
+# Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env (no secrets on disk)
+# Usage:
+#   ./design-doc get <key>                — read a section
+#   ./design-doc set <key> '<json-value>' — write a section (durable: retries on 429/5xx)
+#   ./design-doc delete <key>             — remove a section (durable: retries on 429/5xx)
+#   ./design-doc list                     — list all section keys
+
+OP="\${1:?Usage: design-doc get|set|delete|list <key> [json-value]}"
+KEY="$2"
+VALUE="$3"
+API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+TASK="${taskId}"
+
+# Fail-fast POST for read operations (list/get): single curl, no retry.
+_post_once() {
+  curl -f -sS --max-time 30 --connect-timeout 10 \\
+    -X POST "$API/api/agent/design-doc" \\
+    -H "Content-Type: application/json" \\
+    -H "X-Agent-Token: $TOKEN" \\
+    --data-binary @-
+}
+
+# Durable POST for write operations (set/delete). Retries up to 3 times on
+# 429 (lock contention / rate limit) and 5xx (transient), honoring the
+# Retry-After header when present and falling back to linear backoff.
+# Non-retryable responses (other 4xx) surface immediately.
+_post_retry() {
+  local body="$1"
+  local attempt=0 max=3 delay http_code response dump
+  while [ $attempt -lt $max ]; do
+    dump=$(mktemp)
+    response=$(printf '%s' "$body" | \\
+      curl -sS --max-time 30 --connect-timeout 10 \\
+        -X POST "$API/api/agent/design-doc" \\
+        -H "Content-Type: application/json" \\
+        -H "X-Agent-Token: $TOKEN" \\
+        --data-binary @- \\
+        -D "$dump" \\
+        -w '\\n%{http_code}')
+    http_code=$(printf '%s' "$response" | tail -n1)
+    delay=$(grep -i '^retry-after:' "$dump" 2>/dev/null | tail -n1 | tr -dc '0-9')
+    rm -f "$dump"
+    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+      printf '%s' "$response" | head -n -1
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    if [ $attempt -ge $max ]; then break; fi
+    if [ "$http_code" = "429" ] || { [ "$http_code" -ge 500 ] && [ "$http_code" -lt 600 ]; }; then
+      [ -z "$delay" ] && delay=$((attempt * 2))
+      echo "[RETRY $attempt/$((max - 1))] design-doc $OP failed (HTTP $http_code), retrying in \${delay}s..." >&2
+      sleep "$delay"
+    else
+      printf '%s' "$response" | head -n -1 >&2
+      echo "[ERROR] design-doc $OP failed (HTTP $http_code, non-retryable)" >&2
+      return 1
+    fi
+  done
+  echo "[ERROR] design-doc $OP failed after $max attempts" >&2
+  return 1
+}
+
+if [ "$OP" = "list" ]; then
+  printf '{"task_id":"%s","op":"list"}' "$TASK" | _post_once
+elif [ "$OP" = "get" ]; then
+  if [ -z "$KEY" ]; then
+    echo "Error: get requires <key>" >&2; exit 1
+  fi
+  printf '{"task_id":"%s","op":"get","key":"%s"}' "$TASK" "$KEY" | _post_once
+elif [ "$OP" = "set" ]; then
+  if [ -z "$KEY" ] || [ -z "$VALUE" ]; then
+    echo "Error: set requires <key> and <json-value>" >&2; exit 1
+  fi
+  _post_retry "$(printf '{"task_id":"%s","op":"set","key":"%s","value":%s}' "$TASK" "$KEY" "$VALUE")"
+elif [ "$OP" = "delete" ]; then
+  if [ -z "$KEY" ]; then
+    echo "Error: delete requires <key>" >&2; exit 1
+  fi
+  _post_retry "$(printf '{"task_id":"%s","op":"delete","key":"%s"}' "$TASK" "$KEY")"
+else
+  echo "Unknown op: $OP. Use get, set, delete, or list." >&2; exit 1
+fi
+# Propagate the helper's exit status so the model sees a real failure after
+# retries are exhausted (the trailing newline must not mask a non-zero rc).
+rc=$?
+echo ""
+exit $rc
+`;
+  fs.writeFileSync(`${workspace}/design-doc`, helperScript, { mode: 0o755 });
+  excludeAgentHelpers();
+}
+
 export interface PlaybookEntry {
   content: string;
   effectiveness_score: number;

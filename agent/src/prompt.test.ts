@@ -63,6 +63,7 @@ import {
   formatProjectBlindSpotSummary,
   formatFixIterationHistory,
   formatSelfReviewCalibrationSection,
+  writeDesignDocHelper,
   type FixAttempt,
 } from './prompt.js';
 import { READ_ONLY_TASK_TYPES, WRITE_TASK_TYPES } from './taskCapabilities.js';
@@ -4064,3 +4065,77 @@ describe('CODE_CHANGE_HELPER_GUIDANCE — evidence anchors', () => {
   });
 });
 
+
+// ── writeDesignDocHelper ────────────────────────────────────────────────────────
+describe('writeDesignDocHelper', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('writes /tmp/workspace/design-doc at mode 0o755', () => {
+    writeDesignDocHelper('task-xyz');
+    const call = vi.mocked(fs.writeFileSync).mock.calls.find(
+      c => c[0] === '/tmp/workspace/design-doc',
+    );
+    expect(call).toBeDefined();
+    expect(call?.[2]).toEqual({ mode: 0o755 });
+  });
+
+  it('preserves the design-doc get|set|delete|list CLI surface and bakes in the task id', () => {
+    writeDesignDocHelper('task-xyz');
+    const script = capturedScripts['/tmp/workspace/design-doc'];
+    expect(script.startsWith('#!/bin/bash')).toBe(true);
+    expect(script).toContain('design-doc get|set|delete|list');
+    expect(script).toContain('TASK="task-xyz"');
+    // POST body shape the backend op handler parses must be unchanged.
+    expect(script).toContain('"op":"set","key":"%s","value":%s');
+    expect(script).toContain('"op":"delete","key":"%s"');
+  });
+
+  it('makes set/delete durable: a retry loop honoring Retry-After on 429/5xx', () => {
+    writeDesignDocHelper('task-xyz');
+    const script = capturedScripts['/tmp/workspace/design-doc'];
+    // Bounded retry loop wired to the write ops.
+    expect(script).toContain('_post_retry()');
+    expect(script).toContain('max=3');
+    expect(script).toContain('_post_retry "$(printf');
+    // Retries on contention (429) and transient server errors (5xx).
+    expect(script).toContain('"$http_code" = "429"');
+    expect(script).toContain('"$http_code" -ge 500');
+    // Honors the Retry-After header before backing off.
+    expect(script).toContain('retry-after:');
+    expect(script).toContain('sleep "$delay"');
+  });
+
+  it('keeps read ops (list/get) fail-fast with no retry', () => {
+    writeDesignDocHelper('task-xyz');
+    const script = capturedScripts['/tmp/workspace/design-doc'];
+    expect(script).toContain('_post_once()');
+    // list and get route through the single-shot helper, not the retry loop.
+    expect(script).toMatch(/"op":"list"\}' "\$TASK" \| _post_once/);
+    expect(script).toMatch(/"op":"get","key":"%s"\}' "\$TASK" "\$KEY" \| _post_once/);
+  });
+
+  it('generated design-doc script passes `bash -n` syntax check', async () => {
+    writeDesignDocHelper('task-xyz');
+    const script = capturedScripts['/tmp/workspace/design-doc'];
+    expect(script).toBeDefined();
+
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/design_doc_smoke_${process.pid}_${Date.now()}.sh`;
+    realFs.writeFileSync(tmp, script);
+    try {
+      realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+    } finally {
+      try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  });
+});

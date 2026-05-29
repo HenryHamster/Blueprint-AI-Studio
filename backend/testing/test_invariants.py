@@ -2366,6 +2366,43 @@ def _load_lock_baseline() -> dict:
 _LOCK_BASELINE = _load_lock_baseline()
 
 
+# Files with design_doc / vision writes that intentionally do NOT (yet) acquire
+# a project-row lock. These are PRE-EXISTING lock-free read-modify-write sites
+# (identical on origin/main, which never carried a lock here) that the positive
+# ratchet below must not assert on — doing so would demand a lock that was never
+# present, rather than catching a lock that was REMOVED (the ratchet's stated
+# purpose). Migrating these writes to with_design_doc_locked() / with_vision_locked()
+# is tracked as the companion to the "cluster 1/2" positive-ratchet test (#6779);
+# until that migration lands, the entries below are exempt with rationale.
+#
+# NOTE: this exemption only narrows the POSITIVE ratchet (TestDesignDocLockAssignmentGuard
+# / TestVisionLockAssignmentGuard). The NEGATIVE ratchet (TestDesignDocLockInvariant /
+# TestVisionLockInvariant) still applies to these files and prevents any NEW unguarded
+# write from raising the per-file count above its baseline. Remove a file from this set
+# the moment its writes are migrated under a lock — that re-arms the positive guard.
+_LOCK_GUARD_EXEMPT: dict[str, set[str]] = {
+    "design_doc": {
+        # Concurrent auto-recovery RMW of design_doc["_auto_remediation"]; hot
+        # best-effort path — pending migration to with_design_doc_locked(skip_locked=True).
+        "auto_remediation.py",
+        # One-time onboarding write while configuring a freshly created project
+        # (no concurrent writers at onboard time).
+        "routers/admin_onboard.py",
+    },
+    "vision": {
+        # Research vision RMW from the autonomous loop — pending migration to
+        # with_vision_locked(); counter serialization already hardened separately.
+        "autonomous_research.py",
+        # Single direction-metrics vision write.
+        "direction_metrics.py",
+        # Debug-only vision touch ({**project.vision}).
+        "routers/admin_debug.py",
+        # Self-audit dispatch vision write — pending migration to with_vision_locked().
+        "self_audit_dispatch.py",
+    },
+}
+
+
 def _ast_count_attr_assignments(app_dir: str, attr_name: str) -> dict[str, int]:
     """Return per-file counts of AST-level attribute assignments for attr_name.
 
@@ -2722,6 +2759,132 @@ class TestVisionLockInvariant:
 
     def test_no_new_unlocked_vision_writes(self):
         _check_lock_invariant("vision", "vision", "with_vision_locked")
+
+
+# ── Design-Doc Lock Assignment Guard ─────────────────────────────────────────
+
+
+class TestDesignDocLockAssignmentGuard:
+    """Positive ratchet: files with non-zero .design_doc assignments must be
+    wrapped in a project-row-lock acquisition site.
+
+    Complements TestDesignDocLockInvariant (negative ratchet). That test catches
+    NEW direct assignments. This test ensures EXISTING assignments have a surrounding
+    lock — if the lock is removed without migrating the write to with_design_doc_locked(),
+    this test fails.
+
+    Recognized lock acquisition sites:
+      - with_for_update(...) on Project (or alias)
+      - project_lock(...)
+      - lock_project_or_429(...) or _lock_project_or_429(...)
+      - with_design_doc_locked(...)
+
+    Failure message suggests either migrating to with_design_doc_locked or
+    restoring the surrounding lock call.
+    """
+
+    # Recognized patterns that indicate a file has a project-row lock.
+    # Substring matching is sufficient (conservative approach).
+    _LOCK_PATTERNS = [
+        "with_for_update(",
+        "project_lock(",
+        "lock_project_or_429(",
+        "with_design_doc_locked(",
+    ]
+
+    def test_design_doc_writes_guarded_by_locks(self):
+        """Every file with .design_doc writes must contain at least one lock acquisition."""
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        baseline: dict[str, int] = _LOCK_BASELINE.get("design_doc", {})
+        exempt = _LOCK_GUARD_EXEMPT.get("design_doc", set())
+
+        violations: list[str] = []
+        for rel_path, count in sorted(baseline.items()):
+            if count <= 0:
+                continue
+            if rel_path in exempt:
+                continue
+
+            file_path = os.path.join(app_dir, rel_path)
+            if not _file_contains_lock_pattern(file_path, self._LOCK_PATTERNS):
+                violations.append(
+                    f"  {rel_path}: {count} direct assignment(s), no lock guard found"
+                )
+
+        assert not violations, (
+            "Files with .design_doc assignments lack lock acquisition guards:\n"
+            + "\n".join(violations)
+            + "\n\nEach file must contain at least one of these lock-acquisition patterns:\n"
+            + "\n".join(f"  - {p}" for p in self._LOCK_PATTERNS)
+            + "\n\nEither:\n"
+            "  (a) Migrate the write to with_design_doc_locked() (in task_locking.py) and "
+            "lower the count in lock_assignment_baseline.json, or\n"
+            "  (b) Restore the surrounding project_lock / with_for_update / "
+            "lock_project_or_429 call that was accidentally removed."
+        )
+
+
+# ── Vision Lock Assignment Guard ──────────────────────────────────────────────
+
+
+class TestVisionLockAssignmentGuard:
+    """Positive ratchet: files with non-zero .vision assignments must be
+    wrapped in a project-row-lock acquisition site.
+
+    Complements TestVisionLockInvariant (negative ratchet). That test catches
+    NEW direct assignments. This test ensures EXISTING assignments have a surrounding
+    lock — if the lock is removed without migrating the write to with_vision_locked(),
+    this test fails.
+
+    Recognized lock acquisition sites:
+      - with_for_update(...) on Project (or alias)
+      - project_lock(...)
+      - lock_project_or_429(...) or _lock_project_or_429(...)
+      - with_vision_locked(...)
+
+    Failure message suggests either migrating to with_vision_locked or
+    restoring the surrounding lock call.
+    """
+
+    # Recognized patterns that indicate a file has a project-row lock.
+    # Substring matching is sufficient (conservative approach).
+    _LOCK_PATTERNS = [
+        "with_for_update(",
+        "project_lock(",
+        "lock_project_or_429(",
+        "with_vision_locked(",
+    ]
+
+    def test_vision_writes_guarded_by_locks(self):
+        """Every file with .vision writes must contain at least one lock acquisition."""
+        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+        baseline: dict[str, int] = _LOCK_BASELINE.get("vision", {})
+        exempt = _LOCK_GUARD_EXEMPT.get("vision", set())
+
+        violations: list[str] = []
+        for rel_path, count in sorted(baseline.items()):
+            if count <= 0:
+                continue
+            if rel_path in exempt:
+                continue
+
+            file_path = os.path.join(app_dir, rel_path)
+            if not _file_contains_lock_pattern(file_path, self._LOCK_PATTERNS):
+                violations.append(
+                    f"  {rel_path}: {count} direct assignment(s), no lock guard found"
+                )
+
+        assert not violations, (
+            "Files with .vision assignments lack lock acquisition guards:\n"
+            + "\n".join(violations)
+            + "\n\nEach file must contain at least one of these lock-acquisition patterns:\n"
+            + "\n".join(f"  - {p}" for p in self._LOCK_PATTERNS)
+            + "\n\nEither:\n"
+            "  (a) Migrate the write to with_vision_locked() (in task_locking.py) and "
+            "lower the count in lock_assignment_baseline.json, or\n"
+            "  (b) Restore the surrounding project_lock / with_for_update / "
+            "lock_project_or_429 call that was accidentally removed."
+        )
 
 
 # ── Behind-Recovery update_branch Guard ──────────────────────────────────────

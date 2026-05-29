@@ -1,5 +1,5 @@
 import fs from 'fs';
-import { excludeAgentHelpers } from '../prompt.js';
+import { excludeAgentHelpers, writeDesignDocHelper } from '../prompt.js';
 
 // Strategic shell-helper generators
 // Generates three independent bash scripts for strategic-mode task execution:
@@ -101,26 +101,6 @@ echo ""
 `;
 }
 
-function generateDesignDocScript(taskId: string): string {
-  return `#!/bin/bash
-API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
-OP="\${1:?Usage: design-doc get|set|delete|list <key> [json-value]}"
-KEY="$2"
-VALUE="$3"
-if [ "$OP" = "list" ]; then
-  curl -f -X POST "$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"list\\"}"
-elif [ "$OP" = "get" ]; then
-  curl -f -X POST "$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"get\\", \\"key\\": \\"$KEY\\"}"
-elif [ "$OP" = "set" ]; then
-  curl -f -X POST "$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"set\\", \\"key\\": \\"$KEY\\", \\"value\\": $VALUE}"
-elif [ "$OP" = "delete" ]; then
-  curl -f -X POST "$API/api/agent/design-doc" -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" -d "{\\"task_id\\": \\"${taskId}\\", \\"op\\": \\"delete\\", \\"key\\": \\"$KEY\\"}"
-fi
-echo ""
-`;
-}
-
 export function writeStrategicHelpers(taskId: string, projectId: string, workspace: string): void {
   const strategicScript = generateStrategicScript(taskId);
   fs.writeFileSync(`${workspace}/strategic`, strategicScript, { mode: 0o755 });
@@ -128,8 +108,10 @@ export function writeStrategicHelpers(taskId: string, projectId: string, workspa
   const fetchScript = generateFetchScript(projectId);
   fs.writeFileSync(`${workspace}/fetch`, fetchScript, { mode: 0o755 });
 
-  const designDocScript = generateDesignDocScript(taskId);
-  fs.writeFileSync(`${workspace}/design-doc`, designDocScript, { mode: 0o755 });
+  // Write the ./design-doc CLI via the shared, durable generator (prompt.ts)
+  // so strategic_review tasks get the same 429/5xx-retrying set/delete writes
+  // as design_doc_update tasks — a single source of truth for the helper.
+  writeDesignDocHelper(taskId, workspace);
 
   excludeAgentHelpers();
 }

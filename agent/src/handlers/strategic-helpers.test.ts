@@ -69,7 +69,9 @@ describe('writeStrategicHelpers', () => {
     writeStrategicHelpers(taskId, projectId, testWorkspace);
 
     const content = fs.readFileSync(`${testWorkspace}/design-doc`, 'utf-8');
-    expect(content).toContain(`task_id\\": \\"${taskId}\\"`);
+    // Shared durable generator (prompt.ts) bakes the task id into a TASK var and
+    // interpolates it via printf, rather than inlining it in each curl body.
+    expect(content).toContain(`TASK="${taskId}"`);
     expect(content).toContain('get|set|delete|list');
   });
 

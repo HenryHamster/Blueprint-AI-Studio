@@ -6,7 +6,7 @@
     "efficiency_snapshot.py": 1,
     "playbook_learning.py": 2,
     "playbook_lifecycle.py": 1,
-    "playbook_sr_metrics.py": 10,
+    "playbook_sr_metrics.py": 0,
     "playbook_storage.py": 1,
     "review_learning.py": 2,
     "success_patterns.py": 1,
