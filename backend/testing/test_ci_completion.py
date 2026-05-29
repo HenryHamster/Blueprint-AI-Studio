@@ -2323,6 +2323,91 @@ async def test_suppress_warm_handoff_ci_failure(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_ci_failure_broadcast_uses_status_snapshot_not_post_commit_read(
+    db_session, mocker
+):
+    """Regression for the ci_completion.py fix-spawn broadcast MissingGreenlet.
+
+    On the CI-failure fix-spawned path the handler sets task.status, commits,
+    then broadcasts a task_updated event. A rollback earlier on that path (e.g.
+    inside _spawn_pipeline_task) expires the `task` ORM instance even with
+    expire_on_commit=False, so reading task.status when building the broadcast
+    payload did a *sync* lazy-load in async context → MissingGreenlet in prod.
+    The fix snapshots the status BEFORE commit.
+
+    Simulates the post-commit expiry by expiring `task` and rewriting the
+    persisted status out-of-band right after each handler commit. The broadcast
+    must still carry the mutation-time status (COMPLETED) from the pre-commit
+    snapshot, never a re-fetched/expired value (which would be FAILED here).
+    """
+    from sqlalchemy import update
+
+    from app.ci_completion import handle_ci_completion
+
+    mocker.patch("app.main._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    bcast = mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    fake_fix = type("FT", (), {"id": uuid.uuid4()})()
+    mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        return_value=(fake_fix, True),
+    )
+
+    project = Project(name="CI status snapshot bcast", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Wrap commit so every handler commit expires `task` and rewrites the
+    # persisted status. With the bug, the post-commit task.status read would
+    # lazy-load the corrupted value (FAILED); with the snapshot fix the
+    # broadcast carries the mutation-time COMPLETED.
+    _real_commit = db_session.commit
+
+    async def _commit_then_expire():
+        await _real_commit()
+        await db_session.execute(
+            update(Task).where(Task.id == task.id).values(status=TaskStatus.FAILED)
+        )
+        await _real_commit()
+        db_session.expire(task)
+
+    mocker.patch.object(db_session, "commit", side_effect=_commit_then_expire)
+
+    ci_result = {
+        "status": "completed",
+        "conclusion": "failure",
+        "failed_logs": "boom",
+    }
+    result = await handle_ci_completion(
+        task=task,
+        ci_result=ci_result,
+        gh_token="fake-token",
+        owner="owner",
+        repo="repo",
+        session=db_session,
+        source="poll",
+    )
+
+    assert result is True
+    task_updated_calls = [
+        c
+        for c in bcast.call_args_list
+        if len(c.args) >= 2 and c.args[1] == "task_updated"
+    ]
+    assert task_updated_calls, "expected a task_updated broadcast on the fix-spawn path"
+    payload = task_updated_calls[-1].args[2]
+    assert payload["status"] == TaskStatus.COMPLETED, (
+        "broadcast must carry the snapshotted mutation-time status, not a "
+        f"re-fetched/expired value (got {payload['status']!r})"
+    )
+
+
+@pytest.mark.asyncio
 async def test_ci_failure_spawn_extracts_failing_test_names_into_prompt(
     db_session, mocker
 ):

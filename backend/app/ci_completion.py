@@ -1264,7 +1264,10 @@ async def _attempt_merge_with_retry_and_escalation(
                         "task_updated",
                         {
                             "task_id": str(task.id),
-                            "status": task.status,
+                            # task.status was set to FAILED at the top of this
+                            # hard-cap branch; use the literal so a possibly-expired
+                            # instance (failure-alert DB op above) isn't lazy-loaded.
+                            "status": TaskStatus.FAILED,
                             "details": {
                                 "merge_early_exit": True,
                                 "retries_saved": _retries_saved,
@@ -1385,11 +1388,12 @@ async def handle_ci_completion(
                 f"[CI] PR #{ci_pr_number} CI passed, waiting for review approval ({source})"
             )
             session.add(task)
+            _bcast_status = task.status
             await session.commit()
             await broadcast_to_project(
-                str(task.project_id),
+                _bcast_project_id,
                 "task_updated",
-                {"task_id": str(task.id), "status": task.status},
+                {"task_id": _bcast_task_id, "status": _bcast_status},
             )
             return True
 
@@ -1455,11 +1459,12 @@ async def handle_ci_completion(
                 f"[CI] PR #{ci_pr_number} CI failed, fix already exists → {existing_fix.id} ({source})"
             )
             session.add(task)
+            _bcast_status = task.status
             await session.commit()
             await broadcast_to_project(
-                str(task.project_id),
+                _bcast_project_id,
                 "task_updated",
-                {"task_id": str(task.id), "status": task.status},
+                {"task_id": _bcast_task_id, "status": _bcast_status},
             )
             return True
 
@@ -1578,13 +1583,19 @@ async def handle_ci_completion(
             return True
 
     # Reached only by the fix-spawned branch above — the fix-not-spawned
-    # branch commits and returns inline. ``task`` is not expired on this
-    # path (no session-poisoning failure accounting runs here).
+    # branch commits and returns inline. ``task`` CAN be expired here: the
+    # nested _spawn_pipeline_task / prior session work may have rolled back,
+    # and rollback expires instances even with expire_on_commit=False.
     session.add(task)
+    # Snapshot status before commit. A rollback earlier on this path (e.g. inside
+    # _spawn_pipeline_task) expires `task` even with expire_on_commit=False, so a
+    # post-commit task.status read here does a sync lazy-load in async context →
+    # MissingGreenlet (same family as the #6754 claim_task fix).
+    _bcast_status = task.status
     await session.commit()
     await broadcast_to_project(
         _bcast_project_id,
         "task_updated",
-        {"task_id": _bcast_task_id, "status": task.status},
+        {"task_id": _bcast_task_id, "status": _bcast_status},
     )
     return True
