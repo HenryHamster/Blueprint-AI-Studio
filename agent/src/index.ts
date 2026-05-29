@@ -10,6 +10,7 @@ import {
 } from './diagnostics.js';
 import { registerChildPid, unregisterChildPid } from './processTracking.js';
 import { resetForNextRole } from './reset.js';
+import { isHeartbeatTransient } from './heartbeat-classify.js';
 import {
   formatFixIterationHistory,
   type FixAttempt,
@@ -1011,7 +1012,16 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
         }
         return;
       }
-      // Other 4xx = task reassigned to new VM (404) or other client error — graceful shutdown
+      // Transient 4xx (429 rate-limited, 408/425 timeout) — NOT a reassignment.
+      // Back off and keep heartbeating; the reaper's no-heartbeat window is the
+      // backstop. Regression 2026-05-29: a transient 429 here self-terminated
+      // live agents mid-task (recorded as AGENT_TIMEOUT) under orchestrator load.
+      // (409 row-locked is handled by its own retry branch above.)
+      if (e instanceof Error && isHeartbeatTransient(e.message)) {
+        log('Heartbeat transient failure (rate-limited/timeout) — backing off, will retry next interval');
+        return;
+      }
+      // Other 4xx (401/403/404 …) = task genuinely reassigned/deauthorized — graceful shutdown
       if (e instanceof Error && /failed \(4\d{2}\)/.test(e.message)) {
         log('Task no longer assigned to this VM — self-terminating gracefully');
         stopHeartbeat();
