@@ -31,9 +31,18 @@ vi.mock('../index.js', async (importOriginal) => {
     gitCommit: vi.fn().mockReturnValue(true),
     setupWorkspace: vi.fn().mockResolvedValue({ workBranch: 'task-abc123', shortId: 'abc123' }),
     runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
-    captureTestBaseline: vi.fn().mockResolvedValue(null),
     sendHeartbeatSync: vi.fn(),
     getProviderRunner: vi.fn().mockReturnValue({ displayName: 'Claude Code' }),
+  };
+});
+
+// The test verification loop now lives in utils/test-fix-loop.ts; handlers import
+// captureTestBaseline from there, so the mock must target that module.
+vi.mock('../utils/test-fix-loop.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/test-fix-loop.js')>();
+  return {
+    ...actual,
+    captureTestBaseline: vi.fn().mockResolvedValue(null),
   };
 });
 
@@ -117,7 +126,8 @@ vi.mock('ws', () => ({
 
 // ── Imports under test ────────────────────────────────────────────────────────
 import { handleCreate, handleRefactor, handleDocs, handleQA, handleDeps, extractSelfReviewJson, needsMigrationGeneration, buildSmallScopeCallerNote, runFreshReviewerPass, SR_SKIP_REASONS, computeRegressionRiskHeuristic, loneCheckerCategoriesForTask, pickFreshReviewerEffort } from './standard.js';
-import { setupWorkspace, captureTestBaseline, runClaudeCode } from '../index.js';
+import { setupWorkspace, runClaudeCode } from '../index.js';
+import { captureTestBaseline } from '../utils/test-fix-loop.js';
 import { extractModuleInterfaces, discoverAffectedConsumers, parseAnalysisPlanFiles, parseAnalysisPlanTestFiles, parseAnalysisPlanVerifyFiles, buildAnalysisPrompt } from '../prompt.js';
 import { runCodeChangeTask } from './code-change.js';
 

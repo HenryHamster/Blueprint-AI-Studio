@@ -5,10 +5,11 @@ import {
   WORKSPACE, strVal, sanitize, sendLog, validateBranchName,
   persistAndPostStatus, git, gitAsync,
   runClaudeCode, sendHeartbeatSync, setCurrentPromptFingerprint,
-  captureTestBaseline, testFixLoop, extractPytestSelectorsFromOutput,
+  extractPytestSelectorsFromOutput,
   snapshotToolTrace, extractInvestigatedFiles,
   resolveBaseBranch,
 } from '../index.js';
+import { captureTestBaseline, testFixLoop } from '../utils/test-fix-loop.js';
 import { runCodeChangeTask } from './code-change.js';
 import { runFreshReviewerPass } from './standard.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';

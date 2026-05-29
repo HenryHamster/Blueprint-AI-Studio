@@ -40,8 +40,6 @@ vi.mock('../index.js', () => ({
   gitCommit: vi.fn().mockReturnValue(true),
   setupWorkspace: vi.fn(),
   runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
-  captureTestBaseline: vi.fn().mockResolvedValue(null),
-  testFixLoop: vi.fn().mockResolvedValue({ passed: true, testFailuresDetected: false, failureSummary: '' }),
   extractPytestSelectorsFromOutput: vi.fn((output: string) => {
     const match = output.match(/FAILED\s+(backend\/testing\/\S+\.py::\S+)/);
     return match ? [match[1].replace(/\s+-.*$/, '')] : [];
@@ -51,6 +49,13 @@ vi.mock('../index.js', () => ({
   cloneWithRetry: vi.fn(),
   sendHeartbeatSync: vi.fn(),
   setCurrentPromptFingerprint: vi.fn(),
+}));
+
+// The test verification loop now lives in utils/test-fix-loop.ts; handlers import
+// captureTestBaseline and testFixLoop from there.
+vi.mock('../utils/test-fix-loop.js', () => ({
+  captureTestBaseline: vi.fn().mockResolvedValue(null),
+  testFixLoop: vi.fn().mockResolvedValue({ passed: true, testFailuresDetected: false, failureSummary: '' }),
 }));
 
 vi.mock('../workspacePrep.js', () => ({
@@ -109,6 +114,7 @@ vi.mock('child_process', () => ({
 import fs from 'fs';
 import { execFileSync } from 'child_process';
 import * as indexMod from '../index.js';
+import * as testLoopMod from '../utils/test-fix-loop.js';
 import {
   handleReview, handleFix, REVIEW_FEEDBACK_HISTORY_CHARS,
   detectMediumScopeSubsystemHint, pushForceWithLeaseRetrying,
@@ -169,8 +175,8 @@ beforeEach(() => {
   vi.mocked(indexMod.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
   vi.mocked(indexMod.persistAndPostStatus).mockResolvedValue(undefined);
   vi.mocked(indexMod.apiGet).mockResolvedValue({ data: { token: 'fresh' } });
-  vi.mocked(indexMod.testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false, failureSummary: '' });
-  vi.mocked(indexMod.captureTestBaseline).mockResolvedValue(null);
+  vi.mocked(testLoopMod.testFixLoop).mockResolvedValue({ passed: true, testFailuresDetected: false, failureSummary: '' });
+  vi.mocked(testLoopMod.captureTestBaseline).mockResolvedValue(null);
   // fetch is used by handleReview for PR metadata
   global.fetch = vi.fn().mockResolvedValue({
     ok: true,
@@ -1326,7 +1332,7 @@ describe('handleFix — baseline capture', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    expect(vi.mocked(indexMod.captureTestBaseline)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(testLoopMod.captureTestBaseline)).toHaveBeenCalledTimes(1);
   });
 
   it('skips baseline for CI-failure fixes so existing PR failures remain in scope', async () => {
@@ -1337,7 +1343,7 @@ describe('handleFix — baseline capture', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    expect(vi.mocked(indexMod.captureTestBaseline)).not.toHaveBeenCalled();
+    expect(vi.mocked(testLoopMod.captureTestBaseline)).not.toHaveBeenCalled();
     expect(vi.mocked(indexMod.sendLog)).toHaveBeenCalledWith(
       null,
       expect.stringContaining('CI-failure fix'),
@@ -1357,7 +1363,7 @@ describe('handleFix — baseline capture', () => {
       'gh-token', 'owner', 'repo', null, statusRef(),
     );
 
-    expect(vi.mocked(indexMod.testFixLoop)).toHaveBeenCalledWith(
+    expect(vi.mocked(testLoopMod.testFixLoop)).toHaveBeenCalledWith(
       null,
       expect.any(Object),
       undefined,
@@ -1376,7 +1382,7 @@ describe('handleFix — baseline capture', () => {
 
 describe('handleFix — CI failure context is injected into the prompt', () => {
   it('prepends CI repro failureSummary when targeted pytest selector failed locally', async () => {
-    vi.mocked(indexMod.testFixLoop).mockResolvedValueOnce({
+    vi.mocked(testLoopMod.testFixLoop).mockResolvedValueOnce({
       passed: false,
       testFailuresDetected: true,
       failureSummary: 'AssertionError at backend/testing/test_models.py::test_create',

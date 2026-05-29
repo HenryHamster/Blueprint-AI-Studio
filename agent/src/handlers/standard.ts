@@ -4,9 +4,10 @@ import type WebSocket from 'ws';
 import {
   WORKSPACE, strVal, sendLog, validateBranchName,
   persistAndPostStatus, git, setupWorkspace, runClaudeCode,
-  captureTestBaseline, getProviderRunner, setCurrentPromptFingerprint, sendHeartbeatSync,
+  getProviderRunner, setCurrentPromptFingerprint, sendHeartbeatSync,
   resolveBaseBranch,
 } from '../index.js';
+import { captureTestBaseline } from '../utils/test-fix-loop.js';
 import {
   getTaskTypeHints, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, CODE_CHANGE_HELPER_GUIDANCE,
   getTaskTypeFocusBlock,
